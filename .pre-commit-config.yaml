@@ -13,12 +13,12 @@ repos:
         entry: poetry run ruff format
         language: system
         types: [python]
-        files: "^popsim/"
-        exclude: "^popsim/tests/"
+        files: "^popsim_transport_predictor/"
+        exclude: "^popsim_transport_predictor/tests/"
       - id: ruff_check
         name: ruff_check
         entry: poetry run ruff check --fix
         language: system
         types: [python]
-        files: "^popsim/"
-        exclude: "^popsim/tests/"
+        files: "^popsim_transport_predictor/"
+        exclude: "^popsim_transport_predictor/tests/"
