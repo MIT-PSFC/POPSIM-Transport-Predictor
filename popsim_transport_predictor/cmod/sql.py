@@ -3,15 +3,14 @@ Module for SQL queries. Snagged from https://github.com/MIT-PSFC/disruption-efit
 """
 
 import numpy as np
-import pandas as pd
 from disruption_py.machine.tokamak import Tokamak
 from disruption_py.workflow import get_database
 from loguru import logger
 
 summary_table = "summary"
 
-ipmax = 100e3   # [A]
-pulse_length = 0.1 # [s]
+ipmax = 100e3  # [A]
+pulse_length = 0.1  # [s]
 
 
 def summary(
@@ -59,7 +58,7 @@ def summary(
         query += [f"and shot <= {max_shot}"]
     if hasattr(shots, "__iter__"):
         query += [f"and shot in ({', '.join(str(s) for s in shots)})"]
-    query += [f"order by shot"]
+    query += ["order by shot"]
     logger.trace("> {query}", query=" ".join(query))
 
     # results

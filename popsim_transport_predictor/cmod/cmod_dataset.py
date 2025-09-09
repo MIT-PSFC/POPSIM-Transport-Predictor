@@ -1,8 +1,8 @@
 """Makes the 'raw' CMOD dataset on mfews, to be processed later by POPSIM"""
-import os
+
 import xarray as xr
 
-from disruption_py.machine.tokamak import Tokamak, resolve_tokamak_from_environment
+from disruption_py.machine.tokamak import Tokamak
 from disruption_py.settings import RetrievalSettings
 from disruption_py.workflow import get_shots_data
 
@@ -23,12 +23,13 @@ CMOD_DATASET_SIGNALS = [
     "tribot",  # Bottom triangularity
     "rmagx",  # Major radius [m]
     # Power sources and sinks
-    # "p_oh",  # Ohmic heating power
-    # "p_rad",  # Bulk radiated heating power
-    # "p_icrf", # ICRF heating power
-    # "p_lh",  # Lower hybrid heating power
+    "p_oh",  # Ohmic heating power
+    "p_rad",  # Bulk radiated heating power
+    "p_icrf",  # ICRF heating power
+    "p_lh",  # Lower hybrid heating power (yes this is actually lower hybrid on C-Mod, NOT the LH transition threshold like on TCV)
     # Other
 ]
+
 
 def make_raw_dataset(shotlist: list[int]) -> xr.Dataset:
     run_columns = CMOD_DATASET_SIGNALS
@@ -47,6 +48,7 @@ def make_raw_dataset(shotlist: list[int]) -> xr.Dataset:
     )
 
     return result
+
 
 if __name__ == "__main__":
     # Example usage
