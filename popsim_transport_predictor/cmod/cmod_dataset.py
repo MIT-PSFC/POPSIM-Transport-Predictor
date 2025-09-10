@@ -1,16 +1,20 @@
 """Makes the 'raw' CMOD dataset on mfews, to be processed later by POPSIM"""
 
+import os
 import xarray as xr
+import loguru
 
 from disruption_py.machine.tokamak import Tokamak
 from disruption_py.settings import RetrievalSettings
 from disruption_py.workflow import get_shots_data
+from popsim_transport_predictor.sql import summary
 
+CMOD_RAW_DS_DIR = "/usr/local/mfe/ml_data_dump/studies/transport_predictor/cmod"
 
 CMOD_DATASET_SIGNALS = [
     # Profiles being predicted
-    # "Te_rho",  # Electron temperature profile [eV]
-    # "Ne_rho",  # Electron density profile [m^-3]
+    "te_rho",  # Electron temperature profile [eV]
+    "ne_rho",  # Electron density profile [m^-3]
     # Global quantities
     "ip",  # Plasma current
     "btor",  # On-axis magnetic field
@@ -28,13 +32,19 @@ CMOD_DATASET_SIGNALS = [
     "p_icrf",  # ICRF heating power
     "p_lh",  # Lower hybrid heating power (yes this is actually lower hybrid on C-Mod, NOT the LH transition threshold like on TCV)
     # Other
+    # TODO(ZanderKeith): Add gas valves when we get to that point
 ]
+
+SUMMARY_TABLE = "summary"
+IPMAX = 100e3  # [A]
+PULSE_LENGTH = 0.1  # [s]
+MIN_SHOT = 1050204013
+MAX_SHOT = 1160930043
 
 
 def make_raw_dataset(shotlist: list[int]) -> xr.Dataset:
-    run_columns = CMOD_DATASET_SIGNALS
     retrieval_settings = RetrievalSettings(
-        run_columns=run_columns,
+        run_columns=CMOD_DATASET_SIGNALS,
         efit_nickname_setting="default",
         time_setting="tmdb",
         only_requested_columns=True,
@@ -45,14 +55,39 @@ def make_raw_dataset(shotlist: list[int]) -> xr.Dataset:
         shotlist_setting=shotlist,
         retrieval_settings=retrieval_settings,
         output_setting="dataset",
+        num_processes=6,
     )
 
     return result
 
 
+def get_shotlist_from_sql(num_shots: int = None) -> list[int]:
+    data = summary(
+        summary_table=SUMMARY_TABLE,
+        ipmax=IPMAX,
+        pulse_length=PULSE_LENGTH,
+        min_shot=MIN_SHOT,
+        max_shot=MAX_SHOT,
+        shots=False,
+    )
+    shotlist = data[:, 0].astype(int).tolist()
+    if num_shots is not None:
+        shotlist = shotlist[:num_shots]
+    return shotlist
+
+
 if __name__ == "__main__":
-    # Example usage
-    shot_number = 1110316031
-    save_file = f"{shot_number}.nc"
-    ds = make_raw_dataset([shot_number])
-    ds.to_netcdf(save_file)
+    num_shots = 200
+    shotlist = get_shotlist_from_sql(num_shots)
+    loguru.logger.info(f"Selected {len(shotlist)} shots out of {num_shots} requested")
+    save_file = f"cmod_{len(shotlist)}_raw.nc"
+    save_path = os.path.join(CMOD_RAW_DS_DIR, save_file)
+    os.makedirs(CMOD_RAW_DS_DIR, exist_ok=True)
+    if not os.path.exists(save_path):
+        loguru.logger.info(f"Creating new dataset at {save_path}")
+        ds = make_raw_dataset(shotlist)
+        ds.to_netcdf(save_path)
+    else:
+        loguru.logger.info(f"Dataset already exists at {save_path}, loading")
+        ds = xr.load_dataset(save_path)
+    print(ds)
