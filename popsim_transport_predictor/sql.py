@@ -7,17 +7,13 @@ from disruption_py.machine.tokamak import Tokamak
 from disruption_py.workflow import get_database
 from loguru import logger
 
-summary_table = "summary"
-
-ipmax = 100e3  # [A]
-pulse_length = 0.1  # [s]
-
 
 def summary(
-    ipmax: float = ipmax,
-    pulse_length: float = pulse_length,
-    min_shot: int = 1050204013,
-    max_shot: int = 1160930043,
+    summary_table: str,
+    ipmax: float,
+    pulse_length: float,
+    min_shot: int,
+    max_shot: int,
     shots: list[int] | bool = False,
 ) -> np.ndarray:
     """
