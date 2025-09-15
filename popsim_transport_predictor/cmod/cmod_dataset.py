@@ -45,7 +45,6 @@ MAX_SHOT = 1160930043
 def make_raw_dataset(shotlist: list[int]) -> xr.Dataset:
     retrieval_settings = RetrievalSettings(
         run_columns=CMOD_DATASET_SIGNALS,
-        efit_nickname_setting="default",
         time_setting="tmdb",
         only_requested_columns=True,
     )
