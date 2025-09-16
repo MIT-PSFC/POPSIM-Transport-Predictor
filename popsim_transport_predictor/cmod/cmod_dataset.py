@@ -76,7 +76,7 @@ def get_shotlist_from_sql(num_shots: int = None) -> list[int]:
 
 
 if __name__ == "__main__":
-    num_shots = 200
+    num_shots = None
     shotlist = get_shotlist_from_sql(num_shots)
     loguru.logger.info(f"Selected {len(shotlist)} shots out of {num_shots} requested")
     save_file = f"cmod_{len(shotlist)}_raw.nc"

@@ -10,14 +10,14 @@ repos:
         entry: jupyter nbconvert --ClearOutputPreprocessor.enabled=True --inplace
       - id: ruff_format
         name: ruff_format 
-        entry: poetry run ruff format
+        entry: uv run ruff format
         language: system
         types: [python]
         files: "^popsim_transport_predictor/"
         exclude: "^popsim_transport_predictor/tests/"
       - id: ruff_check
         name: ruff_check
-        entry: poetry run ruff check --fix
+        entry: uv run ruff check --fix
         language: system
         types: [python]
         files: "^popsim_transport_predictor/"
