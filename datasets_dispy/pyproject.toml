@@ -1,0 +1,10 @@
+[project]
+name = "datasets-dispy"
+description = "Workspace member for creating datasets for DIII-D and C-Mod with Disruption-Py"
+version = "0.1.0"
+dependencies = [
+    "disruption-py",
+]
+
+[tool.uv.sources]
+disruption-py = { path = "../submodules/disruption-py", editable = true }
