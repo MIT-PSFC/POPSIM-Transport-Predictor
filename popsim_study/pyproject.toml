@@ -1,0 +1,10 @@
+[project]
+name = "popsim-study"
+description = "Workspace member for POPSIM module definition and training/eval workflows"
+version = "0.1.0"
+dependencies = [
+    "popsim",
+]
+
+[tool.uv.sources]
+popsim = { path = "../submodules/popsim", editable = true }

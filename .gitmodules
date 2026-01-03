@@ -2,3 +2,7 @@
 	path = submodules/disruption-py
 	url = git@github.com:MIT-PSFC/disruption-py.git
 	branch = zk/popsim
+[submodule "submodules/popsim"]
+	path = submodules/popsim
+	url = git@github.com:cfs-energy-internal/POPSIM.git
+	branch = zk/trainer-nan
