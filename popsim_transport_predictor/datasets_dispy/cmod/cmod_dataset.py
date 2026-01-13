@@ -7,7 +7,7 @@ import loguru
 from disruption_py.machine.tokamak import Tokamak
 from disruption_py.settings import RetrievalSettings
 from disruption_py.workflow import get_shots_data
-from popsim_transport_predictor.sql import summary
+from popsim_transport_predictor.datasets_dispy.sql import summary
 
 CMOD_RAW_DS_DIR = "/usr/local/mfe/ml_data_dump/studies/transport_predictor/cmod"
 
@@ -32,7 +32,6 @@ CMOD_DATASET_SIGNALS = [
     "p_icrf",  # ICRF heating power
     "p_lh",  # Lower hybrid heating power (yes this is actually lower hybrid on C-Mod, NOT the LH transition threshold like on TCV)
     # Other
-    # TODO(ZanderKeith): Add gas valves when we get to that point
 ]
 
 SUMMARY_TABLE = "summary"
@@ -45,7 +44,7 @@ MAX_SHOT = 1160930043
 def make_raw_dataset(shotlist: list[int]) -> xr.Dataset:
     retrieval_settings = RetrievalSettings(
         run_columns=CMOD_DATASET_SIGNALS,
-        time_setting="tmdb",
+        time_setting="uniform_1kHz",
         only_requested_columns=True,
     )
 
@@ -60,7 +59,7 @@ def make_raw_dataset(shotlist: list[int]) -> xr.Dataset:
     return result
 
 
-def get_shotlist_from_sql(num_shots: int = None) -> list[int]:
+def get_shotlist_from_sql(num_shots: int = None, reversed: bool = False) -> list[int]:
     data = summary(
         summary_table=SUMMARY_TABLE,
         ipmax=IPMAX,
@@ -70,14 +69,16 @@ def get_shotlist_from_sql(num_shots: int = None) -> list[int]:
         shots=False,
     )
     shotlist = data[:, 0].astype(int).tolist()
+    if reversed:
+        shotlist = shotlist[::-1]
     if num_shots is not None:
         shotlist = shotlist[:num_shots]
     return shotlist
 
 
 if __name__ == "__main__":
-    num_shots = None
-    shotlist = get_shotlist_from_sql(num_shots)
+    num_shots = 2
+    shotlist = get_shotlist_from_sql(num_shots, reversed=True)
     loguru.logger.info(f"Selected {len(shotlist)} shots out of {num_shots} requested")
     save_file = f"cmod_{len(shotlist)}_raw.nc"
     save_path = os.path.join(CMOD_RAW_DS_DIR, save_file)
