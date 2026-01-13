@@ -5,6 +5,8 @@ description = ""
 readme = "README.md"
 dependencies = [
     "pre-commit>=4.3.0",
+    "disruption-py",
+    "popsim",
 ]
 
 [dependency-groups]
@@ -23,5 +25,9 @@ dev = [
 [tool.isort]
 profile = "black"
 
-[tool.uv.workspace]
-members = ["datasets_dispy", "popsim_study"]
+[tool.setuptools]
+packages = ["popsim_transport_predictor"]
+
+[tool.uv.sources]
+popsim = { path = "./submodules/popsim", editable = true }
+disruption-py = { path = "./submodules/disruption-py", editable = true }
