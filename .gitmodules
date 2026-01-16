@@ -6,3 +6,7 @@
 	path = submodules/popsim
 	url = git@github.com:cfs-energy-internal/POPSIM.git
 	branch = zk/trainer-nan
+[submodule "submodules/gptools"]
+	path = submodules/gptools
+	url = git@github.com:ZanderKeith/gptools.git
+	branch = zk/cmod-test
