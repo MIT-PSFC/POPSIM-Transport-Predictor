@@ -29,9 +29,6 @@ MIN_SHOT = 1050204013
 MAX_SHOT = 1160930043
 
 CMOD_DATASET_SIGNALS = [
-    # Profiles being predicted
-    "te_rho",  # Electron temperature profile [eV]
-    "ne_rho",  # Electron density profile [m^-3]
     # Global quantities
     "ip",  # Plasma current
     "btor",  # On-axis magnetic field

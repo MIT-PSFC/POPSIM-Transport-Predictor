@@ -10,8 +10,10 @@ from disruption_py.machine.tokamak import Tokamak
 from disruption_py.settings import RetrievalSettings
 from disruption_py.workflow import get_shots_data
 
+from popsim_transport_predictor.datasets_dispy import make_uniform_1khz_timebase
 from popsim_transport_predictor.datasets_dispy.cmod import (
     BLESSED_THOMSON_DAYS,
+    CMOD_DATASET_SIGNALS,
     IPMAX,
     MAX_SHOT,
     MIN_SHOT,
@@ -143,7 +145,7 @@ def make_profile_dataset(ds_thomson: xr.Dataset, gp_fit_rho: np.ndarray) -> xr.D
 
 def get_efit_dataset(shot: int) -> xr.Dataset:
     retrieval_settings = RetrievalSettings(
-        run_columns=["ip"],
+        run_columns=CMOD_DATASET_SIGNALS,
         time_setting="efit",
         only_requested_columns=True,
     )
@@ -154,13 +156,66 @@ def get_efit_dataset(shot: int) -> xr.Dataset:
         output_setting="dataset",
         num_processes=1,
     )
+    result = result.set_index(idx=["shot", "time"]).unstack("idx")
     return result
 
 
-def make_final_dataset() -> xr.Dataset:
+def make_final_dataset(
+    shotlist,
+    ds_thomson_dir,
+    ds_profile_dir,
+    ds_efit_dir,
+    ds_assembly_dir,
+) -> xr.Dataset:
     """
-    Combine profile and EFIT datasets onto a common timebase
+    Combine datasets together and align to uniform 1 kHz timebase
     """
+
+    for shot in shotlist:
+        ds_thomson_path = os.path.join(ds_thomson_dir, f"{shot}.nc")
+        ds_profiles_path = os.path.join(ds_profile_dir, f"{shot}.nc")
+        ds_efit_path = os.path.join(ds_efit_dir, f"{shot}.nc")
+        ds_assembly_path = os.path.join(ds_assembly_dir, f"{shot}.nc")
+
+        ds_thomson = xr.load_dataset(ds_thomson_path)
+        ds_profiles = xr.load_dataset(ds_profiles_path)
+        ds_efit = xr.load_dataset(ds_efit_path)
+
+        # Put each dataset on a 1 kHz timebase, using previous value fill
+        max_time = max(
+            ds_thomson["time"].max().item(),
+            ds_profiles["time"].max().item(),
+            ds_efit["time"].max().item(),
+        )
+        timebase = make_uniform_1khz_timebase(max_time)
+
+        ds_thomson = ds_thomson.interp(time=timebase, method="nearest")
+        ds_profiles = ds_profiles.interp(time=timebase, method="nearest")
+        ds_efit = ds_efit.interp(time=timebase, method="nearest")
+        ds_assembly = xr.merge([ds_thomson, ds_profiles, ds_efit], compat="override")
+
+        # Rename some variables for con
+        ds_assembly = ds_assembly.rename_vars(
+            {
+                "gp_fit_te": "te_rho",
+                "gp_fit_te_error": "te_rho_error",
+                "gp_fit_ne": "ne_rho",
+                "gp_fit_ne_error": "ne_rho_error",
+            }
+        )
+
+        ds_assembly.to_netcdf(ds_assembly_path)
+        loguru.logger.info(f"Saved assembled dataset to {ds_assembly_path}")
+
+    # Now put all shots together
+    ds_final = xr.concat(
+        [
+            xr.load_dataset(os.path.join(ds_assembly_dir, f"{shot}.nc"))
+            for shot in shotlist
+        ],
+        dim=xr.IndexVariable("shot", shotlist),
+    )
+    return ds_final
 
 
 def make_cmod_dataset(  # noqa: PLR0912
@@ -186,10 +241,12 @@ def make_cmod_dataset(  # noqa: PLR0912
     ds_thomson_dir = os.path.join(save_dir, "cmod_thomson_raw")
     ds_profile_dir = os.path.join(save_dir, "cmod_profiles_raw")
     ds_efit_dir = os.path.join(save_dir, "cmod_efit_raw")
+    ds_assembly_dir = os.path.join(save_dir, "cmod_assembly")
     for directory in [
         ds_thomson_dir,
         ds_profile_dir,
         ds_efit_dir,
+        ds_assembly_dir,
     ]:
         os.makedirs(directory, exist_ok=True)
 
@@ -204,6 +261,7 @@ def make_cmod_dataset(  # noqa: PLR0912
             ds_thomson_dir,
             ds_profile_dir,
             ds_efit_dir,
+            ds_assembly_dir,
         ]:
             for file in os.listdir(directory):
                 file_path = os.path.join(directory, file)
@@ -243,22 +301,20 @@ def make_cmod_dataset(  # noqa: PLR0912
             ds_profiles = make_profile_dataset(ds_thomson, gp_fit_rho)
             ds_profiles.to_netcdf(ds_profile_path)
             loguru.logger.info(f"Saved raw profile dataset to {ds_profile_path}")
-        else:
-            ds_profiles = xr.load_dataset(ds_profile_path)
-            loguru.logger.info(
-                f"Loaded existing profile dataset from {ds_profile_path}"
-            )
 
         ds_efit_path = os.path.join(ds_efit_dir, f"{shot}.nc")
         if not os.path.exists(ds_efit_path):
             ds_efit = get_efit_dataset(shot)
             ds_efit.to_netcdf(ds_efit_path)
             loguru.logger.info(f"Saved raw EFIT dataset to {ds_efit_path}")
-        else:
-            ds_efit = xr.load_dataset(ds_efit_path)
-            loguru.logger.info(f"Loaded existing EFIT dataset from {ds_efit_path}")
 
-    ds_final = make_final_dataset()
+    ds_final = make_final_dataset(
+        shotlist,
+        ds_thomson_dir,
+        ds_profile_dir,
+        ds_efit_dir,
+        ds_assembly_dir,
+    )
     ds_final.to_netcdf(ds_final_path)
     loguru.logger.info(f"Saved final CMOD dataset to {ds_final_path}")
 
