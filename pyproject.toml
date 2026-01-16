@@ -3,10 +3,12 @@ name = "popsim-transport-predictor"
 version = "0.1.0"
 description = ""
 readme = "README.md"
+requires-python = ">=3.12"
 dependencies = [
     "pre-commit>=4.3.0",
     "disruption-py",
     "popsim",
+    "fire>=0.7.1",
 ]
 
 [dependency-groups]
@@ -31,3 +33,13 @@ packages = ["popsim_transport_predictor"]
 [tool.uv.sources]
 popsim = { path = "./submodules/popsim", editable = true }
 disruption-py = { path = "./submodules/disruption-py", editable = true }
+
+[tool.hatch.build.targets.sdist]
+include = ["popsim_transport_predictor"]
+
+[tool.hatch.build.targets.wheel]
+include = ["popsim_transport_predictor"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
