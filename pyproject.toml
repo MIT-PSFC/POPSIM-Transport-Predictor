@@ -47,3 +47,41 @@ include = ["popsim_transport_predictor"]
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
+
+[tool.ruff]
+fix = true
+lint.select = [
+  "A", # avoid shadowing
+  "B", # flake8-bugbear
+  "C4", # comprehensions 
+  "E", # pycodestyle Errors
+  "ERA", # no commented out code
+  "F", # pyflakes
+  "FLY", # flynt
+  "I001", # isort
+  "ISC", # implicit string concatenation
+  "PERF", # Perflint
+  "PIE", # flake8-pie
+  "PGH", # pygrep-hooks
+  "PL", # pylint
+  "Q", # flake8-quotes
+  "RUF", # ruff builtins e.g. noqa checking
+  "T10", # flake8-debugger (no breakpoint etc)
+  "TCH",# type-checking imports
+  "UP", # pyupgrade
+  "W", # pycodestyle warnings
+  ]
+
+lint.ignore = [
+  "E501", # Never enforce line length violations, we have black for that.
+  "PLR0913", #ignore limit on number of args
+  "PLR2004", #ignore magic values warning, at least for now
+  "C408", # use {} instead of dict(), but we use dict heavily, for now leave it
+  "F722", # Incompatible with jaxtyping
+  "E402", # False alarms on autoreload magic in Jupyter Notebooks.
+  "PLC0415", # It is helpful to do function level imports for optional deps.
+]
+
+lint.pyupgrade.keep-runtime-typing=true
+lint.pydocstyle.convention = "google"
+
