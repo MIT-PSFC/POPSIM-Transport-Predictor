@@ -1,11 +1,9 @@
-"""
-Module for SQL queries. Snagged from https://github.com/MIT-PSFC/disruption-efit/blob/main/disruption_efit/sql.py
-"""
-
 import numpy as np
+
+from loguru import logger
+
 from disruption_py.machine.tokamak import Tokamak
 from disruption_py.workflow import get_database
-from loguru import logger
 
 
 def summary(
@@ -17,6 +15,7 @@ def summary(
     shots: list[int] | bool = False,
 ) -> np.ndarray:
     """
+    Snagged from https://github.com/MIT-PSFC/disruption-efit/blob/main/disruption_efit/sql.py
     Perform a SELECT query on the `summary` table to find shots
     with high enough current and long enough pulse length.
     Optionally select shots from a given list.

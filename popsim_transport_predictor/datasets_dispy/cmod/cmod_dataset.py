@@ -1,98 +1,26 @@
 """Makes the 'raw' CMOD dataset on mfews, to be processed later by POPSIM"""
 
 import os
-import numpy as np
 import xarray as xr
 import loguru
+import fire
 
 from disruption_py.machine.tokamak import Tokamak
-from disruption_py.settings import RetrievalSettings, TimeSetting, TimeSettingParams
+from disruption_py.settings import RetrievalSettings
 from disruption_py.workflow import get_shots_data
-from popsim_transport_predictor.datasets_dispy.sql import summary
 
-CMOD_RAW_DS_DIR = "/usr/local/mfe/ml_data_dump/studies/transport_predictor/cmod"
-
-CMOD_DATASET_SIGNALS = [
-    # Profiles being predicted
-    "te_rho",  # Electron temperature profile [eV]
-    "ne_rho",  # Electron density profile [m^-3]
-    # Global quantities
-    "ip",  # Plasma current
-    "btor",  # On-axis magnetic field
-    "wmhd",  # Total stored energy (TODO(ZanderKeith): I don't think C-Mod has a consistent fast particle measurement, so this is all we've got)
-    "beta_p",  # Plasma beta
-    "n_e",  # Line average electron density [m^-3]
-    "a_minor",  # Plasma minor radius
-    "kappa",  # Plasma elongation
-    "tritop",  # Top triangularity
-    "tribot",  # Bottom triangularity
-    "rmagx",  # Major radius [m]
-    # Power sources and sinks
-    "p_oh",  # Ohmic heating power
-    "p_rad",  # Bulk radiated heating power
-    "p_icrf",  # ICRF heating power
-    "p_lh",  # Lower hybrid heating power (yes this is actually lower hybrid on C-Mod, NOT the LH transition threshold like on TCV)
-    # Other
-]
-
-SUMMARY_TABLE = "summary"
-IPMAX = 100e3  # [A]
-PULSE_LENGTH = 0.1  # [s]
-MIN_SHOT = 1050204013
-MAX_SHOT = 1160930043
+from popsim_transport_predictor.datasets_dispy.dispy_utils import summary
+from popsim_transport_predictor.datasets_dispy.cmod import (
+    SUMMARY_TABLE,
+    IPMAX,
+    PULSE_LENGTH,
+    MIN_SHOT,
+    MAX_SHOT,
+    BLESSED_THOMSON_DAYS,
+)
 
 
-class Uniform1kHzTimeSetting(TimeSetting):
-    """
-    Time setting for creating a uniform timebase at 1 kHz, based on the maximum EFIT time.
-    """
-
-    def _get_times(self, params: TimeSettingParams) -> np.ndarray:
-        """
-        Parameters
-        ----------
-        params : TimeSettingParams
-            Parameters needed to retrieve the timebase.
-
-        Returns
-        -------
-        np.ndarray
-            Array of times in the timebase.
-        """
-        (efit_time,) = params.mds_conn.get_dims(
-            r"\efit_aeqdsk:ali", tree_name="_efit_tree"
-        )
-
-        max_time = np.max(efit_time)
-        if params.tokamak == Tokamak.CMOD:
-            times = np.round(np.arange(0, max_time + 1e-3, 1e-3), 3)
-        if params.tokamak == Tokamak.D3D:
-            times = np.round(np.arange(0, max_time + 1, 1), 0)
-            times = times * 1e-3  # Convert to seconds
-
-        times = np.unique(times).astype("float32")
-        return times
-
-
-def make_raw_dataset(shotlist: list[int]) -> xr.Dataset:
-    retrieval_settings = RetrievalSettings(
-        run_columns=["ip"],
-        time_setting=Uniform1kHzTimeSetting(),
-        only_requested_columns=True,
-    )
-
-    result = get_shots_data(
-        tokamak=Tokamak.CMOD,
-        shotlist_setting=shotlist,
-        retrieval_settings=retrieval_settings,
-        output_setting="dataset",
-        num_processes=6,
-    )
-
-    return result
-
-
-def get_shotlist_from_sql(num_shots: int = None, reversed: bool = False) -> list[int]:
+def get_shotlist_from_sql(num_shots: int = None) -> list[int]:
     data = summary(
         summary_table=SUMMARY_TABLE,
         ipmax=IPMAX,
@@ -102,25 +30,127 @@ def get_shotlist_from_sql(num_shots: int = None, reversed: bool = False) -> list
         shots=False,
     )
     shotlist = data[:, 0].astype(int).tolist()
-    if reversed:
-        shotlist = shotlist[::-1]
+
+    # Filter to blessed Thomson days
+    shotlist = [shot for shot in shotlist if int(shot / 1000) in BLESSED_THOMSON_DAYS]
+
     if num_shots is not None:
         shotlist = shotlist[:num_shots]
     return shotlist
 
 
-if __name__ == "__main__":
-    num_shots = 2
-    shotlist = get_shotlist_from_sql(num_shots, reversed=True)
-    loguru.logger.info(f"Selected {len(shotlist)} shots out of {num_shots} requested")
-    save_file = f"cmod_{len(shotlist)}_raw.nc"
-    save_path = os.path.join(CMOD_RAW_DS_DIR, save_file)
-    os.makedirs(CMOD_RAW_DS_DIR, exist_ok=True)
-    if not os.path.exists(save_path):
-        loguru.logger.info(f"Creating new dataset at {save_path}")
-        ds = make_raw_dataset(shotlist)
-        ds.to_netcdf(save_path)
+def get_thomson_dataset(shotlist: list[int]) -> xr.Dataset:
+    retrieval_settings = RetrievalSettings(
+        run_methods=["get_thomson_channels"],
+        only_requested_columns=False,
+    )
+    result = get_shots_data(
+        tokamak=Tokamak.CMOD,
+        shotlist_setting=shotlist,
+        retrieval_settings=retrieval_settings,
+        output_setting="dataset",
+        num_processes=6,
+    )
+    return result
+
+
+def make_profile_dataset(ds_thomson: xr.Dataset) -> xr.Dataset:
+    """
+    Perform fitting with GPtools
+    """
+    return xr.Dataset()  # TODO(ZanderKeith)
+
+
+def get_efit_dataset(shotlist: list[int]) -> xr.Dataset:
+    retrieval_settings = RetrievalSettings(
+        run_columns=["ip"],
+        time_setting="efit",
+        only_requested_columns=True,
+    )
+    result = get_shots_data(
+        tokamak=Tokamak.CMOD,
+        shotlist_setting=shotlist,
+        retrieval_settings=retrieval_settings,
+        output_setting="dataset",
+        num_processes=6,
+    )
+    return result
+
+
+def make_final_dataset(
+    ds_profiles: xr.Dataset,
+    ds_efit: xr.Dataset,
+) -> xr.Dataset:
+    """
+    Combine profile and EFIT datasets onto a common timebase
+    """
+    ds_final = ds_profiles.set_index(idx=["shot", "time"]).unstack("idx")
+    return ds_final  # TODO(ZanderKeith)
+
+
+def make_cmod_dataset(save_path: str, num_shots: int, clean: bool = False):
+    """
+    Makee the source CMOD dataset for POPSIM transport predictor study.
+
+    Workflow is as follows:
+    1) Get shotlist from SQL summary table
+    2) Filter to shots that have blessed Thomson scattering data
+    3) Retrieve the raw TS data on its native timebase
+    4) Filter to shots that have both core and edge TS data
+    5) Retrieve EFIT and other 1D signals on the EFIT timebase
+    6) Put TS data and EFIT data together on a uniform 1kHz timebase
+    """
+
+    os.makedirs(save_path, exist_ok=True)
+    ds_final_path = os.path.join(save_path, "cmod_source.nc")
+    ds_thomson_path = os.path.join(save_path, "cmod_thomson_raw.nc")
+    ds_profile_path = os.path.join(save_path, "cmod_profiles_raw.nc")
+    ds_efit_path = os.path.join(save_path, "cmod_efit_raw.nc")
+
+    if clean:
+        for path in [
+            ds_final_path,
+            ds_thomson_path,
+            ds_profile_path,
+            ds_efit_path,
+        ]:
+            if os.path.exists(path):
+                os.remove(path)
+                loguru.logger.info(f"Removed existing file {path}")
+
+    if os.path.exists(ds_final_path):
+        loguru.logger.info(
+            f"Final dataset already exists at {ds_final_path}, skipping creation"
+        )
+        return
+
+    shotlist = get_shotlist_from_sql(num_shots=num_shots)
+    loguru.logger.info(f"Retrieved shotlist of {len(shotlist)} shots from SQL")
+
+    if not os.path.exists(ds_thomson_path):
+        ds_thomson = get_thomson_dataset(shotlist)
+        ds_thomson.to_netcdf(ds_thomson_path)
+        loguru.logger.info(f"Saved raw Thomson dataset to {ds_thomson_path}")
     else:
-        loguru.logger.info(f"Dataset already exists at {save_path}, loading")
-        ds = xr.load_dataset(save_path)
-    print(ds)
+        ds_thomson = xr.load_dataset(ds_thomson_path)
+        loguru.logger.info(f"Loaded existing Thomson dataset from {ds_thomson_path}")
+
+    if not os.path.exists(ds_profile_path):
+        ds_profiles = make_profile_dataset(ds_thomson)
+        ds_profiles.to_netcdf(ds_profile_path)
+        loguru.logger.info(f"Saved raw profile dataset to {ds_profile_path}")
+    else:
+        ds_profiles = xr.load_dataset(ds_profile_path)
+        loguru.logger.info(f"Loaded existing profile dataset from {ds_profile_path}")
+
+    if not os.path.exists(ds_efit_path):
+        ds_efit = get_efit_dataset(shotlist)
+        ds_efit.to_netcdf(ds_efit_path)
+        loguru.logger.info(f"Saved raw EFIT dataset to {ds_efit_path}")
+    else:
+        ds_efit = xr.load_dataset(ds_efit_path)
+        loguru.logger.info(f"Loaded existing EFIT dataset from {ds_efit_path}")
+
+
+if __name__ == "__main__":
+    fire.Fire(make_cmod_dataset)
