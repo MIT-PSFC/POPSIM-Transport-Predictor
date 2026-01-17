@@ -438,7 +438,6 @@ def run_study(
     logger.info("DATA VISUALIZATION")
 
     DataVisualization.performance_extrapolation(
-        working_dir=working_dir,
         figure_dir=figure_dir,
     )
 

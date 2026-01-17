@@ -15,9 +15,12 @@ def add_performance(
 ) -> xr.Dataset:
     """
     Add performance metric to dataset
-    We are saying performance is (Wtot_MJ^2 + Ip_MA^2)**0.5 for now
+    We are saying performance is 75th percentile of (Wtot_MJ^2 + Ip_MA^2)**0.5 along a shot
+    Ignoring nans in the calculation
     """
-    ds["performance"] = (ds["Wtot_MJ"] ** 2 + ds["Ip_MA"] ** 2) ** 0.5
+    ds["performance"] = ds.eval("(Wtot_MJ**2 + Ip_MA**2)**0.5").quantile(
+        0.75, dim="time_idx", skipna=True
+    )
     return ds
 
 
@@ -29,43 +32,44 @@ def get_train_val_test_datasets(
     """
 
     if training_data_case in ["cmod", "tcv", "d3d_lp"]:
-        ds, episode_coord = get_ds(
-            config[f"{training_data_case}_dataset_path"], debug=config["debug"]
-        )
+        if training_data_case == "cmod":
+            ds_path = config.cmod_dataset_path
+        elif training_data_case == "tcv":
+            ds_path = config.tcv_dataset_path
+        elif training_data_case == "d3d_lp":
+            ds_path = config.d3d_lp_dataset_path
+
+        ds, episode_coord = get_ds(ds_path)
         ds = add_performance(ds)
         train_ds, val_ds, test_ds = split_dataset_by_fracs(
             ds,
             fracs=TRAIN_VAL_TEST_SPLIT,
             dim=episode_coord,
-            seed=config["dataloader_prng_seed"],
+            seed=42,
             sortby="performance",
         )
 
     else:
-        ds_cmod, episode_coord = get_ds(
-            config["cmod_dataset_path"], debug=config["debug"]
-        )
+        ds_cmod, episode_coord = get_ds(config.cmod_dataset_path)
         ds_cmod = add_performance(ds_cmod)
         train_ds_cmod, val_ds_cmod, test_ds_cmod = split_dataset_by_fracs(
             ds_cmod,
             fracs=TRAIN_VAL_TEST_SPLIT,
             dim=episode_coord,
-            seed=config["dataloader_prng_seed"],
+            seed=42,
             sortby="performance",
         )
         train_ds_cmod = train_ds_cmod.assign_coords(ds_source="cmod")
         val_ds_cmod = val_ds_cmod.assign_coords(ds_source="cmod")
         test_ds_cmod = test_ds_cmod.assign_coords(ds_source="cmod")
 
-        ds_tcv, episode_coord = get_ds(
-            config["tcv_dataset_path"], debug=config["debug"]
-        )
+        ds_tcv, episode_coord = get_ds(config.tcv_dataset_path)
         ds_tcv = add_performance(ds_tcv)
         train_ds_tcv, val_ds_tcv, test_ds_tcv = split_dataset_by_fracs(
             ds_tcv,
             fracs=TRAIN_VAL_TEST_SPLIT,
             dim=episode_coord,
-            seed=config["dataloader_prng_seed"],
+            seed=42,
             sortby="performance",
         )
         train_ds_tcv = train_ds_tcv.assign_coords(ds_source="tcv")
@@ -78,15 +82,13 @@ def get_train_val_test_datasets(
             test_ds = xr.concat([test_ds_cmod, test_ds_tcv], dim=episode_coord)
 
         elif training_data_case == "cmod_tcv_d3d_lp":
-            ds_d3d_lp, episode_coord = get_ds(
-                config["d3d_lp_dataset_path"], debug=config["debug"]
-            )
+            ds_d3d_lp, episode_coord = get_ds(config.d3d_lp_dataset_path)
             ds_d3d_lp = add_performance(ds_d3d_lp)
             train_ds_d3d_lp, val_ds_d3d_lp, test_ds_d3d_lp = split_dataset_by_fracs(
                 ds_d3d_lp,
                 fracs=TRAIN_VAL_TEST_SPLIT,
                 dim=episode_coord,
-                seed=config["dataloader_prng_seed"],
+                seed=42,
                 sortby="performance",
             )
             train_ds_d3d_lp = train_ds_d3d_lp.assign_coords(ds_source="d3d_lp")
@@ -120,7 +122,7 @@ def get_train_test_datasets_transfer(
 
     # Load the high-performance dataset and split into train/test
     # No validation needed because we are not tuning hyperparameters on transfer learning data
-    ds_hp, episode_coord = get_ds(config.d3d_hp_dataset_path, debug=config["debug"])
+    ds_hp, episode_coord = get_ds(config.d3d_hp_dataset_path)
     ds_hp = add_performance(ds_hp)
     ds_hp = ds_hp.assign_coords(ds_source="d3d_hp")
     sorted_shots = np.argsort(ds_hp[episode_coord].values)
