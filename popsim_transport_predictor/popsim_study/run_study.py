@@ -14,6 +14,7 @@ from popsim_transport_predictor.popsim_study.orchestration import (
     TRAINING_DATA_CASES,
 )
 from popsim_transport_predictor.popsim_study.orchestration.organize_data import (
+    get_train_test_datasets_transfer,
     get_train_val_test_datasets,
 )
 
@@ -52,12 +53,9 @@ class DataVisualization:
             if not os.path.exists(fig_path):
                 train_ds, val_ds, test_ds = get_train_val_test_datasets(
                     training_data_case="cmod",
-                    transfer_learning=False,
                 )
                 performance_extrapolation_plot(
-                    save_path=os.path.join(
-                        save_dir, "cmod_performance_extrapolation.png"
-                    ),
+                    save_path=fig_path,
                     ds_list=[train_ds, val_ds, test_ds],
                     labels=["Train", "Validation", "Test"],
                     performance_metric="performance",
@@ -76,9 +74,7 @@ class DataVisualization:
                     transfer_learning=False,
                 )
                 performance_extrapolation_plot(
-                    save_path=os.path.join(
-                        save_dir, "tcv_performance_extrapolation.png"
-                    ),
+                    save_path=fig_path,
                     ds_list=[train_ds, val_ds, test_ds],
                     labels=["Train", "Validation", "Test"],
                     performance_metric="performance",
@@ -88,17 +84,15 @@ class DataVisualization:
         else:
             logger.warning("TCV dataset path not provided, skipping TCV figures.")
 
+        # C-Mod + TCV
         if config.tcv_dataset_path and config.cmod_dataset_path:
             fig_path = os.path.join(save_dir, "cmod_tcv_performance_extrapolation.png")
             if not os.path.exists(fig_path):
                 train_ds, val_ds, test_ds = get_train_val_test_datasets(
                     training_data_case="cmod_tcv",
-                    transfer_learning=False,
                 )
                 performance_extrapolation_plot(
-                    save_path=os.path.join(
-                        save_dir, "cmod_tcv_performance_extrapolation.png"
-                    ),
+                    save_path=fig_path,
                     ds_list=[train_ds, val_ds, test_ds],
                     labels=["Train", "Validation", "Test"],
                     performance_metric="performance",
@@ -116,12 +110,9 @@ class DataVisualization:
             if not os.path.exists(fig_path):
                 train_ds, val_ds, test_ds = get_train_val_test_datasets(
                     training_data_case="d3d_lp",
-                    transfer_learning=False,
                 )
                 performance_extrapolation_plot(
-                    save_path=os.path.join(
-                        save_dir, "d3d_lp_performance_extrapolation.png"
-                    ),
+                    save_path=fig_path,
                     ds_list=[train_ds, val_ds, test_ds],
                     labels=["Train", "Validation", "Test"],
                     performance_metric="performance",
@@ -133,6 +124,7 @@ class DataVisualization:
                 "DIII-D low-performance dataset path not provided, skipping DIII-D low-performance figures."
             )
 
+        # C-Mod + TCV + DIII-D low-performance
         if (
             config.cmod_dataset_path
             and config.tcv_dataset_path
@@ -147,9 +139,7 @@ class DataVisualization:
                     transfer_learning=False,
                 )
                 performance_extrapolation_plot(
-                    save_path=os.path.join(
-                        save_dir, "cmod_tcv_d3d_lp_performance_extrapolation.png"
-                    ),
+                    save_path=fig_path,
                     ds_list=[train_ds, val_ds, test_ds],
                     labels=["Train", "Validation", "Test"],
                     performance_metric="performance",
@@ -161,13 +151,46 @@ class DataVisualization:
                 "C-Mod, TCV, or DIII-D low-performance dataset path not provided, skipping combined C-Mod + TCV + DIII-D low-performance figures."
             )
 
+        # DIII-D performance overlap
         if config.d3d_hp_dataset_path and config.d3d_lp_dataset_path:
             fig_path = os.path.join(save_dir, "d3d_performance_overlap.png")
+            if not os.path.exists(fig_path):
+                train_ds, test_ds = get_train_test_datasets_transfer(
+                    training_data_case="d3d_lp",
+                    num_hp_shots=max(HP_SHOTS_INCLUDED),
+                )
+                performance_extrapolation_plot(
+                    save_path=fig_path,
+                    ds_list=[train_ds, test_ds],
+                    labels=["Training Data", "High-Performance Test Data"],
+                    performance_metric="performance",
+                    x_var="Ip_MA",
+                    y_var="Wtot_MJ",
+                )
 
-        else:
-            logger.warning(
-                "DIII-D high-performance or low-performance dataset path not provided, skipping DIII-D performance overlap figure."
+        # DIII-D high-performance in context of all training data
+        if (
+            config.d3d_hp_dataset_path
+            and config.cmod_dataset_path
+            and config.tcv_dataset_path
+            and config.d3d_lp_dataset_path
+        ):
+            fig_path = os.path.join(
+                save_dir, "d3d_hp_in_context_performance_extrapolation.png"
             )
+            if not os.path.exists(fig_path):
+                train_ds, test_ds = get_train_test_datasets_transfer(
+                    training_data_case="cmod_tcv_d3d_lp",
+                    num_hp_shots=max(HP_SHOTS_INCLUDED),
+                )
+                performance_extrapolation_plot(
+                    save_path=fig_path,
+                    ds_list=[train_ds, test_ds],
+                    labels=["Training Data", "High-Performance Test Data"],
+                    performance_metric="performance",
+                    x_var="Ip_MA",
+                    y_var="Wtot_MJ",
+                )
 
 
 class ComputeResults:
