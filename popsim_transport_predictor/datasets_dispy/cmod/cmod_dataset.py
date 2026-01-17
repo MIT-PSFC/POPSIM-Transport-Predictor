@@ -105,8 +105,8 @@ def make_profile_dataset(ds_thomson: xr.Dataset, gp_fit_rho: np.ndarray) -> xr.D
             data_y = np.where(data_y < 0.001, np.nan, data_y)
             err_y = np.where(err_y < 0.001, np.nan, err_y)
 
-            # I do not trust you can measure within 10 eV or within 1e18 m^-3
-            err_y = np.where(err_y < 0.01, 0.01, err_y)
+            # I do not trust you can measure within 20 eV or within 2e18 m^-3
+            err_y = np.where(err_y < 0.02, 0.02, err_y)
 
             for i_time, _ in enumerate(times):
                 y_star, std_y_star, _, _ = gp_profile(
