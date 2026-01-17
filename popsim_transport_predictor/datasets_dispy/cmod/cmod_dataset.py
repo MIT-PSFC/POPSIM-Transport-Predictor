@@ -4,6 +4,7 @@ import os
 
 import fire
 import loguru
+import netCDF4  # noqa: F401
 import numpy as np
 import xarray as xr
 from disruption_py.machine.tokamak import Tokamak
@@ -52,7 +53,6 @@ def get_thomson_dataset(shot) -> xr.Dataset:
         tokamak=Tokamak.CMOD,
         shotlist_setting=[shot],
         retrieval_settings=retrieval_settings,
-        output_setting="dataset",
         num_processes=1,
     )
     result = result.set_index(idx=["shot", "time"]).unstack("idx")
@@ -79,8 +79,9 @@ def make_profile_dataset(ds_thomson: xr.Dataset, gp_fit_rho: np.ndarray) -> xr.D
 
     for shot in ds_thomson["shot"].values:
         ds_shot = ds_thomson.where(ds_thomson["shot"] == shot, drop=True)
+        ds_shot = ds_shot.squeeze(dim="shot", drop=True)
         times = ds_shot["time"].values
-        data_x = ds_shot["ts_channel_rho"].values
+        data_x = ds_shot["ts_channel_rho"].values.T  # shape (time, channel)
 
         te_data = np.full((len(times), len(gp_fit_rho)), np.nan)
         te_err = np.full((len(times), len(gp_fit_rho)), np.nan)
@@ -88,8 +89,10 @@ def make_profile_dataset(ds_thomson: xr.Dataset, gp_fit_rho: np.ndarray) -> xr.D
         ne_err = np.full((len(times), len(gp_fit_rho)), np.nan)
 
         for variable in ["te", "ne"]:
-            data_y = ds_shot[f"ts_channel_{variable}"].values
-            err_y = ds_shot[f"ts_channel_{variable}_error"].values
+            data_y = ds_shot[f"ts_channel_{variable}"].values.T  # shape (time, channel)
+            err_y = ds_shot[
+                f"ts_channel_{variable}_error"
+            ].values.T  # shape (time, channel)
 
             if variable == "ne":
                 data_y = data_y * 1e-20  # Convert to [1e20 m^-3]
@@ -153,7 +156,6 @@ def get_efit_dataset(shot: int) -> xr.Dataset:
         tokamak=Tokamak.CMOD,
         shotlist_setting=shot,
         retrieval_settings=retrieval_settings,
-        output_setting="dataset",
         num_processes=1,
     )
     result = result.set_index(idx=["shot", "time"]).unstack("idx")
@@ -189,9 +191,11 @@ def make_final_dataset(
         )
         timebase = make_uniform_1khz_timebase(max_time)
 
-        ds_thomson = ds_thomson.interp(time=timebase, method="nearest")
-        ds_profiles = ds_profiles.interp(time=timebase, method="nearest")
-        ds_efit = ds_efit.interp(time=timebase, method="nearest")
+        ds_thomson = ds_thomson.reindex(time=timebase, method="ffill")
+        ds_profiles = ds_profiles.reindex(time=timebase, method="ffill")
+        ds_efit = ds_efit.interp(
+            time=timebase, method="nearest"
+        )  # This should be okay since EFIT is already at high time resolution
         ds_assembly = xr.merge([ds_thomson, ds_profiles, ds_efit], compat="override")
 
         # Rename some variables for con
@@ -292,9 +296,9 @@ def make_cmod_dataset(  # noqa: PLR0912
         ds_profile_path = os.path.join(ds_profile_dir, f"{shot}.nc")
         if not os.path.exists(ds_profile_path):
             if debug:
-                # Only pick time within the range (0.2, 0.24) seconds for faster testing
+                # Only pick time within the range (0.2, 0.4) seconds for faster testing
                 ds_thomson = ds_thomson.where(
-                    (ds_thomson["time"] >= 0.2) & (ds_thomson["time"] <= 0.24),
+                    (ds_thomson["time"] >= 0.2) & (ds_thomson["time"] <= 0.4),
                     drop=True,
                 )
             gp_fit_rho = np.linspace(0, 1.1, 56)
