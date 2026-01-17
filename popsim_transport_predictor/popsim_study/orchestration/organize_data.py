@@ -1,9 +1,13 @@
+import numpy as np
 import xarray as xr
 from popsim.ml.split_utils import split_dataset_by_fracs
 from popsim.modules.transport_predictor.data import get_ds
 
 from popsim_transport_predictor.popsim_study.config import config
-from popsim_transport_predictor.popsim_study.orchestration import TRAIN_VAL_TEST_SPLIT
+from popsim_transport_predictor.popsim_study.orchestration import (
+    HP_SHOTS_INCLUDED,
+    TRAIN_VAL_TEST_SPLIT,
+)
 
 
 def add_performance(
@@ -17,7 +21,7 @@ def add_performance(
     return ds
 
 
-def get_train_val_test_datasets_standard(
+def get_train_val_test_datasets(
     training_data_case: str,
 ):
     """
@@ -105,7 +109,7 @@ def get_train_val_test_datasets_standard(
     return train_ds, val_ds, test_ds
 
 
-def get_train_val_test_datasets_transfer(
+def get_train_test_datasets_transfer(
     training_data_case: str,
     num_hp_shots: int,
 ):
@@ -113,3 +117,35 @@ def get_train_val_test_datasets_transfer(
     Split dataset into training, validation, and test sets for transfer learning case.
     The number of high-performance shots included in training is specified by `num_hp_shots`.
     """
+
+    # Load the high-performance dataset and split into train/test
+    # No validation needed because we are not tuning hyperparameters on transfer learning data
+    ds_hp, episode_coord = get_ds(config.d3d_hp_dataset_path, debug=config["debug"])
+    ds_hp = add_performance(ds_hp)
+    ds_hp = ds_hp.assign_coords(ds_source="d3d_hp")
+    sorted_shots = np.argsort(ds_hp[episode_coord].values)
+
+    max_train_size = len(HP_SHOTS_INCLUDED)
+    if num_hp_shots > max_train_size:
+        raise ValueError(
+            f"num_hp_shots {num_hp_shots} exceeds maximum available {max_train_size}"
+        )
+
+    train_shot_pool = sorted_shots[:max_train_size]
+    test_shot_pool = sorted_shots[max_train_size:]
+
+    test_ds = ds_hp.isel({episode_coord: test_shot_pool})
+    train_ds_hp = ds_hp.isel({episode_coord: train_shot_pool[:num_hp_shots]})
+
+    if training_data_case == "exnihilo":
+        train_ds = train_ds_hp
+    else:
+        # Load historic data and put it all in the training set
+        train_ds_hist, val_ds_hist, test_ds_hist = get_train_val_test_datasets(
+            training_data_case
+        )
+        train_ds = xr.concat(
+            [train_ds_hist, val_ds_hist, test_ds_hist, train_ds_hp], dim=episode_coord
+        )
+
+    return train_ds, test_ds
