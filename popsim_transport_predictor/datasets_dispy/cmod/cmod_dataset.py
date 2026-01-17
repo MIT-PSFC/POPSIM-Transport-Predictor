@@ -44,7 +44,7 @@ def get_shotlist_from_sql(num_shots: int | None) -> list[int]:
     return shotlist
 
 
-def get_thomson_dataset(shot) -> xr.Dataset:
+def get_thomson_dataset(shot) -> xr.Dataset | None:
     retrieval_settings = RetrievalSettings(
         run_methods=["get_thomson_channels"],
         only_requested_columns=False,
@@ -55,6 +55,9 @@ def get_thomson_dataset(shot) -> xr.Dataset:
         retrieval_settings=retrieval_settings,
         num_processes=1,
     )
+    # If result is empty, return None
+    if len(result) == 0:
+        return None
     result = result.set_index(idx=["shot", "time"]).unstack("idx")
     return result
 
@@ -281,10 +284,18 @@ def make_cmod_dataset(  # noqa: PLR0912
     shotlist = get_shotlist_from_sql(num_shots=num_shots)
     loguru.logger.info(f"Retrieved shotlist of {len(shotlist)} shots from SQL")
 
+    valid_shotlist = shotlist.copy()
+
     for shot in shotlist:
         ds_thomson_path = os.path.join(ds_thomson_dir, f"{shot}.nc")
         if not os.path.exists(ds_thomson_path):
             ds_thomson = get_thomson_dataset(shot)
+            if ds_thomson is None:
+                loguru.logger.warning(
+                    f"Skipping shot {shot} since no Thomson data was retrieved"
+                )
+                valid_shotlist.remove(shot)
+                continue
             ds_thomson.to_netcdf(ds_thomson_path)
             loguru.logger.info(f"Saved raw Thomson dataset to {ds_thomson_path}")
         else:
@@ -313,7 +324,7 @@ def make_cmod_dataset(  # noqa: PLR0912
             loguru.logger.info(f"Saved raw EFIT dataset to {ds_efit_path}")
 
     ds_final = make_final_dataset(
-        shotlist,
+        valid_shotlist,
         ds_thomson_dir,
         ds_profile_dir,
         ds_efit_dir,
