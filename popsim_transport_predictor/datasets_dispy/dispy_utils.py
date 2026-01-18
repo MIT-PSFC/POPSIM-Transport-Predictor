@@ -1,9 +1,7 @@
 import numpy as np
-
-from loguru import logger
-
 from disruption_py.machine.tokamak import Tokamak
 from disruption_py.workflow import get_database
+from loguru import logger
 
 
 def summary(

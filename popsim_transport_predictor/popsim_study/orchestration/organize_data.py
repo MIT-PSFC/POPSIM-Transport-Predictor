@@ -12,15 +12,56 @@ from popsim_transport_predictor.popsim_study.orchestration import (
 
 def add_performance(
     ds: xr.Dataset,
+    episode_coord: str,
 ) -> xr.Dataset:
     """
     Add performance metric to dataset
     We are saying performance is 75th percentile of (Wtot_MJ^2 + Ip_MA^2)**0.5 along a shot
     Ignoring nans in the calculation
+
+    Also stores the specific Ip_MA and Wtot_MJ values at the time point where the
+    performance metric reaches its 75th percentile for plotting in parameter space
     """
-    ds["performance"] = ds.eval("(Wtot_MJ**2 + Ip_MA**2)**0.5").quantile(
-        0.75, dim="time_idx", skipna=True
-    )
+    # Calculate performance at each time step (once for all shots)
+    perf_timeseries = ds.eval("(Wtot_MJ**2 + Ip_MA**2)**0.5")
+
+    # Get the 75th percentile value per shot
+    ds["performance"] = perf_timeseries.quantile(0.75, dim="time_idx", skipna=True)
+
+    n_shots = ds.dims[episode_coord]
+
+    # Initialize arrays for Ip_MA and Wtot_MJ at p75
+    ip_ma_p75 = np.full(n_shots, np.nan)
+    wtot_mj_p75 = np.full(n_shots, np.nan)
+
+    # For each shot, find the time index closest to 75th percentile
+    perf_ts_data = perf_timeseries.values  # shape: (n_shots, n_time)
+    p75_vals = ds["performance"].values  # shape: (n_shots,)
+    ip_ma_data = ds["Ip_MA"].values
+    wtot_mj_data = ds["Wtot_MJ"].values
+
+    for i in range(n_shots):
+        # Get performance timeseries for this shot
+        perf_shot = perf_ts_data[i]
+        p75_val = p75_vals[i]
+
+        # Find valid (non-NaN) indices
+        valid_mask = ~np.isnan(perf_shot)
+
+        if valid_mask.sum() > 0 and not np.isnan(p75_val):
+            # Find index where performance is closest to p75
+            abs_diff = np.abs(perf_shot - p75_val)
+            abs_diff[~valid_mask] = np.inf  # Ignore NaN positions
+            idx_p75 = np.argmin(abs_diff)
+
+            # Extract Ip_MA and Wtot_MJ at that time
+            ip_ma_p75[i] = ip_ma_data[i, idx_p75]
+            wtot_mj_p75[i] = wtot_mj_data[i, idx_p75]
+
+    # Add to dataset
+    ds["Ip_MA_p75"] = (episode_coord, ip_ma_p75)
+    ds["Wtot_MJ_p75"] = (episode_coord, wtot_mj_p75)
+
     return ds
 
 
@@ -40,7 +81,7 @@ def get_train_val_test_datasets(
             ds_path = config.d3d_lp_dataset_path
 
         ds, episode_coord = get_ds(ds_path)
-        ds = add_performance(ds)
+        ds = add_performance(ds, episode_coord)
         train_ds, val_ds, test_ds = split_dataset_by_fracs(
             ds,
             fracs=TRAIN_VAL_TEST_SPLIT,
@@ -48,6 +89,9 @@ def get_train_val_test_datasets(
             seed=42,
             sortby="performance",
         )
+        train_ds = train_ds.assign_coords(ds_source=training_data_case)
+        val_ds = val_ds.assign_coords(ds_source=training_data_case)
+        test_ds = test_ds.assign_coords(ds_source=training_data_case)
 
     else:
         ds_cmod, episode_coord = get_ds(config.cmod_dataset_path)
