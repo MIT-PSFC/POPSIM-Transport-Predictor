@@ -71,7 +71,6 @@ class DataVisualization:
             if not os.path.exists(fig_path):
                 train_ds, val_ds, test_ds = get_train_val_test_datasets(
                     training_data_case="tcv",
-                    transfer_learning=False,
                 )
                 performance_extrapolation_plot(
                     save_path=fig_path,
@@ -83,6 +82,8 @@ class DataVisualization:
                 )
         else:
             logger.warning("TCV dataset path not provided, skipping TCV figures.")
+
+        return
 
         # C-Mod + TCV
         if config.tcv_dataset_path and config.cmod_dataset_path:
@@ -136,7 +137,6 @@ class DataVisualization:
             if not os.path.exists(fig_path):
                 train_ds, val_ds, test_ds = get_train_val_test_datasets(
                     training_data_case="cmod_tcv_d3d_lp",
-                    transfer_learning=False,
                 )
                 performance_extrapolation_plot(
                     save_path=fig_path,
