@@ -1,13 +1,124 @@
 import numpy as np
 import xarray as xr
 from popsim.ml.split_utils import split_dataset_by_fracs
-from popsim.modules.transport_predictor.data import get_ds
 
 from popsim_transport_predictor.popsim_study.config import config
 from popsim_transport_predictor.popsim_study.orchestration import (
     HP_SHOTS_INCLUDED,
     TRAIN_VAL_TEST_SPLIT,
 )
+
+REQUIRED_SIGNALS = [
+    # Target profiles
+    "ne20_rho",
+    "Te_keV_rho",
+    # Inputs for transport predictor
+    "R0",
+    "B0",
+    "Ip_MA",
+    "a_minor",
+    "kappa",
+    "delta_top",
+    "delta_bottom",
+    # Inputs for other things
+    "ne20_line_avg",
+    "Wtot_MJ",
+]
+
+INPUT_POWER_SIGNALS = ["P_ECRH_MW", "P_NBI_MW", "P_ICRF_MW", "P_LH_MW"]
+
+# Key is original signal name, value is new name
+TCV_SIGNAL_REMAPPINGS = {
+    "RMAG": "R0",
+    "BZERO": "B0",
+    "I_P": "Ip",
+    "DELTA_TOP": "delta_top",
+    "DELTA_BOTTOM": "delta_bottom",
+    "KAPPA": "kappa",
+    "NBI": "P_NBI_MW",
+    "ECRH": "P_ECRH_MW",
+}
+
+
+def get_ds(
+    source_ds: str,
+    debug: bool | None = False,
+) -> tuple[xr.Dataset, str]:
+    """Load the dataset, and do some light processing to get it ready for training.
+
+    Args:
+        source_ds (str): Identifier for the source dataset.
+        debug (bool, optional): Whether to enable debug mode, reducing dataset size to at most 50 shots.
+
+    Returns:
+        tuple[xr.Dataset, str]: The processed dataset and the dimension along which to group the data
+    """
+    if source_ds == "cmod":
+        ds_path = config.cmod_dataset_path
+        ds = xr.open_dataset(ds_path)
+    elif source_ds == "tcv":
+        ds_path = config.tcv_dataset_path
+        ds = xr.open_dataset(ds_path)
+        # Rename TCV signals to match expected names
+        ds = ds.rename(TCV_SIGNAL_REMAPPINGS)
+        ds["Ip_MA"] = np.abs(ds["Ip"]) / 1e6  # Convert from A to MA
+        ds["ne20_rho"] = ds["Ne_rho"] * 1e-20  # Convert from m^-3 to 10^20 m^-3
+        ds["Te_keV_rho"] = ds["Te_rho"] / 1e3  # Convert from eV to keV
+        ds["P_oh_MW"] = ds["POHM"] / 1e6  # Convert from W to MW
+        ds["ne20_line_avg"] = ds["NEavg"] * 1e-20  # Convert from m^-3 to 10^20 m^-3
+        ds["Wtot_MJ"] = ds["Wtot"] / 1e6  # Convert from J to MJ
+        ds.drop_vars(
+            ["Ip", "Ne_rho", "Te_rho", "NEavg", "POHM", "Wtot"], errors="ignore"
+        )
+    elif source_ds in ["d3d_lp", "d3d_hp"]:
+        if source_ds == "d3d_lp":
+            ds_path = config.d3d_lp_dataset_path
+        else:
+            ds_path = config.d3d_hp_dataset_path
+        ds = xr.open_dataset(ds_path)
+    else:
+        raise ValueError(f"Unknown source dataset: {source_ds}")
+
+    if debug:
+        ds = ds.isel(shot=slice(0, 50))  # Limit to 50 shots
+
+    # Ensure all required signals are present
+    for signal in REQUIRED_SIGNALS:
+        if signal not in ds:
+            raise ValueError(
+                f"Required signal for transport predictor training {signal} not found in dataset."
+            )
+
+    # Calculate shape variables
+    ds["ne_shape"] = ds["ne20_rho"] / ds["ne20_rho"].integrate("rho")
+    ds["Te_shape"] = ds["Te_keV_rho"] / ds["Te_keV_rho"].integrate("rho")
+
+    # Additional signals and duplicates for slight renames between submodules
+    # This is for the individual submodule training to work, since when they're running on their own they expect these names.
+    for signal in INPUT_POWER_SIGNALS:
+        if signal not in ds:
+            ds[signal] = xr.zeros_like(ds["Ip_MA"])
+
+    ds["P_aux_MW"] = ds["P_NBI_MW"] + ds["P_ECRH_MW"] + ds["P_ICRF_MW"] + ds["P_LH_MW"]
+    ds["P_abs_MW"] = ds["P_oh_MW"] + ds["P_aux_MW"]
+    # Profile predictor
+    ds["Paux_MW"] = ds["P_aux_MW"]
+    ds["Ip"] = ds["Ip_MA"]
+    # Power balance
+    ds["delta"] = (ds["delta_top"] + ds["delta_bottom"]) / 2
+    ds["ne19_line_avg"] = ds["ne20_line_avg"] * 10
+    ds["epsilon"] = ds["a_minor"] / ds["R0"]
+
+    # TODO(ZanderKeith): Later when we have multiple density treatments this should be handled better
+    ds["ne20"] = ds["ne20_line_avg"]
+    ds["ne19"] = ds["ne19_line_avg"]
+
+    # If dataset was from a zarr store, must promote the 'time' data var to a coordinate
+    if "time" not in ds.coords:
+        ds = ds.set_coords("time")
+
+    # Dataset retains all signals, the dataloader will filter out the ones that are not needed.
+    return ds, "shot"
 
 
 def add_performance(
@@ -38,9 +149,12 @@ def add_performance(
     )
 
     # Get the 75th percentile value per shot
-    ds["performance"] = perf_timeseries.quantile(0.75, dim="time_idx", skipna=True)
+    if "time_idx" in ds.dims:
+        ds["performance"] = perf_timeseries.quantile(0.75, dim="time_idx", skipna=True)
+    else:
+        ds["performance"] = perf_timeseries.quantile(0.75, dim="time", skipna=True)
 
-    n_shots = ds.dims[episode_coord]
+    n_shots = ds.sizes[episode_coord]
 
     # Initialize arrays for Ip_MA and Wtot_MJ at p75
     ip_ma_p75 = np.full(n_shots, np.nan)
@@ -85,14 +199,7 @@ def get_train_val_test_datasets(
     """
 
     if training_data_case in ["cmod", "tcv", "d3d_lp"]:
-        if training_data_case == "cmod":
-            ds_path = config.cmod_dataset_path
-        elif training_data_case == "tcv":
-            ds_path = config.tcv_dataset_path
-        elif training_data_case == "d3d_lp":
-            ds_path = config.d3d_lp_dataset_path
-
-        ds, episode_coord = get_ds(ds_path)
+        ds, episode_coord = get_ds(training_data_case)
         ds = add_performance(ds, episode_coord)
         train_ds, val_ds, test_ds = split_dataset_by_fracs(
             ds,
@@ -106,8 +213,8 @@ def get_train_val_test_datasets(
         test_ds = test_ds.assign_coords(ds_source=training_data_case)
 
     else:
-        ds_cmod, episode_coord = get_ds(config.cmod_dataset_path)
-        ds_cmod = add_performance(ds_cmod)
+        ds_cmod, episode_coord = get_ds("cmod")
+        ds_cmod = add_performance(ds_cmod, episode_coord)
         train_ds_cmod, val_ds_cmod, test_ds_cmod = split_dataset_by_fracs(
             ds_cmod,
             fracs=TRAIN_VAL_TEST_SPLIT,
@@ -119,8 +226,8 @@ def get_train_val_test_datasets(
         val_ds_cmod = val_ds_cmod.assign_coords(ds_source="cmod")
         test_ds_cmod = test_ds_cmod.assign_coords(ds_source="cmod")
 
-        ds_tcv, episode_coord = get_ds(config.tcv_dataset_path)
-        ds_tcv = add_performance(ds_tcv)
+        ds_tcv, episode_coord = get_ds("tcv")
+        ds_tcv = add_performance(ds_tcv, episode_coord)
         train_ds_tcv, val_ds_tcv, test_ds_tcv = split_dataset_by_fracs(
             ds_tcv,
             fracs=TRAIN_VAL_TEST_SPLIT,
@@ -138,8 +245,8 @@ def get_train_val_test_datasets(
             test_ds = xr.concat([test_ds_cmod, test_ds_tcv], dim=episode_coord)
 
         elif training_data_case == "cmod_tcv_d3d_lp":
-            ds_d3d_lp, episode_coord = get_ds(config.d3d_lp_dataset_path)
-            ds_d3d_lp = add_performance(ds_d3d_lp)
+            ds_d3d_lp, episode_coord = get_ds("d3d_lp")
+            ds_d3d_lp = add_performance(ds_d3d_lp, episode_coord)
             train_ds_d3d_lp, val_ds_d3d_lp, test_ds_d3d_lp = split_dataset_by_fracs(
                 ds_d3d_lp,
                 fracs=TRAIN_VAL_TEST_SPLIT,
@@ -178,7 +285,7 @@ def get_train_test_datasets_transfer(
 
     # Load the high-performance dataset and split into train/test
     # No validation needed because we are not tuning hyperparameters on transfer learning data
-    ds_hp, episode_coord = get_ds(config.d3d_hp_dataset_path)
+    ds_hp, episode_coord = get_ds("d3d_hp")
     ds_hp = add_performance(ds_hp)
     ds_hp = ds_hp.assign_coords(ds_source="d3d_hp")
     sorted_shots = np.argsort(ds_hp[episode_coord].values)
