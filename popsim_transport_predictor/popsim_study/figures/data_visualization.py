@@ -3,7 +3,6 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 import numpy as np
 import xarray as xr
-from scipy.interpolate import griddata
 
 
 def performance_extrapolation_plot(  # noqa: PLR0915
@@ -91,13 +90,33 @@ def performance_extrapolation_plot(  # noqa: PLR0915
         np.linspace(x_min, x_max, 100), np.linspace(y_min, y_max, 100)
     )
 
-    # Interpolate dataset labels onto grid to show separation boundaries
-    grid_dataset = griddata(
-        (all_x, all_y),
-        all_dataset_labels,
-        (grid_x, grid_y),
-        method="nearest",  # Use nearest neighbor to preserve discrete labels
-    )
+    # Calculate scaling factors to match the performance metric calculation
+    max_x = all_x.max()
+    max_y = all_y.max()
+    x_scale = 1.0 / max_x if max_x != 0 else 1.0
+    y_scale = 1.0 / max_y if max_y != 0 else 1.0
+
+    # Calculate performance metric for each grid point using the same formula
+    # that was used to split the datasets (scaled circular distance)
+    grid_performance = np.sqrt((x_scale * grid_x) ** 2 + (y_scale * grid_y) ** 2)
+
+    # Find performance thresholds that separate the datasets
+    # These are the boundaries between datasets based on their performance values
+    performance_thresholds = []
+    for i in range(len(ds_list) - 1):
+        # Get max performance of dataset i and min performance of dataset i+1
+        mask_i = all_dataset_labels == i
+        mask_i_plus_1 = all_dataset_labels == i + 1
+        if mask_i.sum() > 0 and mask_i_plus_1.sum() > 0:
+            max_perf_i = all_performance[mask_i].max()
+            min_perf_i_plus_1 = all_performance[mask_i_plus_1].min()
+            threshold = (max_perf_i + min_perf_i_plus_1) / 2
+            performance_thresholds.append(threshold)
+
+    # Assign each grid point to a dataset based on performance
+    grid_dataset = np.zeros_like(grid_performance, dtype=int)
+    for i, threshold in enumerate(performance_thresholds):
+        grid_dataset[grid_performance > threshold] = i + 1
 
     # Shade regions by dataset with light colors
     n_datasets = len(ds_list)
@@ -127,15 +146,19 @@ def performance_extrapolation_plot(  # noqa: PLR0915
             linewidths=2,
         )
 
-        # Add dataset labels to legend using proxy artists
+        # Add dataset labels to legend using the same colors as the plot
         from matplotlib.patches import Patch
 
-        dataset_handles = [
-            Patch(
-                facecolor=dataset_cmap(i), alpha=0.3, edgecolor="gray", label=labels[i]
+        # Sample the colormap at the same points contourf uses
+        # contourf with n levels samples the colormap at (i+0.5)/n for i in range(n)
+        dataset_handles = []
+        for i in range(n_datasets):
+            # Sample colormap at the midpoint of each level
+            norm_value = (i + 0.5) / n_datasets
+            color = dataset_cmap(norm_value)
+            dataset_handles.append(
+                Patch(facecolor=color, alpha=0.3, edgecolor="gray", label=labels[i])
             )
-            for i in range(n_datasets)
-        ]
     else:
         dataset_handles = []
 

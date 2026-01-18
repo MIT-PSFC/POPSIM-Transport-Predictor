@@ -22,8 +22,20 @@ def add_performance(
     Also stores the specific Ip_MA and Wtot_MJ values at the time point where the
     performance metric reaches its 75th percentile for plotting in parameter space
     """
+    # TODO(ZanderKeith): I want the performance metric to be 'square-ish' in both Ip and Wtot
+    # so that when we do performance extrapolation plots the contours are not too skewed by one being bigger
+    # But that means we're gonna need to look at the entire dataset from all devices
+    # For now we can do them individually
+
+    max_Wtot = ds["Wtot_MJ"].max().item()
+    max_Ip = ds["Ip_MA"].max().item()
+    Wtot_scale = 1.0 / max_Wtot if max_Wtot != 0 else 1.0
+    Ip_scale = 1.0 / max_Ip if max_Ip != 0 else 1.0
+
     # Calculate performance at each time step (once for all shots)
-    perf_timeseries = ds.eval("(Wtot_MJ**2 + Ip_MA**2)**0.5")
+    perf_timeseries = ds.eval(
+        f"(({Wtot_scale} * Wtot_MJ)**2 + ({Ip_scale} * Ip_MA)**2)**0.5"
+    )
 
     # Get the 75th percentile value per shot
     ds["performance"] = perf_timeseries.quantile(0.75, dim="time_idx", skipna=True)
