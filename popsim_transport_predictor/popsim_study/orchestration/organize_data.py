@@ -1,5 +1,6 @@
 import numpy as np
 import xarray as xr
+from loguru import logger
 from popsim.ml.split_utils import split_dataset_by_fracs
 
 from popsim_transport_predictor.popsim_study.config import config
@@ -271,6 +272,10 @@ def get_train_val_test_datasets(
         else:
             raise ValueError(f"Unknown training data case: {training_data_case}")
 
+    logger.debug("Training dataset size: {}", train_ds.sizes[episode_coord])
+    logger.debug("Validation dataset size: {}", val_ds.sizes[episode_coord])
+    logger.debug("Test dataset size: {}", test_ds.sizes[episode_coord])
+
     return train_ds, val_ds, test_ds
 
 
@@ -286,7 +291,7 @@ def get_train_test_datasets_transfer(
     # Load the high-performance dataset and split into train/test
     # No validation needed because we are not tuning hyperparameters on transfer learning data
     ds_hp, episode_coord = get_ds("d3d_hp")
-    ds_hp = add_performance(ds_hp)
+    ds_hp = add_performance(ds_hp, episode_coord)
     ds_hp = ds_hp.assign_coords(ds_source="d3d_hp")
     sorted_shots = np.argsort(ds_hp[episode_coord].values)
 
