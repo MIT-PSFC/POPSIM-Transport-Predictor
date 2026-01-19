@@ -11,8 +11,8 @@ from disruption_py.machine.tokamak import Tokamak
 from disruption_py.settings import RetrievalSettings
 from disruption_py.workflow import get_shots_data
 
-from popsim_transport_predictor.datasets_dispy import make_uniform_1khz_timebase
-from popsim_transport_predictor.datasets_dispy.cmod import (
+from popsim_transport_predictor.datasets import make_uniform_1khz_timebase
+from popsim_transport_predictor.datasets.cmod import (
     BLESSED_THOMSON_DAYS,
     CMOD_DATASET_SIGNALS,
     IPMAX,
@@ -21,8 +21,8 @@ from popsim_transport_predictor.datasets_dispy.cmod import (
     PULSE_LENGTH,
     SUMMARY_TABLE,
 )
-from popsim_transport_predictor.datasets_dispy.cmod.gp_fit import gp_profile
-from popsim_transport_predictor.datasets_dispy.dispy_utils import summary
+from popsim_transport_predictor.datasets.cmod.gp_fit import gp_profile
+from popsim_transport_predictor.datasets.dispy_utils import summary
 
 
 def get_shotlist_from_sql(num_shots: int | None) -> list[int]:

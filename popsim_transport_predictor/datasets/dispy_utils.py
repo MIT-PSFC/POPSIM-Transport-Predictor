@@ -1,5 +1,5 @@
 import numpy as np
-from disruption_py.machine.tokamak import Tokamak
+from disruption_py.machine.tokamak import Tokamak, resolve_tokamak_from_environment
 from disruption_py.workflow import get_database
 from loguru import logger
 
@@ -38,7 +38,7 @@ def summary(
     """
 
     # database
-    db = get_database(tokamak=Tokamak.CMOD)
+    db = get_database(tokamak=resolve_tokamak_from_environment())
 
     # query
     query = [
