@@ -8,7 +8,6 @@ dependencies = [
     "pre-commit>=4.3.0",
     "disruption-py",
     "gptools",
-    "popsim",
     "xarray",
     "netcdf4",
     "fire>=0.7.1",
@@ -37,7 +36,6 @@ packages = ["popsim_transport_predictor"]
 [tool.uv.sources]
 disruption-py = { path = "./submodules/disruption-py", editable = true }
 gptools = { path = "./submodules/gptools", editable = true }
-popsim = { path = "./submodules/popsim", editable = true }
 
 [tool.hatch.build.targets.sdist]
 include = ["popsim_transport_predictor"]
