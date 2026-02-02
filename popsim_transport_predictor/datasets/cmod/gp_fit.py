@@ -21,6 +21,7 @@ def gp_profile(
     err_y = err_y[valid_mask]
 
     gp.add_data(data_X, data_y, err_y)
+    gp.remove_outliers(sigma=2)
 
     # Boundary conditions
     val_bc = np.array([[1.1, 0, 0.01], [1.2, 0, 0.01], [1.3, 0, 0.01], [1.4, 0, 0.01]])
