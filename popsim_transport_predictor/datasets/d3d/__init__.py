@@ -44,8 +44,6 @@ D3D_DATASET_SIGNALS = [
     "p_rad",  # Bulk radiated heating power
     "p_nbi",  # Absorbed NBI heating power
     "p_ech",  # Absorbed ECH heating power
-    # Other
-    # TODO(ZanderKeith): Add gas valves when we get to that point
 ]
 
 D3D_SIGNAL_BOUNDS = {
