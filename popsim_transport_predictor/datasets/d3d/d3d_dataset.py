@@ -114,8 +114,13 @@ class D3DDataWorkflow(DataWorkflow):
 
         return profile_result
 
-    def _get_profile_dataset_ida(self, shot: int) -> xr.Dataset:
+    def _get_profile_dataset_ida(self, shot: int) -> xr.Dataset | None:
         ida_path = f"/fusion/projects/results/ida-results/HBP_database/IDA_{shot}_.cdf"
+        if not os.path.exists(ida_path):
+            logger.warning(
+                f"IDA profile file for shot {shot} not found at {ida_path}, skipping shot."
+            )
+            return None
         ds = xr.open_dataset(ida_path)
         # Rename profile varaibles to avoid conflict with 0D signals
         ds["Te_rho"] = ds["T_e"]
@@ -136,9 +141,23 @@ class D3DDataWorkflow(DataWorkflow):
                 "disruption_py on DIII-D currently requires numpy < 2 please use the make_d3d_venv.sh script to create the correct environment."
             )
 
+        processed_shots = 0
         for shot in self.shotlist:
+            if self.max_num_shots is not None and processed_shots >= self.max_num_shots:
+                logger.info(
+                    f"Reached maximum number of shots to process: {self.max_num_shots}"
+                )
+                break
+
+            ds_path = os.path.join(self.raw_data_dir, f"{shot}.nc")
+            if os.path.exists(ds_path):
+                logger.info(f"Raw dataset for shot {shot} already exists at {ds_path}")
+                processed_shots += 1
+                continue
             if self.use_ida:
                 ds_profile = self._get_profile_dataset_ida(shot)
+                if ds_profile is None:
+                    continue
             else:
                 ds_profile = self._get_profile_dataset_zipfit(shot)
 
@@ -159,9 +178,11 @@ class D3DDataWorkflow(DataWorkflow):
 
             ds_standardized = self.standardize_signal_names(ds_assembly)
 
-            ds_path = os.path.join(self.raw_data_dir, f"{shot}.nc")
             ds_standardized.to_netcdf(ds_path)
             logger.info(f"Saved raw dataset for shot {shot} to {ds_path}")
+            processed_shots += 1
+
+        logger.info("Finished making raw data files.")
 
     def standardize_signal_names(self, ds: xr.Dataset) -> xr.Dataset:
         """Rename signals in the dataset to match the POPSIM convention"""
