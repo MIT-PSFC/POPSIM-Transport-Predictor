@@ -3,6 +3,9 @@ from abc import abstractmethod
 
 import numpy as np
 import xarray as xr
+from loguru import logger
+
+from popsim_transport_predictor import EPISODE_DIM, TIME_DIM
 
 
 class DataWorkflow:
@@ -67,10 +70,43 @@ class DataWorkflow:
 
     def run_processed_data_workflow(self):
         """Run the data processing workflow"""
+        from popsim.data.dataset_utils import build_tensorized_dataset
 
         if not int(np.version.version.split(".")[0]) >= 2:
             raise RuntimeError(
                 "Numpy version must be greater than 2 to run data processing workflow on all devices."
             )
 
+        zarr_path = os.path.join(self.final_ds_dir, f"{self.ds_name}.zarr")
+        if os.path.exists(zarr_path):
+            print(f"Dataset already exists at {zarr_path}, skipping processing.")
+            return
+
+        identifiers = [
+            int(fname.split(".")[0])
+            for fname in os.listdir(self.raw_data_dir)
+            if fname.endswith(".nc")
+        ]
+        if self.max_num_shots:
+            identifiers = identifiers[: self.max_num_shots]
+
         # Run the data processing workflow and save to a POPSIM tensorized dataset
+        build_tensorized_dataset(
+            process_fn=self.process_fn,
+            identifiers=identifiers,
+            zarr_path=zarr_path,
+            time_dim=TIME_DIM,
+            episode_dim=EPISODE_DIM,
+            extend_existing=False,
+            mb_per_chunk=None,
+        )
+
+        logger.info(f"Saved processed dataset to {zarr_path}")
+
+    def process_fn(self, shot_id: int) -> xr.Dataset:
+        raw_ds_path = os.path.join(self.raw_data_dir, f"{shot_id}.nc")
+        shot_ds = xr.open_dataset(raw_ds_path)
+
+        # Apply any processing steps needed. If something breaks, return None to skip this shot.
+
+        return shot_ds
