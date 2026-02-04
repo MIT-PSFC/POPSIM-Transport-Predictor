@@ -68,7 +68,7 @@ class DataWorkflow:
     def run_processed_data_workflow(self):
         """Run the data processing workflow"""
 
-        if not np.version > 2:
+        if not int(np.version.version.split(".")[0]) >= 2:
             raise RuntimeError(
                 "Numpy version must be greater than 2 to run data processing workflow on all devices."
             )

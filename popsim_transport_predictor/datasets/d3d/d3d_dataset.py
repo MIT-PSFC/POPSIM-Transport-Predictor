@@ -154,6 +154,7 @@ class D3DDataWorkflow(DataWorkflow):
                 logger.info(f"Raw dataset for shot {shot} already exists at {ds_path}")
                 processed_shots += 1
                 continue
+
             if self.use_ida:
                 ds_profile = self._get_profile_dataset_ida(shot)
                 if ds_profile is None:
