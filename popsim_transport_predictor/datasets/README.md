@@ -8,12 +8,7 @@ Use Disruption-Py to get the 0D scalars and the 1D data separately, do some prep
 2. DIII-D
 
 MDSPlus on Omega requires numpy < 2 which is incompatible with POPSIM, so we have a separate virtual environment
-that only has the requirements for Disruption-Py to first pull the data.     
-```
-python -m venv .venv_d3d
-source .venv_d3d
-pip install -r requirements_d3d.txt
-```
+that only has the requirements for Disruption-Py to first pull the data. (set up this venv with `make_d3d_venv.sh`)
 Further filtering and preprocessing is done on the uv-managed venv with numpy >= 2.
 
 3. TCV
