@@ -10,7 +10,7 @@ from disruption_py.settings import RetrievalSettings
 from disruption_py.workflow import get_shots_data
 from loguru import logger
 
-from popsim_transport_predictor import PACKAGE_ROOT
+from popsim_transport_predictor import EPISODE_DIM, PACKAGE_ROOT, TIME_COORD, TIME_DIM
 from popsim_transport_predictor.datasets import make_uniform_1khz_timebase
 from popsim_transport_predictor.datasets.workflow import DataWorkflow
 
@@ -54,6 +54,10 @@ class D3DDataWorkflow(DataWorkflow):
             max_num_shots=max_num_shots,
         )
         self.use_ida = use_ida
+
+        self.valid_signal_bounds = {
+            "Wtot_MJ": (1e-3, None),
+        }
 
     def _get_0D_dataset(self, shot: int) -> xr.Dataset:
         retrieval_settings = RetrievalSettings(
@@ -128,6 +132,7 @@ class D3DDataWorkflow(DataWorkflow):
         ds = ds[["Te_rho", "ne_rho"]]
 
         ds["time"] = ds["time"] / 1e3  # Convert ms to s
+        ds = ds.expand_dims("shot")
         return ds
 
     def make_raw_data_files(self):
@@ -236,5 +241,14 @@ class D3DDataWorkflow(DataWorkflow):
                 "P_LH_MW",
             ]
         ]
+
+        # Make episode dimension, time dimension, and time coordinate names consistent
+        # Rename time dimension to follow POPSIM convention: time_dim -> time_idx
+        if TIME_DIM not in ds.dims:
+            ds = ds.rename_dims({"time": TIME_DIM})
+        if EPISODE_DIM not in ds.dims:
+            ds = ds.rename_dims({"shot": EPISODE_DIM})
+        if TIME_COORD not in ds.coords:
+            ds = ds.rename_vars({"time": TIME_COORD})
 
         return ds
