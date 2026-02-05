@@ -2,6 +2,7 @@ import os
 import shutil
 
 import fire
+from loguru import logger
 
 from popsim_transport_predictor.datasets.d3d.d3d_dataset import (
     DEFAULT_SHOTLIST_FILE,
@@ -35,11 +36,15 @@ class DatasetCLI:
             if clean:
                 shutil.rmtree(raw_data_dir)
             os.makedirs(raw_data_dir, exist_ok=True)
+            log_path = os.path.join(raw_data_dir, "raw_data.log")
+            logger.add(log_path)
             workflow.make_raw_data_files()
         elif mode == "process":
             if clean:
                 shutil.rmtree(final_ds_dir)
             os.makedirs(final_ds_dir, exist_ok=True)
+            log_path = os.path.join(final_ds_dir, "processed_data.log")
+            logger.add(log_path)
             workflow.run_processed_data_workflow()
         else:
             raise ValueError(f"Unknown mode: {mode}. Use 'raw' or 'process'.")
