@@ -6,7 +6,8 @@ import netCDF4  # noqa: F401
 import numpy as np
 import xarray as xr
 from disruption_py.machine.tokamak import Tokamak
-from disruption_py.settings import RetrievalSettings
+from disruption_py.settings import RetrievalSettings, TimeSetting, TimeSettingParams
+from disruption_py.settings.time_setting import _postprocess
 from disruption_py.workflow import get_shots_data
 from loguru import logger
 
@@ -17,6 +18,37 @@ from popsim_transport_predictor.datasets.workflow import DataWorkflow
 DEFAULT_SHOTLIST_FILE = os.path.join(
     PACKAGE_ROOT, "datasets", "d3d", "HBP_shotlist_2024"
 )
+
+
+class Uniform1kHzTimeSetting(TimeSetting):
+    """
+    Time setting for creating a uniform timebase at 1 kHz, based on the maximum EFIT time.
+    """
+
+    def _get_times(self, params: TimeSettingParams) -> np.ndarray:
+        """
+        Parameters
+        ----------
+        params : TimeSettingParams
+            Parameters needed to retrieve the timebase.
+
+        Returns
+        -------
+        np.ndarray
+            Array of times in the timebase.
+        """
+        (efit_time,) = params.mds_conn.get_dims(
+            r"\efit_aeqdsk:ali", tree_name="_efit_tree"
+        )
+
+        max_time = np.max(efit_time)
+        if params.tokamak == Tokamak.CMOD:
+            times = np.round(np.arange(0, max_time + 1e-3, 1e-3), 3)
+            efit_time_unit = "s"
+        if params.tokamak == Tokamak.D3D:
+            times = np.round(np.arange(0, max_time + 1, 1), 0)
+            efit_time_unit = "ms"
+        return _postprocess(times=times, units=efit_time_unit)
 
 
 class D3DDataWorkflow(DataWorkflow):
@@ -59,10 +91,51 @@ class D3DDataWorkflow(DataWorkflow):
             "Wtot_MJ": (1e-3, None),
         }
 
+    def _toksearch_signals(self, shot: int, max_time_ms: int) -> xr.Dataset:
+        # Originally assembled by Oak Nelson here:
+        # https://github.com/cfs-energy-internal/POPSIM/blob/datasets_d3d_mast/popsim/data/d3d/d3d_fetch_toksearch_ex.py
+        # MANY THANKS TO HIM
+        from toksearch import MdsSignal, Pipeline
+
+        p = Pipeline([shot])
+
+        POHM = MdsSignal(
+            r"\pohm", "aot", location="remote://atlas.gat.com"
+        )  # Ohmic heating power
+        PradBulk = MdsSignal(
+            r"\prad_tot", "bolom", location="remote://atlas.gat.com"
+        )  # Bulk radiated heating power (total)
+        TAU_conf = MdsSignal(
+            r"\taue", "transport", location="remote://atlas.gat.com"
+        )  # Confinement time [s]
+
+        sigs_dict = {
+            "p_oh_toksearch": POHM,
+            "p_rad_toksearch": PradBulk,
+            "tau_conf": TAU_conf,
+        }
+
+        p.fetch_dataset("toksearch", sigs_dict)
+        timeline = np.round(np.arange(0, max_time_ms + 1, 1), 0)
+        p.align("toksearch", timeline)
+        results = p.compute_serial()
+        ds = results[0]["toksearch"]
+
+        # Match disruption-py output
+        ds = ds.rename({"times": "time"})
+        ds["time"] = ds["time"] / 1e3
+
+        # Make everything f32 unless it's an int
+        for key in list(ds.data_vars) + list(ds.coords) + list(ds.dims):
+            if ds[key].dtype not in [np.float32, np.int64]:
+                ds[key] = ds[key].astype(np.float32)
+
+        return ds
+
     def _get_0D_dataset(self, shot: int) -> xr.Dataset:
         retrieval_settings = RetrievalSettings(
             run_methods=["get_efit_parameters"],
-            time_setting="efit",
+            time_setting=Uniform1kHzTimeSetting(),
             only_requested_columns=False,
         )
         efit_result = get_shots_data(
@@ -87,7 +160,7 @@ class D3DDataWorkflow(DataWorkflow):
                 "p_ich",
                 "p_lhcd",
             ],
-            time_setting="efit",
+            time_setting=Uniform1kHzTimeSetting(),
             only_requested_columns=True,
         )
         global_result = get_shots_data(
@@ -98,7 +171,20 @@ class D3DDataWorkflow(DataWorkflow):
         )
         global_result = global_result.set_index(idx=["shot", "time"]).unstack("idx")
 
-        result = xr.merge([efit_result, global_result], compat="override")
+        toksearch_result = self._toksearch_signals(
+            shot, max_time_ms=int(efit_result["time"].max().item() * 1e3)
+        )
+
+        # Put toksearch result on the same timebase as efit/global
+        toksearch_result = toksearch_result.reindex(
+            time=efit_result["time"], method="ffill"
+        )
+
+        result = xr.merge(
+            [efit_result, global_result, toksearch_result],
+            compat="override",
+            join="exact",
+        )
 
         return result
 
@@ -160,14 +246,14 @@ class D3DDataWorkflow(DataWorkflow):
                 processed_shots += 1
                 continue
 
+            ds_0d = self._get_0D_dataset(shot)
+
             if self.use_ida:
                 ds_profile = self._get_profile_dataset_ida(shot)
                 if ds_profile is None:
                     continue
             else:
                 ds_profile = self._get_profile_dataset_zipfit(shot)
-
-            ds_0d = self._get_0D_dataset(shot)
 
             # Put each dataset on a 1 kHz timebase, using previous value fill
             max_time = max(
@@ -179,7 +265,7 @@ class D3DDataWorkflow(DataWorkflow):
             ds_profile = ds_profile.reindex(time=timebase, method="ffill")
             ds_0d = ds_0d.interp(
                 time=timebase, method="nearest"
-            )  # This should be okay since 0D signal is already at high time resolution
+            )  # This should be okay since 0D signal is already on 1 kHz timebase
             ds_assembly = xr.merge([ds_profile, ds_0d], compat="no_conflicts")
 
             ds_standardized = self.standardize_signal_names(ds_assembly)
@@ -210,24 +296,30 @@ class D3DDataWorkflow(DataWorkflow):
         ds["Te_keV_rho"] = ds["Te_rho"] / 1e3  # Convert eV to keV
         ds["ne20_rho"] = ds["ne_rho"] / 1e20  # Convert m^-3 to 10^20 m^-3
 
+        # The module should be using Wtot, but Wmhd should be close enough if Wtot is missing
+        ds["Wtot_MJ"] = ds["wmhdf"] / 1e6  # Convert J to MJ
+        ds["Wmhd_MJ"] = ds["wmhd"] / 1e6  # Convert J to MJ
+
         ds["R0"] = ds["rmaxis"]
         ds["B0"] = np.abs(ds["bt"])
         ds["Ip_MA"] = np.abs(ds["ip"]) / 1e6  # Convert A to MA
-        ds["Wmhd_MJ"] = ds["wmhdf"] / 1e6  # Convert J to MJ
         ds["ne20_line_avg"] = ds["n_e"] / 1e20  # Convert m^-3 to 10^20 m^-3
 
         ds["P_ECRH_MW"] = ds["p_ech"] / 1e6  # Convert W to MW
         ds["P_NBI_MW"] = ds["p_nbi"] / 1e6  # Convert W to MW
         ds["P_oh_MW"] = ds["p_ohm"] / 1e6  # Convert W to MW
+        ds["P_oh_MW_alt"] = ds["p_oh_toksearch"] / 1e6  # Convert W to MW
         ds["P_rad_MW"] = ds["p_rad"] / 1e6  # Convert W to MW
+        ds["P_rad_MW_alt"] = ds["p_rad_toksearch"] / 1e6  # Convert W to MW
         ds["P_ICRF_MW"] = ds["p_ich"] / 1e6  # Convert W to MW
         ds["P_LH_MW"] = ds["p_lhcd"] / 1e6  # Convert W to MW
 
-        # Drop unnecessary variables
+        # Only keep variables of interest
         ds = ds[
             [
                 "Te_keV_rho",
                 "ne20_rho",
+                "Wtot_MJ",
                 "Wmhd_MJ",
                 "R0",
                 "B0",
@@ -236,17 +328,21 @@ class D3DDataWorkflow(DataWorkflow):
                 "kappa",
                 "delta_top",
                 "delta_bottom",
+                "ne20_line_avg",
                 "P_ECRH_MW",
                 "P_NBI_MW",
                 "P_oh_MW",
+                "P_oh_MW_alt",
                 "P_rad_MW",
+                "P_rad_MW_alt",
                 "P_ICRF_MW",
                 "P_LH_MW",
+                "tau_conf",
             ]
         ]
 
-        # If any signal is all NaN, return None to skip this shot
-        for signal in ds.data_vars:
+        # If any *important* signal is all NaN, return None to skip this shot
+        for signal in ["Te_keV_rho", "ne20_rho", "Ip_MA"]:
             if ds[signal].isnull().all():
                 logger.warning(
                     f"Signal {signal} is all NaN for shot {ds['shot'].item()}, skipping shot."
