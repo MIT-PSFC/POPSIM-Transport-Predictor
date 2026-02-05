@@ -107,8 +107,14 @@ class DataWorkflow:
         raw_ds_path = os.path.join(self.raw_data_dir, f"{shot_id}.nc")
         shot_ds = xr.open_dataset(raw_ds_path)
 
-        # Sometimes wmhdf was missing, ensure that it exists / is in a valid range
-
         # Apply any processing steps needed. If something breaks, return None to skip this shot.
+        shot_ds = self.device_specific_processing(shot_ds)
+
+        # Ensure powers are non-negative
+        power_signals = [
+            sig for sig in shot_ds.data_vars if "P_" in sig and sig.endswith("_MW")
+        ]
+        for sig in power_signals:
+            shot_ds[sig] = shot_ds[sig].clip(min=0)
 
         return shot_ds

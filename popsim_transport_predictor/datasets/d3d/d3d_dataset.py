@@ -51,6 +51,37 @@ class Uniform1kHzTimeSetting(TimeSetting):
         return _postprocess(times=times, units=efit_time_unit)
 
 
+class Uniform1MHzTimeSetting(TimeSetting):
+    """
+    Time setting for creating a uniform timebase at 1 MHz, based on the maximum EFIT time.
+    """
+
+    def _get_times(self, params: TimeSettingParams) -> np.ndarray:
+        """
+        Parameters
+        ----------
+        params : TimeSettingParams
+            Parameters needed to retrieve the timebase.
+
+        Returns
+        -------
+        np.ndarray
+            Array of times in the timebase.
+        """
+        (efit_time,) = params.mds_conn.get_dims(
+            r"\efit_aeqdsk:ali", tree_name="_efit_tree"
+        )
+
+        max_time = np.max(efit_time)
+        if params.tokamak == Tokamak.CMOD:
+            times = np.round(np.arange(0, max_time + 1e-6, 1e-6), 6)
+            efit_time_unit = "s"
+        if params.tokamak == Tokamak.D3D:
+            times = np.round(np.arange(0, max_time + 1e-3, 1e-3), 3)
+            efit_time_unit = "ms"
+        return _postprocess(times=times, units=efit_time_unit)
+
+
 class D3DDataWorkflow(DataWorkflow):
     def __init__(
         self,
@@ -132,6 +163,84 @@ class D3DDataWorkflow(DataWorkflow):
 
         return ds
 
+    def _get_fast_dataset_toksearch(self, shot: int, max_time_ms: int) -> xr.Dataset:
+        """Certain signals on DIII-D require special handling
+
+        Signals are either too noisy or PWM so interpolating on a 1ms grid doesn't make sense
+        Acquire on the fast timebase and take the average over previous 1ms window.
+        """
+        from toksearch import MdsSignal, Pipeline
+
+        p = Pipeline([shot])
+        NBI = MdsSignal(r"\pabs", "nb", location="remote://atlas.gat.com")
+        ECRH = MdsSignal(r"\pech", "transport", location="remote://atlas.gat.com")
+
+        sigs_dict = {
+            "p_nbi_alt": NBI,
+            "p_ecrh_alt": ECRH,
+        }
+        p.fetch_dataset("ds", sigs_dict)
+        results = p.compute_serial()
+        ds = results[0]["ds"]
+
+        # Resample to 1 kHz by taking the mean over previous 1ms window
+        timeline = make_uniform_1khz_timebase(max_time_ms / 1e3)
+        n_times = len(timeline)
+        times_array = (
+            ds["times"].values / 1e3
+        )  # Convert to seconds to match timeline units
+
+        # Pre-allocate result arrays for better performance
+        resampled_data = {}
+        for var in ds.data_vars:
+            resampled_data[var] = np.full(n_times, np.nan, dtype=np.float32)
+
+        for i, t in enumerate(timeline):
+            mask = (times_array > t - 1e-3) & (times_array <= t)
+            if np.any(mask):
+                for var in ds.data_vars:
+                    var_data = ds[var].values[mask]
+                    resampled_data[var][i] = np.nanmean(var_data)
+
+        # Create Dataset with proper dimensions and coordinates
+        data_vars = {}
+        for var in ds.data_vars:
+            data_vars[var] = (["time"], resampled_data[var])
+
+        coords = {"time": timeline, "shot": shot}
+
+        ds_resampled = xr.Dataset(data_vars, coords=coords)
+        ds_resampled = ds_resampled.expand_dims("shot")
+        return ds_resampled
+
+    def _get_fast_dataset_dispy(self, shot: int) -> xr.Dataset:
+        retrieval_settings = RetrievalSettings(
+            run_columns=["p_nbi", "p_ech", "p_ohm"],
+            time_setting=Uniform1MHzTimeSetting(),
+            only_requested_columns=True,
+        )
+        fast_result = get_shots_data(
+            tokamak=Tokamak.D3D,
+            shotlist_setting=shot,
+            retrieval_settings=retrieval_settings,
+            num_processes=1,
+        )
+        fast_result = fast_result.set_index(idx=["shot", "time"]).unstack("idx")
+
+        # Coarsen to 1 kHz by taking the mean over previous 1ms window
+        ds_coarse = fast_result.coarsen(time=1000, boundary="trim").mean()
+
+        # Rename signals to _fast
+        ds_coarse = ds_coarse.rename(
+            {
+                "p_nbi": "p_nbi_fast",
+                "p_ech": "p_ech_fast",
+                "p_ohm": "p_ohm_fast",
+            }
+        )
+
+        return ds_coarse
+
     def _get_0D_dataset(self, shot: int) -> xr.Dataset:
         retrieval_settings = RetrievalSettings(
             run_methods=["get_efit_parameters"],
@@ -153,8 +262,8 @@ class D3DDataWorkflow(DataWorkflow):
                 "wmhdf",
                 "betapf",
                 "n_e",
-                "p_ohm",
                 "p_rad",
+                "p_ohm",
                 "p_nbi",
                 "p_ech",
                 "p_ich",
@@ -246,6 +355,7 @@ class D3DDataWorkflow(DataWorkflow):
                 processed_shots += 1
                 continue
 
+            ds_fast = self._get_fast_dataset_dispy(shot)
             ds_0d = self._get_0D_dataset(shot)
 
             if self.use_ida:
@@ -259,6 +369,7 @@ class D3DDataWorkflow(DataWorkflow):
             max_time = max(
                 ds_profile["time"].max().item(),
                 ds_0d["time"].max().item(),
+                ds_fast["time"].max().item(),
             )
             timebase = make_uniform_1khz_timebase(max_time)
 
@@ -266,7 +377,10 @@ class D3DDataWorkflow(DataWorkflow):
             ds_0d = ds_0d.interp(
                 time=timebase, method="nearest"
             )  # This should be okay since 0D signal is already on 1 kHz timebase
-            ds_assembly = xr.merge([ds_profile, ds_0d], compat="no_conflicts")
+            ds_fast = ds_fast.interp(
+                time=timebase, method="nearest"
+            )  # Fast dataset is already on 1 kHz timebase
+            ds_assembly = xr.merge([ds_profile, ds_0d, ds_fast], compat="no_conflicts")
 
             ds_standardized = self.standardize_signal_names(ds_assembly)
             if ds_standardized is None:
@@ -305,14 +419,16 @@ class D3DDataWorkflow(DataWorkflow):
         ds["Ip_MA"] = np.abs(ds["ip"]) / 1e6  # Convert A to MA
         ds["ne20_line_avg"] = ds["n_e"] / 1e20  # Convert m^-3 to 10^20 m^-3
 
-        ds["P_ECRH_MW"] = ds["p_ech"] / 1e6  # Convert W to MW
-        ds["P_NBI_MW"] = ds["p_nbi"] / 1e6  # Convert W to MW
-        ds["P_oh_MW"] = ds["p_ohm"] / 1e6  # Convert W to MW
-        ds["P_oh_MW_alt"] = ds["p_oh_toksearch"] / 1e6  # Convert W to MW
-        ds["P_rad_MW"] = ds["p_rad"] / 1e6  # Convert W to MW
-        ds["P_rad_MW_alt"] = ds["p_rad_toksearch"] / 1e6  # Convert W to MW
-        ds["P_ICRF_MW"] = ds["p_ich"] / 1e6  # Convert W to MW
-        ds["P_LH_MW"] = ds["p_lhcd"] / 1e6  # Convert W to MW
+        # Convert all powers to MW
+        ds["P_ECRH_MW"] = ds["p_ech"] / 1e6
+        ds["P_NBI_MW"] = ds["p_nbi"] / 1e6
+        ds["P_NBI_MW_alt"] = ds["p_nbi_fast"] / 1e6
+        ds["P_oh_MW"] = ds["p_ohm"] / 1e6
+        ds["P_oh_MW_alt"] = ds["p_ohm_fast"] / 1e6
+        ds["P_rad_MW"] = ds["p_rad"] / 1e6
+        ds["P_rad_MW_alt"] = ds["p_rad_toksearch"] / 1e6
+        ds["P_ICRF_MW"] = ds["p_ich"] / 1e6
+        ds["P_LH_MW"] = ds["p_lhcd"] / 1e6
 
         # Only keep variables of interest
         ds = ds[
@@ -331,6 +447,7 @@ class D3DDataWorkflow(DataWorkflow):
                 "ne20_line_avg",
                 "P_ECRH_MW",
                 "P_NBI_MW",
+                "P_NBI_MW_alt",
                 "P_oh_MW",
                 "P_oh_MW_alt",
                 "P_rad_MW",
@@ -357,5 +474,26 @@ class D3DDataWorkflow(DataWorkflow):
             ds = ds.rename_dims({"shot": EPISODE_DIM})
         if TIME_COORD not in ds.coords:
             ds = ds.rename_vars({"time": TIME_COORD})
+
+        return ds
+
+    def device_specific_processing(self, ds: xr.Dataset) -> xr.Dataset:
+        """Any additional processing steps specific to DIII-D dataset that should be applied before the general workflow"""
+
+        # If alternative radiated power exists, use that (significantly less noisy)
+        if (
+            "P_rad_MW_alt" in ds
+            and not ds["P_rad_MW_alt"].isnull().all()
+            and not (ds["P_rad_MW_alt"] == 0).all()
+        ):
+            ds["P_rad_MW"] = ds["P_rad_MW_alt"]
+
+        # Wtot_MJ is close enough to Wmhd_MJ while being less available
+        # Have the Wtot_MJ signal take the Wmhd_MJ values when Wtot_MJ is missing or zero
+        if "Wtot_MJ" in ds and "Wmhd_MJ" in ds:
+            wtot_missing_or_zero = ds["Wtot_MJ"].isnull() | (ds["Wtot_MJ"] == 0)
+            ds["Wtot_MJ"] = ds["Wtot_MJ"].where(
+                ~wtot_missing_or_zero, other=ds["Wmhd_MJ"]
+            )
 
         return ds

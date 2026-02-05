@@ -8,6 +8,7 @@ from popsim_transport_predictor.datasets.d3d.d3d_dataset import (
     DEFAULT_SHOTLIST_FILE,
     D3DDataWorkflow,
 )
+from popsim_transport_predictor.datasets.plotting import ds_time_plot
 
 
 class DatasetCLI:
@@ -46,6 +47,11 @@ class DatasetCLI:
             log_path = os.path.join(final_ds_dir, "processed_data.log")
             logger.add(log_path)
             workflow.run_processed_data_workflow()
+            ds_time_plot(
+                os.path.join(final_ds_dir, f"{ds_name}.zarr"),
+                os.path.join(final_ds_dir, "time_traces"),
+                title=f"{ds_name.upper()} Dataset Time Traces",
+            )
         else:
             raise ValueError(f"Unknown mode: {mode}. Use 'raw' or 'process'.")
 
