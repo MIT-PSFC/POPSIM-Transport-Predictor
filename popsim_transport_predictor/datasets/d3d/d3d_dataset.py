@@ -183,6 +183,9 @@ class D3DDataWorkflow(DataWorkflow):
             ds_assembly = xr.merge([ds_profile, ds_0d], compat="no_conflicts")
 
             ds_standardized = self.standardize_signal_names(ds_assembly)
+            if ds_standardized is None:
+                logger.warning(f"Standardization failed for shot {shot}, skipping")
+                continue
 
             ds_standardized.to_netcdf(ds_path)
             logger.info(f"Saved raw dataset for shot {shot} to {ds_path}")
@@ -241,6 +244,14 @@ class D3DDataWorkflow(DataWorkflow):
                 "P_LH_MW",
             ]
         ]
+
+        # If any signal is all NaN, return None to skip this shot
+        for signal in ds.data_vars:
+            if ds[signal].isnull().all():
+                logger.warning(
+                    f"Signal {signal} is all NaN for shot {ds['shot'].item()}, skipping shot."
+                )
+                return None
 
         # Make episode dimension, time dimension, and time coordinate names consistent
         # Rename time dimension to follow POPSIM convention: time_dim -> time_idx

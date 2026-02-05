@@ -107,6 +107,8 @@ class DataWorkflow:
         raw_ds_path = os.path.join(self.raw_data_dir, f"{shot_id}.nc")
         shot_ds = xr.open_dataset(raw_ds_path)
 
+        # Sometimes wmhdf was missing, ensure that it exists / is in a valid range
+
         # Apply any processing steps needed. If something breaks, return None to skip this shot.
 
         return shot_ds
