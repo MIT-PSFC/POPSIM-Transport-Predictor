@@ -83,8 +83,6 @@ class DataVisualization:
         else:
             logger.warning("TCV dataset path not provided, skipping TCV figures.")
 
-        return
-
         # C-Mod + TCV
         if config.tcv_dataset_path and config.cmod_dataset_path:
             fig_path = os.path.join(save_dir, "cmod_tcv_performance_extrapolation.png")
@@ -377,6 +375,7 @@ def run_study(
     tcv_dataset_path: str | None = config.tcv_dataset_path,
     d3d_lp_dataset_path: str | None = config.d3d_lp_dataset_path,
     d3d_hp_dataset_path: str | None = config.d3d_hp_dataset_path,
+    enable_parallelism: bool | None = False,
     clean_models: bool | None = False,
     clean_results: bool | None = False,
     clean_figures: bool | None = False,
@@ -409,6 +408,11 @@ def run_study(
         Path to the DIII-D low-performance dataset file. If not provided, figures which require DIII-D low-performance data will be skipped.
     d3d_hp_dataset_path : str | None
         Path to the DIII-D high-performance dataset file. If not provided, figures which require DIII-D high-performance data will be skipped.
+    enable_parallelism : bool | None
+        If false, runs the entire study sequentially in one process.
+        If true, submits independent training steps with SLURM up to configurable resource limits.
+        The idea is you would periodically call this 'run_study' function, and it checks what models still need to be trained and submit jobs for those, until eventually all models are trained and all results are computed.
+        I would *like* to develop a better way of doing this, but for now it's straightforward for me to set up and execute and we have an experiment schedule in 2 weeks so I gotta move fast.
     clean_models : bool | None
         If True, delete any existing trained models in the working directory before running.
     clean_results : bool | None
@@ -425,6 +429,11 @@ def run_study(
     model_dir = os.path.join(working_dir, "models")
     result_dir = os.path.join(working_dir, "results")
     figure_dir = os.path.join(figure_dir_base, project_name)
+
+    if (clean_models or clean_results or clean_figures) and enable_parallelism:
+        raise ValueError(
+            "Cannot clean models, results, or figures when parallelism is enabled, as this could interfere with jobs currently running or queued."
+        )
 
     if clean_models:
         os.removedirs(model_dir)
