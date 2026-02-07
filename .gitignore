@@ -209,3 +209,9 @@ __marimo__/
 
 # VSCode
 .vscode/
+
+# Result figures
+*.png
+
+# Scratch and other scripts
+scratch
