@@ -22,12 +22,14 @@ class DatasetCLI:
         max_num_shots: int | None = None,
         mode: str | None = "raw",
         clean: bool | None = False,
+        skip_profiles: bool | None = False,
     ):
         workflow = CModDataWorkflow(
             ds_name=ds_name,
             shotlist_file=shotlist_file,
             data_assembly_dir=data_assembly_dir,
             max_num_shots=max_num_shots,
+            skip_profiles=skip_profiles,
         )
 
         self._execute(workflow, mode, clean)
@@ -79,7 +81,7 @@ class DatasetCLI:
         clean: bool,
     ):
         if mode == "raw":
-            if clean:
+            if clean and os.path.exists(workflow.raw_data_dir):
                 shutil.rmtree(workflow.raw_data_dir)
             os.makedirs(workflow.raw_data_dir, exist_ok=True)
             log_path = os.path.join(
@@ -88,7 +90,7 @@ class DatasetCLI:
             logger.add(log_path)
             workflow.make_raw_data_files()
         elif mode == "process":
-            if clean:
+            if clean and os.path.exists(workflow.final_ds_dir):
                 shutil.rmtree(workflow.final_ds_dir)
             os.makedirs(workflow.final_ds_dir, exist_ok=True)
             log_path = os.path.join(

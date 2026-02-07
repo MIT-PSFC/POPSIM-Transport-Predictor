@@ -41,6 +41,7 @@ class CModDataWorkflow(DataWorkflow):
         data_assembly_dir: str,
         max_num_shots: int | None = None,
         gp_fit_rho: np.ndarray | None = None,
+        skip_profiles: bool = False,
     ):
         """Initialize the C-Mod data workflow.
 
@@ -57,6 +58,8 @@ class CModDataWorkflow(DataWorkflow):
             Maximum number of shots to process (for testing). If None, process all shots.
         gp_fit_rho : np.ndarray | None
             Radial locations for GP profile fitting. If None, uses default from config.
+        skip_profiles : bool
+            If True, skip profile fitting and use zero arrays instead. Useful for testing.
         """
 
         # Load config
@@ -80,6 +83,7 @@ class CModDataWorkflow(DataWorkflow):
             shotlist_file,
             data_assembly_dir,
             max_num_shots=max_num_shots,
+            skip_profiles=skip_profiles,
         )
 
     def _get_shotlist_from_source(self) -> list[int]:
@@ -280,37 +284,76 @@ class CModDataWorkflow(DataWorkflow):
                 processed_shots += 1
                 continue
 
-            # Get Thomson data
-            ds_thomson = self._get_thomson_dataset(shot)
-            if ds_thomson is None:
-                logger.warning(
-                    f"Skipping shot {shot} since no Thomson data was retrieved"
-                )
-                continue
-
-            # Fit Thomson profiles
-            ds_profiles = self._make_profile_dataset(ds_thomson)
-
             # Get EFIT and 0D data
             ds_efit = self._get_efit_dataset(shot)
 
-            # Put each dataset on a 1 kHz timebase, using previous value fill
-            max_time = max(
-                ds_thomson["time"].max().item(),
-                ds_profiles["time"].max().item(),
-                ds_efit["time"].max().item(),
-            )
-            timebase = make_uniform_1khz_timebase(max_time)
+            if self.skip_profiles:
+                # Skip profile fitting, use zeros instead
+                logger.info(
+                    f"Skipping profile fitting for shot {shot} (skip_profiles=True)"
+                )
+                max_time = ds_efit["time"].max().item()
+                timebase = make_uniform_1khz_timebase(max_time)
 
-            ds_thomson = ds_thomson.reindex(time=timebase, method="ffill")
-            ds_profiles = ds_profiles.reindex(time=timebase, method="ffill")
-            ds_efit = ds_efit.interp(
-                time=timebase, method="nearest"
-            )  # EFIT is already at high time resolution
+                # Create dummy profile dataset with zeros
+                ds_profiles = xr.Dataset(
+                    data_vars={
+                        "Te_keV_rho": (
+                            ("time", "rho"),
+                            np.zeros((len(timebase), len(self.gp_fit_rho))),
+                        ),
+                        "Te_keV_rho_error": (
+                            ("time", "rho"),
+                            np.zeros((len(timebase), len(self.gp_fit_rho))),
+                        ),
+                        "ne20_rho": (
+                            ("time", "rho"),
+                            np.zeros((len(timebase), len(self.gp_fit_rho))),
+                        ),
+                        "ne20_rho_error": (
+                            ("time", "rho"),
+                            np.zeros((len(timebase), len(self.gp_fit_rho))),
+                        ),
+                    },
+                    coords={
+                        "time": timebase,
+                        "rho": self.gp_fit_rho,
+                        "shot": shot,
+                    },
+                )
+                ds_profiles = ds_profiles.expand_dims("shot")
 
-            ds_assembly = xr.merge(
-                [ds_thomson, ds_profiles, ds_efit], compat="override"
-            )
+                ds_efit = ds_efit.interp(time=timebase, method="nearest")
+                ds_assembly = xr.merge([ds_profiles, ds_efit], compat="override")
+            else:
+                # Get Thomson data
+                ds_thomson = self._get_thomson_dataset(shot)
+                if ds_thomson is None:
+                    logger.warning(
+                        f"Skipping shot {shot} since no Thomson data was retrieved"
+                    )
+                    continue
+
+                # Fit Thomson profiles
+                ds_profiles = self._make_profile_dataset(ds_thomson)
+
+                # Put each dataset on a 1 kHz timebase, using previous value fill
+                max_time = max(
+                    ds_thomson["time"].max().item(),
+                    ds_profiles["time"].max().item(),
+                    ds_efit["time"].max().item(),
+                )
+                timebase = make_uniform_1khz_timebase(max_time)
+
+                ds_thomson = ds_thomson.reindex(time=timebase, method="ffill")
+                ds_profiles = ds_profiles.reindex(time=timebase, method="ffill")
+                ds_efit = ds_efit.interp(
+                    time=timebase, method="nearest"
+                )  # EFIT is already at high time resolution
+
+                ds_assembly = xr.merge(
+                    [ds_thomson, ds_profiles, ds_efit], compat="override"
+                )
 
             ds_standardized = self.standardize_signal_names(ds_assembly)
             if ds_standardized is None:
