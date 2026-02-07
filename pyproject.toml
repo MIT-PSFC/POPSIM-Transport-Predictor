@@ -29,6 +29,12 @@ dev = [
     "yamllint>=1.37.1",
 ]
 
+gpu-orcd = [
+    "jax[cuda12]>=0.7.0,<0.8",
+    "jax-cuda12-plugin==0.7.2",
+    "jax-cuda12-pjrt==0.7.2",
+]
+
 [tool.isort]
 profile = "black"
 

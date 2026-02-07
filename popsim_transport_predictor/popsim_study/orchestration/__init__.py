@@ -7,12 +7,28 @@ TRAINING_DATA_CASES = [
     "exnihilo",  # No training data
 ]
 
-MODEL_CASES = [
-    "simple_shapes",  # Simple analytic shapes
-    "pedestal_shapes",  # Simple analytic shapes with pedestal region
-    "gradient_shapes",  # Gradient-based analytic shapes
-    "unstructured_nn",  # Unstructured neural network
-]
+MODEL_CASES = {
+    # Different treatments of the full-shot transport predictor module
+    "transport_predictor": {
+        "simple_shapes",  # Simple analytic shapes
+        "pedestal_shapes",  # Simple analytic shapes with pedestal region
+        "gradient_shapes",  # Gradient-based analytic shapes
+        "unstructured_nn",  # Unstructured neural network
+    },
+    # Just the power balance module. (P_OH and P_RAD still get their own models since the data is atrocious)
+    "power_balance": {
+        "scaling_law",  # Based on the scaling law, between H89 and H98 HL transition threshold
+        "sciml",  # Neural network predicts tau_E, and we do the power balance calculation
+        "unstructured_nn",  # Unstructured neural network directly predicts stored energy evolution
+    },
+    # Profile predictor (needed for pre-shot trajectory optimization for upcoming DIII-D campaign)
+    "profile_predictor": {
+        "simple_shapes",  # Simple analytic shapes
+        "pedestal_shapes",  # Simple analytic shapes with pedestal region
+        "gradient_shapes",  # Gradient-based analytic shapes
+        "unstructured_nn",  # Unstructured neural network
+    },
+}
 
 # Shots of high-performance data included in training
 HP_SHOTS_INCLUDED = [0, 1, 3, 10, 30, 100]
