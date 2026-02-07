@@ -16,19 +16,40 @@ if [ -z "$PTPS_CMOD_DATASET" ] || [ -z "$PTPS_CMOD_SCRATCH_DIR" ] ; then
     echo "PTPS_CMOD_DATASET or PTPS_CMOD_SCRATCH_DIR not set, skipping C-Mod rsync"
 else
     echo "C-Mod"
-    rsync -az --info=progress2 --info=name0 $PTPS_CMOD_DATASET $PTPS_CMOD_SCRATCH_DIR
+    if [[ "$PTPS_CMOD_SCRATCH_DIR" == *":"* ]]; then
+        REMOTE_HOST=$(echo "$PTPS_CMOD_SCRATCH_DIR" | cut -d':' -f1)
+        REMOTE_PATH=$(echo "$PTPS_CMOD_SCRATCH_DIR" | cut -d':' -f2)
+        ssh "$REMOTE_HOST" "mkdir -p '$REMOTE_PATH'"
+    else
+        mkdir -p "$PTPS_CMOD_SCRATCH_DIR"
+    fi
+    rsync -az --info=progress2 --info=name0 "$PTPS_CMOD_DATASET" "$PTPS_CMOD_SCRATCH_DIR"
 fi
 
 if [ -z "$PTPS_D3D_DATASET" ] || [ -z "$PTPS_D3D_SCRATCH_DIR" ] ; then
     echo "PTPS_D3D_DATASET or PTPS_D3D_SCRATCH_DIR not set, skipping D3D rsync"
 else
     echo "D3D"
-    rsync -az --info=progress2 --info=name0 $PTPS_D3D_DATASET $PTPS_D3D_SCRATCH_DIR
+    if [[ "$PTPS_D3D_SCRATCH_DIR" == *":"* ]]; then
+        REMOTE_HOST=$(echo "$PTPS_D3D_SCRATCH_DIR" | cut -d':' -f1)
+        REMOTE_PATH=$(echo "$PTPS_D3D_SCRATCH_DIR" | cut -d':' -f2)
+        ssh "$REMOTE_HOST" "mkdir -p '$REMOTE_PATH'"
+    else
+        mkdir -p "$PTPS_D3D_SCRATCH_DIR"
+    fi
+    rsync -az --info=progress2 --info=name0 "$PTPS_D3D_DATASET" "$PTPS_D3D_SCRATCH_DIR"
 fi
 
 if [ -z "$PTPS_TCV_DATASET" ] || [ -z "$PTPS_TCV_SCRATCH_DIR" ] ; then
     echo "PTPS_TCV_DATASET or PTPS_TCV_SCRATCH_DIR not set, skipping TCV rsync"
 else
     echo "TCV"
-    rsync -az --info=progress2 --info=name0 $PTPS_TCV_DATASET $PTPS_TCV_SCRATCH_DIR
+    if [[ "$PTPS_TCV_SCRATCH_DIR" == *":"* ]]; then
+        REMOTE_HOST=$(echo "$PTPS_TCV_SCRATCH_DIR" | cut -d':' -f1)
+        REMOTE_PATH=$(echo "$PTPS_TCV_SCRATCH_DIR" | cut -d':' -f2)
+        ssh "$REMOTE_HOST" "mkdir -p '$REMOTE_PATH'"
+    else
+        mkdir -p "$PTPS_TCV_SCRATCH_DIR"
+    fi
+    rsync -az --info=progress2 --info=name0 "$PTPS_TCV_DATASET" "$PTPS_TCV_SCRATCH_DIR"
 fi
