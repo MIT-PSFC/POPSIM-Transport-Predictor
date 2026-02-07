@@ -2,337 +2,377 @@
 
 import os
 
-import fire
-import loguru
 import netCDF4  # noqa: F401
 import numpy as np
 import xarray as xr
 from disruption_py.machine.tokamak import Tokamak
 from disruption_py.settings import RetrievalSettings
 from disruption_py.workflow import get_shots_data
+from loguru import logger
 
+from popsim_transport_predictor import EPISODE_DIM, PACKAGE_ROOT, TIME_COORD, TIME_DIM
 from popsim_transport_predictor.datasets import make_uniform_1khz_timebase
 from popsim_transport_predictor.datasets.cmod import (
-    BLESSED_THOMSON_DAYS,
     CMOD_DATASET_SIGNALS,
-    IPMAX,
-    MAX_SHOT,
-    MIN_SHOT,
-    PULSE_LENGTH,
-    SUMMARY_TABLE,
 )
 from popsim_transport_predictor.datasets.cmod.gp_fit import gp_profile
-from popsim_transport_predictor.datasets.dispy_utils import summary
+from popsim_transport_predictor.datasets.workflow import DataWorkflow
+
+DEFAULT_SHOTLIST_FILE = os.path.join(PACKAGE_ROOT, "datasets", "cmod", "cmod_shotlist")
 
 
-def get_shotlist_from_sql(num_shots: int | None) -> list[int]:
-    data = summary(
-        summary_table=SUMMARY_TABLE,
-        ipmax=IPMAX,
-        pulse_length=PULSE_LENGTH,
-        min_shot=MIN_SHOT,
-        max_shot=MAX_SHOT,
-        shots=False,
-    )
-    shotlist = data[:, 0].astype(int).tolist()
+class CModDataWorkflow(DataWorkflow):
+    """C-Mod specific data workflow for creating and processing datasets.
 
-    # Filter to blessed Thomson days
-    shotlist = [shot for shot in shotlist if int(shot / 1000) in BLESSED_THOMSON_DAYS]
+    This workflow retrieves data from C-Mod's MDSPlus server, fits Thomson scattering
+    profiles using Gaussian processes, standardizes signal names, and creates a uniform
+    1 kHz timebase dataset suitable for POPSIM transport prediction studies.
 
-    if num_shots is not None:
-        shotlist = shotlist[:num_shots]
-    return shotlist
-
-
-def get_thomson_dataset(shot) -> xr.Dataset | None:
-    retrieval_settings = RetrievalSettings(
-        run_methods=["get_thomson_channels"],
-        only_requested_columns=False,
-    )
-    result = get_shots_data(
-        tokamak=Tokamak.CMOD,
-        shotlist_setting=[shot],
-        retrieval_settings=retrieval_settings,
-        num_processes=1,
-    )
-    # If result is empty, return None
-    if len(result) == 0:
-        return None
-    result = result.set_index(idx=["shot", "time"]).unstack("idx")
-    return result
-
-
-def make_profile_dataset(ds_thomson: xr.Dataset, gp_fit_rho: np.ndarray) -> xr.Dataset:
-    """
-    Perform fitting with GPtools
-
-    This assumes the input data is raw Thomson scattering data from get_thomson_dataset()
-    Where Te is in keV and ne is in m^-3
-    This returns Te in keV and ne in 1e20 m^-3
-
-    Parameters
-    ----------
-    ds_thomson : xr.Dataset
-        Raw Thomson scattering dataset
-    gp_fit_rho : np.ndarray
-        Radial locations to predict at (normalized minor radius)
+    Note: This workflow can execute on the present cluster with C-Mod data access.
     """
 
-    shot_prediction = {}
+    def __init__(
+        self,
+        shotlist_file: str,
+        raw_data_dir: str,
+        final_ds_dir: str,
+        max_num_shots: int | None = None,
+        gp_fit_rho: np.ndarray | None = None,
+    ):
+        """Initialize the C-Mod data workflow.
 
-    for shot in ds_thomson["shot"].values:
-        ds_shot = ds_thomson.where(ds_thomson["shot"] == shot, drop=True)
-        ds_shot = ds_shot.squeeze(dim="shot", drop=True)
-        times = ds_shot["time"].values
-        data_x = ds_shot["ts_channel_rho"].values.T  # shape (time, channel)
+        Parameters
+        ----------
+        shotlist_file : str
+            Path to file containing list of shots to process
+        raw_data_dir : str
+            Directory where raw data files are stored
+        final_ds_dir : str
+            Directory to save the final combined dataset
+        max_num_shots : int | None
+            Maximum number of shots to process (for testing). If None, process all shots.
+        gp_fit_rho : np.ndarray | None
+            Radial locations for GP profile fitting. If None, uses default linspace(0, 1.1, 56).
+        """
 
-        te_data = np.full((len(times), len(gp_fit_rho)), np.nan)
-        te_err = np.full((len(times), len(gp_fit_rho)), np.nan)
-        ne_data = np.full((len(times), len(gp_fit_rho)), np.nan)
-        ne_err = np.full((len(times), len(gp_fit_rho)), np.nan)
+        super().__init__(
+            "cmod",
+            shotlist_file,
+            raw_data_dir,
+            final_ds_dir,
+            max_num_shots=max_num_shots,
+        )
+        self.gp_fit_rho = (
+            gp_fit_rho if gp_fit_rho is not None else np.linspace(0, 1.1, 56)
+        )
 
-        for variable in ["te", "ne"]:
-            data_y = ds_shot[f"ts_channel_{variable}"].values.T  # shape (time, channel)
-            err_y = ds_shot[
-                f"ts_channel_{variable}_error"
-            ].values.T  # shape (time, channel)
+    def _get_thomson_dataset(self, shot: int) -> xr.Dataset | None:
+        """Retrieve Thomson scattering data for a shot.
 
-            if variable == "ne":
-                data_y = data_y * 1e-20  # Convert to [1e20 m^-3]
-                err_y = err_y * 1e-20
+        Parameters
+        ----------
+        shot : int
+            Shot number to retrieve
 
-            # If data or error bar is incredibly small, set to NaN since it's probably bad data
-            data_y = np.where(data_y < 0.001, np.nan, data_y)
-            err_y = np.where(err_y < 0.001, np.nan, err_y)
+        Returns
+        -------
+        xr.Dataset | None
+            Raw Thomson scattering data, or None if retrieval fails
+        """
+        retrieval_settings = RetrievalSettings(
+            run_methods=["get_thomson_channels"],
+            only_requested_columns=False,
+        )
+        result = get_shots_data(
+            tokamak=Tokamak.CMOD,
+            shotlist_setting=[shot],
+            retrieval_settings=retrieval_settings,
+            num_processes=1,
+        )
+        if len(result) == 0:
+            return None
+        result = result.set_index(idx=["shot", "time"]).unstack("idx")
+        return result
 
-            # I do not trust you can measure within 20 eV or within 2e18 m^-3
-            err_y = np.where(err_y < 0.02, 0.02, err_y)
+    def _make_profile_dataset(self, ds_thomson: xr.Dataset) -> xr.Dataset:
+        """Perform GP fitting on Thomson scattering data.
 
-            for i_time, _ in enumerate(times):
-                y_star, std_y_star, _, _ = gp_profile(
-                    data_X=data_x[i_time, :],
-                    data_y=data_y[i_time, :],
-                    err_y=err_y[i_time, :],
-                    X_star=gp_fit_rho,
-                    calc_gradient=False,
+        This assumes the input data is raw Thomson scattering data from _get_thomson_dataset()
+        where Te is in keV and ne is in m^-3. Returns Te in keV and ne in 1e20 m^-3.
+
+        Parameters
+        ----------
+        ds_thomson : xr.Dataset
+            Raw Thomson scattering dataset
+
+        Returns
+        -------
+        xr.Dataset
+            GP-fitted profiles on rho grid
+        """
+
+        shot_prediction = {}
+
+        for shot in ds_thomson["shot"].values:
+            ds_shot = ds_thomson.where(ds_thomson["shot"] == shot, drop=True)
+            ds_shot = ds_shot.squeeze(dim="shot", drop=True)
+            times = ds_shot["time"].values
+            data_x = ds_shot["ts_channel_rho"].values.T  # shape (time, channel)
+
+            te_data = np.full((len(times), len(self.gp_fit_rho)), np.nan)
+            te_err = np.full((len(times), len(self.gp_fit_rho)), np.nan)
+            ne_data = np.full((len(times), len(self.gp_fit_rho)), np.nan)
+            ne_err = np.full((len(times), len(self.gp_fit_rho)), np.nan)
+
+            for variable in ["te", "ne"]:
+                data_y = ds_shot[
+                    f"ts_channel_{variable}"
+                ].values.T  # shape (time, channel)
+                err_y = ds_shot[
+                    f"ts_channel_{variable}_error"
+                ].values.T  # shape (time, channel)
+
+                if variable == "ne":
+                    data_y = data_y * 1e-20  # Convert to [1e20 m^-3]
+                    err_y = err_y * 1e-20
+
+                # If data or error bar is incredibly small, set to NaN since it's probably bad data
+                data_y = np.where(data_y < 0.001, np.nan, data_y)
+                err_y = np.where(err_y < 0.001, np.nan, err_y)
+
+                # I do not trust you can measure within 20 eV or within 2e18 m^-3
+                err_y = np.where(err_y < 0.02, 0.02, err_y)
+
+                for i_time, _ in enumerate(times):
+                    y_star, std_y_star, _, _ = gp_profile(
+                        data_X=data_x[i_time, :],
+                        data_y=data_y[i_time, :],
+                        err_y=err_y[i_time, :],
+                        X_star=self.gp_fit_rho,
+                        calc_gradient=False,
+                    )
+
+                    if variable == "te":
+                        te_data[i_time, :] = y_star
+                        te_err[i_time, :] = std_y_star
+                    elif variable == "ne":
+                        ne_data[i_time, :] = y_star
+                        ne_err[i_time, :] = std_y_star
+
+            shot_prediction[shot] = xr.Dataset(
+                data_vars={
+                    "Te_keV_rho": (("time", "rho"), te_data),
+                    "Te_keV_rho_error": (("time", "rho"), te_err),
+                    "ne20_rho": (("time", "rho"), ne_data),
+                    "ne20_rho_error": (("time", "rho"), ne_err),
+                },
+                coords={
+                    "time": times,
+                    "rho": self.gp_fit_rho,
+                },
+            )
+
+        # Put the shots together into the original dataset with shot dimension
+        ds_profiles = xr.concat(
+            [shot_prediction[shot] for shot in shot_prediction],
+            dim=xr.IndexVariable("shot", list(shot_prediction.keys())),
+        )
+
+        return ds_profiles
+
+    def _get_efit_dataset(self, shot: int) -> xr.Dataset:
+        """Retrieve EFIT and 0D signals for a shot.
+
+        Parameters
+        ----------
+        shot : int
+            Shot number to retrieve
+
+        Returns
+        -------
+        xr.Dataset
+            Dataset with EFIT and 0D signals
+        """
+        retrieval_settings = RetrievalSettings(
+            run_columns=CMOD_DATASET_SIGNALS,
+            time_setting="efit",
+            only_requested_columns=True,
+        )
+        result = get_shots_data(
+            tokamak=Tokamak.CMOD,
+            shotlist_setting=shot,
+            retrieval_settings=retrieval_settings,
+            num_processes=1,
+        )
+        result = result.set_index(idx=["shot", "time"]).unstack("idx")
+        return result
+
+    def make_raw_data_files(self):
+        """Create raw data files from source for C-Mod dataset.
+
+        This method retrieves Thomson scattering data, performs GP fitting for profiles,
+        retrieves EFIT and 0D signals, combines them on a uniform 1 kHz timebase,
+        standardizes signal names, and saves one netCDF file per shot.
+        """
+
+        processed_shots = 0
+        for shot in self.shotlist:
+            if self.max_num_shots is not None and processed_shots >= self.max_num_shots:
+                logger.info(
+                    f"Reached maximum number of shots to process: {self.max_num_shots}"
                 )
+                break
 
-                if variable == "te":
-                    te_data[i_time, :] = y_star
-                    te_err[i_time, :] = std_y_star
-                elif variable == "ne":
-                    ne_data[i_time, :] = y_star
-                    ne_err[i_time, :] = std_y_star
+            ds_path = os.path.join(self.raw_data_dir, f"{shot}.nc")
+            if os.path.exists(ds_path):
+                logger.info(f"Raw dataset for shot {shot} already exists at {ds_path}")
+                processed_shots += 1
+                continue
 
-        shot_prediction[shot] = xr.Dataset(
-            data_vars={
-                "gp_fit_te": (("time", "gp_fit_rho"), te_data),
-                "gp_fit_te_error": (("time", "gp_fit_rho"), te_err),
-                "gp_fit_ne": (("time", "gp_fit_rho"), ne_data),
-                "gp_fit_ne_error": (("time", "gp_fit_rho"), ne_err),
-            },
-            coords={
-                "time": times,
-                "gp_fit_rho": gp_fit_rho,
-            },
-            attrs={
-                "description": f"GP fitted Thomson scattering profiles for shot {shot}",
-            },
-        )
+            # Get Thomson data
+            ds_thomson = self._get_thomson_dataset(shot)
+            if ds_thomson is None:
+                logger.warning(
+                    f"Skipping shot {shot} since no Thomson data was retrieved"
+                )
+                continue
 
-    # Put the shots together into the original dataset with 'idx' as the dimension
-    ds_profiles = xr.concat(
-        [shot_prediction[shot] for shot in shot_prediction],
-        dim=xr.IndexVariable("shot", list(shot_prediction.keys())),
-    )
+            # Fit Thomson profiles
+            ds_profiles = self._make_profile_dataset(ds_thomson)
 
-    return ds_profiles
+            # Get EFIT and 0D data
+            ds_efit = self._get_efit_dataset(shot)
 
+            # Put each dataset on a 1 kHz timebase, using previous value fill
+            max_time = max(
+                ds_thomson["time"].max().item(),
+                ds_profiles["time"].max().item(),
+                ds_efit["time"].max().item(),
+            )
+            timebase = make_uniform_1khz_timebase(max_time)
 
-def get_efit_dataset(shot: int) -> xr.Dataset:
-    retrieval_settings = RetrievalSettings(
-        run_columns=CMOD_DATASET_SIGNALS,
-        time_setting="efit",
-        only_requested_columns=True,
-    )
-    result = get_shots_data(
-        tokamak=Tokamak.CMOD,
-        shotlist_setting=shot,
-        retrieval_settings=retrieval_settings,
-        num_processes=1,
-    )
-    result = result.set_index(idx=["shot", "time"]).unstack("idx")
-    return result
+            ds_thomson = ds_thomson.reindex(time=timebase, method="ffill")
+            ds_profiles = ds_profiles.reindex(time=timebase, method="ffill")
+            ds_efit = ds_efit.interp(
+                time=timebase, method="nearest"
+            )  # EFIT is already at high time resolution
 
+            ds_assembly = xr.merge(
+                [ds_thomson, ds_profiles, ds_efit], compat="override"
+            )
 
-def make_final_dataset(
-    shotlist,
-    ds_thomson_dir,
-    ds_profile_dir,
-    ds_efit_dir,
-    ds_assembly_dir,
-) -> xr.Dataset:
-    """
-    Combine datasets together and align to uniform 1 kHz timebase
-    """
+            ds_standardized = self.standardize_signal_names(ds_assembly)
+            if ds_standardized is None:
+                logger.warning(f"Standardization failed for shot {shot}, skipping")
+                continue
 
-    for shot in shotlist:
-        ds_thomson_path = os.path.join(ds_thomson_dir, f"{shot}.nc")
-        ds_profiles_path = os.path.join(ds_profile_dir, f"{shot}.nc")
-        ds_efit_path = os.path.join(ds_efit_dir, f"{shot}.nc")
-        ds_assembly_path = os.path.join(ds_assembly_dir, f"{shot}.nc")
+            ds_standardized.to_netcdf(ds_path)
+            logger.info(f"Saved raw dataset for shot {shot} to {ds_path}")
+            processed_shots += 1
 
-        ds_thomson = xr.load_dataset(ds_thomson_path)
-        ds_profiles = xr.load_dataset(ds_profiles_path)
-        ds_efit = xr.load_dataset(ds_efit_path)
+        logger.info("Finished making raw data files.")
 
-        # Put each dataset on a 1 kHz timebase, using previous value fill
-        max_time = max(
-            ds_thomson["time"].max().item(),
-            ds_profiles["time"].max().item(),
-            ds_efit["time"].max().item(),
-        )
-        timebase = make_uniform_1khz_timebase(max_time)
+    def standardize_signal_names(self, ds: xr.Dataset) -> xr.Dataset | None:
+        """Rename signals in the dataset to match the POPSIM convention.
 
-        ds_thomson = ds_thomson.reindex(time=timebase, method="ffill")
-        ds_profiles = ds_profiles.reindex(time=timebase, method="ffill")
-        ds_efit = ds_efit.interp(
-            time=timebase, method="nearest"
-        )  # This should be okay since EFIT is already at high time resolution
-        ds_assembly = xr.merge([ds_thomson, ds_profiles, ds_efit], compat="override")
+        This includes unit conversions and creating derived quantities.
+        Also validates that critical signals are present.
 
-        # Rename some variables for con
-        ds_assembly = ds_assembly.rename_vars(
+        Parameters
+        ----------
+        ds : xr.Dataset
+            Raw dataset with device-specific signal names
+
+        Returns
+        -------
+        xr.Dataset | None
+            Standardized dataset, or None if critical signals are missing
+        """
+
+        # Simple renames
+        ds = ds.rename(
             {
-                "gp_fit_te": "te_rho",
-                "gp_fit_te_error": "te_rho_error",
-                "gp_fit_ne": "ne_rho",
-                "gp_fit_ne_error": "ne_rho_error",
+                "tritop": "delta_top",
+                "tribot": "delta_bottom",
+                "rmagx": "R0",
             }
         )
 
-        ds_assembly.to_netcdf(ds_assembly_path)
-        loguru.logger.info(f"Saved assembled dataset to {ds_assembly_path}")
+        # Conversions (Te_keV_rho and ne20_rho already in correct units from GP fitting)
+        ds["Wtot_MJ"] = ds["wmhd"] / 1e6  # Convert J to MJ
+        ds["B0"] = np.abs(ds["btor"])
+        ds["Ip_MA"] = np.abs(ds["ip"]) / 1e6  # Convert A to MA
+        ds["ne20_line_avg"] = ds["n_e"] / 1e20  # Convert m^-3 to 10^20 m^-3
 
-    # Now put all shots together
-    ds_final = xr.concat(
-        [
-            xr.load_dataset(os.path.join(ds_assembly_dir, f"{shot}.nc"))
-            for shot in shotlist
-        ],
-        dim=xr.IndexVariable("shot", shotlist),
-    )
-    return ds_final
+        # Convert all powers to MW
+        ds["P_oh_MW"] = ds["p_oh"] / 1e6
+        ds["P_rad_MW"] = ds["p_rad"] / 1e6
+        ds["P_ICRF_MW"] = ds["p_icrf"] / 1e6
+        ds["P_LH_MW"] = ds["p_lh"] / 1e6
 
+        # C-Mod doesn't have NBI or ECRH, set to zero where Ip_MA is valid
+        ds["P_NBI_MW"] = xr.zeros_like(ds["Ip_MA"])
+        ds["P_ECRH_MW"] = xr.zeros_like(ds["Ip_MA"])
 
-def make_cmod_dataset(  # noqa: PLR0912
-    save_dir: str, num_shots: int, clean: bool = False, debug: bool = False
-):
-    """
-    Makee the source CMOD dataset for POPSIM transport predictor study.
+        # C-Mod doesn't have tau_conf from standard diagnostics
+        ds["tau_conf"] = xr.zeros_like(ds["Ip_MA"])
 
-    This is handling one shot at a time to save on disk space since we aren't locking to a common timebase until the very end.
-    Each file on its own is ~10 kB so we aren't too worried about wasted 4kB blocks.
+        # Only keep variables of interest
+        ds = ds[
+            [
+                "Te_keV_rho",
+                "ne20_rho",
+                "Wtot_MJ",
+                "R0",
+                "B0",
+                "Ip_MA",
+                "a_minor",
+                "kappa",
+                "delta_top",
+                "delta_bottom",
+                "ne20_line_avg",
+                "P_ECRH_MW",
+                "P_NBI_MW",
+                "P_oh_MW",
+                "P_rad_MW",
+                "P_ICRF_MW",
+                "P_LH_MW",
+                "tau_conf",
+            ]
+        ]
 
-    Workflow is as follows:
-    1) Get shotlist from SQL summary table
-    2) Filter to shots that have blessed Thomson scattering data
-    3) Retrieve the raw TS data on its native timebase
-    4) Filter to shots that have both core and edge TS data
-    5) Retrieve EFIT and other 1D signals on the EFIT timebase
-    6) Put TS data and EFIT data together on a uniform 1kHz timebase
-    """
-
-    os.makedirs(save_dir, exist_ok=True)
-    ds_final_path = os.path.join(save_dir, "cmod_source.nc")
-    ds_thomson_dir = os.path.join(save_dir, "cmod_thomson_raw")
-    ds_profile_dir = os.path.join(save_dir, "cmod_profiles_raw")
-    ds_efit_dir = os.path.join(save_dir, "cmod_efit_raw")
-    ds_assembly_dir = os.path.join(save_dir, "cmod_assembly")
-    for directory in [
-        ds_thomson_dir,
-        ds_profile_dir,
-        ds_efit_dir,
-        ds_assembly_dir,
-    ]:
-        os.makedirs(directory, exist_ok=True)
-
-    if clean:
-        for path in [
-            ds_final_path,
-        ]:
-            if os.path.exists(path):
-                os.remove(path)
-                loguru.logger.info(f"Removed existing file {path}")
-        for directory in [
-            ds_thomson_dir,
-            ds_profile_dir,
-            ds_efit_dir,
-            ds_assembly_dir,
-        ]:
-            for file in os.listdir(directory):
-                file_path = os.path.join(directory, file)
-                os.remove(file_path)
-            loguru.logger.info(f"Removed existing files in directory {directory}")
-
-    if os.path.exists(ds_final_path):
-        loguru.logger.info(
-            f"Final dataset already exists at {ds_final_path}, skipping creation"
-        )
-        return
-
-    shotlist = get_shotlist_from_sql(num_shots=num_shots)
-    loguru.logger.info(f"Retrieved shotlist of {len(shotlist)} shots from SQL")
-
-    valid_shotlist = shotlist.copy()
-
-    for shot in shotlist:
-        ds_thomson_path = os.path.join(ds_thomson_dir, f"{shot}.nc")
-        if not os.path.exists(ds_thomson_path):
-            ds_thomson = get_thomson_dataset(shot)
-            if ds_thomson is None:
-                loguru.logger.warning(
-                    f"Skipping shot {shot} since no Thomson data was retrieved"
+        # If any *important* signal is all NaN, return None to skip this shot
+        for signal in ["Te_keV_rho", "ne20_rho", "Ip_MA"]:
+            if ds[signal].isnull().all():
+                logger.warning(
+                    f"Signal {signal} is all NaN for shot {ds['shot'].item()}, skipping shot."
                 )
-                valid_shotlist.remove(shot)
-                continue
-            ds_thomson.to_netcdf(ds_thomson_path)
-            loguru.logger.info(f"Saved raw Thomson dataset to {ds_thomson_path}")
-        else:
-            ds_thomson = xr.load_dataset(ds_thomson_path)
-            loguru.logger.info(
-                f"Loaded existing Thomson dataset from {ds_thomson_path}"
-            )
+                return None
 
-        ds_profile_path = os.path.join(ds_profile_dir, f"{shot}.nc")
-        if not os.path.exists(ds_profile_path):
-            if debug:
-                # Only pick time within the range (0.2, 0.4) seconds for faster testing
-                ds_thomson = ds_thomson.where(
-                    (ds_thomson["time"] >= 0.2) & (ds_thomson["time"] <= 0.4),
-                    drop=True,
-                )
-            gp_fit_rho = np.linspace(0, 1.1, 56)
-            ds_profiles = make_profile_dataset(ds_thomson, gp_fit_rho)
-            ds_profiles.to_netcdf(ds_profile_path)
-            loguru.logger.info(f"Saved raw profile dataset to {ds_profile_path}")
+        # Make episode dimension, time dimension, and time coordinate names consistent
+        if TIME_DIM not in ds.dims:
+            ds = ds.rename_dims({"time": TIME_DIM})
+        if EPISODE_DIM not in ds.dims:
+            ds = ds.rename_dims({"shot": EPISODE_DIM})
+        if TIME_COORD not in ds.coords:
+            ds = ds.rename_vars({"time": TIME_COORD})
 
-        ds_efit_path = os.path.join(ds_efit_dir, f"{shot}.nc")
-        if not os.path.exists(ds_efit_path):
-            ds_efit = get_efit_dataset(shot)
-            ds_efit.to_netcdf(ds_efit_path)
-            loguru.logger.info(f"Saved raw EFIT dataset to {ds_efit_path}")
+        return ds
 
-    ds_final = make_final_dataset(
-        valid_shotlist,
-        ds_thomson_dir,
-        ds_profile_dir,
-        ds_efit_dir,
-        ds_assembly_dir,
-    )
-    ds_final.to_netcdf(ds_final_path)
-    loguru.logger.info(f"Saved final CMOD dataset to {ds_final_path}")
+    def device_specific_processing(self, ds: xr.Dataset) -> xr.Dataset:
+        """Apply C-Mod specific processing steps.
 
+        Currently no special processing is needed for C-Mod beyond the base workflow.
 
-if __name__ == "__main__":
-    fire.Fire(make_cmod_dataset)
+        Parameters
+        ----------
+        ds : xr.Dataset
+            Standardized dataset
+
+        Returns
+        -------
+        xr.Dataset
+            Processed dataset ready for general workflow
+        """
+        # No special processing needed for C-Mod at this time
+        return ds

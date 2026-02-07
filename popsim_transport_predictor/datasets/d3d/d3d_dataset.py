@@ -83,21 +83,29 @@ class Uniform1MHzTimeSetting(TimeSetting):
 
 
 class D3DDataWorkflow(DataWorkflow):
+    """DIII-D specific data workflow for creating and processing datasets.
+
+    This workflow retrieves data from DIII-D's MDSPlus server and IDA/Zipfit
+    profile databases, standardizes the signal names, and creates a uniform
+    1 kHz timebase dataset suitable for POPSIM transport prediction studies.
+
+    Note: This workflow requires numpy < 2 and access to the DIII-D data servers.
+    It cannot be executed on clusters without DIII-D data access.
+    """
+
     def __init__(
         self,
-        ds_name: str,
         shotlist_file: str,
         raw_data_dir: str,
         final_ds_dir: str,
         max_num_shots: int | None = None,
-        use_ida: bool | None = True,
+        use_ida: bool = True,
     ):
-        """
+        """Initialize the DIII-D data workflow.
+
         Parameters
         ----------
-        ds_name : str
-            Name of the dataset (e.g., 'd3d', 'tcv', 'cmod')
-        shotlist_file: str
+        shotlist_file : str
             Path to file containing list of shots to process
         raw_data_dir : str
             Directory where raw data files are stored
@@ -105,12 +113,12 @@ class D3DDataWorkflow(DataWorkflow):
             Directory to save the final combined dataset
         max_num_shots : int | None
             Maximum number of shots to process (for testing). If None, process all shots.
-        use_ida : bool | None
-            Whether to use IDA for profile data (True) or Zipfit (False)
+        use_ida : bool
+            Whether to use IDA for profile data (True) or Zipfit (False). Default is True.
         """
 
         super().__init__(
-            ds_name,
+            "d3d",
             shotlist_file,
             raw_data_dir,
             final_ds_dir,
@@ -123,9 +131,11 @@ class D3DDataWorkflow(DataWorkflow):
         }
 
     def _toksearch_signals(self, shot: int, max_time_ms: int) -> xr.Dataset:
-        # Originally assembled by Oak Nelson here:
-        # https://github.com/cfs-energy-internal/POPSIM/blob/datasets_d3d_mast/popsim/data/d3d/d3d_fetch_toksearch_ex.py
-        # MANY THANKS TO HIM
+        """Retrieve signals from TokSearch that require special handling.
+
+        Originally assembled by Oak Nelson.
+        Reference: https://github.com/cfs-energy-internal/POPSIM/blob/datasets_d3d_mast/popsim/data/d3d/d3d_fetch_toksearch_ex.py
+        """
         from toksearch import MdsSignal, Pipeline
 
         p = Pipeline([shot])
@@ -164,10 +174,23 @@ class D3DDataWorkflow(DataWorkflow):
         return ds
 
     def _get_fast_dataset_toksearch(self, shot: int, max_time_ms: int) -> xr.Dataset:
-        """Certain signals on DIII-D require special handling
+        """Retrieve fast signals from TokSearch with averaging.
 
-        Signals are either too noisy or PWM so interpolating on a 1ms grid doesn't make sense
-        Acquire on the fast timebase and take the average over previous 1ms window.
+        Certain signals on DIII-D (NBI, ECRH) are either too noisy or PWM-modulated,
+        so interpolating on a 1ms grid doesn't make sense. This method acquires data
+        on the fast timebase and takes the average over the previous 1ms window.
+
+        Parameters
+        ----------
+        shot : int
+            Shot number to retrieve
+        max_time_ms : int
+            Maximum time in milliseconds
+
+        Returns
+        -------
+        xr.Dataset
+            Dataset with resampled fast signals
         """
         from toksearch import MdsSignal, Pipeline
 
@@ -213,7 +236,19 @@ class D3DDataWorkflow(DataWorkflow):
         ds_resampled = ds_resampled.expand_dims("shot")
         return ds_resampled
 
-    def _get_fast_dataset_dispy(self, shot: int) -> xr.Dataset:
+    def _get_fast_dataset_dispy(self, shot: int) -> xr.Dataset | None:
+        """Retrieve fast signals using disruption_py and coarsen to 1 kHz.
+
+        Parameters
+        ----------
+        shot : int
+            Shot number to retrieve
+
+        Returns
+        -------
+        xr.Dataset | None
+            Dataset with coarsened fast signals, or None if retrieval fails
+        """
         try:
             retrieval_settings = RetrievalSettings(
                 run_columns=["p_nbi", "p_ech", "p_ohm"],
@@ -248,6 +283,21 @@ class D3DDataWorkflow(DataWorkflow):
         return ds_coarse
 
     def _get_0D_dataset(self, shot: int) -> xr.Dataset:
+        """Retrieve 0D (time-varying scalar) signals for a shot.
+
+        This includes EFIT parameters and global quantities like Ip, Bt, stored energy,
+        and heating powers.
+
+        Parameters
+        ----------
+        shot : int
+            Shot number to retrieve
+
+        Returns
+        -------
+        xr.Dataset
+            Dataset with 0D signals on 1 kHz timebase
+        """
         retrieval_settings = RetrievalSettings(
             run_methods=["get_efit_parameters"],
             time_setting=Uniform1kHzTimeSetting(),
@@ -304,6 +354,18 @@ class D3DDataWorkflow(DataWorkflow):
         return result
 
     def _get_profile_dataset_zipfit(self, shot: int) -> xr.Dataset:
+        """Retrieve profile data from Zipfit.
+
+        Parameters
+        ----------
+        shot : int
+            Shot number to retrieve
+
+        Returns
+        -------
+        xr.Dataset
+            Dataset with electron density and temperature profiles
+        """
         retrieval_settings = RetrievalSettings(
             run_columns=["ne_rho", "te_rho"],
             only_requested_columns=False,
@@ -320,6 +382,18 @@ class D3DDataWorkflow(DataWorkflow):
         return profile_result
 
     def _get_profile_dataset_ida(self, shot: int) -> xr.Dataset | None:
+        """Retrieve profile data from IDA (Integrated Data Analysis).
+
+        Parameters
+        ----------
+        shot : int
+            Shot number to retrieve
+
+        Returns
+        -------
+        xr.Dataset | None
+            Dataset with electron density and temperature profiles, or None if file not found
+        """
         ida_path = f"/fusion/projects/results/ida-results/HBP_database/IDA_{shot}_.cdf"
         if not os.path.exists(ida_path):
             logger.warning(
@@ -337,9 +411,13 @@ class D3DDataWorkflow(DataWorkflow):
         return ds
 
     def make_raw_data_files(self):
-        """Create raw data files from source for DIII-D dataset
+        """Create raw data files from source for DIII-D dataset.
 
-        We are getting 0D signals from MDSPlus and using profiles from IDA or Zipfit.
+        This method retrieves 0D signals from MDSPlus and profiles from IDA or Zipfit,
+        combines them on a uniform 1 kHz timebase, standardizes signal names, and saves
+        one netCDF file per shot.
+
+        Note: Requires numpy < 2 and access to DIII-D data servers.
         """
 
         if not int(np.version.version.split(".")[0]) < 2:
@@ -401,8 +479,22 @@ class D3DDataWorkflow(DataWorkflow):
 
         logger.info("Finished making raw data files.")
 
-    def standardize_signal_names(self, ds: xr.Dataset) -> xr.Dataset:
-        """Rename signals in the dataset to match the POPSIM convention"""
+    def standardize_signal_names(self, ds: xr.Dataset) -> xr.Dataset | None:
+        """Rename signals in the dataset to match the POPSIM convention.
+
+        This includes unit conversions (e.g., eV to keV, J to MJ) and creating
+        derived quantities. Also validates that critical signals are present.
+
+        Parameters
+        ----------
+        ds : xr.Dataset
+            Raw dataset with device-specific signal names
+
+        Returns
+        -------
+        xr.Dataset | None
+            Standardized dataset, or None if critical signals are missing
+        """
 
         # Simple renames
         ds = ds.rename(
@@ -490,7 +582,24 @@ class D3DDataWorkflow(DataWorkflow):
         return ds
 
     def device_specific_processing(self, ds: xr.Dataset) -> xr.Dataset:
-        """Any additional processing steps specific to DIII-D dataset that should be applied before the general workflow"""
+        """Apply DIII-D specific processing steps.
+
+        This includes:
+        - Using alternative (less noisy) signals where available
+        - Substituting Wmhd for Wtot when Wtot is missing or zero
+        - Using smoothed NBI power signal
+        - Dropping unnecessary alternative signals
+
+        Parameters
+        ----------
+        ds : xr.Dataset
+            Standardized dataset
+
+        Returns
+        -------
+        xr.Dataset
+            Processed dataset ready for general workflow
+        """
 
         # If alternative radiated power exists, use that (significantly less noisy)
         if (
