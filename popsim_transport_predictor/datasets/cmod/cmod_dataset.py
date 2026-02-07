@@ -4,7 +4,6 @@ import os
 
 import netCDF4  # noqa: F401
 import numpy as np
-import toml
 import xarray as xr
 from disruption_py.machine.tokamak import Tokamak
 from disruption_py.settings import RetrievalSettings
@@ -12,6 +11,7 @@ from disruption_py.workflow import get_shots_data
 from loguru import logger
 
 from popsim_transport_predictor import EPISODE_DIM, PACKAGE_ROOT, TIME_COORD, TIME_DIM
+from popsim_transport_predictor.config import config
 from popsim_transport_predictor.datasets import make_uniform_1khz_timebase
 from popsim_transport_predictor.datasets.cmod import (
     CMOD_DATASET_SIGNALS,
@@ -21,7 +21,6 @@ from popsim_transport_predictor.datasets.dispy_utils import summary
 from popsim_transport_predictor.datasets.workflow import DataWorkflow
 
 DEFAULT_SHOTLIST_FILE = os.path.join(PACKAGE_ROOT, "datasets", "cmod", "cmod_shotlist")
-CONFIG_FILE = os.path.join(PACKAGE_ROOT, "datasets", "cmod", "config.toml")
 
 
 class CModDataWorkflow(DataWorkflow):
@@ -62,8 +61,8 @@ class CModDataWorkflow(DataWorkflow):
             If True, skip profile fitting and use zero arrays instead. Useful for testing.
         """
 
-        # Load config
-        self.config = toml.load(CONFIG_FILE)
+        # Use centralized config
+        self.config = config.cmod
 
         # Set up GP fitting rho grid
         if gp_fit_rho is not None:

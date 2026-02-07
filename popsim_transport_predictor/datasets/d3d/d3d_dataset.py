@@ -4,7 +4,6 @@ import os
 
 import netCDF4  # noqa: F401
 import numpy as np
-import toml
 import xarray as xr
 from disruption_py.machine.tokamak import Tokamak
 from disruption_py.settings import RetrievalSettings, TimeSetting, TimeSettingParams
@@ -13,6 +12,7 @@ from disruption_py.workflow import get_shots_data
 from loguru import logger
 
 from popsim_transport_predictor import EPISODE_DIM, PACKAGE_ROOT, TIME_COORD, TIME_DIM
+from popsim_transport_predictor.config import config
 from popsim_transport_predictor.datasets import make_uniform_1khz_timebase
 from popsim_transport_predictor.datasets.dispy_utils import summary
 from popsim_transport_predictor.datasets.workflow import DataWorkflow
@@ -20,7 +20,6 @@ from popsim_transport_predictor.datasets.workflow import DataWorkflow
 DEFAULT_SHOTLIST_FILE = os.path.join(
     PACKAGE_ROOT, "datasets", "d3d", "HBP_shotlist_2024"
 )
-CONFIG_FILE = os.path.join(PACKAGE_ROOT, "datasets", "d3d", "config.toml")
 
 
 class Uniform1kHzTimeSetting(TimeSetting):
@@ -121,8 +120,8 @@ class D3DDataWorkflow(DataWorkflow):
             Whether to use IDA for profile data (True) or Zipfit (False). Default is True.
         """
 
-        # Load config
-        self.config = toml.load(CONFIG_FILE)
+        # Use centralized config
+        self.config = config.d3d
         self.use_ida = use_ida
 
         # Call parent init (which will call _get_shotlist_from_source if needed)

@@ -43,6 +43,7 @@ class DatasetCLI:
         mode: str | None = "raw",
         clean: bool | None = False,
         use_ida: bool | None = True,
+        skip_profiles: bool | None = False,
     ):
         workflow = D3DDataWorkflow(
             ds_name=ds_name,
@@ -50,6 +51,7 @@ class DatasetCLI:
             data_assembly_dir=data_assembly_dir,
             max_num_shots=max_num_shots,
             use_ida=use_ida,
+            skip_profiles=skip_profiles,
         )
 
         self._execute(workflow, mode, clean)
@@ -63,6 +65,7 @@ class DatasetCLI:
         max_num_shots: int | None = None,
         mode: str | None = "raw",
         clean: bool | None = False,
+        skip_profiles: bool | None = False,
     ):
         workflow = TCVDataWorkflow(
             ds_name=ds_name,
@@ -70,6 +73,7 @@ class DatasetCLI:
             data_assembly_dir=data_assembly_dir,
             source_dataset_path=source_dataset_path,
             max_num_shots=max_num_shots,
+            skip_profiles=skip_profiles,
         )
 
         self._execute(workflow, mode, clean)
