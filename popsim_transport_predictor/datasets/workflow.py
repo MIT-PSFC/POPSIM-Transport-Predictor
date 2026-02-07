@@ -27,6 +27,7 @@ class DataWorkflow:
         shotlist_file: str | None,
         data_assembly_dir: str,
         max_num_shots: int | None = None,
+        skip_profiles: bool | None = False,
     ):
         """
         Parameters
@@ -40,6 +41,8 @@ class DataWorkflow:
             Directory where data files are stored and final dataset will be saved
         max_num_shots : int | None
             Maximum number of shots to process (for testing). If None, process all shots.
+        skip_profiles : bool
+            If True, skip profile fitting and use zero arrays instead. Useful for testing.
         """
 
         self.ds_name = ds_name
@@ -55,6 +58,7 @@ class DataWorkflow:
             )
 
         self.max_num_shots = max_num_shots
+        self.skip_profiles = skip_profiles
 
         if shotlist_file is None:
             logger.info(
