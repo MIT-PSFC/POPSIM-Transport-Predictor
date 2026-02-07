@@ -4,6 +4,7 @@ import os
 
 import netCDF4  # noqa: F401
 import numpy as np
+import toml
 import xarray as xr
 from loguru import logger
 
@@ -12,6 +13,7 @@ from popsim_transport_predictor.datasets import make_uniform_1khz_timebase
 from popsim_transport_predictor.datasets.workflow import DataWorkflow
 
 DEFAULT_SHOTLIST_FILE = os.path.join(PACKAGE_ROOT, "datasets", "tcv", "tcv_shotlist")
+CONFIG_FILE = os.path.join(PACKAGE_ROOT, "datasets", "tcv", "config.toml")
 
 
 class TCVDataWorkflow(DataWorkflow):
@@ -27,32 +29,64 @@ class TCVDataWorkflow(DataWorkflow):
 
     def __init__(
         self,
-        shotlist_file: str,
-        raw_data_dir: str,
-        final_ds_dir: str,
+        ds_name: str,
+        shotlist_file: str | None,
+        data_assembly_dir: str,
+        source_dataset_path: str | None = None,
         max_num_shots: int | None = None,
     ):
         """Initialize the TCV data workflow.
 
         Parameters
         ----------
-        shotlist_file : str
-            Path to file containing list of shots to process
-        raw_data_dir : str
-            Directory where raw data files are stored
-        final_ds_dir : str
-            Directory to save the final combined dataset
+        ds_name : str
+            Name of the dataset/study, used for directory naming
+        shotlist_file : str | None
+            Path to file containing list of shots to process. If None, retrieves
+            all shots from the source dataset.
+        data_assembly_dir : str
+            Directory where data files are stored and final dataset will be saved
+        source_dataset_path : str | None
+            Path to the source TCV dataset. If None, uses default from config.toml.
         max_num_shots : int | None
             Maximum number of shots to process (for testing). If None, process all shots.
         """
 
+        # Load config
+        self.config = toml.load(CONFIG_FILE)
+
+        # Set source dataset path
+        if source_dataset_path is not None:
+            self.source_dataset_path = source_dataset_path
+        else:
+            self.source_dataset_path = self.config["data_sources"][
+                "default_source_dataset"
+            ]
+
+        # Call parent init (which will call _get_shotlist_from_source if needed)
         super().__init__(
-            "tcv",
+            ds_name,
             shotlist_file,
-            raw_data_dir,
-            final_ds_dir,
+            data_assembly_dir,
             max_num_shots=max_num_shots,
         )
+
+    def _get_shotlist_from_source(self) -> list[int]:
+        """Retrieve shotlist from TCV source dataset.
+
+        Loads the source TCV dataset and extracts all available shot numbers.
+
+        Returns
+        -------
+        list[int]
+            List of shot numbers to process
+        """
+        logger.info(
+            f"Loading source TCV dataset from {self.source_dataset_path} to retrieve shotlist"
+        )
+        ds = xr.open_dataset(self.source_dataset_path)
+        shotlist = ds["shot"].values.tolist()
+        return shotlist
 
     def _load_source_dataset(self) -> xr.Dataset:
         """Load the source TCV dataset.

@@ -24,9 +24,8 @@ class DataWorkflow:
     def __init__(
         self,
         ds_name: str,
-        shotlist_file: str,
-        raw_data_dir: str,
-        final_ds_dir: str,
+        shotlist_file: str | None,
+        data_assembly_dir: str,
         max_num_shots: int | None = None,
     ):
         """
@@ -34,27 +33,55 @@ class DataWorkflow:
         ----------
         ds_name : str
             Name of the dataset (e.g., 'd3d', 'tcv', 'cmod')
-        shotlist_file: str
-            Path to file containing list of shots to process
-        raw_data_dir : str
-            Directory where raw data files are stored
-        final_ds_dir : str
-            Directory to save the final combined dataset
+        shotlist_file : str | None
+            Path to file containing list of shots to process. If None, will call
+            _get_shotlist_from_source() to retrieve shotlist from device-specific source.
+        data_assembly_dir : str
+            Directory where data files are stored and final dataset will be saved
+        max_num_shots : int | None
+            Maximum number of shots to process (for testing). If None, process all shots.
         """
 
         self.ds_name = ds_name
-        self.raw_data_dir = raw_data_dir
-        self.final_ds_dir = final_ds_dir
+        self.data_assembly_dir = data_assembly_dir
+        self.raw_data_dir = os.path.join(data_assembly_dir, ds_name, "raw_data")
+        if max_num_shots is None:
+            self.final_ds_dir = os.path.join(
+                data_assembly_dir, ds_name, "final_dataset_full"
+            )
+        else:
+            self.final_ds_dir = os.path.join(
+                data_assembly_dir, ds_name, f"final_dataset_{max_num_shots}"
+            )
+
         self.max_num_shots = max_num_shots
 
-        with open(shotlist_file) as f:
-            lines = f.readlines()
-            self.shotlist = [
-                int(line.strip()) for line in lines if line.strip().isdigit()
-            ]
+        if shotlist_file is None:
+            logger.info(
+                "No shotlist file provided, retrieving shotlist from device-specific source"
+            )
+            self.shotlist = self._get_shotlist_from_source()
+            logger.info(f"Retrieved {len(self.shotlist)} shots from source")
+        else:
+            with open(shotlist_file) as f:
+                lines = f.readlines()
+                self.shotlist = [
+                    int(line.strip()) for line in lines if line.strip().isdigit()
+                ]
+            logger.info(f"Loaded {len(self.shotlist)} shots from {shotlist_file}")
 
-        os.makedirs(self.raw_data_dir, exist_ok=True)
-        os.makedirs(self.final_ds_dir, exist_ok=True)
+    @abstractmethod
+    def _get_shotlist_from_source(self) -> list[int]:
+        """Retrieve shotlist from device-specific source.
+
+        This method is called when no shotlist file is provided. Subclasses should
+        implement their own logic (e.g., SQL database query, reading from existing dataset).
+
+        Returns
+        -------
+        list[int]
+            List of shot numbers to process
+        """
 
     @abstractmethod
     def make_raw_data_files(self):

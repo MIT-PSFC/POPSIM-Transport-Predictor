@@ -4,6 +4,7 @@ import os
 
 import netCDF4  # noqa: F401
 import numpy as np
+import toml
 import xarray as xr
 from disruption_py.machine.tokamak import Tokamak
 from disruption_py.settings import RetrievalSettings, TimeSetting, TimeSettingParams
@@ -13,11 +14,13 @@ from loguru import logger
 
 from popsim_transport_predictor import EPISODE_DIM, PACKAGE_ROOT, TIME_COORD, TIME_DIM
 from popsim_transport_predictor.datasets import make_uniform_1khz_timebase
+from popsim_transport_predictor.datasets.dispy_utils import summary
 from popsim_transport_predictor.datasets.workflow import DataWorkflow
 
 DEFAULT_SHOTLIST_FILE = os.path.join(
     PACKAGE_ROOT, "datasets", "d3d", "HBP_shotlist_2024"
 )
+CONFIG_FILE = os.path.join(PACKAGE_ROOT, "datasets", "d3d", "config.toml")
 
 
 class Uniform1kHzTimeSetting(TimeSetting):
@@ -95,9 +98,9 @@ class D3DDataWorkflow(DataWorkflow):
 
     def __init__(
         self,
-        shotlist_file: str,
-        raw_data_dir: str,
-        final_ds_dir: str,
+        ds_name: str,
+        shotlist_file: str | None,
+        data_assembly_dir: str,
         max_num_shots: int | None = None,
         use_ida: bool = True,
     ):
@@ -105,30 +108,60 @@ class D3DDataWorkflow(DataWorkflow):
 
         Parameters
         ----------
-        shotlist_file : str
-            Path to file containing list of shots to process
-        raw_data_dir : str
-            Directory where raw data files are stored
-        final_ds_dir : str
-            Directory to save the final combined dataset
+        ds_name : str
+            Name of the dataset/study, used for directory naming
+        shotlist_file : str | None
+            Path to file containing list of shots to process. If None, retrieves
+            shotlist from SQL database using parameters in config.toml.
+        data_assembly_dir : str
+            Directory where data files are stored and final dataset will be saved
         max_num_shots : int | None
             Maximum number of shots to process (for testing). If None, process all shots.
         use_ida : bool
             Whether to use IDA for profile data (True) or Zipfit (False). Default is True.
         """
 
+        # Load config
+        self.config = toml.load(CONFIG_FILE)
+        self.use_ida = use_ida
+
+        # Call parent init (which will call _get_shotlist_from_source if needed)
         super().__init__(
-            "d3d",
+            ds_name,
             shotlist_file,
-            raw_data_dir,
-            final_ds_dir,
+            data_assembly_dir,
             max_num_shots=max_num_shots,
         )
-        self.use_ida = use_ida
 
         self.valid_signal_bounds = {
             "Wtot_MJ": (1e-3, None),
         }
+
+    def _get_shotlist_from_source(self) -> list[int]:
+        """Retrieve shotlist from DIII-D SQL database.
+
+        Uses the summary() function to query the DIII-D database for shots
+        matching the criteria in config.toml.
+
+        Returns
+        -------
+        list[int]
+            List of shot numbers to process
+        """
+        query_config = self.config["shotlist_query"]
+
+        # Query the SQL database
+        data = summary(
+            summary_table=query_config["summary_table"],
+            ipmax=query_config["ipmax"],
+            pulse_length=query_config["pulse_length"],
+            min_shot=query_config["min_shot"],
+            max_shot=query_config["max_shot"],
+            shots=False,
+        )
+        shotlist = data[:, 0].astype(int).tolist()
+
+        return shotlist
 
     def _toksearch_signals(self, shot: int, max_time_ms: int) -> xr.Dataset:
         """Retrieve signals from TokSearch that require special handling.

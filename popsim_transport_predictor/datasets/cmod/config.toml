@@ -1,0 +1,36 @@
+# C-Mod Dataset Configuration
+
+[shotlist_query]
+# SQL query parameters for retrieving shotlist when no shotlist file is provided
+summary_table = "summary"
+ipmax = 100000.0  # Maximum plasma current threshold [A]
+pulse_length = 0.1  # Minimum pulse length [s]
+min_shot = 1050204013
+max_shot = 1160930043
+
+[thomson_filtering]
+# Days with blessed Thomson scattering data
+# Email from J. Hughes 2025-12-12
+blessed_days = [
+    1160503,
+    1160527,
+    1160621,
+    1160628,
+    1160630,
+    1160708,
+]
+blessed_day_ranges = [
+    [1160607, 1160610],
+    [1160712, 1160719],
+    [1160803, 1160820],
+    [1160823, 1160903],
+    [1160908, 1160916],
+    [1160919, 1160924],
+    [1160927, 1160931],
+]
+
+[profile_fitting]
+# Gaussian process profile fitting parameters
+rho_min = 0.0
+rho_max = 1.1
+num_rho_points = 56
