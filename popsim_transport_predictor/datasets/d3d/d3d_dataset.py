@@ -214,30 +214,36 @@ class D3DDataWorkflow(DataWorkflow):
         return ds_resampled
 
     def _get_fast_dataset_dispy(self, shot: int) -> xr.Dataset:
-        retrieval_settings = RetrievalSettings(
-            run_columns=["p_nbi", "p_ech", "p_ohm"],
-            time_setting=Uniform1MHzTimeSetting(),
-            only_requested_columns=True,
-        )
-        fast_result = get_shots_data(
-            tokamak=Tokamak.D3D,
-            shotlist_setting=shot,
-            retrieval_settings=retrieval_settings,
-            num_processes=1,
-        )
-        fast_result = fast_result.set_index(idx=["shot", "time"]).unstack("idx")
+        try:
+            retrieval_settings = RetrievalSettings(
+                run_columns=["p_nbi", "p_ech", "p_ohm"],
+                time_setting=Uniform1MHzTimeSetting(),
+                only_requested_columns=True,
+            )
+            fast_result = get_shots_data(
+                tokamak=Tokamak.D3D,
+                shotlist_setting=shot,
+                retrieval_settings=retrieval_settings,
+                num_processes=1,
+            )
+            fast_result = fast_result.set_index(idx=["shot", "time"]).unstack("idx")
 
-        # Coarsen to 1 kHz by taking the mean over previous 1ms window
-        ds_coarse = fast_result.coarsen(time=1000, boundary="trim").mean()
+            # Coarsen to 1 kHz by taking the mean over previous 1ms window
+            ds_coarse = fast_result.coarsen(time=1000, boundary="trim").mean()
 
-        # Rename signals to _fast
-        ds_coarse = ds_coarse.rename(
-            {
-                "p_nbi": "p_nbi_fast",
-                "p_ech": "p_ech_fast",
-                "p_ohm": "p_ohm_fast",
-            }
-        )
+            # Rename signals to _fast
+            ds_coarse = ds_coarse.rename(
+                {
+                    "p_nbi": "p_nbi_fast",
+                    "p_ech": "p_ech_fast",
+                    "p_ohm": "p_ohm_fast",
+                }
+            )
+        except Exception as e:
+            logger.warning(
+                f"Failed to get fast dataset for shot {shot} using disruption_py: {e}. Falling back to toksearch."
+            )
+            return None
 
         return ds_coarse
 
@@ -356,6 +362,8 @@ class D3DDataWorkflow(DataWorkflow):
                 continue
 
             ds_fast = self._get_fast_dataset_dispy(shot)
+            if ds_fast is None:
+                continue
             ds_0d = self._get_0D_dataset(shot)
 
             if self.use_ida:
@@ -430,6 +438,10 @@ class D3DDataWorkflow(DataWorkflow):
         ds["P_ICRF_MW"] = ds["p_ich"] / 1e6
         ds["P_LH_MW"] = ds["p_lhcd"] / 1e6
 
+        # If tau_conf doesn't exist, replace with 0's like Ip_MA
+        if "tau_conf" not in ds:
+            ds["tau_conf"] = xr.zeros_like(ds["Ip_MA"])
+
         # Only keep variables of interest
         ds = ds[
             [
@@ -495,5 +507,18 @@ class D3DDataWorkflow(DataWorkflow):
             ds["Wtot_MJ"] = ds["Wtot_MJ"].where(
                 ~wtot_missing_or_zero, other=ds["Wmhd_MJ"]
             )
+
+        # Use the smoothed version of P_NBI
+        ds["P_NBI_MW"] = np.abs(ds["P_NBI_MW_alt"])
+
+        # Drop unnecessary alternative signals
+        alt_signals = [
+            "P_NBI_MW_alt",
+            "P_oh_MW_alt",
+            "P_rad_MW_alt",
+        ]
+        for sig in alt_signals:
+            if sig in ds:
+                ds = ds.drop_vars(sig)
 
         return ds

@@ -1,22 +1,21 @@
 import os
-from popsim_transport_predictor import PACKAGE_ROOT
 
-from loguru import logger
+from popsim_transport_predictor import PACKAGE_ROOT
 
 SUMMARY_TABLE = "summaries"
 IPMAX = 400e3  # [A]
 PULSE_LENGTH = 0.1  # [s]
 MIN_SHOT = 156199
-MAX_SHOT = 204996 # Original was 177061 from 1 kHz EFIT bounds, though might not be relevant anymore
+MAX_SHOT = 204996  # Original was 177061 from 1 kHz EFIT bounds, though might not be relevant anymore
 
 HP_SHOTLIST_FILES = [
     "HBP_shotlist_2013_2025",
     "HBP_shotlist_2019_2022",  # Completely encompassed by 2013_2025
-    "HBP_shotlist_2024",       # Completely encompassed by 2013_2025
+    "HBP_shotlist_2024",  # Completely encompassed by 2013_2025
 ]
 sd = {}
 for i, shotlist_file in enumerate(HP_SHOTLIST_FILES):
-    with open(os.path.join(PACKAGE_ROOT, "datasets", "d3d", shotlist_file), "r") as f:
+    with open(os.path.join(PACKAGE_ROOT, "datasets", "d3d", shotlist_file)) as f:
         lines = f.readlines()
         shot_numbers = [int(line.strip()) for line in lines if line.strip().isdigit()]
     sd[i] = shot_numbers
@@ -53,4 +52,3 @@ D3D_SIGNAL_BOUNDS = {
     "P_oh_MW": {"bounds": (0, 3.5)},
     "P_ICRF_MW": {"bounds": (0, 4.0)},
 }
-
