@@ -68,6 +68,10 @@ class DataWorkflow:
     def standardize_signal_names(self, ds: xr.Dataset) -> xr.Dataset:
         """Rename signals in the dataset to match the POPSIM convention"""
 
+    @abstractmethod
+    def device_specific_processing(self, ds: xr.Dataset) -> xr.Dataset:
+        """Apply any device-specific processing steps before the general workflow"""
+
     def log_ds_details(self, ds: xr.Dataset):  # noqa: PLR0912
         logger.info(f"Final dataset dimensions: {ds.dims}")
         logger.info(f"Final dataset variables: {list(ds.data_vars)}")
