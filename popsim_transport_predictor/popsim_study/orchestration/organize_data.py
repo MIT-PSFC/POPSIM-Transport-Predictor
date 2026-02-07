@@ -28,18 +28,6 @@ REQUIRED_SIGNALS = [
 
 INPUT_POWER_SIGNALS = ["P_ECRH_MW", "P_NBI_MW", "P_ICRF_MW", "P_LH_MW"]
 
-# Key is original signal name, value is new name
-TCV_SIGNAL_REMAPPINGS = {
-    "RMAG": "R0",
-    "BZERO": "B0",
-    "I_P": "Ip",
-    "DELTA_TOP": "delta_top",
-    "DELTA_BOTTOM": "delta_bottom",
-    "KAPPA": "kappa",
-    "NBI": "P_NBI_MW",
-    "ECRH": "P_ECRH_MW",
-}
-
 
 def get_ds(
     source_ds: str,
@@ -60,17 +48,6 @@ def get_ds(
     elif source_ds == "tcv":
         ds_path = config.tcv_dataset_path
         ds = xr.open_dataset(ds_path)
-        # Rename TCV signals to match expected names
-        ds = ds.rename(TCV_SIGNAL_REMAPPINGS)
-        ds["Ip_MA"] = np.abs(ds["Ip"]) / 1e6  # Convert from A to MA
-        ds["ne20_rho"] = ds["Ne_rho"] * 1e-20  # Convert from m^-3 to 10^20 m^-3
-        ds["Te_keV_rho"] = ds["Te_rho"] / 1e3  # Convert from eV to keV
-        ds["P_oh_MW"] = ds["POHM"] / 1e6  # Convert from W to MW
-        ds["ne20_line_avg"] = ds["NEavg"] * 1e-20  # Convert from m^-3 to 10^20 m^-3
-        ds["Wtot_MJ"] = ds["Wtot"] / 1e6  # Convert from J to MJ
-        ds.drop_vars(
-            ["Ip", "Ne_rho", "Te_rho", "NEavg", "POHM", "Wtot"], errors="ignore"
-        )
     elif source_ds in ["d3d_lp", "d3d_hp"]:
         if source_ds == "d3d_lp":
             ds_path = config.d3d_lp_dataset_path
@@ -110,7 +87,6 @@ def get_ds(
     ds["ne19_line_avg"] = ds["ne20_line_avg"] * 10
     ds["epsilon"] = ds["a_minor"] / ds["R0"]
 
-    # TODO(ZanderKeith): Later when we have multiple density treatments this should be handled better
     ds["ne20"] = ds["ne20_line_avg"]
     ds["ne19"] = ds["ne19_line_avg"]
 
