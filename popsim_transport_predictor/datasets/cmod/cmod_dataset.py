@@ -285,7 +285,11 @@ class CModDataWorkflow(DataWorkflow):
                 continue
 
             # Get EFIT and 0D data
-            ds_efit = self._get_efit_dataset(shot)
+            try:
+                ds_efit = self._get_efit_dataset(shot)
+            except Exception as e:
+                logger.warning(f"Failed to retrieve EFIT data for shot {shot}: {e}")
+                continue
 
             if self.skip_profiles:
                 # Skip profile fitting, use zeros instead
