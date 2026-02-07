@@ -4,6 +4,7 @@ import os
 
 import netCDF4  # noqa: F401
 import numpy as np
+import toml
 import xarray as xr
 from disruption_py.machine.tokamak import Tokamak
 from disruption_py.settings import RetrievalSettings
@@ -16,9 +17,11 @@ from popsim_transport_predictor.datasets.cmod import (
     CMOD_DATASET_SIGNALS,
 )
 from popsim_transport_predictor.datasets.cmod.gp_fit import gp_profile
+from popsim_transport_predictor.datasets.dispy_utils import summary
 from popsim_transport_predictor.datasets.workflow import DataWorkflow
 
 DEFAULT_SHOTLIST_FILE = os.path.join(PACKAGE_ROOT, "datasets", "cmod", "cmod_shotlist")
+CONFIG_FILE = os.path.join(PACKAGE_ROOT, "datasets", "cmod", "config.toml")
 
 
 class CModDataWorkflow(DataWorkflow):
@@ -33,9 +36,9 @@ class CModDataWorkflow(DataWorkflow):
 
     def __init__(
         self,
-        shotlist_file: str,
-        raw_data_dir: str,
-        final_ds_dir: str,
+        ds_name: str,
+        shotlist_file: str | None,
+        data_assembly_dir: str,
         max_num_shots: int | None = None,
         gp_fit_rho: np.ndarray | None = None,
     ):
@@ -43,28 +46,76 @@ class CModDataWorkflow(DataWorkflow):
 
         Parameters
         ----------
-        shotlist_file : str
-            Path to file containing list of shots to process
-        raw_data_dir : str
-            Directory where raw data files are stored
-        final_ds_dir : str
-            Directory to save the final combined dataset
+        ds_name : str
+            Name of the dataset/study, used for directory naming
+        shotlist_file : str | None
+            Path to file containing list of shots to process. If None, retrieves
+            shotlist from SQL database using parameters in config.toml.
+        data_assembly_dir : str
+            Directory where data files are stored and final dataset will be saved
         max_num_shots : int | None
             Maximum number of shots to process (for testing). If None, process all shots.
         gp_fit_rho : np.ndarray | None
-            Radial locations for GP profile fitting. If None, uses default linspace(0, 1.1, 56).
+            Radial locations for GP profile fitting. If None, uses default from config.
         """
 
+        # Load config
+        self.config = toml.load(CONFIG_FILE)
+
+        # Set up GP fitting rho grid
+        if gp_fit_rho is not None:
+            self.gp_fit_rho = gp_fit_rho
+        else:
+            # Use config values
+            prof_config = self.config["profile_fitting"]
+            self.gp_fit_rho = np.linspace(
+                prof_config["rho_min"],
+                prof_config["rho_max"],
+                prof_config["num_rho_points"],
+            )
+
+        # Call parent init (which will call _get_shotlist_from_source if needed)
         super().__init__(
-            "cmod",
+            ds_name,
             shotlist_file,
-            raw_data_dir,
-            final_ds_dir,
+            data_assembly_dir,
             max_num_shots=max_num_shots,
         )
-        self.gp_fit_rho = (
-            gp_fit_rho if gp_fit_rho is not None else np.linspace(0, 1.1, 56)
+
+    def _get_shotlist_from_source(self) -> list[int]:
+        """Retrieve shotlist from C-Mod SQL database.
+
+        Uses the summary() function to query the C-Mod database for shots
+        matching the criteria in config.toml, then filters to blessed Thomson days.
+
+        Returns
+        -------
+        list[int]
+            List of shot numbers to process
+        """
+        query_config = self.config["shotlist_query"]
+
+        # Query the SQL database
+        data = summary(
+            summary_table=query_config["summary_table"],
+            ipmax=query_config["ipmax"],
+            pulse_length=query_config["pulse_length"],
+            min_shot=query_config["min_shot"],
+            max_shot=query_config["max_shot"],
+            shots=False,
         )
+        shotlist = data[:, 0].astype(int).tolist()
+
+        # Build list of blessed Thomson days
+        thomson_config = self.config["thomson_filtering"]
+        blessed_days = list(thomson_config["blessed_days"])
+        for day_range in thomson_config["blessed_day_ranges"]:
+            blessed_days.extend(range(day_range[0], day_range[1]))
+
+        # Filter to blessed Thomson days
+        shotlist = [shot for shot in shotlist if int(shot / 1000) in blessed_days]
+
+        return shotlist
 
     def _get_thomson_dataset(self, shot: int) -> xr.Dataset | None:
         """Retrieve Thomson scattering data for a shot.

@@ -1,0 +1,10 @@
+# TCV Dataset Configuration
+
+[data_sources]
+# Default path to source TCV dataset (from DEFUSE or similar)
+default_source_dataset = "/orcd/nese/psfc/001/allenw/ml_data_dump/TCV/zkeith/TCV_transport_dataset/full/dataset.nc"
+
+[shotlist_query]
+# For TCV, shotlist is retrieved from the source dataset itself
+# No SQL database query needed
+use_source_dataset = true

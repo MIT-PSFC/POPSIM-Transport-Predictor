@@ -1,0 +1,13 @@
+# DIII-D Dataset Configuration
+
+[shotlist_query]
+# SQL query parameters for retrieving shotlist when no shotlist file is provided
+summary_table = "d3d_shots"
+ipmax = 400000.0  # Maximum plasma current threshold [A]
+pulse_length = 1.0  # Minimum pulse length [s]
+min_shot = 100000
+max_shot = 999999
+
+[data_sources]
+# IDA profile database path pattern
+ida_path_pattern = "/fusion/projects/results/ida-results/HBP_database/IDA_{shot}_.cdf"

@@ -6,11 +6,9 @@ from loguru import logger
 
 from popsim_transport_predictor.config import DATA_DUMP_DIR
 from popsim_transport_predictor.datasets.cmod.cmod_dataset import CModDataWorkflow
-from popsim_transport_predictor.datasets.d3d.d3d_dataset import (
-    DEFAULT_SHOTLIST_FILE,
-    D3DDataWorkflow,
-)
+from popsim_transport_predictor.datasets.d3d.d3d_dataset import D3DDataWorkflow
 from popsim_transport_predictor.datasets.plotting import ds_time_plot
+from popsim_transport_predictor.datasets.tcv.tcv_dataset import TCVDataWorkflow
 
 
 class DatasetCLI:
@@ -19,16 +17,16 @@ class DatasetCLI:
     def cmod(
         self,
         ds_name: str = "cmod",
-        raw_data_dir: str = DATA_DUMP_DIR,
-        final_ds_dir: str = DATA_DUMP_DIR,
+        shotlist_file: str | None = None,
+        data_assembly_dir: str | None = DATA_DUMP_DIR,
         max_num_shots: int | None = None,
         mode: str | None = "raw",
         clean: bool | None = False,
     ):
         workflow = CModDataWorkflow(
             ds_name=ds_name,
-            raw_data_dir=raw_data_dir,
-            final_ds_dir=final_ds_dir,
+            shotlist_file=shotlist_file,
+            data_assembly_dir=data_assembly_dir,
             max_num_shots=max_num_shots,
         )
 
@@ -37,9 +35,8 @@ class DatasetCLI:
     def d3d(
         self,
         ds_name: str = "d3d",
-        shotlist_file: str = DEFAULT_SHOTLIST_FILE,
-        raw_data_dir: str = DATA_DUMP_DIR,
-        final_ds_dir: str = DATA_DUMP_DIR,
+        shotlist_file: str | None = None,
+        data_assembly_dir: str | None = DATA_DUMP_DIR,
         max_num_shots: int | None = None,
         mode: str | None = "raw",
         clean: bool | None = False,
@@ -48,10 +45,29 @@ class DatasetCLI:
         workflow = D3DDataWorkflow(
             ds_name=ds_name,
             shotlist_file=shotlist_file,
-            raw_data_dir=raw_data_dir,
-            final_ds_dir=final_ds_dir,
+            data_assembly_dir=data_assembly_dir,
             max_num_shots=max_num_shots,
             use_ida=use_ida,
+        )
+
+        self._execute(workflow, mode, clean)
+
+    def tcv(
+        self,
+        ds_name: str = "tcv",
+        shotlist_file: str | None = None,
+        data_assembly_dir: str | None = DATA_DUMP_DIR,
+        source_dataset_path: str | None = None,
+        max_num_shots: int | None = None,
+        mode: str | None = "raw",
+        clean: bool | None = False,
+    ):
+        workflow = TCVDataWorkflow(
+            ds_name=ds_name,
+            shotlist_file=shotlist_file,
+            data_assembly_dir=data_assembly_dir,
+            source_dataset_path=source_dataset_path,
+            max_num_shots=max_num_shots,
         )
 
         self._execute(workflow, mode, clean)
