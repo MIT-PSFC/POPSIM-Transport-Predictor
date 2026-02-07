@@ -370,12 +370,16 @@ class ModelComparison:
 
 @staticmethod
 def run_study(
-    project_name: str = "popsim_transport_predictor",
-    working_dir_base: str = PACKAGE_ROOT,
-    figure_dir_base: str = PACKAGE_ROOT,
-    clean_models: bool = False,
-    clean_results: bool = False,
-    clean_figures: bool = False,
+    project_name: str | None = "transport_predictor_transfer",
+    working_dir_base: str | None = PACKAGE_ROOT,
+    figure_dir_base: str | None = PACKAGE_ROOT,
+    cmod_dataset_path: str | None = config.cmod_dataset_path,
+    tcv_dataset_path: str | None = config.tcv_dataset_path,
+    d3d_lp_dataset_path: str | None = config.d3d_lp_dataset_path,
+    d3d_hp_dataset_path: str | None = config.d3d_hp_dataset_path,
+    clean_models: bool | None = False,
+    clean_results: bool | None = False,
+    clean_figures: bool | None = False,
 ):
     """
     Go from datasets to all figures in one command.
@@ -383,33 +387,33 @@ def run_study(
 
     Requires specifying paths to the source datasets.
     Due to data sharing restrictions, the only dataset included in this repository is for C-Mod.
-    If you have access to data from other tokamaks (e.g. DIII-D), create a source dataset using the script at (TODO(ZanderKeith))
+    If you have access to data from other tokamaks (e.g. DIII-D), create a source dataset using the scripts in `popsim_transport_predictor/datasets/`
     and provide the path when running this script.
     If a dataset is not provided for a tokamak, figures which require that data will be skipped.
 
-    *I hardly lifted a finger*
+    "I hardly lifted a finger" - Engi B
 
     Parameters
     ----------
-    project_name : str
+    project_name : str | None
         Name of the project. Used to separate different runs within the working and figure directories.
-    working_dir_base : str
+    working_dir_base : str | None
         Base directory for working data. Trained models and intermediate data files will be placed in `{working_dir_base}/{project_name}`.
-    figure_dir_base : str
+    figure_dir_base : str | None
         Base directory for figures. Figures will be placed in `{figure_dir_base}/{project_name}`.
-    cmod_dataset_path : str
-        Path to the C-Mod dataset file. If not provided, C-Mod figures will be skipped.
-    tcv_dataset_path : str
-        Path to the TCV dataset file. If not provided, TCV figures will be skipped.
-    d3d_lp_dataset_path : str
-        Path to the DIII-D low-performance dataset file. If not provided, DIII-D figures will be skipped.
-    d3d_hp_dataset_path : str
-        Path to the DIII-D high-performance dataset file. If not provided, DIII-D figures will be skipped.
-    clean_models : bool
+    cmod_dataset_path : str | None
+        Path to the C-Mod dataset file. If not provided, figures which require C-Mod data will be skipped.
+    tcv_dataset_path : str | None
+        Path to the TCV dataset file. If not provided, figures which require TCV data will be skipped.
+    d3d_lp_dataset_path : str | None
+        Path to the DIII-D low-performance dataset file. If not provided, figures which require DIII-D low-performance data will be skipped.
+    d3d_hp_dataset_path : str | None
+        Path to the DIII-D high-performance dataset file. If not provided, figures which require DIII-D high-performance data will be skipped.
+    clean_models : bool | None
         If True, delete any existing trained models in the working directory before running.
-    clean_results : bool
+    clean_results : bool | None
         If True, delete any existing intermediate results in the working directory before running.
-    clean_figures : bool
+    clean_figures : bool | None
         If True, delete any existing figures in the figure directory before running.
     """
 

@@ -2450,6 +2450,7 @@ version = "0.1.0"
 source = { editable = "." }
 dependencies = [
     { name = "disruption-py" },
+    { name = "dynaconf" },
     { name = "fire" },
     { name = "gptools" },
     { name = "netcdf4" },
@@ -2475,6 +2476,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "disruption-py", editable = "submodules/disruption-py" },
+    { name = "dynaconf", specifier = ">=3.2.12" },
     { name = "fire", specifier = ">=0.7.1" },
     { name = "gptools", editable = "submodules/gptools" },
     { name = "netcdf4" },

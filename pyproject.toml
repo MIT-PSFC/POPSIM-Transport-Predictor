@@ -13,6 +13,7 @@ dependencies = [
     "netcdf4",
     "fire>=0.7.1",
     "pydantic-settings>=2.12.0",
+    "dynaconf>=3.2.12",
 ]
 
 [dependency-groups]
