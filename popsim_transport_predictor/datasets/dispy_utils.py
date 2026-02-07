@@ -1,5 +1,5 @@
 import numpy as np
-from disruption_py.machine.tokamak import Tokamak, resolve_tokamak_from_environment
+from disruption_py.machine.tokamak import resolve_tokamak_from_environment
 from disruption_py.workflow import get_database
 from loguru import logger
 

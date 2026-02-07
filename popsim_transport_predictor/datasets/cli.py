@@ -37,14 +37,14 @@ class DatasetCLI:
             if clean:
                 shutil.rmtree(raw_data_dir)
             os.makedirs(raw_data_dir, exist_ok=True)
-            log_path = os.path.join(raw_data_dir, "raw_data.log")
+            log_path = os.path.join(raw_data_dir, f"raw_data_{os.getpid()}.log")
             logger.add(log_path)
             workflow.make_raw_data_files()
         elif mode == "process":
             if clean:
                 shutil.rmtree(final_ds_dir)
             os.makedirs(final_ds_dir, exist_ok=True)
-            log_path = os.path.join(final_ds_dir, "processed_data.log")
+            log_path = os.path.join(final_ds_dir, f"processed_data_{os.getpid()}.log")
             logger.add(log_path)
             workflow.run_processed_data_workflow()
             ds_time_plot(
