@@ -228,6 +228,9 @@ class DataWorkflow:
 
         # Apply any processing steps needed. If something breaks, return None to skip this shot.
         shot_ds = self.device_specific_processing(shot_ds)
+        if shot_ds is None:
+            logger.warning(f"Skipping shot {shot_id} due to processing issues")
+            return None
 
         # Ensure powers are non-negative
         power_signals = [

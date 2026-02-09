@@ -426,6 +426,14 @@ class TCVDataWorkflow(DataWorkflow):
             Processed dataset ready for general workflow
         """
 
+        sus_shots = [
+            85117,  # P_rad consistently higher than P_oh and no other power sources
+            83412,  # P_rad consistently higher than P_oh and no other power sources
+        ]
+
+        if ds.shot.values[0] in sus_shots:
+            return None
+
         # Simple fringe-jump correction for ne20_line_avg
         # Detect large step changes and remove the offset for the remainder of the trace
         if "ne20_line_avg" in ds:
