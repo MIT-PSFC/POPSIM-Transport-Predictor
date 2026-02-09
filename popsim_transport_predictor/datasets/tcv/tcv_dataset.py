@@ -15,6 +15,30 @@ from popsim_transport_predictor.datasets.workflow import DataWorkflow
 
 DEFAULT_SHOTLIST_FILE = os.path.join(PACKAGE_ROOT, "datasets", "tcv", "tcv_shotlist")
 
+TCV_0D_SIGNALS = [
+    # Required by the transport predictor module
+    "I_P",
+    "BZERO",
+    "DELTA",
+    "DELTA_TOP",
+    "DELTA_BOTTOM",
+    "ECRH",
+    "KAPPA",
+    "NBI",
+    "NEavg",
+    "Ne_edge_avg",
+    "POHM",
+    "P_LH",
+    "PradBulk",
+    "RMAG",
+    "Wtot",
+    "a_minor",
+    # Extra things for comparison
+    "BETAP",
+    "BETAN",
+    "TAU_conf_calc",
+]
+
 
 class TCVDataWorkflow(DataWorkflow):
     """TCV specific data workflow for creating and processing datasets.
@@ -163,39 +187,15 @@ class TCVDataWorkflow(DataWorkflow):
                 logger.warning(f"Could not load shot file for shot {shot}, skipping")
                 continue
 
-            # Validate shot has required signals
-            ds_validated = self.standardize_signal_names(ds_shot)
-            if ds_validated is None:
-                logger.warning(f"Validation failed for shot {shot}, skipping")
-                continue
-
-            # Determine maximum time from all time coordinates in the dataset
-            max_time = 0.0
-            for coord_name in ds_validated.coords:
-                if coord_name.startswith(("time_", "t_")):
-                    coord_max = float(ds_validated[coord_name].max().values)
-                    max_time = max(max_time, coord_max)
-
-            if max_time <= 0:
-                logger.warning(
-                    f"Could not determine valid max time for shot {shot}, skipping"
-                )
-                continue
-
-            # Create uniform 1 kHz timebase
+            # Create uniform 1 kHz timebase (max time where I_P is greater than 50 kA)
+            valid_ip_mask = np.abs(ds_shot["I_P"]) > 50e3
+            max_time = ds_shot["time_I_P"].where(valid_ip_mask, drop=True).max().item()
             timebase = make_uniform_1khz_timebase(max_time)
 
-            # Interpolate all signals onto uniform timebase
-            ds_standardized = self._create_uniform_timebase_dataset(
-                ds_validated, timebase
-            )
+            # Put signals on uniform timebase
+            ds_standardized = self._create_uniform_timebase_dataset(ds_shot, timebase)
 
-            # Rename time_idx coordinate to time for consistency
-            if (
-                TIME_DIM in ds_standardized.coords
-                and TIME_COORD not in ds_standardized.coords
-            ):
-                ds_standardized = ds_standardized.rename({TIME_DIM: TIME_COORD})
+            ds_standardized = self.standardize_signal_names(ds_standardized)
 
             # Add shot as a dimension (not just coordinate) - required for processing pipeline
             # The processing pipeline expects all data files to have shape (1, time_idx, ...)
@@ -231,105 +231,93 @@ class TCVDataWorkflow(DataWorkflow):
         # Dictionary to store interpolated variables
         interp_vars = {}
 
-        # Define signal mappings: {target_name: (source_name, time_coord, unit_conversion_factor)}
-        scalar_signals = {
-            "B0": ("BZERO", "time_BZERO", lambda x: np.abs(x)),
-            "Ip_MA": ("I_P", "time_I_P", lambda x: np.abs(x) * 1e-6),
-            "P_oh_MW": ("POHM", "time_POHM", lambda x: x * 1e-6),
-            "P_rad_MW": ("PradBulk", "time_PradBulk", lambda x: x * 1e-6),
-            "ne20_line_avg": ("NEavg", "time_NEavg", lambda x: x * 1e-20),
-            "Wtot_MJ": ("Wtot", "time_Wtot", lambda x: x * 1e-6),
-            "R0": ("RMAG", "time_RMAG", lambda x: x),
-            "kappa": ("KAPPA", "time_KAPPA", lambda x: x),
-            "delta_top": ("DELTA_TOP", "time_DELTA_TOP", lambda x: x),
-            "delta_bottom": ("DELTA_BOTTOM", "time_DELTA_BOTTOM", lambda x: x),
-        }
-
         # Interpolate scalar signals
-        for target_name, (source_name, time_coord, converter) in scalar_signals.items():
-            if source_name in ds and time_coord in ds.coords:
+        for signal in TCV_0D_SIGNALS:
+            if signal in ds and f"time_{signal}" in ds.coords:
                 try:
                     # Get the signal and its time coordinate
-                    signal = ds[source_name]
+                    signal_data = ds[signal].values
+                    signal_time = ds[f"time_{signal}"].values
 
-                    # Convert and interpolate
-                    signal_converted = converter(signal)
-                    signal_interp = signal_converted.interp(
-                        {time_coord: timebase},
-                        method="linear",
-                        kwargs={"fill_value": np.nan},
+                    interp_data = np.interp(
+                        timebase, signal_time, signal_data, left=np.nan, right=np.nan
                     )
 
-                    # Store with new time dimension
-                    interp_vars[target_name] = (TIME_DIM, signal_interp.values)
+                    interp_da = xr.DataArray(
+                        interp_data,
+                        dims=[TIME_DIM],
+                        coords={
+                            TIME_DIM: np.arange(len(timebase)),
+                            TIME_COORD: (TIME_DIM, timebase),
+                        },
+                    )
+                    interp_vars[signal] = interp_da
                 except Exception as e:
-                    logger.warning(f"Failed to interpolate {source_name}: {e}")
-
-        # Handle heating power signals (may not exist)
-        for target, source, time_coord in [
-            ("P_ECRH_MW", "ECRH", "time_ECRH"),
-            ("P_NBI_MW", "NBI", "time_NBI"),
-        ]:
-            if source in ds and time_coord in ds.coords:
-                signal_interp = (ds[source] * 1e-6).interp(
-                    {time_coord: timebase},
-                    method="linear",
-                    kwargs={"fill_value": np.nan},
-                )
-                interp_vars[target] = (TIME_DIM, signal_interp.values)
-            else:
-                interp_vars[target] = (TIME_DIM, np.zeros_like(timebase))
-
-        # TCV doesn't have LH or ICRF
-        interp_vars["P_LH_MW"] = (TIME_DIM, np.zeros_like(timebase))
-        interp_vars["P_ICRF_MW"] = (TIME_DIM, np.zeros_like(timebase))
-
-        # TCV doesn't typically have tau_conf
-        interp_vars["tau_conf"] = (TIME_DIM, np.zeros_like(timebase))
+                    logger.warning(f"Failed to interpolate {signal}: {e}")
 
         # Handle profile data (Ne_rho, Te_rho)
-        # Use rectilinear (nearest-neighbor with forward fill) interpolation for slow diagnostic signals
-        if "Ne_rho" in ds and "t_Ne_rho" in ds.coords and "x_Ne_rho" in ds.coords:
-            try:
-                ne_prof = ds["Ne_rho"]
-                ne_rho = ds["x_Ne_rho"]
+        # Use rectilinear interpolation (forward-fill) for slow diagnostic signals
+        for signal in ["Ne_rho", "Te_rho"]:
+            if (
+                signal in ds
+                and f"t_{signal}" in ds.coords
+                and f"x_{signal}" in ds.coords
+            ):
+                try:
+                    profile_data = ds[
+                        signal
+                    ].values  # Shape: (time_profile, rho_profile)
+                    profile_time = ds[f"t_{signal}"].values
+                    profile_rho = ds[f"x_{signal}"].values
 
-                # Use nearest-neighbor interpolation (rectilinear) for profile data
-                # This is appropriate for slow diagnostics where we want piecewise constant values
-                ne_interp = ne_prof.interp(
-                    t_Ne_rho=timebase, method="nearest", kwargs={"fill_value": np.nan}
+                    # Find indices in profile_time for each timebase point
+                    # searchsorted with side='right' gives us the index after each timebase point
+                    indices = np.searchsorted(profile_time, timebase, side="right") - 1
+                    interp_profile = np.full((len(timebase), len(profile_rho)), np.nan)
+                    valid_mask = (indices >= 0) & (indices < len(profile_time))
+                    interp_profile[valid_mask, :] = profile_data[indices[valid_mask], :]
+
+                    # Store with proper dimensions
+                    interp_vars[signal] = xr.DataArray(
+                        interp_profile,
+                        dims=[TIME_DIM, "rho"],
+                        coords={
+                            TIME_DIM: np.arange(len(timebase)),
+                            TIME_COORD: (TIME_DIM, timebase),
+                            "rho": profile_rho,
+                        },
+                    )
+
+                except Exception as e:
+                    logger.warning(f"Failed to interpolate {signal}: {e}")
+
+        # Ensure profile data variables exist for all shots (filled with NaN if not available)
+        # This is required for consistent zarr store structure
+        default_rho = np.linspace(0, 1, 200)  # Standard rho grid
+        for signal in ["Ne_rho", "Te_rho"]:
+            if signal not in interp_vars:
+                logger.info(f"Profile data {signal} not available, filling with NaN")
+                interp_vars[signal] = xr.DataArray(
+                    np.full((len(timebase), len(default_rho)), np.nan),
+                    dims=[TIME_DIM, "rho"],
+                    coords={
+                        TIME_DIM: np.arange(len(timebase)),
+                        TIME_COORD: (TIME_DIM, timebase),
+                        "rho": default_rho,
+                    },
                 )
-                # Convert units
-                ne_interp = ne_interp * 1e-20
-
-                interp_vars["ne20_rho"] = ((TIME_DIM, "rho"), ne_interp.values)
-                interp_vars["rho"] = ("rho", ne_rho.values)
-            except Exception as e:
-                logger.warning(f"Failed to interpolate Ne_rho: {e}")
-
-        if "Te_rho" in ds and "t_Te_rho" in ds.coords and "x_Te_rho" in ds.coords:
-            try:
-                te_prof = ds["Te_rho"]
-                te_rho = ds["x_Te_rho"]
-
-                # Use nearest-neighbor interpolation (rectilinear) for profile data
-                # This is appropriate for slow diagnostics where we want piecewise constant values
-                te_interp = te_prof.interp(
-                    t_Te_rho=timebase, method="nearest", kwargs={"fill_value": np.nan}
-                )
-                # Convert units (eV to keV)
-                te_interp = te_interp * 1e-3
-
-                interp_vars["Te_keV_rho"] = ((TIME_DIM, "rho"), te_interp.values)
-                if "rho" not in interp_vars:
-                    interp_vars["rho"] = ("rho", te_rho.values)
-            except Exception as e:
-                logger.warning(f"Failed to interpolate Te_rho: {e}")
 
         # Create the dataset
-        coords = {TIME_DIM: timebase}
+        # Coords are already set in the DataArrays, so we just need to extract rho if present
+        coords = {TIME_DIM: np.arange(len(timebase)), TIME_COORD: (TIME_DIM, timebase)}
         if "rho" in interp_vars:
             coords["rho"] = interp_vars.pop("rho")[1]
+        elif "Ne_rho" in interp_vars or "Te_rho" in interp_vars:
+            # Get rho from one of the profile variables
+            if "Ne_rho" in interp_vars:
+                coords["rho"] = interp_vars["Ne_rho"].coords["rho"]
+            elif "Te_rho" in interp_vars:
+                coords["rho"] = interp_vars["Te_rho"].coords["rho"]
 
         ds_uniform = xr.Dataset(data_vars=interp_vars, coords=coords)
 
@@ -352,24 +340,71 @@ class TCVDataWorkflow(DataWorkflow):
         xr.Dataset | None
             Dataset ready for interpolation, or None if critical signals are missing
         """
-        # Check for critical signals
-        required_signals = ["I_P", "BZERO"]
-        for signal in required_signals:
-            if signal not in ds:
-                logger.warning(f"Critical signal {signal} missing, skipping shot")
-                return None
 
-        # Check if profile data exists
-        has_ne_profile = "Ne_rho" in ds and "t_Ne_rho" in ds.coords
-        has_te_profile = "Te_rho" in ds and "t_Te_rho" in ds.coords
+        # Simple renames
+        ds = ds.rename(
+            {
+                "RMAG": "R0",
+                "KAPPA": "kappa",
+                "DELTA_TOP": "delta_top",
+                "DELTA_BOTTOM": "delta_bottom",
+            }
+        )
 
-        if not has_ne_profile or not has_te_profile:
-            logger.warning(
-                f"Missing profile data (Ne_rho: {has_ne_profile}, Te_rho: {has_te_profile}), skipping shot"
-            )
-            return None
+        # Conversions
+        ds["B0"] = np.abs(ds["BZERO"])
+        ds["Ip_MA"] = np.abs(ds["I_P"]) * 1e-6
+        ds["P_oh_MW"] = ds["POHM"] * 1e-6
+        ds["P_rad_MW"] = ds["PradBulk"] * 1e-6
+        ds["ne20_line_avg"] = ds["NEavg"] * 1e-20
+        ds["ne20_edge"] = ds["Ne_edge_avg"] * 1e-20
+        ds["Wtot_MJ"] = ds["Wtot"] * 1e-6
+        ds["LH_transition_threshold_MW"] = ds["P_LH"] * 1e-6
 
-        # Return the dataset as-is - interpolation will happen in make_raw_data_files
+        # Profile data may not be available for all shots
+        if "Ne_rho" in ds:
+            ds["ne20_rho"] = ds["Ne_rho"] * 1e-20
+        if "Te_rho" in ds:
+            ds["Te_keV_rho"] = ds["Te_rho"] * 1e-3
+
+        # If the signal is not present, create it as zeros up to shape of Ip_MA
+        # But where Ip_MA is NaN, keep it NaN
+        for new_name, original_name in zip(
+            ["P_NBI_MW", "P_ECRH_MW", "P_LH_MW", "P_ICRF_MW"],
+            ["NBI", "ECRH", "P_LH_MW", "P_ICRF_MW"],
+            strict=True,
+        ):
+            if original_name not in ds:
+                ds[new_name] = xr.where(ds["Ip_MA"].notnull(), 0.0, np.nan)
+            else:
+                ds[new_name] = xr.where(
+                    ds["Ip_MA"].notnull(), ds[original_name].fillna(0.0), np.nan
+                )
+
+        # Drop old names
+        ds = ds.drop(
+            [
+                "I_P",
+                "BZERO",
+                "DELTA",
+                "DELTA_TOP",
+                "DELTA_BOTTOM",
+                "ECRH",
+                "KAPPA",
+                "NBI",
+                "NEavg",
+                "Ne_edge_avg",
+                "POHM",
+                "PradBulk",
+                "RMAG",
+                "Wtot",
+                "Ne_rho",
+                "Te_rho",
+                "P_LH",
+            ],
+            errors="ignore",
+        )
+
         return ds
 
     def device_specific_processing(self, ds: xr.Dataset) -> xr.Dataset:
@@ -394,7 +429,7 @@ class TCVDataWorkflow(DataWorkflow):
         # Simple fringe-jump correction for ne20_line_avg
         # Detect large step changes and remove the offset for the remainder of the trace
         if "ne20_line_avg" in ds:
-            ne_values = ds["ne20_line_avg"].values
+            ne_values = ds["ne20_line_avg"].values[0, :]
             if not np.all(np.isnan(ne_values)):
                 trace = ne_values.copy()
                 diff = np.diff(trace)
@@ -413,7 +448,10 @@ class TCVDataWorkflow(DataWorkflow):
                         offset += step
                     corrected[i] = trace[i] - offset
 
-                ds["ne20_line_avg"] = (ds["ne20_line_avg"].dims, corrected)
+                ds["ne20_line_avg"] = (
+                    ds["ne20_line_avg"].dims,
+                    corrected[np.newaxis, :],
+                )
 
         # Only keep data where ne20_line_avg is above 0.1e20
         if "ne20_line_avg" in ds:
