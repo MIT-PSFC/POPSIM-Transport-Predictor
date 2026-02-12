@@ -259,4 +259,10 @@ class DataWorkflow:
 
         shot_ds = shot_ds.where(valid_mask, drop=True)
 
+        # Label where the profiles are fresh (not carried forward by ffill)
+        if "fresh_profiles" not in shot_ds:
+            shot_ds["fresh_profiles"] = (
+                shot_ds["ne20_rho"].diff("time", label="upper").fillna(1.0) > 0
+            )
+
         return shot_ds
