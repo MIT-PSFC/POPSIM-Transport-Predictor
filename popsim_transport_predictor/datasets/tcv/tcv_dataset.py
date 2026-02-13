@@ -194,6 +194,14 @@ class TCVDataWorkflow(DataWorkflow):
 
             # Put signals on uniform timebase
             ds_standardized = self._create_uniform_timebase_dataset(ds_shot, timebase)
+            # If profile data is missing and we're not skipping profiles, skip this shot
+            if not self.skip_profiles and (
+                ("Ne_rho" not in ds_shot) or ("Te_rho" not in ds_shot)
+            ):
+                logger.warning(
+                    f"Shot {shot} is missing profile data and skip_profiles is False, skipping"
+                )
+                continue
 
             ds_standardized = self.standardize_signal_names(ds_standardized)
 
@@ -202,6 +210,12 @@ class TCVDataWorkflow(DataWorkflow):
             # where the first dimension is 'shot' with size 1
             ds_standardized = ds_standardized.expand_dims(shot=[shot])
 
+            # Make sure data is f32 or int64
+            for var in ds_standardized.data_vars:
+                if np.issubdtype(ds_standardized[var].dtype, np.floating):
+                    ds_standardized[var] = ds_standardized[var].astype(np.float32)
+                elif np.issubdtype(ds_standardized[var].dtype, np.integer):
+                    ds_standardized[var] = ds_standardized[var].astype(np.int64)
             ds_standardized.to_netcdf(ds_path)
             logger.info(f"Saved raw dataset for shot {shot} to {ds_path}")
             processed_shots += 1
@@ -290,22 +304,6 @@ class TCVDataWorkflow(DataWorkflow):
 
                 except Exception as e:
                     logger.warning(f"Failed to interpolate {signal}: {e}")
-
-        # Ensure profile data variables exist for all shots (filled with NaN if not available)
-        # This is required for consistent zarr store structure
-        default_rho = np.linspace(0, 1, 200)  # Standard rho grid
-        for signal in ["Ne_rho", "Te_rho"]:
-            if signal not in interp_vars:
-                logger.info(f"Profile data {signal} not available, filling with NaN")
-                interp_vars[signal] = xr.DataArray(
-                    np.full((len(timebase), len(default_rho)), np.nan),
-                    dims=[TIME_DIM, "rho"],
-                    coords={
-                        TIME_DIM: np.arange(len(timebase)),
-                        TIME_COORD: (TIME_DIM, timebase),
-                        "rho": default_rho,
-                    },
-                )
 
         # Create the dataset
         # Coords are already set in the DataArrays, so we just need to extract rho if present
