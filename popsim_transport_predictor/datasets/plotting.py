@@ -131,16 +131,31 @@ def ds_time_plot(  # noqa: PLR0915 PLR0912
             loc="upper left",
         )
 
-        # density
+        # line avg and edge density
         ax_ne = axes[2]
         ax_ne.plot(
             shot_ds["time"],
             shot_ds["ne20_line_avg"],
-            label="ne20_line_avg [m^-3]",
+            label="ne20_line_avg",
             color="white",
         )
-        ax_ne.set_ylabel("ne20_line_avg [m^-3]", fontsize=LABEL_FONTSIZE, color="white")
+        ax_ne.plot(
+            shot_ds["time"],
+            shot_ds["ne20_edge"],
+            label="ne20_edge",
+            color="yellow",
+        )
+        ax_ne.set_ylabel("ne20 [m^-3]", fontsize=LABEL_FONTSIZE, color="white")
         ax_ne.set_ylim(ylim_ne)
+
+        # Dots at 0 for fresh profiles
+        ax_ne.plot(
+            shot_ds["time"],
+            np.where(shot_ds["fresh_profiles"] > 0, 0, np.nan),
+            color="green",
+            marker="o",
+            linestyle="None",
+        )
 
         # Add B0 on right axis
         ax_b0 = ax_ne.twinx()
@@ -205,6 +220,122 @@ def ds_time_plot(  # noqa: PLR0915 PLR0912
 
         fig.tight_layout()
         fig.savefig(f"{fig_dir}/{shot}.png")
+        plt.close(fig)
+
+
+def ds_profile_plot(
+    ds_path: str,
+    fig_dir: str,
+    num_shots: int | None = 9999,
+    title: str = "Dataset Time Traces",
+):
+    """Plot profile traces of signals from the dataset"""
+    if ds_path.endswith(".zarr"):
+        ds = xr.open_zarr(ds_path)
+    else:
+        ds = xr.open_dataset(ds_path)
+
+    os.makedirs(fig_dir, exist_ok=True)
+
+    for shot in ds["shot"].data[:num_shots]:
+        shot_ds = ds.sel(shot=shot)
+
+        rho = shot_ds["rho"].values
+        time = shot_ds["time"].values
+
+        # Extract 2D arrays for density and temperature
+        ne_data = shot_ds["ne20_rho"].values.T  # shape: (rho, time) - transposed
+        te_data = shot_ds["Te_keV_rho"].values.T  # shape: (rho, time) - transposed
+
+        # Create masks for timesteps with NaN values
+        ne_nan_mask = np.isnan(ne_data).any(axis=0)  # True if any NaN in that timestep
+        te_nan_mask = np.isnan(te_data).any(axis=0)  # True if any NaN in that timestep
+
+        fig, axes = plt.subplots(2, 1, figsize=(16, 12), sharex=True)
+        fig.patch.set_facecolor(BACKGROUND_COLOR)
+        fig.suptitle(
+            f"{title} - {shot}",
+            fontsize=TITLE_FONTSIZE,
+            color=TEXT_COLOR,
+        )
+
+        ax_ne = axes[0]
+        ax_te = axes[1]
+
+        # Plot density heatmap
+        ne_plot_data = ne_data.copy()
+        ne_plot_data[:, ne_nan_mask] = (
+            np.nan
+        )  # Set NaN timesteps to NaN for proper masking
+        im_ne = ax_ne.imshow(
+            ne_plot_data,
+            cmap="viridis",
+            aspect="auto",
+            origin="lower",
+            extent=[0, np.nanmax(time), rho.min(), rho.max()],
+        )
+
+        # Overlay bright pink for NaN timesteps
+        if np.any(ne_nan_mask):
+            ne_pink_data = np.full_like(ne_data, np.nan)
+            ne_pink_data[:, ne_nan_mask] = 1.0  # Use constant value for bright color
+            ax_ne.imshow(
+                ne_pink_data,
+                cmap="Reds",
+                aspect="auto",
+                origin="lower",
+                alpha=0.8,
+                extent=[0, np.nanmax(time), rho.min(), rho.max()],
+            )
+
+        ax_ne.set_ylabel(r"$\rho$", fontsize=LABEL_FONTSIZE, color=TEXT_COLOR)
+        ax_ne.set_title(
+            r"$n_e$ [$10^{20}$ m$^{-3}$]", fontsize=LABEL_FONTSIZE, color=TEXT_COLOR
+        )
+        cbar_ne = plt.colorbar(im_ne, ax=ax_ne)
+        cbar_ne.ax.tick_params(labelsize=TICK_FONTSIZE, colors=TEXT_COLOR)
+
+        # Plot temperature heatmap
+        te_plot_data = te_data.copy()
+        te_plot_data[:, te_nan_mask] = (
+            np.nan
+        )  # Set NaN timesteps to NaN for proper masking
+        im_te = ax_te.imshow(
+            te_plot_data,
+            cmap="plasma",
+            aspect="auto",
+            origin="lower",
+            extent=[0, np.nanmax(time), rho.min(), rho.max()],
+        )
+
+        # Overlay bright pink for NaN timesteps
+        if np.any(te_nan_mask):
+            te_pink_data = np.full_like(te_data, np.nan)
+            te_pink_data[:, te_nan_mask] = 1.0  # Use constant value for bright color
+            ax_te.imshow(
+                te_pink_data,
+                cmap="Reds",
+                aspect="auto",
+                origin="lower",
+                alpha=0.8,
+                extent=[0, np.nanmax(time), rho.min(), rho.max()],
+            )
+
+        ax_te.set_ylabel(r"$\rho$", fontsize=LABEL_FONTSIZE, color=TEXT_COLOR)
+        ax_te.set_xlabel("Time [s]", fontsize=LABEL_FONTSIZE, color=TEXT_COLOR)
+        ax_te.set_title(r"$T_e$ [keV]", fontsize=LABEL_FONTSIZE, color=TEXT_COLOR)
+        cbar_te = plt.colorbar(im_te, ax=ax_te)
+        cbar_te.ax.tick_params(labelsize=TICK_FONTSIZE, colors=TEXT_COLOR)
+
+        for ax in axes:
+            ax.set_facecolor(FACE_COLOR)
+            ax.tick_params(axis="both", labelsize=TICK_FONTSIZE, colors=TEXT_COLOR)
+            ax.set_xlim(np.nanmin(time), np.nanmax(time))
+            for spine in ax.spines.values():
+                spine.set_color(TEXT_COLOR)
+
+        fig.tight_layout()
+        fig.savefig(os.path.join(fig_dir, f"{shot}.png"), dpi=150)
         plt.close(fig)
 
 
