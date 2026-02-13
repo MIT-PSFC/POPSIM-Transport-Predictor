@@ -49,12 +49,10 @@ class DataWorkflow:
         self.data_assembly_dir = data_assembly_dir
         self.raw_data_dir = os.path.join(data_assembly_dir, ds_name, "raw_data")
         if max_num_shots is None:
-            self.final_ds_dir = os.path.join(
-                data_assembly_dir, ds_name, "final_dataset_full"
-            )
+            self.final_ds_dir = os.path.join(data_assembly_dir, ds_name, "dataset_full")
         else:
             self.final_ds_dir = os.path.join(
-                data_assembly_dir, ds_name, f"final_dataset_{max_num_shots}"
+                data_assembly_dir, ds_name, f"dataset_{max_num_shots}"
             )
 
         self.max_num_shots = max_num_shots
@@ -261,8 +259,8 @@ class DataWorkflow:
 
         # Label where the profiles are fresh (not carried forward by ffill)
         if "fresh_profiles" not in shot_ds:
-            shot_ds["fresh_profiles"] = (
-                shot_ds["ne20_rho"].diff("time", label="upper").fillna(1.0) > 0
-            )
+            diff_result = shot_ds["ne20_rho"].fillna(0).diff("time_idx", label="upper")
+            first_valid_is_fresh = shot_ds["ne20_rho"].notnull().cumsum("time_idx") == 1
+            shot_ds["fresh_profiles"] = (diff_result != 0) | first_valid_is_fresh
 
         return shot_ds
