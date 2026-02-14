@@ -83,6 +83,13 @@ class TCVDataWorkflow(DataWorkflow):
         # Use centralized config
         self.config = config.tcv
 
+        # Dictionary for valid signal ranges for filtering
+        self.filter_config = {
+            "Wtot_MJ": {"min": 0.05, "max": 0.5},
+            "ne20_line_avg": {"min": 0.01, "max": 2},
+            "ne20_edge": {"min": 0.01, "max": 2},
+        }
+
         # Set source directory path
         if source_dataset_path is not None:
             self.source_dir = source_dataset_path
@@ -410,8 +417,6 @@ class TCVDataWorkflow(DataWorkflow):
 
         This includes:
         - Simple fringe-jump correction for ne20_line_avg
-        - Setting data 20ms before disruption to NaN
-        - Filtering unrealistic data points
 
         Parameters
         ----------
@@ -423,14 +428,6 @@ class TCVDataWorkflow(DataWorkflow):
         xr.Dataset
             Processed dataset ready for general workflow
         """
-
-        sus_shots = [
-            85117,  # P_rad consistently higher than P_oh and no other power sources
-            83412,  # P_rad consistently higher than P_oh and no other power sources
-        ]
-
-        if ds.shot.values[0] in sus_shots:
-            return None
 
         # Simple fringe-jump correction for ne20_line_avg
         # Detect large step changes and remove the offset for the remainder of the trace
@@ -459,32 +456,19 @@ class TCVDataWorkflow(DataWorkflow):
                     corrected[np.newaxis, :],
                 )
 
-        # Only keep data where ne20_line_avg is above 0.1e20
-        if "ne20_line_avg" in ds:
-            ds["ne20_line_avg"] = xr.where(
-                ds["ne20_line_avg"] > 0.1, ds["ne20_line_avg"], np.nan
-            )
-
-        # Only keep data where Wtot is above 1e-3 MJ
-        if "Wtot_MJ" in ds:
-            ds["Wtot_MJ"] = xr.where(ds["Wtot_MJ"] > 1e-3, ds["Wtot_MJ"], np.nan)
-
-        # Only keep data where Te_keV_rho at rho=1.0 is less than 0.25 keV and above 0.0
-        if "Te_keV_rho" in ds and "rho" in ds.coords:
-            ds["Te_keV_rho"] = xr.where(
-                (ds["Te_keV_rho"].sel(rho=1.0, method="nearest") < 0.25)
-                & (ds["Te_keV_rho"].sel(rho=1.0, method="nearest") > 0.0),
-                ds["Te_keV_rho"],
-                np.nan,
-            )
-
-        # Only keep data where ne20_rho at rho=1.0 is less than 0.4e20 and above 0.0
-        if "ne20_rho" in ds and "rho" in ds.coords:
-            ds["ne20_rho"] = xr.where(
-                (ds["ne20_rho"].sel(rho=1.0, method="nearest") < 0.4)
-                & (ds["ne20_rho"].sel(rho=1.0, method="nearest") > 0.0),
-                ds["ne20_rho"],
-                np.nan,
-            )
-
         return ds
+
+    def device_specific_culling(self, ds: xr.Dataset) -> bool:
+        """Apply TCV-specific culling criteria to the dataset
+
+        Returns True if the dataset should be culled, False otherwise
+        """
+
+        sus_shots = [
+            85117,  # P_rad consistently higher than P_oh and no other power sources
+            83412,  # P_rad consistently higher than P_oh and no other power sources
+        ]
+
+        if ds.shot.values[0] in sus_shots:
+            logger.info(f"Culling shot {ds.shot.values[0]} due to known data issues")
+            return None
