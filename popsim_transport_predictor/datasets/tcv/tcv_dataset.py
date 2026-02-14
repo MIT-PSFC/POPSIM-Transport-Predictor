@@ -194,22 +194,33 @@ class TCVDataWorkflow(DataWorkflow):
                 logger.warning(f"Could not load shot file for shot {shot}, skipping")
                 continue
 
-            # Create uniform 1 kHz timebase (max time where I_P is greater than 50 kA)
-            valid_ip_mask = np.abs(ds_shot["I_P"]) > 50e3
-            max_time = ds_shot["time_I_P"].where(valid_ip_mask, drop=True).max().item()
-            timebase = make_uniform_1khz_timebase(max_time)
-
-            # Put signals on uniform timebase
-            ds_standardized = self._create_uniform_timebase_dataset(ds_shot, timebase)
             # If profile data is missing and we're not skipping profiles, skip this shot
-            if not self.skip_profiles and (
-                ("Ne_rho" not in ds_shot) or ("Te_rho" not in ds_shot)
-            ):
+            def _profiles_exist(ds_shot):
+                if "Ne_rho" in ds_shot:
+                    if ds_shot["Ne_rho"].size == 1:
+                        return False
+                else:
+                    return False
+                if "Te_rho" in ds_shot:
+                    if ds_shot["Te_rho"].size == 1:
+                        return False
+                else:
+                    return False
+                return True
+
+            if not self.skip_profiles and not _profiles_exist(ds_shot):
                 logger.warning(
                     f"Shot {shot} is missing profile data and skip_profiles is False, skipping"
                 )
                 continue
 
+            # Create uniform 1 kHz timebase (max time where I_P is greater than 50 kA)
+            valid_ip_mask = np.abs(ds_shot["I_P"]) > 50e3
+            max_time = ds_shot["time_I_P"].where(valid_ip_mask, drop=True).max().item()
+            timebase = make_uniform_1khz_timebase(max_time)
+
+            # Put signals on uniform timebase with standardized names
+            ds_standardized = self._create_uniform_timebase_dataset(ds_shot, timebase)
             ds_standardized = self.standardize_signal_names(ds_standardized)
 
             # Add shot as a dimension (not just coordinate) - required for processing pipeline
@@ -474,9 +485,9 @@ class TCVDataWorkflow(DataWorkflow):
             return True
 
         p_rad_avg = ds["P_rad_MW"].mean().item()
-        if p_rad_avg < 0.02:
+        if p_rad_avg < 0.02 or ds["P_rad_MW"].isnull().all():
             logger.info(
-                f"Culling shot {ds.shot.values[0]} due to consistently low radiated power measurement (P_rad_MW.mean() < 0.02 MW)"
+                f"Culling shot {ds.shot.values[0]} due to consistently low or missing radiated power measurement (P_rad_MW.mean() < 0.02 MW)"
             )
             return True
 

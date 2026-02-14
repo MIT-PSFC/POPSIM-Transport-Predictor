@@ -254,7 +254,7 @@ class DataWorkflow:
 
         if valid_mask.sum() == 0:
             logger.warning(
-                f"All data points for shot {shot_ds.shot.values[0]} are invalid after filtering, excluding shot"
+                f"Excluding shot {shot_ds.shot.values[0]} because all data points are invalid after filtering"
             )
             return None
 
@@ -315,7 +315,11 @@ class DataWorkflow:
         # Culling that is common across devices
         # If shot is too short (less than 500 ms) after processing, exclude it
         cleaned_ds = shot_ds.dropna("time_idx", how="any")
-        valid_time_duration = float(cleaned_ds.time.max() - cleaned_ds.time.min())
+        valid_time_duration = (
+            0
+            if cleaned_ds.time.size == 0
+            else float(cleaned_ds.time.max() - cleaned_ds.time.min())
+        )
         if valid_time_duration < 0.5:
             logger.warning(
                 f"Excluding shot {shot_id} because duration after processing is only {valid_time_duration:.2f} seconds"
