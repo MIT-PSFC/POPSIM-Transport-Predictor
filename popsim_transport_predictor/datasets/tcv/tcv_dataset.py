@@ -1,5 +1,6 @@
 """Makes the 'raw' TCV dataset, to be processed later by POPSIM"""
 
+import gc
 import glob
 import os
 
@@ -237,6 +238,9 @@ class TCVDataWorkflow(DataWorkflow):
             ds_standardized.to_netcdf(ds_path)
             logger.info(f"Saved raw dataset for shot {shot} to {ds_path}")
             processed_shots += 1
+            if processed_shots > 1 and processed_shots % 100 == 0:
+                logger.info(f"Processed {processed_shots} shots so far...")
+                gc.collect()  # Clean up memory after every 100 shots
 
         logger.info("Finished making raw data files.")
 
