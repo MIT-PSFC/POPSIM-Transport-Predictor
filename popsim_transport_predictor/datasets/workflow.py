@@ -101,6 +101,10 @@ class DataWorkflow:
     def device_specific_processing(self, ds: xr.Dataset) -> xr.Dataset:
         """Apply any device-specific processing steps before the general workflow"""
 
+    @abstractmethod
+    def device_specific_culling(self, ds: xr.Dataset) -> bool:
+        """Apply any device-specific culling logic to determine if this shot should be excluded from the dataset"""
+
     def log_ds_details(self, ds: xr.Dataset):  # noqa: PLR0912
         logger.info(f"Final dataset dimensions: {ds.dims}")
         logger.info(f"Final dataset variables: {list(ds.data_vars)}")
@@ -220,16 +224,37 @@ class DataWorkflow:
         # Log some stats about the resulting dataset
         self.log_ds_details(ds)
 
+    def filter_ds(self, shot_ds: xr.Dataset) -> xr.Dataset:
+        """Apply filtering steps based on device config"""
+
+        # Cut all data 50ms before Ip_MA is NAN to avoid including disruptive data
+        last_valid_index = np.where(~np.isnan(shot_ds["Ip_MA"]))[1][-1]
+        valid_mask = shot_ds.time <= shot_ds.time[last_valid_index] - 0.05
+
+        for var, valid_range in self.filter_config.items():
+            var_mask = (
+                shot_ds[var].notnull()
+                & (shot_ds[var] > valid_range["min"])
+                & (shot_ds[var] < valid_range["max"])
+            )
+            valid_mask = valid_mask & var_mask
+
+        shot_ds = shot_ds.where(valid_mask, drop=True)
+        return shot_ds
+
     def process_fn(self, shot_id: int) -> xr.Dataset:
         raw_ds_path = os.path.join(self.raw_data_dir, f"{shot_id}.nc")
         shot_ds = xr.open_dataset(raw_ds_path)
 
-        # Apply any processing steps needed. If something breaks, return None to skip this shot.
+        # Processing that is specific to the device, implemented in the subclass
         shot_ds = self.device_specific_processing(shot_ds)
         if shot_ds is None:
-            logger.warning(f"Skipping shot {shot_id} due to processing issues")
+            logger.warning(
+                f"Skipping shot {shot_id} due to device-specific processing failure"
+            )
             return None
 
+        # Processing that is common across devices
         # Ensure powers are non-negative
         power_signals = [
             sig for sig in shot_ds.data_vars if "P_" in sig and sig.endswith("_MW")
@@ -237,27 +262,28 @@ class DataWorkflow:
         for sig in power_signals:
             shot_ds[sig] = shot_ds[sig].clip(min=0)
 
-        ne_valid_mask = (
-            shot_ds["ne20_line_avg"].notnull()
-            & (shot_ds["ne20_line_avg"] > 0)
-            & (shot_ds["ne20_line_avg"] < 4e20)
-        )
+        # Filtering based on config thresholds defined in the subclass
+        # Making sure data is within valid ranges, and cutting data 50ms before Ip_MA goes to NaN to avoid including disruptive data
+        shot_ds = self.filter_ds(shot_ds)
 
-        wtot_valid_mask = (
-            shot_ds["Wtot_MJ"].notnull()
-            & (shot_ds["Wtot_MJ"] > 0)
-            & (shot_ds["Wtot_MJ"] < 2)
-        )
+        # Culling that is specific to the device, implemented in the subclass.
+        # This is applied after the device-specific processing and the general processing steps, so that it can take into account any corrections or fixes that were made to the data in those steps.
+        if self.device_specific_culling(shot_ds):
+            logger.warning(
+                f"Excluding shot {shot_id} based on device-specific culling criteria"
+            )
+            return None
 
-        # Cut all data 50ms before Ip_MA is NAN to avoid including disruptive data
-        last_valid_index = np.where(~np.isnan(shot_ds["Ip_MA"]))[1][-1]
-        end_of_shot_mask = shot_ds.time <= shot_ds.time[last_valid_index] - 0.05
+        # Culling that is common across devices
+        # If shot is too short after processing, exclude it
+        valid_time_duration = sum(~shot_ds.isnull().any(dim="time_idx"))
+        if valid_time_duration < 500:  # 500 time steps = 0.5 seconds at 1 kHz
+            logger.warning(
+                f"Excluding shot {shot_id} because duration after processing is only {valid_time_duration / 1000:.2f} seconds"
+            )
+            return None
 
-        valid_mask = ne_valid_mask & end_of_shot_mask & wtot_valid_mask
-
-        shot_ds = shot_ds.where(valid_mask, drop=True)
-
-        # Label where the profiles are fresh (not carried forward by ffill)
+        # Label where the profiles are fresh (not made by ffill)
         if "fresh_profiles" not in shot_ds:
             diff_result = shot_ds["ne20_rho"].fillna(0).diff("time_idx", label="upper")
             first_valid_is_fresh = shot_ds["ne20_rho"].notnull().cumsum("time_idx") == 1
