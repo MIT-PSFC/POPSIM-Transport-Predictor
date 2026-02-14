@@ -7,7 +7,6 @@ from loguru import logger
 from popsim_transport_predictor.config import DATA_DUMP_DIR
 from popsim_transport_predictor.datasets.cmod.cmod_dataset import CModDataWorkflow
 from popsim_transport_predictor.datasets.d3d.d3d_dataset import D3DDataWorkflow
-from popsim_transport_predictor.datasets.plotting import ds_profile_plot, ds_time_plot
 from popsim_transport_predictor.datasets.tcv.tcv_dataset import TCVDataWorkflow
 
 
@@ -102,16 +101,6 @@ class DatasetCLI:
             )
             logger.add(log_path)
             workflow.run_processed_data_workflow()
-            ds_time_plot(
-                os.path.join(workflow.final_ds_dir, f"{workflow.ds_name}.zarr"),
-                os.path.join(workflow.final_ds_dir, "time_traces"),
-                title=f"{workflow.ds_name.upper()} Dataset Time Traces",
-            )
-            ds_profile_plot(
-                os.path.join(workflow.final_ds_dir, f"{workflow.ds_name}.zarr"),
-                os.path.join(workflow.final_ds_dir, "profile_traces"),
-                title=f"{workflow.ds_name.upper()} Dataset Profile Traces",
-            )
         else:
             raise ValueError(f"Unknown mode: {mode}. Use 'raw' or 'process'.")
 

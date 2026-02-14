@@ -6,6 +6,7 @@ import xarray as xr
 from loguru import logger
 
 from popsim_transport_predictor import EPISODE_DIM, TIME_DIM
+from popsim_transport_predictor.datasets.plotting import ds_profile_plot, ds_time_plot
 
 
 class DataWorkflow:
@@ -224,12 +225,24 @@ class DataWorkflow:
         # Log some stats about the resulting dataset
         self.log_ds_details(ds)
 
+        # Make some diagnostic plots of the resulting dataset to check that it looks reasonable. These can be used to spot any remaining issues with the data, and to get a sense of the overall characteristics of the dataset (e.g., typical signal ranges, how many shots have valid profiles, etc.)
+        ds_time_plot(
+            os.path.join(self.final_ds_dir, f"{self.ds_name}.zarr"),
+            os.path.join(self.final_ds_dir, "time_traces"),
+            title=f"{self.ds_name.upper()} Dataset Time Traces",
+        )
+        ds_profile_plot(
+            os.path.join(self.final_ds_dir, f"{self.ds_name}.zarr"),
+            os.path.join(self.final_ds_dir, "profile_traces"),
+            title=f"{self.ds_name.upper()} Dataset Profile Traces",
+        )
+
     def filter_ds(self, shot_ds: xr.Dataset) -> xr.Dataset:
         """Apply filtering steps based on device config"""
 
         # Cut all data 50ms before Ip_MA is NAN to avoid including disruptive data
-        last_valid_index = np.where(~np.isnan(shot_ds["Ip_MA"]))[1][-1]
-        valid_mask = shot_ds.time <= shot_ds.time[last_valid_index] - 0.05
+        last_valid_idx = np.where(shot_ds["Ip_MA"].notnull())[1][-1]
+        valid_mask = shot_ds.time <= shot_ds.time[last_valid_idx] - 0.05
 
         for var, valid_range in self.filter_config.items():
             var_mask = (
@@ -238,6 +251,12 @@ class DataWorkflow:
                 & (shot_ds[var] < valid_range["max"])
             )
             valid_mask = valid_mask & var_mask
+
+        if valid_mask.sum() == 0:
+            logger.warning(
+                f"All data points for shot {shot_ds.shot.values[0]} are invalid after filtering, excluding shot"
+            )
+            return None
 
         shot_ds = shot_ds.where(valid_mask, drop=True)
         return shot_ds
@@ -262,9 +281,19 @@ class DataWorkflow:
         for sig in power_signals:
             shot_ds[sig] = shot_ds[sig].clip(min=0)
 
+        # Label where the profiles are fresh (not made by ffill)
+        if "fresh_profiles" not in shot_ds:
+            diff_result = shot_ds["ne20_rho"].fillna(0).diff("time_idx", label="upper")
+            first_valid_is_fresh = shot_ds["ne20_rho"].notnull().cumsum("time_idx") == 1
+            shot_ds["fresh_profiles"] = (diff_result != 0) | first_valid_is_fresh
+
+        #   # Copy for plotting later if need be debug_ds = shot_ds.copy()
         # Filtering based on config thresholds defined in the subclass
         # Making sure data is within valid ranges, and cutting data 50ms before Ip_MA goes to NaN to avoid including disruptive data
         shot_ds = self.filter_ds(shot_ds)
+        if shot_ds is None:
+            # TODO: Plot shot
+            return None
 
         # Culling that is specific to the device, implemented in the subclass.
         # This is applied after the device-specific processing and the general processing steps, so that it can take into account any corrections or fixes that were made to the data in those steps.
@@ -272,21 +301,18 @@ class DataWorkflow:
             logger.warning(
                 f"Excluding shot {shot_id} based on device-specific culling criteria"
             )
+            # TODO: Plot shot
             return None
 
         # Culling that is common across devices
-        # If shot is too short after processing, exclude it
-        valid_time_duration = sum(~shot_ds.isnull().any(dim="time_idx"))
-        if valid_time_duration < 500:  # 500 time steps = 0.5 seconds at 1 kHz
+        # If shot is too short (less than 500 ms) after processing, exclude it
+        cleaned_ds = shot_ds.dropna("time_idx", how="any")
+        valid_time_duration = float(cleaned_ds.time.max() - cleaned_ds.time.min())
+        if valid_time_duration < 0.5:
             logger.warning(
-                f"Excluding shot {shot_id} because duration after processing is only {valid_time_duration / 1000:.2f} seconds"
+                f"Excluding shot {shot_id} because duration after processing is only {valid_time_duration:.2f} seconds"
             )
+            # TODO: Plot shot
             return None
-
-        # Label where the profiles are fresh (not made by ffill)
-        if "fresh_profiles" not in shot_ds:
-            diff_result = shot_ds["ne20_rho"].fillna(0).diff("time_idx", label="upper")
-            first_valid_is_fresh = shot_ds["ne20_rho"].notnull().cumsum("time_idx") == 1
-            shot_ds["fresh_profiles"] = (diff_result != 0) | first_valid_is_fresh
 
         return shot_ds
