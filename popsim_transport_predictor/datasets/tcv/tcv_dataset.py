@@ -85,8 +85,8 @@ class TCVDataWorkflow(DataWorkflow):
 
         # Dictionary for valid signal ranges for filtering
         self.filter_config = {
-            "Wtot_MJ": {"min": 0.05, "max": 0.5},
-            "ne20_line_avg": {"min": 0.01, "max": 2},
+            "Wtot_MJ": {"min": 0.001, "max": 0.5},
+            "ne20_line_avg": {"min": 0.01, "max": 1.4},
             "ne20_edge": {"min": 0.01, "max": 2},
         }
 
@@ -471,4 +471,13 @@ class TCVDataWorkflow(DataWorkflow):
 
         if ds.shot.values[0] in sus_shots:
             logger.info(f"Culling shot {ds.shot.values[0]} due to known data issues")
-            return None
+            return True
+
+        p_rad_avg = ds["P_rad_MW"].mean().item()
+        if p_rad_avg < 0.02:
+            logger.info(
+                f"Culling shot {ds.shot.values[0]} due to consistently low radiated power measurement (P_rad_MW.mean() < 0.02 MW)"
+            )
+            return True
+
+        return False
