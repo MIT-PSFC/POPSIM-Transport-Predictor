@@ -15,16 +15,18 @@ LEGEND_FONTSIZE = 18
 
 
 def ds_time_plot(  # noqa: PLR0915 PLR0912
-    ds_path: str,
+    ds: str | xr.Dataset,
     fig_dir: str,
     num_shots: int | None = 9999,
     title: str = "Dataset Time Traces",
 ):
     """Plot time traces of signals from the dataset"""
-    if ds_path.endswith(".zarr"):
-        ds = xr.open_zarr(ds_path)
-    else:
-        ds = xr.open_dataset(ds_path)
+    if isinstance(ds, str):
+        ds_path = ds
+        if ds_path.endswith(".zarr"):
+            ds = xr.open_zarr(ds_path)
+        else:
+            ds = xr.open_dataset(ds_path)
 
     os.makedirs(fig_dir, exist_ok=True)
 
@@ -47,7 +49,9 @@ def ds_time_plot(  # noqa: PLR0915 PLR0912
         lh_thresh_max = 0
     ylim_power = (0, max(power_max, lh_thresh_max) * 1.1)
 
-    ylim_ne = (0, float(np.nanmax(ds["ne20_line_avg"].values)) * 1.1)
+    density_signals = ["ne20_line_avg", "ne20_edge"]
+    density_max = max(float(np.nanmax(ds[sig].values)) for sig in density_signals)
+    ylim_ne = (0, density_max * 1.1)
 
     # B0 y-limits for density plot right axis
     if "B0" in ds:
@@ -219,21 +223,23 @@ def ds_time_plot(  # noqa: PLR0915 PLR0912
                 pass
 
         fig.tight_layout()
-        fig.savefig(f"{fig_dir}/{shot}.png")
+        fig.savefig(f"{fig_dir}/{shot}_trace.png")
         plt.close(fig)
 
 
 def ds_profile_plot(
-    ds_path: str,
+    ds: str | xr.Dataset,
     fig_dir: str,
     num_shots: int | None = 9999,
     title: str = "Dataset Time Traces",
 ):
     """Plot profile traces of signals from the dataset"""
-    if ds_path.endswith(".zarr"):
-        ds = xr.open_zarr(ds_path)
-    else:
-        ds = xr.open_dataset(ds_path)
+    if isinstance(ds, str):
+        ds_path = ds
+        if ds_path.endswith(".zarr"):
+            ds = xr.open_zarr(ds_path)
+        else:
+            ds = xr.open_dataset(ds_path)
 
     os.makedirs(fig_dir, exist_ok=True)
 
@@ -335,7 +341,7 @@ def ds_profile_plot(
                 spine.set_color(TEXT_COLOR)
 
         fig.tight_layout()
-        fig.savefig(os.path.join(fig_dir, f"{shot}.png"), dpi=150)
+        fig.savefig(os.path.join(fig_dir, f"{shot}_profiles.png"), dpi=150)
         plt.close(fig)
 
 

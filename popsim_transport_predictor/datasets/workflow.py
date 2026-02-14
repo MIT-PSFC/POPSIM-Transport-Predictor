@@ -261,6 +261,14 @@ class DataWorkflow:
         shot_ds = shot_ds.where(valid_mask, drop=True)
         return shot_ds
 
+    def _debug_plots(self, shot_ds: xr.Dataset):
+        debug_fig_dir = os.path.join(self.final_ds_dir, "debug_plots")
+        os.makedirs(debug_fig_dir, exist_ok=True)
+        ds_time_plot(shot_ds, debug_fig_dir, title=f"Debug: {shot_ds.shot.values[0]}")
+        ds_profile_plot(
+            shot_ds, debug_fig_dir, title=f"Debug: {shot_ds.shot.values[0]}"
+        )
+
     def process_fn(self, shot_id: int) -> xr.Dataset:
         raw_ds_path = os.path.join(self.raw_data_dir, f"{shot_id}.nc")
         shot_ds = xr.open_dataset(raw_ds_path)
@@ -287,12 +295,12 @@ class DataWorkflow:
             first_valid_is_fresh = shot_ds["ne20_rho"].notnull().cumsum("time_idx") == 1
             shot_ds["fresh_profiles"] = (diff_result != 0) | first_valid_is_fresh
 
-        #   # Copy for plotting later if need be debug_ds = shot_ds.copy()
+        debug_ds = shot_ds.copy()  # Copy for plotting later if need be
         # Filtering based on config thresholds defined in the subclass
         # Making sure data is within valid ranges, and cutting data 50ms before Ip_MA goes to NaN to avoid including disruptive data
         shot_ds = self.filter_ds(shot_ds)
         if shot_ds is None:
-            # TODO: Plot shot
+            self._debug_plots(debug_ds)
             return None
 
         # Culling that is specific to the device, implemented in the subclass.
@@ -301,7 +309,7 @@ class DataWorkflow:
             logger.warning(
                 f"Excluding shot {shot_id} based on device-specific culling criteria"
             )
-            # TODO: Plot shot
+            self._debug_plots(debug_ds)
             return None
 
         # Culling that is common across devices
@@ -312,7 +320,7 @@ class DataWorkflow:
             logger.warning(
                 f"Excluding shot {shot_id} because duration after processing is only {valid_time_duration:.2f} seconds"
             )
-            # TODO: Plot shot
+            self._debug_plots(debug_ds)
             return None
 
         return shot_ds
