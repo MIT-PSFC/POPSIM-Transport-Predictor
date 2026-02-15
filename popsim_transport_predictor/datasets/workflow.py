@@ -106,86 +106,30 @@ class DataWorkflow:
     def device_specific_culling(self, ds: xr.Dataset) -> bool:
         """Apply any device-specific culling logic to determine if this shot should be excluded from the dataset"""
 
-    def log_ds_details(self, ds: xr.Dataset):  # noqa: PLR0912
+    def log_ds_details(self, ds: xr.Dataset):
         logger.info(f"Final dataset dimensions: {ds.dims}")
         logger.info(f"Final dataset variables: {list(ds.data_vars)}")
         # For each variable, log the maximum value and the shot in which it occurs, to check for any outliers that might indicate issues with the processing
         for var in ds.data_vars:
             # Compute statistics (needed for dask arrays)
-            max_value = float(ds[var].max().compute())
-            min_value = float(ds[var].min().compute())
-            mean_value = float(ds[var].mean().compute())
-            std_value = float(ds[var].std().compute())
+            max_per_shot = ds[var].max(dim="time_idx", skipna=True)
+            max_shot_idx = np.nanargmax(max_per_shot.values)
+            max_shot = ds["shot"].values[max_shot_idx]
+            max_val = max_per_shot.values[max_shot_idx]
 
-            # Handle shot identification for max/min, accounting for potential NaN values
-            max_shot = None
-            min_shot = None
+            min_per_shot = ds[var].min(dim="time_idx", skipna=True)
+            min_shot_idx = np.nanargmin(min_per_shot.values)
+            min_shot = ds["shot"].values[min_shot_idx]
+            min_val = min_per_shot.values[min_shot_idx]
 
-            if not np.isnan(max_value):
-                try:
-                    max_shot_result = ds[var].idxmax(dim=EPISODE_DIM).compute()
-                    # Handle different possible return types
-                    if hasattr(max_shot_result, "values"):
-                        max_shot_val = max_shot_result.values
-                    else:
-                        max_shot_val = max_shot_result
+            mean = ds[var].mean(skipna=True).compute()
+            std = ds[var].std(skipna=True).compute()
 
-                    # Extract scalar value safely
-                    if np.isscalar(max_shot_val):
-                        max_shot = int(max_shot_val)
-                    else:
-                        max_shot = int(np.asarray(max_shot_val).flat[0])
-                except Exception as e:
-                    logger.debug(
-                        f"Failed to get max shot for {var}: {e}, max_shot_result type: {type(max_shot_result)}"
-                    )
-
-            if not np.isnan(min_value):
-                try:
-                    min_shot_result = ds[var].idxmin(dim=EPISODE_DIM).compute()
-                    # Handle different possible return types
-                    if hasattr(min_shot_result, "values"):
-                        min_shot_val = min_shot_result.values
-                    else:
-                        min_shot_val = min_shot_result
-
-                    # Extract scalar value safely
-                    if np.isscalar(min_shot_val):
-                        min_shot = int(min_shot_val)
-                    else:
-                        min_shot = int(np.asarray(min_shot_val).flat[0])
-                except Exception as e:
-                    logger.debug(
-                        f"Failed to get min shot for {var}: {e}, min_shot_result type: {type(min_shot_result)}"
-                    )
-
-            logger.info(f"Variable {var} stats:")
-            if np.isnan(max_value):
-                logger.info("  Max: NaN (all values are NaN)")
-            else:
-                logger.info(
-                    f"  Max: {max_value:.6g}"
-                    + (
-                        f" (shot {max_shot})"
-                        if max_shot is not None
-                        else " (shot unknown)"
-                    )
-                )
-
-            if np.isnan(min_value):
-                logger.info("  Min: NaN (all values are NaN)")
-            else:
-                logger.info(
-                    f"  Min: {min_value:.6g}"
-                    + (
-                        f" (shot {min_shot})"
-                        if min_shot is not None
-                        else " (shot unknown)"
-                    )
-                )
-
-            logger.info(f"  Mean: {mean_value:.6g}")
-            logger.info(f"  Std: {std_value:.6g}")
+            logger.info(f"Stats for {var}")
+            logger.info(f"  Max is {max_val:.6g} at shot {max_shot}")
+            logger.info(f"  Min is {min_val:.6g} at shot {min_shot}")
+            logger.info(f"  Mean is {mean:.6g}")
+            logger.info(f"  Std is {std:.6g}")
 
     def run_processed_data_workflow(self):
         """Run the data processing workflow"""
@@ -247,8 +191,8 @@ class DataWorkflow:
         for var, valid_range in self.filter_config.items():
             var_mask = (
                 shot_ds[var].notnull()
-                & (shot_ds[var] > valid_range["min"])
-                & (shot_ds[var] < valid_range["max"])
+                & (shot_ds[var] >= valid_range["min"])
+                & (shot_ds[var] <= valid_range["max"])
             )
             valid_mask = valid_mask & var_mask
 

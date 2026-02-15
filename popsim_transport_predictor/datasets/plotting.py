@@ -42,7 +42,7 @@ def ds_time_plot(  # noqa: PLR0915 PLR0912
         "P_LH_MW",
         "P_ICRF_MW",
     ]
-    power_max = max(float(np.nanmax(ds[sig].values)) for sig in power_signals)
+    power_max = min(max(float(np.nanmax(ds[sig].values)) for sig in power_signals), 10)
     if "LH_transition_threshold_MW" in ds:
         lh_thresh_max = float(np.nanmax(ds["LH_transition_threshold_MW"].values / 1e6))
     else:
@@ -50,7 +50,9 @@ def ds_time_plot(  # noqa: PLR0915 PLR0912
     ylim_power = (0, max(power_max, lh_thresh_max) * 1.1)
 
     density_signals = ["ne20_line_avg", "ne20_edge"]
-    density_max = max(float(np.nanmax(ds[sig].values)) for sig in density_signals)
+    density_max = min(
+        max(float(np.nanmax(ds[sig].values)) for sig in density_signals), 5
+    )
     ylim_ne = (0, density_max * 1.1)
 
     # B0 y-limits for density plot right axis
