@@ -87,8 +87,9 @@ class TCVDataWorkflow(DataWorkflow):
         # Dictionary for valid signal ranges for filtering
         self.filter_config = {
             "Wtot_MJ": {"min": 0.001, "max": 0.5},
-            "ne20_line_avg": {"min": 0.01, "max": 1.4},
-            "ne20_edge": {"min": 0.01, "max": 2},
+            "ne20_line_avg": {"min": 0.01, "max": 4},
+            "ne20_edge": {"min": 0.01, "max": 4},
+            "P_ECRH_MW": {"min": 0, "max": 10},
         }
 
         # Set source directory path
@@ -494,5 +495,16 @@ class TCVDataWorkflow(DataWorkflow):
                 f"Culling shot {ds.shot.values[0]} due to consistently low or missing radiated power measurement (P_rad_MW.mean() < 0.02 MW)"
             )
             return True
+
+        ne_line_avg = ds["ne20_line_avg"].mean().item()
+        ne_edge_avg = ds["ne20_edge"].mean().item()
+        if (
+            ne_edge_avg > (2 * ne_line_avg)
+            or ds["ne20_line_avg"].isnull().all()
+            or ds["ne20_edge"].isnull().all()
+        ):
+            logger.info(
+                f"Culling shot {ds.shot.values[0]} due to edge density being significantly higher than line-avg density"
+            )
 
         return False
