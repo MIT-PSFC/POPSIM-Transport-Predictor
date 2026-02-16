@@ -243,7 +243,9 @@ class DataWorkflow:
         if "fresh_profiles" not in shot_ds:
             diff_result = shot_ds["ne20_rho"].fillna(0).diff("time_idx", label="upper")
             first_valid_is_fresh = shot_ds["ne20_rho"].notnull().cumsum("time_idx") == 1
-            shot_ds["fresh_profiles"] = (diff_result != 0) | first_valid_is_fresh
+            fresh_profiles_1D = (diff_result != 0) | first_valid_is_fresh
+            fresh_profiles = fresh_profiles_1D.any("rho")
+            shot_ds["fresh_profiles"] = fresh_profiles.astype(np.float32)
 
         debug_ds = shot_ds.copy()  # Copy for plotting later if need be
         # Filtering based on config thresholds defined in the subclass
