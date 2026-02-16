@@ -113,11 +113,17 @@ class DataWorkflow:
         for var in ds.data_vars:
             # Compute statistics (needed for dask arrays)
             max_per_shot = ds[var].max(dim="time_idx", skipna=True)
+            if len(max_per_shot.sizes) > 1:  # Handle multidimensional case
+                collapse_dims = [dim for dim in max_per_shot.dims if dim != "shot"]
+                max_per_shot = max_per_shot.max(dim=collapse_dims, skipna=True)
             max_shot_idx = np.nanargmax(max_per_shot.values)
             max_shot = ds["shot"].values[max_shot_idx]
             max_val = max_per_shot.values[max_shot_idx]
 
             min_per_shot = ds[var].min(dim="time_idx", skipna=True)
+            if len(min_per_shot.sizes) > 1:  # Handle multidimensional case
+                collapse_dims = [dim for dim in min_per_shot.dims if dim != "shot"]
+                min_per_shot = min_per_shot.min(dim=collapse_dims, skipna=True)
             min_shot_idx = np.nanargmin(min_per_shot.values)
             min_shot = ds["shot"].values[min_shot_idx]
             min_val = min_per_shot.values[min_shot_idx]
