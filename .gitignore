@@ -215,5 +215,6 @@ __marimo__/
 
 # Scratch and other scripts
 scratch
+popsim_transport_predictor/checkpoints
 popsim_transport_predictor/datasets/d3d/debug*
 submodules/toksearch
