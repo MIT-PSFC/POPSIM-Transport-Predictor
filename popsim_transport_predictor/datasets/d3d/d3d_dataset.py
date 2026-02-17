@@ -102,6 +102,7 @@ class D3DDataWorkflow(DataWorkflow):
         data_assembly_dir: str,
         max_num_shots: int | None = None,
         use_ida: bool = True,
+        skip_profiles: bool = False,
     ):
         """Initialize the DIII-D data workflow.
 
@@ -118,6 +119,8 @@ class D3DDataWorkflow(DataWorkflow):
             Maximum number of shots to process (for testing). If None, process all shots.
         use_ida : bool
             Whether to use IDA for profile data (True) or Zipfit (False). Default is True.
+        skip_profiles : bool
+            Whether to skip profile retrieval entirely and only get 0D signals. Default is False.
         """
 
         # Use centralized config
@@ -130,6 +133,7 @@ class D3DDataWorkflow(DataWorkflow):
             shotlist_file,
             data_assembly_dir,
             max_num_shots=max_num_shots,
+            skip_profiles=skip_profiles,
         )
 
         self.valid_signal_bounds = {
@@ -170,6 +174,11 @@ class D3DDataWorkflow(DataWorkflow):
         """
         from toksearch import MdsSignal, Pipeline
 
+        def _cm3_to_m3(result_dict):
+            result_dict["data"] *= 1e6
+            result_dict["units"]["data"] = "m^-3"
+            return result_dict
+
         p = Pipeline([shot])
 
         POHM = MdsSignal(
@@ -181,11 +190,15 @@ class D3DDataWorkflow(DataWorkflow):
         TAU_conf = MdsSignal(
             r"\taue", "transport", location="remote://atlas.gat.com"
         )  # Confinement time [s]
+        Ne_edge_avg = MdsSignal(
+            r"\denv3", "bci", location="remote://atlas.gat.com"
+        ).set_callback(_cm3_to_m3)  # Line average electron density at the edge [m^-3]
 
         sigs_dict = {
             "p_oh_toksearch": POHM,
             "p_rad_toksearch": PradBulk,
             "tau_conf": TAU_conf,
+            "ne_edge_avg": Ne_edge_avg,
         }
 
         p.fetch_dataset("toksearch", sigs_dict)
@@ -428,9 +441,7 @@ class D3DDataWorkflow(DataWorkflow):
         """
         ida_path = f"/fusion/projects/results/ida-results/HBP_database/IDA_{shot}_.cdf"
         if not os.path.exists(ida_path):
-            logger.warning(
-                f"IDA profile file for shot {shot} not found at {ida_path}, skipping shot."
-            )
+            logger.warning(f"IDA profile file for shot {shot} not found at {ida_path}")
             return None
         ds = xr.open_dataset(ida_path)
         # Rename profile varaibles to avoid conflict with 0D signals
@@ -471,17 +482,21 @@ class D3DDataWorkflow(DataWorkflow):
                 processed_shots += 1
                 continue
 
+            if not self.skip_profiles:
+                if self.use_ida:
+                    ds_profile = self._get_profile_dataset_ida(shot)
+                    if ds_profile is None:
+                        logger.info(
+                            f"Skipping shot {shot} since IDA profiles are not available and skip_profiles is False"
+                        )
+                        continue
+                else:
+                    ds_profile = self._get_profile_dataset_zipfit(shot)
+
             ds_fast = self._get_fast_dataset_dispy(shot)
             if ds_fast is None:
                 continue
             ds_0d = self._get_0D_dataset(shot)
-
-            if self.use_ida:
-                ds_profile = self._get_profile_dataset_ida(shot)
-                if ds_profile is None:
-                    continue
-            else:
-                ds_profile = self._get_profile_dataset_zipfit(shot)
 
             # Put each dataset on a 1 kHz timebase, using previous value fill
             max_time = max(
@@ -550,6 +565,7 @@ class D3DDataWorkflow(DataWorkflow):
         ds["B0"] = np.abs(ds["bt"])
         ds["Ip_MA"] = np.abs(ds["ip"]) / 1e6  # Convert A to MA
         ds["ne20_line_avg"] = ds["n_e"] / 1e20  # Convert m^-3 to 10^20 m^-3
+        ds["ne20_edge"] = ds["ne_edge_avg"] / 1e20  # Convert m^-3 to 10^20 m^-3
 
         # Convert all powers to MW
         ds["P_ECRH_MW"] = ds["p_ech"] / 1e6
@@ -581,6 +597,7 @@ class D3DDataWorkflow(DataWorkflow):
                 "delta_top",
                 "delta_bottom",
                 "ne20_line_avg",
+                "ne20_edge",
                 "P_ECRH_MW",
                 "P_NBI_MW",
                 "P_NBI_MW_alt",
