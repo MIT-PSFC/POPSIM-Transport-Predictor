@@ -2,10 +2,10 @@
 
 [shotlist_query]
 # SQL query parameters for retrieving shotlist when no shotlist file is provided
-summary_table = "d3d_shots"
+summary_table = "summaries"
 ipmax = 400000.0  # Maximum plasma current threshold [A]
 pulse_length = 1.0  # Minimum pulse length [s]
-min_shot = 100000
+min_shot = 160000
 max_shot = 999999
 
 [data_sources]
