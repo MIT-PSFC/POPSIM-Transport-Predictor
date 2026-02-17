@@ -36,12 +36,12 @@ def get_ds(
 
     # Load dataset according to JAX setting
     if jax.config.jax_enable_x64:
-        ds = xr.open_dataset(ds_path).astype(jax.numpy.float64)
+        ds = xr.open_dataset(ds_path, consolidated=True).astype(jax.numpy.float64)
     else:
-        ds = xr.open_dataset(ds_path).astype(jax.numpy.float32)
+        ds = xr.open_dataset(ds_path, consolidated=True).astype(jax.numpy.float32)
 
     if debug:
-        ds = ds.isel(
+        ds = ds.sel(
             shot=[201907, 201912, 201927, 201934]
         )  # Limit to specifically these 4 shots
 

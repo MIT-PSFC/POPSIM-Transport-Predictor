@@ -22,7 +22,7 @@ def get_trajectory_input_ranges(
     ds: xr.Dataset,
     inputs: list[str],
     shots_times: dict[int, dict[str, float]] = IP_RAMP_SHOTS,
-) -> dict[str, tuple[float, float]]:
+) -> dict[str, dict[str, float]]:
     """Find the typical ranges of trajectory parameters during the portion of the shot we are interested in
 
     For this study, this finds the ranges of R0, a_minor, kappa, delta_top, and delta_bottom
@@ -36,7 +36,7 @@ def get_trajectory_input_ranges(
 
     Returns:
     --------
-    dict[str, tuple[float, float]]: A dictionary mapping each input parameter to a tuple of (min, max) values that characterize the range of that parameter during the trajectory
+    dict[str, dict[str, float]]: A dictionary mapping each input parameter to a dictionary with keys "min", "max", "mean", "std", "median", "q1", and "q3" for the respective statistics of that parameter across the relevant portion of the shots
     """
 
 
