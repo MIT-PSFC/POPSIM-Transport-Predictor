@@ -475,59 +475,70 @@ class D3DDataWorkflow(DataWorkflow):
 
         processed_shots = 0
         for shot in self.shotlist:
-            if self.max_num_shots is not None and processed_shots >= self.max_num_shots:
-                logger.info(
-                    f"Reached maximum number of shots to process: {self.max_num_shots}"
+            try:
+                if (
+                    self.max_num_shots is not None
+                    and processed_shots >= self.max_num_shots
+                ):
+                    logger.info(
+                        f"Reached maximum number of shots to process: {self.max_num_shots}"
+                    )
+                    break
+
+                ds_path = os.path.join(self.raw_data_dir, f"{shot}.nc")
+                if os.path.exists(ds_path):
+                    logger.info(
+                        f"Raw dataset for shot {shot} already exists at {ds_path}"
+                    )
+                    processed_shots += 1
+                    continue
+
+                if not self.skip_profiles:
+                    if self.use_ida:
+                        ds_profile = self._get_profile_dataset_ida(shot)
+                        if ds_profile is None:
+                            logger.info(
+                                f"Skipping shot {shot} since IDA profiles are not available and skip_profiles is False"
+                            )
+                            continue
+                    else:
+                        ds_profile = self._get_profile_dataset_zipfit(shot)
+
+                ds_fast = self._get_fast_dataset_dispy(shot)
+                if ds_fast is None:
+                    continue
+                ds_0d = self._get_0D_dataset(shot)
+
+                # Put each dataset on a 1 kHz timebase, using previous value fill
+                max_time = max(
+                    ds_profile["time"].max().item(),
+                    ds_0d["time"].max().item(),
+                    ds_fast["time"].max().item(),
                 )
-                break
+                timebase = make_uniform_1khz_timebase(max_time)
 
-            ds_path = os.path.join(self.raw_data_dir, f"{shot}.nc")
-            if os.path.exists(ds_path):
-                logger.info(f"Raw dataset for shot {shot} already exists at {ds_path}")
+                ds_profile = ds_profile.reindex(time=timebase, method="ffill")
+                ds_0d = ds_0d.interp(
+                    time=timebase, method="nearest"
+                )  # This should be okay since 0D signal is already on 1 kHz timebase
+                ds_fast = ds_fast.interp(
+                    time=timebase, method="nearest"
+                )  # Fast dataset is already on 1 kHz timebase
+                ds_assembly = xr.merge(
+                    [ds_profile, ds_0d, ds_fast], compat="no_conflicts"
+                )
+
+                ds_standardized = self.standardize_signal_names(ds_assembly)
+                if ds_standardized is None:
+                    logger.warning(f"Standardization failed for shot {shot}, skipping")
+                    continue
+
+                ds_standardized.to_netcdf(ds_path)
+                logger.info(f"Saved raw dataset for shot {shot} to {ds_path}")
                 processed_shots += 1
+            except Exception as e:
+                logger.error(f"Error processing shot {shot}: {e}", exc_info=True)
                 continue
-
-            if not self.skip_profiles:
-                if self.use_ida:
-                    ds_profile = self._get_profile_dataset_ida(shot)
-                    if ds_profile is None:
-                        logger.info(
-                            f"Skipping shot {shot} since IDA profiles are not available and skip_profiles is False"
-                        )
-                        continue
-                else:
-                    ds_profile = self._get_profile_dataset_zipfit(shot)
-
-            ds_fast = self._get_fast_dataset_dispy(shot)
-            if ds_fast is None:
-                continue
-            ds_0d = self._get_0D_dataset(shot)
-
-            # Put each dataset on a 1 kHz timebase, using previous value fill
-            max_time = max(
-                ds_profile["time"].max().item(),
-                ds_0d["time"].max().item(),
-                ds_fast["time"].max().item(),
-            )
-            timebase = make_uniform_1khz_timebase(max_time)
-
-            ds_profile = ds_profile.reindex(time=timebase, method="ffill")
-            ds_0d = ds_0d.interp(
-                time=timebase, method="nearest"
-            )  # This should be okay since 0D signal is already on 1 kHz timebase
-            ds_fast = ds_fast.interp(
-                time=timebase, method="nearest"
-            )  # Fast dataset is already on 1 kHz timebase
-            ds_assembly = xr.merge([ds_profile, ds_0d, ds_fast], compat="no_conflicts")
-
-            ds_standardized = self.standardize_signal_names(ds_assembly)
-            if ds_standardized is None:
-                logger.warning(f"Standardization failed for shot {shot}, skipping")
-                continue
-
-            ds_standardized.to_netcdf(ds_path)
-            logger.info(f"Saved raw dataset for shot {shot} to {ds_path}")
-            processed_shots += 1
 
         logger.info("Finished making raw data files.")
 
@@ -618,7 +629,7 @@ class D3DDataWorkflow(DataWorkflow):
         ]
 
         # If any *important* signal is all NaN, return None to skip this shot
-        for signal in ["Te_keV_rho", "ne20_rho", "Ip_MA"]:
+        for signal in ["Te_keV_rho", "ne20_rho", "Ip_MA", "ne20_edge"]:
             if ds[signal].isnull().all():
                 logger.warning(
                     f"Signal {signal} is all NaN for shot {ds['shot'].item()}, skipping shot."
