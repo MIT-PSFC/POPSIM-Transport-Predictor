@@ -241,9 +241,11 @@ class DataWorkflow:
 
         # Label where the profiles are fresh (not made by ffill)
         if "fresh_profiles" not in shot_ds:
-            diff_result = shot_ds["ne20_rho"].fillna(0).diff("time_idx", label="upper")
-            first_valid_is_fresh = shot_ds["ne20_rho"].notnull().cumsum("time_idx") == 1
-            fresh_profiles_1D = (diff_result != 0) | first_valid_is_fresh
+            ne20 = shot_ds["ne20_rho"]
+            ne20_filled = ne20.fillna(0)
+            diff_result = ne20_filled != ne20_filled.shift(time_idx=1, fill_value=0)
+            first_valid_is_fresh = ne20.notnull().cumsum("time_idx") == 1
+            fresh_profiles_1D = diff_result | first_valid_is_fresh
             fresh_profiles = fresh_profiles_1D.any("rho")
             shot_ds["fresh_profiles"] = fresh_profiles.astype(np.float32)
 

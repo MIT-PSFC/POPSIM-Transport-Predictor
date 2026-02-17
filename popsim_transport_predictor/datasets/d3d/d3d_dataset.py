@@ -136,8 +136,11 @@ class D3DDataWorkflow(DataWorkflow):
             skip_profiles=skip_profiles,
         )
 
-        self.valid_signal_bounds = {
-            "Wtot_MJ": (1e-3, None),
+        self.filter_config = {
+            "Wtot_MJ": {"min": 0.01, "max": 2},
+            "ne20_line_avg": {"min": 0.01, "max": 4},
+            "ne20_edge": {"min": 0.01, "max": 4},
+            "P_ECRH_MW": {"min": 0, "max": 10},
         }
 
     def _get_shotlist_from_source(self) -> list[int]:
@@ -181,6 +184,7 @@ class D3DDataWorkflow(DataWorkflow):
 
         p = Pipeline([shot])
 
+        betapf = MdsSignal(r"\betapf", "pedestal", location="remote://atlas.gat.com")
         POHM = MdsSignal(
             r"\pohm", "aot", location="remote://atlas.gat.com"
         )  # Ohmic heating power
@@ -195,6 +199,7 @@ class D3DDataWorkflow(DataWorkflow):
         ).set_callback(_cm3_to_m3)  # Line average electron density at the edge [m^-3]
 
         sigs_dict = {
+            "betapf": betapf,
             "p_oh_toksearch": POHM,
             "p_rad_toksearch": PradBulk,
             "tau_conf": TAU_conf,
@@ -549,7 +554,8 @@ class D3DDataWorkflow(DataWorkflow):
                 "aminor": "a_minor",
                 "tritop": "delta_top",
                 "tribot": "delta_bottom",
-                "psi_n": "rho",
+                "psi_n": "rho",  # Yeah I know that this mapping isn't exact, I just need *something*
+                "betapf": "beta",  # Only for DIII-D profile prediction, using beta feedback TODO(ZanderKeith) ensure this is the actual signal
             }
         )
 
@@ -588,7 +594,7 @@ class D3DDataWorkflow(DataWorkflow):
                 "Te_keV_rho",
                 "ne20_rho",
                 "Wtot_MJ",
-                "Wmhd_MJ",
+                "beta",
                 "R0",
                 "B0",
                 "Ip_MA",
