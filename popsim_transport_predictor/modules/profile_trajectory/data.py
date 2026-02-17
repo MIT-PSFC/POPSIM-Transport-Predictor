@@ -1,0 +1,77 @@
+import jax
+import numpy as np
+import xarray as xr
+
+REQUIRED_SIGNALS = [
+    # DIII-D PCS handles these
+    "B0",
+    "Ip_MA",
+    "ne20_edge",
+    "beta",
+    # Our trajectory optimization is over these variables
+    "R0",
+    "a_minor",
+    "kappa",
+    "delta_top",
+    "delta_bottom",
+    # Target profiles for the loss function
+    "ne20_psi",
+    "Te_keV_psi",
+]
+
+
+def get_ds(
+    ds_path: str,
+    debug: bool | None = False,
+) -> tuple[xr.Dataset, str]:
+    """Load the dataset, and do some light processing to get it ready for training.
+
+    Args:
+        ds_path (str): Path to the dataset.
+        debug (bool, optional): Whether to enable debug mode, reducing dataset size to at most 50 shots.
+
+    Returns:
+        tuple[xr.Dataset, str]: The processed dataset and the dimension along which to group the data
+    """
+
+    # Load dataset according to JAX setting
+    if jax.config.jax_enable_x64:
+        ds = xr.open_dataset(ds_path).astype(jax.numpy.float64)
+    else:
+        ds = xr.open_dataset(ds_path).astype(jax.numpy.float32)
+
+    if debug:
+        ds = ds.isel(
+            shot=[201907, 201912, 201927, 201934]
+        )  # Limit to specifically these 4 shots
+
+    # If signals are in terms of rho replace them with psi
+    # TODO(ZanderKeith) this is sloppy dataset creation on my end, should really standardize this naming scheme
+    # Double check if the TCV dataset is in terms of rho or psi and handle accordingly
+    if "rho" in ds.coords and "psi" not in ds.coords:
+        ds = ds.rename({"rho": "psi"})
+        for signal in ["ne20_rho", "Te_keV_rho"]:
+            if signal in ds:
+                ds = ds.rename({signal: signal.replace("rho", "psi")})
+
+    # Ensure all required signals are present
+    for signal in REQUIRED_SIGNALS:
+        if signal not in ds:
+            raise ValueError(
+                f"Required signal for trajectory optimization {signal} not found in dataset."
+            )
+
+    # Put dataset on a 60-point psi grid [0, 1.2]
+    psigrid = np.linspace(0, 1.2, 60)
+    ds = ds.interp(psi=psigrid)
+
+    # Calculate shape variables
+    ds["ne_shape"] = ds["ne20_psi"] / ds["ne20_psi"].integrate("psi")
+    ds["Te_shape"] = ds["Te_keV_psi"] / ds["Te_keV_psi"].integrate("psi")
+
+    # If dataset was from a zarr store, must promote the 'time' data var to a coordinate
+    if "time" not in ds.coords:
+        ds = ds.set_coords("time")
+
+    # Dataset retains all signals, the dataloader will filter out the ones that are not needed.
+    return ds, "shot"

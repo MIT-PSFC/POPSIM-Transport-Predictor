@@ -56,7 +56,7 @@ class ProfileTrajectoryOptimizer(TimeDepModule):
     class Output:
         # Things that are necessary for computing the loss function
         profile_predictor_output: ProfilePredictorOutputs
-        rho: Array
+        psi: Array
 
     def __init__(
         self,
@@ -96,7 +96,7 @@ class ProfileTrajectoryOptimizer(TimeDepModule):
         # Create the output for this module
         output = ProfileTrajectoryOptimizer.Output(
             profile_predictor_output=profile_predictor_output,
-            rho=self.rhogrid,
+            psi=self.psigrid,
         )
 
         # Update the state (in this case, just increment the time)
