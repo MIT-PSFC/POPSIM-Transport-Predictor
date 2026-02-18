@@ -41,8 +41,10 @@ def characterize_dataset(ds_path: str, debug: bool = False) -> None:
 
     for input_var, stats in input_ranges.items():
         logger.info(
-            f"Input variable {input_var} has the following statistics during the trajectory portion of the shots: {stats}"
+            f"Input variable {input_var} has the following statistics during the trajectory portion of the shots:"
         )
+        for stat_name, stat_value in stats.items():
+            logger.info(f"    {stat_name}: {stat_value:.5f}")
 
     controllable_input_ranges = get_controllable_input_ranges(
         ds, ["Ip_MA", "B0", "ne20_edge", "beta"]
@@ -50,7 +52,7 @@ def characterize_dataset(ds_path: str, debug: bool = False) -> None:
 
     for input_var, error in controllable_input_ranges.items():
         logger.info(
-            f"Controllable input variable {input_var} has a characteristic error of {error} during the trajectory portion of the shots"
+            f"Controllable input variable {input_var} has a characteristic error of {error:.5f} during the trajectory portion of the shots"
         )
 
 

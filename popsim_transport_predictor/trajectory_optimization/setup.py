@@ -1,3 +1,4 @@
+import numpy as np
 import xarray as xr
 
 IP_RAMP_SHOTS = {
@@ -39,6 +40,35 @@ def get_trajectory_input_ranges(
     dict[str, dict[str, float]]: A dictionary mapping each input parameter to a dictionary with keys "min", "max", "mean", "std", "median", "q1", and "q3" for the respective statistics of that parameter across the relevant portion of the shots
     """
 
+    shot_datasets = []
+    for shot, times in shots_times.items():
+        if shot in ds["shot"]:
+            ds_shot = ds.sel(shot=shot)
+            ds_ramp = ds_shot.where(
+                (ds_shot["time"] >= times["start"]) & (ds_shot["time"] <= times["end"]),
+                drop=True,
+            )
+            shot_datasets.append(ds_ramp)
+
+    ds_trajectory = xr.concat(
+        shot_datasets, dim="time_idx", coords="minimal", compat="override"
+    )
+
+    input_ranges = {}
+    for input_var in inputs:
+        input_data = ds_trajectory[input_var].values
+        input_ranges[input_var] = {
+            "min": float(input_data.min()),
+            "max": float(input_data.max()),
+            "mean": float(input_data.mean()),
+            "std": float(input_data.std()),
+            "median": float(np.median(input_data)),
+            "q1": float(np.percentile(input_data, 25)),
+            "q3": float(np.percentile(input_data, 75)),
+        }
+
+    return input_ranges
+
 
 def get_controllable_input_ranges(
     ds: xr.Dataset,
@@ -61,6 +91,34 @@ def get_controllable_input_ranges(
     --------
     dict[str, float]: A dictionary mapping each input parameter to a characteristic error value (e.g. standard deviation of the error)
     """
+
+    all_chunk_stds = []
+
+    for shot, times in shots_times.items():
+        if shot in ds["shot"]:
+            ds_shot = ds.sel(shot=shot)
+            # Slice to the specific window of interest
+            ds_ramp = ds_shot.where(
+                (ds_shot["time"] >= times["start"]) & (ds_shot["time"] <= times["end"]),
+                drop=True,
+            )
+
+            # Coarsen this shot individually
+            # This avoids "bleeding" data from Shot A into Shot B
+            shot_chunks = ds_ramp.coarsen(time_idx=100, boundary="trim").std()
+            shot_chunks = shot_chunks.rename({"time_idx": "chunk_idx"})
+            all_chunk_stds.append(shot_chunks)
+
+    # Combine all the standard deviation "snippets" from all shots
+    # We can just use a simple list merge or xr.concat if we want to keep it as an xarray object
+    ds_all_stds = xr.concat(all_chunk_stds, dim="chunk_idx")
+
+    input_ranges = {}
+    for input_var in inputs:
+        # Average the standard deviations across ALL chunks from ALL shots
+        input_ranges[input_var] = float(ds_all_stds[input_var].mean())
+
+    return input_ranges
 
 
 def make_optimization_dataset():
