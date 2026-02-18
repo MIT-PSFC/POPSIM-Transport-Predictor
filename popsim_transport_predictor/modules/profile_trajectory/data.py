@@ -3,6 +3,7 @@ import numpy as np
 import xarray as xr
 
 REQUIRED_SIGNALS = [
+    "time",
     # DIII-D PCS handles these
     "B0",
     "Ip_MA",
@@ -54,12 +55,8 @@ def get_ds(
             if signal in ds:
                 ds = ds.rename({signal: signal.replace("rho", "psi")})
 
-    # Ensure all required signals are present
-    for signal in REQUIRED_SIGNALS:
-        if signal not in ds:
-            raise ValueError(
-                f"Required signal for trajectory optimization {signal} not found in dataset."
-            )
+    # Limit to required signals
+    ds = ds[REQUIRED_SIGNALS]
 
     # Put dataset on a 60-point psi grid [0, 1.2]
     psigrid = np.linspace(0, 1.2, 60)
