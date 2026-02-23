@@ -6,6 +6,8 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 class StudyConfig(BaseSettings):
     """Configuration for dataset paths."""
 
+    debug: bool = False
+
     cmod_dataset_path: Path | None = None
     tcv_dataset_path: Path | None = None
     d3d_lp_dataset_path: Path | None = None

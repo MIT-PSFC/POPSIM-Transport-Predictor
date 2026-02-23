@@ -165,29 +165,48 @@ class DataVisualization:
                     y_var="Wtot_MJ",
                 )
 
-        # DIII-D high-performance in context of all training data
-        if (
-            config.d3d_hp_dataset_path
-            and config.cmod_dataset_path
-            and config.tcv_dataset_path
-            and config.d3d_lp_dataset_path
-        ):
-            fig_path = os.path.join(
-                save_dir, "d3d_hp_in_context_performance_extrapolation.png"
-            )
-            if not os.path.exists(fig_path):
-                train_ds, test_ds = get_train_test_datasets_transfer(
-                    training_data_case="cmod_tcv_d3d_lp",
-                    num_hp_shots=max(HP_SHOTS_INCLUDED),
-                )
-                performance_extrapolation_plot(
-                    save_path=fig_path,
-                    ds_list=[train_ds, test_ds],
-                    labels=["Training Data", "High-Performance Test Data"],
-                    performance_metric="performance",
-                    x_var="Ip_MA",
-                    y_var="Wtot_MJ",
-                )
+        # DIII-D high-performance in context of available training data
+        context_dict = {
+            "cmod": {
+                "condition": config.cmod_dataset_path,
+                "fig_name": "d3d_hp_in_context_cmod_performance_extrapolation.png",
+            },
+            "tcv": {
+                "condition": config.tcv_dataset_path,
+                "fig_name": "d3d_hp_in_context_tcv_performance_extrapolation.png",
+            },
+            "d3d_lp": {
+                "condition": config.d3d_lp_dataset_path,
+                "fig_name": "d3d_hp_in_context_d3d_lp_performance_extrapolation.png",
+            },
+            "cmod_tcv": {
+                "condition": config.cmod_dataset_path and config.tcv_dataset_path,
+                "fig_name": "d3d_hp_in_context_cmod_tcv_performance_extrapolation.png",
+            },
+            "cmod_tcv_d3d_lp": {
+                "condition": config.cmod_dataset_path
+                and config.tcv_dataset_path
+                and config.d3d_lp_dataset_path,
+                "fig_name": "d3d_hp_in_context_cmod_tcv_d3d_lp_performance_extrapolation.png",
+            },
+        }
+
+        for context_case, context_info in context_dict.items():
+            if context_info["condition"] and config.d3d_hp_dataset_path:
+                fig_path = os.path.join(save_dir, context_info["fig_name"])
+                if not os.path.exists(fig_path):
+                    train_ds, test_ds = get_train_test_datasets_transfer(
+                        training_data_case=context_case,
+                        num_hp_shots=max(HP_SHOTS_INCLUDED),
+                    )
+                    performance_extrapolation_plot(
+                        save_path=fig_path,
+                        ds_list=[train_ds, test_ds],
+                        labels=[],
+                        performance_metric="performance",
+                        x_var="Ip_MA",
+                        y_var="Wtot_MJ",
+                    )
 
 
 class ComputeResults:
