@@ -28,9 +28,36 @@ REQUIRED_SIGNALS = [
 INPUT_POWER_SIGNALS = ["P_ECRH_MW", "P_NBI_MW", "P_ICRF_MW", "P_LH_MW"]
 
 
+def concat_with_nan_padding(
+    datasets: list[xr.Dataset],
+    concat_dim: str,
+    pad_dim: str = "time_idx",
+) -> xr.Dataset:
+    """Concatenate datasets while padding shorter `pad_dim` with NaNs.
+
+    This is needed when datasets have different lengths along `pad_dim` and
+    do not all have an explicit coordinate index for that dimension.
+    """
+    prepared_datasets = []
+    for dataset in datasets:
+        if pad_dim in dataset.dims and pad_dim not in dataset.coords:
+            ds = dataset.assign_coords({pad_dim: np.arange(dataset.sizes[pad_dim])})
+        else:
+            ds = dataset
+        prepared_datasets.append(ds)
+
+    aligned_datasets = xr.align(*prepared_datasets, join="outer", fill_value=np.nan)
+    return xr.concat(
+        aligned_datasets,
+        dim=concat_dim,
+        join="outer",
+        fill_value=np.nan,
+    )
+
+
 def get_ds(
     source_ds: str,
-    debug: bool | None = False,
+    debug: bool | None = config.debug,
 ) -> tuple[xr.Dataset, str]:
     """Open the dataset, and do some light processing to get it ready for training.
 
@@ -209,9 +236,15 @@ def get_train_val_test_datasets(
         test_ds_tcv = test_ds_tcv.assign_coords(ds_source="tcv")
 
         if training_data_case == "cmod_tcv":
-            train_ds = xr.concat([train_ds_cmod, train_ds_tcv], dim=episode_coord)
-            val_ds = xr.concat([val_ds_cmod, val_ds_tcv], dim=episode_coord)
-            test_ds = xr.concat([test_ds_cmod, test_ds_tcv], dim=episode_coord)
+            train_ds = concat_with_nan_padding(
+                [train_ds_cmod, train_ds_tcv], concat_dim=episode_coord
+            )
+            val_ds = concat_with_nan_padding(
+                [val_ds_cmod, val_ds_tcv], concat_dim=episode_coord
+            )
+            test_ds = concat_with_nan_padding(
+                [test_ds_cmod, test_ds_tcv], concat_dim=episode_coord
+            )
 
         elif training_data_case == "cmod_tcv_d3d_lp":
             ds_d3d_lp, episode_coord = get_ds("d3d_lp")
@@ -227,14 +260,17 @@ def get_train_val_test_datasets(
             val_ds_d3d_lp = val_ds_d3d_lp.assign_coords(ds_source="d3d_lp")
             test_ds_d3d_lp = test_ds_d3d_lp.assign_coords(ds_source="d3d_lp")
 
-            train_ds = xr.concat(
-                [train_ds_cmod, train_ds_tcv, train_ds_d3d_lp], dim=episode_coord
+            train_ds = concat_with_nan_padding(
+                [train_ds_cmod, train_ds_tcv, train_ds_d3d_lp],
+                concat_dim=episode_coord,
             )
-            val_ds = xr.concat(
-                [val_ds_cmod, val_ds_tcv, val_ds_d3d_lp], dim=episode_coord
+            val_ds = concat_with_nan_padding(
+                [val_ds_cmod, val_ds_tcv, val_ds_d3d_lp],
+                concat_dim=episode_coord,
             )
-            test_ds = xr.concat(
-                [test_ds_cmod, test_ds_tcv, test_ds_d3d_lp], dim=episode_coord
+            test_ds = concat_with_nan_padding(
+                [test_ds_cmod, test_ds_tcv, test_ds_d3d_lp],
+                concat_dim=episode_coord,
             )
 
         else:
@@ -282,8 +318,9 @@ def get_train_test_datasets_transfer(
         train_ds_hist, val_ds_hist, test_ds_hist = get_train_val_test_datasets(
             training_data_case
         )
-        train_ds = xr.concat(
-            [train_ds_hist, val_ds_hist, test_ds_hist, train_ds_hp], dim=episode_coord
+        train_ds = concat_with_nan_padding(
+            [train_ds_hist, val_ds_hist, test_ds_hist, train_ds_hp],
+            concat_dim=episode_coord,
         )
 
     return train_ds, test_ds

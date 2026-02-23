@@ -1,3 +1,5 @@
+from popsim_transport_predictor.transfer_learning.config import config
+
 TRAINING_DATA_CASES = [
     "cmod",  # C-Mod only
     "tcv",  # TCV only
@@ -31,9 +33,12 @@ MODEL_CASES = {
 }
 
 # Shots of high-performance data included in training
-HP_SHOTS_INCLUDED = [0, 1, 3, 10, 30, 100]
+if config.debug:
+    HP_SHOTS_INCLUDED = [0, 1, 3]
+else:
+    HP_SHOTS_INCLUDED = [0, 1, 3, 10, 30, 100]
 
 # 80/20 between training+validation and testing
 # and 80/20 between training and validation
 TRAIN_VAL_TEST_SPLIT = (0.64, 0.16, 0.2)
-TRAIN_TEST_SPLIT = (0.8, 0.2)
+TRAIN_VAL_SPLIT = (0.8, 0.2)
