@@ -4,18 +4,26 @@ import matplotlib.pyplot as plt
 import numpy as np
 import xarray as xr
 
+BACKGROUND_COLOR = "#2F2F2F"
+FACE_COLOR = "#1A1A1A"
+TEXT_COLOR = "white"
+
+TITLE_FONTSIZE = 20
+LABEL_FONTSIZE = 16
+TICK_FONTSIZE = 14
+LEGEND_FONTSIZE = 14
+
 SOURCE_COLORS = {
-    "cmod": "#d62728",
-    "tcv": "#ff7f0e",
-    "d3d_lp": "#1f77b4",
-    "d3d_hp": "#ff00e1",
+    "cmod": "#ff4d4d",
+    "tcv": "#8dff36",
+    "d3d_lp": "#0095ff",
+    "d3d_hp": "#ff60ec",
 }
 
-# Train is a square, val is a circle, test is a star
 DATASET_SHAPES = {
-    "train": "s",
-    "val": "o",
-    "test": "*",
+    "train": ("s", 120),
+    "val": ("o", 160),
+    "test": ("*", 240),
 }
 
 
@@ -36,17 +44,16 @@ def performance_extrapolation_plot(  # noqa: PLR0915
         x_var: Name of the variable to plot on the x-axis (default: "Ip_MA")
         y_var: Name of the variable to plot on the y-axis (default: "Wtot_MJ")
     """
-    _fig, ax = plt.subplots(figsize=(10, 8))
+    fig, ax = plt.subplots(figsize=(10, 8))
+    fig.patch.set_facecolor(BACKGROUND_COLOR)
+    ax.set_facecolor(FACE_COLOR)
 
-    # Collect all data points for contour plotting
     all_x = []
     all_y = []
-    all_performance = []
     all_sources = []
-    all_dataset_labels = []  # Track which dataset each point belongs to
+    all_ds_types = []
 
     for dataset_idx, ds in enumerate(ds_list):
-        # Extract coordinates - use _p75 suffix for scalar per-shot values
         x_var_p75 = f"{x_var}_p75"
         y_var_p75 = f"{y_var}_p75"
 
@@ -54,90 +61,84 @@ def performance_extrapolation_plot(  # noqa: PLR0915
         y_vals = ds[y_var_p75].values
         source_vals = ds.coords["ds_source"].values
 
-        # Flatten if needed
         x_vals = np.atleast_1d(x_vals).flatten()
         y_vals = np.atleast_1d(y_vals).flatten()
 
-        # Handle ds_source - could be array or single value
         if np.isscalar(source_vals) or source_vals.size == 1:
             source_vals = np.full_like(x_vals, source_vals, dtype=object)
         else:
             source_vals = np.atleast_1d(source_vals).flatten()
 
+        ds_type = (
+            ds_type_list[dataset_idx] if dataset_idx < len(ds_type_list) else "unknown"
+        )
+
         all_x.extend(x_vals)
         all_y.extend(y_vals)
         all_sources.extend(source_vals)
-        all_dataset_labels.extend([dataset_idx] * len(x_vals))
+        all_ds_types.extend([ds_type] * len(x_vals))
 
     all_x = np.array(all_x)
     all_y = np.array(all_y)
-    all_performance = np.array(all_performance)
     all_sources = np.array(all_sources)
-    all_dataset_labels = np.array(all_dataset_labels)
+    all_ds_types = np.array(all_ds_types)
 
-    # Filter out NaN values
-    valid_mask = ~(np.isnan(all_x) | np.isnan(all_y) | np.isnan(all_performance))
+    valid_mask = ~(np.isnan(all_x) | np.isnan(all_y))
     all_x = all_x[valid_mask]
     all_y = all_y[valid_mask]
     all_sources = all_sources[valid_mask]
-    all_dataset_labels = all_dataset_labels[valid_mask]
+    all_ds_types = all_ds_types[valid_mask]
 
-    # Find limits for plotting
-    x_min, x_max = 0, all_x.max() * 1.1
-    y_min, y_max = 0, all_y.max() * 1.1
+    x_max = all_x.max() * 1.1 if all_x.size > 0 else 1
+    y_max = all_y.max() * 1.1 if all_y.size > 0 else 1
 
-    # Plot scatter points colored by data source
-    # and shaped by dataset (if multiple datasets)
-    source_handles = []
-    dataset_handles = []
-    for source in np.unique(all_sources):
-        mask = all_sources == source
-        scatter = ax.scatter(
-            all_x[mask],
-            all_y[mask],
-            c=SOURCE_COLORS.get(source, "black"),
-            label=source,
-            s=50,
-            alpha=0.7,
-            edgecolors="black",
-            linewidths=0.5,
+    handles = []
+    for ds_type in np.unique(all_ds_types):
+        mask = all_ds_types == ds_type
+        marker, size = DATASET_SHAPES.get(ds_type.lower(), ("o", 60))
+
+        for source in np.unique(all_sources[mask]):
+            sub_mask = mask & (all_sources == source)
+            scatter = ax.scatter(
+                all_x[sub_mask],
+                all_y[sub_mask],
+                c=SOURCE_COLORS.get(source, "black"),
+                marker=marker,
+                label=f"{ds_type} - {source}",
+                s=size,
+                alpha=0.7,
+                edgecolors="black",
+                linewidths=0.5,
+            )
+            handles.append(scatter)
+
+    ax.set_xlabel(x_var, fontsize=LABEL_FONTSIZE, color=TEXT_COLOR)
+    ax.set_ylabel(y_var, fontsize=LABEL_FONTSIZE, color=TEXT_COLOR)
+    ax.set_title(
+        f"Performance Extrapolation in {x_var}-{y_var} Space",
+        fontsize=TITLE_FONTSIZE,
+        color=TEXT_COLOR,
+    )
+
+    if handles:
+        legend = ax.legend(
+            title="Dataset / Data Source", loc="upper left", framealpha=0.9
         )
-        source_handles.append(scatter)
+        legend.get_title().set_color(TEXT_COLOR)
+        for text in legend.get_texts():
+            text.set_color(TEXT_COLOR)
+        legend.get_frame().set_facecolor(FACE_COLOR)
+        legend.get_frame().set_edgecolor(TEXT_COLOR)
 
-    ax.set_xlabel(x_var)
-    ax.set_ylabel(y_var)
-    ax.set_title(f"Performance Extrapolation in {x_var}-{y_var} Space")
-
-    # Create combined legend with both datasets and data sources
-    if dataset_handles:
-        # Add a separator between datasets and sources
-
-        all_handles = [*dataset_handles, *source_handles]
-        all_labels = [
-            *[h.get_label() for h in dataset_handles],
-            "",
-            *[h.get_label() for h in source_handles],
-        ]
-
-        # Create legend with two sections
-        ax.legend(
-            all_handles,
-            all_labels,
-            title="Dataset / Data Source",
-            loc="upper left",
-            framealpha=0.9,
-        )
-    else:
-        ax.legend(title="Data Source")
-
-    ax.grid(True, alpha=0.3)
-    # Set the x and y limits
-    ax.set_xlim(x_min, x_max)
-    ax.set_ylim(y_min, y_max)
+    ax.tick_params(axis="both", colors=TEXT_COLOR, labelsize=TICK_FONTSIZE)
+    ax.grid(True, color="gray", linestyle="--", linewidth=0.3)
+    for spine in ax.spines.values():
+        spine.set_color(TEXT_COLOR)
+    ax.set_xlim(0, x_max)
+    ax.set_ylim(0, y_max)
 
     plt.tight_layout()
 
-    # Create directory if it doesn't exist
     Path(save_path).parent.mkdir(parents=True, exist_ok=True)
 
     plt.savefig(save_path, dpi=300, bbox_inches="tight")

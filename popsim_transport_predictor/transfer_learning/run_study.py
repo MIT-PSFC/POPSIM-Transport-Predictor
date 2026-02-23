@@ -56,8 +56,7 @@ class DataVisualization:
                 performance_extrapolation_plot(
                     save_path=fig_path,
                     ds_list=[train_ds, val_ds, test_ds],
-                    labels=["Train", "Validation", "Test"],
-                    performance_metric="performance",
+                    ds_type_list=["train", "val", "test"],
                     x_var="Ip_MA",
                     y_var="Wtot_MJ",
                 )
@@ -74,8 +73,7 @@ class DataVisualization:
                 performance_extrapolation_plot(
                     save_path=fig_path,
                     ds_list=[train_ds, val_ds, test_ds],
-                    labels=["Train", "Validation", "Test"],
-                    performance_metric="performance",
+                    ds_type_list=["train", "val", "test"],
                     x_var="Ip_MA",
                     y_var="Wtot_MJ",
                 )
@@ -92,8 +90,7 @@ class DataVisualization:
                 performance_extrapolation_plot(
                     save_path=fig_path,
                     ds_list=[train_ds, val_ds, test_ds],
-                    labels=["Train", "Validation", "Test"],
-                    performance_metric="performance",
+                    ds_type_list=["train", "val", "test"],
                     x_var="Ip_MA",
                     y_var="Wtot_MJ",
                 )
@@ -112,8 +109,7 @@ class DataVisualization:
                 performance_extrapolation_plot(
                     save_path=fig_path,
                     ds_list=[train_ds, val_ds, test_ds],
-                    labels=["Train", "Validation", "Test"],
-                    performance_metric="performance",
+                    ds_type_list=["train", "val", "test"],
                     x_var="Ip_MA",
                     y_var="Wtot_MJ",
                 )
@@ -138,8 +134,7 @@ class DataVisualization:
                 performance_extrapolation_plot(
                     save_path=fig_path,
                     ds_list=[train_ds, val_ds, test_ds],
-                    labels=["Train", "Validation", "Test"],
-                    performance_metric="performance",
+                    ds_type_list=["train", "val", "test"],
                     x_var="Ip_MA",
                     y_var="Wtot_MJ",
                 )
@@ -159,8 +154,7 @@ class DataVisualization:
                 performance_extrapolation_plot(
                     save_path=fig_path,
                     ds_list=[train_ds, test_ds],
-                    labels=["Training Data", "High-Performance Test Data"],
-                    performance_metric="performance",
+                    ds_type_list=["train", "test"],
                     x_var="Ip_MA",
                     y_var="Wtot_MJ",
                 )
@@ -202,8 +196,7 @@ class DataVisualization:
                     performance_extrapolation_plot(
                         save_path=fig_path,
                         ds_list=[train_ds, test_ds],
-                        labels=[],
-                        performance_metric="performance",
+                        ds_type_list=["train", "test"],
                         x_var="Ip_MA",
                         y_var="Wtot_MJ",
                     )
