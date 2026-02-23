@@ -6,7 +6,7 @@ from popsim.ml.split_utils import split_dataset_by_fracs
 from popsim_transport_predictor.transfer_learning.config import config
 from popsim_transport_predictor.transfer_learning.orchestration import (
     HP_SHOTS_INCLUDED,
-    TRAIN_VAL_TEST_SPLIT,
+    TRAIN_VAL_SPLIT,
 )
 
 MAX_DS_SIZE_GB = 100  # If the dataset is larger than this, do not load into memory
@@ -187,53 +187,55 @@ def add_performance(
     return ds
 
 
-def get_train_val_test_datasets(
+def get_train_val_datasets(
     training_data_case: str,
 ):
     """
-    Split dataset into training, validation, and test sets based on the specified case.
+    Split dataset into training and validation sets based on the specified training data case.
+
+    The reason why we only have train and val sets here is because our true test set is the high-performance D3D shots, handled separately.
+    That means all our historic data can be used for training (with the model) and validation (picking the best checkpoint / hyperparameters).
     """
 
     if training_data_case in ["cmod", "tcv", "d3d_lp"]:
+        # Single device historic training data
         ds, episode_coord = get_ds(training_data_case)
         ds = add_performance(ds, episode_coord)
-        train_ds, val_ds, test_ds = split_dataset_by_fracs(
+        train_ds, val_ds = split_dataset_by_fracs(
             ds,
-            fracs=TRAIN_VAL_TEST_SPLIT,
+            fracs=TRAIN_VAL_SPLIT,
             dim=episode_coord,
             seed=42,
             sortby="performance",
         )
         train_ds = train_ds.assign_coords(ds_source=training_data_case)
         val_ds = val_ds.assign_coords(ds_source=training_data_case)
-        test_ds = test_ds.assign_coords(ds_source=training_data_case)
 
     else:
+        # Multi-device historic training data
         ds_cmod, episode_coord = get_ds("cmod")
         ds_cmod = add_performance(ds_cmod, episode_coord)
-        train_ds_cmod, val_ds_cmod, test_ds_cmod = split_dataset_by_fracs(
+        train_ds_cmod, val_ds_cmod = split_dataset_by_fracs(
             ds_cmod,
-            fracs=TRAIN_VAL_TEST_SPLIT,
+            fracs=TRAIN_VAL_SPLIT,
             dim=episode_coord,
             seed=42,
             sortby="performance",
         )
         train_ds_cmod = train_ds_cmod.assign_coords(ds_source="cmod")
         val_ds_cmod = val_ds_cmod.assign_coords(ds_source="cmod")
-        test_ds_cmod = test_ds_cmod.assign_coords(ds_source="cmod")
 
         ds_tcv, episode_coord = get_ds("tcv")
         ds_tcv = add_performance(ds_tcv, episode_coord)
-        train_ds_tcv, val_ds_tcv, test_ds_tcv = split_dataset_by_fracs(
+        train_ds_tcv, val_ds_tcv = split_dataset_by_fracs(
             ds_tcv,
-            fracs=TRAIN_VAL_TEST_SPLIT,
+            fracs=TRAIN_VAL_SPLIT,
             dim=episode_coord,
             seed=42,
             sortby="performance",
         )
         train_ds_tcv = train_ds_tcv.assign_coords(ds_source="tcv")
         val_ds_tcv = val_ds_tcv.assign_coords(ds_source="tcv")
-        test_ds_tcv = test_ds_tcv.assign_coords(ds_source="tcv")
 
         if training_data_case == "cmod_tcv":
             train_ds = concat_with_nan_padding(
@@ -242,23 +244,19 @@ def get_train_val_test_datasets(
             val_ds = concat_with_nan_padding(
                 [val_ds_cmod, val_ds_tcv], concat_dim=episode_coord
             )
-            test_ds = concat_with_nan_padding(
-                [test_ds_cmod, test_ds_tcv], concat_dim=episode_coord
-            )
 
         elif training_data_case == "cmod_tcv_d3d_lp":
             ds_d3d_lp, episode_coord = get_ds("d3d_lp")
             ds_d3d_lp = add_performance(ds_d3d_lp, episode_coord)
-            train_ds_d3d_lp, val_ds_d3d_lp, test_ds_d3d_lp = split_dataset_by_fracs(
+            train_ds_d3d_lp, val_ds_d3d_lp = split_dataset_by_fracs(
                 ds_d3d_lp,
-                fracs=TRAIN_VAL_TEST_SPLIT,
+                fracs=TRAIN_VAL_SPLIT,
                 dim=episode_coord,
                 seed=42,
                 sortby="performance",
             )
             train_ds_d3d_lp = train_ds_d3d_lp.assign_coords(ds_source="d3d_lp")
             val_ds_d3d_lp = val_ds_d3d_lp.assign_coords(ds_source="d3d_lp")
-            test_ds_d3d_lp = test_ds_d3d_lp.assign_coords(ds_source="d3d_lp")
 
             train_ds = concat_with_nan_padding(
                 [train_ds_cmod, train_ds_tcv, train_ds_d3d_lp],
@@ -268,19 +266,13 @@ def get_train_val_test_datasets(
                 [val_ds_cmod, val_ds_tcv, val_ds_d3d_lp],
                 concat_dim=episode_coord,
             )
-            test_ds = concat_with_nan_padding(
-                [test_ds_cmod, test_ds_tcv, test_ds_d3d_lp],
-                concat_dim=episode_coord,
-            )
-
         else:
             raise ValueError(f"Unknown training data case: {training_data_case}")
 
     logger.debug("Training dataset size: {}", train_ds.sizes[episode_coord])
     logger.debug("Validation dataset size: {}", val_ds.sizes[episode_coord])
-    logger.debug("Test dataset size: {}", test_ds.sizes[episode_coord])
 
-    return train_ds, val_ds, test_ds
+    return train_ds, val_ds
 
 
 def get_train_test_datasets_transfer(
@@ -288,8 +280,18 @@ def get_train_test_datasets_transfer(
     num_hp_shots: int,
 ):
     """
-    Split dataset into training, validation, and test sets for transfer learning case.
+    Split dataset into training and test sets for the transfer learning case.
     The number of high-performance shots included in training is specified by `num_hp_shots`.
+
+    The test set is always the same set of high-performance DIII-D shots
+    The training set is made up of the historic data specified by `training_data_case` plus the `num_hp_shots` highest-performing shots from DIII-D.
+
+    There is no validation set in this case, since we are not tuning hyperparameters in this case.
+    We are treating the test set as a validation set in a sense, since we are using it to pick the best checkpoint for evaluation,
+    which I understand is a bit cheaty but given the extremely limited amount of high-performance data in some cases
+    it would be better to do this than train and validate on the same 3-4 high-performance shots.
+
+    In any case, since we're doing this for all the models it should be a fair comparison.
     """
 
     # Load the high-performance dataset and split into train/test
@@ -315,11 +317,9 @@ def get_train_test_datasets_transfer(
         train_ds = train_ds_hp
     else:
         # Load historic data and put it all in the training set
-        train_ds_hist, val_ds_hist, test_ds_hist = get_train_val_test_datasets(
-            training_data_case
-        )
+        train_ds_hist, val_ds_hist = get_train_val_datasets(training_data_case)
         train_ds = concat_with_nan_padding(
-            [train_ds_hist, val_ds_hist, test_ds_hist, train_ds_hp],
+            [train_ds_hist, val_ds_hist, train_ds_hp],
             concat_dim=episode_coord,
         )
 
