@@ -3,27 +3,26 @@ import xarray as xr
 from loguru import logger
 from popsim.ml.split_utils import split_dataset_by_fracs
 
-from popsim_transport_predictor.popsim_study.config import config
-from popsim_transport_predictor.popsim_study.orchestration import (
+from popsim_transport_predictor.transfer_learning.config import config
+from popsim_transport_predictor.transfer_learning.orchestration import (
     HP_SHOTS_INCLUDED,
     TRAIN_VAL_TEST_SPLIT,
 )
 
+MAX_DS_SIZE_GB = 100  # If the dataset is larger than this, do not load into memory
+
 REQUIRED_SIGNALS = [
-    # Target profiles
-    "ne20_rho",
-    "Te_keV_rho",
-    # Inputs for transport predictor
-    "R0",
-    "B0",
-    "Ip_MA",
-    "a_minor",
-    "kappa",
-    "delta_top",
-    "delta_bottom",
-    # Inputs for other things
-    "ne20_line_avg",
+    # Signals for power balance predictor
     "Wtot_MJ",
+    # To start (because it's easy) we will be comparing against the H98 and H89 scaling laws https://wiki.fusion.ciemat.es/wiki/Scaling_law
+    # and threshold powers https://iopscience.iop.org/article/10.1088/1742-6596/123/1/012033/pdf#:~:text=The%20estimated%20power%20law%20scalings,the%20energy%20confinement%20time%20increases.
+    "Ip_MA",
+    "B0",
+    "ne20_line_avg",
+    "R0",
+    "kappa",
+    "a_minor",  # For inverse aspect ratio
+    # TODO(ZanderKeith), missing the Hydrogen isotope mass info. Can we get that in these devices?
 ]
 
 INPUT_POWER_SIGNALS = ["P_ECRH_MW", "P_NBI_MW", "P_ICRF_MW", "P_LH_MW"]
@@ -33,7 +32,7 @@ def get_ds(
     source_ds: str,
     debug: bool | None = False,
 ) -> tuple[xr.Dataset, str]:
-    """Load the dataset, and do some light processing to get it ready for training.
+    """Open the dataset, and do some light processing to get it ready for training.
 
     Args:
         source_ds (str): Identifier for the source dataset.
@@ -44,21 +43,22 @@ def get_ds(
     """
     if source_ds == "cmod":
         ds_path = config.cmod_dataset_path
-        ds = xr.open_dataset(ds_path)
     elif source_ds == "tcv":
         ds_path = config.tcv_dataset_path
-        ds = xr.open_dataset(ds_path)
-    elif source_ds in ["d3d_lp", "d3d_hp"]:
-        if source_ds == "d3d_lp":
-            ds_path = config.d3d_lp_dataset_path
-        else:
-            ds_path = config.d3d_hp_dataset_path
-        ds = xr.open_dataset(ds_path)
+    elif source_ds == "d3d_lp":
+        ds_path = config.d3d_lp_dataset_path
+    elif source_ds == "d3d_hp":
+        ds_path = config.d3d_hp_dataset_path
     else:
         raise ValueError(f"Unknown source dataset: {source_ds}")
 
+    ds = xr.open_dataset(ds_path)
+
     if debug:
-        ds = ds.isel(shot=slice(0, 50))  # Limit to 50 shots
+        ds = ds.isel(shot=slice(0, 10))  # Limit to 10 shots
+
+    if ds.nbytes < MAX_DS_SIZE_GB * 1e9:
+        ds = ds.load()  # Load into memory if not too large
 
     # Ensure all required signals are present
     for signal in REQUIRED_SIGNALS:
@@ -67,28 +67,20 @@ def get_ds(
                 f"Required signal for transport predictor training {signal} not found in dataset."
             )
 
-    # Calculate shape variables
-    ds["ne_shape"] = ds["ne20_rho"] / ds["ne20_rho"].integrate("rho")
-    ds["Te_shape"] = ds["Te_keV_rho"] / ds["Te_keV_rho"].integrate("rho")
-
     # Additional signals and duplicates for slight renames between submodules
     # This is for the individual submodule training to work, since when they're running on their own they expect these names.
     for signal in INPUT_POWER_SIGNALS:
         if signal not in ds:
             ds[signal] = xr.zeros_like(ds["Ip_MA"])
 
+    # Calculate aux power and absorbed power
     ds["P_aux_MW"] = ds["P_NBI_MW"] + ds["P_ECRH_MW"] + ds["P_ICRF_MW"] + ds["P_LH_MW"]
     ds["P_abs_MW"] = ds["P_oh_MW"] + ds["P_aux_MW"]
-    # Profile predictor
-    ds["Paux_MW"] = ds["P_aux_MW"]
-    ds["Ip"] = ds["Ip_MA"]
-    # Power balance
-    ds["delta"] = (ds["delta_top"] + ds["delta_bottom"]) / 2
+
+    # Set up signals for the confinement time predictors
     ds["ne19_line_avg"] = ds["ne20_line_avg"] * 10
     ds["epsilon"] = ds["a_minor"] / ds["R0"]
-
-    ds["ne20"] = ds["ne20_line_avg"]
-    ds["ne19"] = ds["ne19_line_avg"]
+    ds["surface_area_m2"] = 4 * np.pi**2 * ds["R0"] * ds["a_minor"] * ds["kappa"]
 
     # If dataset was from a zarr store, must promote the 'time' data var to a coordinate
     if "time" not in ds.coords:

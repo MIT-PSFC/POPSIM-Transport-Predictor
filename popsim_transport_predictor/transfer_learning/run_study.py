@@ -4,16 +4,16 @@ import fire
 from loguru import logger
 
 from popsim_transport_predictor import PACKAGE_ROOT
-from popsim_transport_predictor.popsim_study.config import config
-from popsim_transport_predictor.popsim_study.figures.data_visualization import (
+from popsim_transport_predictor.transfer_learning.config import config
+from popsim_transport_predictor.transfer_learning.figures.data_visualization import (
     performance_extrapolation_plot,
 )
-from popsim_transport_predictor.popsim_study.orchestration import (
+from popsim_transport_predictor.transfer_learning.orchestration import (
     HP_SHOTS_INCLUDED,
     MODEL_CASES,
     TRAINING_DATA_CASES,
 )
-from popsim_transport_predictor.popsim_study.orchestration.organize_data import (
+from popsim_transport_predictor.transfer_learning.orchestration.organize_data import (
     get_train_test_datasets_transfer,
     get_train_val_test_datasets,
 )
@@ -29,7 +29,7 @@ class DataVisualization:
         figure_dir: str,
     ):
         """
-        Performance is ip**2 + beta**2 <- need to formalize this metric by looking at the distribution of ip and beta separately.
+        Performance is ip**2 + Wtot_MJ**2 <- need to formalize this metric by looking at the distribution of ip and Wtot_MJ separately.
 
         With all data present this creates the following figures:
         1. Performance extrapolation for C-Mod
@@ -44,7 +44,6 @@ class DataVisualization:
         save_dir = os.path.join(
             figure_dir, "data_visualization", "performance_extrapolation"
         )
-        logger.info(f"Creating performance extrapolation figures in {save_dir}")
 
         # C-Mod
         if config.cmod_dataset_path:
@@ -412,7 +411,7 @@ def run_study(
         If false, runs the entire study sequentially in one process.
         If true, submits independent training steps with SLURM up to configurable resource limits.
         The idea is you would periodically call this 'run_study' function, and it checks what models still need to be trained and submit jobs for those, until eventually all models are trained and all results are computed.
-        I would *like* to develop a better way of doing this, but for now it's straightforward for me to set up and execute and we have an experiment schedule in 2 weeks so I gotta move fast.
+        I would *like* to develop a better way of doing this, but for now it's straightforward for me to set up and execute and we have an experiment scheduled in 2 weeks so I gotta move fast.
     clean_models : bool | None
         If True, delete any existing trained models in the working directory before running.
     clean_results : bool | None
@@ -420,6 +419,19 @@ def run_study(
     clean_figures : bool | None
         If True, delete any existing figures in the figure directory before running.
     """
+
+    logger.info("STARTING STUDY")
+    logger.info(f"Project name: {project_name}")
+    logger.info(f"Working directory base: {working_dir_base}")
+    logger.info(f"Figure directory base: {figure_dir_base}")
+    logger.info(f"C-Mod dataset path: {cmod_dataset_path}")
+    logger.info(f"TCV dataset path: {tcv_dataset_path}")
+    logger.info(f"DIII-D low-performance dataset path: {d3d_lp_dataset_path}")
+    logger.info(f"DIII-D high-performance dataset path: {d3d_hp_dataset_path}")
+    logger.info(f"Enable parallelism: {enable_parallelism}")
+    logger.info(f"Clean models: {clean_models}")
+    logger.info(f"Clean results: {clean_results}")
+    logger.info(f"Clean figures: {clean_figures}")
 
     ######################
     # Set up directories #
