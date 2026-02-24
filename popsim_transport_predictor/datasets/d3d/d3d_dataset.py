@@ -197,6 +197,12 @@ class D3DDataWorkflow(DataWorkflow):
         Ne_edge_avg = MdsSignal(
             r"\denv3", "bci", location="remote://atlas.gat.com"
         ).set_callback(_cm3_to_m3)  # Line average electron density at the edge [m^-3]
+        Wtot = MdsSignal(
+            r"\wmhdf", "pedestal", location="remote://atlas.gat.com"
+        )  # Total stored energy
+        BETAP = MdsSignal(
+            r"\betapf", "pedestal", location="remote://atlas.gat.com"
+        )  # Plasma beta
 
         sigs_dict = {
             "betapf": betapf,
@@ -204,17 +210,29 @@ class D3DDataWorkflow(DataWorkflow):
             "p_rad_toksearch": PradBulk,
             "tau_conf": TAU_conf,
             "ne_edge_avg": Ne_edge_avg,
+            "wmhdf_toksearch": Wtot,
+            "betap_toksearch": BETAP,
         }
 
         p.fetch_dataset("toksearch", sigs_dict)
         timeline = np.round(np.arange(0, max_time_ms + 1, 1), 0)
         p.align("toksearch", timeline)
         results = p.compute_serial()
-        ds = results[0]["toksearch"]
+        ds_tok = results[0]["toksearch"].squeeze()
 
         # Match disruption-py output
-        ds = ds.rename({"times": "time"})
-        ds["time"] = ds["time"] / 1e3
+        ds = xr.Dataset(
+            data_vars={
+                var: (["shot", "time"], ds_tok[var].expand_dims("shot").values)
+                for var in ds_tok.data_vars
+            },
+            coords={
+                "shot": np.atleast_1d(
+                    shot
+                ),  # Problem with xarray https://github.com/pydata/xarray/issues/1709
+                "time": ds_tok["times"].values / 1e3,
+            },
+        )
 
         # Make everything f32 unless it's an int
         for key in list(ds.data_vars) + list(ds.coords) + list(ds.dims):
@@ -605,7 +623,9 @@ class D3DDataWorkflow(DataWorkflow):
                 "Te_keV_rho",
                 "ne20_rho",
                 "Wtot_MJ",
-                "beta",
+                "Wmhd_MJ",
+                "beta",  # Poloidal beta from pedestal
+                "beta_p",  # Poloidal beta from EFIT
                 "R0",
                 "B0",
                 "Ip_MA",
@@ -682,6 +702,11 @@ class D3DDataWorkflow(DataWorkflow):
             ds["Wtot_MJ"] = ds["Wtot_MJ"].where(
                 ~wtot_missing_or_zero, other=ds["Wmhd_MJ"]
             )
+
+        # Similarly, beta_p (EFIT) is close enough to beta (pedestal)
+        if "beta" in ds and "beta_p" in ds:
+            beta_missing_or_zero = ds["beta"].isnull() | (ds["beta"] == 0)
+            ds["beta"] = ds["beta"].where(~beta_missing_or_zero, other=ds["beta_p"])
 
         # Use the smoothed version of P_NBI
         ds["P_NBI_MW"] = np.abs(ds["P_NBI_MW_alt"])
