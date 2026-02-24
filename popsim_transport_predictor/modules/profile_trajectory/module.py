@@ -5,9 +5,11 @@ from popsim import TimeDepModule
 from popsim.ml.envs import ModuleTrainingEnv
 from popsim.simulate import StepperType
 
-from popsim_transport_predictor.modules.profile_trajectory.profile_predictor import (
-    ProfilePredictorInputs,
-    ProfilePredictorOutputs,
+from popsim_transport_predictor.modules.profile_trajectory.profile_predictor.module import (
+    Inputs as ProfilePredictorInputs,
+)
+from popsim_transport_predictor.modules.profile_trajectory.profile_predictor.module import (
+    Outputs as ProfilePredictorOutputs,
 )
 
 
@@ -19,11 +21,11 @@ class ProfileTrajectoryOptimizer(TimeDepModule):
 
     # These are the things that we can control over time
     # TODO(ZanderKeith) might be worthwhile to have a small translation layer to be more DIII-D-like
-    R0: Array[float]  # Major radius [m]
-    a_minor: Array[float]  # Minor radius [m]
-    kappa: Array[float]  # Elongation [-]
-    delta_top: Array[float]  # Upper triangularity [-]
-    delta_bottom: Array[float]  # Lower triangularity [-]
+    R0: Array  # Major radius [m]
+    a_minor: Array  # Minor radius [m]
+    kappa: Array  # Elongation [-]
+    delta_top: Array  # Upper triangularity [-]
+    delta_bottom: Array  # Lower triangularity [-]
 
     @chex.dataclass
     class Config:
@@ -118,5 +120,6 @@ class ProfileTrajectoryOptimizerEnv(ModuleTrainingEnv):
             "R0": self.module.R0,
             "a_minor": self.module.a_minor,
             "kappa": self.module.kappa,
-            "delta": self.module.delta,
+            "delta_top": self.module.delta_top,
+            "delta_bottom": self.module.delta_bottom,
         }
