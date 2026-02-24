@@ -4,11 +4,10 @@ import fire
 from loguru import logger
 from popsim import PACKAGE_ROOT
 from popsim.ml.train_config import TrainConfig
-from popsim.modules.transport_predictor.train_configs import (
-    BASE_CONFIG,
-    update_submodule_configs,
-)
 
+from popsim_transport_predictor.modules.profile_trajectory.config import (
+    PROFILE_TRAJECTORY_OPTIMIZER_CONFIG,
+)
 from popsim_transport_predictor.modules.profile_trajectory.data import get_ds
 from popsim_transport_predictor.trajectory_optimization.setup import (
     get_controllable_input_ranges,
@@ -20,6 +19,17 @@ CHECKPOINT_DIR_BASE = os.path.join(
 )
 MAX_EPOCHS = 800
 EPOCHS_PER_VAL = 20
+
+SHAPE_TIMES = [
+    2.0,
+    2.5,
+    3.0,
+    3.5,
+    4.0,
+    4.5,
+    5.0,
+    5.5,
+]  # 8 times to program the shape in by hand... should be fine right?
 
 
 ############################################################################################################
@@ -56,14 +66,15 @@ def characterize_dataset(ds_path: str, debug: bool = False) -> None:
         )
 
 
-#####################
-# Set up the config #
-#####################
+######################
+# Set up the configs #
+######################
 def setup_optimization_config(
     ds_path: str,
     debug: bool | None = False,
 ) -> TrainConfig:
     """Set up the training config for trajectory optimization.
+    Based on the dataset, we determine the allowable ranges for optimization variables and update the config accordingly.
 
     Args:
         ds_path (str): Path to the dataset.
@@ -73,13 +84,59 @@ def setup_optimization_config(
         TrainConfig: The training config for trajectory optimization.
     """
 
-    # Get the dataset and determine the episode coordinate
-    ds, _episode_coord = get_ds(ds_path, debug=debug)
+    max_epochs = 2 if debug else MAX_EPOCHS
+    epochs_per_val = 1 if debug else EPOCHS_PER_VAL
 
-    # Update the base config with submodule configs that are consistent with the dataset
-    config = update_submodule_configs(BASE_CONFIG, ds)
+    # Informed from Jayson Barr / the dataset characterization
+    input_ranges = {
+        "R0": (1.5, 2.5),  # Major radius [m]
+    }
+
+    base_config = TrainConfig.load(PROFILE_TRAJECTORY_OPTIMIZER_CONFIG)
+
+    config = base_config.model_copy(
+        update={
+            "max_epochs": max_epochs,
+            "epochs_per_val": epochs_per_val,
+            "dataloader_config": {
+                **base_config.dataloader_config,
+                "ds_path": ds_path,
+                "debug": debug,
+            },
+            "model_init_config": {
+                **base_config.model_init_config,
+                "input_ranges": input_ranges,
+            },
+        }
+    )
 
     return config
+
+
+###################
+# Train the model #
+###################
+def run_trajectory_optimization(
+    ds_path: str,
+    clean: bool | None = False,
+    debug: bool | None = False,
+):
+    """Run trajectory optimization.
+
+    Args:
+        ds_path (str): Path to the dataset.
+        clean (bool, optional): Whether to clean the checkpoint directory before training.
+        debug (bool, optional): Whether to enable debug mode, reducing dataset size to only the base shots.
+    """
+
+    config = setup_optimization_config(ds_path, debug=debug)
+
+    # Set up the checkpoint directory
+    checkpoint_dir = os.path.join(
+        CHECKPOINT_DIR_BASE,
+        f"trajectory_optimization_{config.submodule_configs['trajectory_predictor'].model_name}",
+    )
+    os.makedirs(checkpoint_dir, exist_ok=True)
 
 
 if __name__ == "__main__":
@@ -88,5 +145,6 @@ if __name__ == "__main__":
         {
             "characterize_dataset": characterize_dataset,
             "setup_optimization_config": setup_optimization_config,
+            "run_trajectory_optimization": run_trajectory_optimization,
         }
     )

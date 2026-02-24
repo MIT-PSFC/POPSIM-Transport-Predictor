@@ -15,7 +15,6 @@ from popsim.basis import Basis1DProtocol, BSplineBasis, InterpedLinearBasis
 from popsim.cfspopcon_jax.current_drive import calc_f_shaping, calc_q_star
 from popsim.cfspopcon_jax.geometry import calc_plasma_volume
 from popsim.ml.rtd_mlp import Activation, RtdMLP
-from scipy.constants import eV, mu_0
 
 
 class ProfileShape(TimeIndepModule):
@@ -133,21 +132,16 @@ class Inputs:
     Ip: float  # Plasma current [MA]
     a_minor: float  # Minor radius [m]
     kappa: float  # Elongation [-]
-    delta: float  # Triangularity [-]
+    delta_top: float  # Upper triangularity [-]
+    delta_bottom: float  # Lower triangularity [-]
     Paux: float  # Auxiliary heating power [MW]
-    ne20_line_avg: float  # Electron density [10^20 m^-3]
-    Wtot_MJ: float  # Thermal energy [MJ]
+    ne20_edge: float  # Edge electron density [10^20 m^-3]
+    beta: float  # Plasma beta [%]
     psi: Array  # Toroidal flux coordinate to evaluate the profiles at
-    ne_edge: float | None = None  # Edge electron density [10^20 m^-3]
 
     @property
     def epsilon(self):
         return self.a_minor / self.R0
-
-    @property
-    def fGW(self):
-        greenwald_limit = self.Ip / (jnp.pi * self.a_minor**2)
-        return self.ne20_line_avg / greenwald_limit
 
     @property
     def volume_approx(self):
@@ -158,24 +152,10 @@ class Inputs:
         )
 
     @property
-    def beta_t(self):
-        """Calculate toroidal beta in percentages."""
-        average_pressure = (2.0 / 3.0) * self.Wtot_MJ * 1e6 / self.volume_approx
-        beta_t = 100.0 * (average_pressure / (self.B0**2 / (2.0 * mu_0)))
-        return beta_t
-
-    @property
-    def te_approx(self):
-        pressure_MPa = (2.0 / 3.0) * self.Wtot_MJ / self.volume_approx
-        pressure_Pa = pressure_MPa * 1e6
-        pressure_eV = pressure_Pa / eV
-        pressure_keV20 = pressure_eV / 1e3 / 1e20
-        temp_keV = pressure_keV20 / self.ne20_line_avg
-        return temp_keV
-
-    @property
     def q_star(self):
-        f_shaping = calc_f_shaping(self.epsilon, self.kappa, self.delta)
+        f_shaping = calc_f_shaping(
+            self.epsilon, self.kappa, self.delta_top, self.delta_bottom
+        )
         return calc_q_star(
             magnetic_field_on_axis=self.B0,
             major_radius=self.R0,
@@ -187,18 +167,17 @@ class Inputs:
     @property
     def nn_inputs(self):
         """An incomplete attempt at having maximally device-independent normalized inputs."""
-        ne_edge = self.ne_edge if self.ne_edge is not None else 0.0
         inp_array = jnp.array(
             [
                 self.B0,
                 self.q_star,
                 self.epsilon,
                 self.kappa,
-                self.delta,
+                self.delta_top,
+                self.delta_bottom,
                 self.Paux,
-                self.fGW,
-                self.beta_t,
-                ne_edge,
+                self.ne20_edge,
+                self.beta,
             ]
         )
         return inp_array
@@ -392,26 +371,6 @@ class ProfilePredictor(TimeIndepModule):
         )
 
         return out
-
-    @classmethod
-    def load_latest_sparc(cls):
-        from popsim.ml import TrainConfig
-        from popsim.modules.profile_predictor.train_configs import SPARC_CONFIG
-        from popsim.modules.profile_predictor.training_run_builder import (
-            ProfilePredictorTrainRunBuilder,
-        )
-
-        config = TrainConfig.load(SPARC_CONFIG)
-
-        _, train_dl, val_dl, test_dl = ProfilePredictorTrainRunBuilder.get_dataloaders(
-            config.dataloader_config
-        )
-
-        model = ProfilePredictorTrainRunBuilder.model_init(
-            train_dl, config.model_init_config
-        )
-
-        return (model, train_dl, val_dl, test_dl)
 
     @classmethod
     def init(
