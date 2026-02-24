@@ -4,7 +4,7 @@ import shutil
 import fire
 from loguru import logger
 
-from popsim_transport_predictor.config import DATA_DUMP_DIR
+from popsim_transport_predictor.config import DATA_DUMP_DIR, config
 from popsim_transport_predictor.datasets.cmod.cmod_dataset import CModDataWorkflow
 from popsim_transport_predictor.datasets.d3d.d3d_dataset import D3DDataWorkflow
 from popsim_transport_predictor.datasets.tcv.tcv_dataset import TCVDataWorkflow
@@ -23,6 +23,7 @@ class DatasetCLI:
         clean: bool | None = False,
         skip_profiles: bool | None = False,
     ):
+        data_assembly_dir = os.path.join(data_assembly_dir, config.study_name)
         workflow = CModDataWorkflow(
             ds_name=ds_name,
             shotlist_file=shotlist_file,
@@ -44,6 +45,7 @@ class DatasetCLI:
         use_ida: bool | None = True,
         skip_profiles: bool | None = False,
     ):
+        data_assembly_dir = os.path.join(data_assembly_dir, config.study_name)
         workflow = D3DDataWorkflow(
             ds_name=ds_name,
             shotlist_file=shotlist_file,
@@ -66,6 +68,7 @@ class DatasetCLI:
         clean: bool | None = False,
         skip_profiles: bool | None = False,
     ):
+        data_assembly_dir = os.path.join(data_assembly_dir, config.study_name)
         workflow = TCVDataWorkflow(
             ds_name=ds_name,
             shotlist_file=shotlist_file,

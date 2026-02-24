@@ -159,6 +159,8 @@ class DataWorkflow:
         if self.max_num_shots:
             identifiers = identifiers[: self.max_num_shots]
 
+        logger.info(f"Processing {len(identifiers)} shots to build dataset")
+
         # Run the data processing workflow and save to a POPSIM tensorized dataset
         ds = build_tensorized_dataset(
             process_fn=self.process_fn,

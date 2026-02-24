@@ -40,9 +40,5 @@ config.tcv = Dynaconf(
     settings_files=[os.path.join(PACKAGE_ROOT, "datasets", "tcv", "config.toml")]
 )
 
-DATA_DUMP_DIR = os.path.join(
-    get_path_to_ml_data_dump(), "POPSIM/popsim_studies", config.study_name
-)
-DATA_SCRATCH_DIR = os.path.join(
-    get_path_to_ml_data_scratch(), "POPSIM/popsim_studies", config.study_name
-)
+DATA_DUMP_DIR = os.path.join(get_path_to_ml_data_dump(), "POPSIM/popsim_studies")
+DATA_SCRATCH_DIR = os.path.join(get_path_to_ml_data_scratch(), "POPSIM/popsim_studies")
