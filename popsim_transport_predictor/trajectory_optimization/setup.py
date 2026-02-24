@@ -28,16 +28,14 @@ def get_trajectory_input_ranges(
 
     For this study, this finds the ranges of R0, a_minor, kappa, delta_top, and delta_bottom
 
-    Parameters:
-    -----------
-    ds: xr.Dataset
-        The full DIII-D HBP dataset
-    inputs: list[str]
-        The list of input parameters to find the ranges for
+    Args:
+        ds: xr.Dataset
+            The full DIII-D HBP dataset
+        inputs: list[str]
+            The list of input parameters to find the ranges for
 
     Returns:
-    --------
-    dict[str, dict[str, float]]: A dictionary mapping each input parameter to a dictionary with keys "min", "max", "mean", "std", "median", "q1", and "q3" for the respective statistics of that parameter across the relevant portion of the shots
+        dict[str, dict[str, float]]: A dictionary mapping each input parameter to a dictionary with keys "min", "max", "mean", "std", "median", "q1", and "q3" for the respective statistics of that parameter across the relevant portion of the shots
     """
 
     shot_datasets = []
@@ -80,16 +78,14 @@ def get_controllable_input_ranges(
     For this study, this finds the typical error of Ip, B0, ne20_edge, and beta
     TODO(ZanderKeith): Yeah yeah I know to do this rigorously I'd want to look at the difference to the actual control waveforms, I'll do that if I have time
 
-    Parameters:
-    -----------
-    ds: xr.Dataset
-        The full DIII-D HBP dataset
-    inputs: list[str]
-        The list of input parameters to find the ranges for
+    Args:
+        ds: xr.Dataset
+            The full DIII-D HBP dataset
+        inputs: list[str]
+            The list of input parameters to find the ranges for
 
     Returns:
-    --------
-    dict[str, float]: A dictionary mapping each input parameter to a characteristic error value (e.g. standard deviation of the error)
+        dict[str, float]: A dictionary mapping each input parameter to a characteristic error value (e.g. standard deviation of the error)
     """
 
     all_chunk_stds = []

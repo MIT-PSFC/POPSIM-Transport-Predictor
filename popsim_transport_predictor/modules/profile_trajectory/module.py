@@ -5,7 +5,7 @@ from popsim import TimeDepModule
 from popsim.ml.envs import ModuleTrainingEnv
 from popsim.simulate import StepperType
 
-from popsim_transport_predictor.modules.profile_predictor import (
+from popsim_transport_predictor.modules.profile_trajectory.profile_predictor import (
     ProfilePredictorInputs,
     ProfilePredictorOutputs,
 )
@@ -18,7 +18,7 @@ class ProfileTrajectoryOptimizer(TimeDepModule):
     psigrid: tuple = eqx.field(static=True)
 
     # These are the things that we can control over time
-    # TODO(ZanderKeith) might be worthwhile to have a small transition to be more DIII-D-like
+    # TODO(ZanderKeith) might be worthwhile to have a small translation layer to be more DIII-D-like
     R0: Array[float]  # Major radius [m]
     a_minor: Array[float]  # Minor radius [m]
     kappa: Array[float]  # Elongation [-]
