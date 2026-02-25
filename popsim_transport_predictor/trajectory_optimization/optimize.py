@@ -87,9 +87,13 @@ def setup_optimization_config(
     max_epochs = 2 if debug else MAX_EPOCHS
     epochs_per_val = 1 if debug else EPOCHS_PER_VAL
 
-    # Informed from Jayson Barr / the dataset characterization
-    input_ranges = {
-        "R0": (1.5, 2.5),  # Major radius [m]
+    # Informed the dataset characterization and Jayson Barr TODO(ZanderKeith) make sure these are ok
+    control_input_ranges = {
+        "R0": (1.77, 1.82),  # Major radius [m]
+        "a_minor": (0.58, 0.6),  # Minor radius [m]
+        "kappa": (1.89, 1.97),  # Elongation
+        "delta_top": (0.5, 0.91),  # Upper triangularity
+        "delta_bottom": (0.7, 0.91),  # Lower triangularity
     }
 
     base_config = TrainConfig.load(PROFILE_TRAJECTORY_OPTIMIZER_CONFIG)
@@ -105,7 +109,7 @@ def setup_optimization_config(
             },
             "model_init_config": {
                 **base_config.model_init_config,
-                "input_ranges": input_ranges,
+                "input_ranges": control_input_ranges,
             },
         }
     )

@@ -1,6 +1,8 @@
 import numpy as np
 import xarray as xr
 
+from popsim_transport_predictor.modules.profile_trajectory.data import get_ds
+
 IP_RAMP_SHOTS = {
     199121: {"start": 3.0, "end": 5.0},
     199122: {"start": 2.5, "end": 5.0},
@@ -16,6 +18,13 @@ IP_RAMP_SHOTS = {
     201914: {"start": 1.5, "end": 5.4},
     201927: {"start": 1.5, "end": 4.7},
     201934: {"start": 1.5, "end": 5.4},
+}
+
+PROG_INPUT_ERRORS = {
+    "Ip_MA": 0.007,
+    "B0": 0.009,
+    "ne20_edge": 0.04,
+    "beta": 0.22,
 }
 
 
@@ -54,7 +63,9 @@ def get_trajectory_input_ranges(
 
     input_ranges = {}
     for input_var in inputs:
+        # Get data for this input var where it's not nan
         input_data = ds_trajectory[input_var].values
+        input_data = input_data[~np.isnan(input_data)]
         input_ranges[input_var] = {
             "min": float(input_data.min()),
             "max": float(input_data.max()),
@@ -92,7 +103,7 @@ def get_controllable_input_ranges(
 
     for shot, times in shots_times.items():
         if shot in ds["shot"]:
-            ds_shot = ds.sel(shot=shot)
+            ds_shot = ds.sel(shot=shot)[inputs]
             # Slice to the specific window of interest
             ds_ramp = ds_shot.where(
                 (ds_shot["time"] >= times["start"]) & (ds_shot["time"] <= times["end"]),
@@ -117,7 +128,14 @@ def get_controllable_input_ranges(
     return input_ranges
 
 
-def make_optimization_dataset():
+def make_optimization_dataset(
+    ds_path: str,
+    shots_times: dict[int, dict[str, float]] = IP_RAMP_SHOTS,
+    prog_input_errors: dict[str, float] = PROG_INPUT_ERRORS,
+    permutations_per_shot: int = 100,
+    prng_seed: int = 42,
+    debug: bool | None = False,
+) -> xr.Dataset:
     """Make a dataset with episode_dim being 'shot_alt', with shot x N episodes
     The idea is that we have historic data for ~10 shots that we're trying to model the scenario off of,
     but of course there's going to be differences when we actually go to run the thing
@@ -125,4 +143,49 @@ def make_optimization_dataset():
 
     Right now doing that in a simple fashion, where we find the typical distribution of input parameters,
     sample some offset for each one independently, and add that to a past trajectory to make a bunch of different trajectories to optimize across
+
+    Args:
+        ds_path: str
+            Path to the dataset
+        shots_times: dict[int, dict[str, float]]
+            The time windows for each shot to use for the trajectory portion of the dataset
+        prog_input_errors: dict[str, float]
+            The characteristic errors of the controllable input parameters during the trajectory time window, as determined from the dataset
+        permutations_per_shot: int
+            The number of different trajectories to make for each shot (including the unmodified one)
+        prng_seed: int
+            The seed to use for the pseudo-random number generator when sampling offsets for the input parameters
+        debug: bool, optional
+            If True, returns a dataset with unmodified source shots.
+
+    Returns:
+        xr.Dataset: Dataset with episode_dim being 'shot_alt', with the modified trajectories to optimize across
     """
+    rng = np.random.default_rng(seed=prng_seed)
+
+    ds, _ = get_ds(ds_path, debug=debug)
+
+    ds_shot_list = []
+    for shot, times in shots_times.items():
+        if shot not in ds["shot"]:
+            raise ValueError(f"Shot {shot} not found in dataset")
+        ds_shot = ds.sel(shot=shot)
+        ds_ramp = ds_shot.where(
+            (ds_shot["time"] >= times["start"]) & (ds_shot["time"] <= times["end"]),
+            drop=True,
+        )
+        for i in range(permutations_per_shot):
+            ds_ramp_permuted = ds_ramp.copy()
+            # Leave the first one unmodified, so we have the actual trajectory in there as well to optimize across
+            if i != 0:
+                for prog_input, error in prog_input_errors.items():
+                    offset = rng.normal(loc=0.0, scale=error)
+                    ds_ramp_permuted[prog_input] = ds_ramp_permuted[prog_input] + offset
+            ds_ramp_permuted = ds_ramp_permuted.expand_dims(
+                {"shot_alt": [f"{shot}_{i}"]}, axis=0
+            )
+            ds_shot_list.append(ds_ramp_permuted)
+
+    ds_optimization = xr.concat(ds_shot_list, dim="shot_alt")
+
+    return ds_optimization
