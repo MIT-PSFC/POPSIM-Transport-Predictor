@@ -1,24 +1,7 @@
 import numpy as np
 import xarray as xr
 
-from popsim_transport_predictor.modules.profile_trajectory.data import get_ds
-
-IP_RAMP_SHOTS = {
-    199121: {"start": 3.0, "end": 5.0},
-    199122: {"start": 2.5, "end": 5.0},
-    199125: {"start": 2.0, "end": 5.5},
-    199126: {"start": 2.0, "end": 4.3},
-    # These 2019XX series are the ones I'll be mostly targeting, still using the above to see what's possible though
-    201907: {"start": 1.5, "end": 5.2},
-    201908: {"start": 1.5, "end": 5.3},
-    201910: {"start": 1.5, "end": 5.4},
-    201911: {"start": 1.5, "end": 5.4},
-    201912: {"start": 1.5, "end": 5.4},
-    201913: {"start": 1.5, "end": 5.4},  # I thought Arunav said there wasn't any ECRH?
-    201914: {"start": 1.5, "end": 5.4},
-    201927: {"start": 1.5, "end": 4.7},
-    201934: {"start": 1.5, "end": 5.4},
-}
+from popsim_transport_predictor.trajectory_optimization import IP_RAMP_SHOTS
 
 PROG_INPUT_ERRORS = {
     "Ip_MA": 0.007,
@@ -129,7 +112,7 @@ def get_controllable_input_ranges(
 
 
 def make_optimization_dataset(
-    ds_path: str,
+    ds: xr.Dataset,
     shots_times: dict[int, dict[str, float]] = IP_RAMP_SHOTS,
     prog_input_errors: dict[str, float] = PROG_INPUT_ERRORS,
     permutations_per_shot: int = 100,
@@ -145,8 +128,8 @@ def make_optimization_dataset(
     sample some offset for each one independently, and add that to a past trajectory to make a bunch of different trajectories to optimize across
 
     Args:
-        ds_path: str
-            Path to the dataset
+        ds: xr.Dataset
+            The dataset to use for making the optimization dataset
         shots_times: dict[int, dict[str, float]]
             The time windows for each shot to use for the trajectory portion of the dataset
         prog_input_errors: dict[str, float]
@@ -162,8 +145,6 @@ def make_optimization_dataset(
         xr.Dataset: Dataset with episode_dim being 'shot_alt', with the modified trajectories to optimize across
     """
     rng = np.random.default_rng(seed=prng_seed)
-
-    ds, _ = get_ds(ds_path, debug=False)
 
     ds_shot_list = []
     for shot, times in shots_times.items():
@@ -203,5 +184,5 @@ def make_optimization_dataset(
         else:
             ds_pad_list.append(ds_shot)
 
-    ds_optimization = xr.concat(ds_pad_list, dim="shot_alt")
+    ds_optimization = xr.concat(ds_pad_list, dim="shot_alt", coords="all")
     return ds_optimization

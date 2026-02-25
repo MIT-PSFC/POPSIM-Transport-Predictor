@@ -31,13 +31,13 @@ class ProfileTrajectoryOptimizerTRB(TrainRunBuilder):
         Profile predictor gets time-independent dataloaders (just train and val),
         while trajectory optimization gets two identical time-dependent dataloaders with a lot of augmented traces
         """
+        ds, episode_coord = get_ds(
+            dataloader_config["ds_path"],
+            fresh_profiles=True,  # Only use timesteps where profile data is fresh
+            debug=dataloader_config["debug"],
+        )
 
         if dataloader_config.get("module") == "profile_predictor":
-            ds, episode_coord = get_ds(
-                dataloader_config["ds_path"],
-                fresh_profiles=True,  # Only use timesteps where profile data is fresh
-                debug=dataloader_config["debug"],
-            )
             ds_train, ds_val = split_dataset_by_fracs(
                 ds,
                 fracs=dataloader_config["split_fracs"],
@@ -59,7 +59,7 @@ class ProfileTrajectoryOptimizerTRB(TrainRunBuilder):
         elif dataloader_config.get("module") == "profile_trajectory":
             # TODO(ZanderKeith) add an augmentation config aug_config = dataloader_config["augmentation"]
             ds_aug = make_optimization_dataset(
-                ds_path=dataloader_config["ds_path"],
+                ds=ds,
                 debug=dataloader_config["debug"],
                 prng_seed=dataloader_config["prng_seed"],
             )
@@ -73,7 +73,8 @@ class ProfileTrajectoryOptimizerTRB(TrainRunBuilder):
                 input_vars=dataloader_config["input_vars"],
                 target_vars=dataloader_config["target_vars"],
                 convert_xr_to_jnp=dataloader_config["convert_xr_to_jnp"],
-                state_init_vars=dataloader_config["state_init_vars"],
+                state_init_vars=dataloader_config["state_vars"],
+                extra_vars=dataloader_config["extra_vars"],
                 batch_size=dataloader_config["batch_size"],
                 shuffle=[True, False],
             )
@@ -84,9 +85,16 @@ class ProfileTrajectoryOptimizerTRB(TrainRunBuilder):
     @staticmethod
     def model_init(train_dl: DataLoader, model_init_config: dict) -> Any:
         """Initialize the model to be trained"""
-        psigrid = jnp.asarray(train_dl.ds["psin"].data)
+        psigrid = jnp.asarray(train_dl.ds["psi"].data)
         submodule_configs = model_init_config["submodules"]
+
+        config = ProfileTrajectoryOptimizer.Config(
+            shape_times=jnp.asarray(model_init_config["shape_times"]),
+            input_ranges=model_init_config["input_ranges"],
+        )
+
         module = ProfileTrajectoryOptimizer.init(
+            config=config,
             profile_predictor_config=submodule_configs["profile_predictor"],
             psigrid=psigrid,
         )
@@ -105,7 +113,19 @@ class ProfileTrajectoryOptimizerTRB(TrainRunBuilder):
     @staticmethod
     def get_loss_fn(loss_config: dict) -> Callable[[Any, Any], jnp.ndarray]:
         def loss_fn(pred, targ):
-            return jnp.mean((pred - targ) ** 2)
+            # Loss function right now just minimizes the pressure peaking
+            ne20_psi = pred.profile_predictor_output.ne.data
+            Te_keV_psi = pred.profile_predictor_output.te.data
+
+            # Ensure arrays have compatible shapes for broadcasting
+            ne20_psi = jnp.asarray(ne20_psi)
+            Te_keV_psi = jnp.asarray(Te_keV_psi)
+
+            # Calculate pressure with explicit broadcasting
+            P_psi = jnp.multiply(ne20_psi, Te_keV_psi)
+            avg = jnp.mean(P_psi)
+            peaking = jnp.max(P_psi) / avg
+            return peaking
 
         return IntegralLoss(loss_fn)
 
@@ -113,7 +133,7 @@ class ProfileTrajectoryOptimizerTRB(TrainRunBuilder):
     def get_optimizer(optimizer_config: dict) -> optax.GradientTransformation:
         schedule = optax.exponential_decay(
             init_value=optimizer_config["lr0"],
-            transition_steps=optimizer_config["decay_steps"],
+            transition_steps=optimizer_config["transition_steps"],
             decay_rate=optimizer_config["decay_rate"],
             end_value=optimizer_config["lrf"],
         )

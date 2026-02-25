@@ -3,11 +3,11 @@ import shutil
 
 import fire
 from loguru import logger
-from popsim import PACKAGE_ROOT
 from popsim.ml.launch import launch_train
 from popsim.ml.train_config import TrainConfig
 from popsim.modules.transport_predictor.train_configs import update_submodule_configs
 
+from popsim_transport_predictor import PACKAGE_ROOT
 from popsim_transport_predictor.modules.profile_trajectory.data import get_ds
 from popsim_transport_predictor.modules.profile_trajectory.train_configs import (
     PROFILE_TRAJECTORY_OPTIMIZER_CONFIG,
@@ -18,11 +18,12 @@ from popsim_transport_predictor.trajectory_optimization.setup import (
 )
 
 CHECKPOINT_DIR_BASE = os.path.join(
-    PACKAGE_ROOT, "checkpoints", "trajectory_optimization"
+    PACKAGE_ROOT, "../checkpoints", "trajectory_optimization"
 )
 MAX_EPOCHS = 800
 EPOCHS_PER_VAL = 20
 
+# TODO(ZanderKeith): Add a config for the number of shape times, see how sensitive the resulting optimization is.
 SHAPE_TIMES = [
     2.0,
     2.5,
@@ -114,7 +115,6 @@ def setup_optimization_config(
             "model_init_config": {
                 **base_config.model_init_config,
                 "input_ranges": control_input_ranges,
-                "restore_submodules": True,
             },
         }
     )
@@ -182,14 +182,32 @@ def run_trajectory_optimization(
         debug (bool, optional): Whether to enable debug mode, reducing dataset size to only the base shots.
     """
 
-    config = setup_optimization_config(ds_path, debug=debug)
-
-    # Set up the checkpoint directory
-    checkpoint_dir = os.path.join(
-        CHECKPOINT_DIR_BASE,
-        f"trajectory_optimization_{config.submodule_configs['trajectory_predictor'].model_name}",
+    base_config = setup_optimization_config(ds_path, debug=debug)
+    config = base_config.model_copy(
+        update={
+            "model_init_config": {
+                **base_config.model_init_config,
+                "submodules": {
+                    "profile_predictor": {
+                        **base_config.model_init_config["submodules"][
+                            "profile_predictor"
+                        ],
+                        "checkpoint_dir": os.path.join(
+                            CHECKPOINT_DIR_BASE, "profile_predictor"
+                        ),
+                    },
+                },
+            },
+        }
     )
-    os.makedirs(checkpoint_dir, exist_ok=True)
+
+    if not os.path.exists(config.checkpoint_dir) or clean:
+        shutil.rmtree(config.checkpoint_dir, ignore_errors=True)
+        launch_train(config.model_dump(), use_wandb=False)
+    else:
+        logger.info(
+            f"Checkpoint directory {config.checkpoint_dir} already exists, skipping trajectory optimization..."
+        )
 
 
 if __name__ == "__main__":
