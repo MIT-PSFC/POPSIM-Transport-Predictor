@@ -1,14 +1,17 @@
 import os
+import shutil
 
 import fire
 from loguru import logger
 from popsim import PACKAGE_ROOT
+from popsim.ml.launch import launch_train
 from popsim.ml.train_config import TrainConfig
+from popsim.modules.transport_predictor.train_configs import update_submodule_configs
 
-from popsim_transport_predictor.modules.profile_trajectory.config import (
+from popsim_transport_predictor.modules.profile_trajectory.data import get_ds
+from popsim_transport_predictor.modules.profile_trajectory.train_configs import (
     PROFILE_TRAJECTORY_OPTIMIZER_CONFIG,
 )
-from popsim_transport_predictor.modules.profile_trajectory.data import get_ds
 from popsim_transport_predictor.trajectory_optimization.setup import (
     get_controllable_input_ranges,
     get_trajectory_input_ranges,
@@ -57,7 +60,7 @@ def characterize_dataset(ds_path: str, debug: bool = False) -> None:
             logger.info(f"    {stat_name}: {stat_value:.5f}")
 
     controllable_input_ranges = get_controllable_input_ranges(
-        ds, ["Ip_MA", "B0", "ne20_edge", "beta"]
+        ds, ["Ip_MA", "B0", "beta", "ne20_edge"]
     )
 
     for input_var, error in controllable_input_ranges.items():
@@ -102,6 +105,7 @@ def setup_optimization_config(
         update={
             "max_epochs": max_epochs,
             "epochs_per_val": epochs_per_val,
+            "checkpoint_dir": os.path.join(CHECKPOINT_DIR_BASE, "trajectory_optimizer"),
             "dataloader_config": {
                 **base_config.dataloader_config,
                 "ds_path": ds_path,
@@ -110,8 +114,17 @@ def setup_optimization_config(
             "model_init_config": {
                 **base_config.model_init_config,
                 "input_ranges": control_input_ranges,
+                "restore_submodules": True,
             },
         }
+    )
+
+    # Update all submodule configs to use the same dataloader as the base module
+    config = update_submodule_configs(
+        config.model_dump(),
+        [
+            "profile_predictor",
+        ],
     )
 
     return config
@@ -120,14 +133,40 @@ def setup_optimization_config(
 ###############################################
 # Train the model and optimize the trajectory #
 ###############################################
-def train_profile_predictor(ds_path: str, debug: bool | None = False) -> None:
+def train_profile_predictor(
+    ds_path: str, debug: bool | None = False, clean: bool | None = False
+) -> None:
     """Train the profile predictor model for trajectory optimization.
 
     Args:
         ds_path (str): Path to the dataset.
         debug (bool, optional): Whether to enable debug mode, reducing dataset size to at most 10 shots.
+        clean (bool, optional): Whether to clean the checkpoint directory before training.
     """
-    _base_config = setup_optimization_config(ds_path, debug=debug)
+    base_config = setup_optimization_config(ds_path, debug=debug)
+
+    profile_predictor_config = TrainConfig.load(
+        base_config.model_init_config["submodules"]["profile_predictor"]
+    )
+    profile_predictor_config = profile_predictor_config.model_copy(
+        update={
+            "max_epochs": MAX_EPOCHS,
+            "epochs_per_val": EPOCHS_PER_VAL,
+            "checkpoint_dir": os.path.join(CHECKPOINT_DIR_BASE, "profile_predictor"),
+            "dataloader_config": {
+                **profile_predictor_config.dataloader_config,
+                "module": "profile_predictor",
+            },
+        }
+    )
+
+    if not os.path.exists(profile_predictor_config.checkpoint_dir) or clean:
+        shutil.rmtree(profile_predictor_config.checkpoint_dir, ignore_errors=True)
+        launch_train(profile_predictor_config.model_dump(), use_wandb=False)
+    else:
+        logger.info(
+            f"Checkpoint directory {profile_predictor_config.checkpoint_dir} already exists, skipping training of profile predictor..."
+        )
 
 
 def run_trajectory_optimization(
@@ -158,7 +197,7 @@ if __name__ == "__main__":
     fire.Fire(
         {
             "characterize_dataset": characterize_dataset,
-            "setup_optimization_config": setup_optimization_config,
+            "train_profile_predictor": train_profile_predictor,
             "run_trajectory_optimization": run_trajectory_optimization,
         }
     )

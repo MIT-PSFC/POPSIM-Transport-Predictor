@@ -5,10 +5,10 @@ import xarray as xr
 REQUIRED_SIGNALS = [
     "time",
     # DIII-D PCS handles these
-    "B0",
     "Ip_MA",
-    "ne20_edge",
+    "B0",
     "beta",
+    "ne20_edge",
     # Our trajectory optimization is over these variables
     "R0",
     "a_minor",
@@ -23,12 +23,14 @@ REQUIRED_SIGNALS = [
 
 def get_ds(
     ds_path: str,
+    fresh_profiles: bool = False,
     debug: bool | None = False,
 ) -> tuple[xr.Dataset, str]:
     """Load the dataset, and do some light processing to get it ready for training.
 
     Args:
         ds_path (str): Path to the dataset.
+        fresh_profiles (bool, optional): Whether to filter the dataset to only include time steps where we have fresh profile measurements. Defaults to False.
         debug (bool, optional): Whether to enable debug mode, reducing dataset size to at most 50 shots.
 
     Returns:
@@ -55,12 +57,15 @@ def get_ds(
             if signal in ds:
                 ds = ds.rename({signal: signal.replace("rho", "psi")})
 
+    if fresh_profiles:
+        ds = ds.where(ds["fresh_profiles"] == 1, drop=True)
+
     # Limit to required signals
     ds = ds[REQUIRED_SIGNALS]
 
     # Put dataset on a 60-point psi grid [0, 1.2]
     psigrid = np.linspace(0, 1.2, 60)
-    ds = ds.interp(psi=psigrid)
+    ds = ds.interp(psi=psigrid, kwargs={"fill_value": "extrapolate"})
 
     # Calculate shape variables
     ds["ne_shape"] = ds["ne20_psi"] / ds["ne20_psi"].integrate("psi")

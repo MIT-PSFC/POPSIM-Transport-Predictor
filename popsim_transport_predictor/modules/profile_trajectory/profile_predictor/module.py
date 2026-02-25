@@ -15,6 +15,7 @@ from popsim.basis import Basis1DProtocol, BSplineBasis, InterpedLinearBasis
 from popsim.cfspopcon_jax.current_drive import calc_f_shaping, calc_q_star
 from popsim.cfspopcon_jax.geometry import calc_plasma_volume
 from popsim.ml.rtd_mlp import Activation, RtdMLP
+from scipy.constants import eV, mu_0
 
 
 class ProfileShape(TimeIndepModule):
@@ -45,8 +46,10 @@ class ProfileShape(TimeIndepModule):
         """
 
         # Check that psi values are between 0 and 1.2
-        assert jnp.all(psi >= 0) and jnp.all(psi <= 1.2), (
-            "Psi values must be between 0 and 1.2"
+        psi = eqx.error_if(
+            psi,
+            jnp.any(jnp.logical_or(psi < 0.0, psi > 1.2)),
+            "psi values must be in the range [0, 1.2]",
         )
 
         vals = self.basis(self.coeffs, psi)
@@ -127,16 +130,20 @@ class ProfileShape(TimeIndepModule):
 
 @chex.dataclass
 class Inputs:
-    R0: float  # Major radius [m]
-    B0: float  # On-axis toroidal field [T]
+    # Controllable inputs (set by DIII-D PCS)
     Ip: float  # Plasma current [MA]
+    B0: float  # On-axis toroidal field [T]
+    beta: float  # Plasma beta [%]
+    ne20_edge: float  # Edge electron density [10^20 m^-3]
+
+    # Trajectory inputs (to be modified)
+    R0: float  # Major radius [m]
     a_minor: float  # Minor radius [m]
     kappa: float  # Elongation [-]
     delta_top: float  # Upper triangularity [-]
     delta_bottom: float  # Lower triangularity [-]
-    Paux: float  # Auxiliary heating power [MW]
-    ne20_edge: float  # Edge electron density [10^20 m^-3]
-    beta: float  # Plasma beta [%]
+
+    # Other
     psi: Array  # Toroidal flux coordinate to evaluate the profiles at
 
     @property
@@ -152,10 +159,17 @@ class Inputs:
         )
 
     @property
+    def te_approx(self):
+        pressure_Pa = self.beta * self.B0**2 / (2 * mu_0)
+        pressure_eV = pressure_Pa / eV
+        pressure_keV20 = pressure_eV / 1e3 / 1e20
+        temp_keV = pressure_keV20 / self.ne20_edge
+        return temp_keV
+
+    @property
     def q_star(self):
-        f_shaping = calc_f_shaping(
-            self.epsilon, self.kappa, self.delta_top, self.delta_bottom
-        )
+        delta = (self.delta_top + self.delta_bottom) / 2
+        f_shaping = calc_f_shaping(self.epsilon, self.kappa, delta)
         return calc_q_star(
             magnetic_field_on_axis=self.B0,
             major_radius=self.R0,
@@ -175,7 +189,6 @@ class Inputs:
                 self.kappa,
                 self.delta_top,
                 self.delta_bottom,
-                self.Paux,
                 self.ne20_edge,
                 self.beta,
             ]
@@ -266,7 +279,6 @@ class ProfilePredictor(TimeIndepModule):
     )  # The psi grid on which the profiles are evaluated
     shape_type: ShapeType = eqx.field(static=True)
     softmax_temp: float = eqx.field(static=True, default=1.0)
-    use_ne_edge: bool = eqx.field(static=True, default=False)
 
     def __init__(
         self,
@@ -276,7 +288,6 @@ class ProfilePredictor(TimeIndepModule):
         nn_depth: int,
         softmax_temp: float,
         shape_type: ShapeType,
-        use_ne_edge: bool,
         psigrid: tuple,
         key: jax.random.PRNGKey,
     ):
@@ -285,7 +296,7 @@ class ProfilePredictor(TimeIndepModule):
 
         key, subkey = jax.random.split(key)
         self.nn = RtdMLP(
-            in_size=9,
+            in_size=8,
             out_size=len(te_shapes) + len(ne_shapes) + 1,
             width_size=nn_width,
             depth=nn_depth,
@@ -295,23 +306,21 @@ class ProfilePredictor(TimeIndepModule):
         )
         self.softmax_temp = softmax_temp
         self.shape_type = shape_type
-        self.use_ne_edge = use_ne_edge
         self.psigrid = psigrid
 
     def __call__(self, inputs: Inputs | xr.Dataset, debug: bool = False) -> Outputs:
         if isinstance(inputs, xr.Dataset):
             inputs = Inputs(
-                R0=inputs["R0"].data,
-                B0=inputs["B0"].data,
                 Ip=inputs["Ip_MA"].data,
+                B0=inputs["B0"].data,
+                beta=inputs["beta"].data,
+                ne20_edge=inputs["ne20_edge"].data,
+                R0=inputs["R0"].data,
                 a_minor=inputs["a_minor"].data,
                 kappa=inputs["kappa"].data,
-                delta=inputs["delta"].data,
-                Paux=inputs["Paux_MW"].data,
-                ne20_line_avg=inputs["ne20_line_avg"].data,
-                Wtot_MJ=inputs["Wtot_MJ"].data,
+                delta_top=inputs["delta_top"].data,
+                delta_bottom=inputs["delta_bottom"].data,
                 psi=jnp.array(self.psigrid),
-                ne_edge=inputs["ne20_edge"].data if "ne20_edge" in inputs else None,
             )
 
         nn_inputs = inputs.nn_inputs
@@ -347,10 +356,8 @@ class ProfilePredictor(TimeIndepModule):
             axis=0,
         )
 
-        # Compute the ne profile. If we are using the edge density as an input, we subtract out the predicted edge density and add the input edge density.
-        ne = jnp.sum(ne_shapes, axis=0) * inputs.ne20_line_avg
-        if self.use_ne_edge:
-            ne = ne - ne[-1] + inputs.ne_edge
+        # Compute the ne profile. TODO(ZanderKeith): Need to treat this more carefully
+        ne = jnp.sum(ne_shapes, axis=0) * inputs.ne20_edge
 
         # Compute the te profile using the learned correction.
         te = jnp.sum(te_shapes, axis=0) * inputs.te_approx * te_correction
@@ -381,7 +388,6 @@ class ProfilePredictor(TimeIndepModule):
         nn_depth: int,
         shape_type: ShapeType,
         softmax_temp: float,
-        use_ne_edge: bool,
         prng_seed: int,
     ) -> "ProfilePredictor":
         psigrid_jax = jnp.array(psigrid)
@@ -405,7 +411,6 @@ class ProfilePredictor(TimeIndepModule):
             nn_depth=nn_depth,
             softmax_temp=softmax_temp,
             shape_type=shape_type,
-            use_ne_edge=use_ne_edge,
             psigrid=psigrid_tuple,
             key=jax.random.PRNGKey(prng_seed),
         )
