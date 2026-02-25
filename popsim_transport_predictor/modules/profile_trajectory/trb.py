@@ -21,7 +21,9 @@ from popsim_transport_predictor.trajectory_optimization.setup import (
 
 class ProfileTrajectoryOptimizerTRB(TrainRunBuilder):
     @staticmethod
-    def get_dataloaders(dataloader_config: dict) -> tuple[xr.Dataset, list[DataLoader]]:
+    def get_dataloaders(
+        dataloader_config: dict,
+    ) -> tuple[xr.Dataset, DataLoader, DataLoader, DataLoader]:
         """
         Get the dataset and dataloaders for training.
 
@@ -30,11 +32,12 @@ class ProfileTrajectoryOptimizerTRB(TrainRunBuilder):
         while trajectory optimization gets two identical time-dependent dataloaders with a lot of augmented traces
         """
 
-        ds, episode_coord = get_ds(
-            dataloader_config["ds_path"], debug=dataloader_config["debug"]
-        )
-
         if dataloader_config.get("module") == "profile_predictor":
+            ds, episode_coord = get_ds(
+                dataloader_config["ds_path"],
+                fresh_profiles=True,  # Only use timesteps where profile data is fresh
+                debug=dataloader_config["debug"],
+            )
             ds_train, ds_val = split_dataset_by_fracs(
                 ds,
                 fracs=dataloader_config["split_fracs"],
@@ -47,20 +50,24 @@ class ProfileTrajectoryOptimizerTRB(TrainRunBuilder):
                 episode_coord=episode_coord,
                 input_vars=dataloader_config["input_vars"],
                 target_vars=dataloader_config["target_vars"],
+                extra_vars=dataloader_config["extra_vars"],
                 convert_xr_to_jnp=dataloader_config["convert_xr_to_jnp"],
                 batch_size=dataloader_config["batch_size"],
                 shuffle=[True, False],
             )
+            return ds, train_dl, val_dl, None
         elif dataloader_config.get("module") == "profile_trajectory":
-            aug_config = dataloader_config["augmentation"]
-            # t_min, t_max to trim the loaded dataset size
-            # give it the dataset to find the typical ranges
-            ds_aug = make_optimization_dataset(aug_config)
+            # TODO(ZanderKeith) add an augmentation config aug_config = dataloader_config["augmentation"]
+            ds_aug = make_optimization_dataset(
+                ds_path=dataloader_config["ds_path"],
+                debug=dataloader_config["debug"],
+                prng_seed=dataloader_config["prng_seed"],
+            )
             train_dl, val_dl = make_dataloaders(
                 datasets=[
                     ds_aug,
                     ds_aug,
-                ],  # Using the same augmented dataset for both training and validation
+                ],  # Using the same augmented dataset to both train and validate the trajectory
                 time_coord="time",
                 episode_coord="shot_alt",
                 input_vars=dataloader_config["input_vars"],
@@ -70,8 +77,9 @@ class ProfileTrajectoryOptimizerTRB(TrainRunBuilder):
                 batch_size=dataloader_config["batch_size"],
                 shuffle=[True, False],
             )
-
-        return ds, [train_dl, val_dl]
+            return ds_aug, train_dl, val_dl, None
+        else:
+            raise ValueError(f"Unknown module type {dataloader_config.get('module')}")
 
     @staticmethod
     def model_init(train_dl: DataLoader, model_init_config: dict) -> Any:

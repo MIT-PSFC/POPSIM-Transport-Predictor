@@ -209,6 +209,8 @@ __marimo__/
 
 # VSCode
 .vscode/
+*.code-workspace
+AGENTS.md
 
 # Result figures
 *.png
