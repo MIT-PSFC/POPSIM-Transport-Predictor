@@ -1,8 +1,12 @@
 import chex
 import equinox as eqx
+import jax.numpy as jnp
 from jaxtyping import Array, ArrayLike
 from popsim import TimeDepModule
+from popsim.math_utils import soft_clip
+from popsim.ml.checkpointing import create_default_checkpoint_manager, restore_model
 from popsim.ml.envs import ModuleTrainingEnv
+from popsim.ml.train_config import load_dict
 from popsim.simulate import StepperType
 
 from popsim_transport_predictor.modules.profile_trajectory.profile_predictor.module import (
@@ -11,10 +15,15 @@ from popsim_transport_predictor.modules.profile_trajectory.profile_predictor.mod
 from popsim_transport_predictor.modules.profile_trajectory.profile_predictor.module import (
     Outputs as ProfilePredictorOutputs,
 )
+from popsim_transport_predictor.modules.profile_trajectory.profile_predictor.module import (
+    ProfilePredictor,
+)
 
 
 class ProfileTrajectoryOptimizer(TimeDepModule):
     """Module for optimizing a desired trajectory of plasma profiles"""
+
+    config: "Config"
 
     profile_predictor: eqx.Module
     psigrid: tuple = eqx.field(static=True)
@@ -30,23 +39,22 @@ class ProfileTrajectoryOptimizer(TimeDepModule):
     @chex.dataclass
     class Config:
         shape_times: (
-            ArrayLike  # The times at which we specify the desired profile shapes [s]
+            Array  # The times at which we specify the desired profile shapes [s]
         )
+        # I think that including these ranges should prevent the autodiff from finding a gradient that pushes it out of range
+        # because if you put it into a softclip it kinda makes a wall that the input can't get nudged into
         input_ranges: dict[
             str, tuple[float, float]
         ]  # The ranges for the input parameters during the trajectory
-        # TODO(ZanderKeith) talk to Allen about the best way to implement this
-        # I think that including these ranges should prevent the autodiff from finding a gradient that pushes it out of range
-        # because if you put it into a softclip it kinda makes a wall that the input can't get nudged into
 
     @chex.dataclass
     class State:
-        # There aren't any state variables for this module, the profile predictor is stateless
-        # All we need to care about is the present time and go to the right place in the input trajectories
-        time_state: float  # This is just a dummy thing
+        # Just a dummy variable to make it a dataclass, since we need to return something
+        stateless: float = 0.0
 
     @chex.dataclass
     class Inputs:
+        time: float  # Current time, to know which point on the trajectory we're at
         # These are all the inputs that DIII-D has real-time feedback for
         # Plug in the waveforms for these in advance, and we expect them to be reasonably accurate
         Ip_MA: float  # [MA]
@@ -62,34 +70,104 @@ class ProfileTrajectoryOptimizer(TimeDepModule):
 
     def __init__(
         self,
+        config: Config,
         profile_predictor: eqx.Module,
         psigrid: tuple,
     ):
+        self.config = config
         self.profile_predictor = profile_predictor
         self.psigrid = psigrid
 
-    def __call__(self, state: "State", inputs: "Inputs") -> tuple[State, Output]:
-        # Get the current time
-        t = state.time_state
+        num_times = len(config.shape_times)
 
-        # Get the current input parameters based on the time and the input trajectories
-        R0_t = self.R0(t)
-        a_minor_t = self.a_minor(t)
-        kappa_t = self.kappa(t)
-        delta_top_t = self.delta_top(t)
-        delta_bottom_t = self.delta_bottom(t)
+        # Initialize input trajectories at the center of the input ranges
+        self.R0 = (
+            jnp.ones(num_times)
+            * (config.input_ranges["R0"][0] + config.input_ranges["R0"][1])
+            / 2
+        )
+        self.a_minor = (
+            jnp.ones(num_times)
+            * (config.input_ranges["a_minor"][0] + config.input_ranges["a_minor"][1])
+            / 2
+        )
+        self.kappa = (
+            jnp.ones(num_times)
+            * (config.input_ranges["kappa"][0] + config.input_ranges["kappa"][1])
+            / 2
+        )
+        self.delta_top = (
+            jnp.ones(num_times)
+            * (
+                config.input_ranges["delta_top"][0]
+                + config.input_ranges["delta_top"][1]
+            )
+            / 2
+        )
+        self.delta_bottom = (
+            jnp.ones(num_times)
+            * (
+                config.input_ranges["delta_bottom"][0]
+                + config.input_ranges["delta_bottom"][1]
+            )
+            / 2
+        )
+
+    def resolve_shapes(self, time: float) -> dict[str, float]:
+        """Output the shape parameters at a given time"""
+        # TODO(ZanderKeith) this needs testing!
+        # Find the index of the previous shape time
+        idx = jnp.searchsorted(self.config.shape_times, time, side="right") - 1
+        idx = jnp.clip(
+            idx, 0, len(self.config.shape_times) - 1
+        )  # Ensure idx is within bounds
+
+        shape_dict = {
+            "R0": soft_clip(
+                self.R0[idx],
+                self.config.input_ranges["R0"][0],
+                self.config.input_ranges["R0"][1],
+            ),
+            "a_minor": soft_clip(
+                self.a_minor[idx],
+                self.config.input_ranges["a_minor"][0],
+                self.config.input_ranges["a_minor"][1],
+            ),
+            "kappa": soft_clip(
+                self.kappa[idx],
+                self.config.input_ranges["kappa"][0],
+                self.config.input_ranges["kappa"][1],
+            ),
+            "delta_top": soft_clip(
+                self.delta_top[idx],
+                self.config.input_ranges["delta_top"][0],
+                self.config.input_ranges["delta_top"][1],
+            ),
+            "delta_bottom": soft_clip(
+                self.delta_bottom[idx],
+                self.config.input_ranges["delta_bottom"][0],
+                self.config.input_ranges["delta_bottom"][1],
+            ),
+        }
+
+        return shape_dict
+
+    def __call__(self, state: "State", inputs: "Inputs") -> tuple[State, Output]:
+        # Get the shape at this point in the trajectory
+        shape_dict = self.resolve_shapes(inputs.time)
 
         # Create the input for the profile predictor
         profile_predictor_input = ProfilePredictorInputs(
-            Ip_MA=inputs.Ip_MA,
+            Ip=inputs.Ip_MA,
             B0=inputs.B0,
             ne20_edge=inputs.ne20_edge,
             beta=inputs.beta,
-            R0=R0_t,
-            a_minor=a_minor_t,
-            kappa=kappa_t,
-            delta_top=delta_top_t,
-            delta_bottom=delta_bottom_t,
+            R0=shape_dict["R0"],
+            a_minor=shape_dict["a_minor"],
+            kappa=shape_dict["kappa"],
+            delta_top=shape_dict["delta_top"],
+            delta_bottom=shape_dict["delta_bottom"],
+            psi=jnp.array(self.psigrid),
         )
 
         # Get the output from the profile predictor
@@ -105,14 +183,63 @@ class ProfileTrajectoryOptimizer(TimeDepModule):
         # This is so dumb but I want to get something to try out the other stuff for right now
         # There *should* be a way to get the time from the coords of the inputs and just use that instead of having a separate time state
         # this is so weird, a stateless time-dependent module. You really gotta try using a thing to understand it
-        new_state = ProfileTrajectoryOptimizer.State(time_state=t + 0.001)
+        new_state = ProfileTrajectoryOptimizer.State()
 
         return new_state, output
+
+    @classmethod
+    def init(
+        cls,
+        config: Config,
+        profile_predictor_config: dict,
+        psigrid: Array,
+    ):
+        profile_predictor_config = load_dict(profile_predictor_config)
+        profile_predictor_model_init = profile_predictor_config["model_init_config"]
+        profile_predictor = ProfilePredictor.init(
+            n_shapes=profile_predictor_model_init["n_shapes"],
+            psigrid=psigrid,
+            nn_width=profile_predictor_model_init["nn_width"],
+            nn_depth=profile_predictor_model_init["nn_depth"],
+            shape_type=profile_predictor_model_init["shape_type"],
+            softmax_temp=profile_predictor_model_init.get("softmax_temp", 1.0),
+            prng_seed=profile_predictor_model_init.get("prng_seed", 42),
+        )
+
+        # Trajectory optimizer ALWAYS needs a pre-trained profile predictor
+        profile_predictor_manager = create_default_checkpoint_manager(
+            profile_predictor_config["checkpoint_dir"]
+        )
+        profile_predictor = restore_model(profile_predictor_manager, profile_predictor)
+
+        return cls(
+            config=config,
+            profile_predictor=profile_predictor,
+            psigrid=tuple(psigrid.tolist()),
+        )
 
 
 class ProfileTrajectoryOptimizerEnv(ModuleTrainingEnv):
     module: ProfileTrajectoryOptimizer
     stepper: StepperType = eqx.field(static=True, default=StepperType.SIMPLE_EULER)
+
+    @staticmethod
+    def create_state(
+        observations: dict[str, ArrayLike], inputs: dict[str, ArrayLike]
+    ) -> ProfileTrajectoryOptimizer.State:
+        return ProfileTrajectoryOptimizer.State()
+
+    @staticmethod
+    def create_inputs(
+        inputs: dict[str, ArrayLike],
+    ) -> ProfileTrajectoryOptimizer.Inputs:
+        return ProfileTrajectoryOptimizer.Inputs(
+            time=inputs["traj_time"].data,
+            Ip_MA=inputs["Ip_MA"].data,
+            B0=inputs["B0"].data,
+            ne20_edge=inputs["ne20_edge"].data,
+            beta=inputs["beta"].data,
+        )
 
     def get_trainable(self):
         # Get only the time-dependent controllable parameters

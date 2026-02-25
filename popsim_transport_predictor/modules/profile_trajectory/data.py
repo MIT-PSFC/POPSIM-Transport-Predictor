@@ -2,6 +2,8 @@ import jax
 import numpy as np
 import xarray as xr
 
+from popsim_transport_predictor.trajectory_optimization import IP_RAMP_SHOTS
+
 REQUIRED_SIGNALS = [
     "time",
     # DIII-D PCS handles these
@@ -45,8 +47,8 @@ def get_ds(
 
     if debug:
         ds = ds.sel(
-            shot=[201907, 201912, 201927, 201934]
-        )  # Limit to specifically these 4 shots
+            shot=list(IP_RAMP_SHOTS.keys())
+        )  # Limit to specifically these Ip ramp shots
 
     # If signals are in terms of rho replace them with psi
     # TODO(ZanderKeith) this is sloppy dataset creation on my end, should really standardize this naming scheme
@@ -63,13 +65,16 @@ def get_ds(
     # Limit to required signals
     ds = ds[REQUIRED_SIGNALS]
 
-    # Put dataset on a 60-point psi grid [0, 1.2]
-    psigrid = np.linspace(0, 1.2, 60)
+    # Put dataset on an even psi grid [0, 1.2]
+    psigrid = np.linspace(0, 1.2, 61)
     ds = ds.interp(psi=psigrid, kwargs={"fill_value": "extrapolate"})
 
     # Calculate shape variables
     ds["ne_shape"] = ds["ne20_psi"] / ds["ne20_psi"].integrate("psi")
     ds["Te_shape"] = ds["Te_keV_psi"] / ds["Te_keV_psi"].integrate("psi")
+
+    # Add a data variable for the trajectory time
+    ds["traj_time"] = ds["time"].copy()
 
     # If dataset was from a zarr store, must promote the 'time' data var to a coordinate
     if "time" not in ds.coords:
