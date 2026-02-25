@@ -37,9 +37,9 @@ def get_ds(
 
     # Load dataset according to JAX setting
     if jax.config.jax_enable_x64:
-        ds = xr.open_dataset(ds_path, consolidated=True).astype(jax.numpy.float64)
+        ds = xr.open_dataset(ds_path).astype(jax.numpy.float64)
     else:
-        ds = xr.open_dataset(ds_path, consolidated=True).astype(jax.numpy.float32)
+        ds = xr.open_dataset(ds_path).astype(jax.numpy.float32)
 
     if debug:
         ds = ds.sel(
