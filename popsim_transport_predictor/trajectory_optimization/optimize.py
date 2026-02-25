@@ -117,9 +117,19 @@ def setup_optimization_config(
     return config
 
 
-###################
-# Train the model #
-###################
+###############################################
+# Train the model and optimize the trajectory #
+###############################################
+def train_profile_predictor(ds_path: str, debug: bool | None = False) -> None:
+    """Train the profile predictor model for trajectory optimization.
+
+    Args:
+        ds_path (str): Path to the dataset.
+        debug (bool, optional): Whether to enable debug mode, reducing dataset size to at most 10 shots.
+    """
+    _base_config = setup_optimization_config(ds_path, debug=debug)
+
+
 def run_trajectory_optimization(
     ds_path: str,
     clean: bool | None = False,

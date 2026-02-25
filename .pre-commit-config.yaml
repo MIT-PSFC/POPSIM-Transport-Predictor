@@ -14,7 +14,6 @@ repos:
         language: system
         types: [python]
         files: "^popsim_transport_predictor/"
-        exclude: "^popsim_transport_predictor/tests/"
       - id: ruff_check
         name: ruff_check
         entry: uv run ruff check --fix
