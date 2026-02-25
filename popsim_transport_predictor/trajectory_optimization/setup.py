@@ -163,7 +163,7 @@ def make_optimization_dataset(
     """
     rng = np.random.default_rng(seed=prng_seed)
 
-    ds, _ = get_ds(ds_path, debug=debug)
+    ds, _ = get_ds(ds_path, debug=False)
 
     ds_shot_list = []
     for shot, times in shots_times.items():
@@ -186,6 +186,22 @@ def make_optimization_dataset(
             )
             ds_shot_list.append(ds_ramp_permuted)
 
-    ds_optimization = xr.concat(ds_shot_list, dim="shot_alt")
+            if debug:
+                # If we're in debug mode, only make one permutation per shot (the unmodified one)
+                break
 
+    # Pad all shots to the same length and combine into one big dataset
+    max_time_len = max(len(ds_shot["time_idx"]) for ds_shot in ds_shot_list)
+    ds_pad_list = []
+    for ds_shot in ds_shot_list:
+        shot_size = len(ds_shot["time_idx"])
+        if shot_size < max_time_len:
+            # Pad this shot with nans to reach the max length
+            padding = max_time_len - shot_size
+            ds_shot_padded = ds_shot.pad(time_idx=(0, padding), constant_values=np.nan)
+            ds_pad_list.append(ds_shot_padded)
+        else:
+            ds_pad_list.append(ds_shot)
+
+    ds_optimization = xr.concat(ds_pad_list, dim="shot_alt")
     return ds_optimization
