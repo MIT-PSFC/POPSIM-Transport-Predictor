@@ -31,13 +31,13 @@ class ProfileTrajectoryOptimizerTRB(TrainRunBuilder):
         Profile predictor gets time-independent dataloaders (just train and val),
         while trajectory optimization gets two identical time-dependent dataloaders with a lot of augmented traces
         """
-        ds, episode_coord = get_ds(
-            dataloader_config["ds_path"],
-            fresh_profiles=True,  # Only use timesteps where profile data is fresh
-            debug=dataloader_config["debug"],
-        )
 
         if dataloader_config.get("module") == "profile_predictor":
+            ds, episode_coord = get_ds(
+                dataloader_config["ds_path"],
+                fresh_profiles=True,  # Only use timesteps where profile data is fresh
+                debug=dataloader_config["debug"],
+            )
             ds_train, ds_val = split_dataset_by_fracs(
                 ds,
                 fracs=dataloader_config["split_fracs"],
