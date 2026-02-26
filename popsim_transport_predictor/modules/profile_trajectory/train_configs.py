@@ -18,9 +18,7 @@ PROFILE_TRAJECTORY_OPTIMIZER_CONFIG = {
         "debug": True,
         "module": "profile_trajectory",
         "split_fracs": (0.8, 0.2),  # Only used for submodule training
-        "state_vars": [
-            "Ip_MA"
-        ],  # TODO(ZanderKeith): Trajectory optimization is time-dependent but stateless... might need a dummy state var
+        "state_vars": ["Ip_MA"],
         "input_vars": [
             "Ip_MA",
             "B0",

@@ -73,6 +73,7 @@ class ProfileTrajectoryOptimizer(TimeDepModule):
         config: Config,
         profile_predictor: eqx.Module,
         psigrid: tuple,
+        trajectory: dict[str, Array] | None = None,
     ):
         self.config = config
         self.profile_predictor = profile_predictor
@@ -80,43 +81,54 @@ class ProfileTrajectoryOptimizer(TimeDepModule):
 
         num_times = len(config.shape_times)
 
-        # Initialize input trajectories at the center of the input ranges
-        self.R0 = (
-            jnp.ones(num_times)
-            * (config.input_ranges["R0"][0] + config.input_ranges["R0"][1])
-            / 2
-        )
-        self.a_minor = (
-            jnp.ones(num_times)
-            * (config.input_ranges["a_minor"][0] + config.input_ranges["a_minor"][1])
-            / 2
-        )
-        self.kappa = (
-            jnp.ones(num_times)
-            * (config.input_ranges["kappa"][0] + config.input_ranges["kappa"][1])
-            / 2
-        )
-        self.delta_top = (
-            jnp.ones(num_times)
-            * (
-                config.input_ranges["delta_top"][0]
-                + config.input_ranges["delta_top"][1]
+        if trajectory is None:
+            # Initialize input trajectories at the center of the input ranges
+            self.R0 = (
+                jnp.ones(num_times)
+                * (config.input_ranges["R0"][0] + config.input_ranges["R0"][1])
+                / 2
             )
-            / 2
-        )
-        self.delta_bottom = (
-            jnp.ones(num_times)
-            * (
-                config.input_ranges["delta_bottom"][0]
-                + config.input_ranges["delta_bottom"][1]
+            self.a_minor = (
+                jnp.ones(num_times)
+                * (
+                    config.input_ranges["a_minor"][0]
+                    + config.input_ranges["a_minor"][1]
+                )
+                / 2
             )
-            / 2
-        )
+            self.kappa = (
+                jnp.ones(num_times)
+                * (config.input_ranges["kappa"][0] + config.input_ranges["kappa"][1])
+                / 2
+            )
+            self.delta_top = (
+                jnp.ones(num_times)
+                * (
+                    config.input_ranges["delta_top"][0]
+                    + config.input_ranges["delta_top"][1]
+                )
+                / 2
+            )
+            self.delta_bottom = (
+                jnp.ones(num_times)
+                * (
+                    config.input_ranges["delta_bottom"][0]
+                    + config.input_ranges["delta_bottom"][1]
+                )
+                / 2
+            )
+        else:
+            # Load trajectories from the provided dictionary
+            self.R0 = trajectory["R0"]
+            self.a_minor = trajectory["a_minor"]
+            self.kappa = trajectory["kappa"]
+            self.delta_top = trajectory["delta_top"]
+            self.delta_bottom = trajectory["delta_bottom"]
 
-    def resolve_shapes(self, time: float) -> dict[str, float]:
+    def resolve_shapes(
+        self, time: float, clip_sharpness: float = 10.0
+    ) -> dict[str, float]:
         """Output the shape parameters at a given time"""
-        # TODO(ZanderKeith) this needs testing!
-        # Find the index of the previous shape time
         idx = jnp.searchsorted(self.config.shape_times, time, side="right") - 1
         idx = jnp.clip(
             idx, 0, len(self.config.shape_times) - 1
@@ -127,26 +139,31 @@ class ProfileTrajectoryOptimizer(TimeDepModule):
                 self.R0[idx],
                 self.config.input_ranges["R0"][0],
                 self.config.input_ranges["R0"][1],
+                sharpness=clip_sharpness,
             ),
             "a_minor": soft_clip(
                 self.a_minor[idx],
                 self.config.input_ranges["a_minor"][0],
                 self.config.input_ranges["a_minor"][1],
+                sharpness=clip_sharpness,
             ),
             "kappa": soft_clip(
                 self.kappa[idx],
                 self.config.input_ranges["kappa"][0],
                 self.config.input_ranges["kappa"][1],
+                sharpness=clip_sharpness,
             ),
             "delta_top": soft_clip(
                 self.delta_top[idx],
                 self.config.input_ranges["delta_top"][0],
                 self.config.input_ranges["delta_top"][1],
+                sharpness=clip_sharpness,
             ),
             "delta_bottom": soft_clip(
                 self.delta_bottom[idx],
                 self.config.input_ranges["delta_bottom"][0],
                 self.config.input_ranges["delta_bottom"][1],
+                sharpness=clip_sharpness,
             ),
         }
 
