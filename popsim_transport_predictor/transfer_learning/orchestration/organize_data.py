@@ -123,16 +123,12 @@ def add_performance(
 ) -> xr.Dataset:
     """
     Add performance metric to dataset
-    We are saying performance is 75th percentile of (Wtot_MJ^2 + Ip_MA^2)**0.5 along a shot
+    We are saying performance is 95th percentile of (Wtot_MJ^2 + Ip_MA^2)**0.5 along a shot
     Ignoring nans in the calculation
 
     Also stores the specific Ip_MA and Wtot_MJ values at the time point where the
-    performance metric reaches its 75th percentile for plotting in parameter space
+    performance metric reaches its 95th percentile for plotting in parameter space
     """
-    # TODO(ZanderKeith): I want the performance metric to be 'square-ish' in both Ip and Wtot
-    # so that when we do performance extrapolation plots the contours are not too skewed by one being bigger
-    # But that means we're gonna need to look at the entire dataset from all devices
-    # For now we can do them individually
 
     max_Wtot = ds["Wtot_MJ"].max().item()
     max_Ip = ds["Ip_MA"].max().item()
@@ -144,45 +140,45 @@ def add_performance(
         f"(({Wtot_scale} * Wtot_MJ)**2 + ({Ip_scale} * Ip_MA)**2)**0.5"
     )
 
-    # Get the 75th percentile value per shot
+    # Get the 95th percentile value per shot
     if "time_idx" in ds.dims:
-        ds["performance"] = perf_timeseries.quantile(0.75, dim="time_idx", skipna=True)
+        ds["performance"] = perf_timeseries.quantile(0.95, dim="time_idx", skipna=True)
     else:
-        ds["performance"] = perf_timeseries.quantile(0.75, dim="time", skipna=True)
+        ds["performance"] = perf_timeseries.quantile(0.95, dim="time", skipna=True)
 
     n_shots = ds.sizes[episode_coord]
 
-    # Initialize arrays for Ip_MA and Wtot_MJ at p75
-    ip_ma_p75 = np.full(n_shots, np.nan)
-    wtot_mj_p75 = np.full(n_shots, np.nan)
+    # Initialize arrays for Ip_MA and Wtot_MJ at p95
+    ip_ma_p95 = np.full(n_shots, np.nan)
+    wtot_mj_p95 = np.full(n_shots, np.nan)
 
-    # For each shot, find the time index closest to 75th percentile
+    # For each shot, find the time index closest to 95th percentile
     perf_ts_data = perf_timeseries.values  # shape: (n_shots, n_time)
-    p75_vals = ds["performance"].values  # shape: (n_shots,)
+    p95_vals = ds["performance"].values  # shape: (n_shots,)
     ip_ma_data = ds["Ip_MA"].values
     wtot_mj_data = ds["Wtot_MJ"].values
 
     for i in range(n_shots):
         # Get performance timeseries for this shot
         perf_shot = perf_ts_data[i]
-        p75_val = p75_vals[i]
+        p95_val = p95_vals[i]
 
         # Find valid (non-NaN) indices
         valid_mask = ~np.isnan(perf_shot)
 
-        if valid_mask.sum() > 0 and not np.isnan(p75_val):
-            # Find index where performance is closest to p75
-            abs_diff = np.abs(perf_shot - p75_val)
+        if valid_mask.sum() > 0 and not np.isnan(p95_val):
+            # Find index where performance is closest to p95
+            abs_diff = np.abs(perf_shot - p95_val)
             abs_diff[~valid_mask] = np.inf  # Ignore NaN positions
-            idx_p75 = np.argmin(abs_diff)
+            idx_p95 = np.argmin(abs_diff)
 
             # Extract Ip_MA and Wtot_MJ at that time
-            ip_ma_p75[i] = ip_ma_data[i, idx_p75]
-            wtot_mj_p75[i] = wtot_mj_data[i, idx_p75]
+            ip_ma_p95[i] = ip_ma_data[i, idx_p95]
+            wtot_mj_p95[i] = wtot_mj_data[i, idx_p95]
 
     # Add to dataset
-    ds["Ip_MA_p75"] = (episode_coord, ip_ma_p75)
-    ds["Wtot_MJ_p75"] = (episode_coord, wtot_mj_p75)
+    ds["Ip_MA_p95"] = (episode_coord, ip_ma_p95)
+    ds["Wtot_MJ_p95"] = (episode_coord, wtot_mj_p95)
 
     return ds
 
