@@ -25,7 +25,7 @@ from popsim_transport_predictor.trajectory_optimization.setup import (
 CHECKPOINT_DIR_BASE = os.path.join(
     PACKAGE_ROOT, "../checkpoints", "trajectory_optimization"
 )
-MAX_EPOCHS = 800
+MAX_EPOCHS = 100
 EPOCHS_PER_VAL = 20
 
 # TODO(ZanderKeith): Add a config for the number of shape times, see how sensitive the resulting optimization is.
@@ -82,6 +82,7 @@ def setup_optimization_config(
     ds_path: str,
     model_type: str,
     checkpoint_dir: str | None = None,
+    shape_times: list[float] | None = SHAPE_TIMES,
     debug: bool | None = False,
 ) -> TrainConfig:
     """Set up the training config for trajectory optimization.
@@ -90,6 +91,7 @@ def setup_optimization_config(
     Args:
         ds_path (str): Path to the dataset.
         checkpoint_dir (str | None, optional): Path to the checkpoint directory. If None, a default path is used.
+        shape_times (list[float] | None, optional): List of shape times to use for the trajectory optimization.
         debug (bool, optional): Whether to enable debug mode, reducing dataset size to at most 50 shots.
 
     Returns:
@@ -137,6 +139,7 @@ def setup_optimization_config(
             "model_init_config": {
                 **base_config.model_init_config,
                 "input_ranges": control_input_ranges,
+                "shape_times": shape_times,
                 "submodules": {
                     "profile_predictor": profile_predictor_config,
                 },

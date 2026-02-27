@@ -20,6 +20,7 @@ REQUIRED_SIGNALS = [
     # Target profiles for the loss function
     "ne20_psi",
     "Te_keV_psi",
+    "fresh_profiles",
 ]
 
 

@@ -115,7 +115,7 @@ def make_optimization_dataset(
     ds: xr.Dataset,
     shots_times: dict[int, dict[str, float]] = IP_RAMP_SHOTS,
     prog_input_errors: dict[str, float] = PROG_INPUT_ERRORS,
-    permutations_per_shot: int = 100,
+    permutations_per_shot: int = 10,
     prng_seed: int = 42,
     debug: bool | None = False,
 ) -> xr.Dataset:

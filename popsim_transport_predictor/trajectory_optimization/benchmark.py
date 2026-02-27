@@ -14,9 +14,11 @@ Plots to make:
 import os
 
 import fire
+import numpy as np
 import xarray as xr
 from loguru import logger
 from popsim.ml import TrainConfig, Trainer
+from popsim.ml.launch import launch_train
 
 from popsim_transport_predictor import PACKAGE_ROOT
 from popsim_transport_predictor.config import config
@@ -33,13 +35,14 @@ from popsim_transport_predictor.trajectory_optimization.optimize import (
 )
 from popsim_transport_predictor.trajectory_optimization.plotting import (
     profile_comparison,
+    trajectory_performance_comparison,
 )
 from popsim_transport_predictor.trajectory_optimization.setup import (
     make_optimization_dataset,
 )
 
 SAVE_DIR = os.path.join(PACKAGE_ROOT, "../scratch", "trajectory_optimization_benchmark")
-NUM_SHAPE_TIMES = 8
+MAX_NUM_SHAPE_TIMES = 4
 SHAPE_TIME_MIN = 2.0
 SHAPE_TIME_MAX = 5.5
 
@@ -167,9 +170,155 @@ def plot_profiles(
     )
 
 
+##############################################
+# Comparing optimized trajectory performance #
+##############################################
+def run_trajectory_evaluation(  # noqa: PLR0915
+    ds_path: str | None = config.d3d_dataset_path,
+    save_dir: str | None = SAVE_DIR,
+    model_type: str | None = "direct_points",
+    max_num_shape_times: int | None = MAX_NUM_SHAPE_TIMES,
+    shape_time_min: float | None = SHAPE_TIME_MIN,
+    shape_time_max: float | None = SHAPE_TIME_MAX,
+    clean: bool | None = False,
+    debug: bool | None = False,
+):
+    num_shape_times_list = list(
+        range(1, max_num_shape_times + 1)
+    )  # [1, 2, ..., max_num_shape_times]
+    if debug:
+        num_shape_times_list = [6, 12]  # Just do a few for quick testing
+    for num_shape_times in num_shape_times_list:
+        case_dir = os.path.join(
+            save_dir, "trajectory_evaluation", model_type, f"n_{num_shape_times}"
+        )
+        eval_ds_path = os.path.join(case_dir, "eval_data.nc")
+        if not os.path.exists(eval_ds_path) or clean:
+            logger.info(
+                f"No evaluation data found for num_shape_times={num_shape_times}"
+            )
+            checkpoint_dir = os.path.join(case_dir, "checkpoints")
+            shape_times = np.linspace(
+                shape_time_min, shape_time_max, num_shape_times
+            ).tolist()
+            shape_times = [round(t, 1) for t in shape_times]  # Round to nearest 10th
+            optimization_config = setup_optimization_config(
+                ds_path,
+                model_type,
+                debug=debug,
+                checkpoint_dir=checkpoint_dir,
+                shape_times=shape_times,
+            )
+            optimization_config.model_init_config["submodules"]["profile_predictor"][
+                "checkpoint_dir"
+            ] = os.path.join(save_dir, model_type, "checkpoints")
+            if not os.path.exists(checkpoint_dir) or clean:
+                logger.info(
+                    f"No checkpoints found for num_shape_times={num_shape_times}, running optimization..."
+                )
+                optimization_trainer, _, aug_dl, _, _test_results = launch_train(
+                    optimization_config.model_dump(), use_wandb=False
+                )
+            else:
+                logger.info(
+                    f"Restoring checkpoint for num_shape_times={num_shape_times}"
+                )
+                _, train_dl, _, _test_dl = (
+                    ProfileTrajectoryOptimizerTRB.get_dataloaders(
+                        optimization_config.dataloader_config
+                    )
+                )
+                optimization_trainer = Trainer(
+                    model=ProfileTrajectoryOptimizerTRB.model_init(
+                        train_dl, optimization_config.model_init_config
+                    ),
+                    loss_fn=ProfileTrajectoryOptimizerTRB.get_loss_fn(
+                        optimization_config.loss_config
+                    ),
+                    optimizer=ProfileTrajectoryOptimizerTRB.get_optimizer(
+                        optimization_config.optimizer_config
+                    ),
+                    checkpoint_dir=checkpoint_dir,
+                )
+            optimization_trainer.restore_best_checkpoint()
+            eval_data = optimization_trainer.run_evals(aug_dl)
+            input_ds = eval_data.input_ds.reset_index("sample")
+            output_ds = eval_data.output_ds.reset_index("sample")
+            eval_ds = xr.merge([input_ds, output_ds], compat="override")
+            eval_ds.to_netcdf(eval_ds_path)
+        else:
+            logger.info(
+                f"Evaluation data already exists for num_shape_times={num_shape_times}, skipping optimization..."
+            )
+            continue
+
+    def _peaking_factor(ds: xr.Dataset) -> xr.DataArray:
+        """Calculate the pressure profile peaking factor (max / avg) metric from the dataset.
+        Args:
+            ds: Dataset containing the pressure profiles to evaluate. Should have a "time_idx" dimension as well as ne and te profile variables.
+        """
+
+        ne20_psi = ds["ne20_psi"]
+        Te_keV_psi = ds["Te_keV_psi"]
+
+        P_psi = ne20_psi * Te_keV_psi
+        avg = P_psi.mean(dim="psi")
+        peaking = P_psi.max(dim="psi") / avg
+        # Returned DataArray should have dimension (sample, time_idx) and coords (shot, time, shot_alt)
+        return peaking
+
+    ds_perf_list = []
+    ds_perf_labels = []
+    for i, num_shape_times in enumerate(num_shape_times_list):
+        case_dir = os.path.join(
+            save_dir, "trajectory_evaluation", model_type, f"n_{num_shape_times}"
+        )
+        eval_ds_path = os.path.join(case_dir, "eval_data.nc")
+        eval_ds = xr.open_dataset(eval_ds_path)
+
+        if i == 0:
+            # For the first one, also calculate the reference peaking factor from the original dataset
+            ds_ref = eval_ds[["ne20_psi", "Te_keV_psi", "fresh_profiles"]]
+            ds_ref_input = ds_ref.where(
+                ds_ref["fresh_profiles"] == 1, drop=True
+            )  # Only use timesteps with fresh profiles for the reference
+            ds_ref_input = ds_ref_input.rename({"time_idx_input": "time_idx"})
+            ds_ref_input = ds_ref_input.swap_dims({"psi_input": "psi"})
+            # Only get unique values of shot_alt coordinate to prevent duplicates from the augmentation
+            ds_ref_input = ds_ref_input.groupby("shot_alt").first()
+            ds_perf = _peaking_factor(ds_ref_input)
+            ds_perf_list.append(ds_perf)
+            ds_perf_labels.append("Original")
+
+        ds_ref = eval_ds[
+            ["output.profile_predictor_output.ne", "output.profile_predictor_output.te"]
+        ]
+        # Rename to match the target variable names expected by the peaking factor calculation
+        ds_ref = ds_ref.rename(
+            {
+                "output.profile_predictor_output.ne": "ne20_psi",
+                "output.profile_predictor_output.te": "Te_keV_psi",
+                "time": "time_idx",
+            }
+        )
+        ds_perf = _peaking_factor(ds_ref)
+        ds_perf_list.append(ds_perf)
+        ds_perf_labels.append(f"Optimized n={num_shape_times}")
+
+    trajectory_performance_comparison(
+        ds_perf_list=ds_perf_list,
+        ds_perf_labels=ds_perf_labels,
+        save_dir=os.path.join(
+            save_dir, "trajectory_evaluation", model_type, "performance_comparison"
+        ),
+        title=f"Trajectory Performance Comparison for {model_type} Profile Predictor",
+    )
+
+
 if __name__ == "__main__":
     fire.Fire(
         {
             "run_profile_predictor_evaluation": run_profile_predictor_evaluation,
+            "run_trajectory_evaluation": run_trajectory_evaluation,
         }
     )

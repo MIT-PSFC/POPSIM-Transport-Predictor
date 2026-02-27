@@ -8,11 +8,15 @@ from popsim.ml import DataLoader, IntegralLoss, TrainRunBuilder
 from popsim.ml.checkpointing import create_default_checkpoint_manager, restore_model
 from popsim.ml.dataloading import make_dataloaders
 from popsim.ml.split_utils import split_dataset_by_fracs
+from popsim.ml.train_config import load_dict
 
 from popsim_transport_predictor.modules.profile_trajectory.data import get_ds
 from popsim_transport_predictor.modules.profile_trajectory.module import (
     ProfileTrajectoryOptimizer,
     ProfileTrajectoryOptimizerEnv,
+)
+from popsim_transport_predictor.modules.profile_trajectory.profile_predictor.trb import (
+    ProfilePredictorTRB,
 )
 from popsim_transport_predictor.trajectory_optimization.setup import (
     make_optimization_dataset,
@@ -122,9 +126,18 @@ class ProfileTrajectoryOptimizerTRB(TrainRunBuilder):
             input_ranges=model_init_config["input_ranges"],
         )
 
+        profile_predictor_config = load_dict(submodule_configs["profile_predictor"])
+        profile_predictor = ProfilePredictorTRB.model_init(
+            train_dl, profile_predictor_config["model_init_config"]
+        )
+        profile_predictor_manager = create_default_checkpoint_manager(
+            profile_predictor_config["checkpoint_dir"]
+        )
+        profile_predictor = restore_model(profile_predictor_manager, profile_predictor)
+
         module = ProfileTrajectoryOptimizer.init(
             config=config,
-            profile_predictor_config=submodule_configs["profile_predictor"],
+            profile_predictor=profile_predictor,
             psigrid=psigrid,
         )
 
