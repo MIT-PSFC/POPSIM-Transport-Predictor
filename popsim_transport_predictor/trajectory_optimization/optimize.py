@@ -117,11 +117,11 @@ def setup_optimization_config(
 
     # Informed the dataset characterization and Jayson Barr TODO(ZanderKeith) make sure these are ok
     control_input_ranges = {
-        "R0": (1.77, 1.82),  # Major radius [m]
-        "a_minor": (0.58, 0.6),  # Minor radius [m]
-        "kappa": (1.89, 1.97),  # Elongation
-        "delta_top": (0.5, 0.91),  # Upper triangularity
-        "delta_bottom": (0.7, 0.91),  # Lower triangularity
+        "R0": (1.75, 1.84),  # Major radius [m]
+        "a_minor": (0.56, 0.62),  # Minor radius [m]
+        "kappa": (1.87, 1.99),  # Elongation
+        "delta_top": (0.48, 0.92),  # Upper triangularity
+        "delta_bottom": (0.68, 0.92),  # Lower triangularity
     }
 
     base_config = TrainConfig.load(PROFILE_TRAJECTORY_OPTIMIZER_CONFIG)
