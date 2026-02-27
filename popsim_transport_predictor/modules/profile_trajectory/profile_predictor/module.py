@@ -270,13 +270,17 @@ def pca_initial_guess(
 
 
 class ProfilePredictor(TimeIndepModule):
-    te_shapes: list[ProfileShape]
-    ne_shapes: list[ProfileShape]
-
-    nn: RtdMLP
     psigrid: tuple = eqx.field(
         static=True
     )  # The psi grid on which the profiles are evaluated
+
+    nn: RtdMLP
+
+
+class ProfilePredictorShapeInit(ProfilePredictor):
+    te_shapes: list[ProfileShape]
+    ne_shapes: list[ProfileShape]
+
     shape_type: ShapeType = eqx.field(static=True)
     softmax_temp: float = eqx.field(static=True, default=1.0)
 
@@ -414,3 +418,73 @@ class ProfilePredictor(TimeIndepModule):
             psigrid=psigrid_tuple,
             key=jax.random.PRNGKey(prng_seed),
         )
+
+
+class ProfilePredictorDirectPoints(ProfilePredictor):
+    psi_points: Array = eqx.field(static=True)  # Points at which the NN predicts
+
+    def __init__(
+        self,
+        n_points: int,
+        nn_width: int,
+        nn_depth: int,
+        psigrid: tuple,
+        key: jax.random.PRNGKey,
+    ):
+        self.psi_points = jnp.linspace(min(psigrid), max(psigrid), n_points)
+
+        key, subkey = jax.random.split(key)
+        self.nn = RtdMLP(
+            in_size=8,
+            out_size=(n_points * 2) + 2,  # +2 for the correction factors
+            width_size=nn_width,
+            depth=nn_depth,
+            activation=Activation.RELU,
+            final_activation=Activation.IDENTITY,
+            key=subkey,
+        )
+        self.psigrid = psigrid
+
+    def __call__(self, inputs: Inputs | xr.Dataset, debug: bool = False) -> Outputs:
+        if isinstance(inputs, xr.Dataset):
+            inputs = Inputs(
+                Ip=inputs["Ip_MA"].data,
+                B0=inputs["B0"].data,
+                beta=inputs["beta"].data,
+                ne20_edge=inputs["ne20_edge"].data,
+                R0=inputs["R0"].data,
+                a_minor=inputs["a_minor"].data,
+                kappa=inputs["kappa"].data,
+                delta_top=inputs["delta_top"].data,
+                delta_bottom=inputs["delta_bottom"].data,
+                psi=jnp.array(self.psigrid),
+            )
+
+        nn_inputs = inputs.nn_inputs
+
+        # Predict the profile values at the specified points.
+        outputs = self.nn(nn_inputs)
+        ne_points = outputs[: self.psi_points.size]
+        te_points = outputs[self.psi_points.size : 2 * self.psi_points.size]
+        ne_correction = jnp.abs(outputs[-1])
+        te_correction = jnp.abs(outputs[-2])
+
+        # Interpolate the predicted points to the psigrid
+        ne = (
+            jnp.interp(inputs.psi, self.psi_points, ne_points)
+            * inputs.ne20_edge
+            * ne_correction
+        )
+        te = (
+            jnp.interp(inputs.psi, self.psi_points, te_points)
+            * inputs.te_approx
+            * te_correction
+        )
+
+        out = Outputs(
+            ne=xr.DataArray(data=ne, dims=("psi",), coords={"psi": list(self.psigrid)}),
+            te=xr.DataArray(data=te, dims=("psi",), coords={"psi": list(self.psigrid)}),
+            debug_info=None,
+        )
+
+        return out

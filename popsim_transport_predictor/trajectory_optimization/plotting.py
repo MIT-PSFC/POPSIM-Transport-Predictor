@@ -79,7 +79,7 @@ def profile_comparison(  # noqa: PLR0915
             fig.patch.set_facecolor(BACKGROUND_COLOR)
 
             fig.suptitle(
-                f"TCV Shot {shot} @ t={time:.3f}s",
+                f"DIII-D Shot {shot} @ t={time:.3f}s",
                 fontsize=TITLE_FONTSIZE,
                 color=TEXT_COLOR,
             )

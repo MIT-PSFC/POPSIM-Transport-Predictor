@@ -3,12 +3,17 @@ import shutil
 
 import fire
 from loguru import logger
-from popsim.ml.launch import launch_train
+from popsim.ml import Trainer
+from popsim.ml.launch import DataLoader, launch_train
 from popsim.ml.train_config import TrainConfig
 from popsim.modules.transport_predictor.train_configs import update_submodule_configs
 
 from popsim_transport_predictor import PACKAGE_ROOT
 from popsim_transport_predictor.modules.profile_trajectory.data import get_ds
+from popsim_transport_predictor.modules.profile_trajectory.profile_predictor.train_configs import (
+    PROFILE_PREDICTOR_DIRECT_POINTS_CONFIG,
+    PROFILE_PREDICTOR_SHAPE_INIT_CONFIG,
+)
 from popsim_transport_predictor.modules.profile_trajectory.train_configs import (
     PROFILE_TRAJECTORY_OPTIMIZER_CONFIG,
 )
@@ -75,6 +80,8 @@ def characterize_dataset(ds_path: str, debug: bool = False) -> None:
 ######################
 def setup_optimization_config(
     ds_path: str,
+    model_type: str,
+    checkpoint_dir: str | None = None,
     debug: bool | None = False,
 ) -> TrainConfig:
     """Set up the training config for trajectory optimization.
@@ -82,11 +89,26 @@ def setup_optimization_config(
 
     Args:
         ds_path (str): Path to the dataset.
+        checkpoint_dir (str | None, optional): Path to the checkpoint directory. If None, a default path is used.
         debug (bool, optional): Whether to enable debug mode, reducing dataset size to at most 50 shots.
 
     Returns:
         TrainConfig: The training config for trajectory optimization.
     """
+
+    if checkpoint_dir is None:
+        checkpoint_dir = os.path.join(CHECKPOINT_DIR_BASE, "trajectory_optimizer")
+
+    if model_type == "shape_init":
+        profile_predictor_config = TrainConfig.load(PROFILE_PREDICTOR_SHAPE_INIT_CONFIG)
+    elif model_type == "direct_points":
+        profile_predictor_config = TrainConfig.load(
+            PROFILE_PREDICTOR_DIRECT_POINTS_CONFIG
+        )
+    else:
+        raise ValueError(
+            f"Invalid model type {model_type}, must be either 'shape_init' or 'direct_points'"
+        )
 
     max_epochs = 2 if debug else MAX_EPOCHS
     epochs_per_val = 1 if debug else EPOCHS_PER_VAL
@@ -106,7 +128,7 @@ def setup_optimization_config(
         update={
             "max_epochs": max_epochs,
             "epochs_per_val": epochs_per_val,
-            "checkpoint_dir": os.path.join(CHECKPOINT_DIR_BASE, "trajectory_optimizer"),
+            "checkpoint_dir": checkpoint_dir,
             "dataloader_config": {
                 **base_config.dataloader_config,
                 "ds_path": ds_path,
@@ -115,6 +137,9 @@ def setup_optimization_config(
             "model_init_config": {
                 **base_config.model_init_config,
                 "input_ranges": control_input_ranges,
+                "submodules": {
+                    "profile_predictor": profile_predictor_config,
+                },
             },
         }
     )
@@ -130,43 +155,85 @@ def setup_optimization_config(
     return config
 
 
-###############################################
-# Train the model and optimize the trajectory #
-###############################################
-def train_profile_predictor(
-    ds_path: str, debug: bool | None = False, clean: bool | None = False
-) -> None:
-    """Train the profile predictor model for trajectory optimization.
+def setup_profile_predictor_config(
+    ds_path: str,
+    model_type: str,
+    checkpoint_dir: str | None = None,
+    debug: bool | None = False,
+) -> TrainConfig:
+    """Set up the training config for the profile predictor submodule.
 
     Args:
-        ds_path (str): Path to the dataset.
-        debug (bool, optional): Whether to enable debug mode, reducing dataset size to at most 10 shots.
-        clean (bool, optional): Whether to clean the checkpoint directory before training.
+        model_type (str): The type of profile predictor model to set up, either "shape_init" or "direct_points".
+        checkpoint_dir (str | None, optional): Path to the checkpoint directory. If None, a default path is used.
+        debug (bool, optional): Whether to enable debug mode, reducing dataset size to at most 50 shots.
+
+    Returns:
+        TrainConfig: The training config for the profile predictor submodule.
     """
-    base_config = setup_optimization_config(ds_path, debug=debug)
+
+    base_config = setup_optimization_config(ds_path, model_type, debug=debug)
+
+    max_epochs = 2 if debug else MAX_EPOCHS
+    epochs_per_val = 1 if debug else EPOCHS_PER_VAL
 
     profile_predictor_config = TrainConfig.load(
         base_config.model_init_config["submodules"]["profile_predictor"]
     )
     profile_predictor_config = profile_predictor_config.model_copy(
         update={
-            "max_epochs": MAX_EPOCHS,
-            "epochs_per_val": EPOCHS_PER_VAL,
-            "checkpoint_dir": os.path.join(CHECKPOINT_DIR_BASE, "profile_predictor"),
+            "max_epochs": max_epochs,
+            "epochs_per_val": epochs_per_val,
+            "checkpoint_dir": checkpoint_dir,
             "dataloader_config": {
                 **profile_predictor_config.dataloader_config,
                 "module": "profile_predictor",
+                "debug": debug,
             },
         }
     )
 
+    return profile_predictor_config
+
+
+###############################################
+# Train the model and optimize the trajectory #
+###############################################
+def train_profile_predictor(
+    ds_path: str,
+    model_type: str,
+    checkpoint_dir: str | None = None,
+    debug: bool | None = False,
+    clean: bool | None = False,
+) -> tuple[Trainer, DataLoader]:
+    """Train the profile predictor model for trajectory optimization.
+
+    Args:
+        ds_path (str): Path to the dataset.
+        model_type (str): The type of profile predictor model to train, either "shape_init" or "direct_points".
+        checkpoint_dir (str | None, optional): Path to the checkpoint directory. If None, a default path is used.
+        debug (bool, optional): Whether to enable debug mode, reducing dataset size to at most 10 shots.
+        clean (bool, optional): Whether to clean the checkpoint directory before training.
+    """
+
+    if checkpoint_dir is None:
+        checkpoint_dir = os.path.join(CHECKPOINT_DIR_BASE, "profile_predictor")
+
+    profile_predictor_config = setup_profile_predictor_config(
+        ds_path, model_type, checkpoint_dir=checkpoint_dir, debug=debug
+    )
+
     if not os.path.exists(profile_predictor_config.checkpoint_dir) or clean:
         shutil.rmtree(profile_predictor_config.checkpoint_dir, ignore_errors=True)
-        launch_train(profile_predictor_config.model_dump(), use_wandb=False)
+        trainer, _, _, test_dl, test_results = launch_train(
+            profile_predictor_config.model_dump(), use_wandb=False
+        )
     else:
         logger.info(
             f"Checkpoint directory {profile_predictor_config.checkpoint_dir} already exists, skipping training of profile predictor..."
         )
+
+    return trainer, test_dl, test_results
 
 
 def run_trajectory_optimization(

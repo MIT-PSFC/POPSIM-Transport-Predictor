@@ -30,6 +30,7 @@ class ProfileTrajectoryOptimizer(TimeDepModule):
 
     # These are the things that we can control over time
     # TODO(ZanderKeith) might be worthwhile to have a small translation layer to be more DIII-D-like
+    # What we are really controlling is R0, GapIn, RxTop, RxBot, ZxTop, ZxBot
     R0: Array  # Major radius [m]
     a_minor: Array  # Minor radius [m]
     kappa: Array  # Elongation [-]
