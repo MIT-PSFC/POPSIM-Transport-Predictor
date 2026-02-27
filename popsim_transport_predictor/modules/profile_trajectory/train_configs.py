@@ -61,7 +61,7 @@ PROFILE_TRAJECTORY_OPTIMIZER_CONFIG = {
         "time_penalty": 1.0,  # Penalty to avoid trajectory shapes changing too much between timesteps
     },
     "optimizer_config": {
-        "lr0": 1e-4,
+        "lr0": 1e-3,
         "transition_steps": 500,
         "decay_rate": 0.5,
         "lrf": 5e-4,
