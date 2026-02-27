@@ -183,8 +183,46 @@ def add_performance(
     return ds
 
 
+def normalize_domain(
+    ds_source: xr.Dataset,
+    ds_target: xr.Dataset | None = None,
+    method: str | None = "raw",
+) -> tuple[xr.Dataset, xr.Dataset]:
+    """Apply the specified domain normalization method to the dataset.
+
+    ds_source is used to inform the normalization parameters (e.g. mean and std for z-score, covariance for coral),
+    but the normalization is applied to both source and target datasets.
+
+    Methods:
+        - "raw": No normalization, Ip, Wtot, etc. are in their original units
+        - "physics": Convert to typical dimensionless parameters like beta, q95, f_G, etc.
+        - "z_score": Within each device, normalize each variable to zero mean and unit variance.
+        - "coral": Use the CORAL method to align covariances of various devices
+
+    Args:
+        ds_source: The source dataset (e.g. historic data)
+        ds_target: The target dataset (e.g. DIII-D high-performance shots)
+        method: The normalization method to apply
+
+    Returns:
+        The normalized source and target datasets.
+    """
+
+    if method == "raw":
+        return ds_source, ds_target
+    elif method == "physics":
+        raise NotImplementedError("Physics-based normalization not implemented yet")
+    elif method == "z_score":
+        raise NotImplementedError("Z-score normalization not implemented yet")
+    elif method == "coral":
+        raise NotImplementedError("CORAL normalization not implemented yet")
+    else:
+        raise ValueError(f"Unknown normalization method: {method}")
+
+
 def get_train_val_datasets(
     training_data_case: str,
+    normalization_method: str | None = "raw",
 ):
     """
     Split dataset into training and validation sets based on the specified training data case.
@@ -268,12 +306,15 @@ def get_train_val_datasets(
     logger.debug("Training dataset size: {}", train_ds.sizes[episode_coord])
     logger.debug("Validation dataset size: {}", val_ds.sizes[episode_coord])
 
+    train_ds, val_ds = normalize_domain(train_ds, val_ds, method=normalization_method)
+
     return train_ds, val_ds
 
 
 def get_train_test_datasets_transfer(
     training_data_case: str,
     num_hp_shots: int,
+    normalization_method: str | None = "raw",
 ):
     """
     Split dataset into training and test sets for the transfer learning case.
@@ -318,5 +359,7 @@ def get_train_test_datasets_transfer(
             [train_ds_hist, val_ds_hist, train_ds_hp],
             concat_dim=episode_coord,
         )
+
+    train_ds, test_ds = normalize_domain(train_ds, test_ds, method=normalization_method)
 
     return train_ds, test_ds

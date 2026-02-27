@@ -143,3 +143,12 @@ def performance_extrapolation_plot(  # noqa: PLR0915
 
     plt.savefig(save_path, dpi=300, bbox_inches="tight")
     plt.close()
+
+
+def domain_plot(
+    ds: xr.Dataset,
+    var_groups: list[list[str]],
+    title: str,
+    save_path: str,
+):
+    """Make a 2x2 grid of scatter plots showing the domain of each dataset in different variable spaces, colored by data source."""
