@@ -188,3 +188,60 @@ def profile_comparison(  # noqa: PLR0915, PLR0912
             fig.tight_layout()
             fig.savefig(os.path.join(shot_dir, f"t{time:.3f}.png"))
             plt.close(fig)
+
+
+def trajectory_performance_comparison(
+    ds_perf_list: list[xr.DataArray],
+    ds_perf_labels: list[str],
+    save_dir: str,
+    title: str,
+):
+    """Compare performance of different trajectories on the same plot, in a both per-shot and per-timeslice manner.
+    Expects each DataArray in ds_perf_list to have dimensions (sample, time_idx) and coords (shot, time, shot_alt), where sample is the dimension corresponding to different trajectories for the same shot and time (e.g. from different permutations or from the optimization trajectory). The "time" coordinate should be the actual time value in seconds, which will be used for the x-axis in the timeslice performance plot.
+    """
+
+    if not os.path.exists(save_dir):
+        os.makedirs(save_dir)
+
+    timeslice_performance_list = []
+    shot_performance_list = []
+    for ds_perf in ds_perf_list:
+        timeslice_perf = ds_perf.data[~np.isnan(ds_perf.data)]
+        timeslice_performance_list.append(timeslice_perf)
+
+        shot_perf = ds_perf.mean(dim="time_idx", skipna=True).data
+        shot_performance_list.append(shot_perf)
+
+    # Boxplots
+    for perf_list, perf_label in zip(
+        [timeslice_performance_list, shot_performance_list],
+        ["Timeslice", "Per-Shot"],
+        strict=True,
+    ):
+        fig, ax = plt.subplots(figsize=(12, 6))
+        fig.patch.set_facecolor(BACKGROUND_COLOR)
+        box_dict = ax.boxplot(perf_list, labels=ds_perf_labels)
+        ax.set_title(
+            f"{title} - {perf_label}", fontsize=TITLE_FONTSIZE, color=TEXT_COLOR
+        )
+        ax.set_ylabel("Peaking Factor", fontsize=LABEL_FONTSIZE, color=TEXT_COLOR)
+        ax.set_facecolor(FACE_COLOR)
+        ax.grid(True, color="gray", linestyle="--", linewidth=0.5)
+        ax.tick_params(axis="both", labelsize=TICK_FONTSIZE, colors=TEXT_COLOR)
+        # Set the boxes to be blue and the whiskers to be red
+        for box in box_dict["boxes"]:
+            box.set(color="cyan", linewidth=2)
+        for whisker in box_dict["whiskers"]:
+            whisker.set(color="red", linewidth=2)
+        for cap in box_dict["caps"]:
+            cap.set(color="lime", linewidth=2)
+        for median in box_dict["medians"]:
+            median.set(color="orange", linewidth=2)
+        for flier in box_dict["fliers"]:
+            flier.set(marker="o", markeredgecolor="white", markersize=4)
+
+        fig.tight_layout()
+        fig.savefig(
+            os.path.join(save_dir, f"performance_comparison_{perf_label.lower()}.png")
+        )
+        plt.close(fig)

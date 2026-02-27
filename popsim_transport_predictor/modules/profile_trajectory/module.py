@@ -4,9 +4,7 @@ import jax.numpy as jnp
 from jaxtyping import Array, ArrayLike
 from popsim import TimeDepModule
 from popsim.math_utils import soft_clip
-from popsim.ml.checkpointing import create_default_checkpoint_manager, restore_model
 from popsim.ml.envs import ModuleTrainingEnv
-from popsim.ml.train_config import load_dict
 from popsim.simulate import StepperType
 
 from popsim_transport_predictor.modules.profile_trajectory.profile_predictor.module import (
@@ -55,7 +53,7 @@ class ProfileTrajectoryOptimizer(TimeDepModule):
 
     @chex.dataclass
     class Inputs:
-        time: float  # Current time, to know which point on the trajectory we're at
+        traj_time: float  # Current time, to know which point on the trajectory we're at
         # These are all the inputs that DIII-D has real-time feedback for
         # Plug in the waveforms for these in advance, and we expect them to be reasonably accurate
         Ip_MA: float  # [MA]
@@ -172,7 +170,7 @@ class ProfileTrajectoryOptimizer(TimeDepModule):
 
     def __call__(self, state: "State", inputs: "Inputs") -> tuple[State, Output]:
         # Get the shape at this point in the trajectory
-        shape_dict = self.resolve_shapes(inputs.time)
+        shape_dict = self.resolve_shapes(inputs.traj_time)
 
         # Create the input for the profile predictor
         profile_predictor_input = ProfilePredictorInputs(
@@ -209,27 +207,9 @@ class ProfileTrajectoryOptimizer(TimeDepModule):
     def init(
         cls,
         config: Config,
-        profile_predictor_config: dict,
+        profile_predictor: ProfilePredictor,
         psigrid: Array,
     ):
-        profile_predictor_config = load_dict(profile_predictor_config)
-        profile_predictor_model_init = profile_predictor_config["model_init_config"]
-        profile_predictor = ProfilePredictor.init(
-            n_shapes=profile_predictor_model_init["n_shapes"],
-            psigrid=psigrid,
-            nn_width=profile_predictor_model_init["nn_width"],
-            nn_depth=profile_predictor_model_init["nn_depth"],
-            shape_type=profile_predictor_model_init["shape_type"],
-            softmax_temp=profile_predictor_model_init.get("softmax_temp", 1.0),
-            prng_seed=profile_predictor_model_init.get("prng_seed", 42),
-        )
-
-        # Trajectory optimizer ALWAYS needs a pre-trained profile predictor
-        profile_predictor_manager = create_default_checkpoint_manager(
-            profile_predictor_config["checkpoint_dir"]
-        )
-        profile_predictor = restore_model(profile_predictor_manager, profile_predictor)
-
         return cls(
             config=config,
             profile_predictor=profile_predictor,
@@ -252,7 +232,7 @@ class ProfileTrajectoryOptimizerEnv(ModuleTrainingEnv):
         inputs: dict[str, ArrayLike],
     ) -> ProfileTrajectoryOptimizer.Inputs:
         return ProfileTrajectoryOptimizer.Inputs(
-            time=inputs["traj_time"].data,
+            traj_time=inputs["traj_time"].data,
             Ip_MA=inputs["Ip_MA"].data,
             B0=inputs["B0"].data,
             ne20_edge=inputs["ne20_edge"].data,
