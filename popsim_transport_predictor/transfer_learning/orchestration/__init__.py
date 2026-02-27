@@ -9,6 +9,13 @@ TRAINING_DATA_CASES = [
     "exnihilo",  # No training data
 ]
 
+DOMAIN_NORMALIZATION_METHODS = [
+    "raw",  # No normalization, Ip, Wtot, etc. are in their original units
+    "physics",  # Convert to typical dimensionless parameters like beta, q95, f_G, etc.
+    "z_score",  # Within each device, normalize each variable to zero mean and unit variance.
+    "coral",  # Use the CORAL method to align covariances of source and target domains (https://arxiv.org/abs/1612.01939)
+]
+
 MODEL_CASES = {
     # Different treatments of the full-shot transport predictor module
     "transport_predictor": {

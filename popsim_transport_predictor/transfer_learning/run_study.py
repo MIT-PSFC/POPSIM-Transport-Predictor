@@ -6,17 +6,49 @@ from loguru import logger
 from popsim_transport_predictor import PACKAGE_ROOT
 from popsim_transport_predictor.transfer_learning.config import config
 from popsim_transport_predictor.transfer_learning.figures.data_visualization import (
+    domain_plot,
     performance_extrapolation_plot,
 )
 from popsim_transport_predictor.transfer_learning.orchestration import (
+    DOMAIN_NORMALIZATION_METHODS,
     HP_SHOTS_INCLUDED,
     MODEL_CASES,
     TRAINING_DATA_CASES,
 )
 from popsim_transport_predictor.transfer_learning.orchestration.organize_data import (
     get_train_test_datasets_transfer,
-    get_train_val_test_datasets,
+    get_train_val_datasets,
 )
+
+
+def _get_largest_dataset_case():
+    # Determine the biggest dataset we can use so that we only need to make one plot
+    if (
+        config.cmod_dataset_path
+        and config.tcv_dataset_path
+        and config.d3d_lp_dataset_path
+    ):
+        training_data_case = "cmod_tcv_d3d_lp"
+    elif (
+        config.cmod_dataset_path
+        and config.tcv_dataset_path
+        and config.d3d_lp_dataset_path
+    ):
+        training_data_case = "cmod_tcv_d3d_lp"
+    elif config.cmod_dataset_path and config.tcv_dataset_path:
+        training_data_case = "cmod_tcv"
+    elif config.cmod_dataset_path:
+        training_data_case = "cmod"
+    elif config.tcv_dataset_path:
+        training_data_case = "tcv"
+    elif config.d3d_lp_dataset_path:
+        training_data_case = "d3d_lp"
+    else:
+        raise ValueError(
+            "No dataset paths provided in config, cannot determine largest dataset case for domain overlap plot."
+        )
+
+    return training_data_case
 
 
 class DataVisualization:
@@ -50,13 +82,13 @@ class DataVisualization:
             # TODO(ZanderKeith) Use the exact dataloader from the study to ensure consistency
             fig_path = os.path.join(save_dir, "cmod_performance_extrapolation.png")
             if not os.path.exists(fig_path):
-                train_ds, val_ds, test_ds = get_train_val_test_datasets(
+                train_ds, val_ds = get_train_val_datasets(
                     training_data_case="cmod",
                 )
                 performance_extrapolation_plot(
                     save_path=fig_path,
-                    ds_list=[train_ds, val_ds, test_ds],
-                    ds_type_list=["train", "val", "test"],
+                    ds_list=[train_ds, val_ds],
+                    ds_type_list=["train", "val"],
                     x_var="Ip_MA",
                     y_var="Wtot_MJ",
                 )
@@ -67,13 +99,13 @@ class DataVisualization:
         if config.tcv_dataset_path:
             fig_path = os.path.join(save_dir, "tcv_performance_extrapolation.png")
             if not os.path.exists(fig_path):
-                train_ds, val_ds, test_ds = get_train_val_test_datasets(
+                train_ds, val_ds = get_train_val_datasets(
                     training_data_case="tcv",
                 )
                 performance_extrapolation_plot(
                     save_path=fig_path,
-                    ds_list=[train_ds, val_ds, test_ds],
-                    ds_type_list=["train", "val", "test"],
+                    ds_list=[train_ds, val_ds],
+                    ds_type_list=["train", "val"],
                     x_var="Ip_MA",
                     y_var="Wtot_MJ",
                 )
@@ -84,13 +116,13 @@ class DataVisualization:
         if config.tcv_dataset_path and config.cmod_dataset_path:
             fig_path = os.path.join(save_dir, "cmod_tcv_performance_extrapolation.png")
             if not os.path.exists(fig_path):
-                train_ds, val_ds, test_ds = get_train_val_test_datasets(
+                train_ds, val_ds = get_train_val_datasets(
                     training_data_case="cmod_tcv",
                 )
                 performance_extrapolation_plot(
                     save_path=fig_path,
-                    ds_list=[train_ds, val_ds, test_ds],
-                    ds_type_list=["train", "val", "test"],
+                    ds_list=[train_ds, val_ds],
+                    ds_type_list=["train", "val"],
                     x_var="Ip_MA",
                     y_var="Wtot_MJ",
                 )
@@ -103,13 +135,13 @@ class DataVisualization:
         if config.d3d_lp_dataset_path:
             fig_path = os.path.join(save_dir, "d3d_lp_performance_extrapolation.png")
             if not os.path.exists(fig_path):
-                train_ds, val_ds, test_ds = get_train_val_test_datasets(
+                train_ds, val_ds = get_train_val_datasets(
                     training_data_case="d3d_lp",
                 )
                 performance_extrapolation_plot(
                     save_path=fig_path,
-                    ds_list=[train_ds, val_ds, test_ds],
-                    ds_type_list=["train", "val", "test"],
+                    ds_list=[train_ds, val_ds],
+                    ds_type_list=["train", "val"],
                     x_var="Ip_MA",
                     y_var="Wtot_MJ",
                 )
@@ -128,13 +160,13 @@ class DataVisualization:
                 save_dir, "cmod_tcv_d3d_lp_performance_extrapolation.png"
             )
             if not os.path.exists(fig_path):
-                train_ds, val_ds, test_ds = get_train_val_test_datasets(
+                train_ds, val_ds = get_train_val_datasets(
                     training_data_case="cmod_tcv_d3d_lp",
                 )
                 performance_extrapolation_plot(
                     save_path=fig_path,
-                    ds_list=[train_ds, val_ds, test_ds],
-                    ds_type_list=["train", "val", "test"],
+                    ds_list=[train_ds, val_ds],
+                    ds_type_list=["train", "val"],
                     x_var="Ip_MA",
                     y_var="Wtot_MJ",
                 )
@@ -200,6 +232,76 @@ class DataVisualization:
                         x_var="Ip_MA",
                         y_var="Wtot_MJ",
                     )
+
+    @staticmethod
+    def domain_overlap(
+        figure_dir: str,
+    ):
+        """
+        Compare different data preparation cases to how the parameter space overlaps.
+        This is different from the performance extrapolation plots because here it is desirable to have a lot of overlap.
+        While we are ALWAYS extrapolating in real units (Ip and Wtot, things that WILL break the device)
+        first normalizing the data should help with transfer learning.
+
+        Basically, this normalization doesn't impact the transfer learning, because the dataset is being split into train and val/test beforehand.
+        """
+
+        training_data_case = _get_largest_dataset_case()
+
+        for method in DOMAIN_NORMALIZATION_METHODS:
+            if method == "raw":
+                var_groups = [
+                    ["Ip_MA", "Wtot_MJ"],
+                    ["R0", "a_minor"],
+                    ["ne20_line_avg", "B0"],
+                    ["P_aux_MW", "kappa"],
+                ]
+            elif method == "physics":
+                var_groups = [
+                    ["Ip_MA", "beta"],
+                    ["q95", "epsilon"],
+                    ["f_G", "aB0"],
+                    ["surface_power_density", "kappa"],
+                ]
+            elif method == "z_score":
+                var_groups = [
+                    ["Ip_MA_z", "Wtot_MJ_z"],
+                    ["R0_z", "a_minor_z"],
+                    ["ne20_line_avg_z", "B0_z"],
+                    ["P_aux_MW_z", "kappa_z"],
+                ]
+            elif method == "coral":
+                var_groups = [
+                    ["Ip_MA_coral", "Wtot_MJ_coral"],
+                    ["R0_coral", "a_minor_coral"],
+                    ["ne20_line_avg_coral", "B0_coral"],
+                    ["P_aux_MW_coral", "kappa_coral"],
+                ]
+            else:
+                raise ValueError(f"Unknown normalization method '{method}' specified.")
+
+            if config.d3d_hp_dataset_path:
+                ds, _ = get_train_test_datasets_transfer(
+                    training_data_case=training_data_case,
+                    num_hp_shots=max(HP_SHOTS_INCLUDED),
+                    normalization_method=method,
+                )
+            else:
+                ds, _ = get_train_val_datasets(
+                    training_data_case=training_data_case, normalization_method=method
+                )
+
+            fig_path = os.path.join(
+                figure_dir,
+                "domain_overlap",
+                f"{training_data_case}_domain_overlap_{method}.png",
+            )
+            domain_plot(
+                ds=ds,
+                var_groups=var_groups,
+                title=f"{training_data_case} domain overlap {method}",
+                save_path=fig_path,
+            )
 
 
 class ComputeResults:
@@ -363,12 +465,6 @@ class ComputeResults:
                     pass
                     # Compute results for this combination of training data, model architecture, and number of high-performance shots
                     # If the model is not trained, train it first
-
-
-class TrainingDataComparison:
-    """
-    Performance vs Training Datasets
-    """
 
 
 class ModelComparison:
