@@ -42,7 +42,7 @@ from popsim_transport_predictor.trajectory_optimization.setup import (
 )
 
 SAVE_DIR = os.path.join(PACKAGE_ROOT, "../scratch", "trajectory_optimization_benchmark")
-MAX_NUM_SHAPE_TIMES = 4
+MAX_NUM_SHAPE_TIMES = 5
 SHAPE_TIME_MIN = 2.0
 SHAPE_TIME_MAX = 5.5
 
