@@ -25,7 +25,7 @@ from popsim_transport_predictor.trajectory_optimization.setup import (
 CHECKPOINT_DIR_BASE = os.path.join(
     PACKAGE_ROOT, "../checkpoints", "trajectory_optimization"
 )
-MAX_EPOCHS = 100
+MAX_EPOCHS = 800
 EPOCHS_PER_VAL = 20
 
 # TODO(ZanderKeith): Add a config for the number of shape times, see how sensitive the resulting optimization is.
