@@ -30,6 +30,8 @@ PROFILE_TRAJECTORY_OPTIMIZER_CONFIG = {
         "extra_vars": [
             "ne20_psi",
             "Te_keV_psi",
+            "ne_shape",
+            "Te_shape",
         ],  # For easy comparison at the end and to pass the psi coord to the profile_predictor submodule
         "convert_xr_to_jnp": False,
         "prng_seed": 42,

@@ -103,6 +103,23 @@ def run_profile_predictor_evaluation(
             continue
 
     # Plots n stuff
+    ds_pred_list = []
+    ds_pred_labels = []
+    for model_type in model_types:
+        eval_ds_path = os.path.join(save_dir, model_type, "eval_data.nc")
+        eval_ds = xr.open_dataset(eval_ds_path)
+        ds_pred_list.append(eval_ds)
+        ds_pred_labels.append(model_type)
+
+    ds_targ = ds_pred_list[
+        0
+    ]  # They should both have the same target dataset since they use the same test dataloader, so just take the first one.
+    profile_comparison(
+        profile_dir=os.path.join(save_dir, "profile_comparison"),
+        ds_targ=ds_targ,
+        ds_pred_list=ds_pred_list,
+        ds_pred_labels=ds_pred_labels,
+    )
 
 
 def eval_profile_predictor(transport_predictor_config: TrainConfig):
