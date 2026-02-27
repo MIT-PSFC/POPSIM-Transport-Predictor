@@ -1,7 +1,7 @@
 from popsim.simulate import StepperType
 
 from popsim_transport_predictor.modules.profile_trajectory.profile_predictor.train_configs import (
-    PROFILE_PREDICTOR_CONFIG,
+    PROFILE_PREDICTOR_SHAPE_INIT_CONFIG,
 )
 from popsim_transport_predictor.modules.profile_trajectory.trb import (
     ProfileTrajectoryOptimizerTRB,
@@ -51,7 +51,7 @@ PROFILE_TRAJECTORY_OPTIMIZER_CONFIG = {
             "delta_bottom": {"min": 0.0, "max": 1.0},
         },
         "shape_times": [2.0, 2.5, 3.0, 3.5, 4.0, 4.5, 5.0, 5.5],
-        "submodules": {"profile_predictor": PROFILE_PREDICTOR_CONFIG},
+        "submodules": {"profile_predictor": PROFILE_PREDICTOR_SHAPE_INIT_CONFIG},
     },
     "loss_config": {
         "huber_delta": 0.1,

@@ -8,7 +8,8 @@ import optax
 from popsim.ml import DataLoader, TrainRunBuilder
 
 from popsim_transport_predictor.modules.profile_trajectory.profile_predictor.module import (
-    ProfilePredictor,
+    ProfilePredictorDirectPoints,
+    ProfilePredictorShapeInit,
     ShapeType,
     kmeans_initial_guess,
     pca_initial_guess,
@@ -32,42 +33,55 @@ class ProfilePredictorTRB(TrainRunBuilder):
         Instantiate and return your model given a training DataLoader
         and a model config dict.
         """
-        shape_type = model_init_config["shape_type"]
-        te_shape_var = model_init_config["te_shape_var"]
-        ne_shape_var = model_init_config["ne_shape_var"]
-        n_shapes = model_init_config["n_shapes"]
+        if model_init_config["model_type"] == "shape_init":
+            shape_type = model_init_config["shape_type"]
+            te_shape_var = model_init_config["te_shape_var"]
+            ne_shape_var = model_init_config["ne_shape_var"]
+            n_shapes = model_init_config["n_shapes"]
 
-        module = ProfilePredictor.init(
-            n_shapes=model_init_config["n_shapes"],
-            psigrid=train_dl.ds["psi"].data,
-            nn_width=model_init_config["nn_width"],
-            nn_depth=model_init_config["nn_depth"],
-            shape_type=shape_type,
-            softmax_temp=model_init_config["softmax_temp"],
-            prng_seed=model_init_config["prng_seed"],
-        )
-
-        # PCA/K-means initial guess for the shapes.
-        ds = train_dl.ds
-        sample_dim = train_dl.dataset.training_metadata.sample_dim
-
-        if shape_type == ShapeType.PCA_LIKE:
-            te_shapes, ne_shapes = pca_initial_guess(
-                n_shapes, ds[te_shape_var], ds[ne_shape_var], sample_dim
+            module = ProfilePredictorShapeInit.init(
+                n_shapes=model_init_config["n_shapes"],
+                psigrid=train_dl.ds["psi"].data,
+                nn_width=model_init_config["nn_width"],
+                nn_depth=model_init_config["nn_depth"],
+                shape_type=shape_type,
+                softmax_temp=model_init_config["softmax_temp"],
+                prng_seed=model_init_config["prng_seed"],
             )
-        elif shape_type == ShapeType.CONVEX_COMBINATION:
-            te_shapes, ne_shapes = kmeans_initial_guess(
-                n_shapes, ds[te_shape_var], ds[ne_shape_var], sample_dim
+
+            # PCA/K-means initial guess for the shapes.
+            ds = train_dl.ds
+            sample_dim = train_dl.dataset.training_metadata.sample_dim
+
+            if shape_type == ShapeType.PCA_LIKE:
+                te_shapes, ne_shapes = pca_initial_guess(
+                    n_shapes, ds[te_shape_var], ds[ne_shape_var], sample_dim
+                )
+            elif shape_type == ShapeType.CONVEX_COMBINATION:
+                te_shapes, ne_shapes = kmeans_initial_guess(
+                    n_shapes, ds[te_shape_var], ds[ne_shape_var], sample_dim
+                )
+            else:
+                raise ValueError(f"Invalid shape type: {shape_type}")
+
+            # Overwrite the initial shapes in the module with the initial guess.
+            module = eqx.tree_at(
+                lambda m: (m.te_shapes, m.ne_shapes),
+                module,
+                (te_shapes, ne_shapes),
+            )
+        elif model_init_config["model_type"] == "direct_points":
+            module = ProfilePredictorDirectPoints(
+                n_points=model_init_config["n_points"],
+                nn_width=model_init_config["nn_width"],
+                nn_depth=model_init_config["nn_depth"],
+                psigrid=train_dl.ds["psi"].data,
+                key=jax.random.PRNGKey(model_init_config["prng_seed"]),
             )
         else:
-            raise ValueError(f"Invalid shape type: {shape_type}")
-
-        # Overwrite the initial shapes in the module with the initial guess.
-        module = eqx.tree_at(
-            lambda m: (m.te_shapes, m.ne_shapes),
-            module,
-            (te_shapes, ne_shapes),
-        )
+            raise ValueError(
+                f"Invalid model type {model_init_config['model_type']}, must be either ProfilePredictorShapeInit or ProfilePredictorDirectPoints"
+            )
 
         return module
 
@@ -102,10 +116,10 @@ class ProfilePredictorTRB(TrainRunBuilder):
         return opt
 
     @staticmethod
-    def get_trainable_getter(config: dict) -> Callable[[Any], Any] | None:
+    def get_trainable_getter(model_init_config: dict) -> Callable[[Any], Any] | None:
         """Optionally return a function that takes in the trainable parameters of your model and returns the trainable parameters."""
 
-        def get_trainable(module: ProfilePredictor):
+        def get_trainable_shape_init(module: ProfilePredictorShapeInit):
             # Get all leaves that are not a part of te_shapes and ne_shapes.
             # All of these leaves are trainable.
             ids_of_shape_leaves = [
@@ -115,4 +129,15 @@ class ProfilePredictorTRB(TrainRunBuilder):
                 x for x in jax.tree.leaves(module) if id(x) not in ids_of_shape_leaves
             ]
 
-        return get_trainable
+        def get_trainable_direct_points(module: ProfilePredictorDirectPoints):
+            ids_of_nn_leaves = [id(x) for x in jax.tree.leaves(module.nn)]
+            return [x for x in jax.tree.leaves(module) if id(x) in ids_of_nn_leaves]
+
+        if model_init_config["model_type"] == "shape_init":
+            return get_trainable_shape_init
+        elif model_init_config["model_type"] == "direct_points":
+            return get_trainable_direct_points
+        else:
+            raise ValueError(
+                f"Invalid model type {model_init_config['model_type']}, must be either 'shape_init' or 'direct_points'"
+            )

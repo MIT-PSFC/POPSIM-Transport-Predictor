@@ -50,14 +50,18 @@ class ProfileTrajectoryOptimizerTRB(TrainRunBuilder):
                 episode_coord=episode_coord,
                 input_vars=dataloader_config["input_vars"],
                 target_vars=dataloader_config["target_vars"],
-                extra_vars=dataloader_config["extra_vars"],
+                extra_vars=dataloader_config.get("extra_vars", None),
                 convert_xr_to_jnp=dataloader_config["convert_xr_to_jnp"],
                 batch_size=dataloader_config["batch_size"],
                 shuffle=[True, False],
             )
-            return ds, train_dl, val_dl, None
         elif dataloader_config.get("module") == "profile_trajectory":
             # TODO(ZanderKeith) add an augmentation config aug_config = dataloader_config["augmentation"]
+            ds, episode_coord = get_ds(
+                dataloader_config["ds_path"],
+                fresh_profiles=False,  # Use all timesteps for trajectory optimization
+                debug=dataloader_config["debug"],
+            )
             ds_aug = make_optimization_dataset(
                 ds=ds,
                 debug=dataloader_config["debug"],
@@ -74,13 +78,38 @@ class ProfileTrajectoryOptimizerTRB(TrainRunBuilder):
                 target_vars=dataloader_config["target_vars"],
                 convert_xr_to_jnp=dataloader_config["convert_xr_to_jnp"],
                 state_init_vars=dataloader_config["state_vars"],
-                extra_vars=dataloader_config["extra_vars"],
+                extra_vars=dataloader_config.get("extra_vars", None),
                 batch_size=dataloader_config["batch_size"],
                 shuffle=[True, False],
             )
-            return ds_aug, train_dl, val_dl, None
+            ds = ds_aug
         else:
             raise ValueError(f"Unknown module type {dataloader_config.get('module')}")
+
+        # Test dataloader is only for fresh profile timesteps in the ramp dataset
+        ds_test, _episode_coord = get_ds(
+            dataloader_config["ds_path"],
+            fresh_profiles=True,  # Only use timesteps where profile data is fresh
+            debug=False,
+        )
+        ds_test_aug = make_optimization_dataset(
+            ds=ds_test,
+            debug=True,
+        )
+        test_dl = make_dataloaders(
+            datasets=[ds_test_aug],
+            time_coord="time",
+            episode_coord="shot_alt",
+            input_vars=dataloader_config["input_vars"],
+            target_vars=dataloader_config["target_vars"],
+            convert_xr_to_jnp=dataloader_config["convert_xr_to_jnp"],
+            state_init_vars=dataloader_config.get("state_vars", None),
+            extra_vars=dataloader_config.get("extra_vars", None),
+            batch_size=dataloader_config["batch_size"],
+            shuffle=[False],
+        )[0]
+
+        return ds, train_dl, val_dl, test_dl
 
     @staticmethod
     def model_init(train_dl: DataLoader, model_init_config: dict) -> Any:
