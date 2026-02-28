@@ -2,6 +2,7 @@ import numpy as np
 import xarray as xr
 from loguru import logger
 from popsim.ml.split_utils import split_dataset_by_fracs
+from scipy.linalg import fractional_matrix_power
 
 from popsim_transport_predictor.transfer_learning.config import config
 from popsim_transport_predictor.transfer_learning.orchestration import (
@@ -304,7 +305,144 @@ def normalize_domain(  # noqa: PLR0915, PLR0912
 
         return ds_source_norm, ds_target_norm
     elif method == "coral":
-        raise NotImplementedError("CORAL normalization not implemented yet")
+        normalize_vars = [
+            "Ip_MA",
+            "B0",
+            "ne20_line_avg",
+            "R0",
+            "kappa",
+            "a_minor",
+            "Wtot_MJ",
+            "P_aux_MW",
+        ]
+
+        # CORAL aligns second-order statistics (covariance) across domains.
+        # We use the pooled source data as the reference domain and transform
+        # each device's features so their covariance matches the reference.
+        # The transform for device d is: center, whiten with C_d^{-1/2}, re-color with C_ref^{1/2}, then re-add mean.
+        # A small regularization term is added to covariance diagonals for numerical stability.
+
+        reg = 1e-6  # Regularization for covariance matrix inversion
+
+        def _build_feature_matrix(ds: xr.Dataset, variables: list[str]) -> np.ndarray:
+            """Build (N, D) feature matrix from dataset, flattening all dims except variables."""
+            arrays = []
+            for var in variables:
+                arr = ds[var].values.flatten()
+                arrays.append(arr)
+            return np.column_stack(arrays)
+
+        def _coral_transform(
+            X: np.ndarray,
+            mu_source: np.ndarray,
+            cov_source: np.ndarray,
+            cov_ref: np.ndarray,
+        ) -> np.ndarray:
+            """Apply CORAL transformation: whiten with source covariance, re-color with reference."""
+            d = cov_source.shape[0]
+            cov_source_reg = cov_source + reg * np.eye(d)
+            cov_ref_reg = cov_ref + reg * np.eye(d)
+
+            cs_neg_half = np.real(fractional_matrix_power(cov_source_reg, -0.5))
+            cr_pos_half = np.real(fractional_matrix_power(cov_ref_reg, 0.5))
+
+            X_centered = X - mu_source
+            X_transformed = X_centered @ cs_neg_half @ cr_pos_half + mu_source
+            return X_transformed
+
+        # Compute reference statistics from pooled source data
+        all_source_features = _build_feature_matrix(ds_source, normalize_vars)
+        valid_rows = ~np.any(np.isnan(all_source_features), axis=1)
+        all_source_valid = all_source_features[valid_rows]
+        cov_ref = np.cov(all_source_valid, rowvar=False)
+
+        # Compute per-device statistics from source
+        source_devices = _separate_devices(ds_source)
+        device_stats = {}
+        for device, ds_device in source_devices.items():
+            X_device = _build_feature_matrix(ds_device, normalize_vars)
+            valid = ~np.any(np.isnan(X_device), axis=1)
+            X_valid = X_device[valid]
+            if len(X_valid) > 1:
+                device_stats[device] = {
+                    "mean": np.mean(X_valid, axis=0),
+                    "cov": np.cov(X_valid, rowvar=False),
+                }
+
+        def _apply_coral_to_ds(
+            ds: xr.Dataset,
+            device_stats: dict,
+            cov_ref: np.ndarray,
+        ) -> xr.Dataset:
+            """Apply CORAL transformation to a dataset, writing results with _coral suffix."""
+            ds_norm = ds.copy()
+            # Initialize coral variables with raw values
+            for var in normalize_vars:
+                ds_norm[f"{var}_coral"] = ds_norm[var].copy()
+
+            source_vals = ds.coords["ds_source"].values
+            # Handle scalar ds_source (single-device dataset)
+            if np.ndim(source_vals) == 0:
+                devices_in_ds = [str(source_vals)]
+            else:
+                devices_in_ds = np.unique(source_vals)
+
+            for device in devices_in_ds:
+                if device not in device_stats:
+                    logger.warning(
+                        "Device {} not in source stats, skipping CORAL for it",
+                        device,
+                    )
+                    continue
+
+                # Determine which shots belong to this device
+                if np.ndim(source_vals) == 0:
+                    # Scalar ds_source: all shots belong to this single device
+                    ds_device = ds
+                    is_single_device = True
+                else:
+                    mask_xr = ds.coords["ds_source"] == device
+                    ds_device = ds.where(mask_xr, drop=True)
+                    device_indices = np.where(np.atleast_1d(mask_xr.values))[0]
+                    is_single_device = False
+
+                # Build feature matrix for this device in the dataset
+                X_device = _build_feature_matrix(ds_device, normalize_vars)
+
+                # Handle NaNs: transform valid rows, leave NaNs in place
+                valid = ~np.any(np.isnan(X_device), axis=1)
+                X_transformed = X_device.copy()
+                if valid.sum() > 0:
+                    X_transformed[valid] = _coral_transform(
+                        X_device[valid],
+                        device_stats[device]["mean"],
+                        device_stats[device]["cov"],
+                        cov_ref,
+                    )
+
+                # Write back transformed values per variable
+                device_shape = ds_device[normalize_vars[0]].shape
+                for j, var in enumerate(normalize_vars):
+                    col = X_transformed[:, j].reshape(device_shape)
+                    if is_single_device:
+                        # All shots are this device, just assign directly
+                        ds_norm[f"{var}_coral"].values = col
+                    else:
+                        full_vals = ds_norm[f"{var}_coral"].values.copy()
+                        for idx_out, idx_in in enumerate(device_indices):
+                            full_vals[idx_in] = col[idx_out]
+                        ds_norm[f"{var}_coral"].values = full_vals
+
+            return ds_norm
+
+        ds_source_norm = _apply_coral_to_ds(ds_source, device_stats, cov_ref)
+
+        if ds_target is not None:
+            ds_target_norm = _apply_coral_to_ds(ds_target, device_stats, cov_ref)
+        else:
+            ds_target_norm = None
+
+        return ds_source_norm, ds_target_norm
     else:
         raise ValueError(f"Unknown normalization method: {method}")
 
