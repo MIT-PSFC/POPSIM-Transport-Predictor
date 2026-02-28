@@ -272,40 +272,33 @@ def normalize_domain(  # noqa: PLR0915, PLR0912
 
         # Apply normalization to source dataset
         ds_source_norm = ds_source.copy()
-        for device, ds_device in _separate_devices(ds_source_norm).items():
-            if device in norm_params:
-                for var in normalize_vars:
-                    if var in ds_device and var in norm_params[device]:
-                        mean_val = norm_params[device][var]["mean"]
-                        std_val = norm_params[device][var]["std"]
-
-                        # Apply z-score normalization to new variable with _z suffix
-                        mask = ds_source_norm.coords["ds_source"] == device
-                        normalized_values = ds_source_norm[var].where(
-                            ~mask, (ds_source_norm[var] - mean_val) / std_val
-                        )
-                        ds_source_norm[f"{var}_z"] = normalized_values.where(
-                            mask, ds_source_norm[var]
-                        )
+        for var in normalize_vars:
+            # Start with raw values, then overwrite per-device
+            z_var = ds_source_norm[var].copy()
+            for device, device_params in norm_params.items():
+                if var in device_params:
+                    mean_val = device_params[var]["mean"]
+                    std_val = device_params[var]["std"]
+                    mask = ds_source_norm.coords["ds_source"] == device
+                    z_var = z_var.where(
+                        ~mask, (ds_source_norm[var] - mean_val) / std_val
+                    )
+            ds_source_norm[f"{var}_z"] = z_var
 
         # Apply same normalization to target dataset if provided
         if ds_target is not None:
             ds_target_norm = ds_target.copy()
-            for device, ds_device in _separate_devices(ds_target_norm).items():
-                if device in norm_params:
-                    for var in normalize_vars:
-                        if var in ds_device and var in norm_params[device]:
-                            mean_val = norm_params[device][var]["mean"]
-                            std_val = norm_params[device][var]["std"]
-
-                            # Apply z-score normalization to new variable with _z suffix
-                            mask = ds_target_norm.coords["ds_source"] == device
-                            normalized_values = ds_target_norm[var].where(
-                                ~mask, (ds_target_norm[var] - mean_val) / std_val
-                            )
-                            ds_target_norm[f"{var}_z"] = normalized_values.where(
-                                mask, ds_target_norm[var]
-                            )
+            for var in normalize_vars:
+                z_var = ds_target_norm[var].copy()
+                for device, device_params in norm_params.items():
+                    if var in device_params:
+                        mean_val = device_params[var]["mean"]
+                        std_val = device_params[var]["std"]
+                        mask = ds_target_norm.coords["ds_source"] == device
+                        z_var = z_var.where(
+                            ~mask, (ds_target_norm[var] - mean_val) / std_val
+                        )
+                ds_target_norm[f"{var}_z"] = z_var
         else:
             ds_target_norm = None
 

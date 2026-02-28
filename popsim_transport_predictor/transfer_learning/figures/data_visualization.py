@@ -262,7 +262,7 @@ def domain_plot(  # noqa: PLR0915, PLR0912
                             hull_points[:-1],  # Exclude the duplicate closing point
                             closed=True,
                             facecolor=SOURCE_COLORS.get(source, "black"),
-                            alpha=0.1,
+                            alpha=0.05,
                             edgecolor="none",
                         )
                         ax.add_patch(hull_polygon)
