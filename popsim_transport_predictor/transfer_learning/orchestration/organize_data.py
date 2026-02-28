@@ -1,7 +1,10 @@
 import numpy as np
 import xarray as xr
 from loguru import logger
+from popsim.cfspopcon_jax.current_drive import calc_f_shaping, calc_q_star
+from popsim.cfspopcon_jax.geometry import calc_plasma_surface_area, calc_plasma_volume
 from popsim.ml.split_utils import split_dataset_by_fracs
+from scipy.constants import mu_0
 from scipy.linalg import fractional_matrix_power
 
 from popsim_transport_predictor.transfer_learning.config import config
@@ -117,7 +120,6 @@ def get_ds(
     # Set up signals for the confinement time predictors
     ds["ne19_line_avg"] = ds["ne20_line_avg"] * 10
     ds["epsilon"] = ds["a_minor"] / ds["R0"]
-    ds["surface_area_m2"] = 4 * np.pi**2 * ds["R0"] * ds["a_minor"] * ds["kappa"]
 
     # If dataset was from a zarr store, must promote the 'time' data var to a coordinate
     if "time" not in ds.coords:
@@ -193,7 +195,7 @@ def add_performance(
     return ds
 
 
-def normalize_domain(  # noqa: PLR0915, PLR0912
+def normalize_domain(  # noqa: PLR0915
     ds_source: xr.Dataset,
     ds_target: xr.Dataset | None = None,
     method: str | None = "raw",
@@ -217,6 +219,16 @@ def normalize_domain(  # noqa: PLR0915, PLR0912
     Returns:
         The normalized source and target datasets.
     """
+    normalize_vars = [
+        "Ip_MA",
+        "B0",
+        "ne20_line_avg",
+        "R0",
+        "kappa",
+        "a_minor",
+        "Wtot_MJ",
+        "P_aux_MW",
+    ]
 
     def _separate_devices(ds: xr.Dataset) -> dict[str, xr.Dataset]:
         devices = np.unique(ds.coords["ds_source"].values)
@@ -225,33 +237,56 @@ def normalize_domain(  # noqa: PLR0915, PLR0912
             for device in devices
         }
 
-    if method == "raw":
-        return ds_source, ds_target
-    elif method == "physics":
-        ds_source["beta"] = xr.ones_like(ds_source["Ip_MA"])
-        ds_source["q95"] = xr.ones_like(ds_source["Ip_MA"])
-        ds_source["f_G"] = xr.ones_like(ds_source["Ip_MA"])
-        ds_source["aB0"] = xr.ones_like(ds_source["Ip_MA"])
-        ds_source["surface_power_density"] = xr.ones_like(ds_source["Ip_MA"])
-        if ds_target is not None:
-            ds_target["beta"] = xr.ones_like(ds_target["Ip_MA"])
-            ds_target["q95"] = xr.ones_like(ds_target["Ip_MA"])
-            ds_target["f_G"] = xr.ones_like(ds_target["Ip_MA"])
-            ds_target["aB0"] = xr.ones_like(ds_target["Ip_MA"])
-            ds_target["surface_power_density"] = xr.ones_like(ds_target["Ip_MA"])
-        return ds_source, ds_target
-    elif method == "z_score":
-        normalize_vars = [
-            "Ip_MA",
-            "B0",
-            "ne20_line_avg",
-            "R0",
-            "kappa",
-            "a_minor",
-            "Wtot_MJ",
-            "P_aux_MW",
-        ]
+    def _physics_normalization(ds_source: xr.Dataset, ds_target: xr.Dataset | None):
+        def _beta(ds: xr.Dataset) -> xr.DataArray:
+            avg_pressure = (
+                (2.0 / 3.0)
+                * (ds["Wtot_MJ"] * 1e6)
+                / calc_plasma_volume(ds["R0"], ds["epsilon"], ds["kappa"])
+            )
+            magnetic_pressure = (ds["B0"] ** 2) / (2 * mu_0)
+            beta = 100 * avg_pressure / magnetic_pressure
+            return beta
 
+        def _q_star(ds: xr.Dataset) -> xr.DataArray:
+            # TODO(ZanderKeith) using 0 triangularity because it isn't part of H89/H98.
+            # Do we care about doing that comparison? If not, could easily add delta_top and delta_bottom to the dataset and use them here.
+            f_shaping = calc_f_shaping(
+                ds["epsilon"], ds["kappa"], xr.zeros_like(ds["epsilon"])
+            )
+            q_star = calc_q_star(
+                ds["B0"], ds["R0"], ds["epsilon"], ds["Ip_MA"], f_shaping
+            )
+            return q_star
+
+        def _greenwald_fraction(ds: xr.Dataset) -> xr.DataArray:
+            greenwald_limit = ds["Ip_MA"] / (np.pi * ds["a_minor"] ** 2)
+            f_G = ds["ne20_line_avg"] / greenwald_limit
+            return f_G
+
+        def _aB0(ds: xr.Dataset) -> xr.DataArray:
+            aB0 = ds["a_minor"] * ds["B0"]
+            return aB0
+
+        def _surface_power_density(ds: xr.Dataset) -> xr.DataArray:
+            surface_area = calc_plasma_surface_area(
+                ds["R0"], ds["epsilon"], ds["kappa"]
+            )
+            power_density = (ds["P_abs_MW"]) / surface_area
+            return power_density
+
+        for ds in [ds_source, ds_target] if ds_target is not None else [ds_source]:
+            ds["beta"] = _beta(ds)
+            ds["q_star"] = _q_star(ds)
+            ds["f_G"] = _greenwald_fraction(ds)
+            ds["aB0"] = _aB0(ds)
+            ds["surface_power_density"] = _surface_power_density(ds)
+
+        return ds_source, ds_target
+
+    def _z_score_normalization(ds_source: xr.Dataset, ds_target: xr.Dataset | None):
+        # Calculate mean and std from source dataset, then apply to both source and target
+        # This is done per device to avoid washing out differences in variable distributions across devices
         # Calculate normalization parameters from source dataset per device
         norm_params = {}
         source_devices = _separate_devices(ds_source)
@@ -304,23 +339,14 @@ def normalize_domain(  # noqa: PLR0915, PLR0912
             ds_target_norm = None
 
         return ds_source_norm, ds_target_norm
-    elif method == "coral":
-        normalize_vars = [
-            "Ip_MA",
-            "B0",
-            "ne20_line_avg",
-            "R0",
-            "kappa",
-            "a_minor",
-            "Wtot_MJ",
-            "P_aux_MW",
-        ]
 
+    def _coral_normalization(ds_source: xr.Dataset, ds_target: xr.Dataset | None):  # noqa: PLR0915
         # CORAL aligns second-order statistics (covariance) across domains.
         # We use the pooled source data as the reference domain and transform
         # each device's features so their covariance matches the reference.
         # The transform for device d is: center, whiten with C_d^{-1/2}, re-color with C_ref^{1/2}, then re-add mean.
         # A small regularization term is added to covariance diagonals for numerical stability.
+        # TODO(ZanderKeith) vet this thoroughly!!!
 
         reg = 1e-6  # Regularization for covariance matrix inversion
 
@@ -443,6 +469,15 @@ def normalize_domain(  # noqa: PLR0915, PLR0912
             ds_target_norm = None
 
         return ds_source_norm, ds_target_norm
+
+    if method == "raw":
+        return ds_source, ds_target
+    elif method == "physics":
+        return _physics_normalization(ds_source, ds_target)
+    elif method == "z_score":
+        return _z_score_normalization(ds_source, ds_target)
+    elif method == "coral":
+        return _coral_normalization(ds_source, ds_target)
     else:
         raise ValueError(f"Unknown normalization method: {method}")
 
