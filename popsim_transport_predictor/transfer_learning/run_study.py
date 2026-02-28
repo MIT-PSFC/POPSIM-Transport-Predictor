@@ -433,7 +433,7 @@ class ComputeResults:
         result_dir: str,
         training_data_cases: list[str] = TRAINING_DATA_CASES,
         domain_normalization_methods: list[str] = DOMAIN_NORMALIZATION_METHODS,
-        model_cases: list[str] = MODEL_CASES,
+        model_cases: list[str] = MODEL_CASES["power_balance"],
     ):
         """
         Compute results with standard learning, training and testing on similar datasets.
@@ -501,7 +501,7 @@ class ComputeResults:
         result_dir: str,
         training_data_cases: list[str] = TRAINING_DATA_CASES,
         domain_normalization_methods: list[str] = DOMAIN_NORMALIZATION_METHODS,
-        model_cases: list[str] = MODEL_CASES,
+        model_cases: list[str] = MODEL_CASES["power_balance"],
         hp_shots_included: list[int] = HP_SHOTS_INCLUDED,
     ):
         """
