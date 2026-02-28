@@ -1,4 +1,6 @@
 import os
+import shutil
+from itertools import product
 
 import fire
 from loguru import logger
@@ -19,36 +21,10 @@ from popsim_transport_predictor.transfer_learning.orchestration.organize_data im
     get_train_test_datasets_transfer,
     get_train_val_datasets,
 )
-
-
-def _get_largest_dataset_case():
-    # Determine the biggest dataset we can use so that we only need to make one plot
-    if (
-        config.cmod_dataset_path
-        and config.tcv_dataset_path
-        and config.d3d_lp_dataset_path
-    ):
-        training_data_case = "cmod_tcv_d3d_lp"
-    elif (
-        config.cmod_dataset_path
-        and config.tcv_dataset_path
-        and config.d3d_lp_dataset_path
-    ):
-        training_data_case = "cmod_tcv_d3d_lp"
-    elif config.cmod_dataset_path and config.tcv_dataset_path:
-        training_data_case = "cmod_tcv"
-    elif config.cmod_dataset_path:
-        training_data_case = "cmod"
-    elif config.tcv_dataset_path:
-        training_data_case = "tcv"
-    elif config.d3d_lp_dataset_path:
-        training_data_case = "d3d_lp"
-    else:
-        raise ValueError(
-            "No dataset paths provided in config, cannot determine largest dataset case for domain overlap plot."
-        )
-
-    return training_data_case
+from popsim_transport_predictor.transfer_learning.orchestration.train import (
+    train_model_standard,
+    train_model_transfer,
+)
 
 
 class DataVisualization:
@@ -56,12 +32,42 @@ class DataVisualization:
     Visualizations of the datasets used in training and testing.
     """
 
+    def _get_largest_dataset_case():
+        # Determine the biggest dataset we can use so that we only need to make one plot
+        # for the domain overlap visualization. Want to only do this once since it's expensive.
+        if (
+            config.cmod_dataset_path
+            and config.tcv_dataset_path
+            and config.d3d_lp_dataset_path
+        ):
+            training_data_case = "cmod_tcv_d3d_lp"
+        elif (
+            config.cmod_dataset_path
+            and config.tcv_dataset_path
+            and config.d3d_lp_dataset_path
+        ):
+            training_data_case = "cmod_tcv_d3d_lp"
+        elif config.cmod_dataset_path and config.tcv_dataset_path:
+            training_data_case = "cmod_tcv"
+        elif config.cmod_dataset_path:
+            training_data_case = "cmod"
+        elif config.tcv_dataset_path:
+            training_data_case = "tcv"
+        elif config.d3d_lp_dataset_path:
+            training_data_case = "d3d_lp"
+        else:
+            raise ValueError(
+                "No dataset paths provided in config, cannot determine largest dataset case for domain overlap plot."
+            )
+
+        return training_data_case
+
     @staticmethod
     def performance_extrapolation(  # noqa: PLR0912
         figure_dir: str,
     ):
         """
-        Performance is ip**2 + Wtot_MJ**2 <- need to formalize this metric by looking at the distribution of ip and Wtot_MJ separately.
+        Performance is ip**2 + Wtot_MJ**2
 
         With all data present this creates the following figures:
         1. Performance extrapolation for C-Mod
@@ -79,7 +85,6 @@ class DataVisualization:
 
         # C-Mod
         if config.cmod_dataset_path:
-            # TODO(ZanderKeith) Use the exact dataloader from the study to ensure consistency
             fig_path = os.path.join(save_dir, "cmod_performance_extrapolation.png")
             if not os.path.exists(fig_path):
                 train_ds, val_ds = get_train_val_datasets(
@@ -246,7 +251,7 @@ class DataVisualization:
         Basically, this normalization doesn't impact the transfer learning, because the dataset is being split into train and val/test beforehand.
         """
 
-        training_data_case = _get_largest_dataset_case()
+        training_data_case = DataVisualization._get_largest_dataset_case()
 
         for method in DOMAIN_NORMALIZATION_METHODS:
             if method == "raw":
@@ -315,10 +320,12 @@ class ComputeResults:
     def _result_path(
         result_dir: str,
         training_data_case: str,
+        normalization_method: str,
         model_case: str,
         transfer_learning: bool = False,
         num_hp_shots: int | None = None,
     ) -> str:
+        """Get the path to save evaluation results for a given combination of training data, normalization, and model architecture"""
         if transfer_learning:
             if num_hp_shots is None:
                 raise ValueError(
@@ -328,24 +335,29 @@ class ComputeResults:
                 result_dir,
                 "transfer_learning",
                 training_data_case,
-                model_case,
-                f"hp_shots_{num_hp_shots}.nc",
+                normalization_method,
+                f"{model_case}_{num_hp_shots}.nc",
             )
         else:
             return os.path.join(
                 result_dir,
                 "standard_learning",
                 training_data_case,
-                model_case,
+                normalization_method,
+                f"{model_case}.nc",
             )
 
     @staticmethod
     def _trained_model_dir(
         model_dir: str,
         training_data_case: str,
+        normalization_method: str,
         model_case: str,
     ) -> str:
-        return os.path.join(model_dir, training_data_case, model_case)
+        """Get the directory to save a trained model for a given combination of training data, normalization, and model architecture"""
+        return os.path.join(
+            model_dir, training_data_case, normalization_method, model_case
+        )
 
     @staticmethod
     def _compute_standard_learning_result(
@@ -354,6 +366,19 @@ class ComputeResults:
     ):
         """
         Compute results for standard learning.
+
+        1. Restore trained model checkpoint
+        2. Construct dataloaders
+        3. Evaluate model on validation set and save results
+        """
+
+    @staticmethod
+    def _compute_transfer_learning_result(
+        trained_model_dir: str,
+        result_path: str,
+    ):
+        """
+        Compute results for transfer learning.
         """
 
     @staticmethod
@@ -369,6 +394,9 @@ class ComputeResults:
                 "DIII-D high-performance dataset path not provided, cannot compute transfer learning results."
             )
             return False
+
+        if transfer_learning and training_data_case == "exnihilo":
+            return True  # Doesn't need historic data
 
         if training_data_case in ["cmod", "cmod_tcv", "cmod_tcv_d3d_lp"] and (
             config.cmod_dataset_path is None
@@ -397,11 +425,14 @@ class ComputeResults:
             )
             return False
 
+        return True
+
     @staticmethod
     def standard_learning_results(
         model_dir: str,
         result_dir: str,
         training_data_cases: list[str] = TRAINING_DATA_CASES,
+        domain_normalization_methods: list[str] = DOMAIN_NORMALIZATION_METHODS,
         model_cases: list[str] = MODEL_CASES,
     ):
         """
@@ -413,37 +444,63 @@ class ComputeResults:
         DIII-D low-performance -> DIII-D low-performance
         C-Mod + TCV + DIII-D low-performance -> C-Mod + TCV + DIII-D low-performance
         """
+        logger.info("Computing standard learning results...")
 
         for training_data_case in training_data_cases:
             if training_data_case == "exnihilo":
                 continue  # No training data, skip
-            for model_case in model_cases:
+            if not ComputeResults._check_data_requirements(
+                training_data_case=training_data_case,
+                transfer_learning=False,
+            ):
+                logger.warning(
+                    f"Data requirements not met to compute results for training data case '{training_data_case}', skipping."
+                )
+                continue
+            for normalization_method, model_case in product(
+                domain_normalization_methods, model_cases
+            ):
                 result_path = ComputeResults._result_path(
                     result_dir=result_dir,
                     training_data_case=training_data_case,
+                    normalization_method=normalization_method,
                     model_case=model_case,
                 )
                 if not os.path.exists(result_path):
-                    if not ComputeResults._check_data_requirements(
-                        training_data_case=training_data_case,
-                        transfer_learning=False,
-                    ):
-                        continue
-
-                    # Results not found, need to compute them
                     trained_model_dir = ComputeResults._trained_model_dir(
                         model_dir=model_dir,
                         training_data_case=training_data_case,
+                        normalization_method=normalization_method,
                         model_case=model_case,
                     )
                     if not os.path.exists(trained_model_dir):
-                        # Model not trained, need to go do that first
-                        pass
+                        logger.info(
+                            f"Trained model not found for standard learning with training data case '{training_data_case}', model case '{model_case}', "
+                            f"normalization method '{normalization_method}'. Training model now."
+                        )
+                        train_model_standard(
+                            model_dir=trained_model_dir,
+                            training_data_case=training_data_case,
+                            normalization_method=normalization_method,
+                            model_case=model_case,
+                        )
+                    else:
+                        logger.info(
+                            f"Trained model found for standard learning with training data case '{training_data_case}', model case '{model_case}', "
+                            f"normalization method '{normalization_method}'. Computing results now."
+                        )
+                else:
+                    logger.info(
+                        f"Results already exist for training data case '{training_data_case}', model case '{model_case}', "
+                        f"and normalization method '{normalization_method}', skipping computation."
+                    )
 
     @staticmethod
     def transfer_learning_results(
-        working_dir: str,
+        model_dir: str,
+        result_dir: str,
         training_data_cases: list[str] = TRAINING_DATA_CASES,
+        domain_normalization_methods: list[str] = DOMAIN_NORMALIZATION_METHODS,
         model_cases: list[str] = MODEL_CASES,
         hp_shots_included: list[int] = HP_SHOTS_INCLUDED,
     ):
@@ -458,13 +515,75 @@ class ComputeResults:
 
         The number of high-performance shots included in training is varied as specified in `hp_shots_included`.
         """
+        logger.info("Computing transfer learning results...")
 
-        for _training_data_case in training_data_cases:
-            for _model_case in model_cases:
-                for _num_hp_shots in hp_shots_included:
-                    pass
-                    # Compute results for this combination of training data, model architecture, and number of high-performance shots
-                    # If the model is not trained, train it first
+        for (
+            training_data_case,
+            normalization_method,
+            model_case,
+            num_hp_shots,
+        ) in product(
+            training_data_cases,
+            domain_normalization_methods,
+            model_cases,
+            hp_shots_included,
+        ):
+            # Compute results for this combination of training data, model architecture, and number of high-performance shots
+            # If the model is not trained, train it first
+            if not ComputeResults._check_data_requirements(
+                training_data_case=training_data_case,
+                transfer_learning=True,
+            ):
+                logger.warning(
+                    f"Data requirements not met to compute transfer learning results for training data case '{training_data_case}', skipping."
+                )
+                continue
+
+            result_path = ComputeResults._result_path(
+                result_dir=result_dir,
+                training_data_case=training_data_case,
+                model_case=model_case,
+                transfer_learning=True,
+                num_hp_shots=num_hp_shots,
+            )
+
+            if not os.path.exists(result_path):
+                # Results not found, need to compute them
+                trained_model_dir = ComputeResults._trained_model_dir(
+                    model_dir=model_dir,
+                    training_data_case=training_data_case,
+                    normalization_method=normalization_method,
+                    model_case=model_case,
+                )
+                if not os.path.exists(trained_model_dir):
+                    # Model not trained, need to go do that first
+                    logger.info(
+                        f"Trained model not found for transfer learning with training data case '{training_data_case}', model case '{model_case}', "
+                        f"normalization method '{normalization_method}', and {num_hp_shots} high-performance shots included. Training model now."
+                    )
+                    # TODO(ZanderKeith) Call training function, and if parallelism is enabled, return to finish this step.
+                    train_model_transfer(
+                        model_dir=trained_model_dir,
+                        training_data_case=training_data_case,
+                        normalization_method=normalization_method,
+                        model_case=model_case,
+                        num_hp_shots=num_hp_shots,
+                    )
+                    return
+                else:
+                    logger.info(
+                        f"Trained model found for transfer learning with training data case '{training_data_case}', model case '{model_case}', "
+                        f"normalization method '{normalization_method}', and {num_hp_shots} high-performance shots included. Computing results now."
+                    )
+                    ComputeResults._compute_transfer_learning_result(
+                        trained_model_dir=trained_model_dir,
+                        result_path=result_path,
+                    )
+            else:
+                logger.info(
+                    f"Results already exist for transfer learning with training data case '{training_data_case}', model case '{model_case}', "
+                    f"normalization method '{normalization_method}', and {num_hp_shots} high-performance shots included, skipping computation."
+                )
 
 
 class ModelComparison:
@@ -473,11 +592,17 @@ class ModelComparison:
     """
 
 
+class DataComparison:
+    """
+    Performance vs Data Normalization
+    """
+
+
 @staticmethod
 def run_study(
-    project_name: str | None = "transport_predictor_transfer",
-    working_dir_base: str | None = PACKAGE_ROOT,
-    figure_dir_base: str | None = PACKAGE_ROOT,
+    project_name: str,
+    working_dir_base: str | None,
+    figure_dir_base: str | None,
     cmod_dataset_path: str | None = config.cmod_dataset_path,
     tcv_dataset_path: str | None = config.tcv_dataset_path,
     d3d_lp_dataset_path: str | None = config.d3d_lp_dataset_path,
@@ -486,6 +611,7 @@ def run_study(
     clean_models: bool | None = False,
     clean_results: bool | None = False,
     clean_figures: bool | None = False,
+    skip_visualization: bool | None = False,
 ):
     """
     Go from datasets to all figures in one command.
@@ -526,57 +652,73 @@ def run_study(
         If True, delete any existing intermediate results in the working directory before running.
     clean_figures : bool | None
         If True, delete any existing figures in the figure directory before running.
+    skip_visualization : bool | None
+        If True, skip data visualization steps.
     """
-
-    logger.info("STARTING STUDY")
-    logger.info(f"Project name: {project_name}")
-    logger.info(f"Working directory base: {working_dir_base}")
-    logger.info(f"Figure directory base: {figure_dir_base}")
-    logger.info(f"C-Mod dataset path: {cmod_dataset_path}")
-    logger.info(f"TCV dataset path: {tcv_dataset_path}")
-    logger.info(f"DIII-D low-performance dataset path: {d3d_lp_dataset_path}")
-    logger.info(f"DIII-D high-performance dataset path: {d3d_hp_dataset_path}")
-    logger.info(f"Enable parallelism: {enable_parallelism}")
-    logger.info(f"Clean models: {clean_models}")
-    logger.info(f"Clean results: {clean_results}")
-    logger.info(f"Clean figures: {clean_figures}")
 
     ######################
     # Set up directories #
     ######################
+    if working_dir_base is None:
+        working_dir_base = os.path.join(PACKAGE_ROOT, "popsim_studies", "working_dir")
+    if figure_dir_base is None:
+        figure_dir_base = working_dir_base
 
-    working_dir = os.path.join(working_dir_base, project_name)
-    model_dir = os.path.join(working_dir, "models")
-    result_dir = os.path.join(working_dir, "results")
-    figure_dir = os.path.join(figure_dir_base, project_name)
+    def _setup_directories():
+        working_dir = os.path.join(working_dir_base, project_name)
+        model_dir = os.path.join(working_dir, "models")
+        result_dir = os.path.join(working_dir, "results")
+        figure_dir = os.path.join(figure_dir_base, project_name)
 
-    if (clean_models or clean_results or clean_figures) and enable_parallelism:
-        raise ValueError(
-            "Cannot clean models, results, or figures when parallelism is enabled, as this could interfere with jobs currently running or queued."
-        )
+        log_path = os.path.join(working_dir, "logs", f"{os.getpid()}_run_study.log")
+        logger.add(log_path)
 
-    if clean_models:
-        os.removedirs(model_dir)
-    if clean_results:
-        os.removedirs(result_dir)
-    if clean_figures:
-        os.removedirs(figure_dir)
+        logger.info("STARTING STUDY")
+        logger.info(f"Project name: {project_name}")
+        logger.info(f"Working directory base: {working_dir_base}")
+        logger.info(f"Figure directory base: {figure_dir_base}")
+        logger.info(f"C-Mod dataset path: {cmod_dataset_path}")
+        logger.info(f"TCV dataset path: {tcv_dataset_path}")
+        logger.info(f"DIII-D low-performance dataset path: {d3d_lp_dataset_path}")
+        logger.info(f"DIII-D high-performance dataset path: {d3d_hp_dataset_path}")
+        logger.info(f"Enable parallelism: {enable_parallelism}")
+        logger.info(f"Clean models: {clean_models}")
+        logger.info(f"Clean results: {clean_results}")
+        logger.info(f"Clean figures: {clean_figures}")
+        logger.info(f"Skip visualization: {skip_visualization}")
 
-    for directory in [model_dir, result_dir, figure_dir]:
-        os.makedirs(directory, exist_ok=True)
+        if (clean_models or clean_results or clean_figures) and enable_parallelism:
+            raise ValueError(
+                "Cannot clean models, results, or figures when parallelism is enabled, as this could interfere with jobs currently running or queued."
+            )
+
+        if clean_models:
+            shutil.rmtree(model_dir, ignore_errors=True)
+        if clean_results:
+            shutil.rmtree(result_dir, ignore_errors=True)
+        if clean_figures:
+            shutil.rmtree(figure_dir, ignore_errors=True)
+
+        for directory in [model_dir, result_dir, figure_dir]:
+            os.makedirs(directory, exist_ok=True)
+
+        return working_dir, model_dir, result_dir, figure_dir
+
+    working_dir, model_dir, result_dir, figure_dir = _setup_directories()
 
     ######################
     # Data Visualization #
     ######################
-    logger.info("DATA VISUALIZATION")
+    if not skip_visualization:
+        logger.info("DATA VISUALIZATION")
 
-    DataVisualization.domain_overlap(
-        figure_dir=figure_dir,
-    )
+        DataVisualization.domain_overlap(
+            figure_dir=figure_dir,
+        )
 
-    DataVisualization.performance_extrapolation(
-        figure_dir=figure_dir,
-    )
+        DataVisualization.performance_extrapolation(
+            figure_dir=figure_dir,
+        )
 
     ########################
     # Launch Orchestration #
@@ -592,6 +734,7 @@ def run_study(
     # Transfer Learning Results
     ComputeResults.transfer_learning_results(
         working_dir=working_dir,
+        result_dir=result_dir,
     )
 
     ############################

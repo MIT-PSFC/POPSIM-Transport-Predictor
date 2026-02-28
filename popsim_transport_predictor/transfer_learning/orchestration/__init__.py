@@ -26,7 +26,7 @@ MODEL_CASES = {
     },
     # Just the power balance module. (P_OH and P_RAD still get their own models since the data is atrocious)
     "power_balance": {
-        "scaling_law",  # Based on the scaling law, between H89 and H98 HL transition threshold
+        "scaling_law",  # Based on scaling laws, H89, H98, and HL transition threshold between them
         "sciml",  # Neural network predicts tau_E, and we do the power balance calculation
         "unstructured_nn",  # Unstructured neural network directly predicts stored energy evolution
     },
@@ -41,11 +41,11 @@ MODEL_CASES = {
 
 # Shots of high-performance data included in training
 if config.debug:
-    HP_SHOTS_INCLUDED = [0, 1, 3]
+    HP_SHOTS_INCLUDED = [0, 1, 10]
 else:
     HP_SHOTS_INCLUDED = [0, 1, 3, 10, 30, 100]
 
-# 80/20 between training+validation and testing
-# and 80/20 between training and validation
-TRAIN_VAL_TEST_SPLIT = (0.64, 0.16, 0.2)
+# 80/20 between train/val
+# 80/20 between train+val/test
 TRAIN_VAL_SPLIT = (0.8, 0.2)
+TRAIN_VAL_TEST_SPLIT = (0.64, 0.16, 0.2)

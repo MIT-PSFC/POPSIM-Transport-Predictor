@@ -7,20 +7,19 @@ regarding how the datasets are constructed and how the models are trained.
 def train_model_standard(
     model_dir: str,
     training_data_case: str,
+    normalization_method: str,
     model_case: str,
 ):
     """
     Train a model using standard learning (train and test on the same data distribution).
-    """
 
-    # 1. Organize datasets and make dataloaders
-    # 2. Set up model configuration
-    # 3. Train the model
+    """
 
 
 def train_model_transfer(
     model_dir: str,
     training_data_case: str,
+    normalization_method: str,
     model_case: str,
     num_hp_shots: int,
 ):
