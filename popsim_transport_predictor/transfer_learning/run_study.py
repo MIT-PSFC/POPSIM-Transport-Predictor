@@ -259,7 +259,7 @@ class DataVisualization:
             elif method == "physics":
                 var_groups = [
                     ["Ip_MA", "beta"],
-                    ["q95", "epsilon"],
+                    ["q_star", "epsilon"],
                     ["f_G", "aB0"],
                     ["surface_power_density", "kappa"],
                 ]
