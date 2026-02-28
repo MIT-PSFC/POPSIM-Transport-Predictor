@@ -570,6 +570,10 @@ def run_study(
     ######################
     logger.info("DATA VISUALIZATION")
 
+    DataVisualization.domain_overlap(
+        figure_dir=figure_dir,
+    )
+
     DataVisualization.performance_extrapolation(
         figure_dir=figure_dir,
     )
