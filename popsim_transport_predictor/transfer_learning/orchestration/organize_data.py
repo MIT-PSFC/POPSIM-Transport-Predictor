@@ -46,13 +46,22 @@ def concat_with_nan_padding(
             ds = dataset
         prepared_datasets.append(ds)
 
-    aligned_datasets = xr.align(*prepared_datasets, join="outer", fill_value=np.nan)
-    return xr.concat(
+    # Align only along pad_dim to avoid creating duplicates along concat_dim
+    if len(prepared_datasets) > 1 and pad_dim in prepared_datasets[0].dims:
+        aligned_datasets = xr.align(
+            *prepared_datasets, join="outer", fill_value=np.nan, exclude=concat_dim
+        )
+    else:
+        aligned_datasets = prepared_datasets
+
+    ds_padded = xr.concat(
         aligned_datasets,
         dim=concat_dim,
         join="outer",
         fill_value=np.nan,
     )
+
+    return ds_padded
 
 
 def get_ds(
@@ -183,7 +192,7 @@ def add_performance(
     return ds
 
 
-def normalize_domain(
+def normalize_domain(  # noqa: PLR0915, PLR0912
     ds_source: xr.Dataset,
     ds_target: xr.Dataset | None = None,
     method: str | None = "raw",
@@ -196,8 +205,8 @@ def normalize_domain(
     Methods:
         - "raw": No normalization, Ip, Wtot, etc. are in their original units
         - "physics": Convert to typical dimensionless parameters like beta, q95, f_G, etc.
-        - "z_score": Within each device, normalize each variable to zero mean and unit variance.
-        - "coral": Use the CORAL method to align covariances of various devices
+        - "z_score": Within each device, normalize each variable to zero mean and unit variance. Variable gets a `_zscore` suffix after normalization.
+        - "coral": Use the CORAL method to align covariances of various devices. Variable gets a `_coral` suffix after normalization.
 
     Args:
         ds_source: The source dataset (e.g. historic data)
@@ -208,12 +217,99 @@ def normalize_domain(
         The normalized source and target datasets.
     """
 
+    def _separate_devices(ds: xr.Dataset) -> dict[str, xr.Dataset]:
+        devices = np.unique(ds.coords["ds_source"].values)
+        return {
+            device: ds.where(ds.coords["ds_source"] == device, drop=True)
+            for device in devices
+        }
+
     if method == "raw":
         return ds_source, ds_target
     elif method == "physics":
-        raise NotImplementedError("Physics-based normalization not implemented yet")
+        ds_source["beta"] = xr.ones_like(ds_source["Ip_MA"])
+        ds_source["q95"] = xr.ones_like(ds_source["Ip_MA"])
+        ds_source["f_G"] = xr.ones_like(ds_source["Ip_MA"])
+        ds_source["aB0"] = xr.ones_like(ds_source["Ip_MA"])
+        ds_source["surface_power_density"] = xr.ones_like(ds_source["Ip_MA"])
+        if ds_target is not None:
+            ds_target["beta"] = xr.ones_like(ds_target["Ip_MA"])
+            ds_target["q95"] = xr.ones_like(ds_target["Ip_MA"])
+            ds_target["f_G"] = xr.ones_like(ds_target["Ip_MA"])
+            ds_target["aB0"] = xr.ones_like(ds_target["Ip_MA"])
+            ds_target["surface_power_density"] = xr.ones_like(ds_target["Ip_MA"])
+        return ds_source, ds_target
     elif method == "z_score":
-        raise NotImplementedError("Z-score normalization not implemented yet")
+        normalize_vars = [
+            "Ip_MA",
+            "B0",
+            "ne20_line_avg",
+            "R0",
+            "kappa",
+            "a_minor",
+            "Wtot_MJ",
+            "P_aux_MW",
+        ]
+
+        # Calculate normalization parameters from source dataset per device
+        norm_params = {}
+        source_devices = _separate_devices(ds_source)
+
+        for device, ds_device in source_devices.items():
+            device_params = {}
+            for var in normalize_vars:
+                if var in ds_device:
+                    # Calculate mean and std across all dimensions except coordinates
+                    data_var = ds_device[var]
+                    mean_val = data_var.mean(skipna=True)
+                    std_val = data_var.std(skipna=True)
+
+                    # Avoid division by zero
+                    std_val = std_val.where(std_val != 0, 1.0)
+
+                    device_params[var] = {"mean": mean_val, "std": std_val}
+            norm_params[device] = device_params
+
+        # Apply normalization to source dataset
+        ds_source_norm = ds_source.copy()
+        for device, ds_device in _separate_devices(ds_source_norm).items():
+            if device in norm_params:
+                for var in normalize_vars:
+                    if var in ds_device and var in norm_params[device]:
+                        mean_val = norm_params[device][var]["mean"]
+                        std_val = norm_params[device][var]["std"]
+
+                        # Apply z-score normalization to new variable with _z suffix
+                        mask = ds_source_norm.coords["ds_source"] == device
+                        normalized_values = ds_source_norm[var].where(
+                            ~mask, (ds_source_norm[var] - mean_val) / std_val
+                        )
+                        ds_source_norm[f"{var}_z"] = normalized_values.where(
+                            mask, ds_source_norm[var]
+                        )
+
+        # Apply same normalization to target dataset if provided
+        if ds_target is not None:
+            ds_target_norm = ds_target.copy()
+            for device, ds_device in _separate_devices(ds_target_norm).items():
+                if device in norm_params:
+                    for var in normalize_vars:
+                        if var in ds_device and var in norm_params[device]:
+                            mean_val = norm_params[device][var]["mean"]
+                            std_val = norm_params[device][var]["std"]
+
+                            # Apply z-score normalization to new variable with _z suffix
+                            mask = ds_target_norm.coords["ds_source"] == device
+                            normalized_values = ds_target_norm[var].where(
+                                ~mask, (ds_target_norm[var] - mean_val) / std_val
+                            )
+                            ds_target_norm[f"{var}_z"] = normalized_values.where(
+                                mask, ds_target_norm[var]
+                            )
+        else:
+            ds_target_norm = None
+
+        return ds_source_norm, ds_target_norm
     elif method == "coral":
         raise NotImplementedError("CORAL normalization not implemented yet")
     else:
