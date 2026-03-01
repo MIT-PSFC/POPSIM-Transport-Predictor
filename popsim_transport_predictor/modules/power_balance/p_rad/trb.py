@@ -28,6 +28,25 @@ class RadiatedPowerTRB(TrainRunBuilder):
         and a model config dict.
         """
 
+        # If max_val is not set, find the device with the largest median P_rad_MW in the training data
+        # and set max_val to 2x that median value.
+        if model_init_config["max_val"] is None:
+            if train_dl.ds["ds_source"].size < 2:
+                median = train_dl.ds["P_rad_MW"].median().item()
+            else:
+                device_medians = []
+                for device in train_dl.ds["ds_source"].values:
+                    device_median = (
+                        train_dl.ds.where(
+                            train_dl.ds["ds_source"] == device, drop=True
+                        )["P_rad_MW"]
+                        .median()
+                        .item()
+                    )
+                    device_medians.append(device_median)
+                median = max(device_medians)
+            model_init_config["max_val"] = 2 * median
+
         module = RadiatedPower.init(
             **model_init_config,
         )

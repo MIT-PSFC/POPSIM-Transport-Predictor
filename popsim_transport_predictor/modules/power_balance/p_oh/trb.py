@@ -28,11 +28,24 @@ class OhmicPowerTRB(TrainRunBuilder):
         and a model config dict.
         """
 
-        # If max_val is not set, set it to 2x the median P_oh_MW in the training data
+        # If max_val is not set, find the device with the largest median P_oh_MW in the training data
+        # and set max_val to 2x that median value.
         if model_init_config["max_val"] is None:
-            model_init_config["max_val"] = (
-                2 * train_dl.dataset["P_oh_MW"].median().item()
-            )
+            if train_dl.ds["ds_source"].size < 2:
+                median = train_dl.ds["P_oh_MW"].median().item()
+            else:
+                device_medians = []
+                for device in train_dl.ds["ds_source"].values:
+                    device_median = (
+                        train_dl.ds.where(
+                            train_dl.ds["ds_source"] == device, drop=True
+                        )["P_oh_MW"]
+                        .median()
+                        .item()
+                    )
+                    device_medians.append(device_median)
+                median = max(device_medians)
+            model_init_config["max_val"] = 2 * median
 
         module = OhmicPower.init(
             **model_init_config,
@@ -43,8 +56,10 @@ class OhmicPowerTRB(TrainRunBuilder):
     @staticmethod
     def get_loss_fn(config: dict) -> Callable[[Any, Any], jnp.ndarray]:
         def loss_fn(pred, targ):
+            device_weights = config["device_weight"]
+            weight = device_weights[targ["ds_source"].item()]
             absolute_error = jnp.abs(pred.P_oh_MW_pred - targ["P_oh_MW"].data)
-            return optax.huber_loss(absolute_error)
+            return weight * jnp.mean(optax.huber_loss(absolute_error))
 
         return loss_fn
 

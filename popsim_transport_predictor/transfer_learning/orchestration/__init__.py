@@ -18,25 +18,25 @@ DOMAIN_NORMALIZATION_METHODS = [
 
 MODEL_CASES = {
     # Different treatments of the full-shot transport predictor module
-    "transport_predictor": {
+    "transport_predictor": [
         "simple_shapes",  # Simple analytic shapes
         "pedestal_shapes",  # Simple analytic shapes with pedestal region
         "gradient_shapes",  # Gradient-based analytic shapes
         "unstructured_nn",  # Unstructured neural network
-    },
+    ],
     # Just the power balance module. (P_OH and P_RAD still get their own models since the data is atrocious)
-    "power_balance": {
+    "power_balance": [
         "scaling_law",  # Based on scaling laws, H89, H98, and HL transition threshold between them
         "sciml",  # Neural network predicts tau_E, and we do the power balance calculation
-        "unstructured_nn",  # Unstructured neural network directly predicts stored energy evolution
-    },
+        # "unstructured_nn",  # Unstructured neural network directly predicts stored energy evolution
+    ],
     # Profile predictor (needed for pre-shot trajectory optimization for upcoming DIII-D campaign)
-    "profile_predictor": {
+    "profile_predictor": [
         "simple_shapes",  # Simple analytic shapes
         "pedestal_shapes",  # Simple analytic shapes with pedestal region
         "gradient_shapes",  # Gradient-based analytic shapes
         "unstructured_nn",  # Unstructured neural network
-    },
+    ],
 }
 
 # Shots of high-performance data included in training

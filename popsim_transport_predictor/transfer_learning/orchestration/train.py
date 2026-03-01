@@ -82,7 +82,7 @@ def _make_train_config(
     if normalization_method == "raw":
         input_vars = input_vars_base
     elif normalization_method == "physics":
-        input_vars = [*input_vars_base, "beta", "q_star", "f_G", "aB0", "power_density"]
+        input_vars = [*input_vars_base, "q_star", "f_G", "aB0", "surface_power_density"]
     elif normalization_method == "z_score":
         input_vars = [*input_vars_base, *(f"{var}_z" for var in input_vars_base)]
     elif normalization_method == "coral":
@@ -97,8 +97,9 @@ def _make_train_config(
             "min_val": 0,  # Minimum ohmic power in MW
             "max_val": None,  # Get max from training data
             "prng_seed": 42,
-            "in_size": 8,  # B0, Ip, R0, a_minor, kappa, ne20_line_avg, P_aux_MW, and beta from either training or the prediction
+            "in_size": 7,  # B0, Ip, R0, a_minor, kappa, ne20_line_avg, P_aux_MW TODO(ZanderKeith): It'd be nice to put the predicted stored energy here, but that'd require passing the mapping functions into the submodules... Doable, but a bit of a pain, so maybe for a future study
             "out_size": 1,
+            "normalization_method": normalization_method,
         }
         p_oh_config = TrainConfig(
             project="p_oh_predictor",

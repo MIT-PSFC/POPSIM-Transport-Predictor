@@ -1,3 +1,8 @@
+from collections.abc import Callable
+from typing import Any
+
+import jax.numpy as jnp
+import optax
 import xarray as xr
 from popsim.ml import DataLoader, TrainRunBuilder
 from popsim.ml.dataloading import make_dataloaders
@@ -64,6 +69,43 @@ class PowerBalanceTRB(TrainRunBuilder):
             segment_lengths=segment_lengths,
             segment_overlaps=segment_overlaps,
             shuffle=[True, False],
+            convert_xr_to_jnp=False,  # Needed to keep the coords for calculating loss
         )
 
         return ds_val, train_dl, val_dl, None
+
+    @staticmethod
+    def model_init(train_dl: DataLoader, model_init_config: dict) -> Any:
+        """
+        Instantiate and return your model given a training DataLoader
+        and a model config dict.
+        """
+
+        if model_init_config["model_case"] == "scaling_law":
+            pass
+        elif model_init_config["model_case"] == "sciml":
+            pass
+        elif model_init_config["model_case"] == "unstructured_nn":
+            pass
+        else:
+            raise ValueError(f"Invalid model case: {model_init_config['model_case']}")
+
+    @staticmethod
+    def get_loss_fn(config: dict) -> Callable[[Any, Any], jnp.ndarray]:
+        def loss_fn(pred, targ):
+            raise NotImplementedError(
+                "Loss function not implemented yet for PowerBalanceTRB. This is a placeholder."
+            )
+
+        return loss_fn
+
+    @staticmethod
+    def get_optimizer(config: dict) -> optax.GradientTransformation:
+        schedule = optax.exponential_decay(
+            init_value=config["lr0"],
+            transition_steps=config["transition_steps"],
+            decay_rate=config["decay_rate"],
+            end_value=config["lrf"],
+        )
+        opt = optax.adamw(learning_rate=schedule, weight_decay=config["weight_decay"])
+        return opt
