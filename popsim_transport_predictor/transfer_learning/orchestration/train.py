@@ -42,7 +42,7 @@ def _make_train_config(
     target_vars_base = ["Wtot_MJ", "P_oh_MW", "P_rad_MW"]
 
     max_epochs = 2 if config.debug else 800
-    epochs_per_val = 1 if config.debug else 20
+    epochs_per_val = 2 if config.debug else 20
 
     loss_config_base = {
         "huber_delta": 0.5,
