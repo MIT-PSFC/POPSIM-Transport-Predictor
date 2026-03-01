@@ -25,6 +25,8 @@ def _make_train_config(
     training_data_case: str,
     normalization_method: str,
     model_case: str,
+    num_hp_shots: int | None = None,
+    transfer_learning: bool = False,
 ) -> tuple[TrainConfig, TrainConfig, TrainConfig]:
     """Make TrainConfigs for the power_balance, p_oh_predictor, and p_rad_predictor submodules"""
 
@@ -126,8 +128,10 @@ def _make_train_config(
             loss_config=loss_config_base,
             optimizer_config=optimizer_config_base,
         )
+        submodules = ["p_oh_predictor", "p_rad_predictor"]
     elif model_case == "unstructured_nn":
         p_oh_config, p_rad_config = None, None
+        submodules = []
     else:
         raise ValueError(f"Unknown model case: {model_case}")
 
@@ -147,6 +151,8 @@ def _make_train_config(
         dataloader_config={
             "training_data_case": training_data_case,
             "normalization_method": normalization_method,
+            "num_hp_shots": num_hp_shots,
+            "transfer_learning": transfer_learning,
             "state_vars": ["Wtot_MJ"],
             "input_vars": input_vars,
             "target_vars": target_vars_base,
@@ -161,6 +167,8 @@ def _make_train_config(
             "segment_overlap_val": 0,
         },
         model_init_config={
+            "model_case": model_case,
+            "normalization_method": normalization_method,
             "submodules": {
                 "p_oh_predictor": p_oh_config,
                 "p_rad_predictor": p_rad_config,
@@ -175,7 +183,7 @@ def _make_train_config(
     )
 
     power_balance_config = update_submodule_configs(
-        power_balance_config.model_dump(), ["p_oh_predictor", "p_rad_predictor"]
+        power_balance_config.model_dump(), submodules=submodules
     )
 
     return power_balance_config
@@ -196,6 +204,8 @@ def train_model_standard(
         training_data_case=training_data_case,
         normalization_method=normalization_method,
         model_case=model_case,
+        num_hp_shots=None,
+        transfer_learning=False,
     )
 
     if model_case in ["scaling_law", "sciml"]:
@@ -224,6 +234,24 @@ def train_model_transfer(
     The number of high-performance shots included in training is specified by `num_hp_shots`.
     """
 
-    # 1. Organize datasets and make dataloaders
-    # 2. Load pre-trained model from standard learning
-    # 3. Fine-tune the model with high-performance shots
+    power_balance_config = _make_train_config(
+        model_dir=model_dir,
+        training_data_case=training_data_case,
+        normalization_method=normalization_method,
+        model_case=model_case,
+        num_hp_shots=num_hp_shots,
+        transfer_learning=True,
+    )
+
+    if model_case in ["scaling_law", "sciml"]:
+        p_oh_config = power_balance_config.model_init_config["submodules"][
+            "p_oh_predictor"
+        ]
+        p_rad_config = power_balance_config.model_init_config["submodules"][
+            "p_rad_predictor"
+        ]
+        launch_train(p_oh_config)
+        launch_train(p_rad_config)
+
+    trainer, _, val_dl, _, _ = launch_train(power_balance_config)
+    return trainer, val_dl

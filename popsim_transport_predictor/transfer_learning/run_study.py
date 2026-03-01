@@ -353,11 +353,30 @@ class ComputeResults:
         training_data_case: str,
         normalization_method: str,
         model_case: str,
+        transfer_learning: bool = False,
+        num_hp_shots: int | None = None,
     ) -> str:
         """Get the directory to save a trained model for a given combination of training data, normalization, and model architecture"""
-        return os.path.join(
-            model_dir, training_data_case, normalization_method, model_case
-        )
+        if transfer_learning:
+            if num_hp_shots is None:
+                raise ValueError(
+                    "num_hp_shots must be provided for transfer learning model directories."
+                )
+            return os.path.join(
+                model_dir,
+                training_data_case,
+                normalization_method,
+                model_case,
+                f"transfer_learning_{num_hp_shots}",
+            )
+        else:
+            return os.path.join(
+                model_dir,
+                training_data_case,
+                normalization_method,
+                model_case,
+                "standard_learning",
+            )
 
     @staticmethod
     def _compute_standard_learning_result(
