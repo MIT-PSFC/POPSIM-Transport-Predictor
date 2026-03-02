@@ -1,16 +1,11 @@
-from __future__ import annotations
-
-from typing import TYPE_CHECKING
-
-if TYPE_CHECKING:
-    from collections.abc import Callable
-
+from collections.abc import Callable
 
 import chex
 import equinox as eqx
 import jax
 import jax.numpy as jnp
 import xarray as xr
+from jaxtyping import ArrayLike
 from popsim.math_utils import soft_clip
 from popsim.module_base import TimeIndepModule
 
@@ -24,7 +19,7 @@ class RadiatedPower(TimeIndepModule):
     min_val: float = eqx.field(static=True)
     max_val: float = eqx.field(static=True)
     # TODO(ZanderKeith) this should be replaced with a matrix that just puts things into the correct format for the model
-    input_format_fn: Callable[[dict], RadiatedPower.Inputs] = eqx.field(static=True)
+    input_format_fn: Callable = eqx.field(static=True)
 
     @chex.dataclass
     class Inputs:
@@ -45,7 +40,8 @@ class RadiatedPower(TimeIndepModule):
         debug_info: dict
 
     def __call__(self, inputs: Inputs) -> Output:
-        inputs = self.input_format_fn(inputs)
+        if not isinstance(inputs, RadiatedPower.Inputs):
+            inputs = self.input_format_fn(inputs)
 
         arr = jnp.array(
             [
@@ -80,103 +76,60 @@ class RadiatedPower(TimeIndepModule):
         Kind of a weird break in abstraction, might want to fix that at some point.
         """
 
+        def _formalize_inputs(inputs: xr.Dataset) -> dict[str, ArrayLike]:
+            return {var: inputs[var].data for var in inputs.data_vars}
+
         def _format_inputs_raw(inputs) -> RadiatedPower.Inputs:
-            if isinstance(inputs, xr.Dataset):
-                return RadiatedPower.Inputs(
-                    ne20_real=inputs["ne20_line_avg"].data,
-                    Ip_MA_nn=inputs["Ip_MA"].data,
-                    B0_nn=inputs["B0"].data,
-                    R0_nn=inputs["R0"].data,
-                    a_minor_nn=inputs["a_minor"].data,
-                    kappa_nn=inputs["kappa"].data,
-                    ne20_nn=inputs["ne20_line_avg"].data,
-                    P_aux_nn=inputs["P_aux_MW"].data,
-                )
-            else:
-                return RadiatedPower.Inputs(
-                    ne20_real=inputs["ne20_line_avg"],
-                    Ip_MA_nn=inputs["Ip_MA"],
-                    B0_nn=inputs["B0"],
-                    R0_nn=inputs["R0"],
-                    a_minor_nn=inputs["a_minor"],
-                    kappa_nn=inputs["kappa"],
-                    ne20_nn=inputs["ne20_line_avg"],
-                    P_aux_nn=inputs["P_aux_MW"],
-                )
+            inputs = _formalize_inputs(inputs)
+            return RadiatedPower.Inputs(
+                ne20_real=inputs["ne20_line_avg"],
+                Ip_MA_nn=inputs["Ip_MA"],
+                B0_nn=inputs["B0"],
+                R0_nn=inputs["R0"],
+                a_minor_nn=inputs["a_minor"],
+                kappa_nn=inputs["kappa"],
+                ne20_nn=inputs["ne20_line_avg"],
+                P_aux_nn=inputs["P_aux_MW"],
+            )
 
         def _format_inputs_physics(inputs) -> RadiatedPower.Inputs:
-            if isinstance(inputs, xr.Dataset):
-                # Yeah all the names get messed up, sloppy formatting on my part
-                # it all still works though, fix if you have time TODO(ZanderKeith)
-                return RadiatedPower.Inputs(
-                    ne20_real=inputs["ne20_line_avg"].data,
-                    Ip_MA_nn=inputs["Ip_MA"].data,
-                    B0_nn=inputs["q95"].data,
-                    R0_nn=inputs["epsilon"].data,
-                    a_minor_nn=inputs["aB0"].data,
-                    kappa_nn=inputs["kappa"].data,
-                    ne20_nn=inputs["f_G"].data,
-                    P_aux_nn=inputs["surface_power_density"].data,
-                )
-            else:
-                return RadiatedPower.Inputs(
-                    ne20_real=inputs["ne20_line_avg"],
-                    Ip_MA_nn=inputs["Ip_MA"],
-                    B0_nn=inputs["q95"],
-                    R0_nn=inputs["epsilon"],
-                    a_minor_nn=inputs["aB0"],
-                    kappa_nn=inputs["kappa"],
-                    ne20_nn=inputs["f_G"],
-                    P_aux_nn=inputs["surface_power_density"],
-                )
+            inputs = _formalize_inputs(inputs)
+            return RadiatedPower.Inputs(
+                ne20_real=inputs["ne20_line_avg"],
+                Ip_MA_nn=inputs["Ip_MA"],
+                B0_nn=inputs["q95"],
+                R0_nn=inputs["epsilon"],
+                a_minor_nn=inputs["aB0"],
+                kappa_nn=inputs["kappa"],
+                ne20_nn=inputs["f_G"],
+                P_aux_nn=inputs["surface_power_density"],
+            )
 
         def _format_inputs_z_score(inputs) -> RadiatedPower.Inputs:
-            if isinstance(inputs, xr.Dataset):
-                return RadiatedPower.Inputs(
-                    ne20_real=inputs["ne20_line_avg"].data,
-                    Ip_MA_nn=inputs["Ip_MA_z"].data,
-                    B0_nn=inputs["B0_z"].data,
-                    R0_nn=inputs["R0_z"].data,
-                    a_minor_nn=inputs["a_minor_z"].data,
-                    kappa_nn=inputs["kappa_z"].data,
-                    ne20_nn=inputs["ne20_line_avg_z"].data,
-                    P_aux_nn=inputs["P_aux_MW_z"].data,
-                )
-            else:
-                return RadiatedPower.Inputs(
-                    ne20_real=inputs["ne20_line_avg"],
-                    Ip_MA_nn=inputs["Ip_MA_z"],
-                    B0_nn=inputs["B0_z"],
-                    R0_nn=inputs["R0_z"],
-                    a_minor_nn=inputs["a_minor_z"],
-                    kappa_nn=inputs["kappa_z"],
-                    ne20_nn=inputs["ne20_line_avg_z"],
-                    P_aux_nn=inputs["P_aux_MW_z"],
-                )
+            inputs = _formalize_inputs(inputs)
+            return RadiatedPower.Inputs(
+                ne20_real=inputs["ne20_line_avg"],
+                Ip_MA_nn=inputs["Ip_MA_z"],
+                B0_nn=inputs["B0_z"],
+                R0_nn=inputs["R0_z"],
+                a_minor_nn=inputs["a_minor_z"],
+                kappa_nn=inputs["kappa_z"],
+                ne20_nn=inputs["ne20_line_avg_z"],
+                P_aux_nn=inputs["P_aux_MW_z"],
+            )
 
         def _format_inputs_coral(inputs) -> RadiatedPower.Inputs:
-            if isinstance(inputs, xr.Dataset):
-                return RadiatedPower.Inputs(
-                    ne20_real=inputs["ne20_line_avg"].data,
-                    Ip_MA_nn=inputs["Ip_MA_coral"].data,
-                    B0_nn=inputs["B0_coral"].data,
-                    R0_nn=inputs["R0_coral"].data,
-                    a_minor_nn=inputs["a_minor_coral"].data,
-                    kappa_nn=inputs["kappa_coral"].data,
-                    ne20_nn=inputs["ne20_line_avg_coral"].data,
-                    P_aux_nn=inputs["P_aux_MW_coral"].data,
-                )
-            else:
-                return RadiatedPower.Inputs(
-                    ne20_real=inputs["ne20_line_avg"],
-                    Ip_MA_nn=inputs["Ip_MA_coral"],
-                    B0_nn=inputs["B0_coral"],
-                    R0_nn=inputs["R0_coral"],
-                    a_minor_nn=inputs["a_minor_coral"],
-                    kappa_nn=inputs["kappa_coral"],
-                    ne20_nn=inputs["ne20_line_avg_coral"],
-                    P_aux_nn=inputs["P_aux_MW_coral"],
-                )
+            inputs = _formalize_inputs(inputs)
+            return RadiatedPower.Inputs(
+                ne20_real=inputs["ne20_line_avg"],
+                Ip_MA_nn=inputs["Ip_MA_coral"],
+                B0_nn=inputs["B0_coral"],
+                R0_nn=inputs["R0_coral"],
+                a_minor_nn=inputs["a_minor_coral"],
+                kappa_nn=inputs["kappa_coral"],
+                ne20_nn=inputs["ne20_line_avg_coral"],
+                P_aux_nn=inputs["P_aux_MW_coral"],
+            )
 
         if normalization_method == "raw":
             return _format_inputs_raw
@@ -200,7 +153,7 @@ class RadiatedPower(TimeIndepModule):
         max_val: float,
         prng_seed: int,
         normalization_method: str,
-    ) -> RadiatedPower:
+    ) -> "RadiatedPower":
         nn = eqx.nn.MLP(
             in_size=in_size,
             out_size=out_size,

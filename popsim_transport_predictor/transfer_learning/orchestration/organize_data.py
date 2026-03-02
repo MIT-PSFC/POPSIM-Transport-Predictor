@@ -1,3 +1,4 @@
+import jax
 import numpy as np
 import xarray as xr
 from loguru import logger
@@ -92,7 +93,9 @@ def get_ds(
     else:
         raise ValueError(f"Unknown source dataset: {source_ds}")
 
-    ds = xr.open_dataset(ds_path)
+    ds = xr.open_dataset(ds_path).astype(
+        jax.numpy.float64 if jax.config.jax_enable_x64 else jax.numpy.float32
+    )
 
     if debug:
         ds = ds.isel(shot=slice(0, 10))  # Limit to 10 shots

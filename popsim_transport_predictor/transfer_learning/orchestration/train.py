@@ -170,15 +170,15 @@ def _make_train_config(
         model_init_config={
             "model_case": model_case,
             "normalization_method": normalization_method,
+            "freeze_submodules": freeze_submodules,
             "submodules": {
                 "p_oh_predictor": p_oh_config,
                 "p_rad_predictor": p_rad_config,
             },
             "restore_submodules": True,  # Always restoring pre-trained submodules in this study
         },
-        trainable_getter_config={
-            "freeze_submodules": freeze_submodules,
-        },
+        # TODO(ZanderKeith): is the trainable getter only needed for time-independent modules?
+        trainable_getter_config={},
         loss_config=loss_config_base,
         optimizer_config=optimizer_config_base,
     )

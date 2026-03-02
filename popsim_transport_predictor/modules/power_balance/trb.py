@@ -168,8 +168,6 @@ class PowerBalanceTRB(TrainRunBuilder):
 
         return IntegralLoss(loss_fn)
 
-        return loss_fn
-
     @staticmethod
     def get_optimizer(config: dict) -> optax.GradientTransformation:
         schedule = optax.exponential_decay(

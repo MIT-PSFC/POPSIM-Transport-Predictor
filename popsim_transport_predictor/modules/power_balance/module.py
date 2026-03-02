@@ -2,6 +2,7 @@ import chex
 import equinox as eqx
 import jax
 import jax.numpy as jnp
+import xarray as xr
 from jaxtyping import ArrayLike
 from popsim import TimeDepModule
 from popsim.math_utils import soft_clip
@@ -99,8 +100,8 @@ class ScalingLawPredictor(eqx.Module):
         scaling_lmode: dict[str, float] | None = None,
         scaling_hmode: dict[str, float] | None = None,
         scaling_lh_transition: dict[str, float] | None = None,
-        min_taue: float = MIN_TAUE,
-        max_taue: float = MAX_TAUE,
+        min_taue: float | None = None,
+        max_taue: float | None = None,
     ):
         self.scaling_lmode = (
             scaling_lmode if scaling_lmode is not None else self.create_ipb98()
@@ -113,8 +114,8 @@ class ScalingLawPredictor(eqx.Module):
             if scaling_lh_transition is not None
             else self.create_iter1996()
         )
-        self.min_taue = min_taue
-        self.max_taue = max_taue
+        self.min_taue = MIN_TAUE if min_taue is None else min_taue
+        self.max_taue = MAX_TAUE if max_taue is None else max_taue
 
     def __call__(self, inp: Inputs) -> TauePredictorOutputs:
         # Ensure each of the input values is strictly greater than 0.001 to avoid numerical instability.
@@ -302,7 +303,7 @@ class PowerBalanceScalingLaw(PowerBalance):
         )
         p_rad_predictor_output = self.p_rad_predictor(p_rad_predictor_inputs)
 
-        taue_predictor_inputs = BoundedNNPredictor.Inputs(
+        taue_predictor_inputs = ScalingLawPredictor.Inputs(
             Ip_MA=inputs.Ip_MA_nn,
             B0=inputs.B0_nn,
             R0=inputs.R0_nn,
@@ -310,6 +311,7 @@ class PowerBalanceScalingLaw(PowerBalance):
             kappa=inputs.kappa_nn,
             ne20=inputs.ne20_nn,
             P_aux_MW=inputs.P_aux_nn,
+            P_oh_MW=p_oh_predictor_output.P_oh_MW_pred,
         )
         taue_predictor_output = self.taue_predictor(taue_predictor_inputs)
 
@@ -345,10 +347,13 @@ class PowerBalanceSciML(PowerBalance):
         nn_depth: int,
         p_oh_predictor: OhmicPower,
         p_rad_predictor: RadiatedPower,
-        min_taue: float = MIN_TAUE,
-        max_taue: float = MAX_TAUE,
+        min_taue: float | None = None,
+        max_taue: float | None = None,
         prng_seed: int = 42,
     ) -> "PowerBalanceSciML":
+        min_taue = MIN_TAUE if min_taue is None else min_taue
+        max_taue = MAX_TAUE if max_taue is None else max_taue
+
         taue_predictor = BoundedNNPredictor(
             nn=eqx.nn.MLP(
                 in_size=in_size,
@@ -475,17 +480,93 @@ class PowerBalanceUnstructuredNN(PowerBalance):
 
 class PowerBalanceEnv(ModuleTrainingEnv):
     module: PowerBalance
-    normalization_method: str = eqx.field(static=True)
-    freeze_submodules: list[str] = eqx.field(static=True)
+    normalization_method: str = eqx.field(static=True, default="unset")
+    freeze_submodules: list[str] = eqx.field(static=True, default_factory=list)
     stepper: StepperType = eqx.field(static=True, default=StepperType.SIMPLE_EULER)
 
     @staticmethod
     def create_state(observations: dict[str, ArrayLike], inputs: dict[str, ArrayLike]):
         return PowerBalance.State(Wtot_MJ=observations["Wtot_MJ"].data)
 
-    @staticmethod
-    def create_inputs(inputs: dict[str, ArrayLike]):
-        return PowerBalance.Inputs()
+    def create_inputs(self, inputs: dict[str, ArrayLike]):
+        # TODO(ZanderKeith) this needs to be replaced with a thing where we initialize the module with a transform
+        # The inputs to a top-level module should likely ALWAYS be in physical units
+        if isinstance(inputs, xr.Dataset):
+            inputs = {var: inputs[var].data for var in inputs.data_vars}
+
+        if self.normalization_method == "raw":
+            inputs = PowerBalance.Inputs(
+                Ip_MA=inputs["Ip_MA"],
+                B0=inputs["B0"],
+                R0=inputs["R0"],
+                a_minor=inputs["a_minor"],
+                kappa=inputs["kappa"],
+                ne20=inputs["ne20_line_avg"],
+                P_aux_MW=inputs["P_aux_MW"],
+                Ip_MA_nn=inputs["Ip_MA"],
+                B0_nn=inputs["B0"],
+                R0_nn=inputs["R0"],
+                a_minor_nn=inputs["a_minor"],
+                kappa_nn=inputs["kappa"],
+                ne20_nn=inputs["ne20_line_avg"],
+                P_aux_nn=inputs["P_aux_MW"],
+            )
+        elif self.normalization_method == "physics":
+            inputs = PowerBalance.Inputs(
+                Ip_MA=inputs["Ip_MA"],
+                B0=inputs["B0"],
+                R0=inputs["R0"],
+                a_minor=inputs["a_minor"],
+                kappa=inputs["kappa"],
+                ne20=inputs["ne20_line_avg"],
+                P_aux_MW=inputs["P_aux_MW"],
+                Ip_MA_nn=inputs["Ip_MA"],
+                B0_nn=inputs["q95"],
+                R0_nn=inputs["epsilon"],
+                a_minor_nn=inputs["aB0"],
+                kappa_nn=inputs["kappa"],
+                ne20_nn=inputs["f_G"],
+                P_aux_nn=inputs["surface_power_density"],
+            )
+        elif self.normalization_method == "z_score":
+            inputs = PowerBalance.Inputs(
+                Ip_MA=inputs["Ip_MA"],
+                B0=inputs["B0"],
+                R0=inputs["R0"],
+                a_minor=inputs["a_minor"],
+                kappa=inputs["kappa"],
+                ne20=inputs["ne20_line_avg"],
+                P_aux_MW=inputs["P_aux_MW"],
+                Ip_MA_nn=inputs["Ip_MA_z"],
+                B0_nn=inputs["B0_z"],
+                R0_nn=inputs["R0_z"],
+                a_minor_nn=inputs["a_minor_z"],
+                kappa_nn=inputs["kappa_z"],
+                ne20_nn=inputs["ne20_line_avg_z"],
+                P_aux_nn=inputs["P_aux_MW_z"],
+            )
+        elif self.normalization_method == "coral":
+            inputs = PowerBalance.Inputs(
+                Ip_MA=inputs["Ip_MA"],
+                B0=inputs["B0"],
+                R0=inputs["R0"],
+                a_minor=inputs["a_minor"],
+                kappa=inputs["kappa"],
+                ne20=inputs["ne20_line_avg"],
+                P_aux_MW=inputs["P_aux_MW"],
+                Ip_MA_nn=inputs["Ip_MA_coral"],
+                B0_nn=inputs["B0_coral"],
+                R0_nn=inputs["R0_coral"],
+                a_minor_nn=inputs["a_minor_coral"],
+                kappa_nn=inputs["kappa_coral"],
+                ne20_nn=inputs["ne20_line_avg_coral"],
+                P_aux_nn=inputs["P_aux_MW_coral"],
+            )
+        else:
+            raise ValueError(
+                f"Unknown normalization method: {self.normalization_method}"
+            )
+        return inputs
 
     def get_trainable(self):
         trainable_leaves = {}
