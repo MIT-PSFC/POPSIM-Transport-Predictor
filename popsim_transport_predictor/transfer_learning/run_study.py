@@ -3,6 +3,7 @@ import shutil
 from itertools import product
 
 import fire
+import xarray as xr
 from loguru import logger
 
 from popsim_transport_predictor import PACKAGE_ROOT
@@ -322,15 +323,13 @@ class ComputeResults:
         training_data_case: str,
         normalization_method: str,
         model_case: str,
-        transfer_learning: bool = False,
-        num_hp_shots: int | None = None,
+        transfer_learning: bool,
+        num_hp_shots: int | None,
     ) -> str:
         """Get the path to save evaluation results for a given combination of training data, normalization, and model architecture"""
         if transfer_learning:
             if num_hp_shots is None:
-                raise ValueError(
-                    "num_hp_shots must be provided for transfer learning results."
-                )
+                num_hp_shots = "all"
             return os.path.join(
                 result_dir,
                 "transfer_learning",
@@ -353,15 +352,13 @@ class ComputeResults:
         training_data_case: str,
         normalization_method: str,
         model_case: str,
-        transfer_learning: bool = False,
-        num_hp_shots: int | None = None,
+        transfer_learning: bool,
+        num_hp_shots: int | None,
     ) -> str:
         """Get the directory to save a trained model for a given combination of training data, normalization, and model architecture"""
         if transfer_learning:
             if num_hp_shots is None:
-                raise ValueError(
-                    "num_hp_shots must be provided for transfer learning model directories."
-                )
+                num_hp_shots = "all"
             return os.path.join(
                 model_dir,
                 training_data_case,
@@ -574,6 +571,8 @@ class ComputeResults:
                     training_data_case=training_data_case,
                     normalization_method=normalization_method,
                     model_case=model_case,
+                    transfer_learning=True,
+                    num_hp_shots=num_hp_shots,
                 )
                 if not os.path.exists(trained_model_dir):
                     # Model not trained, need to go do that first
@@ -582,23 +581,29 @@ class ComputeResults:
                         f"normalization method '{normalization_method}', and {num_hp_shots} high-performance shots included. Training model now."
                     )
                     # TODO(ZanderKeith) Call training function, and if parallelism is enabled, return to finish this step.
-                    train_model_transfer(
+                    trainer, eval_dl = train_model_transfer(
                         model_dir=trained_model_dir,
                         training_data_case=training_data_case,
                         normalization_method=normalization_method,
                         model_case=model_case,
                         num_hp_shots=num_hp_shots,
                     )
-                    return
                 else:
                     logger.info(
                         f"Trained model found for transfer learning with training data case '{training_data_case}', model case '{model_case}', "
                         f"normalization method '{normalization_method}', and {num_hp_shots} high-performance shots included. Computing results now."
                     )
-                    ComputeResults._compute_transfer_learning_result(
-                        trained_model_dir=trained_model_dir,
-                        result_path=result_path,
-                    )
+                    # make trainer and eval_dl objects using the trained model directory so we can evaluate and save results
+                    trainer = None
+                    eval_dl = None
+
+                trainer.restore_best_checkpoint()
+                eval_data = trainer.run_evals(eval_dl)
+                input_ds = eval_data.input_ds.reset_index("sample")
+                output_ds = eval_data.output_ds.reset_index("sample")
+                eval_ds = xr.merge([input_ds, output_ds], compat="override")
+                os.makedirs(os.path.dirname(result_path), exist_ok=True)
+                eval_ds.to_netcdf(result_path)
             else:
                 logger.info(
                     f"Results already exist for transfer learning with training data case '{training_data_case}', model case '{model_case}', "

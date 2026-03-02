@@ -1,6 +1,6 @@
 from popsim_transport_predictor.transfer_learning.config import config
 
-TRAINING_DATA_CASES = [
+TRAINING_DATA_CASES_STO = [
     "cmod",  # C-Mod only
     "tcv",  # TCV only
     "cmod_tcv",  # C-Mod + TCV
@@ -9,7 +9,16 @@ TRAINING_DATA_CASES = [
     "exnihilo",  # No training data
 ]
 
+TRAINING_DATA_CASES = [
+    "cmod_tcv",  # C-Mod + TCV
+]
+
 DOMAIN_NORMALIZATION_METHODS = [
+    "physics",  # Convert to typical dimensionless parameters like beta, q95, f_G, etc.
+    "coral",  # Use the CORAL method to align covariances of source and target domains (https://arxiv.org/abs/1612.01939)
+]
+
+DOMAIN_NORMALIZATION_METHODS_STO = [
     "raw",  # No normalization, Ip, Wtot, etc. are in their original units
     "physics",  # Convert to typical dimensionless parameters like beta, q95, f_G, etc.
     "z_score",  # Within each device, normalize each variable to zero mean and unit variance.
@@ -25,9 +34,12 @@ MODEL_CASES = {
         "unstructured_nn",  # Unstructured neural network
     ],
     # Just the power balance module. (P_OH and P_RAD still get their own models since the data is atrocious)
-    "power_balance": [
+    "power_balance_sto": [
         "scaling_law",  # Based on scaling laws, H89, H98, and HL transition threshold between them
         "sciml",  # Neural network predicts tau_E, and we do the power balance calculation
+        "unstructured_nn",  # Unstructured neural network directly predicts stored energy evolution
+    ],
+    "power_balance": [
         "unstructured_nn",  # Unstructured neural network directly predicts stored energy evolution
     ],
     # Profile predictor (needed for pre-shot trajectory optimization for upcoming DIII-D campaign)
@@ -41,9 +53,9 @@ MODEL_CASES = {
 
 # Shots of high-performance data included in training
 if config.debug:
-    HP_SHOTS_INCLUDED = [0, 1, 10]
+    HP_SHOTS_INCLUDED = [0, 1, 3, None]
 else:
-    HP_SHOTS_INCLUDED = [0, 1, 3, 10, 30, 100]
+    HP_SHOTS_INCLUDED = [0, 1, 3, 10, 30, None]
 
 # 80/20 between train/val
 # 80/20 between train+val/test

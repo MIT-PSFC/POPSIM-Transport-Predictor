@@ -54,6 +54,11 @@ class PowerBalanceTRB(TrainRunBuilder):
                 normalization_method=dataloader_config["normalization_method"],
             )
 
+        # Drop time_idx as a shared coordinate — it has duplicate values across shots and
+        # causes groupby("shot") to fail when reassembling. The dataloader uses "time" instead.
+        ds_train = ds_train.drop_vars("time_idx", errors="ignore")
+        ds_val = ds_val.drop_vars("time_idx", errors="ignore")
+
         if "state_vars" in dataloader_config.keys():
             segment_lengths = [
                 dataloader_config.get("segment_length_train", None),
@@ -80,6 +85,7 @@ class PowerBalanceTRB(TrainRunBuilder):
             segment_overlaps=segment_overlaps,
             shuffle=[True, False],
             convert_xr_to_jnp=False,  # Needed to keep the coords for calculating loss
+            nan_handling="drop_segment",
         )
 
         return ds_val, train_dl, val_dl, None
@@ -162,13 +168,13 @@ class PowerBalanceTRB(TrainRunBuilder):
     @staticmethod
     def get_loss_fn(loss_config: dict) -> Callable[[Any, Any], jnp.ndarray]:
         def loss_fn(pred, targ):
-            device_weights = loss_config["device_weight"]
+            _device_weights = loss_config["device_weight"]
             var_weights = loss_config["var_weight"]
 
             wtot_loss = jnp.abs(pred.Wtot_MJ_pred - targ["Wtot_MJ"].data)
             wtot_loss = optax.huber_loss(wtot_loss, delta=loss_config["huber_delta"])
 
-            device_weight = device_weights[targ["ds_source"].item()]
+            device_weight = 1  # TODO(ZanderKeith) fix device weighting device_weights[targ["ds_source"].item()]
             loss = device_weight * var_weights["Wtot_MJ"] * wtot_loss
             # TODO(ZanderKeith): might be worthwhile to put the p_oh and p_rad in here?
             return loss

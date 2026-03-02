@@ -64,6 +64,7 @@ def concat_with_nan_padding(
         dim=concat_dim,
         join="outer",
         coords="different",
+        compat="equals",
         fill_value=np.nan,
     )
 
@@ -578,7 +579,7 @@ def get_train_val_datasets(
 
 def get_train_test_datasets_transfer(
     training_data_case: str,
-    num_hp_shots: int,
+    num_hp_shots: int | None,
     normalization_method: str | None = "raw",
 ):
     """
@@ -601,19 +602,25 @@ def get_train_test_datasets_transfer(
     ds_hp, episode_coord = get_ds("d3d_hp")
     ds_hp = add_performance(ds_hp, episode_coord)
     ds_hp = ds_hp.assign_coords(ds_source="d3d_hp")
+    # TODO(ZanderKeith): Need to sort by performance here
     sorted_shots = np.argsort(ds_hp[episode_coord].values)
 
-    max_train_size = max(HP_SHOTS_INCLUDED)
-    if num_hp_shots > max_train_size:
-        logger.warning(
-            f"num_hp_shots {num_hp_shots} is greater than the maximum available {max_train_size}. Using {max_train_size} instead."
-        )
+    max_train_size = max([s for s in HP_SHOTS_INCLUDED if s is not None])
+    test_size = ds_hp.sizes[episode_coord] - max_train_size
 
-    train_shot_pool = sorted_shots[:max_train_size]
-    test_shot_pool = sorted_shots[max_train_size:]
-
+    test_shot_pool = sorted_shots[-test_size:]
     test_ds = ds_hp.isel({episode_coord: test_shot_pool})
-    train_ds_hp = ds_hp.isel({episode_coord: train_shot_pool[:num_hp_shots]})
+
+    if num_hp_shots is None:
+        # If num_hp_shots is None, put all available high-performance shots in training and testing set (this is cheating, but allows us to see the maximum theoretical performance)
+        train_ds_hp = ds_hp.isel({episode_coord: sorted_shots})
+    else:
+        if num_hp_shots > max_train_size:
+            logger.warning(
+                f"num_hp_shots {num_hp_shots} is greater than the maximum available {max_train_size}. Using {max_train_size} instead."
+            )
+        train_shot_pool = sorted_shots[:num_hp_shots]
+        train_ds_hp = ds_hp.isel({episode_coord: train_shot_pool})
 
     if training_data_case == "exnihilo":
         train_ds = train_ds_hp
