@@ -122,8 +122,8 @@ class PowerBalanceTRB(TrainRunBuilder):
             module = PowerBalanceSciML.init(
                 p_oh_predictor=p_oh_predictor,
                 p_rad_predictor=p_rad_predictor,
-                in_size=len(model_init_config["network_vars"]),
-                out_size=1,
+                in_size=model_init_config["in_size"],
+                out_size=model_init_config["out_size"],
                 nn_width=model_init_config["nn_width"],
                 nn_depth=model_init_config["nn_depth"],
                 min_taue=model_init_config.get("min_taue", None),
@@ -132,12 +132,12 @@ class PowerBalanceTRB(TrainRunBuilder):
             )
         elif model_case == "unstructured_nn":
             module = PowerBalanceUnstructuredNN.init(
-                in_size=len(model_init_config["network_vars"]),
-                out_size=1,
+                in_size=model_init_config["in_size"],
+                out_size=model_init_config["out_size"],
                 nn_width=model_init_config["nn_width"],
                 nn_depth=model_init_config["nn_depth"],
-                min_taue=model_init_config.get("min_val", None),
-                max_taue=model_init_config.get("max_val", None),
+                min_val=model_init_config.get("min_val", None),
+                max_val=model_init_config.get("max_val", None),
                 prng_seed=model_init_config.get("prng_seed", 42),
             )
         else:
@@ -160,11 +160,18 @@ class PowerBalanceTRB(TrainRunBuilder):
         return env
 
     @staticmethod
-    def get_loss_fn(config: dict) -> Callable[[Any, Any], jnp.ndarray]:
+    def get_loss_fn(loss_config: dict) -> Callable[[Any, Any], jnp.ndarray]:
         def loss_fn(pred, targ):
-            raise NotImplementedError(
-                "Loss function not implemented yet for PowerBalanceTRB. This is a placeholder."
-            )
+            device_weights = loss_config["device_weight"]
+            var_weights = loss_config["var_weight"]
+
+            wtot_loss = jnp.abs(pred.Wtot_MJ_pred - targ["Wtot_MJ"].data)
+            wtot_loss = optax.huber_loss(wtot_loss, delta=loss_config["huber_delta"])
+
+            device_weight = device_weights[targ["ds_source"].item()]
+            loss = device_weight * var_weights["Wtot_MJ"] * wtot_loss
+            # TODO(ZanderKeith): might be worthwhile to put the p_oh and p_rad in here?
+            return loss
 
         return IntegralLoss(loss_fn)
 

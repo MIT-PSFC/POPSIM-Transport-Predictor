@@ -137,9 +137,32 @@ def _make_train_config(
         raise ValueError(f"Unknown model case: {model_case}")
 
     if model_case == "scaling_law":
-        freeze_submodules = ["p_oh_predictor", "p_rad_predictor"]
+        model_init_config = {
+            "model_case": model_case,
+            "normalization_method": normalization_method,
+            "freeze_submodules": ["p_oh_predictor", "p_rad_predictor"],
+            "submodules": {
+                "p_oh_predictor": p_oh_config,
+                "p_rad_predictor": p_rad_config,
+            },
+            "restore_submodules": True,  # Always restoring pre-trained submodules in this study
+        }
     elif model_case in ["sciml", "unstructured_nn"]:
-        freeze_submodules = []
+        model_init_config = {
+            "model_case": model_case,
+            "normalization_method": normalization_method,
+            "freeze_submodules": [],
+            "nn_depth": 2,
+            "nn_width": 16,
+            "in_size": 7,  # B0, Ip, R0, a_minor, kappa, ne20_line_avg, P_aux_MW TODO(ZanderKeith): It'd be nice to put the predicted stored energy here, but that'd require passing the mapping functions into the submodules... Doable, but a bit of a pain, so maybe for a future study
+            "out_size": 1,
+            "prng_seed": 42,
+            "submodules": {
+                "p_oh_predictor": p_oh_config,
+                "p_rad_predictor": p_rad_config,
+            },
+            "restore_submodules": True,  # Always restoring pre-trained submodules in this study
+        }
     else:
         raise ValueError(f"Unknown model case: {model_case}")
 
@@ -167,16 +190,7 @@ def _make_train_config(
             "segment_length_val": None,
             "segment_overlap_val": 0,
         },
-        model_init_config={
-            "model_case": model_case,
-            "normalization_method": normalization_method,
-            "freeze_submodules": freeze_submodules,
-            "submodules": {
-                "p_oh_predictor": p_oh_config,
-                "p_rad_predictor": p_rad_config,
-            },
-            "restore_submodules": True,  # Always restoring pre-trained submodules in this study
-        },
+        model_init_config=model_init_config,
         # TODO(ZanderKeith): is the trainable getter only needed for time-independent modules?
         trainable_getter_config={},
         loss_config=loss_config_base,

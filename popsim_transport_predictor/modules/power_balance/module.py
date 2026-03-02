@@ -14,6 +14,8 @@ from popsim_transport_predictor.modules.power_balance.p_rad.module import Radiat
 
 MIN_TAUE = 0.001  # Default inimum reasonable value for tau_e [s]
 MAX_TAUE = 0.3  # Maximum reasonable value for tau_e [s]
+MIN_POWER = -20  # Minimum reasonable value for power (dW/dt) [MW]
+MAX_POWER = 20  # Maximum reasonable value for power (dW/dt) [MW]
 
 
 @chex.dataclass
@@ -429,6 +431,8 @@ class PowerBalanceSciML(PowerBalance):
 
 class PowerBalanceUnstructuredNN(PowerBalance):
     nn: eqx.Module
+    min_val: float = eqx.field(static=True)
+    max_val: float = eqx.field(static=True)
 
     def __call__(
         self, state: PowerBalance.State, inputs: PowerBalance.Inputs
@@ -445,27 +449,32 @@ class PowerBalanceUnstructuredNN(PowerBalance):
             ]
         )
         nn_out = self.nn(arr)
-        bounded_out = soft_clip(
+        # TODO(ZanderKeith) this should be predicting in beta or something
+        # at least all the inputs are in the same range...
+        Wtot_MJ_dot = soft_clip(
             nn_out, self.min_val, self.max_val, sharpness=6
         ).squeeze()
 
-        output = TauePredictorOutputs(
-            taue_pred=bounded_out,
-            debug_info={
-                "nn_out": nn_out.squeeze(),  # Squeeze to match dimensions with taue_pred
-            },
+        state_dot = PowerBalance.State(Wtot_MJ=Wtot_MJ_dot)
+        output = PowerBalance.Output(
+            Wtot_MJ_pred=state.Wtot_MJ,
+            P_cond_MW=jnp.nan,  # Not predicted in this model
+            taue_predictor_output=TauePredictorOutputs(
+                taue_pred=jnp.nan, debug_info={"nn_out": nn_out.squeeze()}
+            ),
         )
 
-        return output
+        return state_dot, output
 
+    @classmethod
     def init(
         cls,
         in_size: int,
         out_size: int,
         nn_width: int,
         nn_depth: int,
-        min_val: float = -20,
-        max_val: float = 20,
+        min_val: float | None = None,
+        max_val: float | None = None,
         prng_seed: int = 42,
     ) -> "PowerBalanceUnstructuredNN":
         nn = eqx.nn.MLP(
@@ -475,6 +484,8 @@ class PowerBalanceUnstructuredNN(PowerBalance):
             depth=nn_depth,
             key=jax.random.PRNGKey(prng_seed),
         )
+        min_val = MIN_POWER if min_val is None else min_val
+        max_val = MAX_POWER if max_val is None else max_val
         return cls(nn=nn, min_val=min_val, max_val=max_val)
 
 
@@ -521,7 +532,7 @@ class PowerBalanceEnv(ModuleTrainingEnv):
                 ne20=inputs["ne20_line_avg"],
                 P_aux_MW=inputs["P_aux_MW"],
                 Ip_MA_nn=inputs["Ip_MA"],
-                B0_nn=inputs["q95"],
+                B0_nn=inputs["q_star"],
                 R0_nn=inputs["epsilon"],
                 a_minor_nn=inputs["aB0"],
                 kappa_nn=inputs["kappa"],

@@ -273,7 +273,7 @@ def normalize_domain(  # noqa: PLR0915
             surface_area = calc_plasma_surface_area(
                 ds["R0"], ds["epsilon"], ds["kappa"]
             )
-            power_density = (ds["P_abs_MW"]) / surface_area
+            power_density = ds["P_aux_MW"] / surface_area
             return power_density
 
         for ds in [ds_source, ds_target] if ds_target is not None else [ds_source]:

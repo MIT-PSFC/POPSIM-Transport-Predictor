@@ -28,7 +28,7 @@ MODEL_CASES = {
     "power_balance": [
         "scaling_law",  # Based on scaling laws, H89, H98, and HL transition threshold between them
         "sciml",  # Neural network predicts tau_E, and we do the power balance calculation
-        # "unstructured_nn",  # Unstructured neural network directly predicts stored energy evolution
+        "unstructured_nn",  # Unstructured neural network directly predicts stored energy evolution
     ],
     # Profile predictor (needed for pre-shot trajectory optimization for upcoming DIII-D campaign)
     "profile_predictor": [
