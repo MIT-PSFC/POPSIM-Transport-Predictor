@@ -4,9 +4,19 @@ from typing import Any
 import jax.numpy as jnp
 import optax
 import xarray as xr
-from popsim.ml import DataLoader, TrainRunBuilder
+from loguru import logger
+from popsim.ml import DataLoader, IntegralLoss, TrainRunBuilder
+from popsim.ml.checkpointing import create_default_checkpoint_manager, restore_model
 from popsim.ml.dataloading import make_dataloaders
 
+from popsim_transport_predictor.modules.power_balance.module import (
+    PowerBalanceEnv,
+    PowerBalanceScalingLaw,
+    PowerBalanceSciML,
+    PowerBalanceUnstructuredNN,
+)
+from popsim_transport_predictor.modules.power_balance.p_oh.trb import OhmicPowerTRB
+from popsim_transport_predictor.modules.power_balance.p_rad.trb import RadiatedPowerTRB
 from popsim_transport_predictor.transfer_learning.orchestration.organize_data import (
     get_train_test_datasets_transfer,
     get_train_val_datasets,
@@ -80,15 +90,74 @@ class PowerBalanceTRB(TrainRunBuilder):
         Instantiate and return your model given a training DataLoader
         and a model config dict.
         """
+        model_case = model_init_config["model_case"]
+        if model_case in ["scaling_law", "sciml"]:
+            # These cases work in real units, restore the p_oh and p_rad submodules
+            p_oh_config = model_init_config["submodules"]["p_oh_predictor"]
+            p_oh_predictor = OhmicPowerTRB.model_init(
+                train_dl, p_oh_config["model_init_config"]
+            )
+            p_rad_config = model_init_config["submodules"]["p_rad_predictor"]
+            p_rad_predictor = RadiatedPowerTRB.model_init(
+                train_dl, p_rad_config["model_init_config"]
+            )
+            if model_init_config["restore_submodules"]:
+                p_oh_manager = create_default_checkpoint_manager(
+                    p_oh_config["checkpoint_dir"]
+                )
+                p_oh_predictor = restore_model(p_oh_manager, p_oh_predictor)
+                p_rad_manager = create_default_checkpoint_manager(
+                    p_rad_config["checkpoint_dir"]
+                )
+                p_rad_predictor = restore_model(p_rad_manager, p_rad_predictor)
 
-        if model_init_config["model_case"] == "scaling_law":
-            pass
-        elif model_init_config["model_case"] == "sciml":
-            pass
-        elif model_init_config["model_case"] == "unstructured_nn":
-            pass
+        if model_case == "scaling_law":
+            module = PowerBalanceScalingLaw.init(
+                p_oh_predictor=p_oh_predictor,
+                p_rad_predictor=p_rad_predictor,
+                min_taue=model_init_config.get("min_taue", None),
+                max_taue=model_init_config.get("max_taue", None),
+            )
+        elif model_case == "sciml":
+            module = PowerBalanceSciML.init(
+                p_oh_predictor=p_oh_predictor,
+                p_rad_predictor=p_rad_predictor,
+                in_size=len(model_init_config["network_vars"]),
+                out_size=1,
+                nn_width=model_init_config["nn_width"],
+                nn_depth=model_init_config["nn_depth"],
+                min_taue=model_init_config.get("min_taue", None),
+                max_taue=model_init_config.get("max_taue", None),
+                prng_seed=model_init_config.get("prng_seed", 42),
+            )
+        elif model_case == "unstructured_nn":
+            module = PowerBalanceUnstructuredNN.init(
+                in_size=len(model_init_config["network_vars"]),
+                out_size=1,
+                nn_width=model_init_config["nn_width"],
+                nn_depth=model_init_config["nn_depth"],
+                min_taue=model_init_config.get("min_val", None),
+                max_taue=model_init_config.get("max_val", None),
+                prng_seed=model_init_config.get("prng_seed", 42),
+            )
         else:
             raise ValueError(f"Invalid model case: {model_init_config['model_case']}")
+
+        env = PowerBalanceEnv(
+            module=module,
+            normalization_method=model_init_config["normalization_method"],
+            freeze_submodules=model_init_config["freeze_submodules"],
+        )
+
+        if model_init_config.get("restore_main_module", False):
+            manager = create_default_checkpoint_manager(
+                model_init_config["checkpoint_dir"]
+            )
+            env = restore_model(manager, env)
+        else:
+            logger.warning("Not restoring main module from checkpoint.")
+
+        return env
 
     @staticmethod
     def get_loss_fn(config: dict) -> Callable[[Any, Any], jnp.ndarray]:
@@ -96,6 +165,8 @@ class PowerBalanceTRB(TrainRunBuilder):
             raise NotImplementedError(
                 "Loss function not implemented yet for PowerBalanceTRB. This is a placeholder."
             )
+
+        return IntegralLoss(loss_fn)
 
         return loss_fn
 

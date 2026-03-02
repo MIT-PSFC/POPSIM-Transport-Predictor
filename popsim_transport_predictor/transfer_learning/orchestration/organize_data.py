@@ -115,11 +115,6 @@ def get_ds(
 
     # Calculate aux power and absorbed power
     ds["P_aux_MW"] = ds["P_NBI_MW"] + ds["P_ECRH_MW"] + ds["P_ICRF_MW"] + ds["P_LH_MW"]
-    ds["P_abs_MW"] = ds["P_oh_MW"] + ds["P_aux_MW"]
-
-    # Set up signals for the confinement time predictors
-    ds["ne19_line_avg"] = ds["ne20_line_avg"] * 10
-    ds["epsilon"] = ds["a_minor"] / ds["R0"]
 
     # If dataset was from a zarr store, must promote the 'time' data var to a coordinate
     if "time" not in ds.coords:
@@ -238,6 +233,9 @@ def normalize_domain(  # noqa: PLR0915
         }
 
     def _physics_normalization(ds_source: xr.Dataset, ds_target: xr.Dataset | None):
+        def _epsilon(ds: xr.Dataset) -> xr.DataArray:
+            return ds["a_minor"] / ds["R0"]
+
         def _beta(ds: xr.Dataset) -> xr.DataArray:
             avg_pressure = (
                 (2.0 / 3.0)
@@ -276,6 +274,7 @@ def normalize_domain(  # noqa: PLR0915
             return power_density
 
         for ds in [ds_source, ds_target] if ds_target is not None else [ds_source]:
+            ds["epsilon"] = _epsilon(ds)
             ds["beta"] = _beta(ds)
             ds["q_star"] = _q_star(ds)
             ds["f_G"] = _greenwald_fraction(ds)
