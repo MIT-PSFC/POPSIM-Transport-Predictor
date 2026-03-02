@@ -97,7 +97,7 @@ class RadiatedPower(TimeIndepModule):
             return RadiatedPower.Inputs(
                 ne20_real=inputs["ne20_line_avg"],
                 Ip_MA_nn=inputs["Ip_MA"],
-                B0_nn=inputs["q95"],
+                B0_nn=inputs["q_star"],
                 R0_nn=inputs["epsilon"],
                 a_minor_nn=inputs["aB0"],
                 kappa_nn=inputs["kappa"],

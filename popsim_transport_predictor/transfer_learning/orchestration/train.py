@@ -82,7 +82,14 @@ def _make_train_config(
     if normalization_method == "raw":
         input_vars = input_vars_base
     elif normalization_method == "physics":
-        input_vars = [*input_vars_base, "q_star", "f_G", "aB0", "surface_power_density"]
+        input_vars = [
+            *input_vars_base,
+            "epsilon",
+            "q_star",
+            "f_G",
+            "aB0",
+            "surface_power_density",
+        ]
     elif normalization_method == "z_score":
         input_vars = [*input_vars_base, *(f"{var}_z" for var in input_vars_base)]
     elif normalization_method == "coral":

@@ -98,7 +98,7 @@ class OhmicPower(TimeIndepModule):
             return OhmicPower.Inputs(
                 Ip_MA_real=inputs["Ip_MA"],
                 Ip_MA_nn=inputs["Ip_MA"],
-                B0_nn=inputs["q95"],
+                B0_nn=inputs["q_star"],
                 R0_nn=inputs["epsilon"],
                 a_minor_nn=inputs["aB0"],
                 kappa_nn=inputs["kappa"],

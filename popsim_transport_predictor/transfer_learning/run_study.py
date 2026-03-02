@@ -631,6 +631,7 @@ def run_study(
     clean_results: bool | None = False,
     clean_figures: bool | None = False,
     skip_visualization: bool | None = False,
+    skip_standard_learning_results: bool | None = False,
 ):
     """
     Go from datasets to all figures in one command.
@@ -745,10 +746,11 @@ def run_study(
     logger.info("ORCHESTRATION")
 
     # Standard Learning Results
-    ComputeResults.standard_learning_results(
-        model_dir=model_dir,
-        result_dir=result_dir,
-    )
+    if not skip_standard_learning_results:
+        ComputeResults.standard_learning_results(
+            model_dir=model_dir,
+            result_dir=result_dir,
+        )
 
     # Transfer Learning Results
     ComputeResults.transfer_learning_results(
