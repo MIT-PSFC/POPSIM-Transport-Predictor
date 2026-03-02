@@ -56,10 +56,9 @@ class OhmicPowerTRB(TrainRunBuilder):
     @staticmethod
     def get_loss_fn(config: dict) -> Callable[[Any, Any], jnp.ndarray]:
         def loss_fn(pred, targ):
-            device_weights = config["device_weight"]
-            weight = device_weights[targ["ds_source"].item()]
+            # TODO(ZanderKeith): Fix device weights
             absolute_error = jnp.abs(pred.P_oh_MW_pred - targ["P_oh_MW"].data)
-            return weight * jnp.mean(optax.huber_loss(absolute_error))
+            return jnp.mean(optax.huber_loss(absolute_error))
 
         return loss_fn
 

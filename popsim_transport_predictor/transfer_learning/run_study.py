@@ -11,6 +11,7 @@ from popsim_transport_predictor.transfer_learning.config import config
 from popsim_transport_predictor.transfer_learning.figures.data_visualization import (
     domain_plot,
     performance_extrapolation_plot,
+    transfer_learning_losses,
 )
 from popsim_transport_predictor.transfer_learning.orchestration import (
     DOMAIN_NORMALIZATION_METHODS,
@@ -615,6 +616,139 @@ class ModelComparison:
     """
     Performance vs Model Architectures
     """
+
+    @staticmethod
+    def plot_losses(
+        model_dir: str,
+        result_dir: str,
+        figure_dir: str,
+        training_data_cases: list[str] = TRAINING_DATA_CASES,
+        domain_normalization_methods: list[str] = DOMAIN_NORMALIZATION_METHODS,
+        model_cases: list[str] = MODEL_CASES["power_balance"],
+        hp_shots_included: list[int] = HP_SHOTS_INCLUDED,
+    ):
+        """
+        Plot transfer learning losses comparing different model architectures.
+
+        For each combination of training data case and normalization method, creates
+        a figure with two panels:
+        1. Integrated loss (mean +/- std over test samples) vs number of HP shots
+           for each model architecture.
+        2. Per-timestep loss profile for each model architecture at the highest
+           HP shot count.
+
+        Reads the evaluation result netCDF files produced by
+        ``ComputeResults.transfer_learning_results`` and computes MSE between
+        ``Wtot_MJ_pred`` and ``Wtot_MJ``.
+        """
+        import numpy as np
+
+        for training_data_case, normalization_method in product(
+            training_data_cases, domain_normalization_methods
+        ):
+            loss_ds_list = []
+            label_list = []
+
+            for model_case in model_cases:
+                integrated_means: list[float] = []
+                integrated_stds: list[float] = []
+                timestep_means_list: list[np.ndarray] = []
+                timestep_stds_list: list[np.ndarray] = []
+                valid_hp_coords: list[int] = []
+
+                for num_hp_shots in hp_shots_included:
+                    result_path = ComputeResults._result_path(
+                        result_dir=result_dir,
+                        training_data_case=training_data_case,
+                        normalization_method=normalization_method,
+                        model_case=model_case,
+                        transfer_learning=True,
+                        num_hp_shots=num_hp_shots,
+                    )
+
+                    if not os.path.exists(result_path):
+                        logger.warning(
+                            f"Result file not found: {result_path}, skipping."
+                        )
+                        continue
+
+                    eval_ds = xr.open_dataset(result_path)
+
+                    if "Wtot_MJ_pred" not in eval_ds or "Wtot_MJ" not in eval_ds:
+                        logger.warning(
+                            f"Missing Wtot_MJ prediction variables in {result_path}, skipping."
+                        )
+                        eval_ds.close()
+                        continue
+
+                    # MSE between predicted and target stored energy
+                    sq_error = (eval_ds["Wtot_MJ_pred"] - eval_ds["Wtot_MJ"]) ** 2
+
+                    # Integrated loss: mean over time steps per sample, then stats across samples
+                    integrated = sq_error.mean(dim="time_idx")
+                    integrated_means.append(float(integrated.mean()))
+                    integrated_stds.append(float(integrated.std()))
+
+                    # Per-timestep loss: stats across samples at each time step
+                    timestep_means_list.append(sq_error.mean(dim="sample").values)
+                    timestep_stds_list.append(sq_error.std(dim="sample").values)
+
+                    valid_hp_coords.append(
+                        num_hp_shots if num_hp_shots is not None else -1
+                    )
+                    eval_ds.close()
+
+                if not valid_hp_coords:
+                    continue
+
+                # Pad timestep arrays to uniform length (datasets may differ in time_idx size)
+                max_time = max(len(t) for t in timestep_means_list)
+                padded_ts_means = np.full((len(valid_hp_coords), max_time), np.nan)
+                padded_ts_stds = np.full((len(valid_hp_coords), max_time), np.nan)
+                for j, (tm, ts) in enumerate(
+                    zip(timestep_means_list, timestep_stds_list, strict=True)
+                ):
+                    padded_ts_means[j, : len(tm)] = tm
+                    padded_ts_stds[j, : len(ts)] = ts
+
+                loss_ds = xr.Dataset(
+                    {
+                        "integrated_loss_mean": ("num_hp_shots", integrated_means),
+                        "integrated_loss_std": ("num_hp_shots", integrated_stds),
+                        "timestep_loss_mean": (
+                            ["num_hp_shots", "time_idx"],
+                            padded_ts_means,
+                        ),
+                        "timestep_loss_std": (
+                            ["num_hp_shots", "time_idx"],
+                            padded_ts_stds,
+                        ),
+                    },
+                    coords={"num_hp_shots": valid_hp_coords},
+                )
+
+                loss_ds_list.append(loss_ds)
+                label_list.append(model_case)
+
+            if not loss_ds_list:
+                logger.warning(
+                    f"No transfer learning results found for "
+                    f"{training_data_case}/{normalization_method}, skipping loss plot."
+                )
+                continue
+
+            save_path = os.path.join(
+                figure_dir,
+                "model_comparison",
+                f"{training_data_case}_{normalization_method}_transfer_learning_losses.png",
+            )
+
+            transfer_learning_losses(
+                loss_ds_list=loss_ds_list,
+                label_list=label_list,
+                hp_shots_included=hp_shots_included,
+                save_path=save_path,
+            )
 
 
 class DataComparison:

@@ -41,6 +41,7 @@ MODEL_CASES = {
     ],
     "power_balance": [
         "unstructured_nn",  # Unstructured neural network directly predicts stored energy evolution
+        "sciml",
     ],
     # Profile predictor (needed for pre-shot trajectory optimization for upcoming DIII-D campaign)
     "profile_predictor": [
