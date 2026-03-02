@@ -561,6 +561,7 @@ class ComputeResults:
             result_path = ComputeResults._result_path(
                 result_dir=result_dir,
                 training_data_case=training_data_case,
+                normalization_method=normalization_method,
                 model_case=model_case,
                 transfer_learning=True,
                 num_hp_shots=num_hp_shots,
@@ -724,7 +725,7 @@ def run_study(
 
         return working_dir, model_dir, result_dir, figure_dir
 
-    working_dir, model_dir, result_dir, figure_dir = _setup_directories()
+    _working_dir, model_dir, result_dir, figure_dir = _setup_directories()
 
     ######################
     # Data Visualization #
@@ -754,7 +755,7 @@ def run_study(
 
     # Transfer Learning Results
     ComputeResults.transfer_learning_results(
-        working_dir=working_dir,
+        model_dir=model_dir,
         result_dir=result_dir,
     )
 

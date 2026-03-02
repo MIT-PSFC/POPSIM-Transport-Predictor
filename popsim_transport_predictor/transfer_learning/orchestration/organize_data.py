@@ -63,6 +63,7 @@ def concat_with_nan_padding(
         aligned_datasets,
         dim=concat_dim,
         join="outer",
+        coords="different",
         fill_value=np.nan,
     )
 
@@ -602,10 +603,10 @@ def get_train_test_datasets_transfer(
     ds_hp = ds_hp.assign_coords(ds_source="d3d_hp")
     sorted_shots = np.argsort(ds_hp[episode_coord].values)
 
-    max_train_size = len(HP_SHOTS_INCLUDED)
+    max_train_size = max(HP_SHOTS_INCLUDED)
     if num_hp_shots > max_train_size:
-        raise ValueError(
-            f"num_hp_shots {num_hp_shots} exceeds maximum available {max_train_size}"
+        logger.warning(
+            f"num_hp_shots {num_hp_shots} is greater than the maximum available {max_train_size}. Using {max_train_size} instead."
         )
 
     train_shot_pool = sorted_shots[:max_train_size]
