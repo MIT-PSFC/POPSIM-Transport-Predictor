@@ -6,7 +6,13 @@ import netCDF4  # noqa: F401
 import numpy as np
 import xarray as xr
 from disruption_py.machine.tokamak import Tokamak
-from disruption_py.settings import RetrievalSettings, TimeSetting, TimeSettingParams
+from disruption_py.settings import (
+    LogSettings,
+    RetrievalSettings,
+    TimeSetting,
+    TimeSettingParams,
+)
+from disruption_py.settings.output_setting import DatasetOutputSetting
 from disruption_py.settings.time_setting import _postprocess
 from disruption_py.workflow import get_shots_data
 from loguru import logger
@@ -175,7 +181,41 @@ class D3DDataWorkflow(DataWorkflow):
         Originally assembled by Oak Nelson.
         Reference: https://github.com/cfs-energy-internal/POPSIM/blob/datasets_d3d_mast/popsim/data/d3d/d3d_fetch_toksearch_ex.py
         """
+        import MDSplus as mds
         from toksearch import MdsSignal, Pipeline
+        from toksearch.signal.signal import Signal
+
+        class PtDataSignal(Signal):
+            """Fetches a PTDATA pointname from atlas.gat.com via MDSplus connection."""
+
+            def __init__(self, pointname: str, server: str = "atlas.gat.com"):
+                super().__init__()
+                self.pointname = pointname
+                self.server = server
+                self._connection = None
+
+            def _get_connection(self):
+                if self._connection is None:
+                    self._connection = mds.Connection(self.server)
+                return self._connection
+
+            def gather(self, shot: int) -> dict:
+                connection = self._get_connection()
+                expr = f'ptdata("{self.pointname}", {shot})'
+                data = connection.get(expr).value
+                times = connection.get(f"dim_of({expr})").value
+                return {"data": data, "times": times}
+
+            def cleanup_shot(self, shot: int):
+                pass
+
+            def cleanup(self):
+                if self._connection is not None:
+                    try:
+                        self._connection.disconnect()
+                    except Exception:
+                        pass
+                    self._connection = None
 
         def _cm3_to_m3(result_dict):
             result_dict["data"] *= 1e6
@@ -202,7 +242,20 @@ class D3DDataWorkflow(DataWorkflow):
         )  # Total stored energy
         BETAP = MdsSignal(
             r"\betapf", "pedestal", location="remote://atlas.gat.com"
-        )  # Plasma beta
+        )  # plasma poloidal beta
+        BETAN = MdsSignal(
+            r"\betan", "pedestal", location="remote://atlas.gat.com"
+        )  # Normalized plasma beta
+
+        iptipp = PtDataSignal("iptipp")
+        dstdenp = PtDataSignal("dstdenp")
+
+        gapin = MdsSignal(r"\gapin", "efit01", location="remote://atlas.gat.com")
+        gapout = MdsSignal(r"\gapout", "efit01", location="remote://atlas.gat.com")
+        rxpt1 = MdsSignal(r"\rxpt1", "efit01", location="remote://atlas.gat.com")
+        zxpt1 = MdsSignal(r"\zxpt1", "efit01", location="remote://atlas.gat.com")
+        rxpt2 = MdsSignal(r"\rxpt2", "efit01", location="remote://atlas.gat.com")
+        zxpt2 = MdsSignal(r"\zxpt2", "efit01", location="remote://atlas.gat.com")
 
         sigs_dict = {
             "betapf": betapf,
@@ -212,6 +265,15 @@ class D3DDataWorkflow(DataWorkflow):
             "ne_edge_avg": Ne_edge_avg,
             "wmhdf_toksearch": Wtot,
             "betap_toksearch": BETAP,
+            "betan_toksearch": BETAN,
+            "iptipp": iptipp,
+            "dstdenp": dstdenp,
+            "gapin": gapin,
+            "gapout": gapout,
+            "rxpt1": rxpt1,
+            "zxpt1": zxpt1,
+            "rxpt2": rxpt2,
+            "zxpt2": zxpt2,
         }
 
         p.fetch_dataset("toksearch", sigs_dict)
@@ -327,6 +389,8 @@ class D3DDataWorkflow(DataWorkflow):
                 tokamak=Tokamak.D3D,
                 shotlist_setting=shot,
                 retrieval_settings=retrieval_settings,
+                output_setting=DatasetOutputSetting(path=False),
+                log_settings=LogSettings(file_path=None),
                 num_processes=1,
             )
             fast_result = fast_result.set_index(idx=["shot", "time"]).unstack("idx")
@@ -375,6 +439,8 @@ class D3DDataWorkflow(DataWorkflow):
             tokamak=Tokamak.D3D,
             shotlist_setting=shot,
             retrieval_settings=retrieval_settings,
+            output_setting=DatasetOutputSetting(path=False),
+            log_settings=LogSettings(file_path=None),
             num_processes=1,
         )
         efit_result = efit_result.set_index(idx=["shot", "time"]).unstack("idx")
@@ -400,6 +466,8 @@ class D3DDataWorkflow(DataWorkflow):
             tokamak=Tokamak.D3D,
             shotlist_setting=shot,
             retrieval_settings=retrieval_settings,
+            output_setting=DatasetOutputSetting(path=False),
+            log_settings=LogSettings(file_path=None),
             num_processes=1,
         )
         global_result = global_result.set_index(idx=["shot", "time"]).unstack("idx")
@@ -442,6 +510,8 @@ class D3DDataWorkflow(DataWorkflow):
             tokamak=Tokamak.D3D,
             shotlist_setting=shot,
             retrieval_settings=retrieval_settings,
+            output_setting=DatasetOutputSetting(path=False),
+            log_settings=LogSettings(file_path=None),
             num_processes=1,
         )
         # Make the "time" coordinate the dimension instead of "idx"
@@ -599,6 +669,7 @@ class D3DDataWorkflow(DataWorkflow):
         ds["R0"] = ds["rmaxis"]
         ds["B0"] = np.abs(ds["bt"])
         ds["Ip_MA"] = np.abs(ds["ip"]) / 1e6  # Convert A to MA
+        ds["iptipp_MA"] = np.abs(ds["iptipp"]) / 1e6  # Convert A to MA
         ds["ne20_line_avg"] = ds["n_e"] / 1e20  # Convert m^-3 to 10^20 m^-3
         ds["ne20_edge"] = ds["ne_edge_avg"] / 1e20  # Convert m^-3 to 10^20 m^-3
 
@@ -645,6 +716,15 @@ class D3DDataWorkflow(DataWorkflow):
                 "P_ICRF_MW",
                 "P_LH_MW",
                 "tau_conf",
+                # Trajectory optimization on DIII-D
+                "iptipp_MA",
+                "dstdenp",
+                "gapin",
+                "gapout",
+                "rxpt1",
+                "zxpt1",
+                "rxpt2",
+                "zxpt2",
             ]
         ]
 

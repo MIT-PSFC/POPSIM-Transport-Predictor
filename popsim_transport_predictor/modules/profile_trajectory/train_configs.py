@@ -18,14 +18,14 @@ PROFILE_TRAJECTORY_OPTIMIZER_CONFIG = {
         "debug": True,
         "module": "profile_trajectory",
         "split_fracs": (0.8, 0.2),  # Only used for submodule training
-        "state_vars": ["Ip_MA"],
+        "state_vars": ["iptipp_MA"],  # Dummy
         "input_vars": [
-            "Ip_MA",
+            "iptipp_MA",
             "B0",
-            "beta",
-            "ne20_edge",
-            "traj_time",
-        ],  # Time is needed to know which point on the trajectory we're at
+            "betapf",
+            "dstdenp",
+            "traj_time",  # Time is needed to know which point on the trajectory we're at
+        ],
         "target_vars": [],  # Trajectory optimization doesn't have traditional targets, since it optimizes directly on the profile predictor's outputs
         "extra_vars": [
             "ne20_psi",

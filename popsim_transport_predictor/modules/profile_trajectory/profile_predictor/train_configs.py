@@ -12,17 +12,18 @@ PROFILE_PREDICTOR_SHAPE_INIT_CONFIG = {
     "epochs_per_val": 2,
     "checkpoint_dir": None,
     "dataloader_config": {
-        # Reduced set of keys, this will only ever be a submodule of the trajectory optimization
+        # DIII-D - specific keys, this will only ever be a submodule of the trajectory optimization
         "input_vars": [
-            "Ip_MA",
+            "iptipp_MA",
             "B0",
-            "beta",
-            "ne20_edge",
-            "a_minor",
-            "kappa",
-            "delta_top",
-            "delta_bottom",
-            "R0",
+            "betapf",
+            "dstdenp",
+            "gapin",
+            "gapout",
+            "idtrxbot",
+            "idtzxbot",
+            "idtrxtop",
+            "idtzxtop",
         ],
         "target_vars": ["ne20_psi", "Te_keV_psi"],
         "extra_vars": ["Te_shape", "ne_shape"],
