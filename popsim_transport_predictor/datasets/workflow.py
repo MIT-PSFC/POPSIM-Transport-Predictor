@@ -146,7 +146,7 @@ class DataWorkflow:
                 "Numpy version must be greater than 2 to run data processing workflow on all devices."
             )
 
-        zarr_path = os.path.join(self.final_ds_dir, f"{self.ds_name}.zarr")
+        zarr_path = os.path.join(self.final_ds_dir, "ds.zarr")
         if os.path.exists(zarr_path):
             print(f"Dataset already exists at {zarr_path}, skipping processing.")
             return
@@ -169,7 +169,7 @@ class DataWorkflow:
             time_dim=TIME_DIM,
             episode_dim=EPISODE_DIM,
             extend_existing=False,
-            mb_per_chunk=None,
+            mb_per_chunk=100,
         )
 
         logger.info(f"Saved processed dataset to {zarr_path}")
@@ -179,12 +179,12 @@ class DataWorkflow:
 
         # Make some diagnostic plots of the resulting dataset to check that it looks reasonable. These can be used to spot any remaining issues with the data, and to get a sense of the overall characteristics of the dataset (e.g., typical signal ranges, how many shots have valid profiles, etc.)
         ds_time_plot(
-            os.path.join(self.final_ds_dir, f"{self.ds_name}.zarr"),
+            zarr_path,
             os.path.join(self.final_ds_dir, "time_traces"),
             title=f"{self.ds_name.upper()} Dataset Time Traces",
         )
         ds_profile_plot(
-            os.path.join(self.final_ds_dir, f"{self.ds_name}.zarr"),
+            zarr_path,
             os.path.join(self.final_ds_dir, "profile_traces"),
             title=f"{self.ds_name.upper()} Dataset Profile Traces",
         )
@@ -192,10 +192,11 @@ class DataWorkflow:
     def filter_ds(self, shot_ds: xr.Dataset) -> xr.Dataset:
         """Apply filtering steps based on device config"""
 
-        # Cut all data 50ms before Ip_MA is NAN to avoid including disruptive data
+        # Cut all data 50ms before Ip_MA is NAN to avoid including obviously disruptive data
         last_valid_idx = np.where(shot_ds["Ip_MA"].notnull())[1][-1]
         valid_mask = shot_ds.time <= shot_ds.time[last_valid_idx] - 0.05
 
+        # Apply full-timeslice filters
         for var, valid_range in self.filter_config.items():
             var_mask = (
                 shot_ds[var].notnull()
@@ -209,6 +210,16 @@ class DataWorkflow:
                 f"Excluding shot {shot_ds.shot.values[0]} because all data points are invalid after filtering"
             )
             return None
+
+        # Apply individual filters that set out-of-range values to NaN, but don't drop the entire timeslice.
+        if self.individual_filter_config is not None:
+            for var, valid_range in self.individual_filter_config.items():
+                shot_ds[var] = shot_ds[var].where(
+                    (shot_ds[var].notnull())
+                    & (shot_ds[var] >= valid_range["min"])
+                    & (shot_ds[var] <= valid_range["max"]),
+                    other=np.nan,
+                )
 
         shot_ds = shot_ds.where(valid_mask, drop=True)
         return shot_ds

@@ -142,11 +142,40 @@ class D3DDataWorkflow(DataWorkflow):
             skip_profiles=skip_profiles,
         )
 
+        # If any of these signals are out of range, drop the entire timeslice
         self.filter_config = {
             "Wtot_MJ": {"min": 0.01, "max": 2},
             "ne20_line_avg": {"min": 0.01, "max": 4},
             "ne20_edge": {"min": 0.01, "max": 4},
+        }
+
+        # Set signals outside this range to nan, but don't drop the entire timeslice
+        self.individual_filter_config = {
             "P_ECRH_MW": {"min": 0, "max": 10},
+            "P_oh_MW": {
+                "min": 0,
+                "max": 7,
+            },  # 201849 P_oh signal goes crazy, remove some of those spikes
+            "P_rad_MW": {
+                "min": 0,
+                "max": 10,
+            },  # 201855 also has a crazy P_rad far out of distribution, get rid of it
+            "rxpt1": {
+                "min": 0.5,
+                "max": 2,
+            },  # Drop shape points where this is clearly wrong (-10)
+            "rxpt2": {
+                "min": 0.5,
+                "max": 2,
+            },  # Drop shape points where this is clearly wrong (-10)
+            "zxpt1": {
+                "min": -4,
+                "max": 4,
+            },  # Drop shape points where this is clearly wrong (-10)
+            "zxpt2": {
+                "min": -4,
+                "max": 4,
+            },  # Drop shape points where this is clearly wrong (-10)
         }
 
     def _get_shotlist_from_source(self) -> list[int]:
