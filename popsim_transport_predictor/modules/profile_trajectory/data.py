@@ -7,16 +7,17 @@ from popsim_transport_predictor.trajectory_optimization import IP_RAMP_SHOTS
 REQUIRED_SIGNALS = [
     "time",
     # DIII-D PCS handles these
-    "Ip_MA",
+    "iptipp_MA",
     "B0",
     "beta",
-    "ne20_edge",
+    "dstdenp",
     # Our trajectory optimization is over these variables
-    "R0",
-    "a_minor",
-    "kappa",
-    "delta_top",
-    "delta_bottom",
+    "gapin",
+    "gapout",
+    "rxpt1",
+    "zxpt1",
+    "rxpt2",
+    "zxpt2",
     # Target profiles for the loss function
     "ne20_psi",
     "Te_keV_psi",

@@ -27,13 +27,12 @@ class ProfileTrajectoryOptimizer(TimeDepModule):
     psigrid: tuple = eqx.field(static=True)
 
     # These are the things that we can control over time
-    # TODO(ZanderKeith) might be worthwhile to have a small translation layer to be more DIII-D-like
-    # What we are really controlling is R0, GapIn, RxTop, RxBot, ZxTop, ZxBot
-    R0: Array  # Major radius [m]
-    a_minor: Array  # Minor radius [m]
-    kappa: Array  # Elongation [-]
-    delta_top: Array  # Upper triangularity [-]
-    delta_bottom: Array  # Lower triangularity [-]
+    gapin: Array  # Inner gap [m]
+    gapout: Array  # Outer gap [m]
+    rxpt1: Array  # X-point 1 R [m]
+    zxpt1: Array  # X-point 1 Z [m]
+    rxpt2: Array  # X-point 2 R [m]
+    zxpt2: Array  # X-point 2 Z [m]
 
     @chex.dataclass
     class Config:
@@ -58,7 +57,7 @@ class ProfileTrajectoryOptimizer(TimeDepModule):
         # Plug in the waveforms for these in advance, and we expect them to be reasonably accurate
         Ip_MA: float  # [MA]
         B0: float  # On axis magnetic field [T]
-        ne20_edge: float  # Electron density [10^20 m^-3]
+        ne20: float  # Electron density [10^20 m^-3]
         beta: float  # Plasma beta [%]
 
     @chex.dataclass
@@ -82,47 +81,44 @@ class ProfileTrajectoryOptimizer(TimeDepModule):
 
         if trajectory is None:
             # Initialize input trajectories at the center of the input ranges
-            self.R0 = (
+            self.gapin = (
                 jnp.ones(num_times)
-                * (config.input_ranges["R0"][0] + config.input_ranges["R0"][1])
+                * (config.input_ranges["gapin"][0] + config.input_ranges["gapin"][1])
                 / 2
             )
-            self.a_minor = (
+            self.gapout = (
                 jnp.ones(num_times)
-                * (
-                    config.input_ranges["a_minor"][0]
-                    + config.input_ranges["a_minor"][1]
-                )
+                * (config.input_ranges["gapout"][0] + config.input_ranges["gapout"][1])
                 / 2
             )
-            self.kappa = (
+            self.rxpt1 = (
                 jnp.ones(num_times)
-                * (config.input_ranges["kappa"][0] + config.input_ranges["kappa"][1])
+                * (config.input_ranges["rxpt1"][0] + config.input_ranges["rxpt1"][1])
                 / 2
             )
-            self.delta_top = (
+            self.zxpt1 = (
                 jnp.ones(num_times)
-                * (
-                    config.input_ranges["delta_top"][0]
-                    + config.input_ranges["delta_top"][1]
-                )
+                * (config.input_ranges["zxpt1"][0] + config.input_ranges["zxpt1"][1])
                 / 2
             )
-            self.delta_bottom = (
+            self.rxpt2 = (
                 jnp.ones(num_times)
-                * (
-                    config.input_ranges["delta_bottom"][0]
-                    + config.input_ranges["delta_bottom"][1]
-                )
+                * (config.input_ranges["rxpt2"][0] + config.input_ranges["rxpt2"][1])
+                / 2
+            )
+            self.zxpt2 = (
+                jnp.ones(num_times)
+                * (config.input_ranges["zxpt2"][0] + config.input_ranges["zxpt2"][1])
                 / 2
             )
         else:
             # Load trajectories from the provided dictionary
-            self.R0 = trajectory["R0"]
-            self.a_minor = trajectory["a_minor"]
-            self.kappa = trajectory["kappa"]
-            self.delta_top = trajectory["delta_top"]
-            self.delta_bottom = trajectory["delta_bottom"]
+            self.gapin = trajectory["gapin"]
+            self.gapout = trajectory["gapout"]
+            self.rxpt1 = trajectory["rxpt1"]
+            self.zxpt1 = trajectory["zxpt1"]
+            self.rxpt2 = trajectory["rxpt2"]
+            self.zxpt2 = trajectory["zxpt2"]
 
     def resolve_shapes(
         self, time: float, clip_sharpness: float = 10.0
@@ -134,34 +130,40 @@ class ProfileTrajectoryOptimizer(TimeDepModule):
         )  # Ensure idx is within bounds
 
         shape_dict = {
-            "R0": soft_clip(
-                self.R0[idx],
-                self.config.input_ranges["R0"][0],
-                self.config.input_ranges["R0"][1],
+            "gapin": soft_clip(
+                self.gapin[idx],
+                self.config.input_ranges["gapin"][0],
+                self.config.input_ranges["gapin"][1],
                 sharpness=clip_sharpness,
             ),
-            "a_minor": soft_clip(
-                self.a_minor[idx],
-                self.config.input_ranges["a_minor"][0],
-                self.config.input_ranges["a_minor"][1],
+            "gapout": soft_clip(
+                self.gapout[idx],
+                self.config.input_ranges["gapout"][0],
+                self.config.input_ranges["gapout"][1],
                 sharpness=clip_sharpness,
             ),
-            "kappa": soft_clip(
-                self.kappa[idx],
-                self.config.input_ranges["kappa"][0],
-                self.config.input_ranges["kappa"][1],
+            "rxpt1": soft_clip(
+                self.rxpt1[idx],
+                self.config.input_ranges["rxpt1"][0],
+                self.config.input_ranges["rxpt1"][1],
                 sharpness=clip_sharpness,
             ),
-            "delta_top": soft_clip(
-                self.delta_top[idx],
-                self.config.input_ranges["delta_top"][0],
-                self.config.input_ranges["delta_top"][1],
+            "zxpt1": soft_clip(
+                self.zxpt1[idx],
+                self.config.input_ranges["zxpt1"][0],
+                self.config.input_ranges["zxpt1"][1],
                 sharpness=clip_sharpness,
             ),
-            "delta_bottom": soft_clip(
-                self.delta_bottom[idx],
-                self.config.input_ranges["delta_bottom"][0],
-                self.config.input_ranges["delta_bottom"][1],
+            "rxpt2": soft_clip(
+                self.rxpt2[idx],
+                self.config.input_ranges["rxpt2"][0],
+                self.config.input_ranges["rxpt2"][1],
+                sharpness=clip_sharpness,
+            ),
+            "zxpt2": soft_clip(
+                self.zxpt2[idx],
+                self.config.input_ranges["zxpt2"][0],
+                self.config.input_ranges["zxpt2"][1],
                 sharpness=clip_sharpness,
             ),
         }
@@ -176,13 +178,14 @@ class ProfileTrajectoryOptimizer(TimeDepModule):
         profile_predictor_input = ProfilePredictorInputs(
             Ip=inputs.Ip_MA,
             B0=inputs.B0,
-            ne20_edge=inputs.ne20_edge,
+            ne20=inputs.ne20,
             beta=inputs.beta,
-            R0=shape_dict["R0"],
-            a_minor=shape_dict["a_minor"],
-            kappa=shape_dict["kappa"],
-            delta_top=shape_dict["delta_top"],
-            delta_bottom=shape_dict["delta_bottom"],
+            gapin=shape_dict["gapin"],
+            gapout=shape_dict["gapout"],
+            rxpt1=shape_dict["rxpt1"],
+            zxpt1=shape_dict["zxpt1"],
+            rxpt2=shape_dict["rxpt2"],
+            zxpt2=shape_dict["zxpt2"],
             psi=jnp.array(self.psigrid),
         )
 
@@ -195,10 +198,7 @@ class ProfileTrajectoryOptimizer(TimeDepModule):
             psi=self.psigrid,
         )
 
-        # Update the state (in this case, just increment the time)
-        # This is so dumb but I want to get something to try out the other stuff for right now
-        # There *should* be a way to get the time from the coords of the inputs and just use that instead of having a separate time state
-        # this is so weird, a stateless time-dependent module. You really gotta try using a thing to understand it
+        # New dummy state
         new_state = ProfileTrajectoryOptimizer.State()
 
         return new_state, output
@@ -233,18 +233,19 @@ class ProfileTrajectoryOptimizerEnv(ModuleTrainingEnv):
     ) -> ProfileTrajectoryOptimizer.Inputs:
         return ProfileTrajectoryOptimizer.Inputs(
             traj_time=inputs["traj_time"].data,
-            Ip_MA=inputs["Ip_MA"].data,
+            Ip_MA=inputs["iptipp_MA"].data,
             B0=inputs["B0"].data,
-            ne20_edge=inputs["ne20_edge"].data,
+            ne20=inputs["dstdenp"].data / 10,
             beta=inputs["beta"].data,
         )
 
     def get_trainable(self):
         # Get only the time-dependent controllable parameters
         return {
-            "R0": self.module.R0,
-            "a_minor": self.module.a_minor,
-            "kappa": self.module.kappa,
-            "delta_top": self.module.delta_top,
-            "delta_bottom": self.module.delta_bottom,
+            "gapin": self.module.gapin,
+            "gapout": self.module.gapout,
+            "rxpt1": self.module.rxpt1,
+            "zxpt1": self.module.zxpt1,
+            "rxpt2": self.module.rxpt2,
+            "zxpt2": self.module.zxpt2,
         }

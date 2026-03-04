@@ -4,9 +4,9 @@ import xarray as xr
 from popsim_transport_predictor.trajectory_optimization import IP_RAMP_SHOTS
 
 PROG_INPUT_ERRORS = {
-    "Ip_MA": 0.007,
-    "B0": 0.009,
-    "ne20_edge": 0.04,
+    "iptipp_MA": 0.01,
+    "B0": 0.01,
+    "dstdenp": 0.4,
     "beta": 0.22,
 }
 
@@ -69,7 +69,7 @@ def get_controllable_input_ranges(
 ) -> dict[str, float]:
     """Find the characteristic distributions of controllable input parameters during the portion of the shot we are interested in
 
-    For this study, this finds the typical error of Ip, B0, ne20_edge, and beta
+    For this study, this finds the typical error of iptipp_MA, B0, dstdenp, and beta
     TODO(ZanderKeith): Yeah yeah I know to do this rigorously I'd want to look at the difference to the actual control waveforms, I'll do that if I have time
 
     Args:
@@ -101,7 +101,7 @@ def get_controllable_input_ranges(
 
     # Combine all the standard deviation "snippets" from all shots
     # We can just use a simple list merge or xr.concat if we want to keep it as an xarray object
-    ds_all_stds = xr.concat(all_chunk_stds, dim="chunk_idx")
+    ds_all_stds = xr.concat(all_chunk_stds, dim="chunk_idx", coords="different")
 
     input_ranges = {}
     for input_var in inputs:

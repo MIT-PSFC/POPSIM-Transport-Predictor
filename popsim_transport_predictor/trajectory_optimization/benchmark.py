@@ -56,7 +56,7 @@ def run_profile_predictor_evaluation(
     clean: bool | None = False,
     debug: bool | None = False,
 ):
-    model_types = ["shape_init", "direct_points"]
+    model_types = ["direct_points"]
     for model_type in model_types:
         # Generate the evaluation data for each model type if it doesn't already exist
         eval_ds_path = os.path.join(save_dir, model_type, "eval_data.nc")
@@ -186,8 +186,6 @@ def run_trajectory_evaluation(  # noqa: PLR0915
     num_shape_times_list = list(
         range(1, max_num_shape_times + 1)
     )  # [1, 2, ..., max_num_shape_times]
-    if debug:
-        num_shape_times_list = [6, 12]  # Just do a few for quick testing
     for num_shape_times in num_shape_times_list:
         case_dir = os.path.join(
             save_dir, "trajectory_evaluation", model_type, f"n_{num_shape_times}"
@@ -209,9 +207,23 @@ def run_trajectory_evaluation(  # noqa: PLR0915
                 checkpoint_dir=checkpoint_dir,
                 shape_times=shape_times,
             )
+            profile_predictor_checkpoint_dir = os.path.join(
+                save_dir, model_type, "checkpoints"
+            )
+            if not os.path.exists(profile_predictor_checkpoint_dir):
+                logger.info(
+                    "No checkpoints found for profile predictor, running profile predictor training..."
+                )
+                train_profile_predictor(
+                    ds_path,
+                    model_type,
+                    profile_predictor_checkpoint_dir,
+                    debug=False,
+                    clean=True,
+                )
             optimization_config.model_init_config["submodules"]["profile_predictor"][
                 "checkpoint_dir"
-            ] = os.path.join(save_dir, model_type, "checkpoints")
+            ] = profile_predictor_checkpoint_dir
             if not os.path.exists(checkpoint_dir) or clean:
                 logger.info(
                     f"No checkpoints found for num_shape_times={num_shape_times}, running optimization..."

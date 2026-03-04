@@ -22,7 +22,7 @@ PROFILE_TRAJECTORY_OPTIMIZER_CONFIG = {
         "input_vars": [
             "iptipp_MA",
             "B0",
-            "betapf",
+            "beta",
             "dstdenp",
             "traj_time",  # Time is needed to know which point on the trajectory we're at
         ],

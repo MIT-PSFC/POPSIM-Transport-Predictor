@@ -1,5 +1,6 @@
 import numpy as np
 import pytest
+import os
 
 from popsim_transport_predictor.config import config
 from popsim_transport_predictor.trajectory_optimization.setup import (

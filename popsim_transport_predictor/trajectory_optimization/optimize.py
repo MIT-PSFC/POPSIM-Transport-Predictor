@@ -55,7 +55,7 @@ def characterize_dataset(ds_path: str, debug: bool = False) -> None:
     ds, _ = get_ds(ds_path, debug=debug)
 
     input_ranges = get_trajectory_input_ranges(
-        ds, ["R0", "a_minor", "kappa", "delta_top", "delta_bottom"]
+        ds, ["gapin", "gapout", "rxpt1", "zxpt1", "rxpt2", "zxpt2"]
     )
 
     for input_var, stats in input_ranges.items():
@@ -66,7 +66,7 @@ def characterize_dataset(ds_path: str, debug: bool = False) -> None:
             logger.info(f"    {stat_name}: {stat_value:.5f}")
 
     controllable_input_ranges = get_controllable_input_ranges(
-        ds, ["Ip_MA", "B0", "beta", "ne20_edge"]
+        ds, ["iptipp_MA", "B0", "beta", "dstdenp"]
     )
 
     for input_var, error in controllable_input_ranges.items():
@@ -117,11 +117,12 @@ def setup_optimization_config(
 
     # Informed the dataset characterization and Jayson Barr TODO(ZanderKeith) make sure these are ok
     control_input_ranges = {
-        "R0": (1.75, 1.84),  # Major radius [m]
-        "a_minor": (0.56, 0.62),  # Minor radius [m]
-        "kappa": (1.87, 1.99),  # Elongation
-        "delta_top": (0.48, 0.92),  # Upper triangularity
-        "delta_bottom": (0.68, 0.92),  # Lower triangularity
+        "gapin": (0.01, 0.05),  # Inner gap [m]
+        "gapout": (0.06, 0.14),  # Outer gap [m]
+        "rxpt1": (1.09, 1.29),  # Lower X-point R [m]
+        "zxpt1": (-1.51, -1.12),  # Lower X-point Z [m]
+        "rxpt2": (1.08, 1.25),  # Upper X-point R [m]
+        "zxpt2": (0.9, 1.4),  # Upper X-point Z [m]
     }
 
     base_config = TrainConfig.load(PROFILE_TRAJECTORY_OPTIMIZER_CONFIG)

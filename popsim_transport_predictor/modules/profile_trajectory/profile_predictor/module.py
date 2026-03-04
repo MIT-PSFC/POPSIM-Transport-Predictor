@@ -12,7 +12,6 @@ import xarray as xr
 from jaxtyping import Array
 from popsim import TimeIndepModule
 from popsim.basis import Basis1DProtocol, BSplineBasis, InterpedLinearBasis
-from popsim.cfspopcon_jax.current_drive import calc_f_shaping, calc_q_star
 from popsim.cfspopcon_jax.geometry import calc_plasma_volume
 from popsim.ml.rtd_mlp import Activation, RtdMLP
 from scipy.constants import eV, mu_0
@@ -134,21 +133,44 @@ class Inputs:
     Ip: float  # Plasma current [MA]
     B0: float  # On-axis toroidal field [T]
     beta: float  # Plasma beta [%]
-    ne20_edge: float  # Edge electron density [10^20 m^-3]
+    ne20: float  # electron density [10^20 m^-3]
 
     # Trajectory inputs (to be modified)
-    R0: float  # Major radius [m]
-    a_minor: float  # Minor radius [m]
-    kappa: float  # Elongation [-]
-    delta_top: float  # Upper triangularity [-]
-    delta_bottom: float  # Lower triangularity [-]
+    gapin: float
+    gapout: float
+    rxpt1: float
+    zxpt1: float
+    rxpt2: float
+    zxpt2: float
 
     # Other
     psi: Array  # Toroidal flux coordinate to evaluate the profiles at
 
     @property
+    def a_minor(self):
+        a_inner = self.R0 - self.gapin
+        a_outer = self.R0 + self.gapout
+        return (a_inner + a_outer) / 2
+
+    @property
+    def R0(self):
+        return 1.67
+
+    @property
     def epsilon(self):
         return self.a_minor / self.R0
+
+    @property
+    def kappa(self):
+        b_upper = self.zxpt1
+        b_lower = -self.zxpt2
+        b_minor = (b_upper + b_lower) / 2
+        return b_minor / self.a_minor
+
+    @property
+    def fGW(self):
+        greenwald_limit = self.Ip / (jnp.pi * self.a_minor**2)
+        return self.ne20 / greenwald_limit
 
     @property
     def volume_approx(self):
@@ -163,34 +185,23 @@ class Inputs:
         pressure_Pa = self.beta * self.B0**2 / (2 * mu_0)
         pressure_eV = pressure_Pa / eV
         pressure_keV20 = pressure_eV / 1e3 / 1e20
-        temp_keV = pressure_keV20 / self.ne20_edge
+        temp_keV = pressure_keV20 / self.ne20
         return temp_keV
 
     @property
-    def q_star(self):
-        delta = (self.delta_top + self.delta_bottom) / 2
-        f_shaping = calc_f_shaping(self.epsilon, self.kappa, delta)
-        return calc_q_star(
-            magnetic_field_on_axis=self.B0,
-            major_radius=self.R0,
-            inverse_aspect_ratio=self.epsilon,
-            plasma_current=self.Ip,
-            f_shaping=f_shaping,
-        )
-
-    @property
     def nn_inputs(self):
-        """An incomplete attempt at having maximally device-independent normalized inputs."""
         inp_array = jnp.array(
             [
+                self.Ip,
                 self.B0,
-                self.q_star,
-                self.epsilon,
-                self.kappa,
-                self.delta_top,
-                self.delta_bottom,
-                self.ne20_edge,
                 self.beta,
+                self.ne20,
+                self.gapin,
+                self.gapout,
+                self.rxpt1,
+                self.zxpt1,
+                self.rxpt2,
+                self.zxpt2,
             ]
         )
         return inp_array
@@ -435,7 +446,7 @@ class ProfilePredictorDirectPoints(ProfilePredictor):
 
         key, subkey = jax.random.split(key)
         self.nn = RtdMLP(
-            in_size=8,
+            in_size=10,
             out_size=(n_points * 2) + 2,  # +2 for the correction factors
             width_size=nn_width,
             depth=nn_depth,
@@ -448,15 +459,16 @@ class ProfilePredictorDirectPoints(ProfilePredictor):
     def __call__(self, inputs: Inputs | xr.Dataset, debug: bool = False) -> Outputs:
         if isinstance(inputs, xr.Dataset):
             inputs = Inputs(
-                Ip=inputs["Ip_MA"].data,
+                Ip=inputs["iptipp_MA"].data,
                 B0=inputs["B0"].data,
                 beta=inputs["beta"].data,
-                ne20_edge=inputs["ne20_edge"].data,
-                R0=inputs["R0"].data,
-                a_minor=inputs["a_minor"].data,
-                kappa=inputs["kappa"].data,
-                delta_top=inputs["delta_top"].data,
-                delta_bottom=inputs["delta_bottom"].data,
+                ne20=inputs["dstdenp"].data / 10,
+                gapin=inputs["gapin"].data,
+                gapout=inputs["gapout"].data,
+                rxpt1=inputs["rxpt1"].data,
+                zxpt1=inputs["zxpt1"].data,
+                rxpt2=inputs["rxpt2"].data,
+                zxpt2=inputs["zxpt2"].data,
                 psi=jnp.array(self.psigrid),
             )
 
@@ -472,14 +484,10 @@ class ProfilePredictorDirectPoints(ProfilePredictor):
         # Interpolate the predicted points to the psigrid
         ne = (
             jnp.interp(inputs.psi, self.psi_points, ne_points)
-            * inputs.ne20_edge
+            * inputs.ne20
             * ne_correction
         )
-        te = (
-            jnp.interp(inputs.psi, self.psi_points, te_points)
-            * inputs.te_approx
-            * te_correction
-        )
+        te = jnp.interp(inputs.psi, self.psi_points, te_points) * te_correction
 
         out = Outputs(
             ne=xr.DataArray(data=ne, dims=("psi",), coords={"psi": list(self.psigrid)}),
