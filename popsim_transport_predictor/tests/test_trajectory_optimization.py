@@ -1,6 +1,8 @@
 import numpy as np
 import pytest
 import os
+from popsim_transport_predictor import PACKAGE_ROOT
+import chex
 
 from popsim_transport_predictor.config import config
 from popsim_transport_predictor.trajectory_optimization.setup import (
@@ -10,6 +12,25 @@ from popsim_transport_predictor.trajectory_optimization.setup import (
 from popsim_transport_predictor.modules.profile_trajectory.data import get_ds
 from popsim_transport_predictor.modules.profile_trajectory.module import (
     ProfileTrajectoryOptimizer,
+)
+from popsim.ml import TrainConfig, Trainer
+from popsim.ml.launch import launch_train
+from popsim_transport_predictor.modules.profile_trajectory.profile_predictor.trb import (
+    ProfilePredictorTRB,
+)
+from popsim_transport_predictor.modules.profile_trajectory.trb import (
+    ProfileTrajectoryOptimizerTRB,
+)
+from popsim_transport_predictor.trajectory_optimization.optimize import (
+    setup_optimization_config,
+    train_profile_predictor,
+)
+from popsim_transport_predictor.trajectory_optimization.plotting import (
+    profile_comparison,
+    trajectory_performance_comparison,
+)
+from popsim_transport_predictor.trajectory_optimization.setup import (
+    make_optimization_dataset,
 )
 
 
@@ -93,4 +114,116 @@ def test_resolve_shapes():
             clipped_max = max_val + 0.001
             assert clipped_min <= shapes[shape_name] <= clipped_max, (
                 f"Shape {shape_name} at time {time} is out of range: {shapes[shape_name]} not in [{min_val}, {max_val}]"
+            )
+
+
+def test_optimization_training():
+    """Ensure the right things are getting changed in the trajectory optimization
+    1. Confirm we aren't accidentally modifying our world model during optimization
+    2. Confirm the optimization actually modifies the trajectory parameters
+    """
+    save_dir = os.path.join(PACKAGE_ROOT, "tests", "test_trajectory_optimization")
+    case_dir = os.path.join(save_dir, "predictor_unchanged")
+    ds_path = config.d3d_dataset_path
+    model_type = "direct_points"
+
+    checkpoint_dir = os.path.join(case_dir, "checkpoints")
+    shape_times = np.linspace(2.0, 5.0, 4).tolist()
+    shape_times = [round(t, 1) for t in shape_times]  # Round to nearest 10th
+    optimization_config = setup_optimization_config(
+        ds_path,
+        model_type,
+        debug=True,
+        checkpoint_dir=checkpoint_dir,
+        shape_times=shape_times,
+    )
+    optimization_config.model_init_config["submodules"]["profile_predictor"][
+        "checkpoint_dir"
+    ] = os.path.join(save_dir, model_type, "checkpoints")
+    profile_predictor_checkpoint_dir = os.path.join(save_dir, model_type, "checkpoints")
+
+    predictor_trainer, _, _ = train_profile_predictor(
+        ds_path,
+        model_type,
+        profile_predictor_checkpoint_dir,
+        debug=True,
+        clean=True,
+    )
+    optimization_config.model_init_config["submodules"]["profile_predictor"][
+        "checkpoint_dir"
+    ] = profile_predictor_checkpoint_dir
+
+    optimization_trainer, _, aug_dl, _, _test_results = launch_train(
+        optimization_config.model_dump(), use_wandb=False
+    )
+
+    _, train_dl, _, _test_dl = ProfileTrajectoryOptimizerTRB.get_dataloaders(
+        optimization_config.dataloader_config
+    )
+    optimization_trainer_restored = Trainer(
+        model=ProfileTrajectoryOptimizerTRB.model_init(
+            train_dl, optimization_config.model_init_config
+        ),
+        loss_fn=ProfileTrajectoryOptimizerTRB.get_loss_fn(
+            optimization_config.loss_config
+        ),
+        optimizer=ProfileTrajectoryOptimizerTRB.get_optimizer(
+            optimization_config.optimizer_config
+        ),
+        checkpoint_dir=checkpoint_dir,
+    )
+
+    optimization_trainer_restored.restore_best_checkpoint()
+
+    # The parameters of the profile predictor submodule should be identical between all three cases:
+    # 1. The profile predictor trained on its own
+    # 2. The profile predictor as part of the optimization trainer, after training
+    # 3. The profile predictor as part of the optimization trainer, after restoring from checkpoint
+    predictor_params = predictor_trainer.train_state.model.nn
+    optimization_params = (
+        optimization_trainer.train_state.model.module.profile_predictor.nn
+    )
+    restored_params = (
+        optimization_trainer_restored.train_state.model.module.profile_predictor.nn
+    )
+    (
+        chex.assert_trees_all_equal(predictor_params, optimization_params),
+        "Profile predictor parameters should be unchanged during optimization training",
+    )
+    (
+        chex.assert_trees_all_equal(predictor_params, restored_params),
+        "Profile predictor parameters should be unchanged after restoring optimization checkpoint",
+    )
+
+    initial_model = ProfileTrajectoryOptimizerTRB.model_init(
+        train_dl, optimization_config.model_init_config
+    )
+
+    initial_trajectory = {
+        var: getattr(initial_model.module, var)
+        for var in optimization_config.model_init_config["input_ranges"].keys()
+    }
+    optimized_trajectory = {
+        var: getattr(optimization_trainer.train_state.model.module, var)
+        for var in optimization_config.model_init_config["input_ranges"].keys()
+    }
+    restored_trajectory = {
+        var: getattr(optimization_trainer_restored.train_state.model.module, var)
+        for var in optimization_config.model_init_config["input_ranges"].keys()
+    }
+
+    # Assert optimized and restored trajectories are the same, and different from the initial trajectory
+    for var in optimization_config.model_init_config["input_ranges"].keys():
+        (
+            chex.assert_trees_all_equal(
+                optimized_trajectory[var], restored_trajectory[var]
+            ),
+            f"Optimized and restored trajectories should be the same for {var}",
+        )
+        with pytest.raises(AssertionError):
+            (
+                chex.assert_trees_all_equal(
+                    initial_trajectory[var], optimized_trajectory[var]
+                ),
+                f"Optimized trajectory should be different from initial trajectory for {var}",
             )
