@@ -36,6 +36,7 @@ from popsim_transport_predictor.trajectory_optimization.optimize import (
 from popsim_transport_predictor.trajectory_optimization.plotting import (
     profile_comparison,
     trajectory_performance_comparison,
+    trajectory_shapes_comparison,
 )
 from popsim_transport_predictor.trajectory_optimization.setup import (
     make_optimization_dataset,
@@ -315,7 +316,7 @@ def run_trajectory_evaluation(  # noqa: PLR0915
         )
         ds_perf = _peaking_factor(ds_ref)
         ds_perf_list.append(ds_perf)
-        ds_perf_labels.append(f"Optimized n={num_shape_times}")
+        ds_perf_labels.append(f"N={num_shape_times}")
 
     trajectory_performance_comparison(
         ds_perf_list=ds_perf_list,
@@ -327,10 +328,108 @@ def run_trajectory_evaluation(  # noqa: PLR0915
     )
 
 
+def plot_trajectory_shapes(
+    ds_path: str | None = config.d3d_dataset_path,
+    save_dir: str | None = SAVE_DIR,
+    model_type: str | None = "direct_points",
+    max_num_shape_times: int | None = MAX_NUM_SHAPE_TIMES,
+    shape_time_min: float | None = SHAPE_TIME_MIN,
+    shape_time_max: float | None = SHAPE_TIME_MAX,
+    debug: bool | None = False,
+):
+    """Plot trajectory shapes over time"""
+
+    trajectory_shapes = []
+    trajectory_labels = []
+    num_shape_times_list = list(
+        range(1, max_num_shape_times + 1)
+    )  # [1, 2, ..., max_num_shape_times]
+    if debug:
+        num_shape_times_list = [
+            max_num_shape_times
+        ]  # Just plot the max one for debugging
+    for num_shape_times in num_shape_times_list:
+        case_dir = os.path.join(
+            save_dir, "trajectory_evaluation", model_type, f"n_{num_shape_times}"
+        )
+        checkpoint_dir = os.path.join(case_dir, "checkpoints")
+        shape_times = np.linspace(
+            shape_time_min, shape_time_max, num_shape_times
+        ).tolist()
+        shape_times = [round(t, 1) for t in shape_times]  # Round to nearest 10th
+        optimization_config = setup_optimization_config(
+            ds_path,
+            model_type,
+            checkpoint_dir=checkpoint_dir,
+            shape_times=shape_times,
+        )
+        profile_predictor_checkpoint_dir = os.path.join(
+            save_dir, model_type, "checkpoints"
+        )
+        optimization_config.model_init_config["submodules"]["profile_predictor"][
+            "checkpoint_dir"
+        ] = profile_predictor_checkpoint_dir
+        if not os.path.exists(checkpoint_dir):
+            logger.warning(
+                f"No checkpoints found for num_shape_times={num_shape_times}, skipping shape plotting..."
+            )
+            continue
+
+        _, train_dl, _, _test_dl = ProfileTrajectoryOptimizerTRB.get_dataloaders(
+            optimization_config.dataloader_config
+        )
+        optimization_trainer = Trainer(
+            model=ProfileTrajectoryOptimizerTRB.model_init(
+                train_dl, optimization_config.model_init_config
+            ),
+            loss_fn=ProfileTrajectoryOptimizerTRB.get_loss_fn(
+                optimization_config.loss_config
+            ),
+            optimizer=ProfileTrajectoryOptimizerTRB.get_optimizer(
+                optimization_config.optimizer_config
+            ),
+            checkpoint_dir=checkpoint_dir,
+        )
+        optimization_trainer.restore_best_checkpoint()
+
+        optimized_trajectory = {
+            var: getattr(optimization_trainer.train_state.model.module, var)
+            for var in optimization_config.model_init_config["input_ranges"].keys()
+        }
+        optimized_trajectory["shape_times"] = (
+            optimization_trainer.train_state.model.module.config.shape_times
+        )
+
+        trajectory_shapes.append(optimized_trajectory)
+        trajectory_labels.append(f"N={num_shape_times}")
+
+    # Only need to load the evaluation data once since it contains the original trajectory shapes
+    ds, _episode_coord = get_ds(
+        optimization_config.dataloader_config["ds_path"],
+        fresh_profiles=False,  # Use all timesteps for trajectory optimization
+        debug=optimization_config.dataloader_config["debug"],
+    )
+    ds_aug = make_optimization_dataset(
+        ds=ds,
+        debug=True,
+        prng_seed=optimization_config.dataloader_config["prng_seed"],
+    )
+
+    trajectory_shapes_comparison(
+        trajectory_shapes,
+        trajectory_labels,
+        orig_traj=ds_aug,
+        save_dir=os.path.join(
+            save_dir, "trajectory_evaluation", model_type, "shape_comparison"
+        ),
+    )
+
+
 if __name__ == "__main__":
     fire.Fire(
         {
             "run_profile_predictor_evaluation": run_profile_predictor_evaluation,
             "run_trajectory_evaluation": run_trajectory_evaluation,
+            "plot_trajectory_shapes": plot_trajectory_shapes,
         }
     )

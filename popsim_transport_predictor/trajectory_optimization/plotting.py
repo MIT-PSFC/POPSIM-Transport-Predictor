@@ -245,3 +245,28 @@ def trajectory_performance_comparison(
             os.path.join(save_dir, f"performance_comparison_{perf_label.lower()}.png")
         )
         plt.close(fig)
+
+
+def trajectory_shapes_comparison(
+    trajectory_shapes: list[dict],
+    trajectory_labels: list[str],
+    orig_traj: xr.Dataset,
+    save_dir: str,
+):
+    """For each trajectory shape variable, plot the variable over time in the original shots,
+    and compare against the optimized trajectory shapes for each num_shape_times
+
+    Args:
+        trajectory_shapes: list of dicts containing trajectory shapes and their times
+        trajectory_labels: list of labels for each trajectory
+        orig_traj: dataset containing original shots
+
+    """
+
+    trajectory_vars = [
+        var for var in trajectory_shapes[0].keys() if var != "shape_times"
+    ]
+
+    _fig, _axes = plt.subplots(
+        len(trajectory_vars), 1, figsize=(12, 4 * len(trajectory_shapes))
+    )
