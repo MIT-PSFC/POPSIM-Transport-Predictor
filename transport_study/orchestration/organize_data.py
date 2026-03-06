@@ -8,11 +8,7 @@ from popsim.ml.split_utils import split_dataset_by_fracs
 from scipy.constants import mu_0
 from scipy.linalg import fractional_matrix_power
 
-from transport_study.transfer_learning.config import config
-from transport_study.transfer_learning.orchestration import (
-    HP_SHOTS_INCLUDED,
-    TRAIN_VAL_SPLIT,
-)
+from transport_study.config import TRAIN_VAL_SPLIT, config
 
 MAX_DS_SIZE_GB = 100  # If the dataset is larger than this, do not load into memory
 
@@ -605,7 +601,8 @@ def get_train_test_datasets_transfer(
     # TODO(ZanderKeith): Need to sort by performance here
     sorted_shots = np.argsort(ds_hp[episode_coord].values)
 
-    max_train_size = max([s for s in HP_SHOTS_INCLUDED if s is not None])
+    # TODO(ZanderKeith): Fix this
+    max_train_size = 30  # max([s for s in HP_SHOTS_INCLUDED if s is not None])
     test_size = ds_hp.sizes[episode_coord] - max_train_size
 
     test_shot_pool = sorted_shots[-test_size:]

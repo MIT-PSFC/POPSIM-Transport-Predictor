@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 
 from dynaconf import Dynaconf
+from pydantic_settings import BaseSettings, SettingsConfigDict
 
 try:
     from popsim.data import get_path_to_ml_data_dump, get_path_to_ml_data_scratch
@@ -23,11 +24,39 @@ except ImportError:
 # Get package root directory
 PACKAGE_ROOT = os.path.dirname(os.path.abspath(__file__))
 
+# 80/20 between train/val
+# 80/20 between train+val/test
+TRAIN_VAL_SPLIT = (0.8, 0.2)
+TRAIN_VAL_TEST_SPLIT = (0.64, 0.16, 0.2)
+
+
 # Main config for environment variables
-config = Dynaconf(
-    envvar_prefix="PTPS",
-    load_dotenv=True,
-)
+class StudyConfig(BaseSettings):
+    """Configuration for dataset paths."""
+
+    study_name: str = "transport_sample"
+
+    debug: bool = False  # Debug does everything but with reduced scope (less data, fewer epochs, etc.)
+    dry_run: bool = False  # Dry run skips training and evaluation and just runs the orchestration logic to make sure everything is set up correctly
+
+    cmod_dataset_path: Path | None = None
+    tcv_dataset_path: Path | None = None
+    d3d_lp_dataset_path: Path | None = None
+    d3d_hp_dataset_path: Path | None = None
+
+    d3d: dict = {}
+    cmod: dict = {}
+    tcv: dict = {}
+
+    model_config = SettingsConfigDict(
+        env_prefix="PTPS_",  # Put in .env like PTPS_CMOD_DATASET_PATH
+        env_file=".env",
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
+
+
+config = StudyConfig()
 
 # Device-specific configs loaded separately to avoid namespace collisions
 config.d3d = Dynaconf(

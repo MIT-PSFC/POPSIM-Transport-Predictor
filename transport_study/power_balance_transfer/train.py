@@ -13,11 +13,11 @@ import os
 from popsim.ml import TrainConfig
 from popsim.ml.launch import launch_train
 from popsim.modules.transport_predictor.train_configs import update_submodule_configs
+from transport_study.transfer_learning.config import config
 
 from transport_study.modules.power_balance.p_oh.trb import OhmicPowerTRB
 from transport_study.modules.power_balance.p_rad.trb import RadiatedPowerTRB
 from transport_study.modules.power_balance.trb import PowerBalanceTRB
-from transport_study.transfer_learning.config import config
 
 
 def _make_train_config(

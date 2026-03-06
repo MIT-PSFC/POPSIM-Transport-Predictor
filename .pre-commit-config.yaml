@@ -13,11 +13,11 @@ repos:
         entry: uv run ruff format
         language: system
         types: [python]
-        files: "^popsim_transport_predictor/"
+        files: "^transport_study/"
       - id: ruff_check
         name: ruff_check
         entry: uv run ruff check --fix
         language: system
         types: [python]
-        files: "^popsim_transport_predictor/"
-        exclude: "^popsim_transport_predictor/tests/"
+        files: "^transport_study/"
+        exclude: "^transport_study/tests/"

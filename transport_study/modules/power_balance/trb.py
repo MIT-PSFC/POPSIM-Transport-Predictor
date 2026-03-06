@@ -17,7 +17,7 @@ from transport_study.modules.power_balance.module import (
 )
 from transport_study.modules.power_balance.p_oh.trb import OhmicPowerTRB
 from transport_study.modules.power_balance.p_rad.trb import RadiatedPowerTRB
-from transport_study.transfer_learning.orchestration.organize_data import (
+from transport_study.orchestration.organize_data import (
     get_train_test_datasets_transfer,
     get_train_val_datasets,
 )
