@@ -117,8 +117,8 @@ def setup_optimization_config(
 
     # Informed the dataset characterization and Jayson Barr TODO(ZanderKeith) make sure these are ok
     control_input_ranges = {
-        "gapin": (0.01, 0.05),  # Inner gap [m]
-        "gapout": (0.06, 0.14),  # Outer gap [m]
+        "gapin": (0.01, 0.12),  # Inner gap [m]
+        "gapout": (0.06, 0.15),  # Outer gap [m]
         "rxpt1": (1.09, 1.29),  # Lower X-point R [m]
         "zxpt1": (-1.51, -1.12),  # Lower X-point Z [m]
         "rxpt2": (1.08, 1.25),  # Upper X-point R [m]

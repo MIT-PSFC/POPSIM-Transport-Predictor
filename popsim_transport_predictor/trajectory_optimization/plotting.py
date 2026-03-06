@@ -247,26 +247,213 @@ def trajectory_performance_comparison(
         plt.close(fig)
 
 
-def trajectory_shapes_comparison(
+def trajectory_shapes_comparison(  # noqa: PLR0912, PLR0915
     trajectory_shapes: list[dict],
     trajectory_labels: list[str],
     orig_traj: xr.Dataset,
     save_dir: str,
+    input_ranges: dict[str, tuple[float, float]] | None = None,
 ):
-    """For each trajectory shape variable, plot the variable over time in the original shots,
-    and compare against the optimized trajectory shapes for each num_shape_times
+    """For each trajectory shape variable, plot in a 3-column layout:
+    - Col 0: all original shots (grey) + optimized trajectories
+    - Col 1: 201XXX-series shots (faint, colored by shot) + optimized trajectories
+    - Col 2: 199XXX-series shots (faint, colored by shot) + optimized trajectories
+    Allowed min/max bounds from input_ranges are shown as dashed lines when provided.
 
     Args:
         trajectory_shapes: list of dicts containing trajectory shapes and their times
         trajectory_labels: list of labels for each trajectory
         orig_traj: dataset containing original shots
+        save_dir: directory to save the figure
+        input_ranges: optional dict mapping each trajectory var to (min, max) bounds
 
     """
+
+    if not os.path.exists(save_dir):
+        os.makedirs(save_dir)
 
     trajectory_vars = [
         var for var in trajectory_shapes[0].keys() if var != "shape_times"
     ]
+    n_vars = len(trajectory_vars)
 
-    _fig, _axes = plt.subplots(
-        len(trajectory_vars), 1, figsize=(12, 4 * len(trajectory_shapes))
+    # 3 columns: [all-grey, 201xxx series, 199xxx series]
+    col_titles = ["All shots", "201XXX shots", "199XXX shots"]
+    fig, axes_grid = plt.subplots(n_vars, 3, figsize=(18, 4 * n_vars), sharex=False)
+    # Normalise to 2-D array regardless of n_vars
+    if n_vars == 1:
+        axes_grid = axes_grid.reshape(1, 3)
+
+    fig.patch.set_facecolor(BACKGROUND_COLOR)
+
+    pred_colors = ["cyan", "lime", "orange", "magenta", "yellow", "deepskyblue"]
+    orig_palette = plt.cm.tab20.colors  # 20 distinct colors for original shots
+
+    shot_alts = orig_traj["shot_alt"].values
+
+    def _shot_number(shot_alt: str) -> str:
+        return str(shot_alt).split("_")[0]
+
+    unique_shot_numbers = list(dict.fromkeys(_shot_number(sa) for sa in shot_alts))
+    shot_color_map = {
+        sn: orig_palette[i % len(orig_palette)]
+        for i, sn in enumerate(unique_shot_numbers)
+    }
+
+    # Classify shot_alts into series
+    def _series(shot_alt: str) -> str:
+        sn = _shot_number(shot_alt)
+        if sn.startswith("201"):
+            return "201"
+        if sn.startswith("199"):
+            return "199"
+        return "other"
+
+    def _style_ax(ax: plt.Axes) -> None:
+        ax.set_facecolor(FACE_COLOR)
+        ax.grid(True, color="gray", linestyle="--", linewidth=0.5)
+        ax.tick_params(axis="both", labelsize=TICK_FONTSIZE, colors=TEXT_COLOR)
+        for spine in ax.spines.values():
+            spine.set_color(TEXT_COLOR)
+
+    def _plot_orig_shots(
+        ax: plt.Axes, var: str, series_filter: str | None, colored: bool
+    ) -> None:
+        """Plot original shot trajectories on ax.  If series_filter is set, only
+        shots from that series are drawn.  colored=True uses per-shot colors;
+        colored=False uses grey."""
+        if var not in orig_traj:
+            return
+        labeled: set[str] = set()
+        for shot_alt in shot_alts:
+            sn = _shot_number(shot_alt)
+            if series_filter is not None and not sn.startswith(series_filter):
+                continue
+            ds_shot = orig_traj.sel(shot_alt=shot_alt)
+            t = ds_shot["time"].values
+            v = ds_shot[var].values
+            valid = ~np.isnan(t) & ~np.isnan(v)
+            if not valid.any():
+                continue
+            color = shot_color_map[sn] if colored else "gray"
+            alpha = 1.0 if colored else 0.2
+            lw = 1.5 if colored else 1
+            label = sn if (colored and sn not in labeled) else None
+            ax.plot(
+                t[valid],
+                v[valid],
+                color=color,
+                alpha=alpha,
+                linewidth=lw,
+                zorder=1,
+                label=label,
+            )
+            labeled.add(sn)
+
+    def _plot_optimized(ax: plt.Axes, var: str) -> None:
+        for i, (traj, label) in enumerate(
+            zip(trajectory_shapes, trajectory_labels, strict=True)
+        ):
+            shape_times = np.array(traj["shape_times"])
+            var_vals = np.array(traj[var])
+            color = pred_colors[i % len(pred_colors)]
+            ax.plot(
+                shape_times,
+                var_vals,
+                color=color,
+                linewidth=2,
+                marker="o",
+                markersize=8,
+                label=label,
+                zorder=2,
+            )
+
+    def _plot_bounds(ax: plt.Axes, var: str) -> None:
+        if input_ranges is None or var not in input_ranges:
+            return
+        lo, hi = input_ranges[var]
+        ax.axhline(
+            lo,
+            color="red",
+            linewidth=2.0,
+            linestyle="--",
+            alpha=0.9,
+            zorder=4,
+            label="Bounds",
+        )
+        ax.axhline(hi, color="red", linewidth=2.0, linestyle="--", alpha=0.9, zorder=4)
+
+    for row, var in enumerate(trajectory_vars):
+        ax_all, ax_201, ax_199 = axes_grid[row]
+
+        for ax in (ax_all, ax_201, ax_199):
+            _style_ax(ax)
+
+        # Column 0: grey originals + optimized
+        _plot_orig_shots(ax_all, var, series_filter=None, colored=False)
+        _plot_optimized(ax_all, var)
+        _plot_bounds(ax_all, var)
+
+        # Column 1: 201XXX shots (colored) only
+        _plot_orig_shots(ax_201, var, series_filter="201", colored=True)
+        _plot_bounds(ax_201, var)
+
+        # Column 2: 199XXX shots (colored) only
+        _plot_orig_shots(ax_199, var, series_filter="199", colored=True)
+        _plot_bounds(ax_199, var)
+
+        ax_all.set_ylabel(var, fontsize=LABEL_FONTSIZE, color=TEXT_COLOR)
+
+        # Only label x-axis on the bottom row
+        if row == n_vars - 1:
+            for ax in (ax_all, ax_201, ax_199):
+                ax.set_xlabel("Time [s]", fontsize=LABEL_FONTSIZE, color=TEXT_COLOR)
+
+    # Sync y-axis limits across all three columns for each row
+    for row in range(n_vars):
+        row_axes = axes_grid[row]
+        all_ylims = [ax.get_ylim() for ax in row_axes]
+        combined_lo = min(lo for lo, _ in all_ylims)
+        combined_hi = max(hi for _, hi in all_ylims)
+        for ax in row_axes:
+            ax.set_ylim(combined_lo, combined_hi)
+
+    # Column titles on the top row
+    for ax, title in zip(axes_grid[0], col_titles, strict=True):
+        ax.set_title(title, fontsize=TITLE_FONTSIZE, color=TEXT_COLOR, pad=6)
+
+    # Single figure-level legend aggregated from all axes (deduped)
+    seen_labels: set[str] = set()
+    legend_handles: list = []
+    legend_label_list: list[str] = []
+    # Gather optimized + bounds labels first (from col 0), then shot labels (cols 1+2)
+    for col in range(3):
+        for row in range(n_vars):
+            for handle, label in zip(
+                *axes_grid[row, col].get_legend_handles_labels(), strict=True
+            ):
+                if label not in seen_labels:
+                    seen_labels.add(label)
+                    legend_handles.append(handle)
+                    legend_label_list.append(label)
+
+    legend = fig.legend(
+        legend_handles,
+        legend_label_list,
+        fontsize=LEGEND_FONTSIZE - 4,
+        facecolor=BACKGROUND_COLOR,
+        edgecolor=BACKGROUND_COLOR,
+        loc="lower center",
+        bbox_to_anchor=(0.5, -0.02),
+        bbox_transform=fig.transFigure,
+        ncols=min(len(legend_handles), 8),
     )
+    for text in legend.get_texts():
+        text.set_color(TEXT_COLOR)
+
+    fig.tight_layout()
+    fig.savefig(
+        os.path.join(save_dir, "trajectory_shapes_comparison.png"),
+        bbox_inches="tight",
+    )
+    plt.close(fig)

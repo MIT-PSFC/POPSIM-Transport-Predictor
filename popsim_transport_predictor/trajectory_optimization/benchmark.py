@@ -185,8 +185,8 @@ def run_trajectory_evaluation(  # noqa: PLR0915
     debug: bool | None = False,
 ):
     num_shape_times_list = list(
-        range(1, max_num_shape_times + 1)
-    )  # [1, 2, ..., max_num_shape_times]
+        range(1, max_num_shape_times + 1, 2)
+    )  # [1, 3, 5, ..., max_num_shape_times]
     for num_shape_times in num_shape_times_list:
         case_dir = os.path.join(
             save_dir, "trajectory_evaluation", model_type, f"n_{num_shape_times}"
@@ -211,7 +211,10 @@ def run_trajectory_evaluation(  # noqa: PLR0915
             profile_predictor_checkpoint_dir = os.path.join(
                 save_dir, model_type, "checkpoints"
             )
-            if not os.path.exists(profile_predictor_checkpoint_dir):
+            # Only need to train the profile predictor once for the first one since it's the same for all the different trajectory optimizations
+            if (not os.path.exists(profile_predictor_checkpoint_dir) or clean) and (
+                num_shape_times == num_shape_times_list[0]
+            ):
                 logger.info(
                     "No checkpoints found for profile predictor, running profile predictor training..."
                 )
@@ -342,8 +345,8 @@ def plot_trajectory_shapes(
     trajectory_shapes = []
     trajectory_labels = []
     num_shape_times_list = list(
-        range(1, max_num_shape_times + 1)
-    )  # [1, 2, ..., max_num_shape_times]
+        range(1, max_num_shape_times + 1, 2)
+    )  # [1, 3, 5, ..., max_num_shape_times]
     if debug:
         num_shape_times_list = [
             max_num_shape_times
@@ -422,6 +425,7 @@ def plot_trajectory_shapes(
         save_dir=os.path.join(
             save_dir, "trajectory_evaluation", model_type, "shape_comparison"
         ),
+        input_ranges=optimization_config.model_init_config["input_ranges"],
     )
 
 

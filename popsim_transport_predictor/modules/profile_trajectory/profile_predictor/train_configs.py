@@ -80,8 +80,8 @@ PROFILE_PREDICTOR_DIRECT_POINTS_CONFIG = {
         "model_type": "direct_points",
         "shape_type": ShapeType.CONVEX_COMBINATION.value,
         "n_points": 13,
-        "nn_depth": 2,
-        "nn_width": 16,
+        "nn_depth": 3,
+        "nn_width": 20,
         "prng_seed": 42,
     },
     "loss_config": {
