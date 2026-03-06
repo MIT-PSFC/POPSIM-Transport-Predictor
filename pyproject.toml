@@ -14,6 +14,7 @@ dependencies = [
     "fire>=0.7.1",
     "pydantic-settings>=2.12.0",
     "dynaconf>=3.2.12",
+    "wandb>=0.25.0",
 ]
 
 [dependency-groups]

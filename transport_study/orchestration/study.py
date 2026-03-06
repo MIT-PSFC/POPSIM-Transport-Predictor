@@ -1,11 +1,11 @@
 import os
-from abc import abstractmethod
+from abc import ABC, abstractmethod
 from dataclasses import dataclass
 
 from loguru import logger
 
 
-class Study:
+class Study(ABC):
     """A class for organizing various components of a study, essentially outlining everything that needs to be done
     to go from raw data to comparison figures.
     - Paths to source data

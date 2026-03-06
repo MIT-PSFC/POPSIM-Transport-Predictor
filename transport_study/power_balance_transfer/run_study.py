@@ -16,6 +16,9 @@ class PowerBalanceStudy(Study):
     HYPERPARAM_FREEZE_SUBMODULES = True
     HYPERPARAM_DATA_NORMALIZATION = "coral"
 
+    ##################
+    # INITIALIZATION #
+    ##################
     @dataclass
     class Case(Study.Case):
         """
@@ -48,6 +51,9 @@ class PowerBalanceStudy(Study):
 
         num_hp_shots: The number of high-performance shots included in the training data, or None to include all high-performance shots (including all shots in training is cheating, but again answers the question of what is the best possible performance).
         """
+
+        def __str__(self):
+            return f"case.{self.model_type}.{self.training_data}.{self.data_normalization}.{self.domain_adaptation}.freezesub_{self.freeze_submodules}.hp_{self.num_hp_shots})"
 
         model_type: str  # scaling_law, sciml, unstructured_nn
         training_data: str  # cmod, tcv, cmod_tcv, exnihilo
@@ -117,7 +123,6 @@ class PowerBalanceStudy(Study):
         )
         return transfer_case
 
-    # Build in hyperparameter tuning logic but return dummy stuff for the time being, run hyperparameter tuning later.
     def make_cases(
         self,
         model_types,
@@ -245,14 +250,48 @@ class PowerBalanceStudy(Study):
         logger.info(f"Freeze submodules options: {freeze_submodules_options}")
         logger.info(f"Number of high-performance shots options: {num_hp_shots_options}")
 
+    ###########
+    # PATHING #
+    ###########
+    def result_path(self, case: Case) -> str:
+        """Given a case, return the path where the results for that case should be stored."""
+        return os.path.join(self.result_dir, str(case), "eval_data.nc")
 
-def run_case(
-    case: PowerBalanceStudy.Case,
-):
-    """Run a single case of the study, including training and evaluation.
-    This is the function that would be called by a job submission script when parallelism is enabled, so it should check if the results for this case already exist and skip if so,
-    and it should also check if the prereq case has been run and if not, either run that case first or raise an error.
-    """
+    def trained_model_dir(self, case: Case) -> str:
+        """Given a case, return the path where the trained model checkpoints for that case should be stored."""
+        return os.path.join(self.model_dir, str(case))
+
+    #############
+    # EXECUTION #
+    #############
+    def check_prereq_satisfied(self, case: Case) -> bool:
+        """Check if the prerequisites for this case have been satisfied by looking for the existence of the result path"""
+        if case.prereq is None:
+            return True
+        prereq_result_path = self.result_path(case.prereq)
+
+        return os.path.exists(prereq_result_path)
+
+    def run_case(
+        self,
+        case: Study.Case,
+    ):
+        """Run a single case of the study, including hyperparameter tuning, training, and evaluation as needed."""
+        if self.check_prereq_satisfied(case):
+            if case.prereq is None:
+                # No prerequisite case, so we know it's a hyperparameter tuning case
+                logger.info(f"Running hyperparameter tuning for case: {case}")
+            else:
+                logger.info(f"Running case: {case}")
+                if config.dry_run:
+                    result_path = self.result_path(case)
+                    os.makedirs(os.path.dirname(result_path), exist_ok=True)
+                    with open(result_path, "w") as f:
+                        f.write("This is a dummy result file for dry run.")
+        else:
+            logger.debug(
+                f"Prerequisite for case {case} not satisfied yet. Skipping for now."
+            )
 
 
 def run_study(  # noqa: PLR0915
@@ -269,6 +308,7 @@ def run_study(  # noqa: PLR0915
     clean_results: bool | None = False,
     clean_figures: bool | None = False,
     skip_visualization: bool | None = False,
+    skip_tuning: bool | None = False,
 ):
     """
     Go from datasets to all figures in one command.
@@ -303,6 +343,8 @@ def run_study(  # noqa: PLR0915
         If True, delete any existing figures in the figure directory before running.
     skip_visualization : bool | None
         If True, skip data visualization steps.
+    skip_tuning : bool | None
+        If True, skip hyperparameter tuning steps.
     """
 
     def _validate_args(
@@ -333,6 +375,15 @@ def run_study(  # noqa: PLR0915
                 freeze_submodules_options = [True, False]
             if num_hp_shots_options is None:
                 num_hp_shots_options = [0, 1, 3, 10, 30, None]
+
+            return (
+                model_types,
+                training_datasets,
+                data_normalization_methods,
+                domain_adaptation_methods,
+                freeze_submodules_options,
+                num_hp_shots_options,
+            )
 
         (
             model_types,
@@ -474,6 +525,19 @@ def run_study(  # noqa: PLR0915
     ########################
     logger.info("ORCHESTRATION")
 
+    unfinished_cases = [
+        case for case in study.cases if not os.path.exists(study.result_path(case))
+    ]
+    while len(unfinished_cases) > 0:
+        for case in unfinished_cases:
+            study.run_case(case)
+
+        # Check which cases are still unfinished
+        unfinished_cases = [
+            case for case in unfinished_cases if not study.check_prereq_satisfied(case)
+        ]
+        logger.info(f"{len(unfinished_cases)} cases remaining.")
+
     ############################
     # Training Data Comparison #
     ############################
@@ -489,6 +553,5 @@ if __name__ == "__main__":
     fire.Fire(
         {
             "run_study": run_study,
-            "run_case": run_case,
         }
     )
