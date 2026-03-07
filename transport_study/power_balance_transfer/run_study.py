@@ -53,7 +53,7 @@ class PowerBalanceStudy(Study):
         """
 
         def __str__(self):
-            return f"case.{self.model_type}.{self.training_data}.{self.data_normalization}.{self.domain_adaptation}.freezesub_{self.freeze_submodules}.hp_{self.num_hp_shots})"
+            return f"case.{self.model_type}.td_{self.training_data}.dn_{self.data_normalization}.da_{self.domain_adaptation}.freezesub_{self.freeze_submodules}.hp_{self.num_hp_shots})"
 
         model_type: str  # scaling_law, sciml, unstructured_nn
         training_data: str  # cmod, tcv, cmod_tcv, exnihilo
@@ -264,34 +264,66 @@ class PowerBalanceStudy(Study):
     #############
     # EXECUTION #
     #############
+    def check_data_requirements(self, case: Case) -> bool:
+        """Given a case, check if the required data for that case is available. If not, return False and print a message indicating what data is missing."""
+        required_datasets = set()
+
+        if case.training_data in ["cmod", "cmod_tcv"]:
+            required_datasets.add("cmod")
+        if case.training_data in ["tcv", "cmod_tcv"]:
+            required_datasets.add("tcv")
+        if case.training_data == "exnihilo" or case.domain_adaptation in [
+            "mixing",
+            "transfer",
+        ]:
+            required_datasets.add("d3d_hp")
+
+        missing_datasets = [
+            ds for ds in required_datasets if ds not in self.dataset_paths.keys()
+        ]
+        if len(missing_datasets) > 0:
+            logger.warning(
+                f"Case {case} is missing required datasets: {missing_datasets}. Skipping this case."
+            )
+            return False
+
+        return True
+
     def check_prereq_satisfied(self, case: Case) -> bool:
         """Check if the prerequisites for this case have been satisfied by looking for the existence of the result path"""
         if case.prereq is None:
             return True
         prereq_result_path = self.result_path(case.prereq)
-
         return os.path.exists(prereq_result_path)
 
     def run_case(
         self,
         case: Study.Case,
     ):
-        """Run a single case of the study, including hyperparameter tuning, training, and evaluation as needed."""
+        """Run a single case of the study, including hyperparameter tuning, training, and evaluation as needed.
+
+        If case or a prereq is in progress, simply return and let orchestration loop try again later.
+        """
+        if not self.check_data_requirements(case):
+            return
+
         if self.check_prereq_satisfied(case):
             if case.prereq is None:
                 # No prerequisite case, so we know it's a hyperparameter tuning case
                 logger.info(f"Running hyperparameter tuning for case: {case}")
-            else:
-                logger.info(f"Running case: {case}")
-                if config.dry_run:
-                    result_path = self.result_path(case)
-                    os.makedirs(os.path.dirname(result_path), exist_ok=True)
-                    with open(result_path, "w") as f:
-                        f.write("This is a dummy result file for dry run.")
+                # do some necessary stuff and return if we're not done yet
+
+            logger.info(f"Running case: {case}")
+            if config.dry_run:
+                result_path = self.result_path(case)
+                os.makedirs(os.path.dirname(result_path), exist_ok=True)
+                with open(result_path, "w") as f:
+                    f.write("This is a dummy result file for dry run.")
         else:
             logger.debug(
-                f"Prerequisite for case {case} not satisfied yet. Skipping for now."
+                f"Prerequisite for case {case} not satisfied yet,\nrunning prerequisite case {case.prereq} first."
             )
+            self.run_case(case.prereq)
 
 
 def run_study(  # noqa: PLR0915
@@ -433,7 +465,7 @@ def run_study(  # noqa: PLR0915
                         f"Invalid domain adaptation method: {domain_adaptation}. Must be one of None, 'mixing', or 'transfer'."
                     )
 
-        _validate_args(
+        _check_args(
             model_types,
             training_datasets,
             data_normalization_methods,
@@ -525,8 +557,12 @@ def run_study(  # noqa: PLR0915
     ########################
     logger.info("ORCHESTRATION")
 
+    # Unfinished cases are those we have data to run but haven't gotten results for yet
     unfinished_cases = [
-        case for case in study.cases if not os.path.exists(study.result_path(case))
+        case
+        for case in study.cases
+        if not os.path.exists(study.result_path(case))
+        and study.check_data_requirements(case)
     ]
     while len(unfinished_cases) > 0:
         for case in unfinished_cases:
