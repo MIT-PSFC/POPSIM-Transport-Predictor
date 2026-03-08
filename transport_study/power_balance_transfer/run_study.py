@@ -65,7 +65,10 @@ class PowerBalanceStudy(Study):
         """
 
         def __str__(self):
-            return f"case.{self.model_type}.td_{self.training_data}.dn_{self.data_normalization}.da_{self.domain_adaptation}.freezesub_{self.freeze_submodules}.hp_{self.num_hp_shots}"
+            if self.domain_adaptation:
+                return f"case.{self.model_type}.td_{self.training_data}.dn_{self.data_normalization}.da_{self.domain_adaptation}.freezesub_{self.freeze_submodules}.hp_{self.num_hp_shots}"
+            else:
+                return f"case.{self.model_type}.td_{self.training_data}.dn_None.freezesub_{self.freeze_submodules}"
 
         model_type: str  # scaling_law, sciml, unstructured_nn
         training_data: str  # cmod, tcv, cmod_tcv, exnihilo
@@ -76,7 +79,7 @@ class PowerBalanceStudy(Study):
             None  # If not None, the submodule predictions get weighted according to this value
         )
         num_hp_shots: int | None = (
-            None  # Number of high-performance shots included in training, or None for all (also None if domain_adaptation is None)
+            None  # Number of high-performance shots included in training, or None for all (should be -1 if domain_adaptation is None)
         )
         # So that's 3 (model type) x 4 (training data) x 4 (normalization) x 3 (domain adaptation) x 2 (freeze or not) x 6 (hp shots included) = 1728 results
         # Even less since the hyperparameter tuning is only done for a subset of cases
@@ -85,16 +88,27 @@ class PowerBalanceStudy(Study):
         )
 
         def __hash__(self):
-            return hash(
-                (
-                    self.model_type,
-                    self.training_data,
-                    self.data_normalization,
-                    self.domain_adaptation,
-                    self.freeze_submodules,
-                    self.num_hp_shots,
+            if self.domain_adaptation:
+                return hash(
+                    (
+                        self.model_type,
+                        self.training_data,
+                        self.data_normalization,
+                        self.domain_adaptation,
+                        self.freeze_submodules,
+                        self.num_hp_shots,
+                    )
                 )
-            )
+            else:
+                return hash(
+                    (
+                        self.model_type,
+                        self.training_data,
+                        self.data_normalization,
+                        self.domain_adaptation,
+                        self.freeze_submodules,
+                    )
+                )
 
     def _is_hyperparam_case(self, case: Case) -> bool:
         if case.domain_adaptation is None and case.num_hp_shots is None:
@@ -106,7 +120,42 @@ class PowerBalanceStudy(Study):
                 return True
         return False
 
-    def _get_hyperparam_prereq(self, model_type: str) -> Case:
+    def _get_submodule_prereqs(
+        self,
+        model_type: str,
+        training_data: str,
+        data_normalization: str,
+        domain_adaptation: str,
+        freeze_submodules: bool,
+        num_hp_shots: int | None,
+    ) -> list[Case] | None:
+        """Certain types of main modules rely on pretrained submodules"""
+        if model_type in ["scaling_law", "sciml"]:
+            return [
+                self.Case(
+                    model_type="p_oh",
+                    training_data=training_data,
+                    data_normalization=data_normalization,
+                    domain_adaptation=domain_adaptation,
+                    freeze_submodules=freeze_submodules,
+                    num_hp_shots=num_hp_shots,
+                ),
+                self.Case(
+                    model_type="p_rad",
+                    training_data=training_data,
+                    data_normalization=data_normalization,
+                    domain_adaptation=domain_adaptation,
+                    freeze_submodules=freeze_submodules,
+                    num_hp_shots=num_hp_shots,
+                ),
+            ]
+        else:
+            return None
+
+    def _get_hyperparam_prereq(
+        self,
+        model_type: str,
+    ) -> Case:
         """Get the hyperparameter tuning case that this case depends on,
         which is the case with the same model type (same architecture) but with
         values set by the HYPERPARAM_ constants
@@ -117,6 +166,15 @@ class PowerBalanceStudy(Study):
             data_normalization=self.HYPERPARAM_DATA_NORMALIZATION,
             domain_adaptation=None,
             freeze_submodules=self.HYPERPARAM_FREEZE_SUBMODULES,
+            num_hp_shots=-1,  # Use -1 as a placeholder, gotta pass something but it should NEVER be used when domain_adaptation is None
+            prereqs=self._get_submodule_prereqs(
+                model_type=model_type,
+                training_data=self.HYPERPARAM_TRAINING_DATASET,
+                data_normalization=self.HYPERPARAM_DATA_NORMALIZATION,
+                domain_adaptation=None,
+                freeze_submodules=self.HYPERPARAM_FREEZE_SUBMODULES,
+                num_hp_shots=-1,
+            ),
         )
         return hyperparam_case
 
@@ -135,15 +193,25 @@ class PowerBalanceStudy(Study):
             and data_normalization == self.HYPERPARAM_DATA_NORMALIZATION
             and freeze_submodules == self.HYPERPARAM_FREEZE_SUBMODULES
         )
+        if is_hyperparam:
+            prereqs = self._get_hyperparam_prereq(model_type)
+        else:
+            prereqs = self._get_submodule_prereqs(
+                model_type,
+                training_data,
+                data_normalization,
+                domain_adaptation=None,  # Relies on the case with same settings but no domain adaptation
+                freeze_submodules=freeze_submodules,
+                num_hp_shots=-1,
+            )
+
         transfer_case = self.Case(
             model_type=model_type,
             training_data=training_data,
             data_normalization=data_normalization,
             domain_adaptation=None,
             freeze_submodules=freeze_submodules,
-            prereqs=None
-            if is_hyperparam
-            else [self._get_hyperparam_prereq(model_type)],
+            prereqs=prereqs,
         )
         return transfer_case
 
