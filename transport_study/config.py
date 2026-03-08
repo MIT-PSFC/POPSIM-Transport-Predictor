@@ -39,6 +39,12 @@ class StudyConfig(BaseSettings):
     debug: bool = False  # Debug does everything but with reduced scope (less data, fewer epochs, etc.)
     dry_run: bool = False  # Dry run skips training and evaluation and just runs the orchestration logic to make sure everything is set up correctly
 
+    partition: str
+    hyperparam_sweeps: int = 1000
+    max_epochs: int = 2000
+    epochs_per_val: int = 20
+    wandb_entity: str
+
     cmod_dataset_path: Path | None = None
     tcv_dataset_path: Path | None = None
     d3d_lp_dataset_path: Path | None = None
@@ -57,6 +63,11 @@ class StudyConfig(BaseSettings):
 
 
 config = StudyConfig()
+
+if config.debug:
+    config.max_epochs = 2
+    config.epochs_per_val = 1
+    config.hyperparam_sweeps = 2
 
 # Device-specific configs loaded separately to avoid namespace collisions
 config.d3d = Dynaconf(

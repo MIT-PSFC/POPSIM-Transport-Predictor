@@ -3,6 +3,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 
 from loguru import logger
+from popsim.ml import TrainConfig
 
 
 class Study(ABC):
@@ -34,6 +35,16 @@ class Study(ABC):
         """Given a case, return the path where the results for that case should be stored"""
         raise NotImplementedError
 
+    def check_prereq_satisfied(self, case: Case) -> bool:
+        """Check if the prerequisites for this case have been satisfied by looking for the existence of the result path"""
+        if case.prereqs is None:
+            return True
+        for prereq in case.prereqs:
+            prereq_result_path = self.result_path(prereq)
+            if not os.path.exists(prereq_result_path):
+                return False
+        return True
+
     @abstractmethod
     def trained_model_dir(self, case: Case) -> str:
         """Given a case, return the path where the trained model checkpoints for that case should be stored"""
@@ -50,7 +61,6 @@ class Study(ABC):
         working_dir_base: str,
         dataset_paths: dict[str, str],
         cases: list[Case],
-        debug: bool = False,
     ):
         """
         Initialize this study with the given name, dataset paths, and cases.
@@ -58,7 +68,6 @@ class Study(ABC):
         self.name = name
         self.dataset_paths = dataset_paths
         self.cases = cases
-        self.debug = debug
 
         self.working_dir = os.path.join(working_dir_base, name)
         self.model_dir = os.path.join(self.working_dir, "models")
@@ -74,3 +83,37 @@ class Study(ABC):
         logger.info(f"Study name: {name}")
         logger.info(f"Working directory base: {working_dir_base}")
         logger.info(f"Total number of cases: {len(cases)}")
+
+
+def update_submodule_configs(main_config: dict, submodules: list[str]) -> TrainConfig:
+    new_submodule_configs = {}
+    for submodule in submodules:
+        submodule_config = main_config["model_init_config"]["submodules"][submodule]
+        if not isinstance(submodule_config, dict):
+            submodule_config = submodule_config.model_dump()
+
+        submodule_config["project"] = (
+            f"{main_config['project']}.{submodule_config['project']}"
+        )
+
+        # Set the data_train_run_builder for the submodules to match the main module's train_run_builder.
+        submodule_config["dataloader_config"]["data_train_run_builder"] = main_config[
+            "train_run_builder"
+        ]
+
+        # Ensure there is a perfect match between the dataloader configs of the main module and the submodules,
+        # excepting the state_vars, input_vars, target_vars, and extra_vars which are specific to each submodule.
+        for key in main_config["dataloader_config"].keys():
+            if key not in ["state_vars", "input_vars", "target_vars", "extra_vars"]:
+                submodule_config["dataloader_config"][key] = main_config[
+                    "dataloader_config"
+                ][key]
+
+        # Replacing target nans is only relevant to the main module
+        submodule_config["dataloader_config"]["replace_target_nans"] = False
+
+        new_submodule_configs[submodule] = submodule_config
+
+    main_config["model_init_config"]["submodules"] = new_submodule_configs
+
+    return TrainConfig(**main_config)

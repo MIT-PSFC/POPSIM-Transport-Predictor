@@ -1,3 +1,4 @@
+import json
 import os
 import shutil
 from dataclasses import dataclass
@@ -5,10 +6,21 @@ from itertools import product
 
 import fire
 from loguru import logger
+from popsim.ml import TrainConfig
+from popsim.ml.launch import launch_agent, launch_sweep, launch_train
 
 from transport_study import PACKAGE_ROOT
 from transport_study.config import config
-from transport_study.orchestration.study import Study
+from transport_study.modules.power_balance.p_oh.trb import OhmicPowerTRB
+from transport_study.modules.power_balance.p_rad.trb import RadiatedPowerTRB
+from transport_study.modules.power_balance.trb import PowerBalanceTRB
+from transport_study.orchestration.slurm_utils import count_running_jobs
+from transport_study.orchestration.study import Study, update_submodule_configs
+from transport_study.orchestration.wandb_utils import (
+    get_completed_runs,
+    get_sweep_id,
+    run_clean_sweeps,
+)
 
 
 class PowerBalanceStudy(Study):
@@ -53,7 +65,7 @@ class PowerBalanceStudy(Study):
         """
 
         def __str__(self):
-            return f"case.{self.model_type}.td_{self.training_data}.dn_{self.data_normalization}.da_{self.domain_adaptation}.freezesub_{self.freeze_submodules}.hp_{self.num_hp_shots})"
+            return f"case.{self.model_type}.td_{self.training_data}.dn_{self.data_normalization}.da_{self.domain_adaptation}.freezesub_{self.freeze_submodules}.hp_{self.num_hp_shots}"
 
         model_type: str  # scaling_law, sciml, unstructured_nn
         training_data: str  # cmod, tcv, cmod_tcv, exnihilo
@@ -68,7 +80,7 @@ class PowerBalanceStudy(Study):
         )
         # So that's 3 (model type) x 4 (training data) x 4 (normalization) x 3 (domain adaptation) x 2 (freeze or not) x 6 (hp shots included) = 1728 results
         # Even less since the hyperparameter tuning is only done for a subset of cases
-        prereq: Study.Case | None = (
+        prereqs: list[Study.Case] | None = (
             None  # If not None, this case depends on the results of another case, and should only be run after that case has been run
         )
 
@@ -83,6 +95,16 @@ class PowerBalanceStudy(Study):
                     self.num_hp_shots,
                 )
             )
+
+    def _is_hyperparam_case(self, case: Case) -> bool:
+        if case.domain_adaptation is None and case.num_hp_shots is None:
+            if (
+                case.training_data == self.HYPERPARAM_TRAINING_DATASET
+                and case.freeze_submodules == self.HYPERPARAM_FREEZE_SUBMODULES
+                and case.data_normalization == self.HYPERPARAM_DATA_NORMALIZATION
+            ):
+                return True
+        return False
 
     def _get_hyperparam_prereq(self, model_type: str) -> Case:
         """Get the hyperparameter tuning case that this case depends on,
@@ -119,7 +141,9 @@ class PowerBalanceStudy(Study):
             data_normalization=data_normalization,
             domain_adaptation=None,
             freeze_submodules=freeze_submodules,
-            prereq=None if is_hyperparam else self._get_hyperparam_prereq(model_type),
+            prereqs=None
+            if is_hyperparam
+            else [self._get_hyperparam_prereq(model_type)],
         )
         return transfer_case
 
@@ -162,13 +186,36 @@ class PowerBalanceStudy(Study):
                     and freeze_submodules == self.HYPERPARAM_FREEZE_SUBMODULES
                     and data_normalization == self.HYPERPARAM_DATA_NORMALIZATION
                 ):
-                    # So, we only do hyperparameter tuning for a specific subset of cases, and then use those hyperparameters for all others.
+                    if model_type in ["sciml", "scaling_law"]:
+                        # sciml and scaling law cases have p_oh and p_rad submodules, which must be trained beforehand
+                        prereqs = [
+                            self.Case(
+                                model_type="p_oh",
+                                training_data=self.HYPERPARAM_TRAINING_DATASET,
+                                data_normalization=self.HYPERPARAM_DATA_NORMALIZATION,
+                                domain_adaptation=None,
+                                freeze_submodules=self.HYPERPARAM_FREEZE_SUBMODULES,
+                            ),
+                            self.Case(
+                                model_type="p_rad",
+                                training_data=self.HYPERPARAM_TRAINING_DATASET,
+                                data_normalization=self.HYPERPARAM_DATA_NORMALIZATION,
+                                domain_adaptation=None,
+                                freeze_submodules=self.HYPERPARAM_FREEZE_SUBMODULES,
+                            ),
+                        ]
+                    elif model_type in ["unstructured_nn", "p_oh", "p_rad"]:
+                        prereqs = None
+                    else:
+                        raise ValueError(f"Unknown model type: {model_type}")
+
                     case = self.Case(
                         model_type=model_type,
                         training_data=training_dataset,
                         data_normalization=data_normalization,
                         domain_adaptation=None,
                         freeze_submodules=freeze_submodules,
+                        prereqs=prereqs,
                     )
                 else:
                     case = self.Case(
@@ -178,7 +225,7 @@ class PowerBalanceStudy(Study):
                         domain_adaptation=domain_adaptation,
                         freeze_submodules=freeze_submodules,
                         num_hp_shots=num_hp_shots,
-                        prereq=self._get_hyperparam_prereq(model_type),
+                        prereqs=[self._get_hyperparam_prereq(model_type)],
                     )
             # 2. For transfer learning, we need to already have a trained model first
             elif domain_adaptation == "transfer":
@@ -189,12 +236,14 @@ class PowerBalanceStudy(Study):
                     domain_adaptation=domain_adaptation,
                     freeze_submodules=freeze_submodules,
                     num_hp_shots=num_hp_shots,
-                    prereq=self._get_transfer_prereq(
-                        model_type,
-                        training_dataset,
-                        data_normalization,
-                        freeze_submodules,
-                    ),
+                    prereqs=[
+                        self._get_transfer_prereq(
+                            model_type,
+                            training_dataset,
+                            data_normalization,
+                            freeze_submodules,
+                        )
+                    ],
                 )
             # 3. For mixing, we only need the hyperparameter tuning to be done already
             elif domain_adaptation == "mixing":
@@ -205,7 +254,7 @@ class PowerBalanceStudy(Study):
                     domain_adaptation=domain_adaptation,
                     freeze_submodules=freeze_submodules,
                     num_hp_shots=num_hp_shots,
-                    prereq=self._get_hyperparam_prereq(model_type),
+                    prereqs=[self._get_hyperparam_prereq(model_type)],
                 )
             else:
                 continue
@@ -225,7 +274,6 @@ class PowerBalanceStudy(Study):
         domain_adaptation_methods: list[str],
         freeze_submodules_options: list[bool],
         num_hp_shots_options: list[int | None],
-        debug: bool = False,
     ):
         cases = self.make_cases(
             model_types,
@@ -235,7 +283,7 @@ class PowerBalanceStudy(Study):
             freeze_submodules_options,
             num_hp_shots_options,
         )
-        super().__init__(name, working_dir_base, dataset_paths, cases, debug)
+        super().__init__(name, working_dir_base, dataset_paths, cases)
 
         logger.info(f"C-Mod dataset path: {dataset_paths.get('cmod', 'Not provided')}")
         logger.info(f"TCV dataset path: {dataset_paths.get('tcv', 'Not provided')}")
@@ -250,16 +298,31 @@ class PowerBalanceStudy(Study):
         logger.info(f"Freeze submodules options: {freeze_submodules_options}")
         logger.info(f"Number of high-performance shots options: {num_hp_shots_options}")
 
-    ###########
-    # PATHING #
-    ###########
+    ####################
+    # PATHING / NAMING #
+    ####################
+    def trained_model_dir(self, case: Case) -> str:
+        """Given a case, return the path where the trained model checkpoints for that case should be stored."""
+        return os.path.join(self.model_dir, str(case))
+
     def result_path(self, case: Case) -> str:
         """Given a case, return the path where the results for that case should be stored."""
         return os.path.join(self.result_dir, str(case), "eval_data.nc")
 
-    def trained_model_dir(self, case: Case) -> str:
-        """Given a case, return the path where the trained model checkpoints for that case should be stored."""
-        return os.path.join(self.model_dir, str(case))
+    def tuned_config_path(self, case: Case) -> str:
+        """Given a case, return the path where the tuned hyperparameters for that case should be stored"""
+        hyperparam_case = self._get_hyperparam_prereq(case.model_type)
+        return os.path.join(self.model_dir, str(hyperparam_case), "tuned_config.yaml")
+
+    def wandb_project_name(self, case: Case) -> str:
+        """Given a case, return the wandb project name to use for that case"""
+        return f"{self.name}.{case}"
+
+    def sweep_job_name(self, case: Case) -> str:
+        return f"sweep_{case}"
+
+    def train_job_name(self, case: Case) -> str:
+        return f"train_{case}"
 
     #############
     # EXECUTION #
@@ -289,58 +352,318 @@ class PowerBalanceStudy(Study):
 
         return True
 
-    def check_prereq_satisfied(self, case: Case) -> bool:
-        """Check if the prerequisites for this case have been satisfied by looking for the existence of the result path"""
-        if case.prereq is None:
-            return True
-        prereq_result_path = self.result_path(case.prereq)
-        return os.path.exists(prereq_result_path)
-
-    def run_case(
+    def run_case(  # noqa: PLR0912
         self,
         case: Study.Case,
+        skip_tuning: bool,
+        enable_parallelism: bool,
     ):
         """Run a single case of the study, including hyperparameter tuning, training, and evaluation as needed.
 
         If case or a prereq is in progress, simply return and let orchestration loop try again later.
         """
         if not self.check_data_requirements(case):
-            return
+            raise ValueError(
+                f"Case {case} does not have the required data to run. This should have been caught earlier!"
+            )
 
         if self.check_prereq_satisfied(case):
-            if case.prereq is None:
-                # No prerequisite case, so we know it's a hyperparameter tuning case
-                logger.info(f"Running hyperparameter tuning for case: {case}")
-                # do some necessary stuff and return if we're not done yet
+            logger.info(f"RUNNING CASE: {case}")
+            # Prereq is satisfied, can run this case.
+            if self._is_hyperparam_case(case):
+                if skip_tuning:
+                    logger.info("Skipping hyperparameter tuning")
+                    # Copy default config for this module and put it in the trained model dir so the rest of the workflow can find it
+                    default_config = self.make_train_config(case)
+                    tuned_config_path = self.tuned_config_path(case)
+                    os.makedirs(os.path.dirname(tuned_config_path), exist_ok=True)
+                    with open(tuned_config_path, "w") as f:
+                        json.dump(default_config.model_dump(), f, indent=4)
+                else:
+                    logger.info("Checking if hyperparameter tuning is already done")
+                    tuned_config_path = self.tuned_config_path(case)
+                    if os.path.exists(tuned_config_path):
+                        logger.info(
+                            f"Hyperparameter tuning completed, tuned config found at {tuned_config_path}"
+                        )
+                    else:
+                        completed_runs = get_completed_runs(
+                            self.wandb_project_name(case)
+                        )
+                        if len(completed_runs) > config.hyperparam_sweeps:
+                            logger.info(
+                                f"Hyperparameter sweeps completed with {len(completed_runs)} runs"
+                            )
+                            # Check if there are any running jobs for this case
+                            if enable_parallelism:
+                                running_jobs = count_running_jobs(
+                                    self.sweep_job_name(case), config.partition
+                                )
+                                if len(running_jobs) > 0:
+                                    logger.info(
+                                        f"Found {len(running_jobs)} running jobs, waiting for them to complete before proceeding"
+                                    )
+                                    return
+                        else:
+                            logger.info(
+                                f"Hyperparameter sweeps incomplete, {len(completed_runs)} out of {config.hyperparam_sweeps} runs"
+                            )
+                            logger.info("Launching hyperparameter sweep")
+                            self.launch_sweep(case)
+                            return
 
-            logger.info(f"Running case: {case}")
-            if config.dry_run:
-                result_path = self.result_path(case)
-                os.makedirs(os.path.dirname(result_path), exist_ok=True)
-                with open(result_path, "w") as f:
-                    f.write("This is a dummy result file for dry run.")
+                # At this point, we know the tuned config is available at tuned_config_path, so we can proceed to training
+                if enable_parallelism:
+                    running_jobs = count_running_jobs(
+                        self.train_job_name(case), config.partition
+                    )
+                    if len(running_jobs) > 0:
+                        logger.info(
+                            f"Found {len(running_jobs)} running training jobs, waiting for them to complete before proceeding"
+                        )
+                        return
+
+                logger.info("Launching training")
+                self.launch_train(case)
         else:
-            logger.debug(
-                f"Prerequisite for case {case} not satisfied yet,\nrunning prerequisite case {case.prereq} first."
+            for prereq in case.prereqs:
+                if not os.path.exists(self.result_path(prereq)):
+                    logger.debug(
+                        f"Prereq for case {case} not satisfied yet,\nrunning {prereq} first."
+                    )
+                    self.run_case(
+                        prereq,
+                        skip_tuning=skip_tuning,
+                        enable_parallelism=enable_parallelism,
+                    )
+                    return
+
+    def _input_vars(self, case: Case) -> list[str]:
+        input_vars_base = [
+            "Ip_MA",
+            "B0",
+            "R0",
+            "a_minor",
+            "kappa",
+            "ne20_line_avg",
+            "P_aux_MW",
+        ]
+        if case.data_normalization == "raw":
+            input_vars = input_vars_base
+        elif case.data_normalization == "physics":
+            input_vars = [
+                *input_vars_base,
+                "epsilon",
+                "q_star",
+                "f_G",
+                "aB0",
+                "surface_power_density",
+            ]
+        elif case.data_normalization == "z_score":
+            input_vars = [*input_vars_base, *(f"{var}_z" for var in input_vars_base)]
+        elif case.data_normalization == "coral":
+            input_vars = [
+                *input_vars_base,
+                *(f"{var}_coral" for var in input_vars_base),
+            ]
+        else:
+            raise ValueError(f"Unknown normalization method: {case.data_normalization}")
+
+        return input_vars
+
+    def make_train_config(self, case: Case) -> TrainConfig:
+        """Make the train config for the given case"""
+
+        input_vars = self._input_vars(case)
+        optimizer_config_base = {
+            "lr0": 1e-4,
+            "transition_steps": 500,
+            "decay_rate": 0.5,
+            "lrf": 5e-4,
+            "weight_decay": 2e-4,
+        }
+        loss_config_base = {
+            "huber_delta": 0.5,
+        }
+
+        if case.model_type in ["scaling_law", "sciml", "p_oh", "p_rad"]:
+            submodule_init_config = {
+                "nn_depth": 2,
+                "nn_width": 16,
+                "min_val": 0,  # Minimum ohmic power in MW
+                "max_val": None,  # Get max from training data
+                "prng_seed": 42,
+                "in_size": len(input_vars),
+                "out_size": 1,
+                "data_normalization": case.data_normalization,
+            }
+            p_oh_config = TrainConfig(
+                project=self.wandb_project_name(case),
+                train_run_builder=OhmicPowerTRB,
+                max_epochs=config.max_epochs,
+                epochs_per_val=config.epochs_per_val,
+                checkpoint_dir=self.trained_model_dir(
+                    case
+                ),  # When doing hyperparameter tuning, this gets overwritten by the wandb agent
+                dataloader_config={
+                    "target_vars": ["P_oh_MW"],
+                    "input_vars": input_vars,
+                },
+                model_init_config=submodule_init_config,
+                loss_config=loss_config_base,
+                optimizer_config=optimizer_config_base,
             )
-            self.run_case(case.prereq)
+            p_rad_config = TrainConfig(
+                project=self.wandb_project_name(case),
+                train_run_builder=RadiatedPowerTRB,
+                max_epochs=config.max_epochs,
+                epochs_per_val=config.epochs_per_val,
+                checkpoint_dir=self.trained_model_dir(case),
+                dataloader_config={
+                    "target_vars": ["P_rad_MW"],
+                    "input_vars": input_vars,
+                },
+                model_init_config=submodule_init_config,
+                loss_config=loss_config_base,
+                optimizer_config=optimizer_config_base,
+            )
+            submodules = ["p_oh_predictor", "p_rad_predictor"]
+        elif case.model_type == "unstructured_nn":
+            p_oh_config, p_rad_config = None, None
+            submodules = []
+        else:
+            raise ValueError(f"Unknown model type: {case.model_type}")
+
+        if case.model_type == "scaling_law":
+            model_init_config = {
+                "model_case": case.model_type,
+                "data_normalization": case.data_normalization,
+                "freeze_submodules": case.freeze_submodules,
+                "submodules": {
+                    "p_oh_predictor": p_oh_config,
+                    "p_rad_predictor": p_rad_config,
+                },
+                "restore_submodules": True,  # Always restoring pre-trained submodules in this study
+            }
+        elif case.model_type in ["sciml", "unstructured_nn"]:
+            model_init_config = {
+                "model_case": case.model_type,
+                "data_normalization": case.data_normalization,
+                "freeze_submodules": case.freeze_submodules,
+                "nn_depth": 2,
+                "nn_width": 16,
+                "in_size": len(
+                    input_vars
+                ),  # B0, Ip, R0, a_minor, kappa, ne20_line_avg, P_aux_MW
+                "out_size": 1,
+                "prng_seed": 42,
+                "submodules": {
+                    "p_oh_predictor": p_oh_config,
+                    "p_rad_predictor": p_rad_config,
+                },
+                "restore_submodules": True,  # Always restoring pre-trained submodules in this study
+            }
+
+        power_balance_config = TrainConfig(
+            project=f"power_balance_{case.name}",
+            train_run_builder=PowerBalanceTRB,
+            max_epochs=config.max_epochs,
+            epochs_per_val=config.epochs_per_val,
+            checkpoint_dir=self.trained_model_dir(
+                case
+            ),  # When doing hyperparameter tuning, this gets overwritten by the wandb agent
+            dataloader_config={
+                "training_data": case.training_data,
+                "data_normalization": case.data_normalization,
+                "num_hp_shots": case.num_hp_shots,
+                "domain_adaptation": case.domain_adaptation,
+                "state_vars": ["Wtot_MJ"],
+                "input_vars": input_vars,
+                "target_vars": ["Wtot_MJ"],
+                "prng_seed": 42,
+                "debug": config.debug,
+                # Hyperparameters
+                "segment_length_train": 100,
+                "segment_overlap_train": 50,
+                "batch_size": 8192,
+                # Part of validation, should be left alone during hyperparameter tuning
+                "segment_length_val": None,
+                "segment_overlap_val": 0,
+            },
+            model_init_config=model_init_config,
+            # TODO(ZanderKeith): is the trainable getter only needed for time-independent modules?
+            trainable_getter_config={},
+            loss_config=loss_config_base,
+            optimizer_config=optimizer_config_base,
+        )
+
+        power_balance_config = update_submodule_configs(
+            power_balance_config.model_dump(), submodules=submodules
+        )
+
+        tuned_config_path = self.tuned_config_path(case)
+
+        if case.model_type in ["scaling_law", "sciml", "unstructured_nn"]:
+            # This is the main module config
+            raise NotImplementedError
+        else:
+            # This is a submodule config
+            if case.model_type == "p_oh":
+                model_config = power_balance_config.model_init_config["p_oh_predictor"]
+            elif case.model_type == "p_rad":
+                model_config = power_balance_config.model_init_config["p_rad_predictor"]
+
+            if os.path.exists(tuned_config_path):
+                logger.info(
+                    f"Found tuned config at {tuned_config_path}, loading hyperparameters from that config"
+                )
+                tuned_config = TrainConfig.model_validate_json_file(tuned_config_path)
+                model_config.update(tuned_config.model_init_config)
+
+            return model_config
+
+    def launch_sweep(self, case: Case):
+        """Launch a wandb hyperparameter sweep for the given case."""
+        train_config = self.make_train_config(case)
+        sweep_id = get_sweep_id(self.wandb_project_name(case))
+
+        if not sweep_id:
+            logger.info(
+                f"No existing sweep found for case {case}, creating a new sweep"
+            )
+            sweep_config_path = os.path.join(
+                PACKAGE_ROOT,
+                "transport_study",
+                "power_balance_transfer",
+                "sweep_configs",
+                f"{case.model_type}.yaml",
+            )
+            launch_sweep(train_config, sweep_config_path)
+        else:
+            launch_agent(train_config, sweep_id)
+
+    def launch_train(self, case: Case):
+        """Launch a training job for the given case."""
+        train_config = self.make_train_config(case)
+        launch_train(train_config)
 
 
 def run_study(  # noqa: PLR0915
     project_name: str,
     working_dir_base: str | None,
-    enable_parallelism: bool | None = False,
     model_types: list[str] | None = None,
     training_datasets: list[str] | None = None,
     data_normalization_methods: list[str] | None = None,
     domain_adaptation_methods: list[str] | None = None,
     freeze_submodules_options: list[bool] | None = None,
     num_hp_shots_options: list[int | None] | None = None,
+    enable_parallelism: bool | None = False,
+    skip_tuning: bool | None = True,
+    skip_visualization: bool | None = False,
+    clean_sweeps: bool | None = False,
     clean_models: bool | None = False,
     clean_results: bool | None = False,
     clean_figures: bool | None = False,
-    skip_visualization: bool | None = False,
-    skip_tuning: bool | None = False,
 ):
     """
     Go from datasets to all figures in one command.
@@ -366,17 +689,19 @@ def run_study(  # noqa: PLR0915
         If false, runs the entire study sequentially in one process.
         If true, submits independent training steps with SLURM up to configurable resource limits.
         The idea is you would periodically call this 'run_study' function, and it checks what models still need to be trained and submit jobs for those, until eventually all models are trained and all results are computed.
-        I would *like* to develop a better way of doing this, but for now it's straightforward for me to set up and execute and we have an experiment scheduled in 2 weeks so I gotta move fast.
+        Not the cleanest solution, but it works.
+    skip_tuning : bool | None
+        If True, skip hyperparameter tuning steps.
+    skip_visualization : bool | None
+        If True, skip data visualization steps.
+    clean_sweeps : bool | None
+        If True, delete any existing wandb sweeps for this project before running.
     clean_models : bool | None
         If True, delete any existing trained models in the working directory before running.
     clean_results : bool | None
         If True, delete any existing intermediate results in the working directory before running.
     clean_figures : bool | None
         If True, delete any existing figures in the figure directory before running.
-    skip_visualization : bool | None
-        If True, skip data visualization steps.
-    skip_tuning : bool | None
-        If True, skip hyperparameter tuning steps.
     """
 
     def _validate_args(
@@ -524,16 +849,28 @@ def run_study(  # noqa: PLR0915
     def _setup_directories(study: PowerBalanceStudy):
         logger.info("SETTING UP DIRECTORIES")
         logger.info(f"Enable parallelism: {enable_parallelism}")
+        logger.info(f"Skip hyperparameter tuning: {skip_tuning}")
+        logger.info(f"Skip visualization: {skip_visualization}")
+        logger.info(f"Clean sweeps: {clean_sweeps}")
         logger.info(f"Clean models: {clean_models}")
         logger.info(f"Clean results: {clean_results}")
         logger.info(f"Clean figures: {clean_figures}")
-        logger.info(f"Skip visualization: {skip_visualization}")
 
-        if (clean_models or clean_results or clean_figures) and enable_parallelism:
+        if (
+            clean_sweeps or clean_models or clean_results or clean_figures
+        ) and enable_parallelism:
             raise ValueError(
-                "Cannot clean models, results, or figures when parallelism is enabled, as this could interfere with jobs currently running or queued."
+                "Cannot clean models, results, or figures when parallelism is enabled, as this would interfere with jobs currently running or queued."
             )
 
+        if (not skip_tuning) and (not enable_parallelism):
+            logger.critical(
+                "Hyperparameter tuning without parallelism enabled is probably gonna take a long time, are you sure you want to do this?"
+            )
+
+        if clean_sweeps:
+            project_names = {study.wandb_project_name(case) for case in study.cases}
+            run_clean_sweeps(project_names)
         if clean_models:
             shutil.rmtree(study.model_dir, ignore_errors=True)
         if clean_results:
@@ -566,7 +903,9 @@ def run_study(  # noqa: PLR0915
     ]
     while len(unfinished_cases) > 0:
         for case in unfinished_cases:
-            study.run_case(case)
+            study.run_case(
+                case, skip_tuning=skip_tuning, enable_parallelism=enable_parallelism
+            )
 
         # Check which cases are still unfinished
         unfinished_cases = [
