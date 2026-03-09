@@ -92,10 +92,6 @@ def update_submodule_configs(main_config: dict, submodules: list[str]) -> TrainC
         if not isinstance(submodule_config, dict):
             submodule_config = submodule_config.model_dump()
 
-        submodule_config["project"] = (
-            f"{main_config['project']}.{submodule_config['project']}"
-        )
-
         # Set the data_train_run_builder for the submodules to match the main module's train_run_builder.
         submodule_config["dataloader_config"]["data_train_run_builder"] = main_config[
             "train_run_builder"
@@ -108,9 +104,6 @@ def update_submodule_configs(main_config: dict, submodules: list[str]) -> TrainC
                 submodule_config["dataloader_config"][key] = main_config[
                     "dataloader_config"
                 ][key]
-
-        # Replacing target nans is only relevant to the main module
-        submodule_config["dataloader_config"]["replace_target_nans"] = False
 
         new_submodule_configs[submodule] = submodule_config
 
