@@ -21,7 +21,7 @@ from transport_study.orchestration.wandb_utils import (
 
 
 class PowerBalanceStudy(Study):
-    HYPERPARAM_TRAINING_DATASET = "cmod_tcv"
+    HKYPERPARAM_TRAINING_DATA = "cmod_tcv"
     HYPERPARAM_DATA_NORMALIZATION = "coral"
     HYPERPARAM_DOMAIN_ADAPTATION = None
     HYPERPARAM_FREEZE_SUBMODULES = True
@@ -61,12 +61,6 @@ class PowerBalanceStudy(Study):
         num_hp_shots: The number of high-performance shots included in the training data, or None to include all high-performance shots (including all shots in training is cheating, but again answers the question of what is the best possible performance).
         """
 
-        def __str__(self):
-            if self.domain_adaptation:
-                return f"case.{self.model_type}.td_{self.training_data}.dn_{self.data_normalization}.da_{self.domain_adaptation}.freezesub_{self.freeze_submodules}.hp_{self.num_hp_shots}"
-            else:
-                return f"case.{self.model_type}.td_{self.training_data}.dn_{self.data_normalization}.freezesub_{self.freeze_submodules}"
-
         model_type: str  # scaling_law, sciml, unstructured_nn
         training_data: str  # cmod, tcv, cmod_tcv, exnihilo
         data_normalization: str  # raw, physics, z_score, coral
@@ -75,14 +69,123 @@ class PowerBalanceStudy(Study):
         num_hp_shots: (
             int | None
         )  # Number of high-performance shots included in training, or None for all (should be None if domain_adaptation is None)
-        weight_submodules: dict[str, float] | None = (
-            None  # If not None, the submodule predictions get weighted according to this value
-        )
         # So that's 3 (model type) x 4 (training data) x 4 (normalization) x 3 (domain adaptation) x 2 (freeze or not) x 6 (hp shots included) = 1728 results
         # Even less since the hyperparameter tuning is only done for a subset of cases
-        prereqs: list[Study.Case] | None = (
-            None  # If not None, this case depends on the results of another case, and should only be run after that case has been run
-        )
+        prereqs: (
+            list[Study.Case] | None
+        )  # If not None, this case depends on the results of another case, and should only be run after that case has been run
+
+        def is_hyperparam_case(self) -> bool:
+            if (
+                self.training_data == PowerBalanceStudy.HKYPERPARAM_TRAINING_DATA
+                and self.data_normalization
+                == PowerBalanceStudy.HYPERPARAM_DATA_NORMALIZATION
+                and self.domain_adaptation
+                == PowerBalanceStudy.HYPERPARAM_DOMAIN_ADAPTATION
+                and self.freeze_submodules
+                == PowerBalanceStudy.HYPERPARAM_FREEZE_SUBMODULES
+                and self.num_hp_shots == PowerBalanceStudy.HYPERPARAM_NUM_HP_SHOTS
+            ):
+                return True
+            else:
+                return False
+
+        def __init__(
+            self,
+            model_type: str,
+            training_data: str,
+            data_normalization: str,
+            domain_adaptation: str,
+            freeze_submodules: bool,
+            num_hp_shots: int | None,
+        ):
+            self.model_type = model_type
+            self.training_data = training_data
+            self.data_normalization = data_normalization
+            self.domain_adaptation = domain_adaptation
+            self.freeze_submodules = freeze_submodules
+            self.num_hp_shots = num_hp_shots
+
+            # Recursively add prereqs based on the logic of which cases depend on which other cases
+            if model_type not in [
+                "scaling_law",
+                "sciml",
+                "unstructured_nn",
+                "p_oh",
+                "p_rad",
+            ]:
+                raise ValueError(f"Unknown model type: {model_type}")
+            if domain_adaptation is None and num_hp_shots is not None:
+                raise ValueError(
+                    "If domain_adaptation is None, num_hp_shots must also be None since this means we're training and testing on the same dataset and no high-performance data is being used"
+                )
+            if (
+                model_type in ["p_oh", "p_rad"]
+                and freeze_submodules != PowerBalanceStudy.HYPERPARAM_FREEZE_SUBMODULES
+            ):
+                raise ValueError(
+                    f"freeze_submodules should be a dummy value ({PowerBalanceStudy.HYPERPARAM_FREEZE_SUBMODULES}) for submodule {model_type}"
+                )
+
+            prereqs = []
+
+            # Add prereqs based on whether this is a hyperparameter tuning case or not.
+            if not self.is_hyperparam_case():
+                prereqs += [
+                    PowerBalanceStudy.Case(
+                        model_type=model_type,
+                        training_data=PowerBalanceStudy.HYPERPARAM_TRAINING_DATA,
+                        data_normalization=PowerBalanceStudy.HYPERPARAM_DATA_NORMALIZATION,
+                        domain_adaptation=PowerBalanceStudy.HYPERPARAM_DOMAIN_ADAPTATION,
+                        freeze_submodules=PowerBalanceStudy.HYPERPARAM_FREEZE_SUBMODULES,
+                        num_hp_shots=PowerBalanceStudy.HYPERPARAM_NUM_HP_SHOTS,
+                    )
+                ]
+
+            # Set prereqs based on model type
+            if model_type in ["sciml", "scaling_law"]:
+                prereqs += [
+                    PowerBalanceStudy.Case(
+                        model_type="p_oh",
+                        training_data=training_data,
+                        data_normalization=data_normalization,
+                        domain_adaptation=domain_adaptation,
+                        freeze_submodules=PowerBalanceStudy.HYPERPARAM_FREEZE_SUBMODULES,
+                        num_hp_shots=num_hp_shots,
+                    ),
+                    PowerBalanceStudy.Case(
+                        model_type="p_rad",
+                        training_data=training_data,
+                        data_normalization=data_normalization,
+                        domain_adaptation=domain_adaptation,
+                        freeze_submodules=PowerBalanceStudy.HYPERPARAM_FREEZE_SUBMODULES,
+                        num_hp_shots=num_hp_shots,
+                    ),
+                ]
+
+            # Set prereqs based on domain adaptation
+            if domain_adaptation == "transfer":
+                prereqs += [
+                    PowerBalanceStudy.Case(
+                        model_type=model_type,
+                        training_data=training_data,
+                        data_normalization=data_normalization,
+                        domain_adaptation=None,
+                        freeze_submodules=freeze_submodules,
+                        num_hp_shots=None,
+                    )
+                ]
+
+            if len(prereqs) > 0:
+                self.prereqs = prereqs
+            else:
+                self.prereqs = None
+
+        def __str__(self):
+            if self.domain_adaptation:
+                return f"case.{self.model_type}.td_{self.training_data}.dn_{self.data_normalization}.da_{self.domain_adaptation}.freezesub_{self.freeze_submodules}.hp_{self.num_hp_shots}"
+            else:
+                return f"case.{self.model_type}.td_{self.training_data}.dn_{self.data_normalization}.freezesub_{self.freeze_submodules}"
 
         def __hash__(self):
             if self.domain_adaptation:
@@ -106,137 +209,6 @@ class PowerBalanceStudy(Study):
                         self.freeze_submodules,
                     )
                 )
-
-    def _is_hyperparam_case(self, case: Case) -> bool:
-        if (
-            case.training_data == self.HYPERPARAM_TRAINING_DATASET
-            and case.data_normalization == self.HYPERPARAM_DATA_NORMALIZATION
-            and case.domain_adaptation == self.HYPERPARAM_DOMAIN_ADAPTATION
-            and case.freeze_submodules == self.HYPERPARAM_FREEZE_SUBMODULES
-            and case.num_hp_shots == self.HYPERPARAM_NUM_HP_SHOTS
-        ):
-            return True
-        else:
-            return False
-
-    def _get_submodule_prereqs(
-        self,
-        model_type: str,
-        training_data: str,
-        data_normalization: str,
-        domain_adaptation: str,
-        freeze_submodules: bool,
-        num_hp_shots: int | None,
-    ) -> list[Case] | None:
-        """Certain types of main modules rely on pretrained submodules,
-        and those pretrained submodules rely on the architecture from hyperparameter tuning
-        """
-        if model_type in ["scaling_law", "sciml"]:
-            p_oh_case = self.Case(
-                model_type="p_oh",
-                training_data=training_data,
-                data_normalization=data_normalization,
-                domain_adaptation=domain_adaptation,
-                freeze_submodules=freeze_submodules,
-                num_hp_shots=num_hp_shots,
-            )
-            p_rad_case = self.Case(
-                model_type="p_rad",
-                training_data=training_data,
-                data_normalization=data_normalization,
-                domain_adaptation=domain_adaptation,
-                freeze_submodules=freeze_submodules,
-                num_hp_shots=num_hp_shots,
-            )
-            if not self._is_hyperparam_case(p_oh_case):
-                p_oh_case.prereqs = [
-                    self.Case(
-                        model_type="p_oh",
-                        training_data=self.HYPERPARAM_TRAINING_DATASET,
-                        data_normalization=self.HYPERPARAM_DATA_NORMALIZATION,
-                        domain_adaptation=self.HYPERPARAM_DOMAIN_ADAPTATION,
-                        freeze_submodules=self.HYPERPARAM_FREEZE_SUBMODULES,
-                        num_hp_shots=self.HYPERPARAM_NUM_HP_SHOTS,
-                    )
-                ]
-            if not self._is_hyperparam_case(p_rad_case):
-                p_rad_case.prereqs = [
-                    self.Case(
-                        model_type="p_rad",
-                        training_data=self.HYPERPARAM_TRAINING_DATASET,
-                        data_normalization=self.HYPERPARAM_DATA_NORMALIZATION,
-                        domain_adaptation=self.HYPERPARAM_DOMAIN_ADAPTATION,
-                        freeze_submodules=self.HYPERPARAM_FREEZE_SUBMODULES,
-                        num_hp_shots=self.HYPERPARAM_NUM_HP_SHOTS,
-                    )
-                ]
-            return [p_oh_case, p_rad_case]
-        else:
-            return None
-
-    def _get_hyperparam_prereq(
-        self,
-        model_type: str,
-    ) -> Case:
-        """Get the hyperparameter tuning case that this case depends on,
-        which is the case with the same model type (same architecture) but with
-        values set by the HYPERPARAM_ constants
-        """
-        hyperparam_case = self.Case(
-            model_type=model_type,
-            training_data=self.HYPERPARAM_TRAINING_DATASET,
-            data_normalization=self.HYPERPARAM_DATA_NORMALIZATION,
-            domain_adaptation=self.HYPERPARAM_DOMAIN_ADAPTATION,
-            freeze_submodules=self.HYPERPARAM_FREEZE_SUBMODULES,
-            num_hp_shots=self.HYPERPARAM_NUM_HP_SHOTS,
-            prereqs=self._get_submodule_prereqs(
-                model_type=model_type,
-                training_data=self.HYPERPARAM_TRAINING_DATASET,
-                data_normalization=self.HYPERPARAM_DATA_NORMALIZATION,
-                domain_adaptation=self.HYPERPARAM_DOMAIN_ADAPTATION,
-                freeze_submodules=self.HYPERPARAM_FREEZE_SUBMODULES,
-                num_hp_shots=self.HYPERPARAM_NUM_HP_SHOTS,
-            ),
-        )
-        return hyperparam_case
-
-    def _get_transfer_prereq(
-        self,
-        model_type: str,
-        training_data: str,
-        data_normalization: str,
-        freeze_submodules: bool,
-    ) -> Case:
-        """Get the transfer learning case that this case depends on,
-        which is the case with the same model type, training data, data normalization, and freeze_submodules setting, but with no domain adaptation yet (train and test on same device)
-        """
-        is_hyperparam = (
-            training_data == self.HYPERPARAM_TRAINING_DATASET
-            and data_normalization == self.HYPERPARAM_DATA_NORMALIZATION
-            and freeze_submodules == self.HYPERPARAM_FREEZE_SUBMODULES
-        )
-        if is_hyperparam:
-            prereqs = [self._get_hyperparam_prereq(model_type)]
-        else:
-            prereqs = self._get_submodule_prereqs(
-                model_type,
-                training_data,
-                data_normalization,
-                domain_adaptation=None,  # Relies on the case with same settings but no domain adaptation
-                freeze_submodules=freeze_submodules,
-                num_hp_shots=None,
-            )
-
-        transfer_case = self.Case(
-            model_type=model_type,
-            training_data=training_data,
-            data_normalization=data_normalization,
-            domain_adaptation=None,
-            freeze_submodules=freeze_submodules,
-            num_hp_shots=None,
-            prereqs=prereqs,
-        )
-        return transfer_case
 
     def make_cases(
         self,
@@ -264,106 +236,17 @@ class PowerBalanceStudy(Study):
             freeze_submodules_options,
             num_hp_shots_options,
         ):
-            # A few special cases to consider:
-            # 1. Minimize the number of hyperparameter tuning runs
-            # - We want to investigate the differences between power balance architectures, not between P_oh and P_rad architectures
-            # - We want to investigate the differences between data preprocessing and domain adaptation, so they should have the same hyperparameters
-            # - Things of that nature
-            if domain_adaptation is None and num_hp_shots is None:
-                # This is the case where we train and test on the same device with all available data,
-                # so we aren't using high-performance data anyway and only need to add these cases to the list once
-                if (
-                    training_dataset == self.HYPERPARAM_TRAINING_DATASET
-                    and freeze_submodules == self.HYPERPARAM_FREEZE_SUBMODULES
-                    and data_normalization == self.HYPERPARAM_DATA_NORMALIZATION
-                ):
-                    if model_type in ["sciml", "scaling_law"]:
-                        # sciml and scaling law cases have p_oh and p_rad submodules, which must be trained beforehand
-                        prereqs = [
-                            self.Case(
-                                model_type="p_oh",
-                                training_data=self.HYPERPARAM_TRAINING_DATASET,
-                                data_normalization=self.HYPERPARAM_DATA_NORMALIZATION,
-                                domain_adaptation=None,
-                                freeze_submodules=self.HYPERPARAM_FREEZE_SUBMODULES,
-                                num_hp_shots=self.HYPERPARAM_NUM_HP_SHOTS,
-                            ),
-                            self.Case(
-                                model_type="p_rad",
-                                training_data=self.HYPERPARAM_TRAINING_DATASET,
-                                data_normalization=self.HYPERPARAM_DATA_NORMALIZATION,
-                                domain_adaptation=None,
-                                freeze_submodules=self.HYPERPARAM_FREEZE_SUBMODULES,
-                                num_hp_shots=self.HYPERPARAM_NUM_HP_SHOTS,
-                            ),
-                        ]
-                    elif model_type in ["unstructured_nn", "p_oh", "p_rad"]:
-                        prereqs = None
-                    else:
-                        raise ValueError(f"Unknown model type: {model_type}")
+            if domain_adaptation is None and num_hp_shots is not None:
+                continue  # Invalid case, skip
 
-                    case = self.Case(
-                        model_type=model_type,
-                        training_data=training_dataset,
-                        data_normalization=data_normalization,
-                        domain_adaptation=None,
-                        freeze_submodules=freeze_submodules,
-                        num_hp_shots=None,
-                        prereqs=prereqs,
-                    )
-                else:
-                    case = self.Case(
-                        model_type=model_type,
-                        training_data=training_dataset,
-                        data_normalization=data_normalization,
-                        domain_adaptation=domain_adaptation,
-                        freeze_submodules=freeze_submodules,
-                        num_hp_shots=num_hp_shots,
-                        prereqs=[self._get_hyperparam_prereq(model_type)],
-                    )
-            # 2. For transfer learning, we need to already have a trained model first
-            elif domain_adaptation == "transfer":
-                case = self.Case(
-                    model_type=model_type,
-                    training_data=training_dataset,
-                    data_normalization=data_normalization,
-                    domain_adaptation=domain_adaptation,
-                    freeze_submodules=freeze_submodules,
-                    num_hp_shots=num_hp_shots,
-                    prereqs=[
-                        self._get_transfer_prereq(
-                            model_type,
-                            training_dataset,
-                            data_normalization,
-                            freeze_submodules,
-                        )
-                    ],
-                )
-            # 3. For mixing, we only need the hyperparameter tuning to be done already
-            elif domain_adaptation == "mixing":
-                case = self.Case(
-                    model_type=model_type,
-                    training_data=training_dataset,
-                    data_normalization=data_normalization,
-                    domain_adaptation=domain_adaptation,
-                    freeze_submodules=freeze_submodules,
-                    num_hp_shots=num_hp_shots,
-                    prereqs=[self._get_hyperparam_prereq(model_type)],
-                )
-            else:
-                continue
-
-            # Make sure submodule prereqs are included as well
-            submodule_prereqs = self._get_submodule_prereqs(
-                case.model_type,
-                case.training_data,
-                case.data_normalization,
-                case.domain_adaptation,
-                case.freeze_submodules,
-                case.num_hp_shots,
+            case = self.Case(
+                model_type=model_type,
+                training_data=training_dataset,
+                data_normalization=data_normalization,
+                domain_adaptation=domain_adaptation,
+                freeze_submodules=freeze_submodules,
+                num_hp_shots=num_hp_shots,
             )
-            if submodule_prereqs is not None:
-                case.prereqs = case.prereqs + submodule_prereqs
 
             cases.append(case)
 
