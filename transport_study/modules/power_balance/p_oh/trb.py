@@ -2,10 +2,14 @@ from collections.abc import Callable
 from typing import Any
 
 import jax.numpy as jnp
+import netCDF4  # noqa: F401
+import numpy as np
 import optax
 import xarray as xr
 from popsim.ml import DataLoader, TrainRunBuilder
+from popsim.ml.eval import EvalData, EvaluationSuite
 
+from transport_study import EPISODE_DIM, TIME_COORD, TIME_DIM
 from transport_study.modules.power_balance.p_oh.module import OhmicPower
 
 
@@ -35,7 +39,7 @@ class OhmicPowerTRB(TrainRunBuilder):
                 median = train_dl.ds["P_oh_MW"].median().item()
             else:
                 device_medians = []
-                for device in train_dl.ds["ds_source"].values:
+                for device in np.unique(train_dl.ds["ds_source"].values):
                     device_median = (
                         train_dl.ds.where(
                             train_dl.ds["ds_source"] == device, drop=True
@@ -72,3 +76,69 @@ class OhmicPowerTRB(TrainRunBuilder):
         )
         opt = optax.adamw(learning_rate=schedule, weight_decay=config["weight_decay"])
         return opt
+
+    @staticmethod
+    def get_test_eval_suite(config) -> EvaluationSuite:
+        """Evaluation suite for testing after training."""
+
+        def study_results(eval_data: EvalData) -> xr.Dataset:
+            """Calculate final study results
+                - Target vs predicted P_oh_MW
+                - Absolute and relative error on a per-timeslice basis
+                - Integrated error over time for each shot
+            This should maintain the coordinates of the original dataset, in particular `ds_source` and `shot`
+            """
+            # Unstack sample MultiIndex -> (shot, time_idx) so we can integrate per shot
+            targ = eval_data.input_ds.P_oh_MW.unstack("sample")
+            pred = eval_data.output_ds.P_oh_MW_pred.unstack("sample")
+            time_2d = eval_data.input_ds[TIME_COORD].unstack("sample")
+
+            # Get relative error on a per-timeslice basis
+            error_abs_ts = xr.apply_ufunc(np.abs, pred - targ)
+            error_rel_ts = error_abs_ts / (xr.apply_ufunc(np.abs, targ) + 0.1)
+
+            # Integrate absolute error over time for each shot, ignoring NaN-padded entries
+            def _trapezoid_dropna(y, x):
+                mask = ~np.isnan(x)
+                return np.trapezoid(y[mask], x[mask])
+
+            error_shot_abs = xr.apply_ufunc(
+                _trapezoid_dropna,
+                error_abs_ts,
+                time_2d,
+                input_core_dims=[[TIME_DIM], [TIME_DIM]],
+                vectorize=True,
+            )
+
+            error_shot_rel = xr.apply_ufunc(
+                _trapezoid_dropna,
+                error_rel_ts,
+                time_2d,
+                input_core_dims=[[TIME_DIM], [TIME_DIM]],
+                vectorize=True,
+            )
+
+            # ds_source is constant per shot — extract as a shot-only coordinate
+            ds_source = (
+                eval_data.input_ds["ds_source"].unstack("sample").isel({TIME_DIM: 0})
+            )
+
+            ds = xr.Dataset(
+                data_vars={
+                    "P_oh_MW_targ": targ,
+                    "P_oh_MW_pred": pred,
+                    "error_abs_ts": error_abs_ts,
+                    "error_rel_ts": error_rel_ts,
+                    "error_shot_abs": error_shot_abs,
+                    "error_shot_rel": error_shot_rel,
+                }
+            )
+            ds = ds.assign_coords(ds_source=(EPISODE_DIM, ds_source.values))
+            ds = ds.drop_vars("quantile", errors="ignore")
+            return ds
+
+        eval_suite = {
+            "study_results": study_results,
+        }
+
+        return eval_suite

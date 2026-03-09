@@ -69,7 +69,7 @@ class RadiatedPower(TimeIndepModule):
         return output
 
     @classmethod
-    def get_input_format_fn(cls, normalization_method: str) -> Callable[[dict], Inputs]:
+    def get_input_format_fn(cls, data_normalization: str) -> Callable[[dict], Inputs]:
         """Format the inputs according to the normalization method.
         TODO(ZanderKeith): for time-dependent models this is handled by the ModuleEvalEnv,
         but we don't have an equivalnt for time-independent models, meaning they need to do it themselves.
@@ -131,16 +131,16 @@ class RadiatedPower(TimeIndepModule):
                 P_aux_nn=inputs["P_aux_MW_coral"],
             )
 
-        if normalization_method == "raw":
+        if data_normalization == "raw":
             return _format_inputs_raw
-        elif normalization_method == "physics":
+        elif data_normalization == "physics":
             return _format_inputs_physics
-        elif normalization_method == "z_score":
+        elif data_normalization == "z_score":
             return _format_inputs_z_score
-        elif normalization_method == "coral":
+        elif data_normalization == "coral":
             return _format_inputs_coral
         else:
-            raise ValueError(f"Unknown normalization method: {normalization_method}")
+            raise ValueError(f"Unknown normalization method: {data_normalization}")
 
     @classmethod
     def init(
@@ -152,7 +152,7 @@ class RadiatedPower(TimeIndepModule):
         min_val: float,
         max_val: float,
         prng_seed: int,
-        normalization_method: str,
+        data_normalization: str,
     ) -> "RadiatedPower":
         nn = eqx.nn.MLP(
             in_size=in_size,
@@ -161,7 +161,7 @@ class RadiatedPower(TimeIndepModule):
             depth=nn_depth,
             key=jax.random.PRNGKey(prng_seed),
         )
-        input_format_fn = cls.get_input_format_fn(normalization_method)
+        input_format_fn = cls.get_input_format_fn(data_normalization)
         return cls(
             nn=nn, min_val=min_val, max_val=max_val, input_format_fn=input_format_fn
         )

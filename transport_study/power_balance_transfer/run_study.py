@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from itertools import product
 
 import fire
+import netCDF4  # noqa: F401
 from loguru import logger
 from popsim.ml import TrainConfig
 from popsim.ml.launch import launch_agent, launch_sweep, launch_train
@@ -21,7 +22,7 @@ from transport_study.orchestration.wandb_utils import (
 
 
 class PowerBalanceStudy(Study):
-    HKYPERPARAM_TRAINING_DATA = "cmod_tcv"
+    HYPERPARAM_TRAINING_DATA = "cmod_tcv"
     HYPERPARAM_DATA_NORMALIZATION = "coral"
     HYPERPARAM_DOMAIN_ADAPTATION = None
     HYPERPARAM_FREEZE_SUBMODULES = True
@@ -77,7 +78,7 @@ class PowerBalanceStudy(Study):
 
         def is_hyperparam_case(self) -> bool:
             if (
-                self.training_data == PowerBalanceStudy.HKYPERPARAM_TRAINING_DATA
+                self.training_data == PowerBalanceStudy.HYPERPARAM_TRAINING_DATA
                 and self.data_normalization
                 == PowerBalanceStudy.HYPERPARAM_DATA_NORMALIZATION
                 and self.domain_adaptation
@@ -89,6 +90,19 @@ class PowerBalanceStudy(Study):
                 return True
             else:
                 return False
+
+        def get_hyperparam_prereq(self) -> Study.Case:
+            if self.is_hyperparam_case():
+                return self
+            else:
+                return Study.Case(
+                    model_type=self.model_type,
+                    training_data=PowerBalanceStudy.HYPERPARAM_TRAINING_DATA,
+                    data_normalization=PowerBalanceStudy.HYPERPARAM_DATA_NORMALIZATION,
+                    domain_adaptation=PowerBalanceStudy.HYPERPARAM_DOMAIN_ADAPTATION,
+                    freeze_submodules=PowerBalanceStudy.HYPERPARAM_FREEZE_SUBMODULES,
+                    num_hp_shots=PowerBalanceStudy.HYPERPARAM_NUM_HP_SHOTS,
+                )
 
         def __init__(
             self,
@@ -309,11 +323,11 @@ class PowerBalanceStudy(Study):
 
     def result_path(self, case: Case) -> str:
         """Given a case, return the path where the results for that case should be stored."""
-        return os.path.join(self.result_dir, str(case), "eval_data.nc")
+        return os.path.join(self.result_dir, str(case), "result_data.nc")
 
     def tuned_config_path(self, case: Case) -> str:
         """Given a case, return the path where the tuned hyperparameters for that case should be stored"""
-        hyperparam_case = self._get_hyperparam_prereq(case.model_type)
+        hyperparam_case = case.get_hyperparam_prereq()
         return os.path.join(self.model_dir, str(hyperparam_case), "tuned_config.yaml")
 
     def wandb_project_name(self, case: Case) -> str:
@@ -372,7 +386,7 @@ class PowerBalanceStudy(Study):
         if self.check_prereq_satisfied(case):
             logger.info(f"RUNNING CASE:\n{case}")
             # Prereq is satisfied, can run this case.
-            if self._is_hyperparam_case(case):
+            if case.is_hyperparam_case():
                 if skip_tuning:
                     logger.info("Skipping hyperparameter tuning")
                     # Copy default config for this module and put it in the trained model dir so the rest of the workflow can find it
@@ -503,6 +517,9 @@ class PowerBalanceStudy(Study):
             "segment_length_val": None,
             "segment_overlap_val": 0,
         }
+        test_eval_suite_config_base = {
+            "result_path": self.result_path(case),
+        }
 
         if case.model_type == "p_oh":
             input_vars = self._input_vars(case)
@@ -528,10 +545,11 @@ class PowerBalanceStudy(Study):
                     "prng_seed": 42,
                     "in_size": 7,
                     "out_size": 1,
-                    # "data_normalization" must be filled later
+                    "data_normalization": case.data_normalization,
                 },
                 loss_config=loss_config_base,
                 optimizer_config=optimizer_config_base,
+                test_eval_suite_config=test_eval_suite_config_base,
             )
         elif case.model_type == "p_rad":
             input_vars = self._input_vars(case)
@@ -557,10 +575,11 @@ class PowerBalanceStudy(Study):
                     "prng_seed": 42,
                     "in_size": 7,
                     "out_size": 1,
-                    # "data_normalization" must be filled later
+                    "data_normalization": case.data_normalization,
                 },
                 loss_config=loss_config_base,
                 optimizer_config=optimizer_config_base,
+                test_eval_suite_config=test_eval_suite_config_base,
             )
         elif case.model_type == "scaling_law":
             p_oh_config = self.make_train_config(
@@ -607,13 +626,14 @@ class PowerBalanceStudy(Study):
                     "out_size": 1,
                     "prng_seed": 42,
                     "submodules": {
-                        "p_oh": p_oh_config,
-                        "p_rad": p_rad_config,
+                        "p_oh_predictor": p_oh_config,
+                        "p_rad_predictor": p_rad_config,
                     },
                     "restore_submodules": True,  # Always restoring pre-trained submodules in this study
                 },
                 loss_config=loss_config_base,
                 optimizer_config=optimizer_config_base,
+                test_eval_suite_config=test_eval_suite_config_base,
             )
         elif case.model_type == "sciml":
             p_oh_config = self.make_train_config(
@@ -659,13 +679,14 @@ class PowerBalanceStudy(Study):
                     "out_size": 1,
                     "prng_seed": 42,
                     "submodules": {
-                        "p_oh": p_oh_config,
-                        "p_rad": p_rad_config,
+                        "p_oh_predictor": p_oh_config,
+                        "p_rad_predictor": p_rad_config,
                     },
                     "restore_submodules": True,  # Always restoring pre-trained submodules in this study
                 },
                 loss_config=loss_config_base,
                 optimizer_config=optimizer_config_base,
+                test_eval_suite_config=test_eval_suite_config_base,
             )
         elif case.model_type == "unstructured_nn":
             train_config_base = TrainConfig(
@@ -693,6 +714,7 @@ class PowerBalanceStudy(Study):
                 },
                 loss_config=loss_config_base,
                 optimizer_config=optimizer_config_base,
+                test_eval_suite_config=test_eval_suite_config_base,
             )
         else:
             raise ValueError(f"Unknown model type: {case.model_type}")
@@ -758,7 +780,11 @@ class PowerBalanceStudy(Study):
     def launch_train(self, case: Case):
         """Launch a training job for the given case."""
         train_config = self.make_train_config(case)
-        launch_train(train_config)
+        _, _, _, _, result_dict = launch_train(train_config)
+        ds = result_dict["test/study_results"]
+        result_path = self.result_path(case)
+        os.makedirs(os.path.dirname(result_path), exist_ok=True)
+        ds.to_netcdf(result_path)
 
 
 def run_study(  # noqa: PLR0915

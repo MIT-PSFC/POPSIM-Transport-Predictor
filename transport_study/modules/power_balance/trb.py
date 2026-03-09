@@ -2,12 +2,14 @@ from collections.abc import Callable
 from typing import Any
 
 import jax.numpy as jnp
+import numpy as np
 import optax
 import xarray as xr
 from loguru import logger
 from popsim.ml import DataLoader, IntegralLoss, TrainRunBuilder
 from popsim.ml.checkpointing import create_default_checkpoint_manager, restore_model
 from popsim.ml.dataloading import make_dataloaders
+from popsim.ml.eval import EvalData, EvaluationSuite
 
 from transport_study import EPISODE_DIM, TIME_COORD, TIME_DIM
 from transport_study.modules.power_balance.module import (
@@ -94,8 +96,11 @@ class PowerBalanceTRB(TrainRunBuilder):
             convert_xr_to_jnp=False,  # Needed to keep the coords for calculating loss
             nan_handling="drop_segment",
         )
-
-        return ds_val, train_dl, val_dl
+        # Running test evaluation on the validation set, since we don't need a dedicated test set
+        # In the no domain adaptation case, we are hyperparameter tuning on all historic data, pick the best one and test on it
+        # In the domain adaptation case, we are training on all historic data + some new data, and testing on the rest of the new data
+        # No hyperparameter tuning is happening, so we treat the validation set as the test set and just return it for evaluation after training
+        return ds_val, train_dl, val_dl, val_dl
 
     @staticmethod
     def model_init(train_dl: DataLoader, model_init_config: dict) -> Any:
@@ -198,3 +203,69 @@ class PowerBalanceTRB(TrainRunBuilder):
         )
         opt = optax.adamw(learning_rate=schedule, weight_decay=config["weight_decay"])
         return opt
+
+    @staticmethod
+    def get_test_eval_suite(config) -> EvaluationSuite:
+        """Evaluation suite for testing after training."""
+
+        def study_results(eval_data: EvalData) -> xr.Dataset:
+            """Calculate final study results
+                - Target vs predicted Wtot_MJ
+                - Absolute and relative error on a per-timeslice basis
+                - Integrated error over time for each shot
+            This should maintain the coordinates of the original dataset, in particular `ds_source` and `shot`
+            """
+            # Unstack sample MultiIndex -> (shot, time_idx) so we can integrate per shot
+            targ = eval_data.input_ds.Wtot_MJ.unstack("sample")
+            pred = eval_data.output_ds.Wtot_MJ_pred.unstack("sample")
+            time_2d = eval_data.input_ds[TIME_COORD].unstack("sample")
+
+            # Get relative error on a per-timeslice basis
+            error_abs_ts = xr.apply_ufunc(np.abs, pred - targ)
+            error_rel_ts = error_abs_ts / (xr.apply_ufunc(np.abs, targ) + 0.1)
+
+            # Integrate absolute error over time for each shot, ignoring NaN-padded entries
+            def _trapezoid_dropna(y, x):
+                mask = ~np.isnan(x)
+                return np.trapezoid(y[mask], x[mask])
+
+            error_shot_abs = xr.apply_ufunc(
+                _trapezoid_dropna,
+                error_abs_ts,
+                time_2d,
+                input_core_dims=[[TIME_DIM], [TIME_DIM]],
+                vectorize=True,
+            )
+
+            error_shot_rel = xr.apply_ufunc(
+                _trapezoid_dropna,
+                error_rel_ts,
+                time_2d,
+                input_core_dims=[[TIME_DIM], [TIME_DIM]],
+                vectorize=True,
+            )
+
+            # ds_source is constant per shot — extract as a shot-only coordinate
+            ds_source = (
+                eval_data.input_ds["ds_source"].unstack("sample").isel({TIME_DIM: 0})
+            )
+
+            ds = xr.Dataset(
+                data_vars={
+                    "Wtot_MJ_targ": targ,
+                    "Wtot_MJ_pred": pred,
+                    "error_abs_ts": error_abs_ts,
+                    "error_rel_ts": error_rel_ts,
+                    "error_shot_abs": error_shot_abs,
+                    "error_shot_rel": error_shot_rel,
+                }
+            )
+            ds = ds.assign_coords(ds_source=(EPISODE_DIM, ds_source.values))
+            ds = ds.drop_vars("quantile", errors="ignore")
+            return ds
+
+        eval_suite = {
+            "study_results": study_results,
+        }
+
+        return eval_suite
