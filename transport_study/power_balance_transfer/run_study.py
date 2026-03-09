@@ -56,8 +56,6 @@ class PowerBalanceStudy(Study):
         freeze_submodules: Whether to freeze certain submodules of the model during training.
         The P_oh and P_rad signals are hard to quantify, we might want to let them drift from the original targets to better match Wtot_MJ
 
-
-
         num_hp_shots: The number of high-performance shots included in the training data, or None to include all high-performance shots (including all shots in training is cheating, but again answers the question of what is the best possible performance).
         """
 
@@ -339,6 +337,7 @@ class PowerBalanceStudy(Study):
         domain_adaptation_methods: list[str],
         freeze_submodules_options: list[bool],
         num_hp_shots_options: list[int | None],
+        hp_test_set_size: int,
     ):
         cases = self.make_cases(
             model_types,
@@ -348,7 +347,7 @@ class PowerBalanceStudy(Study):
             freeze_submodules_options,
             num_hp_shots_options,
         )
-        super().__init__(name, working_dir_base, dataset_paths, cases)
+        super().__init__(name, working_dir_base, dataset_paths, cases, hp_test_set_size)
 
         logger.info(f"C-Mod dataset path: {dataset_paths.get('cmod', 'Not provided')}")
         logger.info(f"TCV dataset path: {dataset_paths.get('tcv', 'Not provided')}")
@@ -553,8 +552,9 @@ class PowerBalanceStudy(Study):
         dataloader_config_base = {
             "training_data": case.training_data,
             "data_normalization": case.data_normalization,
-            "num_hp_shots": case.num_hp_shots,
             "domain_adaptation": case.domain_adaptation,
+            "num_hp_shots": case.num_hp_shots,
+            "hp_test_set_size": self.hp_test_set_size,
             "prng_seed": 42,
             "debug": config.debug,
             # Hyperparameters
@@ -832,6 +832,7 @@ def run_study(  # noqa: PLR0915
     domain_adaptation_methods: list[str] | None = None,
     freeze_submodules_options: list[bool] | None = None,
     num_hp_shots_options: list[int | None] | None = None,
+    hp_test_set_size: int | None = None,
     enable_parallelism: bool | None = False,
     skip_tuning: bool | None = True,
     skip_visualization: bool | None = False,
@@ -886,6 +887,7 @@ def run_study(  # noqa: PLR0915
         domain_adaptation_methods,
         freeze_submodules_options,
         num_hp_shots_options,
+        hp_test_set_size,
     ):
         def _assign_args(
             model_types,
@@ -894,6 +896,7 @@ def run_study(  # noqa: PLR0915
             domain_adaptation_methods,
             freeze_submodules_options,
             num_hp_shots_options,
+            hp_test_set_size,
         ):
             if model_types is None:
                 model_types = ["scaling_law", "sciml", "unstructured_nn"]
@@ -907,6 +910,8 @@ def run_study(  # noqa: PLR0915
                 freeze_submodules_options = [True, False]
             if num_hp_shots_options is None:
                 num_hp_shots_options = [0, 1, 3, 10, 30, None]
+            if hp_test_set_size is None:
+                hp_test_set_size = 60
 
             return (
                 model_types,
@@ -915,6 +920,7 @@ def run_study(  # noqa: PLR0915
                 domain_adaptation_methods,
                 freeze_submodules_options,
                 num_hp_shots_options,
+                hp_test_set_size,
             )
 
         (
@@ -924,6 +930,7 @@ def run_study(  # noqa: PLR0915
             domain_adaptation_methods,
             freeze_submodules_options,
             num_hp_shots_options,
+            hp_test_set_size,
         ) = _assign_args(
             model_types,
             training_datasets,
@@ -931,6 +938,7 @@ def run_study(  # noqa: PLR0915
             domain_adaptation_methods,
             freeze_submodules_options,
             num_hp_shots_options,
+            hp_test_set_size,
         )
 
         def _check_args(
@@ -938,8 +946,6 @@ def run_study(  # noqa: PLR0915
             training_datasets,
             data_normalization_methods,
             domain_adaptation_methods,
-            freeze_submodules_options,
-            num_hp_shots_options,
         ):
             for model_type in model_types:
                 if model_type not in ["scaling_law", "sciml", "unstructured_nn"]:
@@ -970,8 +976,6 @@ def run_study(  # noqa: PLR0915
             training_datasets,
             data_normalization_methods,
             domain_adaptation_methods,
-            freeze_submodules_options,
-            num_hp_shots_options,
         )
 
         return (
@@ -981,6 +985,7 @@ def run_study(  # noqa: PLR0915
             domain_adaptation_methods,
             freeze_submodules_options,
             num_hp_shots_options,
+            hp_test_set_size,
         )
 
     (
@@ -990,6 +995,7 @@ def run_study(  # noqa: PLR0915
         domain_adaptation_methods,
         freeze_submodules_options,
         num_hp_shots_options,
+        hp_test_set_size,
     ) = _validate_args(
         model_types,
         training_datasets,
@@ -997,6 +1003,7 @@ def run_study(  # noqa: PLR0915
         domain_adaptation_methods,
         freeze_submodules_options,
         num_hp_shots_options,
+        hp_test_set_size,
     )
 
     ###########################################
@@ -1019,6 +1026,7 @@ def run_study(  # noqa: PLR0915
         domain_adaptation_methods=domain_adaptation_methods,
         freeze_submodules_options=freeze_submodules_options,
         num_hp_shots_options=num_hp_shots_options,
+        hp_test_set_size=hp_test_set_size,
     )
 
     def _setup_directories(study: PowerBalanceStudy):

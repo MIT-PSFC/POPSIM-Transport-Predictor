@@ -9,6 +9,7 @@ from popsim.ml import DataLoader, IntegralLoss, TrainRunBuilder
 from popsim.ml.checkpointing import create_default_checkpoint_manager, restore_model
 from popsim.ml.dataloading import make_dataloaders
 
+from transport_study import EPISODE_DIM, TIME_COORD, TIME_DIM
 from transport_study.modules.power_balance.module import (
     PowerBalanceEnv,
     PowerBalanceScalingLaw,
@@ -18,7 +19,7 @@ from transport_study.modules.power_balance.module import (
 from transport_study.modules.power_balance.p_oh.trb import OhmicPowerTRB
 from transport_study.modules.power_balance.p_rad.trb import RadiatedPowerTRB
 from transport_study.orchestration.organize_data import (
-    get_train_test_datasets_transfer,
+    get_train_test_datasets,
     get_train_val_datasets,
 )
 
@@ -42,22 +43,28 @@ class PowerBalanceTRB(TrainRunBuilder):
         Also, slightly different from the POPSIM version, we're just returning the validation dataset.
         """
 
-        if dataloader_config["transfer_learning"]:
-            ds_train, ds_val = get_train_test_datasets_transfer(
-                training_data_case=dataloader_config["training_data_case"],
-                num_hp_shots=dataloader_config["num_hp_shots"],
-                normalization_method=dataloader_config["normalization_method"],
+        if dataloader_config["domain_adaptation"] is None:
+            logger.info("Using standard learning dataloader")
+            ds_train, ds_val = get_train_val_datasets(
+                training_data=dataloader_config["training_data"],
+                data_normalization=dataloader_config["data_normalization"],
             )
         else:
-            ds_train, ds_val = get_train_val_datasets(
-                training_data_case=dataloader_config["training_data_case"],
-                normalization_method=dataloader_config["normalization_method"],
+            logger.info(
+                f"Using transfer learning dataloader with domain adaptation {dataloader_config['domain_adaptation']}"
+            )
+            ds_train, ds_val = get_train_test_datasets(
+                training_data=dataloader_config["training_data_case"],
+                data_normalization=dataloader_config["data_normalization"],
+                domain_adaptation=dataloader_config["domain_adaptation"],
+                num_hp_shots=dataloader_config["num_hp_shots"],
+                hp_test_set_size=dataloader_config.get("hp_test_set_size", None),
             )
 
         # Drop time_idx as a shared coordinate — it has duplicate values across shots and
         # causes groupby("shot") to fail when reassembling. The dataloader uses "time" instead.
-        ds_train = ds_train.drop_vars("time_idx", errors="ignore")
-        ds_val = ds_val.drop_vars("time_idx", errors="ignore")
+        ds_train = ds_train.drop_vars(TIME_DIM, errors="ignore")
+        ds_val = ds_val.drop_vars(TIME_DIM, errors="ignore")
 
         if "state_vars" in dataloader_config.keys():
             segment_lengths = [
@@ -74,8 +81,8 @@ class PowerBalanceTRB(TrainRunBuilder):
 
         train_dl, val_dl = make_dataloaders(
             datasets=(ds_train, ds_val),
-            time_coord="time",
-            episode_coord="shot",
+            time_coord=TIME_COORD,
+            episode_coord=EPISODE_DIM,
             input_vars=dataloader_config["input_vars"],
             target_vars=dataloader_config["target_vars"],
             extra_vars=dataloader_config.get("extra_vars", None),
@@ -88,7 +95,7 @@ class PowerBalanceTRB(TrainRunBuilder):
             nan_handling="drop_segment",
         )
 
-        return ds_val, train_dl, val_dl, None
+        return ds_val, train_dl, val_dl
 
     @staticmethod
     def model_init(train_dl: DataLoader, model_init_config: dict) -> Any:

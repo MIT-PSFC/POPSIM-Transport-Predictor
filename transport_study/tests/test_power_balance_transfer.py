@@ -13,7 +13,7 @@ def test_power_balance_transfer_cases():
     """Make sure cases are set up correctly"""
 
     study = PowerBalanceStudy(
-        name="test_power_balance_transfer",
+        name="xfer_test",
         working_dir_base=os.path.join(PACKAGE_ROOT, "tests", "test_outputs"),
         dataset_paths={
             "cmod": config.cmod_dataset_path,
@@ -26,15 +26,16 @@ def test_power_balance_transfer_cases():
         domain_adaptation_methods=[None, "mixing", "transfer"],
         freeze_submodules_options=[True, False],
         num_hp_shots_options=[0, None],
-        debug=True,
+        hp_test_set_size=4,
     )
 
     # Ensure that each case with a prereq, has that prereq in the list of cases
     for case in study.cases:
-        if case.prereq is not None:
-            assert case.prereq in study.cases, (
-                f"Case {case} has prereq {case.prereq} which is not in the list of cases"
-            )
+        if case.prereqs is not None:
+            for prereq in case.prereqs:
+                assert prereq in study.cases, (
+                    f"{case}\nhas prereq\n{prereq}\nwhich is not in the list of cases"
+                )
 
     # Ensure that there are no duplicate cases
     assert len(study.cases) == len(set(study.cases)), (
@@ -59,3 +60,6 @@ def test_power_balance_transfer_cases():
 
 if __name__ == "__main__":
     test_power_balance_transfer_cases()
+    # TODO(ZanderKeith), make sure the following things are happening:
+    # 1) Cases properly restore their hyperparameters
+    # 2) submodules within cases get their proper hyperparameters and restore properly

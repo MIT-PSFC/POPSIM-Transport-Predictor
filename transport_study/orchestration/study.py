@@ -61,6 +61,7 @@ class Study(ABC):
         working_dir_base: str,
         dataset_paths: dict[str, str],
         cases: list[Case],
+        hp_test_set_size: int,
     ):
         """
         Initialize this study with the given name, dataset paths, and cases.
@@ -68,6 +69,7 @@ class Study(ABC):
         self.name = name
         self.dataset_paths = dataset_paths
         self.cases = cases
+        self.hp_test_set_size = hp_test_set_size
 
         self.working_dir = os.path.join(working_dir_base, name)
         self.model_dir = os.path.join(self.working_dir, "models")
@@ -83,6 +85,7 @@ class Study(ABC):
         logger.info(f"Study name: {name}")
         logger.info(f"Working directory base: {working_dir_base}")
         logger.info(f"Total number of cases: {len(cases)}")
+        logger.info(f"High-performance test set size: {hp_test_set_size}")
 
 
 def update_submodule_configs(main_config: dict, submodules: list[str]) -> TrainConfig:

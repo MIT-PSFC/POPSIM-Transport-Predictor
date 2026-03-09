@@ -8,6 +8,7 @@ from popsim.ml.split_utils import split_dataset_by_fracs
 from scipy.constants import mu_0
 from scipy.linalg import fractional_matrix_power
 
+from transport_study import EPISODE_DIM, TIME_COORD, TIME_DIM
 from transport_study.config import TRAIN_VAL_SPLIT, config
 
 MAX_DS_SIZE_GB = 100  # If the dataset is larger than this, do not load into memory
@@ -32,7 +33,7 @@ INPUT_POWER_SIGNALS = ["P_ECRH_MW", "P_NBI_MW", "P_ICRF_MW", "P_LH_MW"]
 def concat_with_nan_padding(
     datasets: list[xr.Dataset],
     concat_dim: str,
-    pad_dim: str = "time_idx",
+    pad_dim: str = TIME_DIM,
 ) -> xr.Dataset:
     """Concatenate datasets while padding shorter `pad_dim` with NaNs.
 
@@ -118,11 +119,11 @@ def get_ds(
     ds["P_aux_MW"] = ds["P_NBI_MW"] + ds["P_ECRH_MW"] + ds["P_ICRF_MW"] + ds["P_LH_MW"]
 
     # If dataset was from a zarr store, must promote the 'time' data var to a coordinate
-    if "time" not in ds.coords:
-        ds = ds.set_coords("time")
+    if TIME_COORD not in ds.coords:
+        ds = ds.set_coords(TIME_COORD)
 
     # Dataset retains all signals, the dataloader will filter out the ones that are not needed.
-    return ds, "shot"
+    return ds, EPISODE_DIM
 
 
 def add_performance(
@@ -149,10 +150,10 @@ def add_performance(
     )
 
     # Get the 95th percentile value per shot
-    if "time_idx" in ds.dims:
-        ds["performance"] = perf_timeseries.quantile(0.95, dim="time_idx", skipna=True)
+    if TIME_DIM in ds.dims:
+        ds["performance"] = perf_timeseries.quantile(0.95, dim=TIME_DIM, skipna=True)
     else:
-        ds["performance"] = perf_timeseries.quantile(0.95, dim="time", skipna=True)
+        ds["performance"] = perf_timeseries.quantile(0.95, dim=TIME_COORD, skipna=True)
 
     n_shots = ds.sizes[episode_coord]
 
@@ -483,8 +484,8 @@ def normalize_domain(  # noqa: PLR0915
 
 
 def get_train_val_datasets(
-    training_data_case: str,
-    normalization_method: str | None = "raw",
+    training_data: str,
+    data_normalization: str,
 ):
     """
     Split dataset into training and validation sets based on the specified training data case.
@@ -493,9 +494,9 @@ def get_train_val_datasets(
     That means all our historic data can be used for training (with the model) and validation (picking the best checkpoint / hyperparameters).
     """
 
-    if training_data_case in ["cmod", "tcv", "d3d_lp"]:
+    if training_data in ["cmod", "tcv", "d3d_lp"]:
         # Single device historic training data
-        ds, episode_coord = get_ds(training_data_case)
+        ds, episode_coord = get_ds(training_data)
         ds = add_performance(ds, episode_coord)
         train_ds, val_ds = split_dataset_by_fracs(
             ds,
@@ -504,8 +505,8 @@ def get_train_val_datasets(
             seed=42,
             sortby="performance",
         )
-        train_ds = train_ds.assign_coords(ds_source=training_data_case)
-        val_ds = val_ds.assign_coords(ds_source=training_data_case)
+        train_ds = train_ds.assign_coords(ds_source=training_data)
+        val_ds = val_ds.assign_coords(ds_source=training_data)
 
     else:
         # Multi-device historic training data
@@ -533,7 +534,7 @@ def get_train_val_datasets(
         train_ds_tcv = train_ds_tcv.assign_coords(ds_source="tcv")
         val_ds_tcv = val_ds_tcv.assign_coords(ds_source="tcv")
 
-        if training_data_case == "cmod_tcv":
+        if training_data == "cmod_tcv":
             train_ds = concat_with_nan_padding(
                 [train_ds_cmod, train_ds_tcv], concat_dim=episode_coord
             )
@@ -541,7 +542,7 @@ def get_train_val_datasets(
                 [val_ds_cmod, val_ds_tcv], concat_dim=episode_coord
             )
 
-        elif training_data_case == "cmod_tcv_d3d_lp":
+        elif training_data == "cmod_tcv_d3d_lp":
             ds_d3d_lp, episode_coord = get_ds("d3d_lp")
             ds_d3d_lp = add_performance(ds_d3d_lp, episode_coord)
             train_ds_d3d_lp, val_ds_d3d_lp = split_dataset_by_fracs(
@@ -563,27 +564,31 @@ def get_train_val_datasets(
                 concat_dim=episode_coord,
             )
         else:
-            raise ValueError(f"Unknown training data case: {training_data_case}")
+            raise ValueError(f"Unknown training data case: {training_data}")
 
     logger.debug("Training dataset size: {}", train_ds.sizes[episode_coord])
     logger.debug("Validation dataset size: {}", val_ds.sizes[episode_coord])
 
-    train_ds, val_ds = normalize_domain(train_ds, val_ds, method=normalization_method)
+    train_ds, val_ds = normalize_domain(train_ds, val_ds, method=data_normalization)
 
     return train_ds, val_ds
 
 
-def get_train_test_datasets_transfer(
-    training_data_case: str,
+def get_train_test_datasets(
+    training_data: str,
+    data_normalization: str,
+    domain_adaptation: str,
     num_hp_shots: int | None,
-    normalization_method: str | None = "raw",
+    hp_test_set_size: int,
 ):
     """
-    Split dataset into training and test sets for the transfer learning case.
+    Split dataset into training and test sets for the target learning case.
+    If domain adaptation is 'mixing', makes a combined training set of historic data and high-performance DIII-D shots,
+    while if domain adaptation is 'transfer' or the training data case is 'exnihilo', removes all historic data from the training set, leaving only the high-performance DIII-D shots.
     The number of high-performance shots included in training is specified by `num_hp_shots`.
 
     The test set is always the same set of high-performance DIII-D shots
-    The training set is made up of the historic data specified by `training_data_case` plus the `num_hp_shots` highest-performing shots from DIII-D.
+    The training set is made up of the historic data specified by `training_data` plus the `num_hp_shots` highest-performing shots from DIII-D.
 
     There is no validation set in this case, since we are not tuning hyperparameters in this case.
     We are treating the test set as a validation set in a sense, since we are using it to pick the best checkpoint for evaluation,
@@ -598,37 +603,31 @@ def get_train_test_datasets_transfer(
     ds_hp, episode_coord = get_ds("d3d_hp")
     ds_hp = add_performance(ds_hp, episode_coord)
     ds_hp = ds_hp.assign_coords(ds_source="d3d_hp")
-    # TODO(ZanderKeith): Need to sort by performance here
-    sorted_shots = np.argsort(ds_hp[episode_coord].values)
+    sorted_shots = np.argsort(ds_hp["performance"].values)
 
-    # TODO(ZanderKeith): Fix this
-    max_train_size = 30  # max([s for s in HP_SHOTS_INCLUDED if s is not None])
-    test_size = ds_hp.sizes[episode_coord] - max_train_size
-
-    test_shot_pool = sorted_shots[-test_size:]
+    test_shot_pool = sorted_shots[-hp_test_set_size:]
     test_ds = ds_hp.isel({episode_coord: test_shot_pool})
 
     if num_hp_shots is None:
         # If num_hp_shots is None, put all available high-performance shots in training and testing set (this is cheating, but allows us to see the maximum theoretical performance)
         train_ds_hp = ds_hp.isel({episode_coord: sorted_shots})
     else:
-        if num_hp_shots > max_train_size:
-            logger.warning(
-                f"num_hp_shots {num_hp_shots} is greater than the maximum available {max_train_size}. Using {max_train_size} instead."
-            )
         train_shot_pool = sorted_shots[:num_hp_shots]
         train_ds_hp = ds_hp.isel({episode_coord: train_shot_pool})
 
-    if training_data_case == "exnihilo":
-        train_ds = train_ds_hp
-    else:
-        # Load historic data and put it all in the training set
-        train_ds_hist, val_ds_hist = get_train_val_datasets(training_data_case)
-        train_ds = concat_with_nan_padding(
-            [train_ds_hist, val_ds_hist, train_ds_hp],
-            concat_dim=episode_coord,
-        )
+    # Load historic data and put it all in the training set
+    train_ds_hist, val_ds_hist = get_train_val_datasets(training_data)
+    train_ds = concat_with_nan_padding(
+        [train_ds_hist, val_ds_hist, train_ds_hp],
+        concat_dim=episode_coord,
+    )
+    # Normalize the combined dataset (using only the historic data to calculate normalization parameters to avoid data leakage from the test set)
+    train_ds, test_ds = normalize_domain(train_ds, test_ds, method=data_normalization)
 
-    train_ds, test_ds = normalize_domain(train_ds, test_ds, method=normalization_method)
+    # Now depending on the domain adaptation method / training data case, remove stuff from the training set
+    # Everything should already be set up for the 'mixing' case, but the 'transfer' and 'exnihilo' cases require removing historic data from the training set
+    if domain_adaptation == "transfer" or training_data == "exnihilo":
+        # Remove all the historic data from the training set, leaving only the high-performance DIII-D shots
+        train_ds = train_ds.where(train_ds.coords["ds_source"] == "d3d_hp", drop=True)
 
     return train_ds, test_ds
