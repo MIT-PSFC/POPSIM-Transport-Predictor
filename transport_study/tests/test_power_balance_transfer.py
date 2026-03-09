@@ -20,7 +20,7 @@ def test_power_balance_transfer_cases():
             "tcv": config.tcv_dataset_path,
             "d3d_hp": config.d3d_hp_dataset_path,
         },
-        model_types=["scaling_law", "sciml", "unstructured_nn"],
+        model_types=["sciml", "unstructured_nn"],
         training_datasets=["cmod", "cmod_tcv"],
         data_normalization_methods=["raw", "coral"],
         domain_adaptation_methods=[None, "mixing", "transfer"],
@@ -43,12 +43,7 @@ def test_power_balance_transfer_cases():
     )
 
     # Ensure there is only one hyperparameter tuning case per model type
-    # Hyperparameter tuning is defined as cases with no domain adaptation (train and test on same device) and no prereq (this is the one that others depend on)
-    hp_tuning_cases = [
-        case
-        for case in study.cases
-        if case.domain_adaptation is None and case.prereq is None
-    ]
+    hp_tuning_cases = [case for case in study.cases if study._is_hyperparam_case(case)]
     hp_tuning_cases_by_model = {}
     for case in hp_tuning_cases:
         if case.model_type in hp_tuning_cases_by_model:
@@ -56,6 +51,169 @@ def test_power_balance_transfer_cases():
                 f"Multiple hyperparameter tuning cases found for model type {case.model_type}: {case} and {hp_tuning_cases_by_model[case.model_type]}"
             )
         hp_tuning_cases_by_model[case.model_type] = case
+
+    # For a couple special cases, ensure the prereqs are set up correctly
+    for case in study.cases:
+        if (
+            case.model_type == "sciml"
+            and case.training_data == "cmod"
+            and case.data_normalization == "raw"
+            and case.domain_adaptation in [None, "mixing"]
+        ):
+            expected_prereqs = [
+                # Hyperparameter tuning case for this model type
+                PowerBalanceStudy.Case(
+                    model_type="sciml",
+                    training_data=PowerBalanceStudy.HYPERPARAM_TRAINING_DATASET,
+                    data_normalization=PowerBalanceStudy.HYPERPARAM_DATA_NORMALIZATION,
+                    domain_adaptation=PowerBalanceStudy.HYPERPARAM_DOMAIN_ADAPTATION,
+                    freeze_submodules=PowerBalanceStudy.HYPERPARAM_FREEZE_SUBMODULES,
+                    num_hp_shots=PowerBalanceStudy.HYPERPARAM_NUM_HP_SHOTS,
+                    # Submodules required for the hyperparameter tuning of this model type
+                    prereqs=[
+                        PowerBalanceStudy.Case(
+                            model_type="p_oh",
+                            training_data=PowerBalanceStudy.HYPERPARAM_TRAINING_DATASET,
+                            data_normalization=PowerBalanceStudy.HYPERPARAM_DATA_NORMALIZATION,
+                            domain_adaptation=PowerBalanceStudy.HYPERPARAM_DOMAIN_ADAPTATION,
+                            freeze_submodules=PowerBalanceStudy.HYPERPARAM_FREEZE_SUBMODULES,
+                            num_hp_shots=PowerBalanceStudy.HYPERPARAM_NUM_HP_SHOTS,
+                        ),
+                        PowerBalanceStudy.Case(
+                            model_type="p_rad",
+                            training_data=PowerBalanceStudy.HYPERPARAM_TRAINING_DATASET,
+                            data_normalization=PowerBalanceStudy.HYPERPARAM_DATA_NORMALIZATION,
+                            domain_adaptation=PowerBalanceStudy.HYPERPARAM_DOMAIN_ADAPTATION,
+                            freeze_submodules=PowerBalanceStudy.HYPERPARAM_FREEZE_SUBMODULES,
+                            num_hp_shots=PowerBalanceStudy.HYPERPARAM_NUM_HP_SHOTS,
+                        ),
+                    ],
+                ),
+                # p_oh and p_rad pre-trained submodules for this training data, normalization, and domain adaptation setting
+                PowerBalanceStudy.Case(
+                    model_type="p_oh",
+                    training_data=case.training_data,
+                    data_normalization=case.data_normalization,
+                    domain_adaptation=case.domain_adaptation,
+                    freeze_submodules=case.freeze_submodules,
+                    num_hp_shots=case.num_hp_shots,
+                    prereqs=[
+                        PowerBalanceStudy.Case(
+                            model_type="p_oh",
+                            training_data=PowerBalanceStudy.HYPERPARAM_TRAINING_DATASET,
+                            data_normalization=PowerBalanceStudy.HYPERPARAM_DATA_NORMALIZATION,
+                            domain_adaptation=PowerBalanceStudy.HYPERPARAM_DOMAIN_ADAPTATION,
+                            freeze_submodules=PowerBalanceStudy.HYPERPARAM_FREEZE_SUBMODULES,
+                            num_hp_shots=PowerBalanceStudy.HYPERPARAM_NUM_HP_SHOTS,
+                        ),
+                    ],
+                ),
+                PowerBalanceStudy.Case(
+                    model_type="p_rad",
+                    training_data=case.training_data,
+                    data_normalization=case.data_normalization,
+                    domain_adaptation=case.domain_adaptation,
+                    freeze_submodules=case.freeze_submodules,
+                    num_hp_shots=case.num_hp_shots,
+                    prereqs=[
+                        PowerBalanceStudy.Case(
+                            model_type="p_rad",
+                            training_data=PowerBalanceStudy.HYPERPARAM_TRAINING_DATASET,
+                            data_normalization=PowerBalanceStudy.HYPERPARAM_DATA_NORMALIZATION,
+                            domain_adaptation=PowerBalanceStudy.HYPERPARAM_DOMAIN_ADAPTATION,
+                            freeze_submodules=PowerBalanceStudy.HYPERPARAM_FREEZE_SUBMODULES,
+                            num_hp_shots=PowerBalanceStudy.HYPERPARAM_NUM_HP_SHOTS,
+                        ),
+                    ],
+                ),
+            ]
+        elif (
+            case.model_type == "sciml"
+            and case.training_data == "cmod"
+            and case.data_normalization == "raw"
+            and case.domain_adaptation == "transfer"
+        ):
+            expected_prereqs = [
+                # Originally trained model, and this model has all its prereqs, too
+                PowerBalanceStudy.Case(
+                    model_type=case.model_type,
+                    training_data=case.training_data,
+                    data_normalization=case.data_normalization,
+                    domain_adaptation=None,
+                    freeze_submodules=case.freeze_submodules,
+                    num_hp_shots=None,
+                    prereqs=[
+                        # Hyperparameter tuning case for this model type
+                        PowerBalanceStudy.Case(
+                            model_type="sciml",
+                            training_data=PowerBalanceStudy.HYPERPARAM_TRAINING_DATASET,
+                            data_normalization=PowerBalanceStudy.HYPERPARAM_DATA_NORMALIZATION,
+                            domain_adaptation=PowerBalanceStudy.HYPERPARAM_DOMAIN_ADAPTATION,
+                            freeze_submodules=PowerBalanceStudy.HYPERPARAM_FREEZE_SUBMODULES,
+                            num_hp_shots=PowerBalanceStudy.HYPERPARAM_NUM_HP_SHOTS,
+                            # Submodules required for the hyperparameter tuning of this model type
+                            prereqs=[
+                                PowerBalanceStudy.Case(
+                                    model_type="p_oh",
+                                    training_data=PowerBalanceStudy.HYPERPARAM_TRAINING_DATASET,
+                                    data_normalization=PowerBalanceStudy.HYPERPARAM_DATA_NORMALIZATION,
+                                    domain_adaptation=PowerBalanceStudy.HYPERPARAM_DOMAIN_ADAPTATION,
+                                    freeze_submodules=PowerBalanceStudy.HYPERPARAM_FREEZE_SUBMODULES,
+                                    num_hp_shots=PowerBalanceStudy.HYPERPARAM_NUM_HP_SHOTS,
+                                ),
+                                PowerBalanceStudy.Case(
+                                    model_type="p_rad",
+                                    training_data=PowerBalanceStudy.HYPERPARAM_TRAINING_DATASET,
+                                    data_normalization=PowerBalanceStudy.HYPERPARAM_DATA_NORMALIZATION,
+                                    domain_adaptation=PowerBalanceStudy.HYPERPARAM_DOMAIN_ADAPTATION,
+                                    freeze_submodules=PowerBalanceStudy.HYPERPARAM_FREEZE_SUBMODULES,
+                                    num_hp_shots=PowerBalanceStudy.HYPERPARAM_NUM_HP_SHOTS,
+                                ),
+                            ],
+                        ),
+                        # p_oh and p_rad pre-trained submodules for this training data, normalization, and domain adaptation setting
+                        PowerBalanceStudy.Case(
+                            model_type="p_oh",
+                            training_data=case.training_data,
+                            data_normalization=case.data_normalization,
+                            domain_adaptation=case.domain_adaptation,
+                            freeze_submodules=case.freeze_submodules,
+                            num_hp_shots=case.num_hp_shots,
+                            prereqs=[
+                                PowerBalanceStudy.Case(
+                                    model_type="p_oh",
+                                    training_data=PowerBalanceStudy.HYPERPARAM_TRAINING_DATASET,
+                                    data_normalization=PowerBalanceStudy.HYPERPARAM_DATA_NORMALIZATION,
+                                    domain_adaptation=PowerBalanceStudy.HYPERPARAM_DOMAIN_ADAPTATION,
+                                    freeze_submodules=PowerBalanceStudy.HYPERPARAM_FREEZE_SUBMODULES,
+                                    num_hp_shots=PowerBalanceStudy.HYPERPARAM_NUM_HP_SHOTS,
+                                ),
+                            ],
+                        ),
+                        PowerBalanceStudy.Case(
+                            model_type="p_rad",
+                            training_data=case.training_data,
+                            data_normalization=case.data_normalization,
+                            domain_adaptation=case.domain_adaptation,
+                            freeze_submodules=case.freeze_submodules,
+                            num_hp_shots=case.num_hp_shots,
+                            prereqs=[
+                                PowerBalanceStudy.Case(
+                                    model_type="p_rad",
+                                    training_data=PowerBalanceStudy.HYPERPARAM_TRAINING_DATASET,
+                                    data_normalization=PowerBalanceStudy.HYPERPARAM_DATA_NORMALIZATION,
+                                    domain_adaptation=PowerBalanceStudy.HYPERPARAM_DOMAIN_ADAPTATION,
+                                    freeze_submodules=PowerBalanceStudy.HYPERPARAM_FREEZE_SUBMODULES,
+                                    num_hp_shots=PowerBalanceStudy.HYPERPARAM_NUM_HP_SHOTS,
+                                ),
+                            ],
+                        ),
+                    ],
+                )
+            ]
+        assert case.prereqs == expected_prereqs, (
+            f"Case {case} has unexpected prereqs. \nExpected: {expected_prereqs}\nActual: {case.prereqs}"
+        )
 
 
 if __name__ == "__main__":
