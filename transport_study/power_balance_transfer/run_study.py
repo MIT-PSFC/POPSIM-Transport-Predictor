@@ -512,9 +512,6 @@ class PowerBalanceStudy(Study):
             "lrf": 5e-4,
             "weight_decay": 2e-4,
         }
-        loss_config_base = {
-            "huber_delta": 0.5,
-        }
         dataloader_config_base = {
             "training_data": case.training_data,
             "data_normalization": case.data_normalization,
@@ -535,6 +532,34 @@ class PowerBalanceStudy(Study):
             "result_path": self.result_path(case),
         }
 
+        loss_config_base = {
+            "huber_delta": 0.5,
+        }
+
+        if case.domain_adaptation == "mixing":
+            # Special logic for loss weighting when doing mixing domain adaptation
+            # Assuming ~1000 shots of historic data for C-Mod and TCV and DIII-D low-performance, and num_hp_shots of DIII-D high-performance
+            # we want the high-performance data to be consistently heavily weighted
+            # Weights are chosen so that each device's effective contribution F_x = W_x * N_x
+            # (where N_x is the shot count) sums to 200, with d3d_hp carrying ~50% of that total.
+            # So the C-Mod and TCV data each make up 10 out of 200,
+            # the DIII-D low-performance data makes up 80 out of 200,
+            # and the DIII-D high-performance data makes up 100 out of 200
+            W_c = 10 / 1000
+            W_t = 10 / 1000
+            W_dlp = 80 / 1000
+            if case.num_hp_shots is None:
+                N_dhp = 97  # All 97 high-performance shots in the DIII-D dataset
+            else:
+                N_dhp = case.num_hp_shots
+            W_dhp = 100 / N_dhp
+            dataloader_config_base["device_weights"] = {
+                "cmod": W_c,
+                "tcv": W_t,
+                "d3d_lp": W_dlp,
+                "d3d_hp": W_dhp,
+            }
+
         if case.model_type == "p_oh":
             input_vars = self._input_vars(case)
             train_config_base = TrainConfig(
@@ -546,7 +571,7 @@ class PowerBalanceStudy(Study):
                     case
                 ),  # When doing hyperparameter tuning, this gets overwritten by the wandb agent
                 dataloader_config={
-                    "target_vars": ["P_oh_MW"],
+                    "target_vars": ["P_oh_MW", "ds_source_idx"],
                     "input_vars": input_vars,
                     "data_train_run_builder": "transport_study.modules.power_balance.trb.PowerBalanceTRB",  # Needed for submodules
                     **dataloader_config_base,
@@ -576,7 +601,7 @@ class PowerBalanceStudy(Study):
                     case
                 ),  # When doing hyperparameter tuning, this gets overwritten by the wandb agent
                 dataloader_config={
-                    "target_vars": ["P_rad_MW"],
+                    "target_vars": ["P_rad_MW", "ds_source_idx"],
                     "input_vars": input_vars,
                     "data_train_run_builder": "transport_study.modules.power_balance.trb.PowerBalanceTRB",
                     **dataloader_config_base,
@@ -631,7 +656,8 @@ class PowerBalanceStudy(Study):
                     "extra_vars": [
                         "P_oh_MW",
                         "P_rad_MW",
-                    ],  # Bring these along for comparison
+                        "ds_source_idx",
+                    ],  # Bring these along for comparison / device weighting
                     **dataloader_config_base,
                 },
                 model_init_config={
@@ -685,12 +711,12 @@ class PowerBalanceStudy(Study):
                 ),  # When doing hyperparameter tuning, this gets overwritten by the wandb agent
                 dataloader_config={
                     "input_vars": self._input_vars(case),
-                    "target_vars": ["Wtot_MJ"],
+                    "target_vars": ["Wtot_MJ", "ds_source_idx"],
                     "state_vars": ["Wtot_MJ"],
                     "extra_vars": [
                         "P_oh_MW",
                         "P_rad_MW",
-                    ],  # Bring these along for comparison
+                    ],  # Bring these along for comparison / device weighting
                     **dataloader_config_base,
                 },
                 model_init_config={
@@ -723,12 +749,12 @@ class PowerBalanceStudy(Study):
                 ),  # When doing hyperparameter tuning, this gets overwritten by the wandb agent
                 dataloader_config={
                     "input_vars": self._input_vars(case),
-                    "target_vars": ["Wtot_MJ"],
+                    "target_vars": ["Wtot_MJ", "ds_source_idx"],
                     "state_vars": ["Wtot_MJ"],
                     "extra_vars": [
                         "P_oh_MW",
                         "P_rad_MW",
-                    ],  # Bring these along for comparison
+                    ],  # Bring these along for comparison / device weighting
                     **dataloader_config_base,
                 },
                 model_init_config={

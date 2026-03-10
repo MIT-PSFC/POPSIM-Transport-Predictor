@@ -11,6 +11,7 @@ from popsim.ml.eval import EvalData, EvaluationSuite
 
 from transport_study import EPISODE_DIM, TIME_COORD, TIME_DIM
 from transport_study.modules.power_balance.p_oh.module import OhmicPower
+from transport_study.orchestration.organize_data import DS_SOURCE_TO_IDX
 
 
 class OhmicPowerTRB(TrainRunBuilder):
@@ -58,11 +59,28 @@ class OhmicPowerTRB(TrainRunBuilder):
         return module
 
     @staticmethod
-    def get_loss_fn(config: dict) -> Callable[[Any, Any], jnp.ndarray]:
+    def get_loss_fn(loss_config: dict) -> Callable[[Any, Any], jnp.ndarray]:
+        if "device_weights" not in loss_config:
+            device_weights = {
+                "cmod": 1.0,
+                "tcv": 1.0,
+                "d3d_lp": 1.0,
+                "d3d_hp": 1.0,
+            }
+        else:
+            device_weights = loss_config["device_weights"]
+
         def loss_fn(pred, targ):
-            # TODO(ZanderKeith): Fix device weights
             absolute_error = jnp.abs(pred.P_oh_MW_pred - targ["P_oh_MW"].data)
-            return jnp.mean(optax.huber_loss(absolute_error))
+            for device, weight in device_weights.items():
+                device_mask = targ["ds_source_idx"].data == DS_SOURCE_TO_IDX[device]
+                absolute_error = jnp.where(
+                    device_mask, weight * absolute_error, absolute_error
+                )
+            huber_loss = optax.huber_loss(
+                absolute_error, delta=loss_config["huber_delta"]
+            )
+            return jnp.mean(huber_loss)
 
         return loss_fn
 

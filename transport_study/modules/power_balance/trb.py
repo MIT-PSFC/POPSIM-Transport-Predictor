@@ -21,6 +21,7 @@ from transport_study.modules.power_balance.module import (
 from transport_study.modules.power_balance.p_oh.trb import OhmicPowerTRB
 from transport_study.modules.power_balance.p_rad.trb import RadiatedPowerTRB
 from transport_study.orchestration.organize_data import (
+    DS_SOURCE_TO_IDX,
     get_train_test_datasets,
     get_train_val_datasets,
 )
@@ -187,14 +188,27 @@ class PowerBalanceTRB(TrainRunBuilder):
 
     @staticmethod
     def get_loss_fn(loss_config: dict) -> Callable[[Any, Any], jnp.ndarray]:
-        def loss_fn(pred, targ):
-            wtot_loss = jnp.abs(pred.Wtot_MJ_pred - targ["Wtot_MJ"].data)
-            wtot_loss = optax.huber_loss(wtot_loss, delta=loss_config["huber_delta"])
+        if "device_weights" not in loss_config:
+            device_weights = {
+                "cmod": 1.0,
+                "tcv": 1.0,
+                "d3d_lp": 1.0,
+                "d3d_hp": 1.0,
+            }
+        else:
+            device_weights = loss_config["device_weights"]
 
-            device_weight = 1  # TODO(ZanderKeith) fix device weighting device_weights[targ["ds_source"].item()]
-            loss = device_weight * wtot_loss
-            # TODO(ZanderKeith): might be worthwhile to put the p_oh and p_rad in here?
-            return loss
+        def loss_fn(pred, targ):
+            absolute_error = jnp.abs(pred.Wtot_MJ_pred - targ["Wtot_MJ"].data)
+            for device, weight in device_weights.items():
+                device_mask = targ["ds_source_idx"].data == DS_SOURCE_TO_IDX[device]
+                absolute_error = jnp.where(
+                    device_mask, weight * absolute_error, absolute_error
+                )
+            huber_loss = optax.huber_loss(
+                absolute_error, delta=loss_config["huber_delta"]
+            )
+            return jnp.mean(huber_loss)
 
         return IntegralLoss(loss_fn)
 

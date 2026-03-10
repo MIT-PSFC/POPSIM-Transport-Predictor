@@ -13,6 +13,36 @@ from transport_study.config import TRAIN_VAL_SPLIT, config
 
 MAX_DS_SIZE_GB = 100  # If the dataset is larger than this, do not load into memory
 
+# Canonical idx for each device, used to pass device identity through the dataloader as a float variable.
+DS_SOURCE_TO_IDX: dict[str, int] = {"cmod": 0, "tcv": 1, "d3d_lp": 2, "d3d_hp": 3}
+IDX_TO_DS_SOURCE: dict[int, str] = {v: k for k, v in DS_SOURCE_TO_IDX.items()}
+
+
+def _add_ds_source_idx(ds: xr.Dataset) -> xr.Dataset:
+    """Broadcast the per-shot ds_source coordinate to a (shot, time_idx) data variable.
+
+    `ds_source` is a string coordinate that lives only on the shot dimension and is
+    dropped when the dataloader flattens (shot, time_idx) -> sample.  Converting it to
+    an integer data variable makes it survive that reshape so loss functions can look up
+    per-sample device weights via targ["ds_source_idx"].
+    """
+    ds_source = ds.coords["ds_source"]
+    float_type = ds[next(iter(ds.data_vars))].dtype  # match dataset float precision
+    if ds_source.dims == ():  # scalar coordinate for single device
+        int_val = DS_SOURCE_TO_IDX[ds_source.item()]
+        arr = np.full(
+            (ds.sizes[EPISODE_DIM], ds.sizes[TIME_DIM]), int_val, dtype=float_type
+        )
+    else:  # per-shot coordinate (shot,)
+        int_vals = np.array(
+            [DS_SOURCE_TO_IDX[s] for s in ds_source.values], dtype=float_type
+        )
+        arr = np.broadcast_to(
+            int_vals[:, None], (len(int_vals), ds.sizes[TIME_DIM])
+        ).copy()
+    return ds.assign({"ds_source_idx": xr.DataArray(arr, dims=[EPISODE_DIM, TIME_DIM])})
+
+
 REQUIRED_SIGNALS = [
     # Signals for power balance predictor
     "Wtot_MJ",
@@ -571,6 +601,9 @@ def get_train_val_datasets(
 
     train_ds, val_ds = normalize_domain(train_ds, val_ds, method=data_normalization)
 
+    train_ds = _add_ds_source_idx(train_ds)
+    val_ds = _add_ds_source_idx(val_ds)
+
     return train_ds, val_ds
 
 
@@ -634,5 +667,8 @@ def get_train_test_datasets(
 
     logger.debug("HP Training dataset size: {}", train_ds.sizes[episode_coord])
     logger.debug("HP Test dataset size: {}", test_ds.sizes[episode_coord])
+
+    train_ds = _add_ds_source_idx(train_ds)
+    test_ds = _add_ds_source_idx(test_ds)
 
     return train_ds, test_ds

@@ -165,8 +165,85 @@ def test_power_balance_transfer_cases():
             raise AssertionError
 
 
+def test_mix_device_weight():
+    study = PowerBalanceStudy(
+        name="xfer_test",
+        working_dir_base=os.path.join(PACKAGE_ROOT, "tests", "test_outputs"),
+        dataset_paths={
+            "cmod": config.cmod_dataset_path,
+            "tcv": config.tcv_dataset_path,
+            "d3d_hp": config.d3d_hp_dataset_path,
+        },
+        model_types=["sciml"],
+        training_datasets=["cmod_tcv"],
+        data_normalization_methods=["coral"],
+        domain_adaptation_methods=["mixing"],
+        freeze_submodules_options=[True],
+        num_hp_shots_options=[3],
+        hp_test_set_size=4,
+    )
+
+    case_p_oh = PowerBalanceStudy.Case(
+        model_type="p_oh",
+        training_data="cmod_tcv",
+        data_normalization="coral",
+        domain_adaptation="mixing",
+        freeze_submodules=True,
+        num_hp_shots=3,
+    )
+
+    study.launch_train(case_p_oh)
+
+
+def test_submodule_freezing():
+    study = PowerBalanceStudy(
+        name="xfer_test",
+        working_dir_base=os.path.join(PACKAGE_ROOT, "tests", "test_outputs"),
+        dataset_paths={
+            "cmod": config.cmod_dataset_path,
+            "tcv": config.tcv_dataset_path,
+            "d3d_hp": config.d3d_hp_dataset_path,
+        },
+        model_types=["sciml"],
+        training_datasets=["cmod_tcv"],
+        data_normalization_methods=["coral"],
+        domain_adaptation_methods=["mixing"],
+        freeze_submodules_options=[True, False],
+        num_hp_shots_options=[3],
+        hp_test_set_size=4,
+    )
+
+    case_p_oh = PowerBalanceStudy.Case(
+        model_type="p_oh",
+        training_data="cmod_tcv",
+        data_normalization="coral",
+        domain_adaptation=None,
+        freeze_submodules=True,
+        num_hp_shots=None,
+    )
+
+    case_p_rad = PowerBalanceStudy.Case(
+        model_type="p_rad",
+        training_data="cmod_tcv",
+        data_normalization="coral",
+        domain_adaptation=None,
+        freeze_submodules=True,
+        num_hp_shots=None,
+    )
+
+    case_frozen = PowerBalanceStudy.Case(
+        model_type="sciml",
+        training_data="cmod_tcv",
+        data_normalization="coral",
+        domain_adaptation=None,
+        freeze_submodules=True,
+        num_hp_shots=None,
+    )
+
+
 if __name__ == "__main__":
-    test_power_balance_transfer_cases()
+    # test_power_balance_transfer_cases()
+    test_mix_device_weight()
     # TODO(ZanderKeith), make sure the following things are happening:
     # 1) Cases properly restore their hyperparameters
     # 2) submodules within cases get their proper hyperparameters and restore properly
