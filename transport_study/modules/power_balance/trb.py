@@ -177,6 +177,8 @@ class PowerBalanceTRB(TrainRunBuilder):
             freeze_submodules=freeze_submodules,
         )
 
+        # This restoration of the main module is separate from the transfer learning restoration
+        # This would get the post-trained model, AFTER transfer learning has already been done
         if model_init_config.get("restore_main_module", False):
             manager = create_default_checkpoint_manager(
                 model_init_config["checkpoint_dir"]

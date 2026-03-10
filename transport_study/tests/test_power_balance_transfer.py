@@ -1,6 +1,7 @@
 import numpy as np
 import pytest
 import os
+import shutil
 from transport_study import PACKAGE_ROOT
 import chex
 
@@ -313,9 +314,10 @@ def test_transfer_weights():
         num_hp_shots=-1,
     )
 
-    for case in [case_unstructured_nn_base, case_unstructured_nn_transfer]:
-        if not os.path.exists(study.result_path(case)):
-            study.launch_train(case)
+    if not os.path.exists(study.result_path(case_unstructured_nn_base)):
+        study.launch_train(case_unstructured_nn_base)
+
+    study.launch_train(case_unstructured_nn_transfer)
 
     unstructured_nn_base_trainer, _ = study.restore_trainer(
         case_unstructured_nn_base, restore_best_checkpoint=False
@@ -484,6 +486,9 @@ def test_collect_results():
         num_hp_shots_options=[3],
         hp_test_set_size=4,
     )
+
+    shutil.rmtree(study.working_dir, ignore_errors=True)
+    os.makedirs(study.working_dir)
 
     unfinished_cases = [
         case
