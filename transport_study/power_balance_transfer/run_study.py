@@ -5,10 +5,17 @@ from itertools import product
 
 import fire
 import netCDF4  # noqa: F401
+import numpy as np
+import xarray as xr
 import yaml
 from loguru import logger
-from popsim.ml import TrainConfig
-from popsim.ml.launch import launch_agent, launch_sweep, launch_train
+from popsim.ml import DataLoader, TrainConfig, Trainer
+from popsim.ml.launch import (
+    _get_train_run_builder_class,
+    launch_agent,
+    launch_sweep,
+    launch_train,
+)
 
 from transport_study import PACKAGE_ROOT
 from transport_study.config import config
@@ -101,7 +108,7 @@ class PowerBalanceStudy(Study):
 
             return False
 
-        def get_hyperparam_prereq(self) -> "PowerBalanceStudy".Case:
+        def get_hyperparam_prereq(self) -> Study.Case:
             if self.is_hyperparam_case():
                 return self
             else:
@@ -403,7 +410,7 @@ class PowerBalanceStudy(Study):
 
         if self.check_prereq_satisfied(case):
             logger.opt(colors=True).info(
-                f"<bold><cyan>RUNNING CASE:</cyan></bold>\n{case}"
+                f"<bold><red>RUNNING CASE:</red></bold>\n{case}"
             )
             # Prereq is satisfied, can run this case.
             if case.is_hyperparam_case():
@@ -856,6 +863,148 @@ class PowerBalanceStudy(Study):
         os.makedirs(os.path.dirname(result_path), exist_ok=True)
         ds.to_netcdf(result_path)
 
+    ##############
+    # COLLECTION #
+    ##############
+
+    def restore_trainer(
+        self, case: Case, restore_best_checkpoint: bool = True
+    ) -> tuple[Trainer, DataLoader]:
+        """Restore a given case's trainer and the test dataloader"""
+        if not os.path.exists(self.trained_model_dir(case)):
+            raise ValueError(
+                f"Trained model directory for case\n{case}\nnot found at\n{self.trained_model_dir(case)}"
+            )
+        if not os.path.exists(self.result_path(case)):
+            logger.warning(
+                f"Result file for case\n{case}\nnot found at\n{self.result_path(case)}\nTraining may be incomplete!"
+            )
+        training_config = self.make_train_config(case)
+        train_run_builder = _get_train_run_builder_class(
+            training_config.train_run_builder
+        )
+        # If this is a submodule, use the dataloader construction logic from the main module. Fallback to using the submodule's own logic otherwise.
+        if training_config.dataloader_config.get("data_train_run_builder"):
+            data_train_run_builder = _get_train_run_builder_class(
+                training_config.dataloader_config["data_train_run_builder"]
+            )
+            _, train_dl, _val_dl, test_dl = data_train_run_builder.get_dataloaders(
+                training_config.dataloader_config
+            )
+        else:
+            _, train_dl, _val_dl, test_dl = train_run_builder.get_dataloaders(
+                training_config.dataloader_config
+            )
+        model = train_run_builder.model_init(
+            train_dl, training_config.model_init_config
+        )
+        loss_fn = train_run_builder.get_loss_fn(training_config.loss_config)
+        opt = train_run_builder.get_optimizer(training_config.optimizer_config)
+        trainer = Trainer(
+            model=model,
+            loss_fn=loss_fn,
+            optimizer=opt,
+            checkpoint_dir=training_config.checkpoint_dir,
+            trainable_getter=train_run_builder.get_trainable_getter(
+                training_config.model_init_config
+            ),
+        )
+        if restore_best_checkpoint:
+            trainer.restore_best_checkpoint(path=self.trained_model_dir(case))
+
+        return trainer, test_dl
+
+    def collect_results(self):
+        """Collect results from all cases and combine them into a single xarray dataset for analysis and visualization.
+
+        Dims: case_idx, shot_idx
+        Coords:
+        - shot(case_idx, shot_idx)
+        - ds_source(case_idx, shot_idx)
+        - model_type(case_idx)
+        - training_data(case_idx)
+        - data_normalization(case_idx)
+        - domain_adaptation(case_idx)
+        - freeze_submodules(case_idx)
+        - num_hp_shots(case_idx)
+        Data variables: (E is either relative 'rel' or absolute 'abs', and D is dimension either 'shot' or per-timeslice 'ts')
+        - error_E_D_mean(case_idx)
+        - error_E_D_std(case_idx)
+        - error_E_D_med(case_idx)
+        - error_E_D_p25(case_idx)
+        - error_E_D_p75(case_idx)
+        - error_E_D_min(case_idx)
+        - error_E_D_max(case_idx)
+        """
+        results = []
+        for case in self.cases:
+            result_path = self.result_path(case)
+            if not os.path.exists(result_path):
+                continue
+
+            ds = xr.load_dataset(result_path)
+
+            err_abs_shot = ds["error_abs_shot"]
+            err_rel_shot = ds["error_rel_shot"]
+            err_abs_ts = ds["error_abs_ts"]
+            err_rel_ts = ds["error_rel_ts"]
+
+            result = xr.Dataset(
+                {
+                    "err_abs_shot_mean": err_abs_shot.mean(),
+                    "err_abs_shot_std": err_abs_shot.std(),
+                    "err_abs_shot_med": err_abs_shot.median(),
+                    "err_abs_shot_p25": err_abs_shot.quantile(0.25).drop_vars(
+                        "quantile"
+                    ),
+                    "err_abs_shot_p75": err_abs_shot.quantile(0.75).drop_vars(
+                        "quantile"
+                    ),
+                    "err_abs_shot_min": err_abs_shot.min(),
+                    "err_abs_shot_max": err_abs_shot.max(),
+                    "err_rel_shot_mean": err_rel_shot.mean(),
+                    "err_rel_shot_std": err_rel_shot.std(),
+                    "err_rel_shot_med": err_rel_shot.median(),
+                    "err_rel_shot_p25": err_rel_shot.quantile(0.25).drop_vars(
+                        "quantile"
+                    ),
+                    "err_rel_shot_p75": err_rel_shot.quantile(0.75).drop_vars(
+                        "quantile"
+                    ),
+                    "err_rel_shot_min": err_rel_shot.min(),
+                    "err_rel_shot_max": err_rel_shot.max(),
+                    "err_abs_ts_mean": err_abs_ts.mean(),
+                    "err_abs_ts_std": err_abs_ts.std(),
+                    "err_abs_ts_med": err_abs_ts.median(),
+                    "err_abs_ts_p25": err_abs_ts.quantile(0.25).drop_vars("quantile"),
+                    "err_abs_ts_p75": err_abs_ts.quantile(0.75).drop_vars("quantile"),
+                    "err_abs_ts_min": err_abs_ts.min(),
+                    "err_abs_ts_max": err_abs_ts.max(),
+                    "err_rel_ts_mean": err_rel_ts.mean(),
+                    "err_rel_ts_std": err_rel_ts.std(),
+                    "err_rel_ts_med": err_rel_ts.median(),
+                    "err_rel_ts_p25": err_rel_ts.quantile(0.25).drop_vars("quantile"),
+                    "err_rel_ts_p75": err_rel_ts.quantile(0.75).drop_vars("quantile"),
+                    "err_rel_ts_min": err_rel_ts.min(),
+                    "err_rel_ts_max": err_rel_ts.max(),
+                }
+            ).assign_coords(
+                {
+                    "model_type": case.model_type,
+                    "training_data": case.training_data,
+                    "data_normalization": case.data_normalization,
+                    "domain_adaptation": case.domain_adaptation,
+                    "freeze_submodules": case.freeze_submodules,
+                    "num_hp_shots": case.num_hp_shots
+                    if case.num_hp_shots is not None
+                    else np.nan,
+                }
+            )
+            results.append(result)
+
+        ds_merged = xr.concat(results, dim="case_idx")
+        return ds_merged
+
 
 def run_study(  # noqa: PLR0915
     project_name: str,
@@ -1109,7 +1258,7 @@ def run_study(  # noqa: PLR0915
     ########################
     # Launch Orchestration #
     ########################
-    logger.opt(colors=True).info("<bold><magenta>ORCHESTRATION</bold></magenta>")
+    logger.opt(colors=True).info("<bold><magenta>ORCHESTRATION</magenta></bold>")
 
     # Unfinished cases are those we have data to run but haven't gotten results for yet
     unfinished_cases = [
@@ -1119,7 +1268,7 @@ def run_study(  # noqa: PLR0915
         and study.check_data_requirements(case)
     ]
     while len(unfinished_cases) > 0:
-        logger.info(f"{len(unfinished_cases)} cases remaining.")
+        logger.info(f"{len(unfinished_cases)} cases remain")
         for case in unfinished_cases:
             study.run_case(
                 case, skip_tuning=skip_tuning, enable_parallelism=enable_parallelism
@@ -1131,6 +1280,8 @@ def run_study(  # noqa: PLR0915
             for case in unfinished_cases
             if not os.path.exists(study.result_path(case))
         ]
+
+    study.collect_results()
 
     ############################
     # Training Data Comparison #

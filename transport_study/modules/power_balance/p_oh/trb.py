@@ -120,7 +120,7 @@ class OhmicPowerTRB(TrainRunBuilder):
                 mask = ~np.isnan(x)
                 return np.trapezoid(y[mask], x[mask])
 
-            error_shot_abs = xr.apply_ufunc(
+            error_abs_shot = xr.apply_ufunc(
                 _trapezoid_dropna,
                 error_abs_ts,
                 time_2d,
@@ -128,7 +128,7 @@ class OhmicPowerTRB(TrainRunBuilder):
                 vectorize=True,
             )
 
-            error_shot_rel = xr.apply_ufunc(
+            error_rel_shot = xr.apply_ufunc(
                 _trapezoid_dropna,
                 error_rel_ts,
                 time_2d,
@@ -158,8 +158,8 @@ class OhmicPowerTRB(TrainRunBuilder):
                     "P_oh_MW_pred": pred,
                     "error_abs_ts": error_abs_ts,
                     "error_rel_ts": error_rel_ts,
-                    "error_shot_abs": error_shot_abs,
-                    "error_shot_rel": error_shot_rel,
+                    "error_abs_shot": error_abs_shot,
+                    "error_rel_shot": error_rel_shot,
                 }
             )
             ds = ds.assign_coords(ds_source=(EPISODE_DIM, ds_source_array))

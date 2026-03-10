@@ -110,8 +110,8 @@ class PowerBalanceTRB(TrainRunBuilder):
         Instantiate and return your model given a training DataLoader
         and a model config dict.
         """
-        model_case = model_init_config["model_case"]
-        if model_case in ["scaling_law", "sciml"]:
+        model_type = model_init_config["model_type"]
+        if model_type in ["scaling_law", "sciml"]:
             p_oh_config = model_init_config["submodules"]["p_oh_predictor"]
             if isinstance(p_oh_config, TrainConfig):
                 p_oh_config = p_oh_config.model_dump()
@@ -134,14 +134,14 @@ class PowerBalanceTRB(TrainRunBuilder):
                 )
                 p_rad_predictor = restore_model(p_rad_manager, p_rad_predictor)
 
-        if model_case == "scaling_law":
+        if model_type == "scaling_law":
             module = PowerBalanceScalingLaw.init(
                 p_oh_predictor=p_oh_predictor,
                 p_rad_predictor=p_rad_predictor,
                 min_taue=model_init_config.get("min_taue", None),
                 max_taue=model_init_config.get("max_taue", None),
             )
-        elif model_case == "sciml":
+        elif model_type == "sciml":
             module = PowerBalanceSciML.init(
                 p_oh_predictor=p_oh_predictor,
                 p_rad_predictor=p_rad_predictor,
@@ -153,7 +153,7 @@ class PowerBalanceTRB(TrainRunBuilder):
                 max_taue=model_init_config.get("max_taue", None),
                 prng_seed=model_init_config.get("prng_seed", 42),
             )
-        elif model_case == "unstructured_nn":
+        elif model_type == "unstructured_nn":
             module = PowerBalanceUnstructuredNN.init(
                 in_size=model_init_config["in_size"],
                 out_size=model_init_config["out_size"],
@@ -257,7 +257,7 @@ class PowerBalanceTRB(TrainRunBuilder):
                 mask = ~np.isnan(x)
                 return np.trapezoid(y[mask], x[mask])
 
-            error_shot_abs = xr.apply_ufunc(
+            error_abs_shot = xr.apply_ufunc(
                 _trapezoid_dropna,
                 error_abs_ts,
                 time_2d,
@@ -265,7 +265,7 @@ class PowerBalanceTRB(TrainRunBuilder):
                 vectorize=True,
             )
 
-            error_shot_rel = xr.apply_ufunc(
+            error_rel_shot = xr.apply_ufunc(
                 _trapezoid_dropna,
                 error_rel_ts,
                 time_2d,
@@ -291,8 +291,8 @@ class PowerBalanceTRB(TrainRunBuilder):
                     "Wtot_MJ_pred": pred,
                     "error_abs_ts": error_abs_ts,
                     "error_rel_ts": error_rel_ts,
-                    "error_shot_abs": error_shot_abs,
-                    "error_shot_rel": error_shot_rel,
+                    "error_abs_shot": error_abs_shot,
+                    "error_rel_shot": error_rel_shot,
                 }
             )
             ds = ds.assign_coords(ds_source=(EPISODE_DIM, ds_source_array))
