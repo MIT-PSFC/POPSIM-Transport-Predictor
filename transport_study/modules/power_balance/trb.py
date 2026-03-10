@@ -254,8 +254,12 @@ class PowerBalanceTRB(TrainRunBuilder):
 
             # Integrate absolute error over time for each shot, ignoring NaN-padded entries
             def _trapezoid_dropna(y, x):
-                mask = ~np.isnan(x)
-                return np.trapezoid(y[mask], x[mask])
+                mask = ~np.isnan(x) & ~np.isnan(y)
+                if mask.sum() < 2:
+                    return np.nan
+                y_valid, x_valid = y[mask], x[mask]
+                sort_idx = np.argsort(x_valid)
+                return np.trapezoid(y_valid[sort_idx], x_valid[sort_idx])
 
             error_abs_shot = xr.apply_ufunc(
                 _trapezoid_dropna,

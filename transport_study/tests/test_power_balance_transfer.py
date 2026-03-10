@@ -197,7 +197,7 @@ def test_mix_device_weight():
 
 def test_submodule_freezing():
     study = PowerBalanceStudy(
-        name="xfer_test",
+        name="test_submodule_freezing",
         working_dir_base=os.path.join(PACKAGE_ROOT, "tests", "test_outputs"),
         dataset_paths={
             "cmod": config.cmod_dataset_path,
@@ -256,15 +256,114 @@ def test_submodule_freezing():
     # Load the trained models for each case,
     # Ensure the weights for p_oh and p_rad are the same for the frozen case,
     # and different for the unfrozen case
-    trainer_p_oh = study.restore_trainer(case_p_oh)
-    trainer_p_rad = study.restore_trainer(case_p_rad)
-    trainer_frozen = study.restore_trainer(case_frozen)
-    trainer_unfrozen = study.restore_trainer(case_unfrozen)
+    trainer_p_oh, _ = study.restore_trainer(case_p_oh)
+    trainer_p_rad, _ = study.restore_trainer(case_p_rad)
+    trainer_frozen, _ = study.restore_trainer(case_frozen)
+    trainer_unfrozen, _ = study.restore_trainer(case_unfrozen)
+
+    model_p_oh = trainer_p_oh.train_state.model.nn
+    model_p_rad = trainer_p_rad.train_state.model.nn
+    model_frozen = trainer_frozen.train_state.model.module
+    model_frozen_p_oh = model_frozen.p_oh_predictor.nn
+    model_frozen_p_rad = model_frozen.p_rad_predictor.nn
+    model_unfrozen = trainer_unfrozen.train_state.model.module
+    model_unfrozen_p_oh = model_unfrozen.p_oh_predictor.nn
+    model_unfrozen_p_rad = model_unfrozen.p_rad_predictor.nn
+
+    chex.assert_trees_all_equal(model_p_oh, model_frozen_p_oh)
+    chex.assert_trees_all_equal(model_p_rad, model_frozen_p_rad)
+    with pytest.raises(AssertionError):
+        chex.assert_trees_all_equal(model_p_oh, model_unfrozen_p_oh)
+    with pytest.raises(AssertionError):
+        chex.assert_trees_all_equal(model_p_rad, model_unfrozen_p_rad)
 
 
 def test_transfer_weights():
     study = PowerBalanceStudy(
-        name="xfer_test",
+        name="test_transfer_weights",
+        working_dir_base=os.path.join(PACKAGE_ROOT, "tests", "test_outputs"),
+        dataset_paths={
+            "cmod": config.cmod_dataset_path,
+            "tcv": config.tcv_dataset_path,
+            "d3d_hp": config.d3d_hp_dataset_path,
+        },
+        model_types=["sciml", "unstructured_nn"],
+        training_datasets=["cmod_tcv"],
+        data_normalization_methods=["coral"],
+        domain_adaptation_methods=["mixing"],
+        freeze_submodules_options=[True, False],
+        num_hp_shots_options=[3],
+        hp_test_set_size=4,
+    )
+
+    case_unstructured_nn_base = PowerBalanceStudy.Case(
+        model_type="unstructured_nn",
+        training_data="cmod_tcv",
+        data_normalization="coral",
+        domain_adaptation=None,
+        freeze_submodules=True,
+        num_hp_shots=-1,
+    )
+    case_unstructured_nn_transfer = PowerBalanceStudy.Case(
+        model_type="unstructured_nn",
+        training_data="cmod_tcv",
+        data_normalization="coral",
+        domain_adaptation="transfer",
+        freeze_submodules=True,
+        num_hp_shots=-1,
+    )
+
+    for case in [case_unstructured_nn_base, case_unstructured_nn_transfer]:
+        if not os.path.exists(study.result_path(case)):
+            study.launch_train(case)
+
+    unstructured_nn_base_trainer, _ = study.restore_trainer(
+        case_unstructured_nn_base, restore_best_checkpoint=False
+    )
+    unstructured_nn_transfer_trainer, _ = study.restore_trainer(
+        case_unstructured_nn_transfer, restore_best_checkpoint=False
+    )
+    unstructured_nn_base_model_init = (
+        unstructured_nn_base_trainer.train_state.model.module.nn
+    )
+    unstructured_nn_transfer_model_init = (
+        unstructured_nn_transfer_trainer.train_state.model.module.nn
+    )
+    # Can't simply call the restore_best_checkpoint on the trainer since it's a pass by reference
+    unstructured_nn_base_trainer, _ = study.restore_trainer(
+        case_unstructured_nn_base, restore_best_checkpoint=True
+    )
+    unstructured_nn_transfer_trainer, _ = study.restore_trainer(
+        case_unstructured_nn_transfer, restore_best_checkpoint=True
+    )
+    unstructured_nn_base_model_final = (
+        unstructured_nn_base_trainer.train_state.model.module.nn
+    )
+    unstructured_nn_transfer_model_final = (
+        unstructured_nn_transfer_trainer.train_state.model.module.nn
+    )
+
+    # Base model final weights should be the same as the transfer model initial weights.
+    chex.assert_trees_all_equal(
+        unstructured_nn_base_model_final, unstructured_nn_transfer_model_init
+    )
+
+    # Base model initial weights should be different from base model final weights
+    with pytest.raises(AssertionError):
+        chex.assert_trees_all_equal(
+            unstructured_nn_base_model_init, unstructured_nn_base_model_final
+        )
+
+    # Transfer model initial weights should be different from transfer model final weights
+    with pytest.raises(AssertionError):
+        chex.assert_trees_all_equal(
+            unstructured_nn_transfer_model_init, unstructured_nn_transfer_model_final
+        )
+
+
+def test_transfer_weights_submodules():
+    study = PowerBalanceStudy(
+        name="test_transfer_weights_submodules",
         working_dir_base=os.path.join(PACKAGE_ROOT, "tests", "test_outputs"),
         dataset_paths={
             "cmod": config.cmod_dataset_path,
@@ -338,35 +437,34 @@ def test_transfer_weights():
         num_hp_shots=-1,
     )
 
-    case_unstructured_nn_orig = PowerBalanceStudy.Case(
-        model_type="unstructured_nn",
-        training_data="cmod_tcv",
-        data_normalization="coral",
-        domain_adaptation=None,
-        freeze_submodules=True,
-        num_hp_shots=-1,
+    # Restore trainers for each case
+    p_oh_orig_trainer = study.restore_trainer(
+        case_p_oh_orig, restore_best_checkpoint=False
     )
-    case_unstructured_nn_transfer = PowerBalanceStudy.Case(
-        model_type="unstructured_nn",
-        training_data="cmod_tcv",
-        data_normalization="coral",
-        domain_adaptation="transfer",
-        freeze_submodules=True,
-        num_hp_shots=-1,
+    p_oh_transfer_trainer = study.restore_trainer(
+        case_p_oh_transfer, restore_best_checkpoint=False
+    )
+    p_rad_orig_trainer = study.restore_trainer(
+        case_p_rad_orig, restore_best_checkpoint=False
+    )
+    p_rad_transfer_trainer = study.restore_trainer(
+        case_p_rad_transfer, restore_best_checkpoint=False
+    )
+    sciml_orig_trainer = study.restore_trainer(
+        case_sciml_orig, restore_best_checkpoint=False
+    )
+    sciml_transfer_frozen_trainer = study.restore_trainer(
+        case_sciml_transfer_frozen, restore_best_checkpoint=False
+    )
+    sciml_transfer_unfrozen_trainer = study.restore_trainer(
+        case_sciml_transfer_unfrozen, restore_best_checkpoint=False
     )
 
-    # Restore models for each case
-    p_oh_orig = study.restore_trainer(case_p_oh_orig).model
-    p_oh_transfer = study.restore_trainer(case_p_oh_transfer).model
-    p_rad_orig = study.restore_trainer(case_p_rad_orig).model
-    p_rad_transfer = study.restore_trainer(case_p_rad_transfer).model
-    sciml_orig = study.restore_trainer(case_sciml_orig).model
-    sciml_transfer_frozen = study.restore_trainer(case_sciml_transfer_frozen).model
-    sciml_transfer_unfrozen = study.restore_trainer(case_sciml_transfer_unfrozen).model
-    unstructured_nn_orig = study.restore_trainer(case_unstructured_nn_orig).model
-    unstructured_nn_transfer = study.restore_trainer(
-        case_unstructured_nn_transfer
-    ).model
+    # Get initial and final models for each case
+    p_oh_orig_model_init = p_oh_orig_trainer
+
+    # For the p_oh and p_rad cases, the final trained model should be the same as the initial transferred model, and different from the final transferred model
+    p_oh_orig_final_model = None
 
 
 def test_collect_results():
@@ -426,12 +524,13 @@ def test_collect_results():
 
     for var in ds_merged.data_vars:
         # Assert the value is positive
-        assert (ds_merged[var] >= 0).all()
+        assert (ds_merged[var] >= 0).all(), f"Found negative absolute error in {var}"
 
 
 if __name__ == "__main__":
     # test_power_balance_transfer_cases()
-    test_collect_results()
+    # test_collect_results()
+    test_transfer_weights()
+    # test_submodule_freezing()
     # TODO(ZanderKeith), make sure the following things are happening:
     # 1) Cases properly restore their hyperparameters
-    # 2) submodules within cases get their proper hyperparameters and restore properly
