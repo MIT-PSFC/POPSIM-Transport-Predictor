@@ -110,61 +110,69 @@ class PowerBalanceTRB(TrainRunBuilder):
         Instantiate and return your model given a training DataLoader
         and a model config dict.
         """
-        model_type = model_init_config["model_type"]
-        if model_type in ["scaling_law", "sciml"]:
-            p_oh_config = model_init_config["submodules"]["p_oh_predictor"]
-            if isinstance(p_oh_config, TrainConfig):
-                p_oh_config = p_oh_config.model_dump()
-            p_oh_predictor = OhmicPowerTRB.model_init(
-                train_dl, p_oh_config["model_init_config"]
-            )
-            p_rad_config = model_init_config["submodules"]["p_rad_predictor"]
-            if isinstance(p_rad_config, TrainConfig):
-                p_rad_config = p_rad_config.model_dump()
-            p_rad_predictor = RadiatedPowerTRB.model_init(
-                train_dl, p_rad_config["model_init_config"]
-            )
-            if model_init_config["restore_submodules"]:
-                p_oh_manager = create_default_checkpoint_manager(
-                    p_oh_config["checkpoint_dir"]
-                )
-                p_oh_predictor = restore_model(p_oh_manager, p_oh_predictor)
-                p_rad_manager = create_default_checkpoint_manager(
-                    p_rad_config["checkpoint_dir"]
-                )
-                p_rad_predictor = restore_model(p_rad_manager, p_rad_predictor)
 
-        if model_type == "scaling_law":
-            module = PowerBalanceScalingLaw.init(
-                p_oh_predictor=p_oh_predictor,
-                p_rad_predictor=p_rad_predictor,
-                min_taue=model_init_config.get("min_taue", None),
-                max_taue=model_init_config.get("max_taue", None),
-            )
-        elif model_type == "sciml":
-            module = PowerBalanceSciML.init(
-                p_oh_predictor=p_oh_predictor,
-                p_rad_predictor=p_rad_predictor,
-                in_size=model_init_config["in_size"],
-                out_size=model_init_config["out_size"],
-                nn_width=model_init_config["nn_width"],
-                nn_depth=model_init_config["nn_depth"],
-                min_taue=model_init_config.get("min_taue", None),
-                max_taue=model_init_config.get("max_taue", None),
-                prng_seed=model_init_config.get("prng_seed", 42),
-            )
-        elif model_type == "unstructured_nn":
-            module = PowerBalanceUnstructuredNN.init(
-                in_size=model_init_config["in_size"],
-                out_size=model_init_config["out_size"],
-                nn_width=model_init_config["nn_width"],
-                nn_depth=model_init_config["nn_depth"],
-                min_val=model_init_config.get("min_val", None),
-                max_val=model_init_config.get("max_val", None),
-                prng_seed=model_init_config.get("prng_seed", 42),
-            )
-        else:
-            raise ValueError(f"Invalid model case: {model_init_config['model_case']}")
+        def _build_module(train_dl: DataLoader, model_init_config: dict) -> Any:
+            model_type = model_init_config["model_type"]
+            if model_type in ["scaling_law", "sciml"]:
+                p_oh_config = model_init_config["submodules"]["p_oh_predictor"]
+                if isinstance(p_oh_config, TrainConfig):
+                    p_oh_config = p_oh_config.model_dump()
+                p_oh_predictor = OhmicPowerTRB.model_init(
+                    train_dl, p_oh_config["model_init_config"]
+                )
+                p_rad_config = model_init_config["submodules"]["p_rad_predictor"]
+                if isinstance(p_rad_config, TrainConfig):
+                    p_rad_config = p_rad_config.model_dump()
+                p_rad_predictor = RadiatedPowerTRB.model_init(
+                    train_dl, p_rad_config["model_init_config"]
+                )
+                if model_init_config["restore_submodules"]:
+                    p_oh_manager = create_default_checkpoint_manager(
+                        p_oh_config["checkpoint_dir"]
+                    )
+                    p_oh_predictor = restore_model(p_oh_manager, p_oh_predictor)
+                    p_rad_manager = create_default_checkpoint_manager(
+                        p_rad_config["checkpoint_dir"]
+                    )
+                    p_rad_predictor = restore_model(p_rad_manager, p_rad_predictor)
+
+            if model_type == "scaling_law":
+                module = PowerBalanceScalingLaw.init(
+                    p_oh_predictor=p_oh_predictor,
+                    p_rad_predictor=p_rad_predictor,
+                    min_taue=model_init_config.get("min_taue", None),
+                    max_taue=model_init_config.get("max_taue", None),
+                )
+            elif model_type == "sciml":
+                module = PowerBalanceSciML.init(
+                    p_oh_predictor=p_oh_predictor,
+                    p_rad_predictor=p_rad_predictor,
+                    in_size=model_init_config["in_size"],
+                    out_size=model_init_config["out_size"],
+                    nn_width=model_init_config["nn_width"],
+                    nn_depth=model_init_config["nn_depth"],
+                    min_taue=model_init_config.get("min_taue", None),
+                    max_taue=model_init_config.get("max_taue", None),
+                    prng_seed=model_init_config.get("prng_seed", 42),
+                )
+            elif model_type == "unstructured_nn":
+                module = PowerBalanceUnstructuredNN.init(
+                    in_size=model_init_config["in_size"],
+                    out_size=model_init_config["out_size"],
+                    nn_width=model_init_config["nn_width"],
+                    nn_depth=model_init_config["nn_depth"],
+                    min_val=model_init_config.get("min_val", None),
+                    max_val=model_init_config.get("max_val", None),
+                    prng_seed=model_init_config.get("prng_seed", 42),
+                )
+            else:
+                raise ValueError(
+                    f"Invalid model case: {model_init_config['model_case']}"
+                )
+
+            return module
+
+        module = _build_module(train_dl, model_init_config)
 
         if model_init_config.get("freeze_submodules", False):
             freeze_submodules = ["p_oh_predictor", "p_rad_predictor"]
@@ -177,6 +185,15 @@ class PowerBalanceTRB(TrainRunBuilder):
             freeze_submodules=freeze_submodules,
         )
 
+        if model_init_config.get("transfer_checkpoint", False):
+            transfer_manager = create_default_checkpoint_manager(
+                model_init_config["transfer_checkpoint"]
+            )
+            env = restore_model(transfer_manager, env)
+            logger.debug(
+                f"Restoring module from tranfer learning pretrained checkpoint\n{model_init_config['transfer_checkpoint']}"
+            )
+
         # This restoration of the main module is separate from the transfer learning restoration
         # This would get the post-trained model, AFTER transfer learning has already been done
         if model_init_config.get("restore_main_module", False):
@@ -184,8 +201,11 @@ class PowerBalanceTRB(TrainRunBuilder):
                 model_init_config["checkpoint_dir"]
             )
             env = restore_model(manager, env)
+            logger.debug(
+                f"Restoring module from post-training checkpoint\n{model_init_config['checkpoint_dir']}"
+            )
         else:
-            logger.warning("Not restoring main module from checkpoint.")
+            logger.warning("Not restoring main module from post-training checkpoint.")
 
         return env
 

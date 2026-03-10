@@ -350,16 +350,28 @@ def test_transfer_weights():
         unstructured_nn_base_model_final, unstructured_nn_transfer_model_init
     )
 
-    # Base model initial weights should be different from base model final weights
-    with pytest.raises(AssertionError):
+    # Transfer learning freezes all but the final layer
+
+    # Base model initial weights should be different from base model final weights in every layer (whole model trained)
+    for i in range(len(unstructured_nn_base_model_init.layers)):
+        with pytest.raises(AssertionError):
+            chex.assert_trees_all_equal(
+                unstructured_nn_base_model_init.layers[i],
+                unstructured_nn_base_model_final.layers[i],
+            )
+
+    # Transfer model initial weights in layers 0-(n-1) should be the same as transfer model final weights in layers 0-(n-1)
+    for i in range(len(unstructured_nn_transfer_model_init.layers) - 1):
         chex.assert_trees_all_equal(
-            unstructured_nn_base_model_init, unstructured_nn_base_model_final
+            unstructured_nn_transfer_model_init.layers[i],
+            unstructured_nn_transfer_model_final.layers[i],
         )
 
-    # Transfer model initial weights should be different from transfer model final weights
+    # Transfer model initial weights in layer n should be different from transfer model final weights in layer n
     with pytest.raises(AssertionError):
         chex.assert_trees_all_equal(
-            unstructured_nn_transfer_model_init, unstructured_nn_transfer_model_final
+            unstructured_nn_transfer_model_init.layers[-1],
+            unstructured_nn_transfer_model_final.layers[-1],
         )
 
 

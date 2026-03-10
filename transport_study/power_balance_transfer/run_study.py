@@ -574,219 +574,247 @@ class PowerBalanceStudy(Study):
                 "d3d_hp": W_dhp * 100,
             }
 
-        if case.model_type == "p_oh":
-            input_vars = self._input_vars(case)
-            train_config_base = TrainConfig(
-                project=self.wandb_project_name(case),
-                train_run_builder="transport_study.modules.power_balance.p_oh.trb.OhmicPowerTRB",
-                max_epochs=config.max_epochs,
-                epochs_per_val=config.epochs_per_val,
-                checkpoint_dir=self.trained_model_dir(
-                    case
-                ),  # When doing hyperparameter tuning, this gets overwritten by the wandb agent
-                dataloader_config={
-                    "target_vars": ["P_oh_MW", "ds_source_idx"],
-                    "input_vars": input_vars,
-                    "data_train_run_builder": "transport_study.modules.power_balance.trb.PowerBalanceTRB",  # Needed for submodules
-                    **dataloader_config_base,
-                },
-                model_init_config={
-                    "nn_depth": 2,
-                    "nn_width": 16,
-                    "min_val": 0,  # Minimum ohmic power in MW
-                    "max_val": 16,  # Maximum ohmic power in MW
-                    "prng_seed": 42,
-                    "in_size": 7,
-                    "out_size": 1,
-                    "data_normalization": case.data_normalization,
-                },
-                loss_config=loss_config_base,
-                optimizer_config=optimizer_config_base,
-                test_eval_suite_config=test_eval_suite_config_base,
-            )
-        elif case.model_type == "p_rad":
-            input_vars = self._input_vars(case)
-            train_config_base = TrainConfig(
-                project=self.wandb_project_name(case),
-                train_run_builder="transport_study.modules.power_balance.p_rad.trb.RadiatedPowerTRB",
-                max_epochs=config.max_epochs,
-                epochs_per_val=config.epochs_per_val,
-                checkpoint_dir=self.trained_model_dir(
-                    case
-                ),  # When doing hyperparameter tuning, this gets overwritten by the wandb agent
-                dataloader_config={
-                    "target_vars": ["P_rad_MW", "ds_source_idx"],
-                    "input_vars": input_vars,
-                    "data_train_run_builder": "transport_study.modules.power_balance.trb.PowerBalanceTRB",
-                    **dataloader_config_base,
-                },
-                model_init_config={
-                    "nn_depth": 2,
-                    "nn_width": 16,
-                    "min_val": 0,  # Minimum radiated power in MW, probably doesn't need to be enforced but just in case
-                    "max_val": 16,  # Maximum radiated power in MW
-                    "prng_seed": 42,
-                    "in_size": 7,
-                    "out_size": 1,
-                    "data_normalization": case.data_normalization,
-                },
-                loss_config=loss_config_base,
-                optimizer_config=optimizer_config_base,
-                test_eval_suite_config=test_eval_suite_config_base,
-            )
-        elif case.model_type == "scaling_law":
-            p_oh_config = self.make_train_config(
-                self.Case(
-                    model_type="p_oh",
-                    training_data=case.training_data,
-                    data_normalization=case.data_normalization,
-                    domain_adaptation=case.domain_adaptation,
-                    freeze_submodules=PowerBalanceStudy.HYPERPARAM_FREEZE_SUBMODULES,
-                    num_hp_shots=case.num_hp_shots,
-                )
-            )
-            p_rad_config = self.make_train_config(
-                self.Case(
-                    model_type="p_rad",
-                    training_data=case.training_data,
-                    data_normalization=case.data_normalization,
-                    domain_adaptation=case.domain_adaptation,
-                    freeze_submodules=PowerBalanceStudy.HYPERPARAM_FREEZE_SUBMODULES,
-                    num_hp_shots=case.num_hp_shots,
-                )
-            )
-            train_config_base = TrainConfig(
-                project=self.wandb_project_name(case),
-                train_run_builder="transport_study.modules.power_balance.trb.PowerBalanceTRB",
-                max_epochs=config.max_epochs,
-                epochs_per_val=config.epochs_per_val,
-                checkpoint_dir=self.trained_model_dir(
-                    case
-                ),  # When doing hyperparameter tuning, this gets overwritten by the wandb agent
-                dataloader_config={
-                    "input_vars": self._input_vars(case),
-                    "target_vars": ["Wtot_MJ"],
-                    "state_vars": ["Wtot_MJ"],
-                    "extra_vars": [
-                        "P_oh_MW",
-                        "P_rad_MW",
-                        "ds_source_idx",
-                    ],  # Bring these along for comparison / device weighting
-                    **dataloader_config_base,
-                },
-                model_init_config={
-                    "model_type": case.model_type,
-                    "data_normalization": case.data_normalization,
-                    "domain_adaptation": case.domain_adaptation,
-                    "freeze_submodules": case.freeze_submodules,
-                    "nn_depth": 2,
-                    "nn_width": 16,
-                    "in_size": 7,  # B0, Ip, R0, a_minor, kappa, ne20_line_avg, P_aux_MW
-                    "out_size": 1,
-                    "prng_seed": 42,
-                    "submodules": {
-                        "p_oh_predictor": p_oh_config,
-                        "p_rad_predictor": p_rad_config,
+        def _make_train_config_base(case: PowerBalanceStudy.Case) -> TrainConfig:
+            if case.model_type == "p_oh":
+                input_vars = self._input_vars(case)
+                train_config_base = TrainConfig(
+                    project=self.wandb_project_name(case),
+                    train_run_builder="transport_study.modules.power_balance.p_oh.trb.OhmicPowerTRB",
+                    max_epochs=config.max_epochs,
+                    epochs_per_val=config.epochs_per_val,
+                    checkpoint_dir=self.trained_model_dir(
+                        case
+                    ),  # When doing hyperparameter tuning, this gets overwritten by the wandb agent
+                    dataloader_config={
+                        "target_vars": ["P_oh_MW", "ds_source_idx"],
+                        "input_vars": input_vars,
+                        "data_train_run_builder": "transport_study.modules.power_balance.trb.PowerBalanceTRB",  # Needed for submodules
+                        **dataloader_config_base,
                     },
-                    "restore_submodules": True,  # Always restoring pre-trained submodules in this study
-                },
-                loss_config=loss_config_base,
-                optimizer_config=optimizer_config_base,
-                test_eval_suite_config=test_eval_suite_config_base,
-            )
-        elif case.model_type == "sciml":
-            p_oh_config = self.make_train_config(
-                self.Case(
-                    model_type="p_oh",
-                    training_data=case.training_data,
-                    data_normalization=case.data_normalization,
-                    domain_adaptation=case.domain_adaptation,
-                    freeze_submodules=PowerBalanceStudy.HYPERPARAM_FREEZE_SUBMODULES,
-                    num_hp_shots=case.num_hp_shots,
-                )
-            )
-            p_rad_config = self.make_train_config(
-                self.Case(
-                    model_type="p_rad",
-                    training_data=case.training_data,
-                    data_normalization=case.data_normalization,
-                    domain_adaptation=case.domain_adaptation,
-                    freeze_submodules=PowerBalanceStudy.HYPERPARAM_FREEZE_SUBMODULES,
-                    num_hp_shots=case.num_hp_shots,
-                )
-            )
-            train_config_base = TrainConfig(
-                project=self.wandb_project_name(case),
-                train_run_builder="transport_study.modules.power_balance.trb.PowerBalanceTRB",
-                max_epochs=config.max_epochs,
-                epochs_per_val=config.epochs_per_val,
-                checkpoint_dir=self.trained_model_dir(
-                    case
-                ),  # When doing hyperparameter tuning, this gets overwritten by the wandb agent
-                dataloader_config={
-                    "input_vars": self._input_vars(case),
-                    "target_vars": ["Wtot_MJ", "ds_source_idx"],
-                    "state_vars": ["Wtot_MJ"],
-                    "extra_vars": [
-                        "P_oh_MW",
-                        "P_rad_MW",
-                    ],  # Bring these along for comparison / device weighting
-                    **dataloader_config_base,
-                },
-                model_init_config={
-                    "model_type": case.model_type,
-                    "data_normalization": case.data_normalization,
-                    "freeze_submodules": case.freeze_submodules,
-                    "nn_depth": 2,
-                    "nn_width": 16,
-                    "in_size": 7,  # B0, Ip, R0, a_minor, kappa, ne20_line_avg, P_aux_MW
-                    "out_size": 1,
-                    "prng_seed": 42,
-                    "submodules": {
-                        "p_oh_predictor": p_oh_config,
-                        "p_rad_predictor": p_rad_config,
+                    model_init_config={
+                        "nn_depth": 2,
+                        "nn_width": 16,
+                        "min_val": 0,  # Minimum ohmic power in MW
+                        "max_val": 16,  # Maximum ohmic power in MW
+                        "prng_seed": 42,
+                        "in_size": 7,
+                        "out_size": 1,
+                        "data_normalization": case.data_normalization,
                     },
-                    "restore_submodules": True,  # Always restoring pre-trained submodules in this study
-                },
-                loss_config=loss_config_base,
-                optimizer_config=optimizer_config_base,
-                test_eval_suite_config=test_eval_suite_config_base,
+                    loss_config=loss_config_base,
+                    optimizer_config=optimizer_config_base,
+                    test_eval_suite_config=test_eval_suite_config_base,
+                )
+            elif case.model_type == "p_rad":
+                input_vars = self._input_vars(case)
+                train_config_base = TrainConfig(
+                    project=self.wandb_project_name(case),
+                    train_run_builder="transport_study.modules.power_balance.p_rad.trb.RadiatedPowerTRB",
+                    max_epochs=config.max_epochs,
+                    epochs_per_val=config.epochs_per_val,
+                    checkpoint_dir=self.trained_model_dir(
+                        case
+                    ),  # When doing hyperparameter tuning, this gets overwritten by the wandb agent
+                    dataloader_config={
+                        "target_vars": ["P_rad_MW", "ds_source_idx"],
+                        "input_vars": input_vars,
+                        "data_train_run_builder": "transport_study.modules.power_balance.trb.PowerBalanceTRB",
+                        **dataloader_config_base,
+                    },
+                    model_init_config={
+                        "nn_depth": 2,
+                        "nn_width": 16,
+                        "min_val": 0,  # Minimum radiated power in MW, probably doesn't need to be enforced but just in case
+                        "max_val": 16,  # Maximum radiated power in MW
+                        "prng_seed": 42,
+                        "in_size": 7,
+                        "out_size": 1,
+                        "data_normalization": case.data_normalization,
+                    },
+                    loss_config=loss_config_base,
+                    optimizer_config=optimizer_config_base,
+                    test_eval_suite_config=test_eval_suite_config_base,
+                )
+            elif case.model_type == "scaling_law":
+                p_oh_config = self.make_train_config(
+                    self.Case(
+                        model_type="p_oh",
+                        training_data=case.training_data,
+                        data_normalization=case.data_normalization,
+                        domain_adaptation=case.domain_adaptation,
+                        freeze_submodules=PowerBalanceStudy.HYPERPARAM_FREEZE_SUBMODULES,
+                        num_hp_shots=case.num_hp_shots,
+                    )
+                )
+                p_rad_config = self.make_train_config(
+                    self.Case(
+                        model_type="p_rad",
+                        training_data=case.training_data,
+                        data_normalization=case.data_normalization,
+                        domain_adaptation=case.domain_adaptation,
+                        freeze_submodules=PowerBalanceStudy.HYPERPARAM_FREEZE_SUBMODULES,
+                        num_hp_shots=case.num_hp_shots,
+                    )
+                )
+                train_config_base = TrainConfig(
+                    project=self.wandb_project_name(case),
+                    train_run_builder="transport_study.modules.power_balance.trb.PowerBalanceTRB",
+                    max_epochs=config.max_epochs,
+                    epochs_per_val=config.epochs_per_val,
+                    checkpoint_dir=self.trained_model_dir(
+                        case
+                    ),  # When doing hyperparameter tuning, this gets overwritten by the wandb agent
+                    dataloader_config={
+                        "input_vars": self._input_vars(case),
+                        "target_vars": ["Wtot_MJ"],
+                        "state_vars": ["Wtot_MJ"],
+                        "extra_vars": [
+                            "P_oh_MW",
+                            "P_rad_MW",
+                            "ds_source_idx",
+                        ],  # Bring these along for comparison / device weighting
+                        **dataloader_config_base,
+                    },
+                    model_init_config={
+                        "model_type": case.model_type,
+                        "data_normalization": case.data_normalization,
+                        "domain_adaptation": case.domain_adaptation,
+                        "freeze_submodules": case.freeze_submodules,
+                        "nn_depth": 2,
+                        "nn_width": 16,
+                        "in_size": 7,  # B0, Ip, R0, a_minor, kappa, ne20_line_avg, P_aux_MW
+                        "out_size": 1,
+                        "prng_seed": 42,
+                        "submodules": {
+                            "p_oh_predictor": p_oh_config,
+                            "p_rad_predictor": p_rad_config,
+                        },
+                        "restore_submodules": True,  # Always restoring pre-trained submodules in this study
+                    },
+                    loss_config=loss_config_base,
+                    optimizer_config=optimizer_config_base,
+                    test_eval_suite_config=test_eval_suite_config_base,
+                )
+            elif case.model_type == "sciml":
+                p_oh_config = self.make_train_config(
+                    self.Case(
+                        model_type="p_oh",
+                        training_data=case.training_data,
+                        data_normalization=case.data_normalization,
+                        domain_adaptation=case.domain_adaptation,
+                        freeze_submodules=PowerBalanceStudy.HYPERPARAM_FREEZE_SUBMODULES,
+                        num_hp_shots=case.num_hp_shots,
+                    )
+                )
+                p_rad_config = self.make_train_config(
+                    self.Case(
+                        model_type="p_rad",
+                        training_data=case.training_data,
+                        data_normalization=case.data_normalization,
+                        domain_adaptation=case.domain_adaptation,
+                        freeze_submodules=PowerBalanceStudy.HYPERPARAM_FREEZE_SUBMODULES,
+                        num_hp_shots=case.num_hp_shots,
+                    )
+                )
+                train_config_base = TrainConfig(
+                    project=self.wandb_project_name(case),
+                    train_run_builder="transport_study.modules.power_balance.trb.PowerBalanceTRB",
+                    max_epochs=config.max_epochs,
+                    epochs_per_val=config.epochs_per_val,
+                    checkpoint_dir=self.trained_model_dir(
+                        case
+                    ),  # When doing hyperparameter tuning, this gets overwritten by the wandb agent
+                    dataloader_config={
+                        "input_vars": self._input_vars(case),
+                        "target_vars": ["Wtot_MJ", "ds_source_idx"],
+                        "state_vars": ["Wtot_MJ"],
+                        "extra_vars": [
+                            "P_oh_MW",
+                            "P_rad_MW",
+                        ],  # Bring these along for comparison / device weighting
+                        **dataloader_config_base,
+                    },
+                    model_init_config={
+                        "model_type": case.model_type,
+                        "data_normalization": case.data_normalization,
+                        "freeze_submodules": case.freeze_submodules,
+                        "nn_depth": 2,
+                        "nn_width": 16,
+                        "in_size": 7,  # B0, Ip, R0, a_minor, kappa, ne20_line_avg, P_aux_MW
+                        "out_size": 1,
+                        "prng_seed": 42,
+                        "submodules": {
+                            "p_oh_predictor": p_oh_config,
+                            "p_rad_predictor": p_rad_config,
+                        },
+                        "restore_submodules": True,  # Always restoring pre-trained submodules in this study
+                    },
+                    loss_config=loss_config_base,
+                    optimizer_config=optimizer_config_base,
+                    test_eval_suite_config=test_eval_suite_config_base,
+                )
+            elif case.model_type == "unstructured_nn":
+                train_config_base = TrainConfig(
+                    project=self.wandb_project_name(case),
+                    train_run_builder="transport_study.modules.power_balance.trb.PowerBalanceTRB",
+                    max_epochs=config.max_epochs,
+                    epochs_per_val=config.epochs_per_val,
+                    checkpoint_dir=self.trained_model_dir(
+                        case
+                    ),  # When doing hyperparameter tuning, this gets overwritten by the wandb agent
+                    dataloader_config={
+                        "input_vars": self._input_vars(case),
+                        "target_vars": ["Wtot_MJ", "ds_source_idx"],
+                        "state_vars": ["Wtot_MJ"],
+                        "extra_vars": [
+                            "P_oh_MW",
+                            "P_rad_MW",
+                        ],  # Bring these along for comparison / device weighting
+                        **dataloader_config_base,
+                    },
+                    model_init_config={
+                        "model_type": case.model_type,
+                        "data_normalization": case.data_normalization,
+                        "freeze_submodules": case.freeze_submodules,
+                        "nn_depth": 2,
+                        "nn_width": 16,
+                        "in_size": 7,  # B0, Ip, R0, a_minor, kappa, ne20_line_avg, P_aux_MW
+                        "out_size": 1,
+                        "prng_seed": 42,
+                    },
+                    loss_config=loss_config_base,
+                    optimizer_config=optimizer_config_base,
+                    test_eval_suite_config=test_eval_suite_config_base,
+                )
+            else:
+                raise ValueError(f"Unknown model type: {case.model_type}")
+
+            return train_config_base
+
+        train_config_base = _make_train_config_base(case)
+
+        # For transfer learning, point to where this case's pretrained checkpoint
+        if case.domain_adaptation == "transfer":
+            # Pretrained model has same model_type, training_data, and data_normalization,
+            # but no domain adaptation and no high-performance shots
+            transfer_case = PowerBalanceStudy.Case(
+                model_type=case.model_type,
+                training_data=case.training_data,
+                data_normalization=case.data_normalization,
+                domain_adaptation=None,
+                freeze_submodules=case.freeze_submodules,
+                num_hp_shots=-1,
             )
-        elif case.model_type == "unstructured_nn":
-            train_config_base = TrainConfig(
-                project=self.wandb_project_name(case),
-                train_run_builder="transport_study.modules.power_balance.trb.PowerBalanceTRB",
-                max_epochs=config.max_epochs,
-                epochs_per_val=config.epochs_per_val,
-                checkpoint_dir=self.trained_model_dir(
-                    case
-                ),  # When doing hyperparameter tuning, this gets overwritten by the wandb agent
-                dataloader_config={
-                    "input_vars": self._input_vars(case),
-                    "target_vars": ["Wtot_MJ", "ds_source_idx"],
-                    "state_vars": ["Wtot_MJ"],
-                    "extra_vars": [
-                        "P_oh_MW",
-                        "P_rad_MW",
-                    ],  # Bring these along for comparison / device weighting
-                    **dataloader_config_base,
-                },
-                model_init_config={
-                    "model_type": case.model_type,
-                    "data_normalization": case.data_normalization,
-                    "freeze_submodules": case.freeze_submodules,
-                    "nn_depth": 2,
-                    "nn_width": 16,
-                    "in_size": 7,  # B0, Ip, R0, a_minor, kappa, ne20_line_avg, P_aux_MW
-                    "out_size": 1,
-                    "prng_seed": 42,
-                },
-                loss_config=loss_config_base,
-                optimizer_config=optimizer_config_base,
-                test_eval_suite_config=test_eval_suite_config_base,
+            transfer_case_model_dir = self.trained_model_dir(transfer_case)
+
+            train_config_base = train_config_base.model_copy(
+                update={
+                    "model_init_config": {
+                        **train_config_base.model_init_config,
+                        "transfer_checkpoint": transfer_case_model_dir,
+                    }
+                }
             )
-        else:
-            raise ValueError(f"Unknown model type: {case.model_type}")
 
         tuned_config_path = self.tuned_config_path(case)
         if os.path.exists(tuned_config_path):
