@@ -6,7 +6,9 @@ import netCDF4  # noqa: F401
 import numpy as np
 import optax
 import xarray as xr
+from loguru import logger
 from popsim.ml import DataLoader, TrainRunBuilder
+from popsim.ml.checkpointing import create_default_checkpoint_manager, restore_model
 from popsim.ml.eval import EvalData, EvaluationSuite
 
 from transport_study import EPISODE_DIM, TIME_COORD, TIME_DIM
@@ -53,8 +55,24 @@ class OhmicPowerTRB(TrainRunBuilder):
             model_init_config["max_val"] = 2 * median
 
         module = OhmicPower.init(
-            **model_init_config,
+            in_size=model_init_config["in_size"],
+            out_size=model_init_config["out_size"],
+            nn_width=model_init_config["nn_width"],
+            nn_depth=model_init_config["nn_depth"],
+            min_val=model_init_config["min_val"],
+            max_val=model_init_config["max_val"],
+            prng_seed=model_init_config["prng_seed"],
+            data_normalization=model_init_config["data_normalization"],
         )
+
+        if model_init_config.get("transfer_checkpoint", False):
+            transfer_manager = create_default_checkpoint_manager(
+                model_init_config["transfer_checkpoint"]
+            )
+            module = restore_model(transfer_manager, module)
+            logger.debug(
+                f"Restoring module from tranfer learning pretrained checkpoint\n{model_init_config['transfer_checkpoint']}"
+            )
 
         return module
 

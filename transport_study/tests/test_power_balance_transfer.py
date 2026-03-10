@@ -288,11 +288,11 @@ def test_transfer_weights():
             "tcv": config.tcv_dataset_path,
             "d3d_hp": config.d3d_hp_dataset_path,
         },
-        model_types=["sciml", "unstructured_nn"],
+        model_types=["unstructured_nn"],
         training_datasets=["cmod_tcv"],
         data_normalization_methods=["coral"],
-        domain_adaptation_methods=["mixing"],
-        freeze_submodules_options=[True, False],
+        domain_adaptation_methods=["transfer"],
+        freeze_submodules_options=[True],
         num_hp_shots_options=[3],
         hp_test_set_size=4,
     )
@@ -384,20 +384,20 @@ def test_transfer_weights():
         )
 
 
-def test_transfer_weights_submodules():
+def test_transfer_weights_frozen_submodules():
     study = PowerBalanceStudy(
-        name="test_transfer_weights_submodules",
+        name="test_transfer_weights_frozen_submodules",
         working_dir_base=os.path.join(PACKAGE_ROOT, "tests", "test_outputs"),
         dataset_paths={
             "cmod": config.cmod_dataset_path,
             "tcv": config.tcv_dataset_path,
             "d3d_hp": config.d3d_hp_dataset_path,
         },
-        model_types=["sciml", "unstructured_nn"],
+        model_types=["sciml"],
         training_datasets=["cmod_tcv"],
         data_normalization_methods=["coral"],
-        domain_adaptation_methods=["mixing"],
-        freeze_submodules_options=[True, False],
+        domain_adaptation_methods=["transfer"],
+        freeze_submodules_options=[True],
         num_hp_shots_options=[3],
         hp_test_set_size=4,
     )
@@ -435,6 +435,7 @@ def test_transfer_weights_submodules():
         num_hp_shots=-1,
     )
 
+    # Main modules that have frozen submodules
     case_sciml_base = PowerBalanceStudy.Case(
         model_type="sciml",
         training_data="cmod_tcv",
@@ -449,6 +450,177 @@ def test_transfer_weights_submodules():
         data_normalization="coral",
         domain_adaptation="transfer",
         freeze_submodules=True,
+        num_hp_shots=-1,
+    )
+
+    # Cases that don't need to be re-run if something's broken
+    for case in [case_p_oh_base, case_p_rad_base, case_sciml_base]:
+        if not os.path.exists(study.result_path(case)):
+            study.launch_train(case)
+
+    # Clear any stale checkpoints/results from previous runs before retraining.
+    # Without this, orbax keeps the old "best" checkpoint (max_to_keep=1, best_mode=min),
+    # so restore_best_checkpoint=True would load stale weights from a broken training run.
+    for case in [
+        case_p_oh_transfer,
+        case_p_rad_transfer,
+        case_sciml_transfer_frozen,
+    ]:
+        shutil.rmtree(study.trained_model_dir(case), ignore_errors=True)
+        if os.path.exists(study.result_path(case)):
+            os.remove(study.result_path(case))
+        study.launch_train(case)
+
+    # Get initial and final modules for each case
+    p_oh_base_trainer_init, _ = study.restore_trainer(
+        case_p_oh_base, restore_best_checkpoint=False
+    )
+    p_oh_transfer_trainer_init, _ = study.restore_trainer(
+        case_p_oh_transfer, restore_best_checkpoint=False
+    )
+    p_rad_base_trainer_init, _ = study.restore_trainer(
+        case_p_rad_base, restore_best_checkpoint=False
+    )
+    p_rad_transfer_trainer_init, _ = study.restore_trainer(
+        case_p_rad_transfer, restore_best_checkpoint=False
+    )
+    sciml_base_trainer_init, _ = study.restore_trainer(
+        case_sciml_base, restore_best_checkpoint=False
+    )
+    sciml_transfer_frozen_trainer_init, _ = study.restore_trainer(
+        case_sciml_transfer_frozen, restore_best_checkpoint=False
+    )
+    p_oh_base_init = p_oh_base_trainer_init.train_state.model
+    p_oh_transfer_init = p_oh_transfer_trainer_init.train_state.model
+    p_rad_base_init = p_rad_base_trainer_init.train_state.model
+    p_rad_transfer_init = p_rad_transfer_trainer_init.train_state.model
+    sciml_base_init = sciml_base_trainer_init.train_state.model.module
+    sciml_transfer_frozen_init = (
+        sciml_transfer_frozen_trainer_init.train_state.model.module
+    )
+    p_oh_base_trainer_final, _ = study.restore_trainer(
+        case_p_oh_base, restore_best_checkpoint=True
+    )
+    p_oh_transfer_trainer_final, _ = study.restore_trainer(
+        case_p_oh_transfer, restore_best_checkpoint=True
+    )
+    p_rad_base_trainer_final, _ = study.restore_trainer(
+        case_p_rad_base, restore_best_checkpoint=True
+    )
+    p_rad_transfer_trainer_final, _ = study.restore_trainer(
+        case_p_rad_transfer, restore_best_checkpoint=True
+    )
+    sciml_base_trainer_final, _ = study.restore_trainer(
+        case_sciml_base, restore_best_checkpoint=True
+    )
+    sciml_transfer_frozen_trainer_final, _ = study.restore_trainer(
+        case_sciml_transfer_frozen, restore_best_checkpoint=True
+    )
+    p_oh_base_final = p_oh_base_trainer_final.train_state.model
+    p_oh_transfer_final = p_oh_transfer_trainer_final.train_state.model
+    p_rad_base_final = p_rad_base_trainer_final.train_state.model
+    p_rad_transfer_final = p_rad_transfer_trainer_final.train_state.model
+    sciml_base_final = sciml_base_trainer_final.train_state.model.module
+    sciml_transfer_frozen_final = (
+        sciml_transfer_frozen_trainer_final.train_state.model.module
+    )
+
+    # 1. Ensure the modules themselves were correctly transferred
+    # p_oh
+    for i in range(len(p_oh_base_init.nn.layers) - 1):
+        chex.assert_trees_all_equal(
+            p_oh_base_final.nn.layers[i], p_oh_transfer_init.nn.layers[i]
+        )
+    with pytest.raises(AssertionError):
+        chex.assert_trees_all_equal(
+            p_oh_base_final.nn.layers[-1], p_oh_transfer_init.nn.layers[-1]
+        )
+    # p_rad
+    for i in range(len(p_rad_base_init.nn.layers) - 1):
+        chex.assert_trees_all_equal(
+            p_rad_base_final.nn.layers[i], p_rad_transfer_init.nn.layers[i]
+        )
+    with pytest.raises(AssertionError):
+        chex.assert_trees_all_equal(
+            p_rad_base_final.nn.layers[-1], p_rad_transfer_init.nn.layers[-1]
+        )
+    # sciml
+    for i in range(len(sciml_base_init.nn.layers) - 1):
+        chex.assert_trees_all_equal(
+            sciml_base_final.nn.layers[i], sciml_transfer_frozen_init.nn.layers[i]
+        )
+    with pytest.raises(AssertionError):
+        chex.assert_trees_all_equal(
+            sciml_base_final.nn.layers[-1], sciml_transfer_frozen_init.nn.layers[-1]
+        )
+
+    # 2. Ensure the frozen submodules were actually frozen
+    chex.assert_trees_all_equal(
+        p_oh_transfer_final.nn, sciml_transfer_frozen_final.p_oh_predictor.nn
+    )
+    chex.assert_trees_all_equal(
+        p_rad_transfer_final.nn, sciml_transfer_frozen_final.p_rad_predictor.nn
+    )
+
+
+def test_transfer_weights_unfrozen_submodules():
+    study = PowerBalanceStudy(
+        name="test_transfer_weights_frozen_submodules",
+        working_dir_base=os.path.join(PACKAGE_ROOT, "tests", "test_outputs"),
+        dataset_paths={
+            "cmod": config.cmod_dataset_path,
+            "tcv": config.tcv_dataset_path,
+            "d3d_hp": config.d3d_hp_dataset_path,
+        },
+        model_types=["sciml"],
+        training_datasets=["cmod_tcv"],
+        data_normalization_methods=["coral"],
+        domain_adaptation_methods=["transfer"],
+        freeze_submodules_options=[False],
+        num_hp_shots_options=[3],
+        hp_test_set_size=4,
+    )
+
+    case_p_oh_base = PowerBalanceStudy.Case(
+        model_type="p_oh",
+        training_data="cmod_tcv",
+        data_normalization="coral",
+        domain_adaptation=None,
+        freeze_submodules=True,
+        num_hp_shots=-1,
+    )
+    case_p_oh_transfer = PowerBalanceStudy.Case(
+        model_type="p_oh",
+        training_data="cmod_tcv",
+        data_normalization="coral",
+        domain_adaptation="transfer",
+        freeze_submodules=True,
+        num_hp_shots=-1,
+    )
+    case_p_rad_base = PowerBalanceStudy.Case(
+        model_type="p_rad",
+        training_data="cmod_tcv",
+        data_normalization="coral",
+        domain_adaptation=None,
+        freeze_submodules=True,
+        num_hp_shots=-1,
+    )
+    case_p_rad_transfer = PowerBalanceStudy.Case(
+        model_type="p_rad",
+        training_data="cmod_tcv",
+        data_normalization="coral",
+        domain_adaptation="transfer",
+        freeze_submodules=True,
+        num_hp_shots=-1,
+    )
+
+    # Main modules that have frozen submodules
+    case_sciml_base = PowerBalanceStudy.Case(
+        model_type="sciml",
+        training_data="cmod_tcv",
+        data_normalization="coral",
+        domain_adaptation=None,
+        freeze_submodules=False,
         num_hp_shots=-1,
     )
     case_sciml_transfer_unfrozen = PowerBalanceStudy.Case(
@@ -471,7 +643,6 @@ def test_transfer_weights_submodules():
     for case in [
         case_p_oh_transfer,
         case_p_rad_transfer,
-        case_sciml_transfer_frozen,
         case_sciml_transfer_unfrozen,
     ]:
         shutil.rmtree(study.trained_model_dir(case), ignore_errors=True)
@@ -479,34 +650,112 @@ def test_transfer_weights_submodules():
             os.remove(study.result_path(case))
         study.launch_train(case)
 
-    # Restore trainers for each case to get the initial model states
-    p_oh_base_trainer = study.restore_trainer(
+    # Get initial and final modules for each case
+    p_oh_base_trainer_init, _ = study.restore_trainer(
         case_p_oh_base, restore_best_checkpoint=False
     )
-    p_oh_transfer_trainer = study.restore_trainer(
+    p_oh_transfer_trainer_init, _ = study.restore_trainer(
         case_p_oh_transfer, restore_best_checkpoint=False
     )
-    p_rad_base_trainer = study.restore_trainer(
+    p_rad_base_trainer_init, _ = study.restore_trainer(
         case_p_rad_base, restore_best_checkpoint=False
     )
-    p_rad_transfer_trainer = study.restore_trainer(
+    p_rad_transfer_trainer_init, _ = study.restore_trainer(
         case_p_rad_transfer, restore_best_checkpoint=False
     )
-    sciml_base_trainer = study.restore_trainer(
+    sciml_base_trainer_init, _ = study.restore_trainer(
         case_sciml_base, restore_best_checkpoint=False
     )
-    sciml_transfer_frozen_trainer = study.restore_trainer(
-        case_sciml_transfer_frozen, restore_best_checkpoint=False
-    )
-    sciml_transfer_unfrozen_trainer = study.restore_trainer(
+    sciml_transfer_unfrozen_trainer_init, _ = study.restore_trainer(
         case_sciml_transfer_unfrozen, restore_best_checkpoint=False
     )
+    p_oh_base_init = p_oh_base_trainer_init.train_state.model
+    p_oh_transfer_init = p_oh_transfer_trainer_init.train_state.model
+    p_rad_base_init = p_rad_base_trainer_init.train_state.model
+    p_rad_transfer_init = p_rad_transfer_trainer_init.train_state.model
+    sciml_base_init = sciml_base_trainer_init.train_state.model.module
+    sciml_transfer_unfrozen_init = (
+        sciml_transfer_unfrozen_trainer_init.train_state.model.module
+    )
+    p_oh_base_trainer_final, _ = study.restore_trainer(
+        case_p_oh_base, restore_best_checkpoint=True
+    )
+    p_oh_transfer_trainer_final, _ = study.restore_trainer(
+        case_p_oh_transfer, restore_best_checkpoint=True
+    )
+    p_rad_base_trainer_final, _ = study.restore_trainer(
+        case_p_rad_base, restore_best_checkpoint=True
+    )
+    p_rad_transfer_trainer_final, _ = study.restore_trainer(
+        case_p_rad_transfer, restore_best_checkpoint=True
+    )
+    sciml_base_trainer_final, _ = study.restore_trainer(
+        case_sciml_base, restore_best_checkpoint=True
+    )
+    sciml_transfer_unfrozen_trainer_final, _ = study.restore_trainer(
+        case_sciml_transfer_unfrozen, restore_best_checkpoint=True
+    )
+    p_oh_base_final = p_oh_base_trainer_final.train_state.model
+    p_oh_transfer_final = p_oh_transfer_trainer_final.train_state.model
+    p_rad_base_final = p_rad_base_trainer_final.train_state.model
+    p_rad_transfer_final = p_rad_transfer_trainer_final.train_state.model
+    sciml_base_final = sciml_base_trainer_final.train_state.model.module
+    sciml_transfer_unfrozen_final = (
+        sciml_transfer_unfrozen_trainer_final.train_state.model.module
+    )
 
-    # Get initial and final models for each case
-    p_oh_base_model_init = p_oh_orig_trainer.train_state.module.nn
+    # 1. Ensure the modules themselves were correctly transferred
+    # p_oh
+    for i in range(len(p_oh_base_init.nn.layers) - 1):
+        chex.assert_trees_all_equal(
+            p_oh_base_final.nn.layers[i], p_oh_transfer_init.nn.layers[i]
+        )
+    with pytest.raises(AssertionError):
+        chex.assert_trees_all_equal(
+            p_oh_base_final.nn.layers[-1], p_oh_transfer_init.nn.layers[-1]
+        )
+    # p_rad
+    for i in range(len(p_rad_base_init.nn.layers) - 1):
+        chex.assert_trees_all_equal(
+            p_rad_base_final.nn.layers[i], p_rad_transfer_init.nn.layers[i]
+        )
+    with pytest.raises(AssertionError):
+        chex.assert_trees_all_equal(
+            p_rad_base_final.nn.layers[-1], p_rad_transfer_init.nn.layers[-1]
+        )
+    # sciml
+    for i in range(len(sciml_base_init.nn.layers) - 1):
+        chex.assert_trees_all_equal(
+            sciml_base_final.nn.layers[i], sciml_transfer_unfrozen_init.nn.layers[i]
+        )
+    with pytest.raises(AssertionError):
+        chex.assert_trees_all_equal(
+            sciml_base_final.nn.layers[-1], sciml_transfer_unfrozen_init.nn.layers[-1]
+        )
 
-    # For the p_oh and p_rad cases, the final trained model should be the same as the initial transferred model, and different from the final transferred model
-    p_oh_orig_final_model = None
+    # 2. Ensure the unfrozen submodules only changed their last layers (still transfer learning)
+    # p_oh
+    for i in range(len(p_oh_base_init.nn.layers) - 1):
+        chex.assert_trees_all_equal(
+            p_oh_transfer_final.nn.layers[i],
+            sciml_transfer_unfrozen_final.p_oh_predictor.nn.layers[i],
+        )
+    with pytest.raises(AssertionError):
+        chex.assert_trees_all_equal(
+            p_oh_transfer_final.nn.layers[-1],
+            sciml_transfer_unfrozen_final.p_oh_predictor.nn.layers[-1],
+        )
+    # p_rad
+    for i in range(len(p_rad_base_init.nn.layers) - 1):
+        chex.assert_trees_all_equal(
+            p_rad_transfer_final.nn.layers[i],
+            sciml_transfer_unfrozen_final.p_rad_predictor.nn.layers[i],
+        )
+    with pytest.raises(AssertionError):
+        chex.assert_trees_all_equal(
+            p_rad_transfer_final.nn.layers[-1],
+            sciml_transfer_unfrozen_final.p_rad_predictor.nn.layers[-1],
+        )
 
 
 def test_collect_results():
@@ -576,7 +825,7 @@ if __name__ == "__main__":
     # test_power_balance_transfer_cases()
     # test_collect_results()
     # test_transfer_weights()
-    test_transfer_weights_submodules()
+    test_transfer_weights_frozen_submodules()
     # test_submodule_freezing()
     # TODO(ZanderKeith), make sure the following things are happening:
     # 1) Cases properly restore their hyperparameters
