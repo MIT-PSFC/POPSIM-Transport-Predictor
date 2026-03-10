@@ -1,4 +1,3 @@
-import json
 import os
 import shutil
 from dataclasses import dataclass
@@ -6,6 +5,7 @@ from itertools import product
 
 import fire
 import netCDF4  # noqa: F401
+import yaml
 from loguru import logger
 from popsim.ml import TrainConfig
 from popsim.ml.launch import launch_agent, launch_sweep, launch_train
@@ -98,9 +98,10 @@ class PowerBalanceStudy(Study):
                 self.domain_adaptation == "transfer" or self.training_data == "exnihilo"
             ) and self.num_hp_shots == 0:
                 return True
+
             return False
 
-        def get_hyperparam_prereq(self) -> Study.Case:
+        def get_hyperparam_prereq(self) -> "PowerBalanceStudy".Case:
             if self.is_hyperparam_case():
                 return self
             else:
@@ -396,8 +397,14 @@ class PowerBalanceStudy(Study):
                 f"Case {case} does not have the required data to run. This should have been caught earlier!"
             )
 
+        if os.path.exists(self.result_path(case)):
+            logger.warning(f"Case {case} already has results, skipping.")
+            return
+
         if self.check_prereq_satisfied(case):
-            logger.info(f"RUNNING CASE:\n{case}")
+            logger.opt(colors=True).info(
+                f"<bold><cyan>RUNNING CASE:</cyan></bold>\n{case}"
+            )
             # Prereq is satisfied, can run this case.
             if case.is_hyperparam_case():
                 if skip_tuning:
@@ -407,7 +414,7 @@ class PowerBalanceStudy(Study):
                     tuned_config_path = self.tuned_config_path(case)
                     os.makedirs(os.path.dirname(tuned_config_path), exist_ok=True)
                     with open(tuned_config_path, "w") as f:
-                        json.dump(default_config.model_dump(), f, indent=4)
+                        yaml.dump(default_config.model_dump(), f, indent=4)
                 else:
                     logger.info("Checking if hyperparameter tuning is already done")
                     tuned_config_path = self.tuned_config_path(case)
@@ -548,16 +555,19 @@ class PowerBalanceStudy(Study):
             W_c = 10 / 1000
             W_t = 10 / 1000
             W_dlp = 80 / 1000
-            if case.num_hp_shots is None:
-                N_dhp = 97  # All 97 high-performance shots in the DIII-D dataset
+            if case.num_hp_shots in [None, 0]:
+                # If None, all 97 high-performance shots in the DIII-D dataset
+                # If 0, weights aren't being used anyway
+                N_dhp = 97
             else:
                 N_dhp = case.num_hp_shots
             W_dhp = 100 / N_dhp
+            # Multiply all by
             dataloader_config_base["device_weights"] = {
-                "cmod": W_c,
-                "tcv": W_t,
-                "d3d_lp": W_dlp,
-                "d3d_hp": W_dhp,
+                "cmod": W_c * 100,
+                "tcv": W_t * 100,
+                "d3d_lp": W_dlp * 100,
+                "d3d_hp": W_dhp * 100,
             }
 
         if case.model_type == "p_oh":
@@ -720,7 +730,7 @@ class PowerBalanceStudy(Study):
                     **dataloader_config_base,
                 },
                 model_init_config={
-                    "model_case": case.model_type,
+                    "model_type": case.model_type,
                     "data_normalization": case.data_normalization,
                     "freeze_submodules": case.freeze_submodules,
                     "nn_depth": 2,
@@ -758,7 +768,7 @@ class PowerBalanceStudy(Study):
                     **dataloader_config_base,
                 },
                 model_init_config={
-                    "model_case": case.model_type,
+                    "model_type": case.model_type,
                     "data_normalization": case.data_normalization,
                     "freeze_submodules": case.freeze_submodules,
                     "nn_depth": 2,
@@ -1099,7 +1109,7 @@ def run_study(  # noqa: PLR0915
     ########################
     # Launch Orchestration #
     ########################
-    logger.info("ORCHESTRATION", color="<orange><bold>")
+    logger.opt(colors=True).info("<bold><magenta>ORCHESTRATION</bold></magenta>")
 
     # Unfinished cases are those we have data to run but haven't gotten results for yet
     unfinished_cases = [
@@ -1117,7 +1127,9 @@ def run_study(  # noqa: PLR0915
 
         # Check which cases are still unfinished
         unfinished_cases = [
-            case for case in unfinished_cases if not study.check_prereq_satisfied(case)
+            case
+            for case in unfinished_cases
+            if not os.path.exists(study.result_path(case))
         ]
 
     ############################

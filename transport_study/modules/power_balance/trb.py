@@ -95,7 +95,8 @@ class PowerBalanceTRB(TrainRunBuilder):
             segment_overlaps=segment_overlaps,
             shuffle=[True, False],
             convert_xr_to_jnp=False,  # Needed to keep the coords for calculating loss
-            nan_handling="drop_segment",
+            # TODO(ZanderKeith): Switch to 'drop_segment' after you fix the dataset setup
+            nan_handling="drop_slice_any",
         )
         # Running test evaluation on the validation set, since we don't need a dedicated test set
         # In the no domain adaptation case, we are hyperparameter tuning on all historic data, pick the best one and test on it

@@ -240,6 +240,23 @@ def test_submodule_freezing():
         num_hp_shots=None,
     )
 
+    case_unfrozen = PowerBalanceStudy.Case(
+        model_type="sciml",
+        training_data="cmod_tcv",
+        data_normalization="coral",
+        domain_adaptation=None,
+        freeze_submodules=False,
+        num_hp_shots=None,
+    )
+
+    for case in [case_p_oh, case_p_rad, case_frozen, case_unfrozen]:
+        if not os.path.exists(study.result_path(case)):
+            study.launch_train(case)
+
+    # Load the trained models for each case,
+    # Ensure the weights for p_oh and p_rad are the same for the frozen case,
+    # and different for the unfrozen case
+
 
 if __name__ == "__main__":
     # test_power_balance_transfer_cases()
