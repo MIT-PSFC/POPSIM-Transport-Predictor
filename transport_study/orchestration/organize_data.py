@@ -566,8 +566,8 @@ def get_train_val_datasets(
         else:
             raise ValueError(f"Unknown training data case: {training_data}")
 
-    logger.debug("Training dataset size: {}", train_ds.sizes[episode_coord])
-    logger.debug("Validation dataset size: {}", val_ds.sizes[episode_coord])
+    logger.debug("Historic Training dataset size: {}", train_ds.sizes[episode_coord])
+    logger.debug("Historic Validation dataset size: {}", val_ds.sizes[episode_coord])
 
     train_ds, val_ds = normalize_domain(train_ds, val_ds, method=data_normalization)
 
@@ -595,7 +595,7 @@ def get_train_test_datasets(
     which I understand is a bit cheaty but given the extremely limited amount of high-performance data in some cases
     it would be better to do this than train and validate on the same 3-4 high-performance shots.
 
-    In any case, since we're doing this for all the models it should be a fair comparison.
+    Since we're doing this for all the models it should be a fair comparison.
     """
 
     # Load the high-performance dataset and split into train/test
@@ -616,7 +616,9 @@ def get_train_test_datasets(
         train_ds_hp = ds_hp.isel({episode_coord: train_shot_pool})
 
     # Load historic data and put it all in the training set
-    train_ds_hist, val_ds_hist = get_train_val_datasets(training_data)
+    train_ds_hist, val_ds_hist = get_train_val_datasets(
+        training_data, data_normalization
+    )
     train_ds = concat_with_nan_padding(
         [train_ds_hist, val_ds_hist, train_ds_hp],
         concat_dim=episode_coord,
@@ -629,5 +631,8 @@ def get_train_test_datasets(
     if domain_adaptation == "transfer" or training_data == "exnihilo":
         # Remove all the historic data from the training set, leaving only the high-performance DIII-D shots
         train_ds = train_ds.where(train_ds.coords["ds_source"] == "d3d_hp", drop=True)
+
+    logger.debug("HP Training dataset size: {}", train_ds.sizes[episode_coord])
+    logger.debug("HP Test dataset size: {}", test_ds.sizes[episode_coord])
 
     return train_ds, test_ds

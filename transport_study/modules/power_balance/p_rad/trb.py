@@ -118,9 +118,20 @@ class RadiatedPowerTRB(TrainRunBuilder):
             )
 
             # ds_source is constant per shot so extract as a shot-only coordinate
-            ds_source = (
-                eval_data.input_ds["ds_source"].unstack("sample").isel({TIME_DIM: 0})
-            )
+            ds_source = eval_data.input_ds["ds_source"]
+            if "sample" in ds_source.dims:
+                # Case when there are multiple source datasets present
+                ds_source_array = (
+                    eval_data.input_ds["ds_source"]
+                    .unstack("sample")
+                    .isel({TIME_DIM: 0})
+                    .values
+                )
+            else:
+                # Case when there is a single source dataset present
+                ds_source_array = np.array(
+                    [ds_source.values.item() for _ in range(targ.sizes["shot"])]
+                )
 
             ds = xr.Dataset(
                 data_vars={
@@ -132,7 +143,7 @@ class RadiatedPowerTRB(TrainRunBuilder):
                     "error_shot_rel": error_shot_rel,
                 }
             )
-            ds = ds.assign_coords(ds_source=(EPISODE_DIM, ds_source.values))
+            ds = ds.assign_coords(ds_source=(EPISODE_DIM, ds_source_array))
             ds = ds.drop_vars("quantile", errors="ignore")
             return ds
 

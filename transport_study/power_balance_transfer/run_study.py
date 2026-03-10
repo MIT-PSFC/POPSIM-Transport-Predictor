@@ -91,11 +91,20 @@ class PowerBalanceStudy(Study):
             else:
                 return False
 
+        def is_impossible(self) -> bool:
+            """Some cases don't make sense to run. Mark those cases as impossible and raise an error if we try to run them."""
+            # Can't do transfer learning or training from nothing with 0 high-performance shots.
+            if (
+                self.domain_adaptation == "transfer" or self.training_data == "exnihilo"
+            ) and self.num_hp_shots == 0:
+                return True
+            return False
+
         def get_hyperparam_prereq(self) -> Study.Case:
             if self.is_hyperparam_case():
                 return self
             else:
-                return Study.Case(
+                return PowerBalanceStudy.Case(
                     model_type=self.model_type,
                     training_data=PowerBalanceStudy.HYPERPARAM_TRAINING_DATA,
                     data_normalization=PowerBalanceStudy.HYPERPARAM_DATA_NORMALIZATION,
@@ -276,7 +285,11 @@ class PowerBalanceStudy(Study):
             _unwrap_prereqs(case)
 
         unique_cases = list(set(unwrapped_cases))  # Remove duplicates
-        return unique_cases
+        possible_cases = [
+            case for case in unique_cases if not case.is_impossible()
+        ]  # Remove impossible cases
+
+        return possible_cases
 
     def __init__(
         self,
@@ -428,24 +441,25 @@ class PowerBalanceStudy(Study):
                             self.launch_sweep(case)
                             return
 
-                # At this point, we know the tuned config is available at tuned_config_path, so we can proceed to training
-                if enable_parallelism:
-                    running_jobs = count_running_jobs(
-                        self.train_job_name(case), config.partition
+            # At this point, we know the tuned config is available at tuned_config_path, so we can proceed to training
+            if enable_parallelism:
+                running_jobs = count_running_jobs(
+                    self.train_job_name(case), config.partition
+                )
+                if len(running_jobs) > 0:
+                    logger.info(
+                        f"Found {len(running_jobs)} running training jobs, waiting for them to complete before proceeding"
                     )
-                    if len(running_jobs) > 0:
-                        logger.info(
-                            f"Found {len(running_jobs)} running training jobs, waiting for them to complete before proceeding"
-                        )
-                        return
+                    return
 
-                logger.info("Launching training")
-                self.launch_train(case)
+            logger.info("Launching training")
+            self.launch_train(case)
+
         else:
             for prereq in case.prereqs:
                 if not os.path.exists(self.result_path(prereq)):
                     logger.debug(
-                        f"Prereq not satisfied yet, running that first.\nCase: {case}\nPrereq: {prereq}"
+                        f"Prereq not satisfied yet, running that first.\nCase:\t{case}\nPrereq:\t{prereq}"
                     )
                     self.run_case(
                         prereq,
@@ -541,7 +555,7 @@ class PowerBalanceStudy(Study):
                     "nn_depth": 2,
                     "nn_width": 16,
                     "min_val": 0,  # Minimum ohmic power in MW
-                    "max_val": None,  # Get max from training data
+                    "max_val": 16,  # Maximum ohmic power in MW
                     "prng_seed": 42,
                     "in_size": 7,
                     "out_size": 1,
@@ -571,7 +585,7 @@ class PowerBalanceStudy(Study):
                     "nn_depth": 2,
                     "nn_width": 16,
                     "min_val": 0,  # Minimum radiated power in MW, probably doesn't need to be enforced but just in case
-                    "max_val": None,  # Get max from training data
+                    "max_val": 16,  # Maximum radiated power in MW
                     "prng_seed": 42,
                     "in_size": 7,
                     "out_size": 1,
@@ -588,7 +602,7 @@ class PowerBalanceStudy(Study):
                     training_data=case.training_data,
                     data_normalization=case.data_normalization,
                     domain_adaptation=case.domain_adaptation,
-                    freeze_submodules=case.freeze_submodules,
+                    freeze_submodules=PowerBalanceStudy.HYPERPARAM_FREEZE_SUBMODULES,
                     num_hp_shots=case.num_hp_shots,
                 )
             )
@@ -598,7 +612,7 @@ class PowerBalanceStudy(Study):
                     training_data=case.training_data,
                     data_normalization=case.data_normalization,
                     domain_adaptation=case.domain_adaptation,
-                    freeze_submodules=case.freeze_submodules,
+                    freeze_submodules=PowerBalanceStudy.HYPERPARAM_FREEZE_SUBMODULES,
                     num_hp_shots=case.num_hp_shots,
                 )
             )
@@ -647,7 +661,7 @@ class PowerBalanceStudy(Study):
                     training_data=case.training_data,
                     data_normalization=case.data_normalization,
                     domain_adaptation=case.domain_adaptation,
-                    freeze_submodules=case.freeze_submodules,
+                    freeze_submodules=PowerBalanceStudy.HYPERPARAM_FREEZE_SUBMODULES,
                     num_hp_shots=case.num_hp_shots,
                 )
             )
@@ -657,7 +671,7 @@ class PowerBalanceStudy(Study):
                     training_data=case.training_data,
                     data_normalization=case.data_normalization,
                     domain_adaptation=case.domain_adaptation,
-                    freeze_submodules=case.freeze_submodules,
+                    freeze_submodules=PowerBalanceStudy.HYPERPARAM_FREEZE_SUBMODULES,
                     num_hp_shots=case.num_hp_shots,
                 )
             )
@@ -794,6 +808,11 @@ class PowerBalanceStudy(Study):
 
     def launch_train(self, case: Case):
         """Launch a training job for the given case."""
+        if case.is_impossible():
+            raise ValueError(
+                f"Case {case} is not a possible case to run, check the logic in the Case dataclass to see why this is. This should have been caught earlier!"
+            )
+
         train_config = self.make_train_config(case)
         _, _, _, _, result_dict = launch_train(train_config)
         ds = result_dict["test/study_results"]
@@ -1054,7 +1073,7 @@ def run_study(  # noqa: PLR0915
     ########################
     # Launch Orchestration #
     ########################
-    logger.info("ORCHESTRATION")
+    logger.info("ORCHESTRATION", color="<orange><bold>")
 
     # Unfinished cases are those we have data to run but haven't gotten results for yet
     unfinished_cases = [
@@ -1064,6 +1083,7 @@ def run_study(  # noqa: PLR0915
         and study.check_data_requirements(case)
     ]
     while len(unfinished_cases) > 0:
+        logger.info(f"{len(unfinished_cases)} cases remaining.")
         for case in unfinished_cases:
             study.run_case(
                 case, skip_tuning=skip_tuning, enable_parallelism=enable_parallelism
@@ -1073,7 +1093,6 @@ def run_study(  # noqa: PLR0915
         unfinished_cases = [
             case for case in unfinished_cases if not study.check_prereq_satisfied(case)
         ]
-        logger.info(f"{len(unfinished_cases)} cases remaining.")
 
     ############################
     # Training Data Comparison #
