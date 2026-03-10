@@ -182,6 +182,7 @@ class PowerBalanceTRB(TrainRunBuilder):
         env = PowerBalanceEnv(
             module=module,
             data_normalization=model_init_config["data_normalization"],
+            domain_adaptation=model_init_config["domain_adaptation"],
             freeze_submodules=freeze_submodules,
         )
 

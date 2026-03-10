@@ -516,13 +516,6 @@ class PowerBalanceStudy(Study):
         """Make the TrainConfig for a given case.
         If a hyperparameter tuned config is available, fills in the hyperparameters from that, otherwise uses default config.
         """
-        optimizer_config_base = {
-            "lr0": 1e-4,
-            "transition_steps": 500,
-            "decay_rate": 0.5,
-            "lrf": 5e-4,
-            "weight_decay": 2e-4,
-        }
         dataloader_config_base = {
             "training_data": case.training_data,
             "data_normalization": case.data_normalization,
@@ -539,12 +532,22 @@ class PowerBalanceStudy(Study):
             "segment_length_val": None,
             "segment_overlap_val": 0,
         }
-        test_eval_suite_config_base = {
-            "result_path": self.result_path(case),
-        }
-
         loss_config_base = {
             "huber_delta": 0.5,
+        }
+        optimizer_config_base = {
+            "lr0": 1e-4,
+            "transition_steps": 500,
+            "decay_rate": 0.5,
+            "lrf": 5e-4,
+            "weight_decay": 2e-4,
+        }
+        trainable_getter_config_base = {
+            "freeze_submodules": case.freeze_submodules,
+            "domain_adaptation": case.domain_adaptation,
+        }
+        test_eval_suite_config_base = {
+            "result_path": self.result_path(case),
         }
 
         if case.domain_adaptation == "mixing":
@@ -603,6 +606,7 @@ class PowerBalanceStudy(Study):
                     },
                     loss_config=loss_config_base,
                     optimizer_config=optimizer_config_base,
+                    trainable_getter_config=trainable_getter_config_base,
                     test_eval_suite_config=test_eval_suite_config_base,
                 )
             elif case.model_type == "p_rad":
@@ -633,6 +637,7 @@ class PowerBalanceStudy(Study):
                     },
                     loss_config=loss_config_base,
                     optimizer_config=optimizer_config_base,
+                    trainable_getter_config=trainable_getter_config_base,
                     test_eval_suite_config=test_eval_suite_config_base,
                 )
             elif case.model_type == "scaling_law":
@@ -693,6 +698,7 @@ class PowerBalanceStudy(Study):
                     },
                     loss_config=loss_config_base,
                     optimizer_config=optimizer_config_base,
+                    trainable_getter_config=trainable_getter_config_base,
                     test_eval_suite_config=test_eval_suite_config_base,
                 )
             elif case.model_type == "sciml":
@@ -751,6 +757,7 @@ class PowerBalanceStudy(Study):
                     },
                     loss_config=loss_config_base,
                     optimizer_config=optimizer_config_base,
+                    trainable_getter_config=trainable_getter_config_base,
                     test_eval_suite_config=test_eval_suite_config_base,
                 )
             elif case.model_type == "unstructured_nn":
@@ -775,6 +782,7 @@ class PowerBalanceStudy(Study):
                     model_init_config={
                         "model_type": case.model_type,
                         "data_normalization": case.data_normalization,
+                        "domain_adaptation": case.domain_adaptation,
                         "freeze_submodules": case.freeze_submodules,
                         "nn_depth": 2,
                         "nn_width": 16,
@@ -784,6 +792,7 @@ class PowerBalanceStudy(Study):
                     },
                     loss_config=loss_config_base,
                     optimizer_config=optimizer_config_base,
+                    trainable_getter_config=trainable_getter_config_base,
                     test_eval_suite_config=test_eval_suite_config_base,
                 )
             else:
@@ -849,10 +858,20 @@ class PowerBalanceStudy(Study):
                         }
                     }
                 )
-
-            return train_config
         else:
-            return train_config_base
+            train_config = train_config_base
+
+        # Put the model_init_config into the trainable_getter_config
+        train_config = train_config.model_copy(
+            update={
+                "trainable_getter_config": {
+                    **train_config.trainable_getter_config,
+                    "model_init_config": train_config.model_init_config,
+                }
+            }
+        )
+
+        return train_config
 
     def launch_sweep(self, case: Case):
         """Launch a wandb hyperparameter sweep for the given case."""

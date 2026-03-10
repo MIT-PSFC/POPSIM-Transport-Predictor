@@ -492,6 +492,7 @@ class PowerBalanceUnstructuredNN(PowerBalance):
 class PowerBalanceEnv(ModuleTrainingEnv):
     module: PowerBalance
     data_normalization: str = eqx.field(static=True, default="unset")
+    domain_adaptation: str = eqx.field(static=True, default="unset")
     freeze_submodules: list[str] = eqx.field(static=True, default_factory=list)
     stepper: StepperType = eqx.field(static=True, default=StepperType.SIMPLE_EULER)
 
@@ -598,6 +599,24 @@ class PowerBalanceEnv(ModuleTrainingEnv):
                 self.module.taue_predictor, eqx.is_inexact_array
             )
         elif isinstance(self.module, PowerBalanceUnstructuredNN):
-            trainable_leaves["nn"] = eqx.filter(self.module.nn, eqx.is_inexact_array)
+            trainable_leaves["nn"] = eqx.filter(self.module, eqx.is_inexact_array)
 
-        return trainable_leaves
+        if self.domain_adaptation == "transfer":
+            # In transfer learning, only train the last layers of the networks
+            # https://docs.kidger.site/equinox/examples/frozen_layer/
+            unfrozen_leaves = {}
+            for name, leaf in trainable_leaves.items():
+                model = leaf.nn
+                filter_spec = jax.tree_util.tree_map(
+                    lambda _: False, model
+                )  # Start with everything frozen
+                filter_spec = eqx.tree_at(  # Unfreeze the last layer
+                    lambda tree: (tree.layers[-1].weight, tree.layers[-1].bias),
+                    filter_spec,
+                    replace=((True, True)),
+                )
+                trainable, _frozen = eqx.partition(model, filter_spec)
+                unfrozen_leaves[name] = trainable
+            return unfrozen_leaves
+        else:
+            return trainable_leaves
