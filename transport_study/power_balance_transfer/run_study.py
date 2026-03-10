@@ -743,6 +743,7 @@ class PowerBalanceStudy(Study):
                     model_init_config={
                         "model_type": case.model_type,
                         "data_normalization": case.data_normalization,
+                        "domain_adaptation": case.domain_adaptation,
                         "freeze_submodules": case.freeze_submodules,
                         "nn_depth": 2,
                         "nn_width": 16,

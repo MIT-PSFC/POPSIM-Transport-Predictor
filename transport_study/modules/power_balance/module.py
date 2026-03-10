@@ -581,6 +581,33 @@ class PowerBalanceEnv(ModuleTrainingEnv):
         return inputs
 
     def get_trainable(self):
+        if self.domain_adaptation == "transfer":
+            # Transfer learning: only the last layer of each NN is trainable.
+            # TODO(ZanderKeith) replace this with an actual partition
+            last_layer_leaves = []
+            if isinstance(self.module, PowerBalanceUnstructuredNN):
+                last_layer_leaves += [
+                    self.module.nn.layers[-1].weight,
+                    self.module.nn.layers[-1].bias,
+                ]
+            if isinstance(self.module, PowerBalanceSciML):
+                last_layer_leaves += [
+                    self.module.taue_predictor.nn.layers[-1].weight,
+                    self.module.taue_predictor.nn.layers[-1].bias,
+                ]
+            if isinstance(self.module, (PowerBalanceSciML, PowerBalanceScalingLaw)):
+                if "p_oh_predictor" not in self.freeze_submodules:
+                    last_layer_leaves += [
+                        self.module.p_oh_predictor.nn.layers[-1].weight,
+                        self.module.p_oh_predictor.nn.layers[-1].bias,
+                    ]
+                if "p_rad_predictor" not in self.freeze_submodules:
+                    last_layer_leaves += [
+                        self.module.p_rad_predictor.nn.layers[-1].weight,
+                        self.module.p_rad_predictor.nn.layers[-1].bias,
+                    ]
+            return last_layer_leaves
+
         trainable_leaves = {}
         if isinstance(self.module, PowerBalanceScalingLaw) or isinstance(
             self.module, PowerBalanceSciML
@@ -601,22 +628,4 @@ class PowerBalanceEnv(ModuleTrainingEnv):
         elif isinstance(self.module, PowerBalanceUnstructuredNN):
             trainable_leaves["nn"] = eqx.filter(self.module, eqx.is_inexact_array)
 
-        if self.domain_adaptation == "transfer":
-            # In transfer learning, only train the last layers of the networks
-            # https://docs.kidger.site/equinox/examples/frozen_layer/
-            unfrozen_leaves = {}
-            for name, leaf in trainable_leaves.items():
-                model = leaf.nn
-                filter_spec = jax.tree_util.tree_map(
-                    lambda _: False, model
-                )  # Start with everything frozen
-                filter_spec = eqx.tree_at(  # Unfreeze the last layer
-                    lambda tree: (tree.layers[-1].weight, tree.layers[-1].bias),
-                    filter_spec,
-                    replace=((True, True)),
-                )
-                trainable, _frozen = eqx.partition(model, filter_spec)
-                unfrozen_leaves[name] = trainable
-            return unfrozen_leaves
-        else:
-            return trainable_leaves
+        return trainable_leaves

@@ -317,6 +317,15 @@ def test_transfer_weights():
     if not os.path.exists(study.result_path(case_unstructured_nn_base)):
         study.launch_train(case_unstructured_nn_base)
 
+    # Clear any stale checkpoints/results from previous runs before retraining.
+    # Without this, orbax keeps the old "best" checkpoint (max_to_keep=1, best_mode=min),
+    # so restore_best_checkpoint=True would load stale weights from a broken training run.
+    shutil.rmtree(
+        study.trained_model_dir(case_unstructured_nn_transfer), ignore_errors=True
+    )
+    if os.path.exists(study.result_path(case_unstructured_nn_transfer)):
+        os.remove(study.result_path(case_unstructured_nn_transfer))
+
     study.launch_train(case_unstructured_nn_transfer)
 
     unstructured_nn_base_trainer, _ = study.restore_trainer(
@@ -393,7 +402,7 @@ def test_transfer_weights_submodules():
         hp_test_set_size=4,
     )
 
-    case_p_oh_orig = PowerBalanceStudy.Case(
+    case_p_oh_base = PowerBalanceStudy.Case(
         model_type="p_oh",
         training_data="cmod_tcv",
         data_normalization="coral",
@@ -409,7 +418,7 @@ def test_transfer_weights_submodules():
         freeze_submodules=True,
         num_hp_shots=-1,
     )
-    case_p_rad_orig = PowerBalanceStudy.Case(
+    case_p_rad_base = PowerBalanceStudy.Case(
         model_type="p_rad",
         training_data="cmod_tcv",
         data_normalization="coral",
@@ -426,7 +435,7 @@ def test_transfer_weights_submodules():
         num_hp_shots=-1,
     )
 
-    case_sciml_orig = PowerBalanceStudy.Case(
+    case_sciml_base = PowerBalanceStudy.Case(
         model_type="sciml",
         training_data="cmod_tcv",
         data_normalization="coral",
@@ -451,21 +460,40 @@ def test_transfer_weights_submodules():
         num_hp_shots=-1,
     )
 
-    # Restore trainers for each case
-    p_oh_orig_trainer = study.restore_trainer(
-        case_p_oh_orig, restore_best_checkpoint=False
+    # Cases that don't need to be re-run if something's broken
+    for case in [case_p_oh_base, case_p_rad_base, case_sciml_base]:
+        if not os.path.exists(study.result_path(case)):
+            study.launch_train(case)
+
+    # Clear any stale checkpoints/results from previous runs before retraining.
+    # Without this, orbax keeps the old "best" checkpoint (max_to_keep=1, best_mode=min),
+    # so restore_best_checkpoint=True would load stale weights from a broken training run.
+    for case in [
+        case_p_oh_transfer,
+        case_p_rad_transfer,
+        case_sciml_transfer_frozen,
+        case_sciml_transfer_unfrozen,
+    ]:
+        shutil.rmtree(study.trained_model_dir(case), ignore_errors=True)
+        if os.path.exists(study.result_path(case)):
+            os.remove(study.result_path(case))
+        study.launch_train(case)
+
+    # Restore trainers for each case to get the initial model states
+    p_oh_base_trainer = study.restore_trainer(
+        case_p_oh_base, restore_best_checkpoint=False
     )
     p_oh_transfer_trainer = study.restore_trainer(
         case_p_oh_transfer, restore_best_checkpoint=False
     )
-    p_rad_orig_trainer = study.restore_trainer(
-        case_p_rad_orig, restore_best_checkpoint=False
+    p_rad_base_trainer = study.restore_trainer(
+        case_p_rad_base, restore_best_checkpoint=False
     )
     p_rad_transfer_trainer = study.restore_trainer(
         case_p_rad_transfer, restore_best_checkpoint=False
     )
-    sciml_orig_trainer = study.restore_trainer(
-        case_sciml_orig, restore_best_checkpoint=False
+    sciml_base_trainer = study.restore_trainer(
+        case_sciml_base, restore_best_checkpoint=False
     )
     sciml_transfer_frozen_trainer = study.restore_trainer(
         case_sciml_transfer_frozen, restore_best_checkpoint=False
@@ -475,7 +503,7 @@ def test_transfer_weights_submodules():
     )
 
     # Get initial and final models for each case
-    p_oh_orig_model_init = p_oh_orig_trainer
+    p_oh_base_model_init = p_oh_orig_trainer.train_state.module.nn
 
     # For the p_oh and p_rad cases, the final trained model should be the same as the initial transferred model, and different from the final transferred model
     p_oh_orig_final_model = None
@@ -547,7 +575,8 @@ def test_collect_results():
 if __name__ == "__main__":
     # test_power_balance_transfer_cases()
     # test_collect_results()
-    test_transfer_weights()
+    # test_transfer_weights()
+    test_transfer_weights_submodules()
     # test_submodule_freezing()
     # TODO(ZanderKeith), make sure the following things are happening:
     # 1) Cases properly restore their hyperparameters
