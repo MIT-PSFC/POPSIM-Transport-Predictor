@@ -6,7 +6,7 @@ import numpy as np
 import optax
 import xarray as xr
 from loguru import logger
-from popsim.ml import DataLoader, IntegralLoss, TrainRunBuilder
+from popsim.ml import DataLoader, IntegralLoss, TrainConfig, TrainRunBuilder
 from popsim.ml.checkpointing import create_default_checkpoint_manager, restore_model
 from popsim.ml.dataloading import make_dataloaders
 from popsim.ml.eval import EvalData, EvaluationSuite
@@ -110,12 +110,15 @@ class PowerBalanceTRB(TrainRunBuilder):
         """
         model_case = model_init_config["model_case"]
         if model_case in ["scaling_law", "sciml"]:
-            # These cases work in real units, restore the p_oh and p_rad submodules
             p_oh_config = model_init_config["submodules"]["p_oh_predictor"]
+            if isinstance(p_oh_config, TrainConfig):
+                p_oh_config = p_oh_config.model_dump()
             p_oh_predictor = OhmicPowerTRB.model_init(
                 train_dl, p_oh_config["model_init_config"]
             )
             p_rad_config = model_init_config["submodules"]["p_rad_predictor"]
+            if isinstance(p_rad_config, TrainConfig):
+                p_rad_config = p_rad_config.model_dump()
             p_rad_predictor = RadiatedPowerTRB.model_init(
                 train_dl, p_rad_config["model_init_config"]
             )
@@ -161,10 +164,15 @@ class PowerBalanceTRB(TrainRunBuilder):
         else:
             raise ValueError(f"Invalid model case: {model_init_config['model_case']}")
 
+        if model_init_config.get("freeze_submodules", False):
+            freeze_submodules = ["p_oh_predictor", "p_rad_predictor"]
+        else:
+            freeze_submodules = []
+
         env = PowerBalanceEnv(
             module=module,
-            normalization_method=model_init_config["normalization_method"],
-            freeze_submodules=model_init_config["freeze_submodules"],
+            data_normalization=model_init_config["data_normalization"],
+            freeze_submodules=freeze_submodules,
         )
 
         if model_init_config.get("restore_main_module", False):
@@ -180,14 +188,11 @@ class PowerBalanceTRB(TrainRunBuilder):
     @staticmethod
     def get_loss_fn(loss_config: dict) -> Callable[[Any, Any], jnp.ndarray]:
         def loss_fn(pred, targ):
-            _device_weights = loss_config["device_weight"]
-            var_weights = loss_config["var_weight"]
-
             wtot_loss = jnp.abs(pred.Wtot_MJ_pred - targ["Wtot_MJ"].data)
             wtot_loss = optax.huber_loss(wtot_loss, delta=loss_config["huber_delta"])
 
             device_weight = 1  # TODO(ZanderKeith) fix device weighting device_weights[targ["ds_source"].item()]
-            loss = device_weight * var_weights["Wtot_MJ"] * wtot_loss
+            loss = device_weight * wtot_loss
             # TODO(ZanderKeith): might be worthwhile to put the p_oh and p_rad in here?
             return loss
 
@@ -215,10 +220,18 @@ class PowerBalanceTRB(TrainRunBuilder):
                 - Integrated error over time for each shot
             This should maintain the coordinates of the original dataset, in particular `ds_source` and `shot`
             """
-            # Unstack sample MultiIndex -> (shot, time_idx) so we can integrate per shot
-            targ = eval_data.input_ds.Wtot_MJ.unstack("sample")
-            pred = eval_data.output_ds.Wtot_MJ_pred.unstack("sample")
-            time_2d = eval_data.input_ds[TIME_COORD].unstack("sample")
+
+            # Unstack sample MultiIndex -> (shot, time_idx) and sqeeze out batch dimension so we can integrate per shot
+            targ = eval_data.input_ds.Wtot_MJ.unstack("sample").squeeze()
+            pred = (
+                eval_data.output_ds["output.Wtot_MJ_pred"].unstack("sample").squeeze()
+            )
+            time_2d = eval_data.input_ds[TIME_COORD].unstack("sample").squeeze()
+
+            # time-dependent modules modify the time dimension name, change it back to avoid confusion
+            targ = targ.rename({TIME_DIM + "_input": TIME_DIM})
+            pred = pred.rename({TIME_DIM + "_input": TIME_DIM})
+            time_2d = time_2d.rename({TIME_DIM + "_input": TIME_DIM})
 
             # Get relative error on a per-timeslice basis
             error_abs_ts = xr.apply_ufunc(np.abs, pred - targ)
@@ -245,10 +258,8 @@ class PowerBalanceTRB(TrainRunBuilder):
                 vectorize=True,
             )
 
-            # ds_source is constant per shot — extract as a shot-only coordinate
-            ds_source = (
-                eval_data.input_ds["ds_source"].unstack("sample").isel({TIME_DIM: 0})
-            )
+            # ds_source is constant per shot so extract as a shot-only coordinate
+            ds_source = eval_data.input_ds["ds_source"].unstack("sample").squeeze()
 
             ds = xr.Dataset(
                 data_vars={
@@ -262,6 +273,7 @@ class PowerBalanceTRB(TrainRunBuilder):
             )
             ds = ds.assign_coords(ds_source=(EPISODE_DIM, ds_source.values))
             ds = ds.drop_vars("quantile", errors="ignore")
+            ds = ds.drop_vars("input_batch", errors="ignore")
             return ds
 
         eval_suite = {

@@ -611,8 +611,13 @@ class PowerBalanceStudy(Study):
                     case
                 ),  # When doing hyperparameter tuning, this gets overwritten by the wandb agent
                 dataloader_config={
-                    "target_vars": ["Wtot_MJ"],
                     "input_vars": self._input_vars(case),
+                    "target_vars": ["Wtot_MJ"],
+                    "state_vars": ["Wtot_MJ"],
+                    "extra_vars": [
+                        "P_oh_MW",
+                        "P_rad_MW",
+                    ],  # Bring these along for comparison
                     **dataloader_config_base,
                 },
                 model_init_config={
@@ -665,8 +670,13 @@ class PowerBalanceStudy(Study):
                     case
                 ),  # When doing hyperparameter tuning, this gets overwritten by the wandb agent
                 dataloader_config={
-                    "target_vars": ["Wtot_MJ"],
                     "input_vars": self._input_vars(case),
+                    "target_vars": ["Wtot_MJ"],
+                    "state_vars": ["Wtot_MJ"],
+                    "extra_vars": [
+                        "P_oh_MW",
+                        "P_rad_MW",
+                    ],  # Bring these along for comparison
                     **dataloader_config_base,
                 },
                 model_init_config={
@@ -698,8 +708,13 @@ class PowerBalanceStudy(Study):
                     case
                 ),  # When doing hyperparameter tuning, this gets overwritten by the wandb agent
                 dataloader_config={
-                    "target_vars": ["Wtot_MJ"],
                     "input_vars": self._input_vars(case),
+                    "target_vars": ["Wtot_MJ"],
+                    "state_vars": ["Wtot_MJ"],
+                    "extra_vars": [
+                        "P_oh_MW",
+                        "P_rad_MW",
+                    ],  # Bring these along for comparison
                     **dataloader_config_base,
                 },
                 model_init_config={
@@ -728,7 +743,7 @@ class PowerBalanceStudy(Study):
             train_config = train_config_base.model_copy(
                 update={
                     "dataloader_config": {
-                        **tuned_config.dataloader_config,
+                        **train_config_base.dataloader_config,
                         "segment_length_train": tuned_config.dataloader_config[
                             "segment_length_train"
                         ],

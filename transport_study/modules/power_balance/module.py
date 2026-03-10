@@ -491,7 +491,7 @@ class PowerBalanceUnstructuredNN(PowerBalance):
 
 class PowerBalanceEnv(ModuleTrainingEnv):
     module: PowerBalance
-    normalization_method: str = eqx.field(static=True, default="unset")
+    data_normalization: str = eqx.field(static=True, default="unset")
     freeze_submodules: list[str] = eqx.field(static=True, default_factory=list)
     stepper: StepperType = eqx.field(static=True, default=StepperType.SIMPLE_EULER)
 
@@ -505,7 +505,7 @@ class PowerBalanceEnv(ModuleTrainingEnv):
         if isinstance(inputs, xr.Dataset):
             inputs = {var: inputs[var].data for var in inputs.data_vars}
 
-        if self.normalization_method == "raw":
+        if self.data_normalization == "raw":
             inputs = PowerBalance.Inputs(
                 Ip_MA=inputs["Ip_MA"],
                 B0=inputs["B0"],
@@ -522,7 +522,7 @@ class PowerBalanceEnv(ModuleTrainingEnv):
                 ne20_nn=inputs["ne20_line_avg"],
                 P_aux_nn=inputs["P_aux_MW"],
             )
-        elif self.normalization_method == "physics":
+        elif self.data_normalization == "physics":
             inputs = PowerBalance.Inputs(
                 Ip_MA=inputs["Ip_MA"],
                 B0=inputs["B0"],
@@ -539,7 +539,7 @@ class PowerBalanceEnv(ModuleTrainingEnv):
                 ne20_nn=inputs["f_G"],
                 P_aux_nn=inputs["surface_power_density"],
             )
-        elif self.normalization_method == "z_score":
+        elif self.data_normalization == "z_score":
             inputs = PowerBalance.Inputs(
                 Ip_MA=inputs["Ip_MA"],
                 B0=inputs["B0"],
@@ -556,7 +556,7 @@ class PowerBalanceEnv(ModuleTrainingEnv):
                 ne20_nn=inputs["ne20_line_avg_z"],
                 P_aux_nn=inputs["P_aux_MW_z"],
             )
-        elif self.normalization_method == "coral":
+        elif self.data_normalization == "coral":
             inputs = PowerBalance.Inputs(
                 Ip_MA=inputs["Ip_MA"],
                 B0=inputs["B0"],
@@ -575,7 +575,7 @@ class PowerBalanceEnv(ModuleTrainingEnv):
             )
         else:
             raise ValueError(
-                f"Unknown normalization method: {self.normalization_method}"
+                f"Unknown data normalization method: {self.data_normalization}"
             )
         return inputs
 

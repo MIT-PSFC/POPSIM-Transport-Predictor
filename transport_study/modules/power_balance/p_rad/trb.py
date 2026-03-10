@@ -117,7 +117,7 @@ class RadiatedPowerTRB(TrainRunBuilder):
                 vectorize=True,
             )
 
-            # ds_source is constant per shot — extract as a shot-only coordinate
+            # ds_source is constant per shot so extract as a shot-only coordinate
             ds_source = (
                 eval_data.input_ds["ds_source"].unstack("sample").isel({TIME_DIM: 0})
             )
