@@ -611,7 +611,7 @@ def get_train_test_datasets(
     training_data: str,
     data_normalization: str,
     domain_adaptation: str,
-    num_hp_shots: int | None,
+    num_hp_shots: int,
     hp_test_set_size: int,
 ):
     """
@@ -641,8 +641,8 @@ def get_train_test_datasets(
     test_shot_pool = sorted_shots[-hp_test_set_size:]
     test_ds = ds_hp.isel({episode_coord: test_shot_pool})
 
-    if num_hp_shots is None:
-        # If num_hp_shots is None, put all available high-performance shots in training and testing set (this is cheating, but allows us to see the maximum theoretical performance)
+    if num_hp_shots == -1:
+        # If num_hp_shots is -1, put all available high-performance shots in training and testing set (this is cheating, but allows us to see the maximum theoretical performance)
         train_ds_hp = ds_hp.isel({episode_coord: sorted_shots})
     else:
         train_shot_pool = sorted_shots[:num_hp_shots]

@@ -5,7 +5,6 @@ from itertools import product
 
 import fire
 import netCDF4  # noqa: F401
-import numpy as np
 import xarray as xr
 import yaml
 from loguru import logger
@@ -33,7 +32,7 @@ class PowerBalanceStudy(Study):
     HYPERPARAM_DATA_NORMALIZATION = "coral"
     HYPERPARAM_DOMAIN_ADAPTATION = None
     HYPERPARAM_FREEZE_SUBMODULES = True
-    HYPERPARAM_NUM_HP_SHOTS = None
+    HYPERPARAM_NUM_HP_SHOTS = -1
 
     ##################
     # INITIALIZATION #
@@ -66,7 +65,7 @@ class PowerBalanceStudy(Study):
         freeze_submodules: Whether to freeze certain submodules of the model during training.
         The P_oh and P_rad signals are hard to quantify, we might want to let them drift from the original targets to better match Wtot_MJ
 
-        num_hp_shots: The number of high-performance shots included in the training data, or None to include all high-performance shots (including all shots in training is cheating, but again answers the question of what is the best possible performance).
+        num_hp_shots: The number of high-performance shots included in the training data, or -1 to include all high-performance shots (including all shots in training is cheating, but again answers the question of what is the best possible performance).
         """
 
         model_type: str  # scaling_law, sciml, unstructured_nn
@@ -74,9 +73,7 @@ class PowerBalanceStudy(Study):
         data_normalization: str  # raw, physics, z_score, coral
         domain_adaptation: str  # none, mixing, transfer
         freeze_submodules: bool
-        num_hp_shots: (
-            int | None
-        )  # Number of high-performance shots included in training, or None for all (should be None if domain_adaptation is None)
+        num_hp_shots: int  # Number of high-performance shots included in training, or -1 for all (should be -1 if domain_adaptation is None)
         # So that's 3 (model type) x 4 (training data) x 4 (normalization) x 3 (domain adaptation) x 2 (freeze or not) x 6 (hp shots included) = 1728 results
         # Even less since the hyperparameter tuning is only done for a subset of cases
         prereqs: (
@@ -128,7 +125,7 @@ class PowerBalanceStudy(Study):
             data_normalization: str,
             domain_adaptation: str,
             freeze_submodules: bool,
-            num_hp_shots: int | None,
+            num_hp_shots: int,
         ):
             self.model_type = model_type
             self.training_data = training_data
@@ -146,9 +143,9 @@ class PowerBalanceStudy(Study):
                 "p_rad",
             ]:
                 raise ValueError(f"Unknown model type: {model_type}")
-            if domain_adaptation is None and num_hp_shots is not None:
+            if domain_adaptation is None and num_hp_shots != -1:
                 raise ValueError(
-                    "If domain_adaptation is None, num_hp_shots must also be None since this means we're training and testing on the same dataset and no high-performance data is being used"
+                    "If domain_adaptation is None, num_hp_shots must be -1 since this means we're training and testing on the same dataset and no high-performance data is being used"
                 )
             if (
                 model_type in ["p_oh", "p_rad"]
@@ -203,7 +200,7 @@ class PowerBalanceStudy(Study):
                         data_normalization=data_normalization,
                         domain_adaptation=None,
                         freeze_submodules=freeze_submodules,
-                        num_hp_shots=None,
+                        num_hp_shots=-1,
                     )
                 ]
 
@@ -267,7 +264,7 @@ class PowerBalanceStudy(Study):
             freeze_submodules_options,
             num_hp_shots_options,
         ):
-            if domain_adaptation is None and num_hp_shots is not None:
+            if domain_adaptation is None and num_hp_shots != -1:
                 continue  # Invalid case, skip
 
             case = self.Case(
@@ -309,7 +306,7 @@ class PowerBalanceStudy(Study):
         data_normalization_methods: list[str],
         domain_adaptation_methods: list[str],
         freeze_submodules_options: list[bool],
-        num_hp_shots_options: list[int | None],
+        num_hp_shots_options: list[int],
         hp_test_set_size: int,
     ):
         cases = self.make_cases(
@@ -562,8 +559,8 @@ class PowerBalanceStudy(Study):
             W_c = 10 / 1000
             W_t = 10 / 1000
             W_dlp = 80 / 1000
-            if case.num_hp_shots in [None, 0]:
-                # If None, all 97 high-performance shots in the DIII-D dataset
+            if case.num_hp_shots in [-1, 0]:
+                # If -1, all 97 high-performance shots in the DIII-D dataset
                 # If 0, weights aren't being used anyway
                 N_dhp = 97
             else:
@@ -995,9 +992,7 @@ class PowerBalanceStudy(Study):
                     "data_normalization": case.data_normalization,
                     "domain_adaptation": case.domain_adaptation,
                     "freeze_submodules": case.freeze_submodules,
-                    "num_hp_shots": case.num_hp_shots
-                    if case.num_hp_shots is not None
-                    else np.nan,
+                    "num_hp_shots": case.num_hp_shots,
                 }
             )
             results.append(result)
@@ -1014,7 +1009,7 @@ def run_study(  # noqa: PLR0915
     data_normalization_methods: list[str] | None = None,
     domain_adaptation_methods: list[str] | None = None,
     freeze_submodules_options: list[bool] | None = None,
-    num_hp_shots_options: list[int | None] | None = None,
+    num_hp_shots_options: list[int] | None = None,
     hp_test_set_size: int | None = None,
     enable_parallelism: bool | None = False,
     skip_tuning: bool | None = True,
@@ -1092,7 +1087,7 @@ def run_study(  # noqa: PLR0915
             if freeze_submodules_options is None:
                 freeze_submodules_options = [True, False]
             if num_hp_shots_options is None:
-                num_hp_shots_options = [0, 1, 3, 10, 30, None]
+                num_hp_shots_options = [0, 1, 3, 10, 30, -1]
             if hp_test_set_size is None:
                 hp_test_set_size = 60
 

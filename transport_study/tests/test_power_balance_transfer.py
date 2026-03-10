@@ -25,7 +25,7 @@ def test_power_balance_transfer_cases():
         data_normalization_methods=["raw", "coral"],
         domain_adaptation_methods=[None, "mixing", "transfer"],
         freeze_submodules_options=[True, False],
-        num_hp_shots_options=[0, None],
+        num_hp_shots_options=[0, -1],
         hp_test_set_size=4,
     )
 
@@ -90,7 +90,7 @@ def test_power_balance_transfer_cases():
                     data_normalization=case.data_normalization,
                     domain_adaptation=None,
                     freeze_submodules=case.freeze_submodules,
-                    num_hp_shots=None,
+                    num_hp_shots=-1,
                 ),
                 # The hyperparameter tuning case
                 PowerBalanceStudy.Case(
@@ -219,7 +219,7 @@ def test_submodule_freezing():
         data_normalization="coral",
         domain_adaptation=None,
         freeze_submodules=True,
-        num_hp_shots=None,
+        num_hp_shots=-1,
     )
 
     case_p_rad = PowerBalanceStudy.Case(
@@ -228,7 +228,7 @@ def test_submodule_freezing():
         data_normalization="coral",
         domain_adaptation=None,
         freeze_submodules=True,
-        num_hp_shots=None,
+        num_hp_shots=-1,
     )
 
     case_frozen = PowerBalanceStudy.Case(
@@ -237,7 +237,7 @@ def test_submodule_freezing():
         data_normalization="coral",
         domain_adaptation=None,
         freeze_submodules=True,
-        num_hp_shots=None,
+        num_hp_shots=-1,
     )
 
     case_unfrozen = PowerBalanceStudy.Case(
@@ -246,7 +246,7 @@ def test_submodule_freezing():
         data_normalization="coral",
         domain_adaptation=None,
         freeze_submodules=False,
-        num_hp_shots=None,
+        num_hp_shots=-1,
     )
 
     for case in [case_p_oh, case_p_rad, case_frozen, case_unfrozen]:
@@ -286,7 +286,7 @@ def test_transfer_weights():
         data_normalization="coral",
         domain_adaptation=None,
         freeze_submodules=True,
-        num_hp_shots=None,
+        num_hp_shots=-1,
     )
     case_p_oh_transfer = PowerBalanceStudy.Case(
         model_type="p_oh",
@@ -294,7 +294,7 @@ def test_transfer_weights():
         data_normalization="coral",
         domain_adaptation="transfer",
         freeze_submodules=True,
-        num_hp_shots=None,
+        num_hp_shots=-1,
     )
     case_p_rad_orig = PowerBalanceStudy.Case(
         model_type="p_rad",
@@ -302,7 +302,7 @@ def test_transfer_weights():
         data_normalization="coral",
         domain_adaptation=None,
         freeze_submodules=True,
-        num_hp_shots=None,
+        num_hp_shots=-1,
     )
     case_p_rad_transfer = PowerBalanceStudy.Case(
         model_type="p_rad",
@@ -310,7 +310,7 @@ def test_transfer_weights():
         data_normalization="coral",
         domain_adaptation="transfer",
         freeze_submodules=True,
-        num_hp_shots=None,
+        num_hp_shots=-1,
     )
 
     case_sciml_orig = PowerBalanceStudy.Case(
@@ -319,7 +319,7 @@ def test_transfer_weights():
         data_normalization="coral",
         domain_adaptation=None,
         freeze_submodules=True,
-        num_hp_shots=None,
+        num_hp_shots=-1,
     )
     case_sciml_transfer_frozen = PowerBalanceStudy.Case(
         model_type="sciml",
@@ -327,7 +327,7 @@ def test_transfer_weights():
         data_normalization="coral",
         domain_adaptation="transfer",
         freeze_submodules=True,
-        num_hp_shots=None,
+        num_hp_shots=-1,
     )
     case_sciml_transfer_unfrozen = PowerBalanceStudy.Case(
         model_type="sciml",
@@ -335,7 +335,7 @@ def test_transfer_weights():
         data_normalization="coral",
         domain_adaptation="transfer",
         freeze_submodules=False,
-        num_hp_shots=None,
+        num_hp_shots=-1,
     )
 
     case_unstructured_nn_orig = PowerBalanceStudy.Case(
@@ -344,7 +344,7 @@ def test_transfer_weights():
         data_normalization="coral",
         domain_adaptation=None,
         freeze_submodules=True,
-        num_hp_shots=None,
+        num_hp_shots=-1,
     )
     case_unstructured_nn_transfer = PowerBalanceStudy.Case(
         model_type="unstructured_nn",
@@ -352,7 +352,7 @@ def test_transfer_weights():
         data_normalization="coral",
         domain_adaptation="transfer",
         freeze_submodules=True,
-        num_hp_shots=None,
+        num_hp_shots=-1,
     )
 
     # Restore models for each case
@@ -423,6 +423,10 @@ def test_collect_results():
         assert case.num_hp_shots in ds_merged.coords["num_hp_shots"].values, (
             f"{case.num_hp_shots} not found in collected results"
         )
+
+    for var in ds_merged.data_vars:
+        # Assert the value is positive
+        assert (ds_merged[var] >= 0).all()
 
 
 if __name__ == "__main__":
