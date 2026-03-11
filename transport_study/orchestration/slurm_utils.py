@@ -127,10 +127,10 @@ os.remove({config_path!r})
 #SBATCH --job-name={job_name}
 #SBATCH --partition={partition}
 #SBATCH --gres=gpu:1
-#SBATCH --mem=120G
+#SBATCH --mem=250G
 #SBATCH --cpus-per-task=4
 #SBATCH --export=ALL
-#SBATCH --exclude=node2301
+#SBATCH --exclude=node2301,node2101
 #SBATCH --output={log_path}
 #SBATCH --error={log_path}
 

@@ -1145,7 +1145,7 @@ def run_study(  # noqa: PLR0915
             if freeze_submodules_options is None:
                 freeze_submodules_options = [True, False]
             if num_hp_shots_options is None:
-                num_hp_shots_options = [0, 1, 3, 10, 30, -1]
+                num_hp_shots_options = [0, 1, 3, 10, 33, -1]
             if hp_test_set_size is None:
                 hp_test_set_size = 60
 
@@ -1326,7 +1326,9 @@ def run_study(  # noqa: PLR0915
             and study.check_data_requirements(case)
         ]
         while len(unfinished_cases) > 0:
-            logger.info(f"{len(unfinished_cases)} cases remain")
+            logger.opt(colors=True).info(
+                f"<<bold><green>{len(unfinished_cases)} cases remain</green></bold>>"
+            )
             for case in unfinished_cases:
                 # TODO(ZanderKeith): Duplicates are happening somehow, but going fast
                 if not os.path.exists(study.result_path(case)):

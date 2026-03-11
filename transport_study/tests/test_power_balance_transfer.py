@@ -819,7 +819,6 @@ if __name__ == "__main__":
     # test_power_balance_transfer_cases()
     # test_collect_results()
     # test_transfer_weights()
-    # test_transfer_weights_frozen_submodules()
     test_transfer_weights_unfrozen_submodules()
     # test_submodule_freezing()
     # TODO(ZanderKeith), make sure the following things are happening:
