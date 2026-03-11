@@ -22,6 +22,7 @@ from transport_study.config import config
 from transport_study.orchestration.slurm_utils import (
     count_running_jobs,
     launch_train_parallel,
+    resources_available,
 )
 from transport_study.orchestration.study import Study
 from transport_study.orchestration.wandb_utils import (
@@ -467,6 +468,12 @@ class PowerBalanceStudy(Study):
                     logger.info(
                         f"Found {running_jobs} running training jobs, waiting for them to complete before proceeding"
                     )
+                    return
+                if not resources_available():
+                    logger.info(
+                        "No resources currently available, waiting before trying again..."
+                    )
+                    time.sleep(10)
                     return
 
             self.launch_train(case, enable_parallelism=enable_parallelism)
