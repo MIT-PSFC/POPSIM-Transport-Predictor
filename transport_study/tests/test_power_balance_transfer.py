@@ -648,20 +648,12 @@ def test_transfer_weights_unfrozen_submodules():
         study.launch_train(case)
 
     # Get initial and final modules for each case
-    p_oh_base_trainer_init, _ = study.restore_trainer(
-        case_p_oh_base, restore_best_checkpoint=False
-    )
-    p_rad_base_trainer_init, _ = study.restore_trainer(
-        case_p_rad_base, restore_best_checkpoint=False
-    )
     sciml_base_trainer_init, _ = study.restore_trainer(
         case_sciml_base, restore_best_checkpoint=False
     )
     sciml_transfer_unfrozen_trainer_init, _ = study.restore_trainer(
         case_sciml_transfer_unfrozen, restore_best_checkpoint=False
     )
-    p_oh_base_init = p_oh_base_trainer_init.train_state.model
-    p_rad_base_init = p_rad_base_trainer_init.train_state.model
     sciml_base_init = sciml_base_trainer_init.train_state.model.module
     sciml_transfer_unfrozen_init = (
         sciml_transfer_unfrozen_trainer_init.train_state.model.module
@@ -695,7 +687,7 @@ def test_transfer_weights_unfrozen_submodules():
 
     # 1. Ensure the modules themselves were correctly transferred
     # p_oh
-    for i in range(len(p_oh_base_init.nn.layers) - 1):
+    for i in range(len(p_oh_base_final.nn.layers) - 1):
         chex.assert_trees_all_equal(
             p_oh_base_final.nn.layers[i], p_oh_transfer_final.nn.layers[i]
         )
@@ -704,7 +696,7 @@ def test_transfer_weights_unfrozen_submodules():
             p_oh_base_final.nn.layers[-1], p_oh_transfer_final.nn.layers[-1]
         )
     # p_rad
-    for i in range(len(p_rad_base_init.nn.layers) - 1):
+    for i in range(len(p_rad_base_final.nn.layers) - 1):
         chex.assert_trees_all_equal(
             p_rad_base_final.nn.layers[i], p_rad_transfer_final.nn.layers[i]
         )
@@ -735,9 +727,9 @@ def test_transfer_weights_unfrozen_submodules():
         p_rad_transfer_final.nn, sciml_transfer_unfrozen_init.p_rad_predictor.nn
     )
 
-    # 2. Ensure the unfrozen submodules only changed their last layers (still transfer learning)
+    # 3. Ensure the unfrozen submodules only changed their last layers (still transfer learning)
     # p_oh
-    for i in range(len(p_oh_base_init.nn.layers) - 1):
+    for i in range(len(p_oh_transfer_final.nn.layers) - 1):
         chex.assert_trees_all_equal(
             p_oh_transfer_final.nn.layers[i],
             sciml_transfer_unfrozen_final.p_oh_predictor.nn.layers[i],
@@ -748,7 +740,7 @@ def test_transfer_weights_unfrozen_submodules():
             sciml_transfer_unfrozen_final.p_oh_predictor.nn.layers[-1],
         )
     # p_rad
-    for i in range(len(p_rad_base_init.nn.layers) - 1):
+    for i in range(len(p_rad_transfer_final.nn.layers) - 1):
         chex.assert_trees_all_equal(
             p_rad_transfer_final.nn.layers[i],
             sciml_transfer_unfrozen_final.p_rad_predictor.nn.layers[i],
@@ -827,7 +819,8 @@ if __name__ == "__main__":
     # test_power_balance_transfer_cases()
     # test_collect_results()
     # test_transfer_weights()
-    test_transfer_weights_frozen_submodules()
+    # test_transfer_weights_frozen_submodules()
+    test_transfer_weights_unfrozen_submodules()
     # test_submodule_freezing()
     # TODO(ZanderKeith), make sure the following things are happening:
     # 1) Cases properly restore their hyperparameters
