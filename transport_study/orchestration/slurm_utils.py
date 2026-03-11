@@ -1,7 +1,12 @@
+import os
 import re
 import subprocess
+import sys
+import tempfile
 
+import yaml
 from loguru import logger
+from popsim.ml import TrainConfig
 
 from transport_study.config import config
 
@@ -9,7 +14,15 @@ from transport_study.config import config
 def count_running_jobs(job_name: str, partition: str = config.partition) -> int:
     """Run squeue to list running jobs on the partition with the specific name"""
     result = subprocess.run(
-        ["squeue", "-p", partition, "-n", job_name, "--state=RUNNING", "--noheader"],
+        [
+            "squeue",
+            "-p",
+            partition,
+            "-n",
+            job_name,
+            "--state=RUNNING,PENDING,COMPLETING",
+            "--noheader",
+        ],
         check=False,
         capture_output=True,
         text=True,
@@ -52,3 +65,80 @@ def resources_available(
 ) -> bool:
     idle_gpus = count_idle_gpus(partition)
     return idle_gpus >= buffer_gpus
+
+
+def launch_train_parallel(
+    train_config: TrainConfig,
+    job_name: str,
+    result_path: str,
+    log_dir: str,
+    partition: str = config.partition,
+) -> None:
+    """Submit a SLURM job that runs training serially and saves results to result_path.
+
+    Args:
+        train_config: The training configuration.
+        job_name: The SLURM job name.
+        result_path: Path where the result xarray Dataset will be saved as NetCDF.
+        log_dir: Directory for SLURM stdout/stderr logs.
+        partition: The SLURM partition to submit to.
+    """
+    # Serialize the train config so the job can reconstruct it
+    with tempfile.NamedTemporaryFile(
+        mode="w", suffix=".yaml", delete=False, prefix=f"ptp_{job_name}_config_"
+    ) as f:
+        yaml.dump(train_config.model_dump(), f, indent=4)
+        config_path = f.name
+
+    # Write the serial training logic as a small Python script
+    py_script = f"""\
+import os
+import yaml
+from popsim.ml import TrainConfig
+from popsim.ml.launch import launch_train
+
+with open({config_path!r}) as f:
+    train_config = TrainConfig(**yaml.safe_load(f))
+
+_, _, _, _, result_dict = launch_train(train_config)
+ds = result_dict["test/study_results"]
+os.makedirs(os.path.dirname({result_path!r}) or ".", exist_ok=True)
+ds.to_netcdf({result_path!r})
+os.remove({config_path!r})
+"""
+
+    with tempfile.NamedTemporaryFile(
+        mode="w", suffix=".py", delete=False, prefix=f"ptp_{job_name}_script_"
+    ) as f:
+        f.write(py_script)
+        script_path = f.name
+
+    os.makedirs(log_dir, exist_ok=True)
+    log_path = os.path.join(log_dir, f"{job_name}.log")
+
+    sbatch_script = f"""\
+#!/bin/bash
+#SBATCH --job-name={job_name}
+#SBATCH --partition={partition}
+#SBATCH --gres=gpu:1
+#SBATCH --mem=120G
+#SBATCH --cpus-per-task=4
+#SBATCH --export=ALL
+#SBATCH --output={log_path}
+#SBATCH --error={log_path}
+
+{sys.executable} {script_path}
+rm -f {script_path}
+"""
+
+    result = subprocess.run(
+        ["sbatch"],
+        input=sbatch_script,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        logger.error(f"sbatch failed for job {job_name}: {result.stderr}")
+    else:
+        logger.info(f"Submitted training job {job_name}: {result.stdout.strip()}")

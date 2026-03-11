@@ -1,5 +1,6 @@
 import os
 import shutil
+import time
 from dataclasses import dataclass
 from itertools import product
 
@@ -18,7 +19,10 @@ from popsim.ml.launch import (
 
 from transport_study import PACKAGE_ROOT
 from transport_study.config import config
-from transport_study.orchestration.slurm_utils import count_running_jobs
+from transport_study.orchestration.slurm_utils import (
+    count_running_jobs,
+    launch_train_parallel,
+)
 from transport_study.orchestration.study import Study
 from transport_study.orchestration.wandb_utils import (
     get_completed_runs,
@@ -457,9 +461,9 @@ class PowerBalanceStudy(Study):
                 running_jobs = count_running_jobs(
                     self.train_job_name(case), config.partition
                 )
-                if len(running_jobs) > 0:
+                if running_jobs > 0:
                     logger.info(
-                        f"Found {len(running_jobs)} running training jobs, waiting for them to complete before proceeding"
+                        f"Found {running_jobs} running training jobs, waiting for them to complete before proceeding"
                     )
                     return
 
@@ -888,7 +892,12 @@ class PowerBalanceStudy(Study):
         train_job_name = self.train_job_name(case)
         if enable_parallelism:
             logger.info(f"Launching training job {train_job_name} for case\n{case}")
-
+            launch_train_parallel(
+                train_config,
+                train_job_name,
+                result_path,
+                os.path.join(self.result_dir, "logs"),
+            )
         else:
             logger.info("Launching training serially")
             _, _, _, _, result_dict = launch_train(train_config)
@@ -1301,9 +1310,11 @@ def run_study(  # noqa: PLR0915
     while len(unfinished_cases) > 0:
         logger.info(f"{len(unfinished_cases)} cases remain")
         for case in unfinished_cases:
-            study.run_case(
-                case, skip_tuning=skip_tuning, enable_parallelism=enable_parallelism
-            )
+            # TODO(ZanderKeith): Duplicates are happening somehow, but going fast
+            if not os.path.exists(study.result_path(case)):
+                study.run_case(
+                    case, skip_tuning=skip_tuning, enable_parallelism=enable_parallelism
+                )
 
         # Check which cases are still unfinished
         unfinished_cases = [
@@ -1311,6 +1322,8 @@ def run_study(  # noqa: PLR0915
             for case in unfinished_cases
             if not os.path.exists(study.result_path(case))
         ]
+        # Sleep for a bit before checking again to avoid spamming slurm
+        time.sleep(8)
 
     study.collect_results()
 
