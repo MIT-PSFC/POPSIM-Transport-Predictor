@@ -105,7 +105,7 @@ class PowerBalanceTRB(TrainRunBuilder):
         return ds_val, train_dl, val_dl, val_dl
 
     @staticmethod
-    def model_init(train_dl: DataLoader, model_init_config: dict) -> Any:
+    def model_init(train_dl: DataLoader, model_init_config: dict) -> Any:  # noqa: PLR0915
         """
         Instantiate and return your model given a training DataLoader
         and a model config dict.
@@ -191,6 +191,29 @@ class PowerBalanceTRB(TrainRunBuilder):
                 model_init_config["transfer_checkpoint"]
             )
             env = restore_model(transfer_manager, env)
+            # Restoring the main module overwrote the submodules new weights with the old one, must go back and fix it
+            # TODO(ZanderKeith) there's gotta be a cleaner way to do this...
+            if model_init_config["model_type"] in ["scaling_law", "sciml"]:
+                p_oh_config = model_init_config["submodules"]["p_oh_predictor"]
+                if isinstance(p_oh_config, TrainConfig):
+                    p_oh_config = p_oh_config.model_dump()
+                p_rad_config = model_init_config["submodules"]["p_rad_predictor"]
+                if isinstance(p_rad_config, TrainConfig):
+                    p_rad_config = p_rad_config.model_dump()
+
+                p_oh_manager = create_default_checkpoint_manager(
+                    p_oh_config["checkpoint_dir"]
+                )
+                env.module.p_oh_predictor = restore_model(
+                    p_oh_manager, env.module.p_oh_predictor
+                )
+                p_rad_manager = create_default_checkpoint_manager(
+                    p_rad_config["checkpoint_dir"]
+                )
+                env.module.p_rad_predictor = restore_model(
+                    p_rad_manager, env.module.p_rad_predictor
+                )
+
             logger.debug(
                 f"Restoring module from tranfer learning pretrained checkpoint\n{model_init_config['transfer_checkpoint']}"
             )
