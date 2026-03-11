@@ -130,8 +130,12 @@ os.remove({config_path!r})
 #SBATCH --mem=120G
 #SBATCH --cpus-per-task=4
 #SBATCH --export=ALL
+#SBATCH --exclude=node2301
 #SBATCH --output={log_path}
 #SBATCH --error={log_path}
+
+# Save results to netcdf only; no need to sync wandb runs online from batch jobs
+export WANDB_MODE=offline
 
 {sys.executable} {script_path}
 rm -f {script_path}
