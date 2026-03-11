@@ -20,7 +20,7 @@ def count_running_jobs(job_name: str, partition: str = config.partition) -> int:
             partition,
             "-n",
             job_name,
-            "--state=RUNNING,PENDING,COMPLETING",
+            "--state=RUNNING,PENDING",
             "--noheader",
         ],
         check=False,
@@ -83,9 +83,17 @@ def launch_train_parallel(
         log_dir: Directory for SLURM stdout/stderr logs.
         partition: The SLURM partition to submit to.
     """
+    # All temp files must live on the shared filesystem (not /tmp which is
+    # node-local), so that compute nodes can read them.
+    os.makedirs(log_dir, exist_ok=True)
+
     # Serialize the train config so the job can reconstruct it
     with tempfile.NamedTemporaryFile(
-        mode="w", suffix=".yaml", delete=False, prefix=f"ptp_{job_name}_config_"
+        mode="w",
+        suffix=".yaml",
+        delete=False,
+        prefix=f"{job_name}_config_",
+        dir=log_dir,
     ) as f:
         yaml.dump(train_config.model_dump(), f, indent=4)
         config_path = f.name
@@ -108,12 +116,10 @@ os.remove({config_path!r})
 """
 
     with tempfile.NamedTemporaryFile(
-        mode="w", suffix=".py", delete=False, prefix=f"ptp_{job_name}_script_"
+        mode="w", suffix=".py", delete=False, prefix=f"{job_name}_script_", dir=log_dir
     ) as f:
         f.write(py_script)
         script_path = f.name
-
-    os.makedirs(log_dir, exist_ok=True)
     log_path = os.path.join(log_dir, f"{job_name}.log")
 
     sbatch_script = f"""\

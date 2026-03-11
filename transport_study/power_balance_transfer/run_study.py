@@ -347,6 +347,10 @@ class PowerBalanceStudy(Study):
         """Given a case, return the path where the results for that case should be stored."""
         return os.path.join(self.result_dir, str(case), "result_data.nc")
 
+    def collected_results_path(self) -> str:
+        """Return the path where the collected results for all cases should be stored."""
+        return os.path.join(self.result_dir, "collected_results.nc")
+
     def tuned_config_path(self, case: Case) -> str:
         """Given a case, return the path where the tuned hyperparameters for that case should be stored"""
         hyperparam_case = case.get_hyperparam_prereq()
@@ -410,9 +414,7 @@ class PowerBalanceStudy(Study):
             return
 
         if self.check_prereq_satisfied(case):
-            logger.opt(colors=True).info(
-                f"<bold><red>RUNNING CASE:</red></bold>\n{case}"
-            )
+            logger.opt(colors=True).info(f"<bold>RUNNING CASE:</bold>\n{case}")
             # Prereq is satisfied, can run this case.
             if case.is_hyperparam_case():
                 if skip_tuning:
@@ -887,6 +889,10 @@ class PowerBalanceStudy(Study):
                 f"Case {case} is not a possible case to run, check the logic in the Case dataclass to see why this is. This should have been caught earlier!"
             )
 
+        logger.opt(colors=True).info(
+            f"<bold><red>LAUNCHING TRAINING for case\n{case}</red></bold>"
+        )
+
         train_config = self.make_train_config(case)
         result_path = self.result_path(case)
         train_job_name = self.train_job_name(case)
@@ -1298,34 +1304,42 @@ def run_study(  # noqa: PLR0915
     ########################
     # Launch Orchestration #
     ########################
-    logger.opt(colors=True).info("<bold><magenta>ORCHESTRATION</magenta></bold>")
+    if os.path.exists(study.collected_results_path()):
+        logger.info(
+            f"Collected results file found at\n{study.collected_results_path()}\nSkipping orchestration and going straight to analysis and visualization"
+        )
+    else:
+        logger.opt(colors=True).info("<bold><magenta>ORCHESTRATION</magenta></bold>")
 
-    # Unfinished cases are those we have data to run but haven't gotten results for yet
-    unfinished_cases = [
-        case
-        for case in study.cases
-        if not os.path.exists(study.result_path(case))
-        and study.check_data_requirements(case)
-    ]
-    while len(unfinished_cases) > 0:
-        logger.info(f"{len(unfinished_cases)} cases remain")
-        for case in unfinished_cases:
-            # TODO(ZanderKeith): Duplicates are happening somehow, but going fast
-            if not os.path.exists(study.result_path(case)):
-                study.run_case(
-                    case, skip_tuning=skip_tuning, enable_parallelism=enable_parallelism
-                )
-
-        # Check which cases are still unfinished
+        # Unfinished cases are those we have data to run but haven't gotten results for yet
         unfinished_cases = [
             case
-            for case in unfinished_cases
+            for case in study.cases
             if not os.path.exists(study.result_path(case))
+            and study.check_data_requirements(case)
         ]
-        # Sleep for a bit before checking again to avoid spamming slurm
-        time.sleep(8)
+        while len(unfinished_cases) > 0:
+            logger.info(f"{len(unfinished_cases)} cases remain")
+            for case in unfinished_cases:
+                # TODO(ZanderKeith): Duplicates are happening somehow, but going fast
+                if not os.path.exists(study.result_path(case)):
+                    study.run_case(
+                        case,
+                        skip_tuning=skip_tuning,
+                        enable_parallelism=enable_parallelism,
+                    )
 
-    study.collect_results()
+            # Check which cases are still unfinished
+            unfinished_cases = [
+                case
+                for case in unfinished_cases
+                if not os.path.exists(study.result_path(case))
+            ]
+            # Sleep for a bit before checking again to avoid spamming slurm
+            time.sleep(8)
+
+        ds_final = study.collect_results()
+        ds_final.to_netcdf(study.collected_results_path())
 
     ############################
     # Training Data Comparison #
