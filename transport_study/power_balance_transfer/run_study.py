@@ -542,10 +542,6 @@ class PowerBalanceStudy(Study):
             "lrf": 5e-4,
             "weight_decay": 2e-4,
         }
-        trainable_getter_config_base = {
-            "freeze_submodules": case.freeze_submodules,
-            "domain_adaptation": case.domain_adaptation,
-        }
         test_eval_suite_config_base = {
             "result_path": self.result_path(case),
         }
@@ -603,10 +599,10 @@ class PowerBalanceStudy(Study):
                         "in_size": 7,
                         "out_size": 1,
                         "data_normalization": case.data_normalization,
+                        "domain_adaptation": case.domain_adaptation,
                     },
                     loss_config=loss_config_base,
                     optimizer_config=optimizer_config_base,
-                    trainable_getter_config=trainable_getter_config_base,
                     test_eval_suite_config=test_eval_suite_config_base,
                 )
             elif case.model_type == "p_rad":
@@ -634,10 +630,10 @@ class PowerBalanceStudy(Study):
                         "in_size": 7,
                         "out_size": 1,
                         "data_normalization": case.data_normalization,
+                        "domain_adaptation": case.domain_adaptation,
                     },
                     loss_config=loss_config_base,
                     optimizer_config=optimizer_config_base,
-                    trainable_getter_config=trainable_getter_config_base,
                     test_eval_suite_config=test_eval_suite_config_base,
                 )
             elif case.model_type == "scaling_law":
@@ -698,7 +694,6 @@ class PowerBalanceStudy(Study):
                     },
                     loss_config=loss_config_base,
                     optimizer_config=optimizer_config_base,
-                    trainable_getter_config=trainable_getter_config_base,
                     test_eval_suite_config=test_eval_suite_config_base,
                 )
             elif case.model_type == "sciml":
@@ -758,7 +753,6 @@ class PowerBalanceStudy(Study):
                     },
                     loss_config=loss_config_base,
                     optimizer_config=optimizer_config_base,
-                    trainable_getter_config=trainable_getter_config_base,
                     test_eval_suite_config=test_eval_suite_config_base,
                 )
             elif case.model_type == "unstructured_nn":
@@ -793,7 +787,6 @@ class PowerBalanceStudy(Study):
                     },
                     loss_config=loss_config_base,
                     optimizer_config=optimizer_config_base,
-                    trainable_getter_config=trainable_getter_config_base,
                     test_eval_suite_config=test_eval_suite_config_base,
                 )
             else:
@@ -861,16 +854,6 @@ class PowerBalanceStudy(Study):
                 )
         else:
             train_config = train_config_base
-
-        # Put the model_init_config into the trainable_getter_config
-        train_config = train_config.model_copy(
-            update={
-                "trainable_getter_config": {
-                    **train_config.trainable_getter_config,
-                    "model_init_config": train_config.model_init_config,
-                }
-            }
-        )
 
         return train_config
 

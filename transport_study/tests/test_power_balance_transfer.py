@@ -472,28 +472,12 @@ def test_transfer_weights_frozen_submodules():
         study.launch_train(case)
 
     # Get initial and final modules for each case
-    p_oh_base_trainer_init, _ = study.restore_trainer(
-        case_p_oh_base, restore_best_checkpoint=False
-    )
-    p_oh_transfer_trainer_init, _ = study.restore_trainer(
-        case_p_oh_transfer, restore_best_checkpoint=False
-    )
-    p_rad_base_trainer_init, _ = study.restore_trainer(
-        case_p_rad_base, restore_best_checkpoint=False
-    )
-    p_rad_transfer_trainer_init, _ = study.restore_trainer(
-        case_p_rad_transfer, restore_best_checkpoint=False
-    )
     sciml_base_trainer_init, _ = study.restore_trainer(
         case_sciml_base, restore_best_checkpoint=False
     )
     sciml_transfer_frozen_trainer_init, _ = study.restore_trainer(
         case_sciml_transfer_frozen, restore_best_checkpoint=False
     )
-    p_oh_base_init = p_oh_base_trainer_init.train_state.model
-    p_oh_transfer_init = p_oh_transfer_trainer_init.train_state.model
-    p_rad_base_init = p_rad_base_trainer_init.train_state.model
-    p_rad_transfer_init = p_rad_transfer_trainer_init.train_state.model
     sciml_base_init = sciml_base_trainer_init.train_state.model.module
     sciml_transfer_frozen_init = (
         sciml_transfer_frozen_trainer_init.train_state.model.module
@@ -527,34 +511,47 @@ def test_transfer_weights_frozen_submodules():
 
     # 1. Ensure the modules themselves were correctly transferred
     # p_oh
-    for i in range(len(p_oh_base_init.nn.layers) - 1):
+    for i in range(len(p_oh_base_final.nn.layers) - 1):
         chex.assert_trees_all_equal(
-            p_oh_base_final.nn.layers[i], p_oh_transfer_init.nn.layers[i]
+            p_oh_base_final.nn.layers[i], p_oh_transfer_final.nn.layers[i]
         )
     with pytest.raises(AssertionError):
         chex.assert_trees_all_equal(
-            p_oh_base_final.nn.layers[-1], p_oh_transfer_init.nn.layers[-1]
+            p_oh_base_final.nn.layers[-1], p_oh_transfer_final.nn.layers[-1]
         )
     # p_rad
-    for i in range(len(p_rad_base_init.nn.layers) - 1):
+    for i in range(len(p_rad_base_final.nn.layers) - 1):
         chex.assert_trees_all_equal(
-            p_rad_base_final.nn.layers[i], p_rad_transfer_init.nn.layers[i]
+            p_rad_base_final.nn.layers[i], p_rad_transfer_final.nn.layers[i]
         )
     with pytest.raises(AssertionError):
         chex.assert_trees_all_equal(
-            p_rad_base_final.nn.layers[-1], p_rad_transfer_init.nn.layers[-1]
+            p_rad_base_final.nn.layers[-1], p_rad_transfer_final.nn.layers[-1]
         )
     # sciml
-    for i in range(len(sciml_base_init.nn.layers) - 1):
+    for i in range(len(sciml_base_init.taue_predictor.nn.layers) - 1):
         chex.assert_trees_all_equal(
-            sciml_base_final.nn.layers[i], sciml_transfer_frozen_init.nn.layers[i]
+            sciml_base_final.taue_predictor.nn.layers[i],
+            sciml_transfer_frozen_final.taue_predictor.nn.layers[i],
         )
     with pytest.raises(AssertionError):
         chex.assert_trees_all_equal(
-            sciml_base_final.nn.layers[-1], sciml_transfer_frozen_init.nn.layers[-1]
+            sciml_base_final.taue_predictor.nn.layers[-1],
+            sciml_transfer_frozen_final.taue_predictor.nn.layers[-1],
         )
 
-    # 2. Ensure the frozen submodules were actually frozen
+    # 2. Ensure the submodules were initialized properly
+    chex.assert_trees_all_equal(p_oh_base_final.nn, sciml_base_init.p_oh_predictor.nn)
+    chex.assert_trees_all_equal(p_rad_base_final.nn, sciml_base_init.p_rad_predictor.nn)
+
+    chex.assert_trees_all_equal(
+        p_oh_transfer_final.nn, sciml_transfer_frozen_init.p_oh_predictor.nn
+    )
+    chex.assert_trees_all_equal(
+        p_rad_transfer_final.nn, sciml_transfer_frozen_init.p_rad_predictor.nn
+    )
+
+    # 3. Ensure the submodules were actually frozen
     chex.assert_trees_all_equal(
         p_oh_transfer_final.nn, sciml_transfer_frozen_final.p_oh_predictor.nn
     )
@@ -654,14 +651,8 @@ def test_transfer_weights_unfrozen_submodules():
     p_oh_base_trainer_init, _ = study.restore_trainer(
         case_p_oh_base, restore_best_checkpoint=False
     )
-    p_oh_transfer_trainer_init, _ = study.restore_trainer(
-        case_p_oh_transfer, restore_best_checkpoint=False
-    )
     p_rad_base_trainer_init, _ = study.restore_trainer(
         case_p_rad_base, restore_best_checkpoint=False
-    )
-    p_rad_transfer_trainer_init, _ = study.restore_trainer(
-        case_p_rad_transfer, restore_best_checkpoint=False
     )
     sciml_base_trainer_init, _ = study.restore_trainer(
         case_sciml_base, restore_best_checkpoint=False
@@ -670,9 +661,7 @@ def test_transfer_weights_unfrozen_submodules():
         case_sciml_transfer_unfrozen, restore_best_checkpoint=False
     )
     p_oh_base_init = p_oh_base_trainer_init.train_state.model
-    p_oh_transfer_init = p_oh_transfer_trainer_init.train_state.model
     p_rad_base_init = p_rad_base_trainer_init.train_state.model
-    p_rad_transfer_init = p_rad_transfer_trainer_init.train_state.model
     sciml_base_init = sciml_base_trainer_init.train_state.model.module
     sciml_transfer_unfrozen_init = (
         sciml_transfer_unfrozen_trainer_init.train_state.model.module
@@ -708,30 +697,43 @@ def test_transfer_weights_unfrozen_submodules():
     # p_oh
     for i in range(len(p_oh_base_init.nn.layers) - 1):
         chex.assert_trees_all_equal(
-            p_oh_base_final.nn.layers[i], p_oh_transfer_init.nn.layers[i]
+            p_oh_base_final.nn.layers[i], p_oh_transfer_final.nn.layers[i]
         )
     with pytest.raises(AssertionError):
         chex.assert_trees_all_equal(
-            p_oh_base_final.nn.layers[-1], p_oh_transfer_init.nn.layers[-1]
+            p_oh_base_final.nn.layers[-1], p_oh_transfer_final.nn.layers[-1]
         )
     # p_rad
     for i in range(len(p_rad_base_init.nn.layers) - 1):
         chex.assert_trees_all_equal(
-            p_rad_base_final.nn.layers[i], p_rad_transfer_init.nn.layers[i]
+            p_rad_base_final.nn.layers[i], p_rad_transfer_final.nn.layers[i]
         )
     with pytest.raises(AssertionError):
         chex.assert_trees_all_equal(
-            p_rad_base_final.nn.layers[-1], p_rad_transfer_init.nn.layers[-1]
+            p_rad_base_final.nn.layers[-1], p_rad_transfer_final.nn.layers[-1]
         )
     # sciml
-    for i in range(len(sciml_base_init.nn.layers) - 1):
+    for i in range(len(sciml_base_init.taue_predictor.nn.layers) - 1):
         chex.assert_trees_all_equal(
-            sciml_base_final.nn.layers[i], sciml_transfer_unfrozen_init.nn.layers[i]
+            sciml_base_final.taue_predictor.nn.layers[i],
+            sciml_transfer_unfrozen_final.taue_predictor.nn.layers[i],
         )
     with pytest.raises(AssertionError):
         chex.assert_trees_all_equal(
-            sciml_base_final.nn.layers[-1], sciml_transfer_unfrozen_init.nn.layers[-1]
+            sciml_base_final.taue_predictor.nn.layers[-1],
+            sciml_transfer_unfrozen_final.taue_predictor.nn.layers[-1],
         )
+
+    # 2. Ensure the submodules were initialized properly
+    chex.assert_trees_all_equal(p_oh_base_final.nn, sciml_base_init.p_oh_predictor.nn)
+    chex.assert_trees_all_equal(p_rad_base_final.nn, sciml_base_init.p_rad_predictor.nn)
+
+    chex.assert_trees_all_equal(
+        p_oh_transfer_final.nn, sciml_transfer_unfrozen_init.p_oh_predictor.nn
+    )
+    chex.assert_trees_all_equal(
+        p_rad_transfer_final.nn, sciml_transfer_unfrozen_init.p_rad_predictor.nn
+    )
 
     # 2. Ensure the unfrozen submodules only changed their last layers (still transfer learning)
     # p_oh

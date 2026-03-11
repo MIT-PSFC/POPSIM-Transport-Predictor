@@ -192,3 +192,15 @@ class RadiatedPowerTRB(TrainRunBuilder):
         }
 
         return eval_suite
+
+    @staticmethod
+    def get_trainable_getter(model_init_config: dict) -> Callable[[Any], Any] | None:
+        domain_adaptation = model_init_config["domain_adaptation"]
+
+        if domain_adaptation != "transfer":
+            return None
+
+        def get_trainable(module: RadiatedPower):
+            return module.nn.layers[-1]
+
+        return get_trainable
