@@ -1,6 +1,7 @@
 from collections.abc import Callable
 from typing import Any
 
+import equinox as eqx
 import jax.numpy as jnp
 import numpy as np
 import optax
@@ -204,14 +205,17 @@ class PowerBalanceTRB(TrainRunBuilder):
                 p_oh_manager = create_default_checkpoint_manager(
                     p_oh_config["checkpoint_dir"]
                 )
-                env.module.p_oh_predictor = restore_model(
-                    p_oh_manager, env.module.p_oh_predictor
-                )
+                p_oh_restored = restore_model(p_oh_manager, env.module.p_oh_predictor)
                 p_rad_manager = create_default_checkpoint_manager(
                     p_rad_config["checkpoint_dir"]
                 )
-                env.module.p_rad_predictor = restore_model(
+                p_rad_restored = restore_model(
                     p_rad_manager, env.module.p_rad_predictor
+                )
+                env = eqx.tree_at(
+                    lambda e: (e.module.p_oh_predictor, e.module.p_rad_predictor),
+                    env,
+                    (p_oh_restored, p_rad_restored),
                 )
 
             logger.debug(

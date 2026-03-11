@@ -562,7 +562,7 @@ def test_transfer_weights_frozen_submodules():
 
 def test_transfer_weights_unfrozen_submodules():
     study = PowerBalanceStudy(
-        name="test_transfer_weights_frozen_submodules",
+        name="test_transfer_weights_unfrozen_submodules",
         working_dir_base=os.path.join(PACKAGE_ROOT, "tests", "test_outputs"),
         dataset_paths={
             "cmod": config.cmod_dataset_path,
