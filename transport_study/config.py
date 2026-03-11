@@ -39,12 +39,12 @@ class StudyConfig(BaseSettings):
     debug: bool = False  # Debug does everything but with reduced scope (less data, fewer epochs, etc.)
     dry_run: bool = False  # Dry run skips training and evaluation and just runs the orchestration logic to make sure everything is set up correctly
 
-    partition: str
+    partition: str | None = None
     buffer_gpus: int = 20
     hyperparam_sweeps: int = 1000
     max_epochs: int = 500
     epochs_per_val: int = 20
-    wandb_entity: str
+    wandb_entity: str | None = None
 
     cmod_dataset_path: Path | None = None
     tcv_dataset_path: Path | None = None
