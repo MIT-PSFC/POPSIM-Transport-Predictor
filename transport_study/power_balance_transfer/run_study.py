@@ -463,8 +463,7 @@ class PowerBalanceStudy(Study):
                     )
                     return
 
-            logger.info("Launching training")
-            self.launch_train(case)
+            self.launch_train(case, enable_parallelism=enable_parallelism)
 
         else:
             for prereq in case.prereqs:
@@ -877,7 +876,7 @@ class PowerBalanceStudy(Study):
         else:
             launch_agent(train_config, sweep_id)
 
-    def launch_train(self, case: Case):
+    def launch_train(self, case: Case, enable_parallelism: bool = False):
         """Launch a training job for the given case."""
         if case.is_impossible():
             raise ValueError(
@@ -885,11 +884,17 @@ class PowerBalanceStudy(Study):
             )
 
         train_config = self.make_train_config(case)
-        _, _, _, _, result_dict = launch_train(train_config)
-        ds = result_dict["test/study_results"]
         result_path = self.result_path(case)
-        os.makedirs(os.path.dirname(result_path), exist_ok=True)
-        ds.to_netcdf(result_path)
+        train_job_name = self.train_job_name(case)
+        if enable_parallelism:
+            logger.info(f"Launching training job {train_job_name} for case\n{case}")
+
+        else:
+            logger.info("Launching training serially")
+            _, _, _, _, result_dict = launch_train(train_config)
+            ds = result_dict["test/study_results"]
+            os.makedirs(os.path.dirname(result_path), exist_ok=True)
+            ds.to_netcdf(result_path)
 
     ##############
     # COLLECTION #

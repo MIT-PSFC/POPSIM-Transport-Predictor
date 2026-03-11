@@ -40,8 +40,9 @@ class StudyConfig(BaseSettings):
     dry_run: bool = False  # Dry run skips training and evaluation and just runs the orchestration logic to make sure everything is set up correctly
 
     partition: str
+    buffer_gpus: int = 20
     hyperparam_sweeps: int = 1000
-    max_epochs: int = 2000
+    max_epochs: int = 500
     epochs_per_val: int = 20
     wandb_entity: str
 
