@@ -85,6 +85,12 @@ class CModDataWorkflow(DataWorkflow):
             skip_profiles=skip_profiles,
         )
 
+        self.filter_config = {
+            "Wtot_MJ": {"min": 0.001, "max": 2},
+            "ne20_line_avg": {"min": 0.01, "max": 4},
+        }
+        self.individual_filter_config = None
+
     def _get_shotlist_from_source(self) -> list[int]:
         """Retrieve shotlist from C-Mod SQL database.
 
