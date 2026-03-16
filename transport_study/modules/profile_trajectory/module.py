@@ -28,7 +28,7 @@ class ProfileTrajectoryOptimizer(TimeDepModule):
 
     # These are the things that we can control over time
     gapin: Array  # Inner gap [m]
-    gapout: Array  # Outer gap [m]
+    R0: Array  # Major radius [m]
     rxpt1: Array  # X-point 1 R [m]
     zxpt1: Array  # X-point 1 Z [m]
     rxpt2: Array  # X-point 2 R [m]
@@ -86,9 +86,9 @@ class ProfileTrajectoryOptimizer(TimeDepModule):
                 * (config.input_ranges["gapin"][0] + config.input_ranges["gapin"][1])
                 / 2
             )
-            self.gapout = (
+            self.R0 = (
                 jnp.ones(num_times)
-                * (config.input_ranges["gapout"][0] + config.input_ranges["gapout"][1])
+                * (config.input_ranges["R0"][0] + config.input_ranges["R0"][1])
                 / 2
             )
             self.rxpt1 = (
@@ -114,7 +114,7 @@ class ProfileTrajectoryOptimizer(TimeDepModule):
         else:
             # Load trajectories from the provided dictionary
             self.gapin = trajectory["gapin"]
-            self.gapout = trajectory["gapout"]
+            self.R0 = trajectory["R0"]
             self.rxpt1 = trajectory["rxpt1"]
             self.zxpt1 = trajectory["zxpt1"]
             self.rxpt2 = trajectory["rxpt2"]
@@ -136,10 +136,10 @@ class ProfileTrajectoryOptimizer(TimeDepModule):
                 self.config.input_ranges["gapin"][1],
                 sharpness=clip_sharpness,
             ),
-            "gapout": soft_clip(
-                self.gapout[idx],
-                self.config.input_ranges["gapout"][0],
-                self.config.input_ranges["gapout"][1],
+            "R0": soft_clip(
+                self.R0[idx],
+                self.config.input_ranges["R0"][0],
+                self.config.input_ranges["R0"][1],
                 sharpness=clip_sharpness,
             ),
             "rxpt1": soft_clip(
@@ -181,7 +181,7 @@ class ProfileTrajectoryOptimizer(TimeDepModule):
             ne20=inputs.ne20,
             beta=inputs.beta,
             gapin=shape_dict["gapin"],
-            gapout=shape_dict["gapout"],
+            R0=shape_dict["R0"],
             rxpt1=shape_dict["rxpt1"],
             zxpt1=shape_dict["zxpt1"],
             rxpt2=shape_dict["rxpt2"],
@@ -243,7 +243,7 @@ class ProfileTrajectoryOptimizerEnv(ModuleTrainingEnv):
         # Get only the time-dependent controllable parameters
         return {
             "gapin": self.module.gapin,
-            "gapout": self.module.gapout,
+            "R0": self.module.R0,
             "rxpt1": self.module.rxpt1,
             "zxpt1": self.module.zxpt1,
             "rxpt2": self.module.rxpt2,

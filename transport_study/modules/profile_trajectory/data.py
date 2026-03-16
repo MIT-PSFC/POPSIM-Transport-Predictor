@@ -13,7 +13,7 @@ REQUIRED_SIGNALS = [
     "dstdenp",
     # Our trajectory optimization is over these variables
     "gapin",
-    "gapout",
+    "R0",
     "rxpt1",
     "zxpt1",
     "rxpt2",

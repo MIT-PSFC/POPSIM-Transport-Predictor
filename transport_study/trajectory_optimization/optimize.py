@@ -44,6 +44,8 @@ SHAPE_TIMES = [
 ############################################################################################################
 # Scope the dataset to determine the distribution of targets / allowable ranges for optimization variables #
 ############################################################################################################
+
+
 def characterize_dataset(ds_path: str, debug: bool = False) -> None:
     """Load the dataset and print out some basic statistics to help scope the optimization problem.
 
@@ -55,7 +57,7 @@ def characterize_dataset(ds_path: str, debug: bool = False) -> None:
     ds, _ = get_ds(ds_path, debug=debug)
 
     input_ranges = get_trajectory_input_ranges(
-        ds, ["gapin", "gapout", "rxpt1", "zxpt1", "rxpt2", "zxpt2"]
+        ds, ["gapin", "R0", "rxpt1", "zxpt1", "rxpt2", "zxpt2"]
     )
 
     for input_var, stats in input_ranges.items():
@@ -115,14 +117,14 @@ def setup_optimization_config(
     max_epochs = 2 if debug else MAX_EPOCHS
     epochs_per_val = 1 if debug else EPOCHS_PER_VAL
 
-    # Informed the dataset characterization and Jayson Barr TODO(ZanderKeith) make sure these are ok
+    # Informed by the dataset characterization and Jayson Barr TODO(ZanderKeith) make sure these are ok
     control_input_ranges = {
         "gapin": (0.01, 0.12),  # Inner gap [m]
-        "gapout": (0.06, 0.15),  # Outer gap [m]
+        "R0": (1.63, 1.95),  # Major radius [m]
         "rxpt1": (1.09, 1.29),  # Lower X-point R [m]
-        "zxpt1": (-1.51, -1.12),  # Lower X-point Z [m]
+        "zxpt1": (-1.25, -0.85),  # Lower X-point Z [m] (From Jayson Barr)
         "rxpt2": (1.08, 1.25),  # Upper X-point R [m]
-        "zxpt2": (0.9, 1.4),  # Upper X-point Z [m]
+        "zxpt2": (0.85, 1.25),  # Upper X-point Z [m]  (From Jayson Barr)
     }
 
     base_config = TrainConfig.load(PROFILE_TRAJECTORY_OPTIMIZER_CONFIG)
@@ -242,6 +244,7 @@ def train_profile_predictor(
 
 def run_trajectory_optimization(
     ds_path: str,
+    model_type: str,
     clean: bool | None = False,
     debug: bool | None = False,
 ):
@@ -253,7 +256,7 @@ def run_trajectory_optimization(
         debug (bool, optional): Whether to enable debug mode, reducing dataset size to only the base shots.
     """
 
-    base_config = setup_optimization_config(ds_path, debug=debug)
+    base_config = setup_optimization_config(ds_path, model_type, debug=debug)
     config = base_config.model_copy(
         update={
             "model_init_config": {

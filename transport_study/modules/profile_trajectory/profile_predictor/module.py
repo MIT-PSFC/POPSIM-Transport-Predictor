@@ -137,7 +137,7 @@ class Inputs:
 
     # Trajectory inputs (to be modified)
     gapin: float
-    gapout: float
+    R0: float
     rxpt1: float
     zxpt1: float
     rxpt2: float
@@ -148,13 +148,8 @@ class Inputs:
 
     @property
     def a_minor(self):
-        a_inner = self.R0 - self.gapin
-        a_outer = self.R0 + self.gapout
-        return (a_inner + a_outer) / 2
-
-    @property
-    def R0(self):
-        return 1.67
+        # TODO: Ensure this is correct by Jayson
+        return self.R0 - self.gapin
 
     @property
     def epsilon(self):
@@ -197,7 +192,7 @@ class Inputs:
                 self.beta,
                 self.ne20,
                 self.gapin,
-                self.gapout,
+                self.R0,
                 self.rxpt1,
                 self.zxpt1,
                 self.rxpt2,
@@ -464,7 +459,7 @@ class ProfilePredictorDirectPoints(ProfilePredictor):
                 beta=inputs["beta"].data,
                 ne20=inputs["dstdenp"].data / 10,
                 gapin=inputs["gapin"].data,
-                gapout=inputs["gapout"].data,
+                R0=inputs["R0"].data,
                 rxpt1=inputs["rxpt1"].data,
                 zxpt1=inputs["zxpt1"].data,
                 rxpt2=inputs["rxpt2"].data,

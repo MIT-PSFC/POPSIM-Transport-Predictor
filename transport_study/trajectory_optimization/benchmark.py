@@ -52,7 +52,7 @@ SHAPE_TIME_MAX = 5.5
 # Comparing different implementations of the profile predictor #
 ################################################################
 def run_profile_predictor_evaluation(
-    ds_path: str | None = config.d3d_dataset_path,
+    ds_path: str | None = config.d3d_hp_dataset_path,
     save_dir: str | None = SAVE_DIR,
     clean: bool | None = False,
     debug: bool | None = False,
@@ -175,7 +175,7 @@ def plot_profiles(
 # Comparing optimized trajectory performance #
 ##############################################
 def run_trajectory_evaluation(  # noqa: PLR0915
-    ds_path: str | None = config.d3d_dataset_path,
+    ds_path: str | None = config.d3d_hp_dataset_path,
     save_dir: str | None = SAVE_DIR,
     model_type: str | None = "direct_points",
     max_num_shape_times: int | None = MAX_NUM_SHAPE_TIMES,
@@ -332,7 +332,7 @@ def run_trajectory_evaluation(  # noqa: PLR0915
 
 
 def plot_trajectory_shapes(
-    ds_path: str | None = config.d3d_dataset_path,
+    ds_path: str | None = config.d3d_hp_dataset_path,
     save_dir: str | None = SAVE_DIR,
     model_type: str | None = "direct_points",
     max_num_shape_times: int | None = MAX_NUM_SHAPE_TIMES,
