@@ -14,6 +14,7 @@ dependencies = [
     "fire>=0.7.1",
     "pydantic-settings>=2.12.0",
     "dynaconf>=3.2.12",
+    "wandb>=0.25.0",
 ]
 
 [dependency-groups]
@@ -39,7 +40,7 @@ gpu-orcd = [
 profile = "black"
 
 [tool.setuptools]
-packages = ["popsim_transport_predictor"]
+packages = ["transport_study"]
 
 [tool.uv.sources]
 disruption-py = { path = "./submodules/disruption-py", editable = true }
@@ -47,10 +48,10 @@ gptools = { path = "./submodules/gptools", editable = true }
 popsim = { path = "./submodules/popsim", editable = true }
 
 [tool.hatch.build.targets.sdist]
-include = ["popsim_transport_predictor"]
+include = ["transport_study"]
 
 [tool.hatch.build.targets.wheel]
-include = ["popsim_transport_predictor"]
+include = ["transport_study"]
 
 [build-system]
 requires = ["hatchling"]
