@@ -1,19 +1,28 @@
+import os
 from pathlib import Path
 
 import matplotlib.pyplot as plt
+import netCDF4  # noqa: F401
 import numpy as np
 import xarray as xr
+from loguru import logger
 from matplotlib import patches
 from scipy.spatial import ConvexHull
+
+from transport_study.config import config
+from transport_study.orchestration.organize_data import (
+    get_train_test_datasets,
+    get_train_val_datasets,
+)
 
 BACKGROUND_COLOR = "#2F2F2F"
 FACE_COLOR = "#1A1A1A"
 TEXT_COLOR = "white"
 
-TITLE_FONTSIZE = 20
-LABEL_FONTSIZE = 16
-TICK_FONTSIZE = 14
-LEGEND_FONTSIZE = 14
+TITLE_FONTSIZE = 22
+LABEL_FONTSIZE = 18
+TICK_FONTSIZE = 16
+LEGEND_FONTSIZE = 16
 
 SOURCE_COLORS = {
     "cmod": "#ff4d4d",
@@ -46,7 +55,7 @@ def performance_extrapolation_plot(  # noqa: PLR0915
         x_var: Name of the variable to plot on the x-axis (default: "Ip_MA")
         y_var: Name of the variable to plot on the y-axis (default: "Wtot_MJ")
     """
-    fig, ax = plt.subplots(figsize=(10, 8))
+    fig, ax = plt.subplots(figsize=(8, 6))
     fig.patch.set_facecolor(BACKGROUND_COLOR)
     ax.set_facecolor(FACE_COLOR)
 
@@ -155,7 +164,7 @@ def domain_plot(  # noqa: PLR0915, PLR0912
 ):
     """Make a 2x2 grid of scatter plots showing the domain of each dataset in different variable spaces, colored by data source."""
 
-    fig, axes = plt.subplots(2, 2, figsize=(15, 12))
+    fig, axes = plt.subplots(2, 2, figsize=(12, 10))
     fig.patch.set_facecolor(BACKGROUND_COLOR)
 
     # Get the median value of the x and y variables for each shot (across the time_idx dimension)
@@ -285,8 +294,11 @@ def domain_plot(  # noqa: PLR0915, PLR0912
             handles,
             labels,
             title="Data Source",
-            loc="center",
+            loc="center left",
+            bbox_to_anchor=(1.0, 0.5),
             framealpha=0.9,
+            fontsize=LEGEND_FONTSIZE * 1.2,
+            title_fontsize=LEGEND_FONTSIZE * 1.2,
         )
         legend.get_title().set_color(TEXT_COLOR)
         for text in legend.get_texts():
@@ -298,3 +310,295 @@ def domain_plot(  # noqa: PLR0915, PLR0912
     Path(save_path).parent.mkdir(parents=True, exist_ok=True)
     plt.savefig(save_path, dpi=300, bbox_inches="tight")
     plt.close()
+
+
+class DataVisualization:
+    """
+    Visualizations of the datasets used in training and testing.
+    """
+
+    def _get_largest_dataset():
+        # Determine the biggest dataset we can use so that we only need to make one plot
+        # for the domain overlap visualization. Want to only do this once since it's expensive.
+        if (
+            config.cmod_dataset_path
+            and config.tcv_dataset_path
+            and config.d3d_lp_dataset_path
+        ):
+            training_data = "cmod_tcv_d3d_lp"
+        elif (
+            config.cmod_dataset_path
+            and config.tcv_dataset_path
+            and config.d3d_lp_dataset_path
+        ):
+            training_data = "cmod_tcv_d3d_lp"
+        elif config.cmod_dataset_path and config.tcv_dataset_path:
+            training_data = "cmod_tcv"
+        elif config.cmod_dataset_path:
+            training_data = "cmod"
+        elif config.tcv_dataset_path:
+            training_data = "tcv"
+        elif config.d3d_lp_dataset_path:
+            training_data = "d3d_lp"
+        else:
+            raise ValueError(
+                "No dataset paths provided in config, cannot determine largest dataset case for domain overlap plot."
+            )
+
+        return training_data
+
+    @staticmethod
+    def performance_extrapolation(  # noqa: PLR0912
+        figure_dir: str,
+    ):
+        """
+        Performance is ip**2 + Wtot_MJ**2
+
+        With all data present this creates the following figures:
+        1. Performance extrapolation for C-Mod
+        2. Performance extrapolation for TCV
+        3. Performance extrapolation for DIII-D low-performance shots
+        4. Performance extrapolation for C-Mod + TCV
+        5. Performance extrapolation for C-Mod + TCV + DIII-D low-performance shots
+        6. Showing there is no overlap in parameter space between the DIII-D low-performance shots, high-performance shots used in training, and high-performance shots used in testing
+        7. Put DIII-D high-performance shots in context of all training data
+        """
+
+        save_dir = os.path.join(
+            figure_dir, "data_visualization", "performance_extrapolation"
+        )
+
+        # C-Mod
+        if config.cmod_dataset_path:
+            fig_path = os.path.join(save_dir, "cmod_performance_extrapolation.png")
+            if not os.path.exists(fig_path):
+                train_ds, val_ds = get_train_val_datasets(
+                    training_data="cmod",
+                    data_normalization="raw",
+                )
+                performance_extrapolation_plot(
+                    save_path=fig_path,
+                    ds_list=[train_ds, val_ds],
+                    ds_type_list=["train", "val"],
+                    x_var="Ip_MA",
+                    y_var="Wtot_MJ",
+                )
+        else:
+            logger.warning("C-Mod dataset path not provided, skipping C-Mod figures.")
+
+        # TCV
+        if config.tcv_dataset_path:
+            fig_path = os.path.join(save_dir, "tcv_performance_extrapolation.png")
+            if not os.path.exists(fig_path):
+                train_ds, val_ds = get_train_val_datasets(
+                    training_data="tcv",
+                    data_normalization="raw",
+                )
+                performance_extrapolation_plot(
+                    save_path=fig_path,
+                    ds_list=[train_ds, val_ds],
+                    ds_type_list=["train", "val"],
+                    x_var="Ip_MA",
+                    y_var="Wtot_MJ",
+                )
+        else:
+            logger.warning("TCV dataset path not provided, skipping TCV figures.")
+
+        # C-Mod + TCV
+        if config.tcv_dataset_path and config.cmod_dataset_path:
+            fig_path = os.path.join(save_dir, "cmod_tcv_performance_extrapolation.png")
+            if not os.path.exists(fig_path):
+                train_ds, val_ds = get_train_val_datasets(
+                    training_data="cmod_tcv",
+                    data_normalization="raw",
+                )
+                performance_extrapolation_plot(
+                    save_path=fig_path,
+                    ds_list=[train_ds, val_ds],
+                    ds_type_list=["train", "val"],
+                    x_var="Ip_MA",
+                    y_var="Wtot_MJ",
+                )
+        else:
+            logger.warning(
+                "TCV or C-Mod dataset path not provided, skipping combined C-Mod + TCV figures."
+            )
+
+        # DIII-D low-performance
+        if config.d3d_lp_dataset_path:
+            fig_path = os.path.join(save_dir, "d3d_lp_performance_extrapolation.png")
+            if not os.path.exists(fig_path):
+                train_ds, val_ds = get_train_val_datasets(
+                    training_data="d3d_lp",
+                    data_normalization="raw",
+                )
+                performance_extrapolation_plot(
+                    save_path=fig_path,
+                    ds_list=[train_ds, val_ds],
+                    ds_type_list=["train", "val"],
+                    x_var="Ip_MA",
+                    y_var="Wtot_MJ",
+                )
+        else:
+            logger.warning(
+                "DIII-D low-performance dataset path not provided, skipping DIII-D low-performance figures."
+            )
+
+        # C-Mod + TCV + DIII-D low-performance
+        if (
+            config.cmod_dataset_path
+            and config.tcv_dataset_path
+            and config.d3d_lp_dataset_path
+        ):
+            fig_path = os.path.join(
+                save_dir, "cmod_tcv_d3d_lp_performance_extrapolation.png"
+            )
+            if not os.path.exists(fig_path):
+                train_ds, val_ds = get_train_val_datasets(
+                    training_data="cmod_tcv_d3d_lp",
+                    data_normalization="raw",
+                )
+                performance_extrapolation_plot(
+                    save_path=fig_path,
+                    ds_list=[train_ds, val_ds],
+                    ds_type_list=["train", "val"],
+                    x_var="Ip_MA",
+                    y_var="Wtot_MJ",
+                )
+        else:
+            logger.warning(
+                "C-Mod, TCV, or DIII-D low-performance dataset path not provided, skipping combined C-Mod + TCV + DIII-D low-performance figures."
+            )
+
+        # DIII-D performance overlap
+        if config.d3d_hp_dataset_path and config.d3d_lp_dataset_path:
+            fig_path = os.path.join(save_dir, "d3d_performance_overlap.png")
+            if not os.path.exists(fig_path):
+                train_ds, test_ds = get_train_test_datasets(
+                    training_data="d3d_lp",
+                    num_hp_shots=33,
+                )
+                performance_extrapolation_plot(
+                    save_path=fig_path,
+                    ds_list=[train_ds, test_ds],
+                    ds_type_list=["train", "test"],
+                    x_var="Ip_MA",
+                    y_var="Wtot_MJ",
+                )
+
+        # DIII-D high-performance in context of available training data
+        context_dict = {
+            "cmod": {
+                "condition": config.cmod_dataset_path,
+                "fig_name": "d3d_hp_in_context_cmod_performance_extrapolation.png",
+            },
+            "tcv": {
+                "condition": config.tcv_dataset_path,
+                "fig_name": "d3d_hp_in_context_tcv_performance_extrapolation.png",
+            },
+            "d3d_lp": {
+                "condition": config.d3d_lp_dataset_path,
+                "fig_name": "d3d_hp_in_context_d3d_lp_performance_extrapolation.png",
+            },
+            "cmod_tcv": {
+                "condition": config.cmod_dataset_path and config.tcv_dataset_path,
+                "fig_name": "d3d_hp_in_context_cmod_tcv_performance_extrapolation.png",
+            },
+            "cmod_tcv_d3d_lp": {
+                "condition": config.cmod_dataset_path
+                and config.tcv_dataset_path
+                and config.d3d_lp_dataset_path,
+                "fig_name": "d3d_hp_in_context_cmod_tcv_d3d_lp_performance_extrapolation.png",
+            },
+        }
+
+        for context_case, context_info in context_dict.items():
+            if context_info["condition"] and config.d3d_hp_dataset_path:
+                fig_path = os.path.join(save_dir, context_info["fig_name"])
+                if not os.path.exists(fig_path):
+                    train_ds, test_ds = get_train_test_datasets(
+                        training_data=context_case,
+                        data_normalization="raw",
+                        domain_adaptation="mixing",
+                        num_hp_shots=33,
+                        hp_test_set_size=60,
+                    )
+                    performance_extrapolation_plot(
+                        save_path=fig_path,
+                        ds_list=[train_ds, test_ds],
+                        ds_type_list=["train", "test"],
+                        x_var="Ip_MA",
+                        y_var="Wtot_MJ",
+                    )
+
+    @staticmethod
+    def domain_overlap(
+        figure_dir: str,
+    ):
+        """
+        Compare different data preparation cases to how the parameter space overlaps.
+        This is different from the performance extrapolation plots because here it is desirable to have a lot of overlap.
+        While we are ALWAYS extrapolating in real units (Ip and Wtot, things that WILL break the device)
+        first normalizing the data should help with transfer learning.
+
+        Basically, this normalization doesn't impact the transfer learning, because the dataset is being split into train and val/test beforehand.
+        """
+
+        training_data = DataVisualization._get_largest_dataset()
+
+        for method in ["raw", "physics", "z_score", "coral"]:
+            if method == "raw":
+                var_groups = [
+                    ["Ip_MA", "Wtot_MJ"],
+                    ["R0", "a_minor"],
+                    ["ne20_line_avg", "B0"],
+                    ["P_aux_MW", "kappa"],
+                ]
+            elif method == "physics":
+                var_groups = [
+                    ["Ip_MA", "beta"],
+                    ["q_star", "epsilon"],
+                    ["f_G", "aB0"],
+                    ["surface_power_density", "kappa"],
+                ]
+            elif method == "z_score":
+                var_groups = [
+                    ["Ip_MA_z", "Wtot_MJ_z"],
+                    ["R0_z", "a_minor_z"],
+                    ["ne20_line_avg_z", "B0_z"],
+                    ["P_aux_MW_z", "kappa_z"],
+                ]
+            elif method == "coral":
+                var_groups = [
+                    ["Ip_MA_coral", "Wtot_MJ_coral"],
+                    ["R0_coral", "a_minor_coral"],
+                    ["ne20_line_avg_coral", "B0_coral"],
+                    ["P_aux_MW_coral", "kappa_coral"],
+                ]
+            else:
+                raise ValueError(f"Unknown normalization method '{method}' specified.")
+
+            if config.d3d_hp_dataset_path:
+                ds, _ = get_train_test_datasets(
+                    training_data=training_data,
+                    data_normalization=method,
+                    domain_adaptation="mixing",
+                    num_hp_shots=-1,
+                    hp_test_set_size=60,
+                )
+            else:
+                ds, _ = get_train_val_datasets(
+                    training_data=training_data, data_normalization=method
+                )
+
+            fig_path = os.path.join(
+                figure_dir,
+                "domain_overlap",
+                f"{training_data}_domain_overlap_{method}.png",
+            )
+            domain_plot(
+                ds=ds,
+                var_groups=var_groups,
+                title=f"{training_data} domain overlap {method}",
+                save_path=fig_path,
+            )

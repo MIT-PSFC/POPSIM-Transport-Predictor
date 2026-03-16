@@ -30,6 +30,7 @@ from transport_study.orchestration.wandb_utils import (
     get_sweep_id,
     run_clean_sweeps,
 )
+from transport_study.power_balance_transfer.data_visualization import DataVisualization
 
 
 class PowerBalanceStudy(Study):
@@ -1306,7 +1307,11 @@ def run_study(  # noqa: PLR0915
     # Data Visualization #
     ######################
     if not skip_visualization:
-        logger.info("DATA VISUALIZATION")
+        logger.opt(colors=True).info(
+            "<bold><magenta>DATA VISUALIZATION</magenta></bold>"
+        )
+        DataVisualization.performance_extrapolation(study.figure_dir)
+        DataVisualization.domain_overlap(study.figure_dir)
 
     ########################
     # Launch Orchestration #
