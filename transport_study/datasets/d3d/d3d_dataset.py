@@ -1,6 +1,8 @@
 """Makes the 'raw' DIII-D dataset on omega, to be processed later by POPSIM"""
 
+import glob
 import os
+import tempfile
 
 import netCDF4  # noqa: F401
 import numpy as np
@@ -15,6 +17,7 @@ from disruption_py.settings import (
 from disruption_py.settings.output_setting import DatasetOutputSetting
 from disruption_py.settings.time_setting import _postprocess
 from disruption_py.workflow import get_shots_data
+from freeqdsk import geqdsk
 from loguru import logger
 
 from transport_study import EPISODE_DIM, PACKAGE_ROOT, TIME_COORD, TIME_DIM
@@ -48,6 +51,12 @@ class Uniform1kHzTimeSetting(TimeSetting):
         (efit_time,) = params.mds_conn.get_dims(
             r"\efit_aeqdsk:ali", tree_name="_efit_tree"
         )
+        # If timebase is much slower than 1 kHz, log a warning
+        typical_delta = np.median(np.diff(efit_time))
+        if typical_delta > 2:
+            logger.critical(
+                f"EFIT timebase is much slower than 1 kHz (typical delta: {typical_delta:.3f} ms). This may cause issues with interpolation and data quality."
+            )
 
         max_time = np.max(efit_time)
         if params.tokamak == Tokamak.CMOD:
@@ -276,11 +285,25 @@ class D3DDataWorkflow(DataWorkflow):
             r"\betan", "pedestal", location="remote://atlas.gat.com"
         )  # Normalized plasma beta
 
+        # Programmed inputs
         iptipp = PtDataSignal("iptipp")
+        bttbt = PtDataSignal("bttbt")
         dstdenp = PtDataSignal("dstdenp")
+        bmtpwrtar = PtDataSignal("bmtpwrtar")
+        ieeseg07 = PtDataSignal("ieeseg07")
+        idtrp = PtDataSignal("idtrp")
+        idtrxbot = PtDataSignal("idtrxbot")
+        idtzxbot = PtDataSignal("idtzxbot")
+        idtrxtop = PtDataSignal("idtrxtop")
+        idtzxtop = PtDataSignal("idtzxtop")
 
+        # Measured inputs
+        # Ip_MA handled
+        # B0 handled
+        dssneped = PtDataSignal("dssneped")
+        # betapf above
         gapin = MdsSignal(r"\gapin", "efit01", location="remote://atlas.gat.com")
-        gapout = MdsSignal(r"\gapout", "efit01", location="remote://atlas.gat.com")
+        rsurf = MdsSignal(r"\rsurf", "efit01", location="remote://atlas.gat.com")
         rxpt1 = MdsSignal(r"\rxpt1", "efit01", location="remote://atlas.gat.com")
         zxpt1 = MdsSignal(r"\zxpt1", "efit01", location="remote://atlas.gat.com")
         rxpt2 = MdsSignal(r"\rxpt2", "efit01", location="remote://atlas.gat.com")
@@ -293,12 +316,23 @@ class D3DDataWorkflow(DataWorkflow):
             "tau_conf": TAU_conf,
             "ne_edge_avg": Ne_edge_avg,
             "wmhdf_toksearch": Wtot,
-            "betap_toksearch": BETAP,
             "betan_toksearch": BETAN,
+            # Programmed inputs
             "iptipp": iptipp,
+            "bttbt": bttbt,
             "dstdenp": dstdenp,
+            "bmtpwrtar": bmtpwrtar,
+            "ieeseg07": ieeseg07,
+            "idtrp": idtrp,
+            "idtrxbot": idtrxbot,
+            "idtzxbot": idtzxbot,
+            "idtrxtop": idtrxtop,
+            "idtzxtop": idtzxtop,
+            # Measured inputs
+            "betap_toksearch": BETAP,
+            "dssneped": dssneped,
             "gapin": gapin,
-            "gapout": gapout,
+            "rsurf": rsurf,
             "rxpt1": rxpt1,
             "zxpt1": zxpt1,
             "rxpt2": rxpt2,
@@ -567,9 +601,9 @@ class D3DDataWorkflow(DataWorkflow):
             return None
         ds = xr.open_dataset(ida_path)
         # Rename profile varaibles to avoid conflict with 0D signals
-        ds["Te_rho"] = ds["T_e"]
-        ds["ne_rho"] = ds["n_e"]
-        ds = ds[["Te_rho", "ne_rho"]]
+        ds["Te_psi"] = ds["T_e"]
+        ds["ne_psi"] = ds["n_e"]
+        ds = ds[["Te_psi", "ne_psi"]]
 
         ds["time"] = ds["time"] / 1e3  # Convert ms to s
         ds = ds.expand_dims("shot")
@@ -831,3 +865,154 @@ class D3DDataWorkflow(DataWorkflow):
                 ds = ds.drop_vars(sig)
 
         return ds
+
+    def _1kHz_efit(self, shot: int) -> xr.Dataset:  # noqa:  PLR0912
+        """Directly parse the saved 1 kHz EFIT results into an xarray dataset for a shot
+
+        We re-computed EFIT01 at 1 kHz, but the DIII-D data curators did not allow us to have a dedicated tree in MDSPlus,
+        so we had to put the results under scratch paths like EFIT02-EFIT06 or something
+        Of course some shots got overwritten by other researchers using the same scratch paths, so we can't rely on it being consistent.
+        So here I'm just going to where we have the results saved and parse the data directly into Xarray
+        """
+
+        efit_tgz_path = (
+            f"/fusion/projects/disruption_warning/data/disruption-efit/{shot}.tgz"
+        )
+        if not os.path.exists(efit_tgz_path):
+            logger.warning(
+                f"EFIT tgz file for shot {shot} not found at {efit_tgz_path}"
+            )
+            return None
+
+        start_dir = os.getcwd()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            os.chdir(tmpdir)
+            a_files = glob.glob("a*")  # Mainly 0D scalars
+            g_files = glob.glob("g*")  # Grids and boundaries
+            m_files = glob.glob("m*")  # netcdf
+
+            # Ensure they're sorted from low to high
+            for files in [g_files, a_files, m_files]:
+                files.sort()
+            if len(a_files) != len(m_files) or len(g_files) != len(m_files):
+                raise ValueError("Inconstent number of EFIT files!")
+
+            datasets = []
+            for i, m_file in enumerate(m_files):
+                # ignoring this for now aeq  OMFITaeqdsk(a_files[i])
+                aeq = {}
+                a_data = aeq.todict()
+                a_desc = a_data["_desc"]
+
+                with open(g_files[i]) as f:
+                    g_data = geqdsk.read(f)
+
+                ds = xr.open_dataset(m_file, engine="netcdf4")
+                # Oh, this is number of iterations. Just take the value at the last one I suppose?
+                # Would be useful to track how values change over number of iterations
+
+                # Add stuff from the a file which isn't already in the dataset https://fusion.gat.com/theory/Efitaeqdsk
+                a_data_unique = {}
+                for key in a_data.keys():
+                    if key not in ds and not key.startswith("_"):
+                        # Special cases
+                        if key in ["rco2r", "dco2r"]:
+                            da = xr.DataArray(
+                                a_data[key],
+                                coords={
+                                    "radial_co2_chord": np.arange(len(a_data[key]))
+                                },
+                                attrs={"long_name": a_desc[key]},
+                            )
+                        elif key in ["rco2v", "dco2v"]:
+                            da = xr.DataArray(
+                                a_data[key],
+                                coords={
+                                    "vertical_co2_chord": np.arange(len(a_data[key]))
+                                },
+                                attrs={"long_name": a_desc[key]},
+                            )
+                        elif key in ["rseps", "zseps"]:
+                            da = xr.DataArray(
+                                a_data[key],
+                                coords={"x_point": np.arange(len(a_data[key]))},
+                                attrs={"long_name": a_desc[key]},
+                            )
+                        else:
+                            da = xr.DataArray(
+                                a_data[key], attrs={"long_name": a_desc[key]}
+                            )
+                        if "dim_0" in da.dims:
+                            pass
+                        a_data_unique[key] = da
+                ds = ds.assign(a_data_unique)
+
+                if g_data["rbbbs"] is not None:
+                    g_data_boundary = {
+                        "rbbbs": xr.DataArray(
+                            g_data["rbbbs"],
+                            coords={"boundary_grid": np.arange(0, g_data["nbbbs"])},
+                            attrs={"long_name": "R of boundary points in meter"},
+                        ),  # same as rbdry
+                        "zbbbs": xr.DataArray(
+                            g_data["zbbbs"],
+                            coords={"boundary_grid": np.arange(0, g_data["nbbbs"])},
+                            attrs={"long_name": "Z of boundary points in meter"},
+                        ),  # same as zbdry
+                    }
+                    ds = ds.assign(g_data_boundary)
+
+                g_data_limiter = {
+                    "rlim": xr.DataArray(
+                        g_data["rlim"],
+                        coords={"limiter_grid": np.arange(0, g_data["limitr"])},
+                        attrs={"long_name": "R of limiter points in meter"},
+                    ),
+                    "zlim": xr.DataArray(
+                        g_data["zlim"],
+                        coords={"limiter_grid": np.arange(0, g_data["limitr"])},
+                        attrs={"long_name": "Z of limiter points in meter"},
+                    ),
+                    "xlim": None,  # Copy of rlim???
+                    "ylim": None,  # copy of zlim???
+                }
+                ds = ds.assign(g_data_limiter)
+
+                datasets.append(ds)
+
+            max_nitera = max(ds.dim_nitera.size for ds in datasets)
+            datasets_nitera = []
+            for ds in datasets:
+                expand_len = max_nitera - ds.dim_nitera.size
+                expanded_vals = {
+                    "cchisq": xr.DataArray(
+                        np.pad(
+                            ds["cchisq"][0],
+                            ((0, expand_len)),
+                            "constant",
+                            constant_values=np.nan,
+                        ),
+                        coords={"dim_nitera": np.arange(0, max_nitera)},
+                    ),
+                    "cerror": xr.DataArray(
+                        np.pad(
+                            ds["cerror"][0],
+                            ((0, expand_len)),
+                            "constant",
+                            constant_values=np.nan,
+                        ),
+                        coords={"dim_nitera": np.arange(0, max_nitera)},
+                    ),
+                }
+                ds_n = ds.drop_dims("dim_nitera")
+                ds_n = ds.assign(expanded_vals)
+                datasets_nitera.append(ds_n)
+
+            datasets_coordinated = [
+                ds.assign_coords(time=[ds.time.values[0]]) for ds in datasets_nitera
+            ]
+            final_dataset = xr.concat(datasets_coordinated, dim="time")
+
+        os.chdir(start_dir)
+        return final_dataset
