@@ -36,7 +36,7 @@ from transport_study.datasets.d3d.d3d_dataset import (
 
 from disruption_py.workflow import get_shots_data
 from disruption_py.settings.time_setting import _postprocess
-
+import xarray as xr
 from loguru import logger
 
 
@@ -45,15 +45,6 @@ def test_trajopt_input_mapping():
     The DIII-D PCS has a unique way to input shapes (gapin, R0, X points).
     We need to have a mapping from these shape parameters to the profile predictor inputs.
     """
-
-    with tempfile.TemporaryDirectory() as tmpdir:
-        # Create the workflow and run it on a test shot
-        workflow = D3DDataWorkflow(
-            ds_name="d3d_dataset_prof_test_trajopt_input_mapping",
-            shotlist_file=None,
-            data_assembly_dir=tmpdir,
-        )
-        workflow._1kHz_efit(201927)
 
 
 class TimeCheckSetting(TimeSetting):
@@ -127,18 +118,18 @@ def find_1kHz_discrepancies():
         only_requested_columns=False,
     )
 
-    # shutil.rmtree(result_dir, ignore_errors=True)
-    # os.makedirs(good_shots_dir, exist_ok=True)
-    # os.makedirs(bad_shots_dir, exist_ok=True)
-    # for shot in shotlist_ida:
-    #     efit_result = get_shots_data(
-    #         tokamak=Tokamak.D3D,
-    #         shotlist_setting=shot,
-    #         retrieval_settings=retrieval_settings,
-    #         output_setting=DatasetOutputSetting(path=False),
-    #         log_settings=LogSettings(file_path=None),
-    #         num_processes=1,
-    #     )
+    shutil.rmtree(result_dir, ignore_errors=True)
+    os.makedirs(good_shots_dir, exist_ok=True)
+    os.makedirs(bad_shots_dir, exist_ok=True)
+    for shot in shotlist_ida:
+        efit_result = get_shots_data(
+            tokamak=Tokamak.D3D,
+            shotlist_setting=shot,
+            retrieval_settings=retrieval_settings,
+            output_setting=DatasetOutputSetting(path=False),
+            log_settings=LogSettings(file_path=None),
+            num_processes=1,
+        )
 
     shotlist_good = []
     shotlist_bad = []
@@ -164,7 +155,71 @@ def find_1kHz_discrepancies():
                 f"Shot {shot} is in the bad list but has a disruption efit file."
             )
 
+    with tempfile.TemporaryDirectory() as tmpdir:
+        # Create the workflow and run it on a test shot
+        workflow = D3DDataWorkflow(
+            ds_name="d3d_dataset_prof_test_trajopt_input_mapping",
+            shotlist_file=None,
+            data_assembly_dir=tmpdir,
+        )
+    ds_fast = workflow._1kHz_efit(199072)
+
+    ds_slow_path = "/fusion/projects/disruption_warning/data/popsim/popsim_studies/orchestration_test/hbp_trajopt/dataset_full/ds.zarr"
+    ds_slow = xr.open_zarr(ds_slow_path)
+    ds_slow_shot = ds_slow.where(ds_slow["shot"] == 199072, drop=True).load()
+
+    max_time = 0.2
+    ds_slow_shot = ds_slow_shot.where(ds_slow["time"] <= max_time, drop=True)
+    ds_fast = ds_fast.where(ds_fast["time"] <= max_time, drop=True)
+
+    # Plot a few signals to see if they look reasonably similar
+    fig, axs = plt.subplots(4, 1, figsize=(10, 15))
+    axs[0].plot(ds_fast["time"], ds_fast["gapin"], label="gapin (fast)")
+    axs[0].plot(
+        ds_slow_shot["time"],
+        ds_slow_shot["gapin"],
+        label="gapin (slow)",
+        linestyle="dashed",
+    )
+    axs[0].set_title("gapin")
+    axs[0].legend()
+    axs[1].plot(ds_fast["time"], ds_fast["rsurf"], label="R0 (fast)")
+    axs[1].plot(
+        ds_slow_shot["time"], ds_slow_shot["R0"], label="R0 (slow)", linestyle="dashed"
+    )
+    axs[1].set_title("R0")
+    axs[1].legend()
+    axs[2].plot(ds_fast["time"], ds_fast["rxpt1"], label="rxpt1 (fast)")
+    axs[2].plot(
+        ds_slow_shot["time"],
+        ds_slow_shot["rxpt1"],
+        label="rxpt1 (slow)",
+        linestyle="dashed",
+    )
+    axs[2].set_title("rxpt1")
+    axs[2].legend()
+    axs[3].plot(ds_fast["time"], ds_fast["zxpt1"], label="zxpt1 (fast)")
+    axs[3].plot(
+        ds_slow_shot["time"],
+        ds_slow_shot["zxpt1"],
+        label="zxpt1 (slow)",
+        linestyle="dashed",
+    )
+    axs[3].set_title("zxpt1")
+    axs[3].legend()
+    fig.tight_layout()
+    fig.savefig(
+        os.path.join(
+            PACKAGE_ROOT,
+            "tests",
+            "test_outputs",
+            "d3d_1kHz_discrepancies",
+            "input_mapping_comparison.png",
+        )
+    )
+    plt.close(fig)
+
 
 if __name__ == "__main__":
-    # test_trajopt_input_mapping()
-    find_1kHz_discrepancies()
+    test_trajopt_input_mapping()
+    # find_1kHz_discrepancies()

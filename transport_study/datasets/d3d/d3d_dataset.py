@@ -1,7 +1,9 @@
 """Makes the 'raw' DIII-D dataset on omega, to be processed later by POPSIM"""
 
 import glob
+import io
 import os
+import tarfile
 import tempfile
 
 import netCDF4  # noqa: F401
@@ -17,7 +19,7 @@ from disruption_py.settings import (
 from disruption_py.settings.output_setting import DatasetOutputSetting
 from disruption_py.settings.time_setting import _postprocess
 from disruption_py.workflow import get_shots_data
-from freeqdsk import geqdsk
+from freeqdsk import aeqdsk, geqdsk
 from loguru import logger
 
 from transport_study import EPISODE_DIM, PACKAGE_ROOT, TIME_COORD, TIME_DIM
@@ -25,6 +27,68 @@ from transport_study.config import config
 from transport_study.datasets import make_uniform_1khz_timebase
 from transport_study.datasets.dispy_utils import summary
 from transport_study.datasets.workflow import DataWorkflow
+
+
+def _clean_aeqdsk_file(f):
+    """Clean AEQDSK file by removing invalid text lines that don't fit Fortran format.
+
+    Some AEQDSK files have stray text labels (like "MAG") at the end that are not
+    valid floating-point values for Fortran format descriptors. This function filters
+    those out by reading all lines, checking if they're valid numeric data, and
+    returning a cleaned file-like object.
+
+    Parameters
+    ----------
+    f : file-like object
+        File handle to read from
+
+    Returns
+    -------
+    io.StringIO
+        A file-like object with cleaned content
+    """
+    content = f.read()
+    lines = content.split("\n")
+    cleaned_lines = []
+
+    for line in lines:
+        # Check if this line contains only whitespace and text (no numbers)
+        # Valid FORTRAN formatted lines will have numbers in scientific notation
+        stripped = line.strip()
+        if stripped:
+            # If the line contains valid numeric indicators, keep it
+            # Valid indicators: E+, E-, D+, D-, digits, -, +, ., or leading spaces
+            if any(
+                c in stripped
+                for c in [
+                    "E",
+                    "D",
+                    "e",
+                    "d",
+                    "0",
+                    "1",
+                    "2",
+                    "3",
+                    "4",
+                    "5",
+                    "6",
+                    "7",
+                    "8",
+                    "9",
+                    "+",
+                    "-",
+                    ".",
+                ]
+            ):
+                cleaned_lines.append(line)
+        else:
+            # Keep blank lines as they're part of the format
+            cleaned_lines.append(line)
+
+    # Reconstruct the file content and return as StringIO
+    cleaned_content = "\n".join(cleaned_lines)
+    return io.StringIO(cleaned_content)
+
 
 DEFAULT_SHOTLIST_FILE = os.path.join(
     PACKAGE_ROOT, "datasets", "d3d", "HBP_shotlist_2024"
@@ -866,7 +930,7 @@ class D3DDataWorkflow(DataWorkflow):
 
         return ds
 
-    def _1kHz_efit(self, shot: int) -> xr.Dataset:  # noqa:  PLR0912
+    def _1kHz_efit(self, shot: int) -> xr.Dataset:
         """Directly parse the saved 1 kHz EFIT results into an xarray dataset for a shot
 
         We re-computed EFIT01 at 1 kHz, but the DIII-D data curators did not allow us to have a dedicated tree in MDSPlus,
@@ -875,9 +939,7 @@ class D3DDataWorkflow(DataWorkflow):
         So here I'm just going to where we have the results saved and parse the data directly into Xarray
         """
 
-        efit_tgz_path = (
-            f"/fusion/projects/disruption_warning/data/disruption-efit/{shot}.tgz"
-        )
+        efit_tgz_path = f"/cscratch/keithz/disruption-efit/2026-03-19/manager/13-16-00.525590/archive/{shot}.tgz"
         if not os.path.exists(efit_tgz_path):
             logger.warning(
                 f"EFIT tgz file for shot {shot} not found at {efit_tgz_path}"
@@ -887,132 +949,59 @@ class D3DDataWorkflow(DataWorkflow):
         start_dir = os.getcwd()
 
         with tempfile.TemporaryDirectory() as tmpdir:
-            os.chdir(tmpdir)
+            with tarfile.open(efit_tgz_path, "r:gz") as tar:
+                tar.extractall(path=tmpdir)
+            os.chdir(os.path.join(tmpdir, "efit"))
             a_files = glob.glob("a*")  # Mainly 0D scalars
             g_files = glob.glob("g*")  # Grids and boundaries
-            m_files = glob.glob("m*")  # netcdf
 
             # Ensure they're sorted from low to high
-            for files in [g_files, a_files, m_files]:
+            for files in [g_files, a_files]:
                 files.sort()
-            if len(a_files) != len(m_files) or len(g_files) != len(m_files):
+            if len(a_files) != len(g_files):
                 raise ValueError("Inconstent number of EFIT files!")
 
             datasets = []
-            for i, m_file in enumerate(m_files):
-                # ignoring this for now aeq  OMFITaeqdsk(a_files[i])
-                aeq = {}
-                a_data = aeq.todict()
-                a_desc = a_data["_desc"]
-
+            for i, a_file in enumerate(a_files):
+                with open(a_file) as f:
+                    cleaned_f = _clean_aeqdsk_file(f)
+                    a_data = aeqdsk.read(cleaned_f)
                 with open(g_files[i]) as f:
                     g_data = geqdsk.read(f)
 
-                ds = xr.open_dataset(m_file, engine="netcdf4")
-                # Oh, this is number of iterations. Just take the value at the last one I suppose?
-                # Would be useful to track how values change over number of iterations
-
-                # Add stuff from the a file which isn't already in the dataset https://fusion.gat.com/theory/Efitaeqdsk
-                a_data_unique = {}
-                for key in a_data.keys():
-                    if key not in ds and not key.startswith("_"):
-                        # Special cases
-                        if key in ["rco2r", "dco2r"]:
-                            da = xr.DataArray(
-                                a_data[key],
-                                coords={
-                                    "radial_co2_chord": np.arange(len(a_data[key]))
-                                },
-                                attrs={"long_name": a_desc[key]},
-                            )
-                        elif key in ["rco2v", "dco2v"]:
-                            da = xr.DataArray(
-                                a_data[key],
-                                coords={
-                                    "vertical_co2_chord": np.arange(len(a_data[key]))
-                                },
-                                attrs={"long_name": a_desc[key]},
-                            )
-                        elif key in ["rseps", "zseps"]:
-                            da = xr.DataArray(
-                                a_data[key],
-                                coords={"x_point": np.arange(len(a_data[key]))},
-                                attrs={"long_name": a_desc[key]},
-                            )
-                        else:
-                            da = xr.DataArray(
-                                a_data[key], attrs={"long_name": a_desc[key]}
-                            )
-                        if "dim_0" in da.dims:
-                            pass
-                        a_data_unique[key] = da
-                ds = ds.assign(a_data_unique)
-
-                if g_data["rbbbs"] is not None:
-                    g_data_boundary = {
-                        "rbbbs": xr.DataArray(
-                            g_data["rbbbs"],
-                            coords={"boundary_grid": np.arange(0, g_data["nbbbs"])},
-                            attrs={"long_name": "R of boundary points in meter"},
-                        ),  # same as rbdry
-                        "zbbbs": xr.DataArray(
-                            g_data["zbbbs"],
-                            coords={"boundary_grid": np.arange(0, g_data["nbbbs"])},
-                            attrs={"long_name": "Z of boundary points in meter"},
-                        ),  # same as zbdry
-                    }
-                    ds = ds.assign(g_data_boundary)
-
-                g_data_limiter = {
-                    "rlim": xr.DataArray(
-                        g_data["rlim"],
-                        coords={"limiter_grid": np.arange(0, g_data["limitr"])},
-                        attrs={"long_name": "R of limiter points in meter"},
-                    ),
-                    "zlim": xr.DataArray(
-                        g_data["zlim"],
-                        coords={"limiter_grid": np.arange(0, g_data["limitr"])},
-                        attrs={"long_name": "Z of limiter points in meter"},
-                    ),
-                    "xlim": None,  # Copy of rlim???
-                    "ylim": None,  # copy of zlim???
+                # Create dataset for this time slice
+                # The only things we're using in this study are as follows:
+                # TODO(ZanderKeith): Complete this after you verify they line up
+                # major radius
+                # minor radius
+                # X point R and Z
+                data_vars = {
+                    "gapin": a_data["oleft"] / 100,  # Inner gap
+                    "rxpt1": a_data["rseps1"] / 100,  # Lower X-point R
+                    "zxpt1": a_data["zseps1"] / 100,  # Lower X-point Z
+                    "rxpt2": a_data["rseps2"] / 100,  # Upper X-point R
+                    "zxpt2": a_data["zseps2"] / 100,  # Upper X-point Z
+                    "rsurf": a_data["rout"] / 100,  # Geometric major radius
+                    "aminor": a_data["rout"] - a_data["rinn"],  # Geometric minor radius
+                    "beans": g_data["beans"],  # Elongation
                 }
-                ds = ds.assign(g_data_limiter)
+
+                ds = xr.Dataset(
+                    data_vars=data_vars,
+                    coords={
+                        "time": a_data["time"] / 1e3,  # Convert ms to s
+                    },
+                )
+
+                # If the x-point coordinates are broken (e.g. -9.9), set them to NaN
+                # TODO(ZanderKeith): This should be done in a common location for things obtained from EFIT, too
+                valid_xpoint_mask = (ds["rxpt1"] > 0) & (ds["rxpt2"] > 0)
+                for var in ["rxpt1", "zxpt1", "rxpt2", "zxpt2"]:
+                    ds[var] = ds[var].where(valid_xpoint_mask, other=np.nan)
 
                 datasets.append(ds)
 
-            max_nitera = max(ds.dim_nitera.size for ds in datasets)
-            datasets_nitera = []
-            for ds in datasets:
-                expand_len = max_nitera - ds.dim_nitera.size
-                expanded_vals = {
-                    "cchisq": xr.DataArray(
-                        np.pad(
-                            ds["cchisq"][0],
-                            ((0, expand_len)),
-                            "constant",
-                            constant_values=np.nan,
-                        ),
-                        coords={"dim_nitera": np.arange(0, max_nitera)},
-                    ),
-                    "cerror": xr.DataArray(
-                        np.pad(
-                            ds["cerror"][0],
-                            ((0, expand_len)),
-                            "constant",
-                            constant_values=np.nan,
-                        ),
-                        coords={"dim_nitera": np.arange(0, max_nitera)},
-                    ),
-                }
-                ds_n = ds.drop_dims("dim_nitera")
-                ds_n = ds.assign(expanded_vals)
-                datasets_nitera.append(ds_n)
-
-            datasets_coordinated = [
-                ds.assign_coords(time=[ds.time.values[0]]) for ds in datasets_nitera
-            ]
-            final_dataset = xr.concat(datasets_coordinated, dim="time")
+            final_dataset = xr.concat(datasets, dim="time")
 
         os.chdir(start_dir)
         return final_dataset
