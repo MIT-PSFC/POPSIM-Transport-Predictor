@@ -20,7 +20,7 @@ from transport_study.datasets import make_uniform_1khz_timebase
 from transport_study.datasets.cmod import (
     CMOD_DATASET_SIGNALS,
 )
-from transport_study.datasets.cmod.gp_fit import gp_profile
+from transport_study.datasets.cmod.gp_fit import fit_gp_hyperparameters, gp_profile
 from transport_study.datasets.dispy_utils import summary
 from transport_study.datasets.workflow import DataWorkflow
 
@@ -178,6 +178,7 @@ class CModDataWorkflow(DataWorkflow):
         """
 
         shot_prediction = {}
+        cached_hyperparams: dict[str, np.ndarray | None] = {"te": None, "ne": None}
 
         for shot in ds_thomson["shot"].values:
             ds_shot = ds_thomson.where(ds_thomson["shot"] == shot, drop=True)
@@ -209,6 +210,17 @@ class CModDataWorkflow(DataWorkflow):
                 # Historic data, we're mostly going off vibes anyway
                 err_y = np.where(err_y < 0.1, 0.1, err_y)
 
+                if cached_hyperparams[variable] is None:
+                    # Fit once and reuse for the remainder of the dataset build.
+                    for i_seed, _ in enumerate(times):
+                        cached_hyperparams[variable] = fit_gp_hyperparameters(
+                            data_X=data_x[i_seed, :],
+                            data_y=data_y[i_seed, :],
+                            err_y=err_y[i_seed, :],
+                        )
+                        if cached_hyperparams[variable] is not None:
+                            break
+
                 for i_time, _ in enumerate(times):
                     y_star, std_y_star, _, _ = gp_profile(
                         data_X=data_x[i_time, :],
@@ -216,6 +228,8 @@ class CModDataWorkflow(DataWorkflow):
                         err_y=err_y[i_time, :],
                         X_star=self.gp_fit_psi,
                         calc_gradient=False,
+                        hyperparams=cached_hyperparams[variable],
+                        optimize_hyperparams=cached_hyperparams[variable] is None,
                     )
                     if y_star is None:
                         continue
