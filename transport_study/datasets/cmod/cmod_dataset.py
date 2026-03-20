@@ -6,7 +6,11 @@ import netCDF4  # noqa: F401
 import numpy as np
 import xarray as xr
 from disruption_py.machine.tokamak import Tokamak
-from disruption_py.settings import RetrievalSettings
+from disruption_py.settings import (
+    LogSettings,
+    RetrievalSettings,
+)
+from disruption_py.settings.output_setting import DatasetOutputSetting
 from disruption_py.workflow import get_shots_data
 from loguru import logger
 
@@ -147,6 +151,8 @@ class CModDataWorkflow(DataWorkflow):
             tokamak=Tokamak.CMOD,
             shotlist_setting=[shot],
             retrieval_settings=retrieval_settings,
+            output_setting=DatasetOutputSetting(path=False),
+            log_settings=LogSettings(file_path=None),
             num_processes=1,
         )
         if len(result) == 0:
@@ -221,7 +227,12 @@ class CModDataWorkflow(DataWorkflow):
                         ne_data[i_time, :] = y_star
                         ne_err[i_time, :] = std_y_star
 
-                    if config.debug and i_time > 2:
+                    if i_time % 10 == 0:
+                        logger.verbose(
+                            f"Completed {i_time}/{len(times)} fits for {variable}"
+                        )
+
+                    if config.debug and i_time > 20:
                         break
 
             shot_prediction[shot] = xr.Dataset(
@@ -267,6 +278,8 @@ class CModDataWorkflow(DataWorkflow):
             tokamak=Tokamak.CMOD,
             shotlist_setting=shot,
             retrieval_settings=retrieval_settings,
+            output_setting=DatasetOutputSetting(path=False),
+            log_settings=LogSettings(file_path=None),
             num_processes=1,
         )
         result = result.set_index(idx=["shot", "time"]).unstack("idx")
@@ -417,8 +430,8 @@ class CModDataWorkflow(DataWorkflow):
         # B0
         ds["betan"] = ds["beta_n"]
         ds["ne20_edge"] = ds["ne20_psi"].sel(
-            psi=1.0
-        )  # C-Mod doesn't have edge interferometry, get the density from psi=1.0
+            psi=0.9
+        )  # C-Mod doesn't have edge interferometry, get the density from psi=0.9
         # R0
         # kappa
         # a_minor

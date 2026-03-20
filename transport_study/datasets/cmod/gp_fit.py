@@ -33,9 +33,7 @@ def gp_profile(
     gp.add_data(val_bc[:, 0], val_bc[:, 1], err_y=val_bc[:, 2], n=0)
     gp.add_data(grad_bc[:, 0], grad_bc[:, 1], err_y=grad_bc[:, 2], n=1)
 
-    gp.optimize_hyperparameters(
-        verbose=False, random_starts=12, max_tries=6, num_proc=2
-    )
+    gp.optimize_hyperparameters(verbose=False, random_starts=8, max_tries=4, num_proc=4)
     y_star, std_y_star = gp.predict(X_star)
 
     if not calc_gradient:
