@@ -37,6 +37,7 @@ class D3DDataWorkflow(DataWorkflow):
     It cannot be executed on clusters without DIII-D data access.
 
     POWER BALANCE SIGNALS:
+    Wtot_MJ
     Ip_MA
     - measured:
     B0
@@ -99,6 +100,8 @@ class D3DDataWorkflow(DataWorkflow):
     - measured: betapf
     beta_p from slow EFIT
     beta_n from slow EFIT
+    wmhd_MJ
+    - wmhd from slow EFIT (just to fill in missing power balance)
 
     """
 
@@ -248,6 +251,9 @@ class D3DDataWorkflow(DataWorkflow):
 
         p = Pipeline([shot])
 
+        # POWER BALANCE SIGNALS
+        wmhdf = MdsSignal(r"\wmhdf", "pedestal", location="remote://atlas.gat.com")
+
         # MEASURED SIGNALS
         ip = PtDataSignal("ip")
         bt = PtDataSignal("bt")
@@ -286,6 +292,7 @@ class D3DDataWorkflow(DataWorkflow):
             "idtrxtop": idtrxtop,
             "idtzxtop": idtzxtop,
             "betapf": betapf,
+            "wmhdf": wmhdf,
         }
 
         p.fetch_dataset("toksearch", sigs_dict)
@@ -438,6 +445,7 @@ class D3DDataWorkflow(DataWorkflow):
             # recomputation mangles this, fallback to EFIT01
             efit_result["gapin"] = slow_efit_result["gapin"]
             efit_result["beta_n"] = slow_efit_result["beta_n"]
+            efit_result["wmhd"] = slow_efit_result["wmhd"]
 
         valid_xpoint_mask = (efit_result["rxpt1"] > 0) & (efit_result["rxpt2"] > 0)
         for var in ["rxpt1", "zxpt1", "rxpt2", "zxpt2"]:
@@ -631,6 +639,8 @@ class D3DDataWorkflow(DataWorkflow):
         """
 
         # POWER BALANCE TRAINING
+        ds["Wtot_MJ"] = ds["wmhdf"] / 1e6
+        ds["Wmhd_MJ"] = ds["wmhd"] / 1e6  # Convert J to MJ
         ds["Ip_MA"] = np.abs(ds["ip"]) / 1e6  # Convert A to MA
         ds["B0"] = np.abs(ds["bt"])
         ds["R0"] = ds["rsurf"]
@@ -676,10 +686,13 @@ class D3DDataWorkflow(DataWorkflow):
 
         # Only keep variables of interest
         kept_vars = {
+            # POWER BALANCE TRAINING
+            "Wtot_MJ",
+            "Wmhd_MJ",
+            "Ip_MA",
             # PROFILE PREDICTOR PREDICT-FIRST SIGNALS
             "Te_keV_psi",
             "ne20_psi",
-            "Ip_MA",
             "Ip_MA_prog",
             "B0",
             "B0_prog",
@@ -766,22 +779,22 @@ class D3DDataWorkflow(DataWorkflow):
                 ~wtot_missing_or_zero, other=ds["Wmhd_MJ"]
             )
 
-        # Similarly, beta_p (EFIT) is close enough to beta (pedestal)
-        if "beta" in ds and "beta_p" in ds:
-            beta_missing_or_zero = ds["beta"].isnull() | (ds["beta"] == 0)
-            ds["beta"] = ds["beta"].where(~beta_missing_or_zero, other=ds["beta_p"])
+        # Similarly, we sometimes need to fill in betan (from pedestal) with betan from some other source
+        # Our order of preference is as follows:
+        # 1: betan from pedestal (betanf from toksearch)
+        betanf = ds["betan"]
+        # 2: beta_n from fast efit (recomputed from betat)
+        betat = ds["betat"]
+        betan_fast = betat * ds["a_minor"] * ds["B0"] / ds["Ip_MA"]
+        # 3: beta_n from slow efit
+        beta_n = ds["beta_n"]
+
+        priority_2 = betan_fast.where(betan_fast.notnull() & (betan_fast != 0), beta_n)
+        priority_1 = betanf.where(betanf.notnull() & (betanf != 0), priority_2)
+        ds["betan"] = priority_1
 
         # Use the smoothed version of P_NBI
-        ds["P_NBI_MW"] = np.abs(ds["P_NBI_MW_alt"])
-
-        # Drop unnecessary alternative signals
-        alt_signals = [
-            "P_NBI_MW_alt",
-            "P_oh_MW_alt",
-            "P_rad_MW_alt",
-        ]
-        for sig in alt_signals:
-            if sig in ds:
-                ds = ds.drop_vars(sig)
+        if "P_NBI_MW" in ds and "P_NBI_MW_alt" in ds:
+            ds["P_NBI_MW"] = np.abs(ds["P_NBI_MW_alt"])
 
         return ds
