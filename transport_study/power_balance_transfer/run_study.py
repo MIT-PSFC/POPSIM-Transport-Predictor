@@ -7,11 +7,9 @@ from itertools import product
 import fire
 import netCDF4  # noqa: F401
 import xarray as xr
-import yaml
 from loguru import logger
-from popsim.ml import DataLoader, TrainConfig, Trainer
+from popsim.ml import TrainConfig
 from popsim.ml.launch import (
-    _get_train_run_builder_class,
     launch_agent,
     launch_sweep,
     launch_train,
@@ -20,13 +18,10 @@ from popsim.ml.launch import (
 from transport_study import PACKAGE_ROOT
 from transport_study.config import config
 from transport_study.orchestration.slurm_utils import (
-    count_running_jobs,
     launch_train_parallel,
-    resources_available,
 )
 from transport_study.orchestration.study import Study
 from transport_study.orchestration.wandb_utils import (
-    get_completed_runs,
     get_sweep_id,
     run_clean_sweeps,
 )
@@ -337,160 +332,6 @@ class PowerBalanceStudy(Study):
         logger.info(f"Domain adaptation methods: {domain_adaptation_methods}")
         logger.info(f"Freeze submodules options: {freeze_submodules_options}")
         logger.info(f"Number of high-performance shots options: {num_hp_shots_options}")
-
-    ####################
-    # PATHING / NAMING #
-    ####################
-    def trained_model_dir(self, case: Case) -> str:
-        """Given a case, return the path where the trained model checkpoints for that case should be stored."""
-        return os.path.join(self.model_dir, str(case))
-
-    def result_path(self, case: Case) -> str:
-        """Given a case, return the path where the results for that case should be stored."""
-        return os.path.join(self.result_dir, str(case), "result_data.nc")
-
-    def collected_results_path(self) -> str:
-        """Return the path where the collected results for all cases should be stored."""
-        return os.path.join(self.result_dir, "collected_results.nc")
-
-    def tuned_config_path(self, case: Case) -> str:
-        """Given a case, return the path where the tuned hyperparameters for that case should be stored"""
-        hyperparam_case = case.get_hyperparam_prereq()
-        return os.path.join(self.model_dir, str(hyperparam_case), "tuned_config.yaml")
-
-    def wandb_project_name(self, case: Case) -> str:
-        """Given a case, return the wandb project name to use for that case"""
-        return f"{self.name}.{case}"
-
-    def sweep_job_name(self, case: Case) -> str:
-        return f"sweep_{case}"
-
-    def train_job_name(self, case: Case) -> str:
-        return f"train_{case}"
-
-    #############
-    # EXECUTION #
-    #############
-    def check_data_requirements(self, case: Case) -> bool:
-        """Given a case, check if the required data for that case is available. If not, return False and print a message indicating what data is missing."""
-        required_datasets = set()
-
-        if case.training_data in ["cmod", "cmod_tcv"]:
-            required_datasets.add("cmod")
-        if case.training_data in ["tcv", "cmod_tcv"]:
-            required_datasets.add("tcv")
-        if case.training_data == "exnihilo" or case.domain_adaptation in [
-            "mixing",
-            "transfer",
-        ]:
-            required_datasets.add("d3d_hp")
-
-        missing_datasets = [
-            ds for ds in required_datasets if ds not in self.dataset_paths.keys()
-        ]
-        if len(missing_datasets) > 0:
-            logger.warning(
-                f"Case {case} is missing required datasets: {missing_datasets}. Skipping this case."
-            )
-            return False
-
-        return True
-
-    def run_case(  # noqa: PLR0912
-        self,
-        case: Study.Case,
-        skip_tuning: bool,
-        enable_parallelism: bool,
-    ):
-        """Run a single case of the study, including hyperparameter tuning, training, and evaluation as needed.
-
-        If case or a prereq is in progress, simply return and let orchestration loop try again later.
-        """
-        if not self.check_data_requirements(case):
-            raise ValueError(
-                f"Case {case} does not have the required data to run. This should have been caught earlier!"
-            )
-
-        if os.path.exists(self.result_path(case)):
-            logger.warning(f"Case {case} already has results, skipping.")
-            return
-
-        if self.check_prereq_satisfied(case):
-            logger.opt(colors=True).info(f"<bold>RUNNING CASE:</bold>\n{case}")
-            # Prereq is satisfied, can run this case.
-            if case.is_hyperparam_case():
-                if skip_tuning:
-                    logger.info("Skipping hyperparameter tuning")
-                    # Copy default config for this module and put it in the trained model dir so the rest of the workflow can find it
-                    default_config = self.make_train_config(case)
-                    tuned_config_path = self.tuned_config_path(case)
-                    os.makedirs(os.path.dirname(tuned_config_path), exist_ok=True)
-                    with open(tuned_config_path, "w") as f:
-                        yaml.dump(default_config.model_dump(), f, indent=4)
-                else:
-                    logger.info("Checking if hyperparameter tuning is already done")
-                    tuned_config_path = self.tuned_config_path(case)
-                    if os.path.exists(tuned_config_path):
-                        logger.info(
-                            f"Hyperparameter tuning completed, tuned config found at {tuned_config_path}"
-                        )
-                    else:
-                        completed_runs = get_completed_runs(
-                            self.wandb_project_name(case)
-                        )
-                        if len(completed_runs) > config.hyperparam_sweeps:
-                            logger.info(
-                                f"Hyperparameter sweeps completed with {len(completed_runs)} runs"
-                            )
-                            # Check if there are any running jobs for this case
-                            if enable_parallelism:
-                                running_jobs = count_running_jobs(
-                                    self.sweep_job_name(case), config.partition
-                                )
-                                if len(running_jobs) > 0:
-                                    logger.info(
-                                        f"Found {len(running_jobs)} running jobs, waiting for them to complete before proceeding"
-                                    )
-                                    return
-                        else:
-                            logger.info(
-                                f"Hyperparameter sweeps incomplete, {len(completed_runs)} out of {config.hyperparam_sweeps} runs"
-                            )
-                            logger.info("Launching hyperparameter sweep")
-                            self.launch_sweep(case)
-                            return
-
-            # At this point, we know the tuned config is available at tuned_config_path, so we can proceed to training
-            if enable_parallelism:
-                running_jobs = count_running_jobs(
-                    self.train_job_name(case), config.partition
-                )
-                if running_jobs > 0:
-                    logger.info(
-                        f"Found {running_jobs} running training jobs, waiting for them to complete before proceeding"
-                    )
-                    return
-                if not resources_available():
-                    logger.info(
-                        "No resources currently available, waiting before trying again..."
-                    )
-                    time.sleep(10)
-                    return
-
-            self.launch_train(case, enable_parallelism=enable_parallelism)
-
-        else:
-            for prereq in case.prereqs:
-                if not os.path.exists(self.result_path(prereq)):
-                    logger.debug(
-                        f"Prereq not satisfied yet, running that first.\nCase:\t{case}\nPrereq:\t{prereq}"
-                    )
-                    self.run_case(
-                        prereq,
-                        skip_tuning=skip_tuning,
-                        enable_parallelism=enable_parallelism,
-                    )
-                    return
 
     def _input_vars(self, case: Case) -> list[str]:
         input_vars_base = [
@@ -922,53 +763,6 @@ class PowerBalanceStudy(Study):
     ##############
     # COLLECTION #
     ##############
-
-    def restore_trainer(
-        self, case: Case, restore_best_checkpoint: bool = True
-    ) -> tuple[Trainer, DataLoader]:
-        """Restore a given case's trainer and the test dataloader"""
-        if not os.path.exists(self.trained_model_dir(case)):
-            raise ValueError(
-                f"Trained model directory for case\n{case}\nnot found at\n{self.trained_model_dir(case)}"
-            )
-        if not os.path.exists(self.result_path(case)):
-            logger.warning(
-                f"Result file for case\n{case}\nnot found at\n{self.result_path(case)}\nTraining may be incomplete!"
-            )
-        training_config = self.make_train_config(case)
-        train_run_builder = _get_train_run_builder_class(
-            training_config.train_run_builder
-        )
-        # If this is a submodule, use the dataloader construction logic from the main module. Fallback to using the submodule's own logic otherwise.
-        if training_config.dataloader_config.get("data_train_run_builder"):
-            data_train_run_builder = _get_train_run_builder_class(
-                training_config.dataloader_config["data_train_run_builder"]
-            )
-            _, train_dl, _val_dl, test_dl = data_train_run_builder.get_dataloaders(
-                training_config.dataloader_config
-            )
-        else:
-            _, train_dl, _val_dl, test_dl = train_run_builder.get_dataloaders(
-                training_config.dataloader_config
-            )
-        model = train_run_builder.model_init(
-            train_dl, training_config.model_init_config
-        )
-        loss_fn = train_run_builder.get_loss_fn(training_config.loss_config)
-        opt = train_run_builder.get_optimizer(training_config.optimizer_config)
-        trainer = Trainer(
-            model=model,
-            loss_fn=loss_fn,
-            optimizer=opt,
-            checkpoint_dir=training_config.checkpoint_dir,
-            trainable_getter=train_run_builder.get_trainable_getter(
-                training_config.model_init_config
-            ),
-        )
-        if restore_best_checkpoint:
-            trainer.restore_best_checkpoint(path=self.trained_model_dir(case))
-
-        return trainer, test_dl
 
     def collect_results(self):
         """Collect results from all cases and combine them into a single xarray dataset for analysis and visualization.

@@ -6,12 +6,23 @@ from itertools import product
 
 import fire
 import netCDF4  # noqa: F401
+import xarray as xr
 from loguru import logger
+from popsim.ml import TrainConfig
+from popsim.ml.launch import (
+    launch_agent,
+    launch_sweep,
+    launch_train,
+)
 
 from transport_study import PACKAGE_ROOT
 from transport_study.config import config
+from transport_study.orchestration.slurm_utils import (
+    launch_train_parallel,
+)
 from transport_study.orchestration.study import Study
 from transport_study.orchestration.wandb_utils import (
+    get_sweep_id,
     run_clean_sweeps,
 )
 
@@ -200,7 +211,7 @@ class ProfileStudy(Study):
         training_datasets,
         data_normalization_methods,
         domain_adaptation_methods,
-        freeze_submodules_options,
+        freeze_shapes_options,
         num_hp_shots_options,
     ):
         cases = []
@@ -210,14 +221,14 @@ class ProfileStudy(Study):
             training_dataset,
             data_normalization,
             domain_adaptation,
-            freeze_submodules,
+            freeze_shapes,
             num_hp_shots,
         ) in product(
             model_types,
             training_datasets,
             data_normalization_methods,
             domain_adaptation_methods,
-            freeze_submodules_options,
+            freeze_shapes_options,
             num_hp_shots_options,
         ):
             if domain_adaptation is None and num_hp_shots != -1:
@@ -228,7 +239,7 @@ class ProfileStudy(Study):
                 training_data=training_dataset,
                 data_normalization=data_normalization,
                 domain_adaptation=domain_adaptation,
-                freeze_submodules=freeze_submodules,
+                freeze_shapes=freeze_shapes,
                 num_hp_shots=num_hp_shots,
             )
 
@@ -251,6 +262,391 @@ class ProfileStudy(Study):
         ]  # Remove impossible cases
 
         return possible_cases
+
+    def __init__(
+        self,
+        name: str,
+        working_dir_base: str,
+        dataset_paths: dict[str, str],
+        model_types: list[str],
+        training_datasets: list[str],
+        data_normalization_methods: list[str],
+        domain_adaptation_methods: list[str],
+        freeze_shapes_options: list[bool],
+        num_hp_shots_options: list[int],
+        hp_test_set_size: int,
+    ):
+        cases = self.make_cases(
+            model_types,
+            training_datasets,
+            data_normalization_methods,
+            domain_adaptation_methods,
+            freeze_shapes_options,
+            num_hp_shots_options,
+        )
+        super().__init__(name, working_dir_base, dataset_paths, cases, hp_test_set_size)
+
+        logger.info(f"C-Mod dataset path: {dataset_paths.get('cmod', 'Not provided')}")
+        logger.info(f"TCV dataset path: {dataset_paths.get('tcv', 'Not provided')}")
+        logger.info(
+            f"DIII-D high-performance dataset path: {dataset_paths.get('d3d_hp', 'Not provided')}"
+        )
+
+        logger.info(f"Model types: {model_types}")
+        logger.info(f"Training datasets: {training_datasets}")
+        logger.info(f"Data normalization methods: {data_normalization_methods}")
+        logger.info(f"Domain adaptation methods: {domain_adaptation_methods}")
+        logger.info(f"Freeze shapes options: {freeze_shapes_options}")
+        logger.info(f"Number of high-performance shots options: {num_hp_shots_options}")
+
+    #############
+    # EXECUTION #
+    #############
+    def _input_vars(self, case: Case) -> list[str]:
+        input_vars_base = [
+            "Ip_MA",
+            "B0",
+            "betan",
+            "ne20_edgeR0",
+            "a_minorkappa",
+            "delta_top",
+            "delta_bot",
+        ]
+        if case.data_normalization == "raw":
+            input_vars = input_vars_base
+        elif case.data_normalization == "physics":
+            input_vars = [
+                *input_vars_base,
+                "epsilon",
+                "q_star",
+                "f_G",
+                "aB0",
+            ]
+        elif case.data_normalization == "z_score":
+            input_vars = [*input_vars_base, *(f"{var}_z" for var in input_vars_base)]
+        elif case.data_normalization == "coral":
+            input_vars = [
+                *input_vars_base,
+                *(f"{var}_coral" for var in input_vars_base),
+            ]
+        else:
+            raise ValueError(f"Unknown normalization method: {case.data_normalization}")
+
+        return input_vars
+
+    def make_train_config(self, case: Case) -> TrainConfig:
+        """Make the TrainConfig for a given case
+        If a hyperparameter tuned config is available, fills in the hyperparameters from that, otherwise uses default config.
+        """
+        dataloader_config_base = {
+            "training_data": case.training_data,
+            "data_normalization": case.data_normalization,
+            "domain_adaptation": case.domain_adaptation,
+            "num_hp_shots": case.num_hp_shots,
+            "hp_test_set_size": self.hp_test_set_size,
+            "prng_seed": 42,
+            "debug": config.debug,
+            # Hyperparameters
+            "batch_size": 8192,
+        }
+        loss_config_base = {
+            "huber_delta": 0.5,
+        }
+        optimizer_config_base = {
+            "lr0": 1e-4,
+            "transition_steps": 500,
+            "decay_rate": 0.5,
+            "lrf": 5e-4,
+            "weight_decay": 2e-4,
+        }
+        test_eval_suite_config_base = {
+            "result_path": self.result_path(case),
+        }
+        if case.domain_adaptation == "mixing":
+            # Special logic for loss weighting when doing mixing domain adaptation
+            # Assuming ~1000 shots of historic data for C-Mod and TCV and DIII-D low-performance, and num_hp_shots of DIII-D high-performance
+            # we want the high-performance data to be consistently heavily weighted
+            # Weights are chosen so that each device's effective contribution F_x = W_x * N_x
+            # (where N_x is the shot count) sums to 200, with d3d_hp carrying ~50% of that total.
+            # So the C-Mod and TCV data each make up 10 out of 200,
+            # the DIII-D low-performance data makes up 80 out of 200,
+            # and the DIII-D high-performance data makes up 100 out of 200
+            W_c = 10 / 1000
+            W_t = 10 / 1000
+            W_dlp = 80 / 1000
+            if case.num_hp_shots in [-1, 0]:
+                # If -1, all 97 high-performance shots in the DIII-D dataset
+                # If 0, weights aren't being used anyway
+                N_dhp = 97
+            else:
+                N_dhp = case.num_hp_shots
+            W_dhp = 100 / N_dhp
+            # Multiply all by
+            dataloader_config_base["device_weights"] = {
+                "cmod": W_c * 100,
+                "tcv": W_t * 100,
+                "d3d_lp": W_dlp * 100,
+                "d3d_hp": W_dhp * 100,
+            }
+
+        def _make_train_config_base(case: ProfileStudy.Case) -> TrainConfig:
+            if case.model_type == "shape_init":
+                input_vars = self._input_vars(case)
+                train_config_base = TrainConfig(
+                    project=self.wandb_project_name(case),
+                    train_run_builder="transport_study.modules.profile_predictor.trb.ProfilePredictorTRB",
+                    max_epochs=config.max_epochs,
+                    epochs_per_val=config.epochs_per_val,
+                    checkpoint_dir=self.trained_model_dir(
+                        case
+                    ),  # When doing hyperparameter tuning, this gets overwritten by the wandb agent
+                    dataloader_config={
+                        "target_vars": ["Wtot_MJ", "ds_source_idx"],
+                        "input_vars": input_vars,
+                        **dataloader_config_base,
+                    },
+                    model_init_config={
+                        "nn_depth": 2,
+                        "nn_width": 16,
+                        "min_val": 0,  # Minimum ohmic power in MW
+                        "max_val": 16,  # Maximum ohmic power in MW
+                        "prng_seed": 42,
+                        "in_size": 7,
+                        "out_size": 1,
+                        "data_normalization": case.data_normalization,
+                        "domain_adaptation": case.domain_adaptation,
+                        "freeze_shapes": case.freeze_shapes,
+                    },
+                    loss_config=loss_config_base,
+                    optimizer_config=optimizer_config_base,
+                    test_eval_suite_config=test_eval_suite_config_base,
+                )
+            elif case.model_type == "unstructured_nn":
+                train_config_base = TrainConfig(
+                    project=self.wandb_project_name(case),
+                    train_run_builder="transport_study.modules.profile_predictor.trb.ProfilePredictorTRB",
+                    max_epochs=config.max_epochs,
+                    epochs_per_val=config.epochs_per_val,
+                    checkpoint_dir=self.trained_model_dir(
+                        case
+                    ),  # When doing hyperparameter tuning, this gets overwritten by the wandb agent
+                    dataloader_config={
+                        "input_vars": self._input_vars(case),
+                        "target_vars": ["Wtot_MJ", "ds_source_idx"],
+                        **dataloader_config_base,
+                    },
+                    model_init_config={
+                        "model_type": case.model_type,
+                        "data_normalization": case.data_normalization,
+                        "domain_adaptation": case.domain_adaptation,
+                        "freeze_shapes": case.freeze_shapes,
+                        "nn_depth": 2,
+                        "nn_width": 16,
+                        "in_size": 9,  # Ip_MA, B0, betan, ne20_edge, R0, a_minor, kappa, delta_top, delta_bot,
+                        "out_size": 1,
+                        "prng_seed": 42,
+                    },
+                    loss_config=loss_config_base,
+                    optimizer_config=optimizer_config_base,
+                    test_eval_suite_config=test_eval_suite_config_base,
+                )
+            else:
+                raise ValueError(f"Unknown model type: {case.model_type}")
+
+            return train_config_base
+
+        train_config_base = _make_train_config_base(case)
+
+        # For transfer learning, point to where this case's pretrained checkpoint
+        if case.domain_adaptation == "transfer":
+            # Pretrained model has same model_type, training_data, and data_normalization,
+            # but no domain adaptation and no high-performance shots
+            transfer_case = ProfileStudy.Case(
+                model_type=case.model_type,
+                training_data=case.training_data,
+                data_normalization=case.data_normalization,
+                domain_adaptation=None,
+                freeze_shapes=case.freeze_shapes,
+                num_hp_shots=-1,
+            )
+            transfer_case_model_dir = self.trained_model_dir(transfer_case)
+
+            train_config_base = train_config_base.model_copy(
+                update={
+                    "model_init_config": {
+                        **train_config_base.model_init_config,
+                        "transfer_checkpoint": transfer_case_model_dir,
+                    }
+                }
+            )
+
+        tuned_config_path = self.tuned_config_path(case)
+        if os.path.exists(tuned_config_path):
+            tuned_config = TrainConfig.load(tuned_config_path)
+            # Restore hyperparameters from the tuned config, but keep the rest of the settings the same
+
+            # Hyperparameters swept for all modules
+            train_config = train_config_base.model_copy(
+                update={
+                    "model_init_config": {
+                        **train_config_base.model_init_config,
+                        "nn_depth": tuned_config.model_init_config["nn_depth"],
+                        "nn_width": tuned_config.model_init_config["nn_width"],
+                    },
+                    "dataloader_config": {
+                        **train_config_base.dataloader_config,
+                        "batch_size": tuned_config.dataloader_config["batch_size"],
+                    },
+                    "optimizer_config": tuned_config.optimizer_config,
+                }
+            )
+            # Hyperparameters swept for only certain modules (N/A for now)
+        else:
+            train_config = train_config_base
+
+        return train_config
+
+    def launch_sweep(self, case: Case):
+        """Launch a wandb hyperparameter sweep for the given case."""
+        train_config = self.make_train_config(case)
+        sweep_id = get_sweep_id(self.wandb_project_name(case))
+
+        if not sweep_id:
+            logger.info(
+                f"No existing sweep found for case {case}, creating a new sweep"
+            )
+            sweep_config_path = os.path.join(
+                PACKAGE_ROOT,
+                "transport_study",
+                "profile_transfer",
+                "sweep_configs",
+                f"{case.model_type}.yaml",
+            )
+            launch_sweep(train_config, sweep_config_path)
+        else:
+            launch_agent(train_config, sweep_id)
+
+    def launch_train(self, case: Case, enable_parallelism: bool = False):
+        """Launch a training job for the given case."""
+        if case.is_impossible():
+            raise ValueError(
+                f"Case {case} is not a possible case to run, check the logic in the Case dataclass to see why this is. This should have been caught earlier!"
+            )
+
+        logger.opt(colors=True).info(
+            f"<bold><red>LAUNCHING TRAINING for case\n{case}</red></bold>"
+        )
+
+        train_config = self.make_train_config(case)
+        result_path = self.result_path(case)
+        train_job_name = self.train_job_name(case)
+        if enable_parallelism:
+            logger.info(f"Launching training job {train_job_name} for case\n{case}")
+            launch_train_parallel(
+                train_config,
+                train_job_name,
+                result_path,
+                os.path.join(self.result_dir, "logs"),
+            )
+        else:
+            logger.info("Launching training serially")
+            _, _, _, _, result_dict = launch_train(train_config)
+            ds = result_dict["test/study_results"]
+            os.makedirs(os.path.dirname(result_path), exist_ok=True)
+            ds.to_netcdf(result_path)
+
+    ##############
+    # COLLECTION #
+    ##############
+
+    def collect_results(self):
+        """Collect results from all cases and combine them into a single xarray dataset for analysis and visualization.
+
+        Dims: case_idx, shot_idx
+        Coords:
+        - shot(case_idx, shot_idx)
+        - ds_source(case_idx, shot_idx)
+        - model_type(case_idx)
+        - training_data(case_idx)
+        - data_normalization(case_idx)
+        - domain_adaptation(case_idx)
+        - freeze_shapes(case_idx)
+        - num_hp_shots(case_idx)
+        Data variables: (E is either relative 'rel' or absolute 'abs', and D is dimension either 'shot' or per-timeslice 'ts')
+        - error_E_D_mean(case_idx)
+        - error_E_D_std(case_idx)
+        - error_E_D_med(case_idx)
+        - error_E_D_p25(case_idx)
+        - error_E_D_p75(case_idx)
+        - error_E_D_min(case_idx)
+        - error_E_D_max(case_idx)
+        """
+        results = []
+        for case in self.cases:
+            result_path = self.result_path(case)
+            if not os.path.exists(result_path):
+                continue
+
+            ds = xr.load_dataset(result_path)
+
+            err_abs_shot = ds["error_abs_shot"]
+            err_rel_shot = ds["error_rel_shot"]
+            err_abs_ts = ds["error_abs_ts"]
+            err_rel_ts = ds["error_rel_ts"]
+
+            result = xr.Dataset(
+                {
+                    "err_abs_shot_mean": err_abs_shot.mean(),
+                    "err_abs_shot_std": err_abs_shot.std(),
+                    "err_abs_shot_med": err_abs_shot.median(),
+                    "err_abs_shot_p25": err_abs_shot.quantile(0.25).drop_vars(
+                        "quantile"
+                    ),
+                    "err_abs_shot_p75": err_abs_shot.quantile(0.75).drop_vars(
+                        "quantile"
+                    ),
+                    "err_abs_shot_min": err_abs_shot.min(),
+                    "err_abs_shot_max": err_abs_shot.max(),
+                    "err_rel_shot_mean": err_rel_shot.mean(),
+                    "err_rel_shot_std": err_rel_shot.std(),
+                    "err_rel_shot_med": err_rel_shot.median(),
+                    "err_rel_shot_p25": err_rel_shot.quantile(0.25).drop_vars(
+                        "quantile"
+                    ),
+                    "err_rel_shot_p75": err_rel_shot.quantile(0.75).drop_vars(
+                        "quantile"
+                    ),
+                    "err_rel_shot_min": err_rel_shot.min(),
+                    "err_rel_shot_max": err_rel_shot.max(),
+                    "err_abs_ts_mean": err_abs_ts.mean(),
+                    "err_abs_ts_std": err_abs_ts.std(),
+                    "err_abs_ts_med": err_abs_ts.median(),
+                    "err_abs_ts_p25": err_abs_ts.quantile(0.25).drop_vars("quantile"),
+                    "err_abs_ts_p75": err_abs_ts.quantile(0.75).drop_vars("quantile"),
+                    "err_abs_ts_min": err_abs_ts.min(),
+                    "err_abs_ts_max": err_abs_ts.max(),
+                    "err_rel_ts_mean": err_rel_ts.mean(),
+                    "err_rel_ts_std": err_rel_ts.std(),
+                    "err_rel_ts_med": err_rel_ts.median(),
+                    "err_rel_ts_p25": err_rel_ts.quantile(0.25).drop_vars("quantile"),
+                    "err_rel_ts_p75": err_rel_ts.quantile(0.75).drop_vars("quantile"),
+                    "err_rel_ts_min": err_rel_ts.min(),
+                    "err_rel_ts_max": err_rel_ts.max(),
+                }
+            ).assign_coords(
+                {
+                    "model_type": case.model_type,
+                    "training_data": case.training_data,
+                    "data_normalization": case.data_normalization,
+                    "domain_adaptation": case.domain_adaptation,
+                    "freeze_shapes": case.freeze_shapes,
+                    "num_hp_shots": case.num_hp_shots,
+                }
+            )
+            results.append(result)
+
+        ds_merged = xr.concat(results, dim="case_idx")
+        return ds_merged
 
 
 def run_study(  # noqa: PLR0915
