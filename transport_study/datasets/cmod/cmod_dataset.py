@@ -91,6 +91,7 @@ class CModDataWorkflow(DataWorkflow):
         self.filter_config = {
             "Wtot_MJ": {"min": 0.001, "max": 2},
             "ne20_line_avg": {"min": 0.01, "max": 4},
+            "betan": {"min": 0, "max": 5},
         }
         self.individual_filter_config = None
         self.skip_profiles = skip_profiles
@@ -496,8 +497,6 @@ class CModDataWorkflow(DataWorkflow):
     def device_specific_processing(self, ds: xr.Dataset) -> xr.Dataset:
         """Apply C-Mod specific processing steps.
 
-        Currently no special processing is needed for C-Mod beyond the base workflow.
-
         Parameters
         ----------
         ds : xr.Dataset
@@ -508,5 +507,23 @@ class CModDataWorkflow(DataWorkflow):
         xr.Dataset
             Processed dataset ready for general workflow
         """
-        # No special processing needed for C-Mod at this time
+
+        # Cull obviously bad fits, such as when the point at psi = 0 is super low (1160503009 0.83)
+        # Or when any profile value at psi < 1.0 is negative
+        negative_profile_mask = (ds["ne20_psi"].where(ds["psi"] < 1.0) < 0).any(
+            dim="psi"
+        ) | (ds["Te_keV_psi"].where(ds["psi"] < 1.0) < 0).any(dim="psi")
+        low_value_mask = (ds["Te_keV_psi"].sel(psi=0) < 1.0) | (
+            ds["ne20_psi"].sel(psi=0) < 0.3
+        )
+        valid_profile_mask = ~(negative_profile_mask | low_value_mask)
+        if valid_profile_mask.sum() == 0:
+            logger.warning(f"All profiles are invalid for shot {ds['shot'].item()}")
+        else:
+            logger.debug(
+                f"Culled {(~valid_profile_mask).sum().item() / (valid_profile_mask.sum().item()) * 100:.2f}% invalid profiles for shot {ds['shot'].item()}"
+            )
+        ds["ne20_psi"] = ds["ne20_psi"].where(valid_profile_mask)
+        ds["Te_keV_psi"] = ds["Te_keV_psi"].where(valid_profile_mask)
+
         return ds
