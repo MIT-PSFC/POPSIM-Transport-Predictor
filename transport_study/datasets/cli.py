@@ -43,7 +43,6 @@ class DatasetCLI:
         mode: str | None = "raw",
         clean: bool | None = False,
         use_ida: bool | None = True,
-        skip_profiles: bool | None = False,
     ):
         data_assembly_dir = os.path.join(data_assembly_dir, config.study_name)
         workflow = D3DDataWorkflow(
@@ -52,7 +51,6 @@ class DatasetCLI:
             data_assembly_dir=data_assembly_dir,
             max_num_shots=max_num_shots,
             use_ida=use_ida,
-            skip_profiles=skip_profiles,
         )
 
         self._execute(workflow, mode, clean)

@@ -1,10 +1,6 @@
 """Makes the 'raw' DIII-D dataset on omega, to be processed later by POPSIM"""
 
-import glob
-import io
 import os
-import tarfile
-import tempfile
 
 import netCDF4  # noqa: F401
 import numpy as np
@@ -13,154 +9,21 @@ from disruption_py.machine.tokamak import Tokamak
 from disruption_py.settings import (
     LogSettings,
     RetrievalSettings,
-    TimeSetting,
-    TimeSettingParams,
 )
 from disruption_py.settings.output_setting import DatasetOutputSetting
-from disruption_py.settings.time_setting import _postprocess
 from disruption_py.workflow import get_shots_data
-from freeqdsk import aeqdsk, geqdsk
 from loguru import logger
 
-from transport_study import EPISODE_DIM, PACKAGE_ROOT, TIME_COORD, TIME_DIM
+from transport_study import EPISODE_DIM, TIME_COORD, TIME_DIM
 from transport_study.config import config
 from transport_study.datasets import make_uniform_1khz_timebase
+from transport_study.datasets.d3d.utils import (
+    Uniform1kHzTimeSetting,
+    compare_efits,
+    disruption_efit,
+)
 from transport_study.datasets.dispy_utils import summary
 from transport_study.datasets.workflow import DataWorkflow
-
-
-def _clean_aeqdsk_file(f):
-    """Clean AEQDSK file by removing invalid text lines that don't fit Fortran format.
-
-    Some AEQDSK files have stray text labels (like "MAG") at the end that are not
-    valid floating-point values for Fortran format descriptors. This function filters
-    those out by reading all lines, checking if they're valid numeric data, and
-    returning a cleaned file-like object.
-
-    Parameters
-    ----------
-    f : file-like object
-        File handle to read from
-
-    Returns
-    -------
-    io.StringIO
-        A file-like object with cleaned content
-    """
-    content = f.read()
-    lines = content.split("\n")
-    cleaned_lines = []
-
-    for line in lines:
-        # Check if this line contains only whitespace and text (no numbers)
-        # Valid FORTRAN formatted lines will have numbers in scientific notation
-        stripped = line.strip()
-        if stripped:
-            # If the line contains valid numeric indicators, keep it
-            # Valid indicators: E+, E-, D+, D-, digits, -, +, ., or leading spaces
-            if any(
-                c in stripped
-                for c in [
-                    "E",
-                    "D",
-                    "e",
-                    "d",
-                    "0",
-                    "1",
-                    "2",
-                    "3",
-                    "4",
-                    "5",
-                    "6",
-                    "7",
-                    "8",
-                    "9",
-                    "+",
-                    "-",
-                    ".",
-                ]
-            ):
-                cleaned_lines.append(line)
-        else:
-            # Keep blank lines as they're part of the format
-            cleaned_lines.append(line)
-
-    # Reconstruct the file content and return as StringIO
-    cleaned_content = "\n".join(cleaned_lines)
-    return io.StringIO(cleaned_content)
-
-
-DEFAULT_SHOTLIST_FILE = os.path.join(
-    PACKAGE_ROOT, "datasets", "d3d", "HBP_shotlist_2024"
-)
-
-
-class Uniform1kHzTimeSetting(TimeSetting):
-    """
-    Time setting for creating a uniform timebase at 1 kHz, based on the maximum EFIT time.
-    """
-
-    def _get_times(self, params: TimeSettingParams) -> np.ndarray:
-        """
-        Parameters
-        ----------
-        params : TimeSettingParams
-            Parameters needed to retrieve the timebase.
-
-        Returns
-        -------
-        np.ndarray
-            Array of times in the timebase.
-        """
-        (efit_time,) = params.mds_conn.get_dims(
-            r"\efit_aeqdsk:ali", tree_name="_efit_tree"
-        )
-        # If timebase is much slower than 1 kHz, log a warning
-        typical_delta = np.median(np.diff(efit_time))
-        if typical_delta > 2:
-            logger.critical(
-                f"EFIT timebase is much slower than 1 kHz (typical delta: {typical_delta:.3f} ms). This may cause issues with interpolation and data quality."
-            )
-
-        max_time = np.max(efit_time)
-        if params.tokamak == Tokamak.CMOD:
-            times = np.round(np.arange(0, max_time + 1e-3, 1e-3), 3)
-            efit_time_unit = "s"
-        if params.tokamak == Tokamak.D3D:
-            times = np.round(np.arange(0, max_time + 1, 1), 0)
-            efit_time_unit = "ms"
-        return _postprocess(times=times, units=efit_time_unit)
-
-
-class Uniform1MHzTimeSetting(TimeSetting):
-    """
-    Time setting for creating a uniform timebase at 1 MHz, based on the maximum EFIT time.
-    """
-
-    def _get_times(self, params: TimeSettingParams) -> np.ndarray:
-        """
-        Parameters
-        ----------
-        params : TimeSettingParams
-            Parameters needed to retrieve the timebase.
-
-        Returns
-        -------
-        np.ndarray
-            Array of times in the timebase.
-        """
-        (efit_time,) = params.mds_conn.get_dims(
-            r"\efit_aeqdsk:ali", tree_name="_efit_tree"
-        )
-
-        max_time = np.max(efit_time)
-        if params.tokamak == Tokamak.CMOD:
-            times = np.round(np.arange(0, max_time + 1e-6, 1e-6), 6)
-            efit_time_unit = "s"
-        if params.tokamak == Tokamak.D3D:
-            times = np.round(np.arange(0, max_time + 1e-3, 1e-3), 3)
-            efit_time_unit = "ms"
-        return _postprocess(times=times, units=efit_time_unit)
 
 
 class D3DDataWorkflow(DataWorkflow):
@@ -172,6 +35,71 @@ class D3DDataWorkflow(DataWorkflow):
 
     Note: This workflow requires numpy < 2 and access to the DIII-D data servers.
     It cannot be executed on clusters without DIII-D data access.
+
+    POWER BALANCE SIGNALS:
+    Ip_MA
+    - measured:
+    B0
+    R0
+    a_minor
+    kappa
+    ne20_line_avg
+    P_aux_MW
+
+    PROFILE PREDICTOR TRAINING SIGNALS:
+    Ip_MA
+    B0
+    betan
+    ne20_edge
+    R0
+    a_minor
+    kappa
+    delta_top
+    delta_bot
+
+    PROFILE PREDICTOR PREDICT-FIRST SIGNALS:
+    ne20_psi
+    - measured: n_e (ida)
+    Te_keV_psi
+    - measured: T_e (ida)
+    Ip_MA
+    - measured: ip (toksearch)
+    - programmed: iptipp (toksearch)
+    B0
+    - measured: bt (toksearch)
+    - programmed: bttbt (toksearch)
+    betan
+    - measured: betanf (toksearch) -> beta_n (dispy)
+    - programmed: bmtpwrtar (toksearch)
+    ne20_edge
+    - measured: dssneped (toksearch)
+    - programmed: dstdenp (toksearch)
+    R0
+    - measured: rsurf (dispy)
+    - programmed: idtrp (toksearch)
+    (kappa, a_minor, delta_top, delta_bot)
+    gapin
+    - measured: gapin (dispy slow)
+    - programmed: ieeseg07 (toksearch)
+    rxbot
+    - measured: rxpt1 (dispy)
+    - programmed: idtrxbot (toksearch)
+    zxtop
+    - measured: zxpt1 (dispy)
+    - programmed: idtzxtop (toksearch)
+    rxtop
+    - measured: rxpt2 (dispy)
+    - programmed: idtrxtop (toksearch)
+    rxbot
+    - measured: zxpt2 (dispy)
+    - programmed: idtzxbot (toksearch)
+
+    OTHER COMPARISON THINGS
+    betap
+    - measured: betapf
+    beta_p from slow EFIT
+    beta_n from slow EFIT
+
     """
 
     def __init__(
@@ -181,7 +109,6 @@ class D3DDataWorkflow(DataWorkflow):
         data_assembly_dir: str,
         max_num_shots: int | None = None,
         use_ida: bool = True,
-        skip_profiles: bool = False,
     ):
         """Initialize the DIII-D data workflow.
 
@@ -198,8 +125,6 @@ class D3DDataWorkflow(DataWorkflow):
             Maximum number of shots to process (for testing). If None, process all shots.
         use_ida : bool
             Whether to use IDA for profile data (True) or Zipfit (False). Default is True.
-        skip_profiles : bool
-            Whether to skip profile retrieval entirely and only get 0D signals. Default is False.
         """
 
         # Use centralized config
@@ -212,7 +137,6 @@ class D3DDataWorkflow(DataWorkflow):
             shotlist_file,
             data_assembly_dir,
             max_num_shots=max_num_shots,
-            skip_profiles=skip_profiles,
         )
 
         # If any of these signals are out of range, drop the entire timeslice
@@ -326,81 +250,44 @@ class D3DDataWorkflow(DataWorkflow):
 
         p = Pipeline([shot])
 
-        betapf = MdsSignal(r"\betapf", "pedestal", location="remote://atlas.gat.com")
-        POHM = MdsSignal(
-            r"\pohm", "aot", location="remote://atlas.gat.com"
-        )  # Ohmic heating power
-        PradBulk = MdsSignal(
-            r"\prad_tot", "bolom", location="remote://atlas.gat.com"
-        )  # Bulk radiated heating power (total)
-        TAU_conf = MdsSignal(
-            r"\taue", "transport", location="remote://atlas.gat.com"
-        )  # Confinement time [s]
-        Ne_edge_avg = MdsSignal(
-            r"\denv3", "bci", location="remote://atlas.gat.com"
-        ).set_callback(_cm3_to_m3)  # Line average electron density at the edge [m^-3]
-        Wtot = MdsSignal(
-            r"\wmhdf", "pedestal", location="remote://atlas.gat.com"
-        )  # Total stored energy
-        BETAP = MdsSignal(
-            r"\betapf", "pedestal", location="remote://atlas.gat.com"
-        )  # plasma poloidal beta
-        BETAN = MdsSignal(
-            r"\betan", "pedestal", location="remote://atlas.gat.com"
-        )  # Normalized plasma beta
+        # MEASURED SIGNALS
+        ip = PtDataSignal("ip")
+        bt = PtDataSignal("bt")
+        betanf = MdsSignal(r"\betanf", "pedestal", location="remote://atlas.gat.com")
+        dssneped = PtDataSignal("dssneped")
+        # rsurf, kappa, a_minor, delta_top, delta_bot, gapin, rxpt1, zxpt1, rxpt2, zxpt2 handled by dispy
 
-        # Programmed inputs
+        # PROGRAMMED INPUTS
         iptipp = PtDataSignal("iptipp")
         bttbt = PtDataSignal("bttbt")
-        dstdenp = PtDataSignal("dstdenp")
         bmtpwrtar = PtDataSignal("bmtpwrtar")
-        ieeseg07 = PtDataSignal("ieeseg07")
+        dstdenp = PtDataSignal("dstdenp")
         idtrp = PtDataSignal("idtrp")
+        ieeseg07 = PtDataSignal("ieeseg07")
         idtrxbot = PtDataSignal("idtrxbot")
         idtzxbot = PtDataSignal("idtzxbot")
         idtrxtop = PtDataSignal("idtrxtop")
         idtzxtop = PtDataSignal("idtzxtop")
 
-        # Measured inputs
-        # Ip_MA handled
-        # B0 handled
-        dssneped = PtDataSignal("dssneped")
-        # betapf above
-        gapin = MdsSignal(r"\gapin", "efit01", location="remote://atlas.gat.com")
-        rsurf = MdsSignal(r"\rsurf", "efit01", location="remote://atlas.gat.com")
-        rxpt1 = MdsSignal(r"\rxpt1", "efit01", location="remote://atlas.gat.com")
-        zxpt1 = MdsSignal(r"\zxpt1", "efit01", location="remote://atlas.gat.com")
-        rxpt2 = MdsSignal(r"\rxpt2", "efit01", location="remote://atlas.gat.com")
-        zxpt2 = MdsSignal(r"\zxpt2", "efit01", location="remote://atlas.gat.com")
+        # OTHER
+        betapf = MdsSignal(r"\betapf", "pedestal", location="remote://atlas.gat.com")
 
         sigs_dict = {
-            "betapf": betapf,
-            "p_oh_toksearch": POHM,
-            "p_rad_toksearch": PradBulk,
-            "tau_conf": TAU_conf,
-            "ne_edge_avg": Ne_edge_avg,
-            "wmhdf_toksearch": Wtot,
-            "betan_toksearch": BETAN,
-            # Programmed inputs
+            "ip": ip,
+            "bt": bt,
+            "betanf": betanf,
+            "dssneped": dssneped,
             "iptipp": iptipp,
             "bttbt": bttbt,
-            "dstdenp": dstdenp,
             "bmtpwrtar": bmtpwrtar,
-            "ieeseg07": ieeseg07,
+            "dstdenp": dstdenp,
             "idtrp": idtrp,
+            "ieeseg07": ieeseg07,
             "idtrxbot": idtrxbot,
             "idtzxbot": idtzxbot,
             "idtrxtop": idtrxtop,
             "idtzxtop": idtzxtop,
-            # Measured inputs
-            "betap_toksearch": BETAP,
-            "dssneped": dssneped,
-            "gapin": gapin,
-            "rsurf": rsurf,
-            "rxpt1": rxpt1,
-            "zxpt1": zxpt1,
-            "rxpt2": rxpt2,
-            "zxpt2": zxpt2,
+            "betapf": betapf,
         }
 
         p.fetch_dataset("toksearch", sigs_dict)
@@ -427,6 +314,18 @@ class D3DDataWorkflow(DataWorkflow):
         for key in list(ds.data_vars) + list(ds.coords) + list(ds.dims):
             if ds[key].dtype not in [np.float32, np.int64]:
                 ds[key] = ds[key].astype(np.float32)
+
+        for sig in sigs_dict.keys():
+            if sig not in ds.data_vars:
+                logger.warning(
+                    f"Signal {sig} not found in TokSearch results for shot {shot}. Filling with NaNs."
+                )
+                ds[sig] = (
+                    ["shot", "time"],
+                    np.full_like(ds["time"].values, np.nan, dtype=np.float32).reshape(
+                        1, -1
+                    ),
+                )
 
         return ds
 
@@ -493,8 +392,8 @@ class D3DDataWorkflow(DataWorkflow):
         ds_resampled = ds_resampled.expand_dims("shot")
         return ds_resampled
 
-    def _get_fast_dataset_dispy(self, shot: int) -> xr.Dataset | None:
-        """Retrieve fast signals using disruption_py and coarsen to 1 kHz.
+    def _get_efit_dataset(self, shot: int) -> xr.Dataset:
+        """Retrieve EFIT parameters for a shot.
 
         Parameters
         ----------
@@ -503,43 +402,46 @@ class D3DDataWorkflow(DataWorkflow):
 
         Returns
         -------
-        xr.Dataset | None
-            Dataset with coarsened fast signals, or None if retrieval fails
+        xr.Dataset
+            Dataset with EFIT parameters on 1 kHz timebase
         """
-        try:
-            retrieval_settings = RetrievalSettings(
-                run_columns=["p_nbi", "p_ech", "p_ohm"],
-                time_setting=Uniform1MHzTimeSetting(),
-                only_requested_columns=True,
-            )
-            fast_result = get_shots_data(
-                tokamak=Tokamak.D3D,
-                shotlist_setting=shot,
-                retrieval_settings=retrieval_settings,
-                output_setting=DatasetOutputSetting(path=False),
-                log_settings=LogSettings(file_path=None),
-                num_processes=1,
-            )
-            fast_result = fast_result.set_index(idx=["shot", "time"]).unstack("idx")
 
-            # Coarsen to 1 kHz by taking the mean over previous 1ms window
-            ds_coarse = fast_result.coarsen(time=1000, boundary="trim").mean()
+        retrieval_settings = RetrievalSettings(
+            run_methods=["get_efit_parameters"],
+            time_setting=Uniform1kHzTimeSetting(),
+            only_requested_columns=False,
+        )
+        efit_result = get_shots_data(
+            tokamak=Tokamak.D3D,
+            shotlist_setting=shot,
+            retrieval_settings=retrieval_settings,
+            output_setting=DatasetOutputSetting(path=False),
+            log_settings=LogSettings(file_path=None),
+            num_processes=1,
+        )
+        efit_result = efit_result.set_index(idx=["shot", "time"]).unstack("idx")
 
-            # Rename signals to _fast
-            ds_coarse = ds_coarse.rename(
-                {
-                    "p_nbi": "p_nbi_fast",
-                    "p_ech": "p_ech_fast",
-                    "p_ohm": "p_ohm_fast",
-                }
+        disruption_efit_path = f"/fusion/projects/disruption_warning/data/popsim/popsim_studies/profopt/archive/{shot}.tgz"
+        if os.path.exists(disruption_efit_path):
+            fast_efit_result = disruption_efit(disruption_efit_path, shot)
+            fig_dir = os.path.join(
+                self.data_assembly_dir, self.ds_name, "raw_data", "debug_figs"
             )
-        except Exception as e:
-            logger.warning(
-                f"Failed to get fast dataset for shot {shot} using disruption_py: {e}. Falling back to toksearch."
+            os.makedirs(fig_dir, exist_ok=True)
+            compare_efits(
+                fast_efit_result,
+                efit_result,
+                shot,
+                fig_path=os.path.join(fig_dir, f"{shot}_efit_comparison.png"),
             )
-            return None
 
-        return ds_coarse
+            slow_efit_result = efit_result
+            efit_result = fast_efit_result
+            # recomputation mangles these, fallback to EFIT01
+            efit_result["gapin"] = slow_efit_result["gapin"]
+            efit_result["beta_n"] = slow_efit_result["beta_n"]
+
+        return efit_result
 
     def _get_0D_dataset(self, shot: int) -> xr.Dataset:
         """Retrieve 0D (time-varying scalar) signals for a shot.
@@ -557,59 +459,20 @@ class D3DDataWorkflow(DataWorkflow):
         xr.Dataset
             Dataset with 0D signals on 1 kHz timebase
         """
-        retrieval_settings = RetrievalSettings(
-            run_methods=["get_efit_parameters"],
-            time_setting=Uniform1kHzTimeSetting(),
-            only_requested_columns=False,
-        )
-        efit_result = get_shots_data(
-            tokamak=Tokamak.D3D,
-            shotlist_setting=shot,
-            retrieval_settings=retrieval_settings,
-            output_setting=DatasetOutputSetting(path=False),
-            log_settings=LogSettings(file_path=None),
-            num_processes=1,
-        )
-        efit_result = efit_result.set_index(idx=["shot", "time"]).unstack("idx")
 
-        retrieval_settings = RetrievalSettings(
-            run_columns=[
-                "ip",
-                "bt",
-                "wmhdf",
-                "betapf",
-                "n_e",
-                "p_rad",
-                "p_ohm",
-                "p_nbi",
-                "p_ech",
-                "p_ich",
-                "p_lhcd",
-            ],
-            time_setting=Uniform1kHzTimeSetting(),
-            only_requested_columns=True,
-        )
-        global_result = get_shots_data(
-            tokamak=Tokamak.D3D,
-            shotlist_setting=shot,
-            retrieval_settings=retrieval_settings,
-            output_setting=DatasetOutputSetting(path=False),
-            log_settings=LogSettings(file_path=None),
-            num_processes=1,
-        )
-        global_result = global_result.set_index(idx=["shot", "time"]).unstack("idx")
+        efit_result = self._get_efit_dataset(shot)
 
         toksearch_result = self._toksearch_signals(
             shot, max_time_ms=int(efit_result["time"].max().item() * 1e3)
         )
 
-        # Put toksearch result on the same timebase as efit/global
+        # Put toksearch result on the same timebase as efit
         toksearch_result = toksearch_result.reindex(
             time=efit_result["time"], method="ffill"
         )
 
         result = xr.merge(
-            [efit_result, global_result, toksearch_result],
+            [efit_result, toksearch_result],
             compat="override",
             join="exact",
         )
@@ -630,7 +493,10 @@ class D3DDataWorkflow(DataWorkflow):
             Dataset with electron density and temperature profiles
         """
         retrieval_settings = RetrievalSettings(
-            run_columns=["ne_rho", "te_rho"],
+            run_columns=[
+                "ne_rho",
+                "te_rho",
+            ],  # TODO(ZanderKeith): Are these rho or psi?
             only_requested_columns=False,
         )
         profile_result = get_shots_data(
@@ -708,27 +574,20 @@ class D3DDataWorkflow(DataWorkflow):
                     processed_shots += 1
                     continue
 
-                if not self.skip_profiles:
-                    if self.use_ida:
-                        ds_profile = self._get_profile_dataset_ida(shot)
-                        if ds_profile is None:
-                            logger.info(
-                                f"Skipping shot {shot} since IDA profiles are not available and skip_profiles is False"
-                            )
-                            continue
-                    else:
-                        ds_profile = self._get_profile_dataset_zipfit(shot)
+                if self.use_ida:
+                    ds_profile = self._get_profile_dataset_ida(shot)
+                    if ds_profile is None:
+                        logger.info(
+                            f"Skipping shot {shot} since IDA profiles are not available and skip_profiles is False"
+                        )
+                        continue
 
-                ds_fast = self._get_fast_dataset_dispy(shot)
-                if ds_fast is None:
-                    continue
                 ds_0d = self._get_0D_dataset(shot)
 
                 # Put each dataset on a 1 kHz timebase, using previous value fill
                 max_time = max(
                     ds_profile["time"].max().item(),
                     ds_0d["time"].max().item(),
-                    ds_fast["time"].max().item(),
                 )
                 timebase = make_uniform_1khz_timebase(max_time)
 
@@ -736,12 +595,7 @@ class D3DDataWorkflow(DataWorkflow):
                 ds_0d = ds_0d.interp(
                     time=timebase, method="nearest"
                 )  # This should be okay since 0D signal is already on 1 kHz timebase
-                ds_fast = ds_fast.interp(
-                    time=timebase, method="nearest"
-                )  # Fast dataset is already on 1 kHz timebase
-                ds_assembly = xr.merge(
-                    [ds_profile, ds_0d, ds_fast], compat="no_conflicts"
-                )
+                ds_assembly = xr.merge([ds_profile, ds_0d], compat="no_conflicts")
 
                 ds_standardized = self.standardize_signal_names(ds_assembly)
                 if ds_standardized is None:
@@ -774,89 +628,88 @@ class D3DDataWorkflow(DataWorkflow):
             Standardized dataset, or None if critical signals are missing
         """
 
-        # Simple renames
-        ds = ds.rename(
-            {
-                "aminor": "a_minor",
-                "tritop": "delta_top",
-                "tribot": "delta_bottom",
-                "psi_n": "rho",  # Yeah I know that this mapping isn't exact, I just need *something*
-                "betapf": "beta",  # Only for DIII-D profile prediction, using beta feedback TODO(ZanderKeith) ensure this is the actual signal
-            }
-        )
-
-        # Conversions
-        ds["Te_keV_rho"] = ds["Te_rho"] / 1e3  # Convert eV to keV
-        ds["ne20_rho"] = ds["ne_rho"] / 1e20  # Convert m^-3 to 10^20 m^-3
-
-        # The module should be using Wtot, but Wmhd should be close enough if Wtot is missing
-        ds["Wtot_MJ"] = ds["wmhdf"] / 1e6  # Convert J to MJ
-        ds["Wmhd_MJ"] = ds["wmhd"] / 1e6  # Convert J to MJ
-
-        ds["R0"] = ds["rmaxis"]
-        ds["B0"] = np.abs(ds["bt"])
+        # POWER BALANCE TRAINING
         ds["Ip_MA"] = np.abs(ds["ip"]) / 1e6  # Convert A to MA
-        ds["iptipp_MA"] = np.abs(ds["iptipp"]) / 1e6  # Convert A to MA
-        ds["ne20_line_avg"] = ds["n_e"] / 1e20  # Convert m^-3 to 10^20 m^-3
-        ds["ne20_edge"] = ds["ne_edge_avg"] / 1e20  # Convert m^-3 to 10^20 m^-3
+        ds["B0"] = np.abs(ds["bt"])
+        ds["R0"] = ds["rsurf"]
+        ds["a_minor"] = ds["aminor"]
+        # kappa
 
-        # Convert all powers to MW
-        ds["P_ECRH_MW"] = ds["p_ech"] / 1e6
-        ds["P_NBI_MW"] = ds["p_nbi"] / 1e6
-        ds["P_NBI_MW_alt"] = ds["p_nbi_fast"] / 1e6
-        ds["P_oh_MW"] = ds["p_ohm"] / 1e6
-        ds["P_oh_MW_alt"] = ds["p_ohm_fast"] / 1e6
-        ds["P_rad_MW"] = ds["p_rad"] / 1e6
-        ds["P_rad_MW_alt"] = ds["p_rad_toksearch"] / 1e6
-        ds["P_ICRF_MW"] = ds["p_ich"] / 1e6
-        ds["P_LH_MW"] = ds["p_lhcd"] / 1e6
+        # PROFILE PREDICTOR TRAINING
+        ds["Te_keV_psi"] = ds["Te_psi"] / 1e3  # Convert eV to keV
+        ds["ne20_psi"] = ds["ne_psi"] / 1e20  # Convert m^-3 to 10^20 m^-3
+        # Ip_MA
+        # B0
+        ds["betan"] = ds["betanf"]  # Already unitless
+        ds["ne20_edge"] = ds["dssneped"] / 10  # Convert 10^19 m^-3 to 10^20 m^-3
+        # R0
+        # a_minor
+        # kappa
+        ds["delta_top"] = ds["tritop"]
+        ds["delta_bot"] = ds["tribot"]
 
-        # If tau_conf doesn't exist, replace with 0's like Ip_MA
-        if "tau_conf" not in ds:
-            ds["tau_conf"] = xr.zeros_like(ds["Ip_MA"])
+        # PROFILE PREDICTOR PREDICT-FIRST
+        # Te_keV_psi
+        # Ip_MA
+        ds["Ip_MA_prog"] = np.abs(ds["iptipp"]) / 1e6  # Convert A to MA
+        # B0
+        ds["B0_prog"] = np.abs(ds["bttbt"])
+        # betan
+        ds["betan_prog"] = ds["bmtpwrtar"]
+        # ne20_edge
+        ds["ne20_edge_prog"] = ds["dstdenp"] / 10  # Convert 10^19 m^-3 to 10^20 m^-3
+        # R0
+        ds["R0_prog"] = ds["idtrp"]
+        # kappa, a_minor, delta_top, delta_bot
+        # gapin
+        ds["gapin_prog"] = ds["ieeseg07"]
+        ds["rxbot"] = ds["rxpt1"]
+        ds["rxbot_prog"] = ds["idtrxbot"]
+        ds["zxbot"] = ds["zxpt1"]
+        ds["zxbot_prog"] = ds["idtzxbot"]
+        ds["rxtop"] = ds["rxpt2"]
+        ds["rxtop_prog"] = ds["idtrxtop"]
+        ds["zxtop"] = ds["zxpt2"]
+        ds["zxtop_prog"] = ds["idtzxtop"]
 
         # Only keep variables of interest
-        ds = ds[
-            [
-                "Te_keV_rho",
-                "ne20_rho",
-                "Wtot_MJ",
-                "Wmhd_MJ",
-                "beta",  # Poloidal beta from pedestal
-                "beta_p",  # Poloidal beta from EFIT
-                "R0",
-                "B0",
-                "Ip_MA",
-                "a_minor",
-                "kappa",
-                "delta_top",
-                "delta_bottom",
-                "ne20_line_avg",
-                "ne20_edge",
-                "P_ECRH_MW",
-                "P_NBI_MW",
-                "P_NBI_MW_alt",
-                "P_oh_MW",
-                "P_oh_MW_alt",
-                "P_rad_MW",
-                "P_rad_MW_alt",
-                "P_ICRF_MW",
-                "P_LH_MW",
-                "tau_conf",
-                # Trajectory optimization on DIII-D
-                "iptipp_MA",
-                "dstdenp",
-                "gapin",
-                "gapout",
-                "rxpt1",
-                "zxpt1",
-                "rxpt2",
-                "zxpt2",
-            ]
-        ]
+        kept_vars = {
+            # PROFILE PREDICTOR PREDICT-FIRST SIGNALS
+            "Te_keV_psi",
+            "ne20_psi",
+            "Ip_MA",
+            "Ip_MA_prog",
+            "B0",
+            "B0_prog",
+            "betan",
+            "betan_prog",
+            "ne20_edge",
+            "ne20_edge_prog",
+            "R0",
+            "R0_prog",
+            "kappa",
+            "a_minor",
+            "delta_top",
+            "delta_bot",
+            "gapin",
+            "rxbot",
+            "rxbot_prog",
+            "zxbot",
+            "zxbot_prog",
+            "rxtop",
+            "rxtop_prog",
+            "zxtop",
+            "zxtop_prog",
+            # OTHER
+            "betapf",  # pedestal, obtained from toksearch
+            "beta_n",  # EFIT
+            "beta_p",  # EFIT
+        }
+
+        ds = ds[list(kept_vars)]
 
         # If any *important* signal is all NaN, return None to skip this shot
-        for signal in ["Te_keV_rho", "ne20_rho", "Ip_MA", "ne20_edge"]:
+        for signal in ["Te_keV_psi", "ne20_psi", "Ip_MA", "ne20_edge"]:
             if ds[signal].isnull().all():
                 logger.warning(
                     f"Signal {signal} is all NaN for shot {ds['shot'].item()}, skipping shot."
@@ -929,79 +782,3 @@ class D3DDataWorkflow(DataWorkflow):
                 ds = ds.drop_vars(sig)
 
         return ds
-
-    def _1kHz_efit(self, shot: int) -> xr.Dataset:
-        """Directly parse the saved 1 kHz EFIT results into an xarray dataset for a shot
-
-        We re-computed EFIT01 at 1 kHz, but the DIII-D data curators did not allow us to have a dedicated tree in MDSPlus,
-        so we had to put the results under scratch paths like EFIT02-EFIT06 or something
-        Of course some shots got overwritten by other researchers using the same scratch paths, so we can't rely on it being consistent.
-        So here I'm just going to where we have the results saved and parse the data directly into Xarray
-        """
-
-        efit_tgz_path = f"/cscratch/keithz/disruption-efit/2026-03-19/manager/13-16-00.525590/archive/{shot}.tgz"
-        if not os.path.exists(efit_tgz_path):
-            logger.warning(
-                f"EFIT tgz file for shot {shot} not found at {efit_tgz_path}"
-            )
-            return None
-
-        start_dir = os.getcwd()
-
-        with tempfile.TemporaryDirectory() as tmpdir:
-            with tarfile.open(efit_tgz_path, "r:gz") as tar:
-                tar.extractall(path=tmpdir)
-            os.chdir(os.path.join(tmpdir, "efit"))
-            a_files = glob.glob("a*")  # Mainly 0D scalars
-            g_files = glob.glob("g*")  # Grids and boundaries
-
-            # Ensure they're sorted from low to high
-            for files in [g_files, a_files]:
-                files.sort()
-            if len(a_files) != len(g_files):
-                raise ValueError("Inconstent number of EFIT files!")
-
-            datasets = []
-            for i, a_file in enumerate(a_files):
-                with open(a_file) as f:
-                    cleaned_f = _clean_aeqdsk_file(f)
-                    a_data = aeqdsk.read(cleaned_f)
-                with open(g_files[i]) as f:
-                    g_data = geqdsk.read(f)
-
-                # Create dataset for this time slice
-                # The only things we're using in this study are as follows:
-                # TODO(ZanderKeith): Complete this after you verify they line up
-                # major radius
-                # minor radius
-                # X point R and Z
-                data_vars = {
-                    "gapin": a_data["oleft"] / 100,  # Inner gap
-                    "rxpt1": a_data["rseps1"] / 100,  # Lower X-point R
-                    "zxpt1": a_data["zseps1"] / 100,  # Lower X-point Z
-                    "rxpt2": a_data["rseps2"] / 100,  # Upper X-point R
-                    "zxpt2": a_data["zseps2"] / 100,  # Upper X-point Z
-                    "rsurf": a_data["rout"] / 100,  # Geometric major radius
-                    "aminor": a_data["rout"] - a_data["rinn"],  # Geometric minor radius
-                    "beans": g_data["beans"],  # Elongation
-                }
-
-                ds = xr.Dataset(
-                    data_vars=data_vars,
-                    coords={
-                        "time": a_data["time"] / 1e3,  # Convert ms to s
-                    },
-                )
-
-                # If the x-point coordinates are broken (e.g. -9.9), set them to NaN
-                # TODO(ZanderKeith): This should be done in a common location for things obtained from EFIT, too
-                valid_xpoint_mask = (ds["rxpt1"] > 0) & (ds["rxpt2"] > 0)
-                for var in ["rxpt1", "zxpt1", "rxpt2", "zxpt2"]:
-                    ds[var] = ds[var].where(valid_xpoint_mask, other=np.nan)
-
-                datasets.append(ds)
-
-            final_dataset = xr.concat(datasets, dim="time")
-
-        os.chdir(start_dir)
-        return final_dataset
