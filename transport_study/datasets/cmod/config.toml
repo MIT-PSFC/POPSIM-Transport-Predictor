@@ -31,6 +31,6 @@ blessed_day_ranges = [
 
 [profile_fitting]
 # Gaussian process profile fitting parameters
-rho_min = 0.0
-rho_max = 1.1
-num_rho_points = 56
+psi_min = 0.0
+psi_max = 1.1
+num_psi_points = 56

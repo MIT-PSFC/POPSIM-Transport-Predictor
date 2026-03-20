@@ -652,7 +652,7 @@ requires-dist = [
     { name = "dynaconf", specifier = ">=3.2.0" },
     { name = "loguru", specifier = ">=0.7.0" },
     { name = "netcdf4", specifier = ">=1.7.0,<1.7.3" },
-    { name = "numpy", specifier = ">=1.26.0" },
+    { name = "numpy", specifier = ">=2" },
     { name = "pandas", specifier = ">=2.2.0,<2.3.3" },
     { name = "pyodbc", specifier = ">=5.2.0" },
     { name = "scipy", specifier = ">=1.15.0" },
@@ -890,21 +890,25 @@ wheels = [
 ]
 
 [[package]]
+name = "freeqdsk"
+version = "0.5.2"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "fortranformat" },
+    { name = "numpy" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/51/cd/a98eea70d69fbee460278d54ca94370ad659f4245e96f1383471749c7e57/freeqdsk-0.5.2.tar.gz", hash = "sha256:7b40430f8368a9ac130d441d43aa50944b4165c8c44fc49b752836bd8e822b4b", size = 201827 }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/3b/c3/27c40f49900c200ff1655af3070cd5f9e796e39e85e3d7edb452a9874f30/freeqdsk-0.5.2-py3-none-any.whl", hash = "sha256:36f9b614b03b7af930b5239e1f9e0ea2da4a8b16de8284b8e8c96a8160a08895", size = 25751 },
+]
+
+[[package]]
 name = "fsspec"
 version = "2026.1.0"
 source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/d5/7d/5df2650c57d47c57232af5ef4b4fdbff182070421e405e0d62c6cdbfaa87/fsspec-2026.1.0.tar.gz", hash = "sha256:e987cb0496a0d81bba3a9d1cee62922fb395e7d4c3b575e57f547953334fe07b", size = 310496 }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/01/c9/97cc5aae1648dcb851958a3ddf73ccd7dbe5650d95203ecb4d7720b4cdbf/fsspec-2026.1.0-py3-none-any.whl", hash = "sha256:cb76aa913c2285a3b49bdd5fc55b1d7c708d7208126b60f2eb8194fe1b4cbdcc", size = 201838 },
-]
-
-[[package]]
-name = "git-filter-repo"
-version = "2.47.0"
-source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/b9/bb/7a283f568af6b0528ade65e8ace84bd6ba46003e429101bcd62c232d01a5/git_filter_repo-2.47.0.tar.gz", hash = "sha256:411b27e68a080c07a69c233cb526dbc2d848b09a72f10477f4444dd0822cf290", size = 275743 }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/60/60/d3943f0880ebcb7e0bdf79254d10dddd39c7b656eeecae32b8806ff66dec/git_filter_repo-2.47.0-py3-none-any.whl", hash = "sha256:2cd04929b9024e83e65db571cbe36aec65ead0cb5f9ec5abe42158654af5ad83", size = 76282 },
 ]
 
 [[package]]
@@ -951,7 +955,7 @@ requires-dist = [
     { name = "ipykernel", specifier = ">=7.1.0" },
     { name = "matplotlib", specifier = ">=3.10.8" },
     { name = "mpmath", specifier = ">=1.3.0" },
-    { name = "numpy", specifier = ">=1.26.4" },
+    { name = "numpy", specifier = ">=2" },
     { name = "scipy", specifier = ">=1.17.0" },
     { name = "triangle-plot", specifier = ">=0.3.0" },
 ]
@@ -2587,7 +2591,6 @@ dependencies = [
     { name = "equinox" },
     { name = "fire" },
     { name = "flox" },
-    { name = "git-filter-repo" },
     { name = "h5netcdf" },
     { name = "hvplot" },
     { name = "interpax" },
@@ -2620,7 +2623,6 @@ requires-dist = [
     { name = "equinox", specifier = ">=0.13.1,<0.14" },
     { name = "fire", specifier = ">=0.7.1,<0.8" },
     { name = "flox", specifier = ">=0.9.9,<0.10" },
-    { name = "git-filter-repo", specifier = ">=2.47.0" },
     { name = "h5netcdf", specifier = ">=1.6.4" },
     { name = "hvplot", specifier = ">=0.9.2,<0.10" },
     { name = "interpax", specifier = ">=0.3.4,<0.4" },
@@ -2678,6 +2680,7 @@ dependencies = [
     { name = "disruption-py" },
     { name = "dynaconf" },
     { name = "fire" },
+    { name = "freeqdsk" },
     { name = "gptools" },
     { name = "netcdf4" },
     { name = "popsim" },
@@ -2710,6 +2713,7 @@ requires-dist = [
     { name = "disruption-py", editable = "submodules/disruption-py" },
     { name = "dynaconf", specifier = ">=3.2.12" },
     { name = "fire", specifier = ">=0.7.1" },
+    { name = "freeqdsk", specifier = ">=0.5.2" },
     { name = "gptools", editable = "submodules/gptools" },
     { name = "netcdf4" },
     { name = "popsim", editable = "submodules/popsim" },
@@ -2915,10 +2919,6 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/5c/96/5fb7d8c3c17bc8c62fdb031c47d77a1af698f1d7a406b0f79aaa1338f9ad/pydantic_core-2.41.5-cp314-cp314t-win32.whl", hash = "sha256:b4ececa40ac28afa90871c2cc2b9ffd2ff0bf749380fbdf57d165fd23da353aa", size = 1988906 },
     { url = "https://files.pythonhosted.org/packages/22/ed/182129d83032702912c2e2d8bbe33c036f342cc735737064668585dac28f/pydantic_core-2.41.5-cp314-cp314t-win_amd64.whl", hash = "sha256:80aa89cad80b32a912a65332f64a4450ed00966111b6615ca6816153d3585a8c", size = 1981607 },
     { url = "https://files.pythonhosted.org/packages/9f/ed/068e41660b832bb0b1aa5b58011dea2a3fe0ba7861ff38c4d4904c1c1a99/pydantic_core-2.41.5-cp314-cp314t-win_arm64.whl", hash = "sha256:35b44f37a3199f771c3eaa53051bc8a70cd7b54f333531c59e29fd4db5d15008", size = 1974769 },
-    { url = "https://files.pythonhosted.org/packages/09/32/59b0c7e63e277fa7911c2fc70ccfb45ce4b98991e7ef37110663437005af/pydantic_core-2.41.5-graalpy312-graalpy250_312_native-macosx_10_12_x86_64.whl", hash = "sha256:7da7087d756b19037bc2c06edc6c170eeef3c3bafcb8f532ff17d64dc427adfd", size = 2110495 },
-    { url = "https://files.pythonhosted.org/packages/aa/81/05e400037eaf55ad400bcd318c05bb345b57e708887f07ddb2d20e3f0e98/pydantic_core-2.41.5-graalpy312-graalpy250_312_native-macosx_11_0_arm64.whl", hash = "sha256:aabf5777b5c8ca26f7824cb4a120a740c9588ed58df9b2d196ce92fba42ff8dc", size = 1915388 },
-    { url = "https://files.pythonhosted.org/packages/6e/0d/e3549b2399f71d56476b77dbf3cf8937cec5cd70536bdc0e374a421d0599/pydantic_core-2.41.5-graalpy312-graalpy250_312_native-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:c007fe8a43d43b3969e8469004e9845944f1a80e6acd47c150856bb87f230c56", size = 1942879 },
-    { url = "https://files.pythonhosted.org/packages/f7/07/34573da085946b6a313d7c42f82f16e8920bfd730665de2d11c0c37a74b5/pydantic_core-2.41.5-graalpy312-graalpy250_312_native-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:76d0819de158cd855d1cbb8fcafdf6f5cf1eb8e470abe056d5d161106e38062b", size = 2139017 },
 ]
 
 [[package]]

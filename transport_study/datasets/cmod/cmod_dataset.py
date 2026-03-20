@@ -39,7 +39,7 @@ class CModDataWorkflow(DataWorkflow):
         shotlist_file: str | None,
         data_assembly_dir: str,
         max_num_shots: int | None = None,
-        gp_fit_rho: np.ndarray | None = None,
+        gp_fit_psi: np.ndarray | None = None,
         skip_profiles: bool = False,
     ):
         """Initialize the C-Mod data workflow.
@@ -55,7 +55,7 @@ class CModDataWorkflow(DataWorkflow):
             Directory where data files are stored and final dataset will be saved
         max_num_shots : int | None
             Maximum number of shots to process (for testing). If None, process all shots.
-        gp_fit_rho : np.ndarray | None
+        gp_fit_psi : np.ndarray | None
             Radial locations for GP profile fitting. If None, uses default from config.
         skip_profiles : bool
             If True, skip profile fitting and use zero arrays instead. Useful for testing.
@@ -64,16 +64,16 @@ class CModDataWorkflow(DataWorkflow):
         # Use centralized config
         self.config = config.cmod
 
-        # Set up GP fitting rho grid
-        if gp_fit_rho is not None:
-            self.gp_fit_rho = gp_fit_rho
+        # Set up GP fitting psi grid
+        if gp_fit_psi is not None:
+            self.gp_fit_psi = gp_fit_psi
         else:
             # Use config values
             prof_config = self.config["profile_fitting"]
-            self.gp_fit_rho = np.linspace(
-                prof_config["rho_min"],
-                prof_config["rho_max"],
-                prof_config["num_rho_points"],
+            self.gp_fit_psi = np.linspace(
+                prof_config["psi_min"],
+                prof_config["psi_max"],
+                prof_config["num_psi_points"],
             )
 
         # Call parent init (which will call _get_shotlist_from_source if needed)
@@ -82,7 +82,6 @@ class CModDataWorkflow(DataWorkflow):
             shotlist_file,
             data_assembly_dir,
             max_num_shots=max_num_shots,
-            skip_profiles=skip_profiles,
         )
 
         self.filter_config = {
@@ -90,6 +89,7 @@ class CModDataWorkflow(DataWorkflow):
             "ne20_line_avg": {"min": 0.01, "max": 4},
         }
         self.individual_filter_config = None
+        self.skip_profiles = skip_profiles
 
     def _get_shotlist_from_source(self) -> list[int]:
         """Retrieve shotlist from C-Mod SQL database.
@@ -168,7 +168,7 @@ class CModDataWorkflow(DataWorkflow):
         Returns
         -------
         xr.Dataset
-            GP-fitted profiles on rho grid
+            GP-fitted profiles on psi grid
         """
 
         shot_prediction = {}
@@ -179,10 +179,10 @@ class CModDataWorkflow(DataWorkflow):
             times = ds_shot["time"].values
             data_x = ds_shot["ts_channel_rho"].values.T  # shape (time, channel)
 
-            te_data = np.full((len(times), len(self.gp_fit_rho)), np.nan)
-            te_err = np.full((len(times), len(self.gp_fit_rho)), np.nan)
-            ne_data = np.full((len(times), len(self.gp_fit_rho)), np.nan)
-            ne_err = np.full((len(times), len(self.gp_fit_rho)), np.nan)
+            te_data = np.full((len(times), len(self.gp_fit_psi)), np.nan)
+            te_err = np.full((len(times), len(self.gp_fit_psi)), np.nan)
+            ne_data = np.full((len(times), len(self.gp_fit_psi)), np.nan)
+            ne_err = np.full((len(times), len(self.gp_fit_psi)), np.nan)
 
             for variable in ["te", "ne"]:
                 data_y = ds_shot[
@@ -200,17 +200,19 @@ class CModDataWorkflow(DataWorkflow):
                 data_y = np.where(data_y < 0.001, np.nan, data_y)
                 err_y = np.where(err_y < 0.001, np.nan, err_y)
 
-                # I do not trust you can measure within 20 eV or within 2e18 m^-3
-                err_y = np.where(err_y < 0.02, 0.02, err_y)
+                # Historic data, we're mostly going off vibes anyway
+                err_y = np.where(err_y < 0.1, 0.1, err_y)
 
                 for i_time, _ in enumerate(times):
                     y_star, std_y_star, _, _ = gp_profile(
                         data_X=data_x[i_time, :],
                         data_y=data_y[i_time, :],
                         err_y=err_y[i_time, :],
-                        X_star=self.gp_fit_rho,
+                        X_star=self.gp_fit_psi,
                         calc_gradient=False,
                     )
+                    if y_star is None:
+                        continue
 
                     if variable == "te":
                         te_data[i_time, :] = y_star
@@ -219,16 +221,19 @@ class CModDataWorkflow(DataWorkflow):
                         ne_data[i_time, :] = y_star
                         ne_err[i_time, :] = std_y_star
 
+                    if config.debug and i_time > 2:
+                        break
+
             shot_prediction[shot] = xr.Dataset(
                 data_vars={
-                    "Te_keV_rho": (("time", "rho"), te_data),
-                    "Te_keV_rho_error": (("time", "rho"), te_err),
-                    "ne20_rho": (("time", "rho"), ne_data),
-                    "ne20_rho_error": (("time", "rho"), ne_err),
+                    "Te_keV_psi": (("time", "psi"), te_data),
+                    "Te_keV_psi_error": (("time", "psi"), te_err),
+                    "ne20_psi": (("time", "psi"), ne_data),
+                    "ne20_psi_error": (("time", "psi"), ne_err),
                 },
                 coords={
                     "time": times,
-                    "rho": self.gp_fit_rho,
+                    "psi": self.gp_fit_psi,
                 },
             )
 
@@ -307,26 +312,26 @@ class CModDataWorkflow(DataWorkflow):
                 # Create dummy profile dataset with zeros
                 ds_profiles = xr.Dataset(
                     data_vars={
-                        "Te_keV_rho": (
-                            ("time", "rho"),
-                            np.zeros((len(timebase), len(self.gp_fit_rho))),
+                        "Te_keV_psi": (
+                            ("time", "psi"),
+                            np.zeros((len(timebase), len(self.gp_fit_psi))),
                         ),
-                        "Te_keV_rho_error": (
-                            ("time", "rho"),
-                            np.zeros((len(timebase), len(self.gp_fit_rho))),
+                        "Te_keV_psi_error": (
+                            ("time", "psi"),
+                            np.zeros((len(timebase), len(self.gp_fit_psi))),
                         ),
-                        "ne20_rho": (
-                            ("time", "rho"),
-                            np.zeros((len(timebase), len(self.gp_fit_rho))),
+                        "ne20_psi": (
+                            ("time", "psi"),
+                            np.zeros((len(timebase), len(self.gp_fit_psi))),
                         ),
-                        "ne20_rho_error": (
-                            ("time", "rho"),
-                            np.zeros((len(timebase), len(self.gp_fit_rho))),
+                        "ne20_psi_error": (
+                            ("time", "psi"),
+                            np.zeros((len(timebase), len(self.gp_fit_psi))),
                         ),
                     },
                     coords={
                         "time": timebase,
-                        "rho": self.gp_fit_rho,
+                        "psi": self.gp_fit_psi,
                         "shot": shot,
                     },
                 )
@@ -391,61 +396,60 @@ class CModDataWorkflow(DataWorkflow):
         xr.Dataset | None
             Standardized dataset, or None if critical signals are missing
         """
-
-        # Simple renames
-        ds = ds.rename(
-            {
-                "tritop": "delta_top",
-                "tribot": "delta_bottom",
-                "rmagx": "R0",
-            }
-        )
-
-        # Conversions (Te_keV_rho and ne20_rho already in correct units from GP fitting)
+        # POWER BALANCE
         ds["Wtot_MJ"] = ds["wmhd"] / 1e6  # Convert J to MJ
         ds["B0"] = np.abs(ds["btor"])
         ds["Ip_MA"] = np.abs(ds["ip"]) / 1e6  # Convert A to MA
+        ds["R0"] = ds["rout"]
         ds["ne20_line_avg"] = ds["n_e"] / 1e20  # Convert m^-3 to 10^20 m^-3
-
-        # Convert all powers to MW
         ds["P_oh_MW"] = ds["p_oh"] / 1e6
         ds["P_rad_MW"] = ds["p_rad"] / 1e6
         ds["P_ICRF_MW"] = ds["p_icrf"] / 1e6
         ds["P_LH_MW"] = ds["p_lh"] / 1e6
-
         # C-Mod doesn't have NBI or ECRH, set to zero where Ip_MA is valid
         ds["P_NBI_MW"] = xr.zeros_like(ds["Ip_MA"])
         ds["P_ECRH_MW"] = xr.zeros_like(ds["Ip_MA"])
+
+        # PROFILE PREDICTOR TRAINING
+        # Te_kev_psi
+        # ne20_psi
+        # Ip_MA
+        # B0
+        ds["betan"] = ds["beta_n"]
+        ds["ne20_edge"] = ds["ne20_psi"].sel(
+            psi=1.0
+        )  # C-Mod doesn't have edge interferometry, get the density from psi=1.0
+        # R0
+        # kappa
+        # a_minor
+        ds["delta_top"] = ds["tritop"]
+        ds["delta_bot"] = ds["tribot"]
 
         # C-Mod doesn't have tau_conf from standard diagnostics
         ds["tau_conf"] = xr.zeros_like(ds["Ip_MA"])
 
         # Only keep variables of interest
-        ds = ds[
-            [
-                "Te_keV_rho",
-                "ne20_rho",
-                "Wtot_MJ",
-                "R0",
-                "B0",
-                "Ip_MA",
-                "a_minor",
-                "kappa",
-                "delta_top",
-                "delta_bottom",
-                "ne20_line_avg",
-                "P_ECRH_MW",
-                "P_NBI_MW",
-                "P_oh_MW",
-                "P_rad_MW",
-                "P_ICRF_MW",
-                "P_LH_MW",
-                "tau_conf",
-            ]
-        ]
+        kept_vars = {
+            # PROFILE PREDICTOR TRAINING
+            "Te_keV_psi",
+            "ne20_psi",
+            "Ip_MA",
+            "B0",
+            "betan",
+            "ne20_edge",
+            "R0",
+            "kappa",
+            "a_minor",
+            "delta_top",
+            "delta_bot",
+            # OTHER
+            "beta_p",  # EFIT
+        }
+
+        ds = ds[list(kept_vars)]
 
         # If any *important* signal is all NaN, return None to skip this shot
-        for signal in ["Te_keV_rho", "ne20_rho", "Ip_MA"]:
+        for signal in ["Te_keV_psi", "ne20_psi", "Ip_MA"]:
             if ds[signal].isnull().all():
                 logger.warning(
                     f"Signal {signal} is all NaN for shot {ds['shot'].item()}, skipping shot."
