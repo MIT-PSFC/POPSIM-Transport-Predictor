@@ -1146,9 +1146,9 @@ def run_study(  # noqa: PLR0915
             if freeze_submodules_options is None:
                 freeze_submodules_options = [True, False]
             if num_hp_shots_options is None:
-                num_hp_shots_options = [0, 1, 3, 10, 33, -1]
+                num_hp_shots_options = [0, 1, 3, 10, 32, -1]
             if hp_test_set_size is None:
-                hp_test_set_size = 60
+                hp_test_set_size = 65
 
             return (
                 model_types,
