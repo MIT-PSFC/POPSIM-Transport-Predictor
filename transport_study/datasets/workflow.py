@@ -112,7 +112,13 @@ class DataWorkflow:
             if len(max_per_shot.sizes) > 1:  # Handle multidimensional case
                 collapse_dims = [dim for dim in max_per_shot.dims if dim != "shot"]
                 max_per_shot = max_per_shot.max(dim=collapse_dims, skipna=True)
-            max_shot_idx = np.nanargmax(max_per_shot.values)
+            try:
+                max_shot_idx = np.nanargmax(max_per_shot.values)
+            except ValueError:
+                logger.warning(
+                    f"Variable {var} has no valid values, skipping stats logging"
+                )
+                continue
             max_shot = ds["shot"].values[max_shot_idx]
             max_val = max_per_shot.values[max_shot_idx]
 
@@ -174,16 +180,22 @@ class DataWorkflow:
         self.log_ds_details(ds)
 
         # Make some diagnostic plots of the resulting dataset to check that it looks reasonable. These can be used to spot any remaining issues with the data, and to get a sense of the overall characteristics of the dataset (e.g., typical signal ranges, how many shots have valid profiles, etc.)
-        ds_profile_time_plot(
-            zarr_path,
-            os.path.join(self.final_ds_dir, "time_traces"),
-            title=f"{self.ds_name.upper()} Dataset Time Traces",
-        )
-        ds_profile_plot(
-            zarr_path,
-            os.path.join(self.final_ds_dir, "profile_traces"),
-            title=f"{self.ds_name.upper()} Dataset Profile Traces",
-        )
+        try:
+            ds_profile_time_plot(
+                zarr_path,
+                os.path.join(self.final_ds_dir, "time_traces"),
+                title=f"{self.ds_name.upper()} Dataset Time Traces",
+            )
+        except Exception as e:
+            logger.error(f"Error generating time trace plots: {e}")
+        try:
+            ds_profile_plot(
+                zarr_path,
+                os.path.join(self.final_ds_dir, "profile_traces"),
+                title=f"{self.ds_name.upper()} Dataset Profile Traces",
+            )
+        except Exception as e:
+            logger.error(f"Error generating profile plots: {e}")
 
     def filter_ds(self, shot_ds: xr.Dataset) -> xr.Dataset:
         """Apply filtering steps based on device config"""
@@ -289,7 +301,7 @@ class DataWorkflow:
 
         # Culling that is common across devices
         # If shot is too short (less than 500 ms) after processing, exclude it
-        cleaned_ds = shot_ds.dropna("time_idx", how="any")
+        cleaned_ds = shot_ds.dropna("time_idx", how="all")
         valid_time_duration = (
             0
             if cleaned_ds.time.size == 0

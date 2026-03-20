@@ -19,6 +19,7 @@ from transport_study.config import config
 from transport_study.datasets import make_uniform_1khz_timebase
 from transport_study.datasets.d3d.utils import (
     Uniform1kHzTimeSetting,
+    compare_densities,
     compare_efits,
     disruption_efit,
 )
@@ -73,7 +74,7 @@ class D3DDataWorkflow(DataWorkflow):
     - measured: betanf (toksearch) -> beta_n (dispy)
     - programmed: bmtpwrtar (toksearch)
     ne20_edge
-    - measured: dssneped (toksearch)
+    - measured: dssneped (toksearch) -> denv3
     - programmed: dstdenp (toksearch)
     R0
     - measured: rsurf (dispy)
@@ -275,6 +276,9 @@ class D3DDataWorkflow(DataWorkflow):
 
         # OTHER
         betapf = MdsSignal(r"\betapf", "pedestal", location="remote://atlas.gat.com")
+        ne_line_avg = MdsSignal(
+            r"\denv3", "bci", location="remote://atlas.gat.com"
+        ).set_callback(_cm3_to_m3)  # Line average electron density at the edge [m^-3]
 
         sigs_dict = {
             "ip": ip,
@@ -293,6 +297,7 @@ class D3DDataWorkflow(DataWorkflow):
             "idtzxtop": idtzxtop,
             "betapf": betapf,
             "wmhdf": wmhdf,
+            "ne_line_avg": ne_line_avg,
         }
 
         p.fetch_dataset("toksearch", sigs_dict)
@@ -300,6 +305,18 @@ class D3DDataWorkflow(DataWorkflow):
         p.align("toksearch", timeline)
         results = p.compute_serial()
         ds_tok = results[0]["toksearch"].squeeze()
+
+        # Toksearch puts things on a forward fill, we can't have that for training.
+        # Replace these signals with nan until their value changes for the first time (e.g. from 0.1 to 0.2)
+        for sig in ["betanf", "wmhdf", "dssneped", "ip", "ne_line_avg"]:
+            sig_data = ds_tok[sig].values
+            first_valid_idx = np.where(sig_data != sig_data[0])[0]
+            if len(first_valid_idx) > 0:
+                first_valid_idx = first_valid_idx[0]
+                sig_data[:first_valid_idx] = np.nan
+                ds_tok[sig] = xr.DataArray(
+                    sig_data, coords={"time": ds_tok["times"].values}, dims=["time"]
+                )
 
         # Match disruption-py output
         ds = xr.Dataset(
@@ -430,14 +447,14 @@ class D3DDataWorkflow(DataWorkflow):
         if os.path.exists(disruption_efit_path):
             fast_efit_result = disruption_efit(disruption_efit_path, shot)
             fig_dir = os.path.join(
-                self.data_assembly_dir, self.ds_name, "raw_data", "debug_figs"
+                self.data_assembly_dir, self.ds_name, "raw_data", "debug_figs", "efits"
             )
             os.makedirs(fig_dir, exist_ok=True)
             compare_efits(
                 fast_efit_result,
                 efit_result,
                 shot,
-                fig_path=os.path.join(fig_dir, f"{shot}_efit_comparison.png"),
+                fig_path=os.path.join(fig_dir, f"{shot}.png"),
             )
 
             slow_efit_result = efit_result
@@ -602,9 +619,9 @@ class D3DDataWorkflow(DataWorkflow):
                 timebase = make_uniform_1khz_timebase(max_time)
 
                 ds_profile = ds_profile.reindex(time=timebase, method="ffill")
-                ds_0d = ds_0d.interp(
-                    time=timebase, method="nearest"
-                )  # This should be okay since 0D signal is already on 1 kHz timebase
+                ds_0d = ds_0d.reindex(
+                    time=timebase, method="ffill"
+                )  # Hold last value to avoid nearest-neighbor jumps at startup
                 ds_assembly = xr.merge([ds_profile, ds_0d], compat="no_conflicts")
 
                 ds_standardized = self.standardize_signal_names(ds_assembly)
@@ -638,6 +655,16 @@ class D3DDataWorkflow(DataWorkflow):
             Standardized dataset, or None if critical signals are missing
         """
 
+        fig_dir = os.path.join(
+            self.data_assembly_dir, self.ds_name, "raw_data", "debug_figs", "densities"
+        )
+        os.makedirs(fig_dir, exist_ok=True)
+        compare_densities(
+            ds,
+            ds.shot.item(),
+            fig_path=os.path.join(fig_dir, f"{ds.shot.item()}.png"),
+        )
+
         # POWER BALANCE TRAINING
         ds["Wtot_MJ"] = ds["wmhdf"] / 1e6
         ds["Wmhd_MJ"] = ds["wmhd"] / 1e6  # Convert J to MJ
@@ -645,6 +672,7 @@ class D3DDataWorkflow(DataWorkflow):
         ds["B0"] = np.abs(ds["bt"])
         ds["R0"] = ds["rsurf"]
         ds["a_minor"] = ds["aminor"]
+        ds["ne20_line_avg"] = ds["ne_line_avg"] / 1e20  # Convert to 10^20 m^-3
         # kappa
 
         # PROFILE PREDICTOR TRAINING
@@ -689,6 +717,7 @@ class D3DDataWorkflow(DataWorkflow):
             # POWER BALANCE TRAINING
             "Wtot_MJ",
             "Ip_MA",
+            "ne20_line_avg",
             # PROFILE PREDICTOR PREDICT-FIRST SIGNALS
             "Te_keV_psi",
             "ne20_psi",
@@ -782,16 +811,19 @@ class D3DDataWorkflow(DataWorkflow):
         # Similarly, we sometimes need to fill in betan (from pedestal) with betan from some other source
         # Our order of preference is as follows:
         # 1: betan from pedestal (betanf from toksearch)
-        betanf = ds["betan"]
+        betan = ds["betan"]
         # 2: beta_n from fast efit (recomputed from betat)
-        betat = ds["betat"]
-        betan_fast = betat * ds["a_minor"] * ds["B0"] / ds["Ip_MA"]
+        betan_fast = ds["betat"] * ds["a_minor"] * ds["B0"] / ds["Ip_MA"]
+        betan = betan.where(betan.notnull() & (betan > 0), betan_fast)
         # 3: beta_n from slow efit
-        beta_n = ds["beta_n"]
+        betan = betan.where(betan.notnull() & (betan > 0), ds["beta_n"])
+        ds["betan"] = betan
 
-        priority_2 = betan_fast.where(betan_fast.notnull() & (betan_fast != 0), beta_n)
-        priority_1 = betanf.where(betanf.notnull() & (betanf != 0), priority_2)
-        ds["betan"] = priority_1
+        # dssneped is often missing, so fill it in with density from the profile where need be
+        ds["ne20_edge"] = ds["ne20_edge"].where(
+            ds["ne20_edge"].notnull() & (ds["ne20_edge"] > 0.001),
+            ds["ne20_psi"].sel(psi_n=0.9, method="nearest"),
+        )
 
         # Use the smoothed version of P_NBI
         if "P_NBI_MW" in ds and "P_NBI_MW_alt" in ds:

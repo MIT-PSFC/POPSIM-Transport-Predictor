@@ -417,12 +417,12 @@ def ds_profile_plot(
     for shot in ds["shot"].data[:num_shots]:
         shot_ds = ds.sel(shot=shot)
 
-        psi = shot_ds["psi"].values
+        psi_n = shot_ds["psi_n"].values
         time = shot_ds["time"].values
 
         # Extract 2D arrays for density and temperature
-        ne_data = shot_ds["ne20_psi"].values.T  # shape: (psi, time) - transposed
-        te_data = shot_ds["Te_keV_psi"].values.T  # shape: (psi, time) - transposed
+        ne_data = shot_ds["ne20_psi"].values.T  # shape: (psi_n, time) - transposed
+        te_data = shot_ds["Te_keV_psi"].values.T  # shape: (psi_n, time) - transposed
 
         # Create masks for timesteps with NaN values
         ne_nan_mask = np.isnan(ne_data).any(axis=0)  # True if any NaN in that timestep
@@ -449,7 +449,7 @@ def ds_profile_plot(
             cmap="viridis",
             aspect="auto",
             origin="lower",
-            extent=[0, np.nanmax(time), psi.min(), psi.max()],
+            extent=[0, np.nanmax(time), psi_n.min(), psi_n.max()],
         )
 
         # Overlay bright pink for NaN timesteps
@@ -462,10 +462,10 @@ def ds_profile_plot(
                 aspect="auto",
                 origin="lower",
                 alpha=0.8,
-                extent=[0, np.nanmax(time), psi.min(), psi.max()],
+                extent=[0, np.nanmax(time), psi_n.min(), psi_n.max()],
             )
 
-        ax_ne.set_ylabel(r"$\psi$", fontsize=LABEL_FONTSIZE, color=TEXT_COLOR)
+        ax_ne.set_ylabel(r"$\psi_n$", fontsize=LABEL_FONTSIZE, color=TEXT_COLOR)
         ax_ne.set_title(
             r"$n_e$ [$10^{20}$ m$^{-3}$]", fontsize=LABEL_FONTSIZE, color=TEXT_COLOR
         )
@@ -482,7 +482,7 @@ def ds_profile_plot(
             cmap="plasma",
             aspect="auto",
             origin="lower",
-            extent=[0, np.nanmax(time), psi.min(), psi.max()],
+            extent=[0, np.nanmax(time), psi_n.min(), psi_n.max()],
         )
 
         # Overlay bright pink for NaN timesteps
@@ -495,10 +495,10 @@ def ds_profile_plot(
                 aspect="auto",
                 origin="lower",
                 alpha=0.8,
-                extent=[0, np.nanmax(time), psi.min(), psi.max()],
+                extent=[0, np.nanmax(time), psi_n.min(), psi_n.max()],
             )
 
-        ax_te.set_ylabel(r"$\psi$", fontsize=LABEL_FONTSIZE, color=TEXT_COLOR)
+        ax_te.set_ylabel(r"$\psi_n$", fontsize=LABEL_FONTSIZE, color=TEXT_COLOR)
         ax_te.set_xlabel("Time [s]", fontsize=LABEL_FONTSIZE, color=TEXT_COLOR)
         ax_te.set_title(r"$T_e$ [keV]", fontsize=LABEL_FONTSIZE, color=TEXT_COLOR)
         cbar_te = plt.colorbar(im_te, ax=ax_te)

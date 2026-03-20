@@ -276,3 +276,57 @@ def compare_efits(ds_fast: xr.Dataset, ds_slow: xr.Dataset, shot: int, fig_path:
     fig.tight_layout()
     fig.savefig(fig_path)
     plt.close(fig)
+
+
+def compare_densities(ds: xr.Dataset, shot: int, fig_path: str):
+    ds = ds.isel(shot=0)
+    dssneped = ds["dssneped"].data / 10
+    ne_line_avg = ds["ne_line_avg"].data / 2e20
+    dstdenp = ds["dstdenp"].data / 10
+
+    ne_prof_90 = ds["ne_psi"].sel(psi_n=0.9, method="nearest") / 1e20
+    ne_prof_95 = ds["ne_psi"].sel(psi_n=0.95, method="nearest") / 1e20
+    ne_prof_100 = ds["ne_psi"].sel(psi_n=1.0, method="nearest") / 1e20
+
+    fig, axs = plt.subplots(1, 1, figsize=(10, 5))
+    axs.plot(
+        ds["time"],
+        dssneped,
+        label="dssneped",
+        color="blue",
+    )
+    axs.plot(
+        ds["time"],
+        ne_line_avg,
+        label="ne_line_avg",
+        color="orange",
+        linestyle="dashed",
+    )
+    axs.plot(
+        ds["time"],
+        dstdenp,
+        label="dstdenp",
+        color="green",
+        linestyle="dotted",
+    )
+    for ne_prof, psi_n in zip(
+        [ne_prof_90, ne_prof_95, ne_prof_100],
+        [0.9, 0.95, 1.0],
+        strict=True,
+    ):
+        axs.plot(
+            ds["time"],
+            ne_prof.data,
+            label=f"ne_psi(psi_n={psi_n})",
+            linestyle="dashdot",
+        )
+
+    axs.set_title(f"Edge density comparison for shot {shot}")
+    axs.set_xlabel("Time [s]")
+    axs.set_ylabel("Density [10^20 m^-3]")
+    axs.legend()
+    axs.grid()
+
+    fig.tight_layout()
+    fig.savefig(fig_path)
+    plt.close(fig)
