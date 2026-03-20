@@ -6,7 +6,7 @@ import xarray as xr
 from loguru import logger
 
 from transport_study import EPISODE_DIM, TIME_DIM
-from transport_study.datasets.plotting import ds_profile_plot, ds_time_plot
+from transport_study.datasets.plotting import ds_profile_plot, ds_profile_time_plot
 
 
 class DataWorkflow:
@@ -174,7 +174,7 @@ class DataWorkflow:
         self.log_ds_details(ds)
 
         # Make some diagnostic plots of the resulting dataset to check that it looks reasonable. These can be used to spot any remaining issues with the data, and to get a sense of the overall characteristics of the dataset (e.g., typical signal ranges, how many shots have valid profiles, etc.)
-        ds_time_plot(
+        ds_profile_time_plot(
             zarr_path,
             os.path.join(self.final_ds_dir, "time_traces"),
             title=f"{self.ds_name.upper()} Dataset Time Traces",
@@ -194,12 +194,17 @@ class DataWorkflow:
 
         # Apply full-timeslice filters
         for var, valid_range in self.filter_config.items():
-            var_mask = (
-                shot_ds[var].notnull()
-                & (shot_ds[var] >= valid_range["min"])
-                & (shot_ds[var] <= valid_range["max"])
-            )
-            valid_mask = valid_mask & var_mask
+            if var in shot_ds:
+                var_mask = (
+                    shot_ds[var].notnull()
+                    & (shot_ds[var] >= valid_range["min"])
+                    & (shot_ds[var] <= valid_range["max"])
+                )
+                valid_mask = valid_mask & var_mask
+            else:
+                logger.debug(
+                    f"Variable {var} specified in filter_config not found in dataset for shot {shot_ds.shot.values[0]}"
+                )
 
         if valid_mask.sum() == 0:
             logger.warning(
@@ -210,12 +215,17 @@ class DataWorkflow:
         # Apply individual filters that set out-of-range values to NaN, but don't drop the entire timeslice.
         if self.individual_filter_config is not None:
             for var, valid_range in self.individual_filter_config.items():
-                shot_ds[var] = shot_ds[var].where(
-                    (shot_ds[var].notnull())
-                    & (shot_ds[var] >= valid_range["min"])
-                    & (shot_ds[var] <= valid_range["max"]),
-                    other=np.nan,
-                )
+                if var in shot_ds:
+                    shot_ds[var] = shot_ds[var].where(
+                        (shot_ds[var].notnull())
+                        & (shot_ds[var] >= valid_range["min"])
+                        & (shot_ds[var] <= valid_range["max"]),
+                        other=np.nan,
+                    )
+                else:
+                    logger.debug(
+                        f"Variable {var} specified in individual_filter_config not found in dataset for shot {shot_ds.shot.values[0]}"
+                    )
 
         shot_ds = shot_ds.where(valid_mask, drop=True)
         return shot_ds
@@ -223,7 +233,9 @@ class DataWorkflow:
     def _debug_plots(self, shot_ds: xr.Dataset):
         debug_fig_dir = os.path.join(self.final_ds_dir, "debug_plots")
         os.makedirs(debug_fig_dir, exist_ok=True)
-        ds_time_plot(shot_ds, debug_fig_dir, title=f"Debug: {shot_ds.shot.values[0]}")
+        ds_profile_time_plot(
+            shot_ds, debug_fig_dir, title=f"Debug: {shot_ds.shot.values[0]}"
+        )
         ds_profile_plot(
             shot_ds, debug_fig_dir, title=f"Debug: {shot_ds.shot.values[0]}"
         )

@@ -259,7 +259,7 @@ def ds_time_plot(fig_dir: str, num_shots: int = 2):  # noqa: PLR0915
 
     ylim_ne = (0, float(np.nanmax(ds["ne20_line_avg"].values)) * 1.1)
 
-    shape_signals = ["a_minor", "kappa", "delta_top", "delta_bottom"]
+    shape_signals = ["a_minor", "kappa", "delta_top", "delta_bot"]
     shape_min = min(float(np.nanmin(ds[sig].values)) for sig in shape_signals)
     shape_max = max(float(np.nanmax(ds[sig].values)) for sig in shape_signals)
     ylim_shape = (
@@ -339,8 +339,8 @@ def ds_time_plot(fig_dir: str, num_shots: int = 2):  # noqa: PLR0915
         )
         ax_shape.plot(
             shot_ds["time"],
-            shot_ds["delta_bottom"],
-            label="delta_bottom",
+            shot_ds["delta_bot"],
+            label="delta_bot",
             color="green",
         )
         ax_shape.set_ylabel("Shaping", fontsize=LABEL_FONTSIZE, color="white")

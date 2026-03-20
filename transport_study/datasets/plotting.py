@@ -14,7 +14,7 @@ TICK_FONTSIZE = 18
 LEGEND_FONTSIZE = 18
 
 
-def ds_time_plot(  # noqa: PLR0915 PLR0912
+def ds_power_balance_time_plot(  # noqa: PLR0915 PLR0912
     ds: str | xr.Dataset,
     fig_dir: str,
     num_shots: int | None = 9999,
@@ -61,7 +61,7 @@ def ds_time_plot(  # noqa: PLR0915 PLR0912
     else:
         ylim_b0 = (0, 5)  # Default range
 
-    shape_signals = ["a_minor", "kappa", "delta_top", "delta_bottom"]
+    shape_signals = ["a_minor", "kappa", "delta_top", "delta_bot"]
     shape_min = min(float(np.nanmin(ds[sig].values)) for sig in shape_signals)
     shape_max = max(float(np.nanmax(ds[sig].values)) for sig in shape_signals)
     ylim_shape = (
@@ -186,8 +186,177 @@ def ds_time_plot(  # noqa: PLR0915 PLR0912
         )
         ax_shape.plot(
             shot_ds["time"],
-            shot_ds["delta_bottom"],
-            label="delta_bottom",
+            shot_ds["delta_bot"],
+            label="delta_bot",
+            color="green",
+        )
+        ax_shape.set_ylabel("Shaping", fontsize=LABEL_FONTSIZE, color="white")
+        ax_shape.set_ylim(ylim_shape)
+        ax_shape.set_xlabel("Time [s]", fontsize=LABEL_FONTSIZE, color="white")
+        ax_shape.legend(
+            fontsize=LEGEND_FONTSIZE,
+            facecolor=BACKGROUND_COLOR,
+            edgecolor=BACKGROUND_COLOR,
+            loc="upper left",
+        )
+
+        # Add R0 on right axis
+        ax_r0 = ax_shape.twinx()
+        if "R0" in shot_ds:
+            ax_r0.plot(
+                shot_ds["time"],
+                shot_ds["R0"],
+                label="R0 [m]",
+                color="cyan",
+                linestyle="--",
+            )
+        ax_r0.set_ylabel("R0 [m]", fontsize=LABEL_FONTSIZE, color="cyan")
+        ax_r0.set_ylim(ylim_r0)
+        ax_r0.tick_params(axis="y", labelsize=TICK_FONTSIZE, colors=TEXT_COLOR)
+
+        for ax in axes:
+            ax.set_facecolor(FACE_COLOR)
+            ax.grid(True, color="gray", linestyle="--", linewidth=0.1)
+            ax.tick_params(axis="both", labelsize=TICK_FONTSIZE, colors=TEXT_COLOR)
+            try:
+                for text in ax.get_legend().get_texts():
+                    text.set_color(TEXT_COLOR)
+            except AttributeError:
+                pass
+
+        fig.tight_layout()
+        fig.savefig(f"{fig_dir}/{shot}_trace.png")
+        plt.close(fig)
+
+
+def ds_profile_time_plot(  # noqa: PLR0915 PLR0912
+    ds: str | xr.Dataset,
+    fig_dir: str,
+    num_shots: int | None = 9999,
+    title: str = "Profile dataset Time Traces",
+):
+    """Plot time traces of signals from the dataset"""
+    if isinstance(ds, str):
+        ds_path = ds
+        if ds_path.endswith(".zarr"):
+            ds = xr.open_zarr(ds_path)
+        else:
+            ds = xr.open_dataset(ds_path)
+
+    os.makedirs(fig_dir, exist_ok=True)
+
+    # Compute global y-limits across all shots for consistent axes
+    ylim_ip = (0, float(np.nanmax(np.abs(ds["Ip_MA"].values))) * 1.1)
+    ylim_betan = (0, float(np.nanmax(ds["betan"].values)) * 1.1)
+
+    density_signals = ["ne20_edge"]
+    density_max = min(
+        max(float(np.nanmax(ds[sig].values)) for sig in density_signals), 5
+    )
+    ylim_ne = (0, density_max * 1.1)
+
+    # B0 y-limits for density plot right axis
+    if "B0" in ds:
+        ylim_b0 = (0, float(np.nanmax(ds["B0"].values)) * 1.1)
+    else:
+        ylim_b0 = (0, 5)  # Default range
+
+    shape_signals = ["a_minor", "kappa", "delta_top", "delta_bot"]
+    shape_min = min(float(np.nanmin(ds[sig].values)) for sig in shape_signals)
+    shape_max = max(float(np.nanmax(ds[sig].values)) for sig in shape_signals)
+    ylim_shape = (
+        shape_min * 0.9 if shape_min > 0 else shape_min * 1.1,
+        shape_max * 1.1,
+    )
+
+    # R0 y-limits for shaping plot right axis
+    if "R0" in ds:
+        ylim_r0 = (0, float(np.nanmax(ds["R0"].values)) * 1.1)
+    else:
+        ylim_r0 = (0, 3)  # Default range
+
+    # If any ylim is NaN or infinite, set it to a default range
+    if not np.isfinite(ylim_ip).all():
+        ylim_ip = (0, 1)
+    if not np.isfinite(ylim_betan).all():
+        ylim_betan = (0, 1)
+    if not np.isfinite(ylim_ne).all():
+        ylim_ne = (0, 1)
+    if not np.isfinite(ylim_b0).all():
+        ylim_b0 = (0, 1)
+    if not np.isfinite(ylim_shape).all():
+        ylim_shape = (0, 1)
+    if not np.isfinite(ylim_r0).all():
+        ylim_r0 = (0, 1)
+
+    for shot in ds["shot"].data[:num_shots]:
+        shot_ds = ds.sel(shot=shot)
+
+        fig, axes = plt.subplots(3, 1, figsize=(16, 12), sharex=True)
+        fig.patch.set_facecolor(BACKGROUND_COLOR)
+
+        fig.suptitle(f"{title} - {shot}", fontsize=TITLE_FONTSIZE, color=TEXT_COLOR)
+
+        # Ip and betan
+        ax_ip = axes[0]
+        # Put Ip on the left y axis and Wtot on the right y axis
+        ax_ip.plot(shot_ds["time"], shot_ds["Ip_MA"], label="Ip [MA]", color="cyan")
+        ax_ip.set_ylabel("Ip [MA]", fontsize=LABEL_FONTSIZE, color="cyan")
+        ax_ip.set_ylim(ylim_ip)
+        ax_betan = ax_ip.twinx()
+        if "betan" in shot_ds:
+            ax_betan.plot(
+                shot_ds["time"], shot_ds["betan"], label="betan", color="magenta"
+            )
+        ax_betan.set_ylabel("Normalized Beta", fontsize=LABEL_FONTSIZE, color="red")
+        ax_betan.set_ylim(ylim_betan)
+        ax_betan.tick_params(axis="y", labelsize=TICK_FONTSIZE, colors=TEXT_COLOR)
+
+        # line avg and edge density
+        ax_ne = axes[1]
+        ax_ne.plot(
+            shot_ds["time"],
+            shot_ds["ne20_edge"],
+            label="ne20_edge",
+            color="yellow",
+        )
+        ax_ne.set_ylabel("ne20 [m^-3]", fontsize=LABEL_FONTSIZE, color="white")
+        ax_ne.set_ylim(ylim_ne)
+
+        # Dots at 0 for fresh profiles
+        ax_ne.plot(
+            shot_ds["time"],
+            np.where(shot_ds["fresh_profiles"] > 0, 0, np.nan),
+            color="green",
+            marker="o",
+            linestyle="None",
+        )
+
+        # Add B0 on right axis
+        ax_b0 = ax_ne.twinx()
+        if "B0" in shot_ds:
+            ax_b0.plot(
+                shot_ds["time"],
+                shot_ds["B0"],
+                label="B0 [T]",
+                color="magenta",
+                linestyle="-",
+            )
+        ax_b0.set_ylabel("B0 [T]", fontsize=LABEL_FONTSIZE, color="magenta")
+        ax_b0.set_ylim(ylim_b0)
+        ax_b0.tick_params(axis="y", labelsize=TICK_FONTSIZE, colors=TEXT_COLOR)
+
+        # Shaping
+        ax_shape = axes[2]
+        ax_shape.plot(shot_ds["time"], shot_ds["a_minor"], label="a_minor", color="red")
+        ax_shape.plot(shot_ds["time"], shot_ds["kappa"], label="kappa", color="yellow")
+        ax_shape.plot(
+            shot_ds["time"], shot_ds["delta_top"], label="delta_top", color="lime"
+        )
+        ax_shape.plot(
+            shot_ds["time"],
+            shot_ds["delta_bot"],
+            label="delta_bot",
             color="green",
         )
         ax_shape.set_ylabel("Shaping", fontsize=LABEL_FONTSIZE, color="white")
@@ -248,12 +417,12 @@ def ds_profile_plot(
     for shot in ds["shot"].data[:num_shots]:
         shot_ds = ds.sel(shot=shot)
 
-        rho = shot_ds["psi"].values
+        psi = shot_ds["psi"].values
         time = shot_ds["time"].values
 
         # Extract 2D arrays for density and temperature
-        ne_data = shot_ds["ne20_psi"].values.T  # shape: (rho, time) - transposed
-        te_data = shot_ds["Te_keV_psi"].values.T  # shape: (rho, time) - transposed
+        ne_data = shot_ds["ne20_psi"].values.T  # shape: (psi, time) - transposed
+        te_data = shot_ds["Te_keV_psi"].values.T  # shape: (psi, time) - transposed
 
         # Create masks for timesteps with NaN values
         ne_nan_mask = np.isnan(ne_data).any(axis=0)  # True if any NaN in that timestep
@@ -280,7 +449,7 @@ def ds_profile_plot(
             cmap="viridis",
             aspect="auto",
             origin="lower",
-            extent=[0, np.nanmax(time), rho.min(), rho.max()],
+            extent=[0, np.nanmax(time), psi.min(), psi.max()],
         )
 
         # Overlay bright pink for NaN timesteps
@@ -293,10 +462,10 @@ def ds_profile_plot(
                 aspect="auto",
                 origin="lower",
                 alpha=0.8,
-                extent=[0, np.nanmax(time), rho.min(), rho.max()],
+                extent=[0, np.nanmax(time), psi.min(), psi.max()],
             )
 
-        ax_ne.set_ylabel(r"$\rho$", fontsize=LABEL_FONTSIZE, color=TEXT_COLOR)
+        ax_ne.set_ylabel(r"$\psi$", fontsize=LABEL_FONTSIZE, color=TEXT_COLOR)
         ax_ne.set_title(
             r"$n_e$ [$10^{20}$ m$^{-3}$]", fontsize=LABEL_FONTSIZE, color=TEXT_COLOR
         )
@@ -313,7 +482,7 @@ def ds_profile_plot(
             cmap="plasma",
             aspect="auto",
             origin="lower",
-            extent=[0, np.nanmax(time), rho.min(), rho.max()],
+            extent=[0, np.nanmax(time), psi.min(), psi.max()],
         )
 
         # Overlay bright pink for NaN timesteps
@@ -326,10 +495,10 @@ def ds_profile_plot(
                 aspect="auto",
                 origin="lower",
                 alpha=0.8,
-                extent=[0, np.nanmax(time), rho.min(), rho.max()],
+                extent=[0, np.nanmax(time), psi.min(), psi.max()],
             )
 
-        ax_te.set_ylabel(r"$\rho$", fontsize=LABEL_FONTSIZE, color=TEXT_COLOR)
+        ax_te.set_ylabel(r"$\psi$", fontsize=LABEL_FONTSIZE, color=TEXT_COLOR)
         ax_te.set_xlabel("Time [s]", fontsize=LABEL_FONTSIZE, color=TEXT_COLOR)
         ax_te.set_title(r"$T_e$ [keV]", fontsize=LABEL_FONTSIZE, color=TEXT_COLOR)
         cbar_te = plt.colorbar(im_te, ax=ax_te)
