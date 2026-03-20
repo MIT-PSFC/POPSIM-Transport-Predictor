@@ -104,10 +104,9 @@ class Uniform1MHzTimeSetting(TimeSetting):
 def _clean_aeqdsk_file(f):
     """Clean AEQDSK file by removing invalid text lines that don't fit Fortran format.
 
-    Some AEQDSK files have stray text labels (like "MAG") at the end that are not
-    valid floating-point values for Fortran format descriptors. This function filters
-    those out by reading all lines, checking if they're valid numeric data, and
-    returning a cleaned file-like object.
+    Some AEQDSK files have stray text labels (like "MAG", "EQU") at the end that are not
+    valid floating-point values for Fortran format descriptors. This function removes
+    lines that contain only alphabetic characters (pure garbage text).
 
     Parameters
     ----------
@@ -119,47 +118,36 @@ def _clean_aeqdsk_file(f):
     io.StringIO
         A file-like object with cleaned content
     """
-    content = f.read()
-    lines = content.split("\n")
-    cleaned_lines = []
 
-    for line in lines:
-        # Check if this line contains only whitespace and text (no numbers)
-        # Valid FORTRAN formatted lines will have numbers in scientific notation
-        stripped = line.strip()
-        if stripped:
-            # If the line contains valid numeric indicators, keep it
-            # Valid indicators: E+, E-, D+, D-, digits, -, +, ., or leading spaces
-            if any(
-                c in stripped
-                for c in [
-                    "E",
-                    "D",
-                    "e",
-                    "d",
-                    "0",
-                    "1",
-                    "2",
-                    "3",
-                    "4",
-                    "5",
-                    "6",
-                    "7",
-                    "8",
-                    "9",
-                    "+",
-                    "-",
-                    ".",
-                ]
-            ):
+    try:
+        content = f.read()
+        lines = content.split("\n")
+        cleaned_lines = []
+
+        for line in lines:
+            stripped = line.strip()
+            if not stripped:
+                # Keep blank lines as they're part of the format
                 cleaned_lines.append(line)
-        else:
-            # Keep blank lines as they're part of the format
-            cleaned_lines.append(line)
+            elif any(c.isdigit() for c in stripped):
+                # Keep lines that contain at least one digit (numeric data)
+                # This preserves all data lines while removing pure text like "EQU" or "MAG"
+                cleaned_lines.append(line)
+            else:
+                # Skip pure text lines (like "EQU", "MAG", etc.)
+                logger.debug(f"Skipping invalid AEQDSK line: {stripped}")
 
-    # Reconstruct the file content and return as StringIO
-    cleaned_content = "\n".join(cleaned_lines)
-    return io.StringIO(cleaned_content)
+        # Reconstruct the file content and return as StringIO
+        cleaned_content = "\n".join(cleaned_lines)
+        string_io = io.StringIO(cleaned_content)
+
+    except Exception as e:
+        logger.error(f"Error while cleaning AEQDSK file: {e}")
+        # If there's an error, return the original content to avoid data loss
+        f.seek(0)
+        return f
+
+    return string_io
 
 
 def disruption_efit(efit_tgz_path: str, shot: int) -> xr.Dataset:

@@ -45,6 +45,52 @@ def test_trajopt_input_mapping():
     The DIII-D PCS has a unique way to input shapes (gapin, R0, X points).
     We need to have a mapping from these shape parameters to the profile predictor inputs.
     """
+    ds_path = "/fusion/projects/disruption_warning/data/popsim/popsim_studies/profopt/hbp_ida/raw_data/199056.nc"
+    ds = xr.open_dataset(ds_path)
+
+    a_minor = ds["a_minor"].values
+    kappa = ds["kappa"].values
+    delta_top = ds["delta_top"].values
+    delta_bot = ds["delta_bot"].values
+
+    # Need to remake these things from our input parameters
+    a_minor_reconst = ds["R0"].values - ds["gapin"].values
+    kappa_reconst = (ds["zxpt2"].values - ds["zxpt1"].values) / (a_minor_reconst * 2)
+    delta_top_reconst = (ds["rxtop"].values - ds["R0"].values) / a_minor_reconst
+    delta_bot_reconst = (ds["rxbot"].values - ds["R0"].values) / a_minor_reconst
+
+    fig, axes = plt.subplots(4, 1, figsize=(10, 15))
+    axes[0].plot(ds["time"], a_minor, label="a_minor")
+    axes[0].plot(
+        ds["time"], a_minor_reconst, label="a_minor_reconst", linestyle="dashed"
+    )
+    axes[0].set_title("a_minor")
+    axes[0].legend()
+    axes[1].plot(ds["time"], kappa, label="kappa")
+    axes[1].plot(ds["time"], kappa_reconst, label="kappa_reconst", linestyle="dashed")
+    axes[1].set_title("kappa")
+    axes[1].legend()
+    axes[2].plot(ds["time"], delta_top, label="delta_top")
+    axes[2].plot(
+        ds["time"], delta_top_reconst, label="delta_top_reconst", linestyle="dashed"
+    )
+    axes[2].set_title("delta_top")
+    axes[2].legend()
+    axes[3].plot(ds["time"], delta_bot, label="delta_bot")
+    axes[3].plot(
+        ds["time"], delta_bot_reconst, label="delta_bot_reconst", linestyle="dashed"
+    )
+    axes[3].set_title("delta_bot")
+    axes[3].legend()
+    fig.tight_layout()
+
+    fig_dir = os.path.join(
+        PACKAGE_ROOT,
+        "tests",
+        "test_outputs",
+    )
+    os.makedirs(fig_dir, exist_ok=True)
+    fig.savefig(os.path.join(fig_dir, "input_mapping_reconstruction.png"))
 
 
 class TimeCheckSetting(TimeSetting):

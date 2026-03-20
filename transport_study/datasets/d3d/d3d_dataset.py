@@ -441,6 +441,10 @@ class D3DDataWorkflow(DataWorkflow):
             efit_result["gapin"] = slow_efit_result["gapin"]
             efit_result["beta_n"] = slow_efit_result["beta_n"]
 
+        valid_xpoint_mask = (efit_result["rxpt1"] > 0) & (efit_result["rxpt2"] > 0)
+        for var in ["rxpt1", "zxpt1", "rxpt2", "zxpt2"]:
+            efit_result[var] = efit_result[var].where(valid_xpoint_mask, np.nan)
+
         return efit_result
 
     def _get_0D_dataset(self, shot: int) -> xr.Dataset:
@@ -603,7 +607,7 @@ class D3DDataWorkflow(DataWorkflow):
                     continue
 
                 ds_standardized.to_netcdf(ds_path)
-                logger.info(f"Saved raw dataset for shot {shot} to {ds_path}")
+                logger.success(f"Saved raw dataset for shot {shot} to {ds_path}")
                 processed_shots += 1
             except Exception as e:
                 logger.error(f"Error processing shot {shot}: {e}", exc_info=True)
