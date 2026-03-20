@@ -688,7 +688,6 @@ class D3DDataWorkflow(DataWorkflow):
         kept_vars = {
             # POWER BALANCE TRAINING
             "Wtot_MJ",
-            "Wmhd_MJ",
             "Ip_MA",
             # PROFILE PREDICTOR PREDICT-FIRST SIGNALS
             "Te_keV_psi",
@@ -720,6 +719,7 @@ class D3DDataWorkflow(DataWorkflow):
             "beta_n",  # EFIT, only from MDSPlus tree (local recomputation mangles)
             "beta_p",  # EFIT
             "betat",  # EFIT
+            "Wmhd_MJ",  # From EFIT, to fill in missing Wtot_MJ if need be
         }
 
         ds = ds[list(kept_vars)]

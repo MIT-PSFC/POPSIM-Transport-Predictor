@@ -248,12 +248,12 @@ def ds_profile_plot(
     for shot in ds["shot"].data[:num_shots]:
         shot_ds = ds.sel(shot=shot)
 
-        rho = shot_ds["rho"].values
+        rho = shot_ds["psi"].values
         time = shot_ds["time"].values
 
         # Extract 2D arrays for density and temperature
-        ne_data = shot_ds["ne20_rho"].values.T  # shape: (rho, time) - transposed
-        te_data = shot_ds["Te_keV_rho"].values.T  # shape: (rho, time) - transposed
+        ne_data = shot_ds["ne20_psi"].values.T  # shape: (rho, time) - transposed
+        te_data = shot_ds["Te_keV_psi"].values.T  # shape: (rho, time) - transposed
 
         # Create masks for timesteps with NaN values
         ne_nan_mask = np.isnan(ne_data).any(axis=0)  # True if any NaN in that timestep

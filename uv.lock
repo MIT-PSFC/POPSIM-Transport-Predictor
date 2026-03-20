@@ -890,6 +890,19 @@ wheels = [
 ]
 
 [[package]]
+name = "freeqdsk"
+version = "0.5.2"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "fortranformat" },
+    { name = "numpy" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/51/cd/a98eea70d69fbee460278d54ca94370ad659f4245e96f1383471749c7e57/freeqdsk-0.5.2.tar.gz", hash = "sha256:7b40430f8368a9ac130d441d43aa50944b4165c8c44fc49b752836bd8e822b4b", size = 201827 }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/3b/c3/27c40f49900c200ff1655af3070cd5f9e796e39e85e3d7edb452a9874f30/freeqdsk-0.5.2-py3-none-any.whl", hash = "sha256:36f9b614b03b7af930b5239e1f9e0ea2da4a8b16de8284b8e8c96a8160a08895", size = 25751 },
+]
+
+[[package]]
 name = "fsspec"
 version = "2026.1.0"
 source = { registry = "https://pypi.org/simple" }
@@ -2678,6 +2691,7 @@ dependencies = [
     { name = "disruption-py" },
     { name = "dynaconf" },
     { name = "fire" },
+    { name = "freeqdsk" },
     { name = "gptools" },
     { name = "netcdf4" },
     { name = "popsim" },
@@ -2710,6 +2724,7 @@ requires-dist = [
     { name = "disruption-py", editable = "submodules/disruption-py" },
     { name = "dynaconf", specifier = ">=3.2.12" },
     { name = "fire", specifier = ">=0.7.1" },
+    { name = "freeqdsk", specifier = ">=0.5.2" },
     { name = "gptools", editable = "submodules/gptools" },
     { name = "netcdf4" },
     { name = "popsim", editable = "submodules/popsim" },
