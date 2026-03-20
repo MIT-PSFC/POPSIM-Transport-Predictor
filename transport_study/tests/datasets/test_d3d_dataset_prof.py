@@ -28,8 +28,8 @@ from disruption_py.settings import (
     TimeSetting,
     TimeSettingParams,
 )
-from transport_study.datasets.d3d.d3d_dataset import (
-    D3DDataWorkflow,
+from transport_study.datasets.d3d.d3d_dataset import D3DDataWorkflow
+from transport_study.datasets.d3d.utils import (
     DEFAULT_SHOTLIST_FILE,
     Uniform1kHzTimeSetting,
 )
@@ -47,17 +47,25 @@ def test_trajopt_input_mapping():
     """
     ds_path = "/fusion/projects/disruption_warning/data/popsim/popsim_studies/profopt/hbp_ida/raw_data/199056.nc"
     ds = xr.open_dataset(ds_path)
+    ds = ds.isel(shot=0)
 
     a_minor = ds["a_minor"].values
     kappa = ds["kappa"].values
     delta_top = ds["delta_top"].values
     delta_bot = ds["delta_bot"].values
 
+    valid_point_mask = (ds["rxtop"] > 0) & (ds["rxbot"] > 0)
+    for var in ["rxtop", "rxbot", "zxtop", "zxbot"]:
+        ds[var] = ds[var].where(valid_point_mask, np.nan)
+
+    # RW = (ds["R0"] - ds["gapin"] - ds["a_minor"]).mean()
+    RW = 1.046  # Location of the inner wall
+
     # Need to remake these things from our input parameters
-    a_minor_reconst = ds["R0"].values - ds["gapin"].values
-    kappa_reconst = (ds["zxpt2"].values - ds["zxpt1"].values) / (a_minor_reconst * 2)
-    delta_top_reconst = (ds["rxtop"].values - ds["R0"].values) / a_minor_reconst
-    delta_bot_reconst = (ds["rxbot"].values - ds["R0"].values) / a_minor_reconst
+    a_minor_reconst = ds["R0"].values - ds["gapin"].values - RW
+    kappa_reconst = (ds["zxtop"].values - ds["zxbot"].values) / (a_minor_reconst * 2)
+    delta_top_reconst = (ds["R0"].values - ds["rxtop"].values) / a_minor_reconst
+    delta_bot_reconst = (ds["R0"].values - ds["rxbot"].values) / a_minor_reconst
 
     fig, axes = plt.subplots(4, 1, figsize=(10, 15))
     axes[0].plot(ds["time"], a_minor, label="a_minor")
@@ -266,6 +274,57 @@ def find_1kHz_discrepancies():
     plt.close(fig)
 
 
+def correct_betan_source():
+    """When betanf is missing, we need a fallback"""
+
+    # Find a shot where these three things all exist and compare them
+    # 1. betanf from pedestal
+    # 2. betan from fast EFIT
+    # 3. betan from slow EFIT
+    # 4. programmed betan
+    raw_path = "/fusion/projects/disruption_warning/data/popsim/popsim_studies/profopt/hbp_ida/raw_data/201927.nc"
+    ds_raw = xr.open_dataset(raw_path).isel(shot=0)
+
+    betanf = ds_raw["betan"].values
+    beta_n = ds_raw["beta_n"].values
+    betan_prog = ds_raw["betan_prog"].values
+
+    betat = ds_raw["betat"].values
+    ip_norm = ds_raw["Ip_MA"].values / (ds_raw["a_minor"].values * ds_raw["B0"].values)
+    betan_reconstructed = betat / ip_norm
+
+    fig, ax = plt.subplots(figsize=(10, 5))
+    ax.plot(ds_raw["time"], betanf, label="betanf (pedestal)")
+    ax.plot(ds_raw["time"], beta_n, label="betan (EFIT)", linestyle="dashed")
+    ax.plot(
+        ds_raw["time"], betan_prog, label="betan_prog (programmed)", linestyle="dotted"
+    )
+    ax.plot(ds_raw["time"], betat, label="betat (EFIT)", linestyle="dashdot")
+    ax.plot(
+        ds_raw["time"],
+        betan_reconstructed,
+        label="betan_reconstructed (from betat)",
+        linestyle="dotted",
+    )
+    ax.set_title("betan comparison")
+    ax.set_xlabel("Time (s)")
+    ax.set_ylabel("betan")
+    ax.set_ylim(-0.01, 5)
+    ax.legend()
+    fig.tight_layout()
+    fig.savefig(
+        os.path.join(
+            PACKAGE_ROOT,
+            "tests",
+            "test_outputs",
+            "d3d_1kHz_discrepancies",
+            "betan_comparison.png",
+        )
+    )
+    plt.close(fig)
+
+
 if __name__ == "__main__":
-    test_trajopt_input_mapping()
+    # test_trajopt_input_mapping()
     # find_1kHz_discrepancies()
+    correct_betan_source()

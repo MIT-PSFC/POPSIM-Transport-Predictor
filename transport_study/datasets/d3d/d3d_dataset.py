@@ -157,22 +157,20 @@ class D3DDataWorkflow(DataWorkflow):
                 "min": 0,
                 "max": 10,
             },  # 201855 also has a crazy P_rad far out of distribution, get rid of it
-            "rxpt1": {
-                "min": 0.5,
-                "max": 2,
-            },  # Drop shape points where this is clearly wrong (-10)
+            # Drop shape points where this is clearly wrong
+            "rxpt1": {"min": 0, "max": 3},
             "rxpt2": {
-                "min": 0.5,
-                "max": 2,
-            },  # Drop shape points where this is clearly wrong (-10)
+                "min": 0,
+                "max": 3,
+            },
             "zxpt1": {
                 "min": -4,
                 "max": 4,
-            },  # Drop shape points where this is clearly wrong (-10)
+            },
             "zxpt2": {
                 "min": -4,
                 "max": 4,
-            },  # Drop shape points where this is clearly wrong (-10)
+            },
         }
 
     def _get_shotlist_from_source(self) -> list[int]:
@@ -437,7 +435,7 @@ class D3DDataWorkflow(DataWorkflow):
 
             slow_efit_result = efit_result
             efit_result = fast_efit_result
-            # recomputation mangles these, fallback to EFIT01
+            # recomputation mangles this, fallback to EFIT01
             efit_result["gapin"] = slow_efit_result["gapin"]
             efit_result["beta_n"] = slow_efit_result["beta_n"]
 
@@ -706,8 +704,9 @@ class D3DDataWorkflow(DataWorkflow):
             "zxtop_prog",
             # OTHER
             "betapf",  # pedestal, obtained from toksearch
-            "beta_n",  # EFIT
+            "beta_n",  # EFIT, only from MDSPlus tree (local recomputation mangles)
             "beta_p",  # EFIT
+            "betat",  # EFIT
         }
 
         ds = ds[list(kept_vars)]

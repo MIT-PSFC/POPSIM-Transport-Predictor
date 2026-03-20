@@ -217,9 +217,7 @@ def disruption_efit(efit_tgz_path: str, shot: int) -> xr.Dataset:
                 "tritop": a_data["doutu"],  # Triangularity at the top
                 "tribot": a_data["doutl"],  # Triangularity at the bottom
                 "beta_p": a_data["betap"],  # Poloidal beta
-                "beta_n": a_data[
-                    "betat"
-                ],  # Toroidal beta TODO(ZanderKeith) this might be wrong
+                "betat": a_data["betat"],  # Toroidal beta
             }
 
             ds = xr.Dataset(
