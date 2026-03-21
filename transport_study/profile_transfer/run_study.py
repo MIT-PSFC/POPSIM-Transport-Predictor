@@ -412,8 +412,6 @@ class ProfileStudy(Study):
                         "n_shapes": 3,
                         "nn_depth": 2,
                         "nn_width": 16,
-                        "min_val": 0,  # Minimum profile value
-                        "max_val": 6,  # Maximum profile value
                         "in_size": 9,  # Ip_MA, B0, betan, ne20_edge, R0, a_minor, kappa, delta_top, delta_bot
                         "softmax_temp": 1,
                         "prng_seed": 42,
@@ -531,6 +529,9 @@ class ProfileStudy(Study):
     def launch_sweep(self, case: Case):
         """Launch a wandb hyperparameter sweep for the given case."""
         train_config = self.make_train_config(case)
+        # Remove the test_eval_suite_config since that's for final results only
+        train_config = train_config.model_copy(update={"test_eval_suite_config": None})
+
         sweep_id = get_sweep_id(self.wandb_project_name(case))
 
         if not sweep_id:
@@ -539,7 +540,6 @@ class ProfileStudy(Study):
             )
             sweep_config_path = os.path.join(
                 PACKAGE_ROOT,
-                "transport_study",
                 "profile_transfer",
                 "sweep_configs",
                 f"{case.model_type}.yaml",
@@ -853,6 +853,9 @@ def run_study(  # noqa: PLR0915
     if working_dir_base is None:
         working_dir_base = os.path.join(PACKAGE_ROOT, "popsim_studies", "working_dir")
 
+    if config.debug:
+        project_name = f"{project_name}_debug"
+
     study = ProfileStudy(
         name=project_name,
         working_dir_base=working_dir_base,
@@ -892,7 +895,11 @@ def run_study(  # noqa: PLR0915
             )
 
         if clean_sweeps:
-            project_names = {study.wandb_project_name(case) for case in study.cases}
+            project_names = {
+                study.wandb_project_name(case)
+                for case in study.cases
+                if case.is_hyperparam_case()
+            }
             run_clean_sweeps(project_names)
         if clean_models:
             shutil.rmtree(study.model_dir, ignore_errors=True)

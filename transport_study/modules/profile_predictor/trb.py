@@ -441,8 +441,11 @@ class ProfilePredictorTRB(TrainRunBuilder):
             ds = ds.drop_vars("input_batch", errors="ignore")
             return ds
 
-        eval_suite = {
-            "study_results": study_results,
-        }
-
-        return eval_suite
+        if config:
+            eval_suite = {
+                "study_results": study_results,
+            }
+            return eval_suite
+        else:
+            # Hyperparameter tuning, do not run test evals
+            return None
