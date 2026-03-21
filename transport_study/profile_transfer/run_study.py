@@ -96,6 +96,10 @@ class ProfileStudy(Study):
             ) and self.num_hp_shots == 0:
                 return True
 
+            # The whole point of exnihilo is training from nothing, so it doesn't make sense to have domain adaptation in that case since there's no source domain to adapt from
+            if self.training_data == "exnihilo" and self.domain_adaptation is not None:
+                return True
+
             return False
 
         def get_hyperparam_prereq(self) -> Study.Case:
@@ -362,12 +366,12 @@ class ProfileStudy(Study):
             # we want the high-performance data to be consistently heavily weighted
             # Weights are chosen so that each device's effective contribution F_x = W_x * N_x
             # (where N_x is the shot count) sums to 200, with d3d_hp carrying ~50% of that total.
-            # So the C-Mod and TCV data each make up 10 out of 200,
-            # the DIII-D low-performance data makes up 80 out of 200,
+            # So the C-Mod and TCV data each make up 40 out of 200,
+            # the DIII-D low-performance data makes up 60 out of 200,
             # and the DIII-D high-performance data makes up 100 out of 200
-            W_c = 10 / 1000
-            W_t = 10 / 1000
-            W_dlp = 80 / 1000
+            W_c = 20 / 1000
+            W_t = 20 / 1000
+            W_dlp = 60 / 1000
             if case.num_hp_shots in [-1, 0]:
                 # If -1, all 97 high-performance shots in the DIII-D dataset
                 # If 0, weights aren't being used anyway
@@ -375,7 +379,7 @@ class ProfileStudy(Study):
             else:
                 N_dhp = case.num_hp_shots
             W_dhp = 100 / N_dhp
-            # Multiply all by
+            # Multiply all by 100 to get back to a value ~1
             dataloader_config_base["device_weights"] = {
                 "cmod": W_c * 100,
                 "tcv": W_t * 100,

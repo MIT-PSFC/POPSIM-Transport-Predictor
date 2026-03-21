@@ -250,16 +250,27 @@ class PowerBalanceTRB(TrainRunBuilder):
             device_weights = loss_config["device_weights"]
 
         def loss_fn(pred, targ):
-            absolute_error = jnp.abs(pred.Wtot_MJ_pred - targ["Wtot_MJ"].data)
-            for device, weight in device_weights.items():
-                device_mask = targ["ds_source_idx"].data == DS_SOURCE_TO_IDX[device]
-                absolute_error = jnp.where(
-                    device_mask, weight * absolute_error, absolute_error
-                )
             huber_loss = optax.huber_loss(
-                absolute_error, delta=loss_config["huber_delta"]
+                pred.Wtot_MJ_pred,
+                targ["Wtot_MJ"].data,
+                delta=loss_config["huber_delta"],
             )
-            return jnp.mean(huber_loss)
+
+            # Build per-sample weights from device labels
+            ds_source_idx = targ["ds_source_idx"].data
+            sample_weights = jnp.ones(ds_source_idx.shape, dtype=huber_loss.dtype)
+            for device, weight in device_weights.items():
+                sample_weights = jnp.where(
+                    ds_source_idx == DS_SOURCE_TO_IDX[device],
+                    weight,
+                    sample_weights,
+                )
+
+            # Broadcast sample weights to match huber_loss shape if needed
+            while sample_weights.ndim < huber_loss.ndim:
+                sample_weights = sample_weights[..., None]
+
+            return jnp.mean(sample_weights * huber_loss)
 
         return IntegralLoss(loss_fn)
 

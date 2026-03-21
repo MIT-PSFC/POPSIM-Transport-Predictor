@@ -438,7 +438,9 @@ class ProfilePredictorShapeInit(ProfilePredictor):
 
 
 class ProfilePredictorUnstructuredNN(ProfilePredictor):
-    psi_points: Array = eqx.field(static=True)  # Points at which the NN predicts
+    psi_points: tuple = eqx.field(
+        static=True
+    )  # Hashable points at which the NN predicts
 
     def __init__(
         self,
@@ -448,7 +450,12 @@ class ProfilePredictorUnstructuredNN(ProfilePredictor):
         psigrid: tuple,
         key: jax.random.PRNGKey,
     ):
-        self.psi_points = jnp.linspace(min(psigrid), max(psigrid), n_points)
+        psigrid_tuple = (
+            tuple(psigrid.tolist()) if hasattr(psigrid, "tolist") else tuple(psigrid)
+        )
+        self.psi_points = tuple(
+            jnp.linspace(min(psigrid_tuple), max(psigrid_tuple), n_points).tolist()
+        )
 
         key, subkey = jax.random.split(key)
         self.nn = RtdMLP(
@@ -460,7 +467,7 @@ class ProfilePredictorUnstructuredNN(ProfilePredictor):
             final_activation=Activation.IDENTITY,
             key=subkey,
         )
-        self.psigrid = psigrid
+        self.psigrid = psigrid_tuple
 
     def __call__(self, inputs: Inputs | xr.Dataset, debug: bool = False) -> Outputs:
         if isinstance(inputs, xr.Dataset):
@@ -478,21 +485,19 @@ class ProfilePredictorUnstructuredNN(ProfilePredictor):
             )
 
         nn_inputs = inputs.nn_inputs
+        psi_points = jnp.asarray(self.psi_points)
+        n_pred_points = len(self.psi_points)
 
         # Predict the profile values at the specified points.
         outputs = self.nn(nn_inputs)
-        ne_points = outputs[: self.psi_points.size]
-        te_points = outputs[self.psi_points.size : 2 * self.psi_points.size]
+        ne_points = outputs[:n_pred_points]
+        te_points = outputs[n_pred_points : 2 * n_pred_points]
         ne_correction = jnp.abs(outputs[-1])
         te_correction = jnp.abs(outputs[-2])
 
         # Interpolate the predicted points to the psigrid
-        ne = (
-            jnp.interp(inputs.psi, self.psi_points, ne_points)
-            * inputs.ne20
-            * ne_correction
-        )
-        te = jnp.interp(inputs.psi, self.psi_points, te_points) * te_correction
+        ne = jnp.interp(inputs.psi, psi_points, ne_points) * inputs.ne20 * ne_correction
+        te = jnp.interp(inputs.psi, psi_points, te_points) * te_correction
 
         out = Outputs(
             ne=xr.DataArray(

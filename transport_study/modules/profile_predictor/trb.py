@@ -21,6 +21,7 @@ from transport_study.modules.profile_predictor.module import (
     pca_initial_guess,
 )
 from transport_study.orchestration.organize_data import (
+    DS_SOURCE_TO_IDX,
     get_train_test_datasets,
     get_train_val_datasets,
 )
@@ -49,11 +50,30 @@ class ProfilePredictorTRB(TrainRunBuilder):
 
         if dataloader_config["domain_adaptation"] is None:
             logger.info("Using standard learning dataloader")
-            ds_train, ds_val = get_train_val_datasets(
-                training_data=dataloader_config["training_data"],
-                data_normalization=dataloader_config["data_normalization"],
-                study_type="profile_transfer",
-            )
+            if dataloader_config["training_data"] != "exnihilo":
+                ds_train, ds_val = get_train_val_datasets(
+                    training_data=dataloader_config["training_data"],
+                    data_normalization=dataloader_config["data_normalization"],
+                    study_type="profile_transfer",
+                )
+            else:
+                ds_train, ds_val = get_train_test_datasets(
+                    training_data=dataloader_config["training_data"],
+                    data_normalization=dataloader_config["data_normalization"],
+                    domain_adaptation=None,
+                    num_hp_shots=dataloader_config["num_hp_shots"],
+                    hp_test_set_size=dataloader_config.get("hp_test_set_size", None),
+                    study_type="profile_transfer",
+                )
+                # Double check there's no historic data anywhere in here
+                if (
+                    (ds_train["ds_source"] == "cmod").any()
+                    or (ds_train["ds_source"] == "tcv").any()
+                    or (ds_train["ds_source"] == "d3d_lp").any()
+                ):
+                    raise ValueError(
+                        "Historic data found in training set for exnihilo training_data option. Please check the dataset construction logic."
+                    )
         else:
             logger.info(
                 f"Using transfer learning dataloader with domain adaptation {dataloader_config['domain_adaptation']}"
@@ -157,20 +177,47 @@ class ProfilePredictorTRB(TrainRunBuilder):
         return module
 
     @staticmethod
-    def get_loss_fn(config: dict) -> Callable[[Any, Any], jnp.ndarray]:
+    def get_loss_fn(loss_config: dict) -> Callable[[Any, Any], jnp.ndarray]:
+        if "device_weights" not in loss_config:
+            device_weights = {
+                "cmod": 1.0,
+                "tcv": 1.0,
+                "d3d_lp": 1.0,
+                "d3d_hp": 1.0,
+            }
+        else:
+            device_weights = loss_config["device_weights"]
+
         def loss_fn(pred, targ):
-            ne_psi_loss = jnp.trapezoid(
-                optax.huber_loss(
-                    pred.ne.data, targ["ne20_psi"].data, delta=config["huber_delta"]
-                ),
-                x=pred.ne.psi_n.data,
+            ne_huber = optax.huber_loss(
+                pred.ne.data,
+                targ["ne20_psi"].data,
+                delta=loss_config["huber_delta"],
             )
-            te_psi_loss = jnp.trapezoid(
-                optax.huber_loss(
-                    pred.te.data, targ["Te_keV_psi"].data, delta=config["huber_delta"]
-                ),
-                x=pred.te.psi_n.data,
+            te_huber = optax.huber_loss(
+                pred.te.data,
+                targ["Te_keV_psi"].data,
+                delta=loss_config["huber_delta"],
             )
+
+            # Build per-sample device weight
+            ds_source_idx = targ["ds_source_idx"].data
+            sample_weights = jnp.ones(ds_source_idx.shape, dtype=ne_huber.dtype)
+            for device, weight in device_weights.items():
+                sample_weights = jnp.where(
+                    ds_source_idx == DS_SOURCE_TO_IDX[device], weight, sample_weights
+                )
+
+            # Broadcast sample weights across profile/time axes
+            while sample_weights.ndim < ne_huber.ndim:
+                sample_weights = sample_weights[..., None]
+
+            ne_weighted = sample_weights * ne_huber
+            te_weighted = sample_weights * te_huber
+
+            ne_psi_loss = jnp.trapezoid(ne_weighted, x=pred.ne.psi_n.data)
+            te_psi_loss = jnp.trapezoid(te_weighted, x=pred.te.psi_n.data)
+
             return ne_psi_loss + te_psi_loss
 
         return loss_fn
@@ -231,7 +278,15 @@ class ProfilePredictorTRB(TrainRunBuilder):
             """
 
             def _unstack_and_rename_time(da: xr.DataArray) -> xr.DataArray:
-                da = da.unstack("sample").squeeze()
+                da = da.unstack("sample")
+                # Keep episode/time axes even when they have length 1.
+                # Single-shot eval splits are valid and should retain the shot dimension.
+                protected_dims = {EPISODE_DIM, TIME_DIM, TIME_DIM + "_input"}
+                squeeze_dims = [
+                    d for d, n in da.sizes.items() if n == 1 and d not in protected_dims
+                ]
+                if squeeze_dims:
+                    da = da.squeeze(dim=squeeze_dims, drop=True)
                 if TIME_DIM + "_input" in da.dims:
                     da = da.rename({TIME_DIM + "_input": TIME_DIM})
                 return da
@@ -329,7 +384,7 @@ class ProfilePredictorTRB(TrainRunBuilder):
             # Keep ds_source coord aligned to shot
             ds_source = eval_data.input_ds["ds_source"]
             if "sample" in ds_source.dims:
-                ds_source_unstacked = ds_source.unstack("sample").squeeze()
+                ds_source_unstacked = ds_source.unstack("sample")
                 if (
                     EPISODE_DIM in ds_source_unstacked.dims
                     and ds_source_unstacked.ndim > 1
