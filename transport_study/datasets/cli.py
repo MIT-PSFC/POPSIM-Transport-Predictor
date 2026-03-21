@@ -64,7 +64,6 @@ class DatasetCLI:
         max_num_shots: int | None = None,
         mode: str | None = "raw",
         clean: bool | None = False,
-        skip_profiles: bool | None = False,
     ):
         data_assembly_dir = os.path.join(data_assembly_dir, config.study_name)
         workflow = TCVDataWorkflow(
@@ -73,7 +72,6 @@ class DatasetCLI:
             data_assembly_dir=data_assembly_dir,
             source_dataset_path=source_dataset_path,
             max_num_shots=max_num_shots,
-            skip_profiles=skip_profiles,
         )
 
         self._execute(workflow, mode, clean)

@@ -333,7 +333,7 @@ class ProfileStudy(Study):
             "data_normalization": case.data_normalization,
             "domain_adaptation": case.domain_adaptation,
             "num_hp_shots": case.num_hp_shots,
-            "hp_test_set_size": self.hp_test_set_size,
+            "hp_test_set_size": config.hp_test_set_size,
             "prng_seed": 42,
             "debug": config.debug,
             # Hyperparameters

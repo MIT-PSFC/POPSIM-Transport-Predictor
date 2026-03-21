@@ -31,7 +31,7 @@ TCV_0D_SIGNALS = [
     "POHM",
     "P_LH",
     "PradBulk",
-    "RMAG",
+    "R_geom",
     "Wtot",
     "a_minor",
     # Extra things for comparison
@@ -59,7 +59,6 @@ class TCVDataWorkflow(DataWorkflow):
         data_assembly_dir: str,
         source_dataset_path: str | None = None,
         max_num_shots: int | None = None,
-        skip_profiles: bool | None = False,
     ):
         """Initialize the TCV data workflow.
 
@@ -77,8 +76,6 @@ class TCVDataWorkflow(DataWorkflow):
             Each file should be named like TCVno{shot_number}.nc
         max_num_shots : int | None
             Maximum number of shots to process (for testing). If None, process all shots.
-        skip_profiles: bool | None = False,
-            If True, skip profile fitting and use zero arrays instead. Useful for testing.
         """
 
         # Use centralized config
@@ -91,6 +88,7 @@ class TCVDataWorkflow(DataWorkflow):
             "ne20_edge": {"min": 0.01, "max": 4},
             "P_ECRH_MW": {"min": 0, "max": 10},
         }
+        self.individual_filter_config = None
 
         # Set source directory path
         if source_dataset_path is not None:
@@ -104,7 +102,6 @@ class TCVDataWorkflow(DataWorkflow):
             shotlist_file,
             data_assembly_dir,
             max_num_shots=max_num_shots,
-            skip_profiles=skip_profiles,
         )
 
     def _get_shotlist_from_source(self) -> list[int]:
@@ -210,10 +207,8 @@ class TCVDataWorkflow(DataWorkflow):
                     return False
                 return True
 
-            if not self.skip_profiles and not _profiles_exist(ds_shot):
-                logger.warning(
-                    f"Shot {shot} is missing profile data and skip_profiles is False, skipping"
-                )
+            if not _profiles_exist(ds_shot):
+                logger.warning(f"Shot {shot} is missing profile data, skipping")
                 continue
 
             # Create uniform 1 kHz timebase (max time where I_P is greater than 50 kA)
@@ -365,10 +360,11 @@ class TCVDataWorkflow(DataWorkflow):
         # Simple renames
         ds = ds.rename(
             {
-                "RMAG": "R0",
+                "R_geom": "R0",
                 "KAPPA": "kappa",
                 "DELTA_TOP": "delta_top",
-                "DELTA_BOTTOM": "delta_bottom",
+                "DELTA_BOTTOM": "delta_bot",
+                "BETAN": "betan",
             }
         )
 
@@ -382,11 +378,8 @@ class TCVDataWorkflow(DataWorkflow):
         ds["Wtot_MJ"] = ds["Wtot"] * 1e-6
         ds["LH_transition_threshold_MW"] = ds["P_LH"] * 1e-6
 
-        # Profile data may not be available for all shots
-        if "Ne_rho" in ds:
-            ds["ne20_rho"] = ds["Ne_rho"] * 1e-20
-        if "Te_rho" in ds:
-            ds["Te_keV_rho"] = ds["Te_rho"] * 1e-3
+        ds["ne20_psi"] = ds["Ne_rho"] * 1e-20
+        ds["Te_keV_psi"] = ds["Te_rho"] * 1e-3
 
         # If the signal is not present, create it as zeros up to shape of Ip_MA
         # But where Ip_MA is NaN, keep it NaN
@@ -401,30 +394,27 @@ class TCVDataWorkflow(DataWorkflow):
                 ds[new_name] = xr.where(
                     ds["Ip_MA"].notnull(), ds[original_name].fillna(0.0), np.nan
                 )
+                # Only keep variables of interest
+        kept_vars = {
+            # POWER BALANCE TRAINING
+            "Wtot_MJ",
+            "Ip_MA",
+            "ne20_line_avg",
+            # PROFILE PREDICTOR PREDICT-FIRST SIGNALS
+            "Te_keV_psi",
+            "ne20_psi",
+            "B0",
+            "betan",
+            "ne20_edge",
+            "R0",
+            "kappa",
+            "a_minor",
+            "delta_top",
+            "delta_bot",
+            # OTHER
+        }
 
-        # Drop old names
-        ds = ds.drop(
-            [
-                "I_P",
-                "BZERO",
-                "DELTA",
-                "DELTA_TOP",
-                "DELTA_BOTTOM",
-                "ECRH",
-                "KAPPA",
-                "NBI",
-                "NEavg",
-                "Ne_edge_avg",
-                "POHM",
-                "PradBulk",
-                "RMAG",
-                "Wtot",
-                "Ne_rho",
-                "Te_rho",
-                "P_LH",
-            ],
-            errors="ignore",
-        )
+        ds = ds[list(kept_vars)]
 
         return ds
 
@@ -447,30 +437,37 @@ class TCVDataWorkflow(DataWorkflow):
 
         # Simple fringe-jump correction for ne20_line_avg
         # Detect large step changes and remove the offset for the remainder of the trace
-        if "ne20_line_avg" in ds:
-            ne_values = ds["ne20_line_avg"].values[0, :]
-            if not np.all(np.isnan(ne_values)):
-                trace = ne_values.copy()
-                diff = np.diff(trace)
-                median_abs_diff = np.nanmedian(np.abs(diff))
-                jump_threshold = max(0.1, 5.0 * median_abs_diff)
+        for density_var in ["ne20_line_avg", "ne20_edge"]:
+            if density_var in ds:
+                ne_values = ds[density_var].values[0, :]
+                if not np.all(np.isnan(ne_values)):
+                    trace = ne_values.copy()
+                    diff = np.diff(trace)
+                    median_abs_diff = np.nanmedian(np.abs(diff))
+                    jump_threshold = max(0.1, 5.0 * median_abs_diff)
 
-                # Cumulative offset after each detected jump
-                offset = 0.0
-                corrected = trace.copy()
-                for i in range(1, trace.size):
-                    if np.isnan(trace[i - 1]) or np.isnan(trace[i]):
+                    # Cumulative offset after each detected jump
+                    offset = 0.0
+                    corrected = trace.copy()
+                    for i in range(1, trace.size):
+                        if np.isnan(trace[i - 1]) or np.isnan(trace[i]):
+                            corrected[i] = trace[i] - offset
+                            continue
+                        step = trace[i] - trace[i - 1]
+                        if np.abs(step) >= jump_threshold:
+                            offset += step
                         corrected[i] = trace[i] - offset
-                        continue
-                    step = trace[i] - trace[i - 1]
-                    if np.abs(step) >= jump_threshold:
-                        offset += step
-                    corrected[i] = trace[i] - offset
 
-                ds["ne20_line_avg"] = (
-                    ds["ne20_line_avg"].dims,
-                    corrected[np.newaxis, :],
-                )
+                    ds[density_var] = (
+                        ds[density_var].dims,
+                        corrected[np.newaxis, :],
+                    )
+
+        # Rename "rho" to "psi_n"
+        # This is a little scuffed, but I just need *something* for historic data to compare against
+        # Really making me want to create a fully coupled equilibrium fitter to make this consistent
+        ds = ds.rename_dims({"rho": "psi_n"})
+        ds = ds.rename_vars({"rho": "psi_n"})
 
         return ds
 
@@ -489,12 +486,13 @@ class TCVDataWorkflow(DataWorkflow):
             logger.info(f"Culling shot {ds.shot.values[0]} due to known data issues")
             return True
 
-        p_rad_avg = ds["P_rad_MW"].mean().item()
-        if p_rad_avg < 0.02 or ds["P_rad_MW"].isnull().all():
-            logger.info(
-                f"Culling shot {ds.shot.values[0]} due to consistently low or missing radiated power measurement (P_rad_MW.mean() < 0.02 MW)"
-            )
-            return True
+        if "P_rad_MW" in ds:
+            p_rad_avg = ds["P_rad_MW"].mean().item()
+            if p_rad_avg < 0.02 or ds["P_rad_MW"].isnull().all():
+                logger.info(
+                    f"Culling shot {ds.shot.values[0]} due to consistently low or missing radiated power measurement (P_rad_MW.mean() < 0.02 MW)"
+                )
+                return True
 
         ne_line_avg = ds["ne20_line_avg"].mean().item()
         ne_edge_avg = ds["ne20_edge"].mean().item()

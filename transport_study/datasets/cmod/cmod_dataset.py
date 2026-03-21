@@ -526,4 +526,8 @@ class CModDataWorkflow(DataWorkflow):
         ds["ne20_psi"] = ds["ne20_psi"].where(valid_profile_mask)
         ds["Te_keV_psi"] = ds["Te_keV_psi"].where(valid_profile_mask)
 
+        # Rename 'psi' dimension to 'psi_n'
+        ds = ds.rename_dims({"psi": "psi_n"})
+        ds = ds.rename_vars({"psi": "psi_n"})
+
         return ds
