@@ -11,8 +11,6 @@ from scipy.linalg import fractional_matrix_power
 from transport_study import EPISODE_DIM, TIME_COORD, TIME_DIM
 from transport_study.config import TRAIN_VAL_SPLIT, config
 
-MAX_DS_SIZE_GB = 100  # If the dataset is larger than this, do not load into memory
-
 # Canonical idx for each device, used to pass device identity through the dataloader as a float variable.
 DS_SOURCE_TO_IDX: dict[str, int] = {"cmod": 0, "tcv": 1, "d3d_lp": 2, "d3d_hp": 3}
 IDX_TO_DS_SOURCE: dict[int, str] = {v: k for k, v in DS_SOURCE_TO_IDX.items()}
@@ -43,21 +41,31 @@ def _add_ds_source_idx(ds: xr.Dataset) -> xr.Dataset:
     return ds.assign({"ds_source_idx": xr.DataArray(arr, dims=[EPISODE_DIM, TIME_DIM])})
 
 
-REQUIRED_SIGNALS = [
-    # Signals for power balance predictor
+REQUIRED_SIGNALS_POWER_BALANCE = [
     "Wtot_MJ",
-    # To start (because it's easy) we will be comparing against the H98 and H89 scaling laws https://wiki.fusion.ciemat.es/wiki/Scaling_law
-    # and threshold powers https://iopscience.iop.org/article/10.1088/1742-6596/123/1/012033/pdf#:~:text=The%20estimated%20power%20law%20scalings,the%20energy%20confinement%20time%20increases.
     "Ip_MA",
     "B0",
-    "ne20_line_avg",
     "R0",
     "kappa",
     "a_minor",  # For inverse aspect ratio
-    # TODO(ZanderKeith), missing the Hydrogen isotope mass info. Can we get that in these devices?
 ]
-
 INPUT_POWER_SIGNALS = ["P_ECRH_MW", "P_NBI_MW", "P_ICRF_MW", "P_LH_MW"]
+
+REQUIRED_SIGNALS_PROFILE_TRANSFER = [
+    "Te_keV_psi",
+    "ne20_psi",
+    "fresh_profiles",
+    "Ip_MA",
+    "B0",
+    "betan",
+    "ne20_edge",
+    "R0",
+    "a_minor",
+    "kappa",
+    "delta_top",
+    "delta_bot",
+    "Wtot_MJ",  # Not strictly necessary but used for performance extrapolation
+]
 
 
 def concat_with_nan_padding(
@@ -100,12 +108,14 @@ def concat_with_nan_padding(
 
 def get_ds(
     source_ds: str,
+    study_type: str,
     debug: bool | None = config.debug,
 ) -> tuple[xr.Dataset, str]:
     """Open the dataset, and do some light processing to get it ready for training.
 
     Args:
         source_ds (str): Identifier for the source dataset.
+        study_type (str): Type of study for which to prepare the dataset.
         debug (bool, optional): Whether to enable debug mode, reducing dataset size to at most 50 shots.
 
     Returns:
@@ -129,24 +139,54 @@ def get_ds(
     if debug:
         ds = ds.isel(shot=slice(0, 10))  # Limit to 10 shots
 
-    if ds.nbytes < MAX_DS_SIZE_GB * 1e9:
-        ds = ds.load()  # Load into memory if not too large
+    def _profile_transfer(ds: xr.Dataset) -> xr.Dataset:
+        for signal in REQUIRED_SIGNALS_PROFILE_TRANSFER:
+            if signal not in ds:
+                raise ValueError(
+                    f"Required signal for training {signal} not found in dataset."
+                )
 
-    # Ensure all required signals are present
-    for signal in REQUIRED_SIGNALS:
-        if signal not in ds:
-            raise ValueError(
-                f"Required signal for transport predictor training {signal} not found in dataset."
-            )
+        # Only keep fresh profiles for training
+        ds = ds.where(ds["fresh_profiles"] == 1, drop=True)
+        # TCV only has profile data out to rho=1 / psi_n=1
+        # Put all the datasets on a uniform 51 point psi_n grid for consistency
+        psi_n_grid = np.linspace(0, 1, 51)
+        ds = ds.interp(psi_n=psi_n_grid)
 
-    # Additional signals and duplicates for slight renames between submodules
-    # This is for the individual submodule training to work, since when they're running on their own they expect these names.
-    for signal in INPUT_POWER_SIGNALS:
-        if signal not in ds:
-            ds[signal] = xr.zeros_like(ds["Ip_MA"])
+        # Compute means and shapes.
+        ds["Te_keV_line_avg"] = ds["Te_keV_psi"].integrate("psi_n")
+        ds["ne20_line_avg"] = ds["ne20_psi"].integrate("psi_n")
+        ds["Te_shape"] = ds["Te_keV_psi"] / ds["Te_keV_line_avg"]
+        ds["ne_shape"] = ds["ne20_psi"] / ds["ne20_line_avg"]
+        return ds
 
-    # Calculate aux power and absorbed power
-    ds["P_aux_MW"] = ds["P_NBI_MW"] + ds["P_ECRH_MW"] + ds["P_ICRF_MW"] + ds["P_LH_MW"]
+    def _power_balance(ds: xr.Dataset) -> xr.Dataset:
+        # Ensure all required signals are present
+        for signal in REQUIRED_SIGNALS_POWER_BALANCE:
+            if signal not in ds:
+                raise ValueError(
+                    f"Required signal for training {signal} not found in dataset."
+                )
+
+        # Additional signals and duplicates for slight renames between submodules
+        # This is for the individual submodule training to work, since when they're running on their own they expect these names.
+        for signal in INPUT_POWER_SIGNALS:
+            if signal not in ds:
+                ds[signal] = xr.zeros_like(ds["Ip_MA"])
+
+        # Calculate aux power and absorbed power
+        ds["P_aux_MW"] = (
+            ds["P_NBI_MW"] + ds["P_ECRH_MW"] + ds["P_ICRF_MW"] + ds["P_LH_MW"]
+        )
+
+        return ds
+
+    if study_type == "profile_transfer":
+        ds = _profile_transfer(ds)
+    elif study_type == "power_balance_transfer":
+        ds = _power_balance(ds)
+    else:
+        raise ValueError(f"Unknown study type: {study_type}")
 
     # If dataset was from a zarr store, must promote the 'time' data var to a coordinate
     if TIME_COORD not in ds.coords:
@@ -302,7 +342,10 @@ def normalize_domain(  # noqa: PLR0915
             surface_area = calc_plasma_surface_area(
                 ds["R0"], ds["epsilon"], ds["kappa"]
             )
-            power_density = ds["P_aux_MW"] / surface_area
+            if "P_aux_MW" not in ds:
+                power_density = xr.zeros_like(surface_area)
+            else:
+                power_density = ds["P_aux_MW"] / surface_area
             return power_density
 
         for ds in [ds_source, ds_target] if ds_target is not None else [ds_source]:
@@ -516,6 +559,7 @@ def normalize_domain(  # noqa: PLR0915
 def get_train_val_datasets(
     training_data: str,
     data_normalization: str,
+    study_type: str = "profile_transfer",
 ):
     """
     Split dataset into training and validation sets based on the specified training data case.
@@ -526,7 +570,7 @@ def get_train_val_datasets(
 
     if training_data in ["cmod", "tcv", "d3d_lp"]:
         # Single device historic training data
-        ds, episode_coord = get_ds(training_data)
+        ds, episode_coord = get_ds(training_data, study_type)
         ds = add_performance(ds, episode_coord)
         train_ds, val_ds = split_dataset_by_fracs(
             ds,
@@ -540,7 +584,7 @@ def get_train_val_datasets(
 
     else:
         # Multi-device historic training data
-        ds_cmod, episode_coord = get_ds("cmod")
+        ds_cmod, episode_coord = get_ds("cmod", study_type=study_type)
         ds_cmod = add_performance(ds_cmod, episode_coord)
         train_ds_cmod, val_ds_cmod = split_dataset_by_fracs(
             ds_cmod,
@@ -552,7 +596,7 @@ def get_train_val_datasets(
         train_ds_cmod = train_ds_cmod.assign_coords(ds_source="cmod")
         val_ds_cmod = val_ds_cmod.assign_coords(ds_source="cmod")
 
-        ds_tcv, episode_coord = get_ds("tcv")
+        ds_tcv, episode_coord = get_ds("tcv", study_type=study_type)
         ds_tcv = add_performance(ds_tcv, episode_coord)
         train_ds_tcv, val_ds_tcv = split_dataset_by_fracs(
             ds_tcv,
@@ -573,7 +617,7 @@ def get_train_val_datasets(
             )
 
         elif training_data == "cmod_tcv_d3d_lp":
-            ds_d3d_lp, episode_coord = get_ds("d3d_lp")
+            ds_d3d_lp, episode_coord = get_ds("d3d_lp", study_type=study_type)
             ds_d3d_lp = add_performance(ds_d3d_lp, episode_coord)
             train_ds_d3d_lp, val_ds_d3d_lp = split_dataset_by_fracs(
                 ds_d3d_lp,
@@ -613,6 +657,7 @@ def get_train_test_datasets(
     domain_adaptation: str,
     num_hp_shots: int,
     hp_test_set_size: int,
+    study_type: str = "profile_transfer",
 ):
     """
     Split dataset into training and test sets for the target learning case.
@@ -633,7 +678,7 @@ def get_train_test_datasets(
 
     # Load the high-performance dataset and split into train/test
     # No validation needed because we are not tuning hyperparameters on transfer learning data
-    ds_hp, episode_coord = get_ds("d3d_hp")
+    ds_hp, episode_coord = get_ds("d3d_hp", study_type=study_type)
     ds_hp = add_performance(ds_hp, episode_coord)
     ds_hp = ds_hp.assign_coords(ds_source="d3d_hp")
     sorted_shots = np.argsort(ds_hp["performance"].values)
@@ -650,7 +695,7 @@ def get_train_test_datasets(
 
     # Load historic data and put it all in the training set
     train_ds_hist, val_ds_hist = get_train_val_datasets(
-        training_data, data_normalization
+        training_data, data_normalization, study_type=study_type
     )
     train_ds = concat_with_nan_padding(
         [train_ds_hist, val_ds_hist, train_ds_hp],

@@ -129,7 +129,8 @@ class ProfileStudy(Study):
 
             # Recursively add prereqs based on the logic of which cases depend on which other cases
             if model_type not in [
-                "shape_init",
+                "shape_init_pca",
+                "shape_init_kmeans",
                 "unstructured_nn",
             ]:
                 raise ValueError(f"Unknown model type: {model_type}")
@@ -304,8 +305,10 @@ class ProfileStudy(Study):
             "Ip_MA",
             "B0",
             "betan",
-            "ne20_edgeR0",
-            "a_minorkappa",
+            "ne20_edge",
+            "R0",
+            "a_minor",
+            "kappa",
             "delta_top",
             "delta_bot",
         ]
@@ -329,6 +332,7 @@ class ProfileStudy(Study):
         If a hyperparameter tuned config is available, fills in the hyperparameters from that, otherwise uses default config.
         """
         dataloader_config_base = {
+            "target_vars": ["Te_keV_psi", "ne20_psi", "ds_source_idx"],
             "training_data": case.training_data,
             "data_normalization": case.data_normalization,
             "domain_adaptation": case.domain_adaptation,
@@ -380,8 +384,7 @@ class ProfileStudy(Study):
             }
 
         def _make_train_config_base(case: ProfileStudy.Case) -> TrainConfig:
-            if case.model_type == "shape_init":
-                input_vars = self._input_vars(case)
+            if case.model_type in ["shape_init_pca", "shape_init_kmeans"]:
                 train_config_base = TrainConfig(
                     project=self.wandb_project_name(case),
                     train_run_builder="transport_study.modules.profile_predictor.trb.ProfilePredictorTRB",
@@ -391,21 +394,25 @@ class ProfileStudy(Study):
                         case
                     ),  # When doing hyperparameter tuning, this gets overwritten by the wandb agent
                     dataloader_config={
-                        "target_vars": ["Wtot_MJ", "ds_source_idx"],
-                        "input_vars": input_vars,
+                        "input_vars": self._input_vars(case),
+                        "extra_vars": ["Te_shape", "ne_shape"],
                         **dataloader_config_base,
                     },
                     model_init_config={
-                        "nn_depth": 2,
-                        "nn_width": 16,
-                        "min_val": 0,  # Minimum ohmic power in MW
-                        "max_val": 16,  # Maximum ohmic power in MW
-                        "prng_seed": 42,
-                        "in_size": 7,
-                        "out_size": 1,
+                        "model_type": case.model_type,
                         "data_normalization": case.data_normalization,
                         "domain_adaptation": case.domain_adaptation,
                         "freeze_shapes": case.freeze_shapes,
+                        "te_shape_var": "Te_shape",
+                        "ne_shape_var": "ne_shape",
+                        "n_shapes": 3,
+                        "nn_depth": 2,
+                        "nn_width": 16,
+                        "min_val": 0,  # Minimum profile value
+                        "max_val": 6,  # Maximum profile value
+                        "in_size": 9,  # Ip_MA, B0, betan, ne20_edge, R0, a_minor, kappa, delta_top, delta_bot
+                        "softmax_temp": 1,
+                        "prng_seed": 42,
                     },
                     loss_config=loss_config_base,
                     optimizer_config=optimizer_config_base,
@@ -422,7 +429,6 @@ class ProfileStudy(Study):
                     ),  # When doing hyperparameter tuning, this gets overwritten by the wandb agent
                     dataloader_config={
                         "input_vars": self._input_vars(case),
-                        "target_vars": ["Wtot_MJ", "ds_source_idx"],
                         **dataloader_config_base,
                     },
                     model_init_config={
@@ -432,8 +438,7 @@ class ProfileStudy(Study):
                         "freeze_shapes": case.freeze_shapes,
                         "nn_depth": 2,
                         "nn_width": 16,
-                        "in_size": 9,  # Ip_MA, B0, betan, ne20_edge, R0, a_minor, kappa, delta_top, delta_bot,
-                        "out_size": 1,
+                        "in_size": 9,  # Ip_MA, B0, betan, ne20_edge, R0, a_minor, kappa, delta_top, delta_bot
                         "prng_seed": 42,
                     },
                     loss_config=loss_config_base,
@@ -490,7 +495,20 @@ class ProfileStudy(Study):
                     "optimizer_config": tuned_config.optimizer_config,
                 }
             )
-            # Hyperparameters swept for only certain modules (N/A for now)
+
+            # Hyperparameters swept for only certain modules
+            if case.model_type in ["shape_init_pca", "shape_init_kmeans"]:
+                train_config = train_config.model_copy(
+                    update={
+                        "model_init_config": {
+                            **train_config.model_init_config,
+                            "n_shapes": tuned_config.model_init_config["n_shapes"],
+                            "softmax_temp": tuned_config.model_init_config[
+                                "softmax_temp"
+                            ],
+                        }
+                    }
+                )
         else:
             train_config = train_config_base
 
@@ -712,7 +730,7 @@ def run_study(  # noqa: PLR0915
             num_hp_shots_options,
         ):
             if model_types is None:
-                model_types = ["shape_init", "unstructured_nn"]
+                model_types = ["shape_init_pca", "shape_init_kmeans", "unstructured_nn"]
             if training_datasets is None:
                 training_datasets = ["cmod", "tcv", "cmod_tcv", "exnihilo"]
             if data_normalization_methods is None:
@@ -756,9 +774,13 @@ def run_study(  # noqa: PLR0915
             domain_adaptation_methods,
         ):
             for model_type in model_types:
-                if model_type not in ["shape_init", "unstructured_nn"]:
+                if model_type not in [
+                    "shape_init_pca",
+                    "shape_init_kmeans",
+                    "unstructured_nn",
+                ]:
                     raise ValueError(
-                        f"Invalid model type: {model_type}. Must be one of 'scaling_law', 'sciml', or 'unstructured_nn'."
+                        f"Invalid model type: {model_type}. Must be one of 'shape_init_pca', 'shape_init_kmeans', or 'unstructured_nn'."
                     )
 
             for training_dataset in training_datasets:

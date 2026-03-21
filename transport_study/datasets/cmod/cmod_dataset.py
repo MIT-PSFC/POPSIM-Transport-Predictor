@@ -458,6 +458,8 @@ class CModDataWorkflow(DataWorkflow):
 
         # Only keep variables of interest
         kept_vars = {
+            # POWER BALANCE
+            "Wtot_MJ",
             # PROFILE PREDICTOR TRAINING
             "Te_keV_psi",
             "ne20_psi",

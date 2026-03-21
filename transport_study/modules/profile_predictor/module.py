@@ -12,6 +12,7 @@ import xarray as xr
 from jaxtyping import Array
 from popsim import TimeIndepModule
 from popsim.basis import Basis1DProtocol, BSplineBasis, InterpedLinearBasis
+from popsim.cfspopcon_jax.current_drive import calc_f_shaping, calc_q_star
 from popsim.cfspopcon_jax.geometry import calc_plasma_volume
 from popsim.ml.rtd_mlp import Activation, RtdMLP
 from scipy.constants import eV, mu_0
@@ -147,9 +148,24 @@ class Inputs:
         return self.a_minor / self.R0
 
     @property
+    def q_star(self):
+        delta = (self.delta_top + self.delta_bot) / 2
+        f_shaping = calc_f_shaping(
+            self.epsilon,
+            self.kappa,
+            delta,
+        )
+        q_star = calc_q_star(self.B0, self.R0, self.epsilon, self.Ip, f_shaping)
+        return q_star
+
+    @property
     def fGW(self):
         greenwald_limit = self.Ip / (jnp.pi * self.a_minor**2)
         return self.ne20 / greenwald_limit
+
+    @property
+    def aB0(self):
+        return self.a_minor * self.B0
 
     @property
     def volume_approx(self):
@@ -160,10 +176,12 @@ class Inputs:
         )
 
     @property
+    def beta(self):
+        return self.betan * self.Ip / (self.a_minor * self.B0)
+
+    @property
     def te_approx(self):
-        pressure_Pa = (
-            self.betan * self.B0**2 / (2 * mu_0)
-        )  # TODO(ZanderKeith) need to convert back to betat
+        pressure_Pa = self.beta * self.B0**2 / (2 * mu_0)
         pressure_eV = pressure_Pa / eV
         pressure_keV20 = pressure_eV / 1e3 / 1e20
         temp_keV = pressure_keV20 / self.ne20
@@ -171,18 +189,18 @@ class Inputs:
 
     @property
     def nn_inputs(self):
+        # 9 unitless parameters that maintain the same dimensionality as the original inputs
         inp_array = jnp.array(
             [
-                self.Ip,
-                self.B0,
                 self.beta,
-                self.ne20,
-                self.gapin,
-                self.R0,
-                self.rxpt1,
-                self.zxpt1,
-                self.rxpt2,
-                self.zxpt2,
+                self.q_star,
+                self.epsilon,
+                self.fGW,
+                self.aB0,
+                self.betan,
+                self.kappa,
+                self.delta_top,
+                self.delta_bot,
             ]
         )
         return inp_array
@@ -218,13 +236,13 @@ def kmeans_initial_guess(
 
     te_shapes = [
         ProfileShape.make_points(
-            points=te_kmeans.cluster_centers_[i], grid=te_data.psi.values
+            points=te_kmeans.cluster_centers_[i], grid=te_data.psi_n.values
         )
         for i in range(n_shapes)
     ]
     ne_shapes = [
         ProfileShape.make_points(
-            points=ne_kmeans.cluster_centers_[i], grid=ne_data.psi.values
+            points=ne_kmeans.cluster_centers_[i], grid=ne_data.psi_n.values
         )
         for i in range(n_shapes)
     ]
@@ -242,7 +260,7 @@ def pca_initial_guess(
     te_shapes = [
         ProfileShape.make_points(
             points=te_components.sel(mode=i).values,
-            grid=te_data.psi.values,
+            grid=te_data.psi_n.values,
             normalize=False,
         )
         for i in te_components.mode.values
@@ -253,7 +271,7 @@ def pca_initial_guess(
     ne_shapes = [
         ProfileShape.make_points(
             points=ne_components.sel(mode=i).values,
-            grid=ne_data.psi.values,
+            grid=ne_data.psi_n.values,
             normalize=False,
         )
         for i in ne_components.mode.values
@@ -282,6 +300,7 @@ class ProfilePredictorShapeInit(ProfilePredictor):
         ne_shapes: list[ProfileShape],
         nn_width: int,
         nn_depth: int,
+        in_size: int,
         softmax_temp: float,
         shape_type: ShapeType,
         psigrid: tuple,
@@ -292,7 +311,7 @@ class ProfilePredictorShapeInit(ProfilePredictor):
 
         key, subkey = jax.random.split(key)
         self.nn = RtdMLP(
-            in_size=8,
+            in_size=in_size,
             out_size=len(te_shapes) + len(ne_shapes) + 1,
             width_size=nn_width,
             depth=nn_depth,
@@ -309,13 +328,13 @@ class ProfilePredictorShapeInit(ProfilePredictor):
             inputs = Inputs(
                 Ip=inputs["Ip_MA"].data,
                 B0=inputs["B0"].data,
-                beta=inputs["beta"].data,
-                ne20_edge=inputs["ne20_edge"].data,
+                betan=inputs["betan"].data,
+                ne20=inputs["ne20_edge"].data,
                 R0=inputs["R0"].data,
                 a_minor=inputs["a_minor"].data,
                 kappa=inputs["kappa"].data,
                 delta_top=inputs["delta_top"].data,
-                delta_bottom=inputs["delta_bottom"].data,
+                delta_bot=inputs["delta_bot"].data,
                 psi=jnp.array(self.psigrid),
             )
 
@@ -352,8 +371,8 @@ class ProfilePredictorShapeInit(ProfilePredictor):
             axis=0,
         )
 
-        # Compute the ne profile. TODO(ZanderKeith): Need to treat this more carefully
-        ne = jnp.sum(ne_shapes, axis=0) * inputs.ne20_edge
+        # Compute the ne profile.
+        ne = jnp.sum(ne_shapes, axis=0) * inputs.ne20
 
         # Compute the te profile using the learned correction.
         te = jnp.sum(te_shapes, axis=0) * inputs.te_approx * te_correction
@@ -368,8 +387,12 @@ class ProfilePredictorShapeInit(ProfilePredictor):
             debug_info = None
 
         out = Outputs(
-            ne=xr.DataArray(data=ne, dims=("psi",), coords={"psi": list(self.psigrid)}),
-            te=xr.DataArray(data=te, dims=("psi",), coords={"psi": list(self.psigrid)}),
+            ne=xr.DataArray(
+                data=ne, dims=("psi_n",), coords={"psi_n": list(self.psigrid)}
+            ),
+            te=xr.DataArray(
+                data=te, dims=("psi_n",), coords={"psi_n": list(self.psigrid)}
+            ),
             debug_info=debug_info,
         )
 
@@ -382,6 +405,7 @@ class ProfilePredictorShapeInit(ProfilePredictor):
         psigrid: Array,
         nn_width: int,
         nn_depth: int,
+        in_size: int,
         shape_type: ShapeType,
         softmax_temp: float,
         prng_seed: int,
@@ -405,6 +429,7 @@ class ProfilePredictorShapeInit(ProfilePredictor):
             ne_shapes=ne_shapes,
             nn_width=nn_width,
             nn_depth=nn_depth,
+            in_size=in_size,
             softmax_temp=softmax_temp,
             shape_type=shape_type,
             psigrid=psigrid_tuple,
@@ -471,8 +496,12 @@ class ProfilePredictorUnstructuredNN(ProfilePredictor):
         te = jnp.interp(inputs.psi, self.psi_points, te_points) * te_correction
 
         out = Outputs(
-            ne=xr.DataArray(data=ne, dims=("psi",), coords={"psi": list(self.psigrid)}),
-            te=xr.DataArray(data=te, dims=("psi",), coords={"psi": list(self.psigrid)}),
+            ne=xr.DataArray(
+                data=ne, dims=("psi_n",), coords={"psi_n": list(self.psigrid)}
+            ),
+            te=xr.DataArray(
+                data=te, dims=("psi_n",), coords={"psi_n": list(self.psigrid)}
+            ),
             debug_info=None,
         )
 
