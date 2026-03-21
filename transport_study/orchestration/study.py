@@ -160,7 +160,9 @@ class Study:
             return
 
         if self.check_prereq_satisfied(case):
-            logger.opt(colors=True).info(f"<bold>RUNNING CASE:</bold>\n{case}")
+            logger.opt(colors=True).info(
+                f"<bold><cyan>RUNNING CASE:</cyan></bold>\n{case}"
+            )
             # Prereq is satisfied, can run this case.
             if case.is_hyperparam_case():
                 if skip_tuning:
@@ -182,9 +184,9 @@ class Study:
                         completed_runs = get_completed_runs(
                             self.wandb_project_name(case)
                         )
-                        if len(completed_runs) > config.hyperparam_sweeps:
+                        if len(completed_runs) >= config.hyperparam_sweeps:
                             logger.info(
-                                f"Hyperparameter sweeps completed with {len(completed_runs)} runs"
+                                f"Hyperparameter sweeps completed with {len(completed_runs)}/{config.hyperparam_sweeps} runs"
                             )
                             # Check if there are any running jobs for this case
                             if enable_parallelism:
@@ -210,7 +212,7 @@ class Study:
                             )
                         else:
                             logger.info(
-                                f"Hyperparameter sweeps incomplete, {len(completed_runs)} out of {config.hyperparam_sweeps} runs"
+                                f"Hyperparameter sweeps incomplete, {len(completed_runs)}/{config.hyperparam_sweeps} runs"
                             )
                             logger.info("Launching hyperparameter sweep")
                             self.launch_sweep(case)

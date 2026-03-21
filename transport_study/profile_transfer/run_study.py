@@ -534,8 +534,9 @@ class ProfileStudy(Study):
         train_config = self.make_train_config(case)
         # Remove the test_eval_suite_config since that's for final results only
         train_config = train_config.model_copy(update={"test_eval_suite_config": None})
-
-        sweep_id = get_sweep_id(self.wandb_project_name(case))
+        wandb_project_name = self.wandb_project_name(case)
+        sweep_id = get_sweep_id(wandb_project_name)
+        kwargs_agent = {"count": 1}  # One training run per agent
 
         if not sweep_id:
             logger.info(
@@ -547,9 +548,9 @@ class ProfileStudy(Study):
                 "sweep_configs",
                 f"{case.model_type}.yaml",
             )
-            launch_sweep(train_config, sweep_config_path)
+            launch_sweep(train_config, sweep_config_path, kwargs_agent=kwargs_agent)
         else:
-            launch_agent(train_config, sweep_id)
+            launch_agent(train_config, sweep_id, kwargs_agent=kwargs_agent)
 
     def launch_train(self, case: Case, enable_parallelism: bool = False):
         """Launch a training job for the given case."""
@@ -906,6 +907,7 @@ def run_study(  # noqa: PLR0915
             run_clean_sweeps(project_names)
         if clean_models:
             shutil.rmtree(study.model_dir, ignore_errors=True)
+            shutil.rmtree(os.path.join(study.working_dir, "wandb"), ignore_errors=True)
         if clean_results:
             shutil.rmtree(study.result_dir, ignore_errors=True)
         if clean_figures:
@@ -969,7 +971,6 @@ def run_study(  # noqa: PLR0915
                 f"<<bold><green>{len(unfinished_cases)} cases remain</green></bold>>"
             )
             for case in unfinished_cases:
-                # TODO(ZanderKeith): Duplicates are happening somehow, but going fast
                 if not os.path.exists(study.result_path(case)):
                     study.run_case(
                         case,

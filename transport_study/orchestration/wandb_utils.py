@@ -1,5 +1,4 @@
 import subprocess
-from functools import lru_cache
 from typing import Any
 
 import wandb
@@ -9,13 +8,8 @@ from popsim.ml import TrainConfig
 from transport_study.config import config
 
 
-@lru_cache(maxsize=1)
-def wandb_api() -> wandb.Api:
-    return wandb.Api()
-
-
 def get_project(project: str, entity: str = config.wandb_entity):
-    api = wandb_api()
+    api = wandb.Api()
 
     if entity is None:
         logger.critical("WANDB_ENTITY is not set, cannot check if project exists.")
@@ -30,7 +24,7 @@ def get_project(project: str, entity: str = config.wandb_entity):
 
 
 def get_completed_runs(project: str, entity: str = config.wandb_entity) -> list[Any]:
-    api = wandb_api()
+    api = wandb.Api()
 
     project_obj = get_project(project, entity)
     if project_obj is None:
@@ -80,7 +74,7 @@ def get_sweep_id(project: str, entity: str = config.wandb_entity) -> str | None:
         project_sweeps = project_obj.sweeps()
         if len(project_sweeps) == 0:
             return None
-        active_sweeps = [s for s in project_sweeps if s.state == "running"]
+        active_sweeps = [s for s in project_sweeps if s.state in ["RUNNING", "PENDING"]]
         if len(active_sweeps) > 1:
             raise ValueError(
                 f"Multiple running sweeps found for project {project}, cannot determine which to launch. Active sweeps: {[s.id for s in active_sweeps]}"
@@ -107,7 +101,7 @@ def run_clean_sweeps(projects: list[str], entity: str = config.wandb_entity):
         return result
 
     def _delete_runs(project):
-        api = wandb_api()
+        api = wandb.api()
         for run in api.runs(project):
             run.delete()
 
