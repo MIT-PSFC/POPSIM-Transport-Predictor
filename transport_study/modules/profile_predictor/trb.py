@@ -146,7 +146,7 @@ class ProfilePredictorTRB(TrainRunBuilder):
                 n_points=model_init_config["n_points"],
                 nn_width=model_init_config["nn_width"],
                 nn_depth=model_init_config["nn_depth"],
-                psigrid=train_dl.ds["psi"].data,
+                psigrid=train_dl.ds["psi_n"].data,
                 key=jax.random.PRNGKey(model_init_config["prng_seed"]),
             )
         else:

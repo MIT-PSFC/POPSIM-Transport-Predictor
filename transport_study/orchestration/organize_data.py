@@ -605,7 +605,7 @@ def get_train_val_datasets(
         train_ds_tcv = train_ds_tcv.assign_coords(ds_source="tcv")
         val_ds_tcv = val_ds_tcv.assign_coords(ds_source="tcv")
 
-        if training_data == "cmod_tcv":
+        if training_data in ["cmod_tcv"]:
             train_ds = concat_with_nan_padding(
                 [train_ds_cmod, train_ds_tcv], concat_dim=episode_coord
             )
@@ -691,9 +691,16 @@ def get_train_test_datasets(
         train_ds_hp = ds_hp.isel({episode_coord: train_shot_pool})
 
     # Load historic data and put it all in the training set
-    train_ds_hist, val_ds_hist = get_train_val_datasets(
-        training_data, data_normalization, study_type=study_type
-    )
+    if training_data == "exnihilo":
+        # Exnihilo still needs historic data for normalization,
+        # we will strip out all the data from historic devices later
+        train_ds_hist, val_ds_hist = get_train_val_datasets(
+            "cmod_tcv", data_normalization, study_type=study_type
+        )
+    else:
+        train_ds_hist, val_ds_hist = get_train_val_datasets(
+            training_data, data_normalization, study_type=study_type
+        )
     train_ds = concat_with_nan_padding(
         [train_ds_hist, val_ds_hist, train_ds_hp],
         concat_dim=episode_coord,

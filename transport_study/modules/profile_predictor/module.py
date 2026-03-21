@@ -465,16 +465,15 @@ class ProfilePredictorUnstructuredNN(ProfilePredictor):
     def __call__(self, inputs: Inputs | xr.Dataset, debug: bool = False) -> Outputs:
         if isinstance(inputs, xr.Dataset):
             inputs = Inputs(
-                Ip=inputs["iptipp_MA"].data,
+                Ip=inputs["Ip_MA"].data,
                 B0=inputs["B0"].data,
-                beta=inputs["beta"].data,
-                ne20=inputs["dstdenp"].data / 10,
-                gapin=inputs["gapin"].data,
+                betan=inputs["betan"].data,
+                ne20=inputs["ne20_edge"].data,
                 R0=inputs["R0"].data,
-                rxpt1=inputs["rxpt1"].data,
-                zxpt1=inputs["zxpt1"].data,
-                rxpt2=inputs["rxpt2"].data,
-                zxpt2=inputs["zxpt2"].data,
+                a_minor=inputs["a_minor"].data,
+                kappa=inputs["kappa"].data,
+                delta_top=inputs["delta_top"].data,
+                delta_bot=inputs["delta_bot"].data,
                 psi=jnp.array(self.psigrid),
             )
 

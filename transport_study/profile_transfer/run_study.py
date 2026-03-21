@@ -436,6 +436,7 @@ class ProfileStudy(Study):
                         "data_normalization": case.data_normalization,
                         "domain_adaptation": case.domain_adaptation,
                         "freeze_shapes": case.freeze_shapes,
+                        "n_points": 21,  # Number of points along the profile to predict for the unstructured NN
                         "nn_depth": 2,
                         "nn_width": 16,
                         "in_size": 9,  # Ip_MA, B0, betan, ne20_edge, R0, a_minor, kappa, delta_top, delta_bot
@@ -506,6 +507,15 @@ class ProfileStudy(Study):
                             "softmax_temp": tuned_config.model_init_config[
                                 "softmax_temp"
                             ],
+                        }
+                    }
+                )
+            elif case.model_type in ["unstructured_nn"]:
+                train_config = train_config.model_copy(
+                    update={
+                        "model_init_config": {
+                            **train_config.model_init_config,
+                            "n_points": tuned_config.model_init_config["n_points"],
                         }
                     }
                 )
