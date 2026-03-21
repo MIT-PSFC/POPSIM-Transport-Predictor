@@ -2,22 +2,22 @@ import os
 import time
 from dataclasses import dataclass
 
+import wandb
 import yaml
 from loguru import logger
 from popsim.ml import DataLoader, TrainConfig, Trainer
 from popsim.ml.launch import (
     _get_train_run_builder_class,
     launch_agent,
-    launch_sweep,
     launch_train,
 )
+from popsim.ml.train_config import load_dict
 
 from transport_study import PACKAGE_ROOT
 from transport_study.config import config
 from transport_study.orchestration.slurm_utils import (
     count_running_jobs,
     launch_agent_parallel,
-    launch_sweep_parallel,
     launch_train_parallel,
     resources_available,
 )
@@ -153,7 +153,7 @@ class Study:
 
         return True
 
-    def run_case(  # noqa: PLR0912, PLR0915, PLR0911
+    def run_case(  # noqa: PLR0912
         self,
         case: Case,
         skip_tuning: bool,
@@ -235,17 +235,6 @@ class Study:
                             logger.info(
                                 f"Hyperparameter sweeps incomplete, {len(completed_runs)}/{config.hyperparam_sweeps} runs"
                             )
-
-                            if enable_parallelism:
-                                running_jobs = count_running_jobs(
-                                    self.sweep_job_name(case), config.partition
-                                )
-                                if len(running_jobs) > 0:
-                                    logger.info(
-                                        f"Found {len(running_jobs)} running sweep initialization jobs, waiting for them to complete before proceeding"
-                                    )
-                                    return
-                            logger.info("Launching hyperparameter sweep")
                             self.launch_sweep(
                                 case, enable_parallelism=enable_parallelism
                             )
@@ -295,20 +284,10 @@ class Study:
                 "sweep_configs",
                 f"{case.model_type}.yaml",
             )
-            if enable_parallelism:
-                sweep_job_name = self.sweep_job_name(case)
-                logger.info(f"Launching sweep job {sweep_job_name} for case\n{case}")
-                launch_sweep_parallel(
-                    train_config,
-                    sweep_config_path,
-                    kwargs_agent,
-                    sweep_job_name,
-                    os.path.join(self.result_dir, "logs_sweep"),
-                )
-            else:
-                logger.info("Launching sweep serially")
-                launch_sweep(train_config, sweep_config_path, kwargs_agent=kwargs_agent)
-        elif enable_parallelism:
+            sweep_config = load_dict(sweep_config_path)
+            sweep_id = wandb.sweep(sweep_config, project=wandb_project_name)
+
+        if enable_parallelism:
             agent_job_name = self.agent_job_name(case)
             logger.info(f"Launching agent job {agent_job_name} for case\n{case}")
             launch_agent_parallel(
