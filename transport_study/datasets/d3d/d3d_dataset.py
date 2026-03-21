@@ -309,14 +309,15 @@ class D3DDataWorkflow(DataWorkflow):
         # Toksearch puts things on a forward fill, we can't have that for training.
         # Replace these signals with nan until their value changes for the first time (e.g. from 0.1 to 0.2)
         for sig in ["betanf", "wmhdf", "dssneped", "ip", "ne_line_avg"]:
-            sig_data = ds_tok[sig].values
-            first_valid_idx = np.where(sig_data != sig_data[0])[0]
-            if len(first_valid_idx) > 0:
-                first_valid_idx = first_valid_idx[0]
-                sig_data[:first_valid_idx] = np.nan
-                ds_tok[sig] = xr.DataArray(
-                    sig_data, coords={"time": ds_tok["times"].values}, dims=["time"]
-                )
+            if sig in ds_tok.keys():
+                sig_data = ds_tok[sig].values
+                first_valid_idx = np.where(sig_data != sig_data[0])[0]
+                if len(first_valid_idx) > 0:
+                    first_valid_idx = first_valid_idx[0]
+                    sig_data[:first_valid_idx] = np.nan
+                    ds_tok[sig] = xr.DataArray(
+                        sig_data, coords={"time": ds_tok["times"].values}, dims=["time"]
+                    )
 
         # Match disruption-py output
         ds = xr.Dataset(
