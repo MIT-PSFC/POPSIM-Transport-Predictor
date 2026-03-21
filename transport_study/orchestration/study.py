@@ -87,7 +87,6 @@ class Study:
         working_dir_base: str,
         dataset_paths: dict[str, str],
         cases: list[Case],
-        hp_test_set_size: int,
     ):
         """
         Initialize this study with the given name, dataset paths, and cases.
@@ -95,7 +94,6 @@ class Study:
         self.name = name
         self.dataset_paths = dataset_paths
         self.cases = cases
-        self.hp_test_set_size = hp_test_set_size
 
         self.working_dir = os.path.join(working_dir_base, name)
         self.model_dir = os.path.join(self.working_dir, "models")
@@ -111,7 +109,7 @@ class Study:
         logger.info(f"Study name: {name}")
         logger.info(f"Working directory base: {working_dir_base}")
         logger.info(f"Total number of cases: {len(cases)}")
-        logger.info(f"High-performance test set size: {hp_test_set_size}")
+        logger.info(f"High-performance test set size: {config.hp_test_set_size}")
 
     #############
     # EXECUTION #
@@ -131,7 +129,7 @@ class Study:
             required_datasets.add("d3d_hp")
 
         missing_datasets = [
-            ds for ds in required_datasets if ds not in self.dataset_paths.keys()
+            ds for ds in required_datasets if self.dataset_paths[ds] is None
         ]
         if len(missing_datasets) > 0:
             logger.warning(

@@ -34,10 +34,11 @@ TRAIN_VAL_TEST_SPLIT = (0.64, 0.16, 0.2)
 class StudyConfig(BaseSettings):
     """Configuration for dataset paths."""
 
-    study_name: str = "transport_sample"
+    study_name: str = "transport_study"
 
-    debug: bool = False  # Debug does everything but with reduced scope (less data, fewer epochs, etc.)
+    debug: bool = True  # Debug does everything but with reduced scope (less data, fewer epochs, etc.)
     dry_run: bool = False  # Dry run skips training and evaluation and just runs the orchestration logic to make sure everything is set up correctly
+    hp_test_set_size: int = 65
 
     partition: str | None = None
     buffer_gpus: int = 20
@@ -46,6 +47,9 @@ class StudyConfig(BaseSettings):
     epochs_per_val: int = 20
     wandb_entity: str | None = None
 
+    scratch_dir: Path | None = (
+        None  # Datasets get pared down and copied to here before study gets run
+    )
     cmod_dataset_path: Path | None = None
     tcv_dataset_path: Path | None = None
     d3d_lp_dataset_path: Path | None = None

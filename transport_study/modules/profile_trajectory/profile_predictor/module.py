@@ -19,7 +19,7 @@ from scipy.constants import eV, mu_0
 
 class ProfileShape(TimeIndepModule):
     """
-    A module defining a profile shape on the psi_n grid [0, 1.2].
+    A module defining a profile shape on the psi_n grid [0, 1].
 
     The profile shape can either be specified either directly with points on the psi grid or with a set of coefficients for a B-spline basis.
     """
@@ -129,38 +129,22 @@ class ProfileShape(TimeIndepModule):
 
 @chex.dataclass
 class Inputs:
-    # Controllable inputs (set by DIII-D PCS)
     Ip: float  # Plasma current [MA]
     B0: float  # On-axis toroidal field [T]
-    beta: float  # Plasma beta [%]
+    betan: float  # Normalized beta
     ne20: float  # electron density [10^20 m^-3]
-
-    # Trajectory inputs (to be modified)
-    gapin: float
-    R0: float
-    rxpt1: float
-    zxpt1: float
-    rxpt2: float
-    zxpt2: float
+    R0: float  # Geometric major radius [m]
+    a_minor: float  # Minor radius [m]
+    kappa: float  # Elongation
+    delta_top: float  # Upper triangularity
+    delta_bot: float  # Bottom triangularity
 
     # Other
     psi: Array  # Toroidal flux coordinate to evaluate the profiles at
 
     @property
-    def a_minor(self):
-        # TODO: Ensure this is correct by Jayson
-        return self.R0 - self.gapin
-
-    @property
     def epsilon(self):
         return self.a_minor / self.R0
-
-    @property
-    def kappa(self):
-        b_upper = self.zxpt1
-        b_lower = -self.zxpt2
-        b_minor = (b_upper + b_lower) / 2
-        return b_minor / self.a_minor
 
     @property
     def fGW(self):
@@ -177,7 +161,9 @@ class Inputs:
 
     @property
     def te_approx(self):
-        pressure_Pa = self.beta * self.B0**2 / (2 * mu_0)
+        pressure_Pa = (
+            self.betan * self.B0**2 / (2 * mu_0)
+        )  # TODO(ZanderKeith) need to convert back to betat
         pressure_eV = pressure_Pa / eV
         pressure_keV20 = pressure_eV / 1e3 / 1e20
         temp_keV = pressure_keV20 / self.ne20
@@ -426,7 +412,7 @@ class ProfilePredictorShapeInit(ProfilePredictor):
         )
 
 
-class ProfilePredictorDirectPoints(ProfilePredictor):
+class ProfilePredictorUnstructuredNN(ProfilePredictor):
     psi_points: Array = eqx.field(static=True)  # Points at which the NN predicts
 
     def __init__(
@@ -441,7 +427,7 @@ class ProfilePredictorDirectPoints(ProfilePredictor):
 
         key, subkey = jax.random.split(key)
         self.nn = RtdMLP(
-            in_size=10,
+            in_size=9,
             out_size=(n_points * 2) + 2,  # +2 for the correction factors
             width_size=nn_width,
             depth=nn_depth,

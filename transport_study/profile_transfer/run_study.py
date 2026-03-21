@@ -29,7 +29,7 @@ from transport_study.orchestration.wandb_utils import (
 
 class ProfileStudy(Study):
     HYPERPARAM_TRAINING_DATA = "cmod_tcv"
-    HYPERPARAM_DATA_NORMALIZATION = "raw"
+    HYPERPARAM_DATA_NORMALIZATION = "physics"
     HYPERPARAM_DOMAIN_ADAPTATION = None
     HYPERPARAM_FREEZE_SHAPES = True
     HYPERPARAM_NUM_HP_SHOTS = -1
@@ -51,10 +51,8 @@ class ProfileStudy(Study):
         - exnihilo: No historic training data
 
         data_normalization: The method for normalizing the input data.
-        - raw: No normalization, Ip, Wtot, etc. are in their original units
         - physics: Convert to typical dimensionless parameters like beta, q95, f_G, etc.
-        - z_score: Within each device, normalize each variable to zero mean and unit variance.
-        - coral: Use the CORAL method to align covariances of source and target domains (https://arxiv.org/abs/1612.01939)
+        - Since we found that physics transfers best for power balance, only studying it here
 
         domain_adaptation: The method for domain adaptation between source and target devices.
         - none: No domain adaptation, train and test on the same device(s). This is used for hyperparameter tuning and as a baseline for comparison, answering the question "what is the best possible performance we could expect if we had a bunch of data?"
@@ -178,9 +176,9 @@ class ProfileStudy(Study):
 
         def __str__(self):
             if self.domain_adaptation:
-                return f"case.{self.model_type}.td_{self.training_data}.dn_{self.data_normalization}.da_{self.domain_adaptation}.freeze_{self.freeze_shapes}.hp_{self.num_hp_shots}"
+                return f"case.{self.model_type}.td_{self.training_data}.da_{self.domain_adaptation}.freeze_{self.freeze_shapes}.hp_{self.num_hp_shots}"
             else:
-                return f"case.{self.model_type}.td_{self.training_data}.dn_{self.data_normalization}.freeze_{self.freeze_shapes}"
+                return f"case.{self.model_type}.td_{self.training_data}.freeze_{self.freeze_shapes}"
 
         def __hash__(self):
             if self.domain_adaptation:
@@ -274,7 +272,6 @@ class ProfileStudy(Study):
         domain_adaptation_methods: list[str],
         freeze_shapes_options: list[bool],
         num_hp_shots_options: list[int],
-        hp_test_set_size: int,
     ):
         cases = self.make_cases(
             model_types,
@@ -284,7 +281,7 @@ class ProfileStudy(Study):
             freeze_shapes_options,
             num_hp_shots_options,
         )
-        super().__init__(name, working_dir_base, dataset_paths, cases, hp_test_set_size)
+        super().__init__(name, working_dir_base, dataset_paths, cases)
 
         logger.info(f"C-Mod dataset path: {dataset_paths.get('cmod', 'Not provided')}")
         logger.info(f"TCV dataset path: {dataset_paths.get('tcv', 'Not provided')}")
@@ -312,9 +309,7 @@ class ProfileStudy(Study):
             "delta_top",
             "delta_bot",
         ]
-        if case.data_normalization == "raw":
-            input_vars = input_vars_base
-        elif case.data_normalization == "physics":
+        if case.data_normalization == "physics":
             input_vars = [
                 *input_vars_base,
                 "epsilon",
@@ -322,15 +317,10 @@ class ProfileStudy(Study):
                 "f_G",
                 "aB0",
             ]
-        elif case.data_normalization == "z_score":
-            input_vars = [*input_vars_base, *(f"{var}_z" for var in input_vars_base)]
-        elif case.data_normalization == "coral":
-            input_vars = [
-                *input_vars_base,
-                *(f"{var}_coral" for var in input_vars_base),
-            ]
         else:
-            raise ValueError(f"Unknown normalization method: {case.data_normalization}")
+            raise ValueError(
+                f"Profile study only uses physics normalization, but got {case.data_normalization}"
+            )
 
         return input_vars
 
@@ -658,7 +648,6 @@ def run_study(  # noqa: PLR0915
     domain_adaptation_methods: list[str] | None = None,
     freeze_shapes_options: list[bool] | None = None,
     num_hp_shots_options: list[int] | None = None,
-    hp_test_set_size: int | None = None,
     enable_parallelism: bool | None = False,
     skip_tuning: bool | None = True,
     skip_visualization: bool | None = False,
@@ -713,7 +702,6 @@ def run_study(  # noqa: PLR0915
         domain_adaptation_methods,
         freeze_shapes_options,
         num_hp_shots_options,
-        hp_test_set_size,
     ):
         def _assign_args(
             model_types,
@@ -722,22 +710,19 @@ def run_study(  # noqa: PLR0915
             domain_adaptation_methods,
             freeze_shapes_options,
             num_hp_shots_options,
-            hp_test_set_size,
         ):
             if model_types is None:
                 model_types = ["shape_init", "unstructured_nn"]
             if training_datasets is None:
                 training_datasets = ["cmod", "tcv", "cmod_tcv", "exnihilo"]
             if data_normalization_methods is None:
-                data_normalization_methods = ["raw", "physics", "z_score", "coral"]
+                data_normalization_methods = ["physics"]
             if domain_adaptation_methods is None:
                 domain_adaptation_methods = [None, "mixing", "transfer"]
             if freeze_shapes_options is None:
                 freeze_shapes_options = [True, False]
             if num_hp_shots_options is None:
                 num_hp_shots_options = [0, 1, 3, 10, 32, -1]
-            if hp_test_set_size is None:
-                hp_test_set_size = 65
 
             return (
                 model_types,
@@ -746,7 +731,6 @@ def run_study(  # noqa: PLR0915
                 domain_adaptation_methods,
                 freeze_shapes_options,
                 num_hp_shots_options,
-                hp_test_set_size,
             )
 
         (
@@ -756,7 +740,6 @@ def run_study(  # noqa: PLR0915
             domain_adaptation_methods,
             freeze_shapes_options,
             num_hp_shots_options,
-            hp_test_set_size,
         ) = _assign_args(
             model_types,
             training_datasets,
@@ -764,7 +747,6 @@ def run_study(  # noqa: PLR0915
             domain_adaptation_methods,
             freeze_shapes_options,
             num_hp_shots_options,
-            hp_test_set_size,
         )
 
         def _check_args(
@@ -774,7 +756,7 @@ def run_study(  # noqa: PLR0915
             domain_adaptation_methods,
         ):
             for model_type in model_types:
-                if model_type not in ["scaling_law", "sciml", "unstructured_nn"]:
+                if model_type not in ["shape_init", "unstructured_nn"]:
                     raise ValueError(
                         f"Invalid model type: {model_type}. Must be one of 'scaling_law', 'sciml', or 'unstructured_nn'."
                     )
@@ -786,9 +768,9 @@ def run_study(  # noqa: PLR0915
                     )
 
             for data_normalization in data_normalization_methods:
-                if data_normalization not in ["raw", "physics", "z_score", "coral"]:
+                if data_normalization not in ["physics"]:
                     raise ValueError(
-                        f"Invalid data normalization method: {data_normalization}. Must be one of 'raw', 'physics', 'z_score', or 'coral'."
+                        f"Invalid data normalization method: {data_normalization}. Only 'physics' is implemented for profile transfer."
                     )
 
             for domain_adaptation in domain_adaptation_methods:
@@ -811,7 +793,6 @@ def run_study(  # noqa: PLR0915
             domain_adaptation_methods,
             freeze_shapes_options,
             num_hp_shots_options,
-            hp_test_set_size,
         )
 
     (
@@ -821,7 +802,6 @@ def run_study(  # noqa: PLR0915
         domain_adaptation_methods,
         freeze_shapes_options,
         num_hp_shots_options,
-        hp_test_set_size,
     ) = _validate_args(
         model_types,
         training_datasets,
@@ -829,7 +809,6 @@ def run_study(  # noqa: PLR0915
         domain_adaptation_methods,
         freeze_shapes_options,
         num_hp_shots_options,
-        hp_test_set_size,
     )
 
     ###########################################
@@ -852,7 +831,6 @@ def run_study(  # noqa: PLR0915
         domain_adaptation_methods=domain_adaptation_methods,
         freeze_shapes_options=freeze_shapes_options,
         num_hp_shots_options=num_hp_shots_options,
-        hp_test_set_size=hp_test_set_size,
     )
 
     def _setup_directories(study: ProfileStudy):
@@ -892,10 +870,28 @@ def run_study(  # noqa: PLR0915
 
     _setup_directories(study)
 
-    def _move_data(study):
+    def _move_data(study: Study):
         logger.info("Moving data to cluster scratch for faster training")
+        for ds_path in [
+            config.cmod_dataset_path,
+            config.tcv_dataset_path,
+            config.d3d_lp_dataset_path,
+            config.d3d_hp_dataset_path,
+        ]:
+            if ds_path:
+                _, file_name = os.path.split(ds_path)
+                scratch_dir = os.path.join(config.scratch_dir, study.name)
+                os.makedirs(scratch_dir, exist_ok=True)
+                scratch_path = os.path.join(scratch_dir, file_name)
+                if not os.path.exists(scratch_path):
+                    ds = xr.open_dataset(ds_path)
+                    # For training, only need fresh profiles
+                    ds = ds.where(ds.fresh_profiles == 1, drop=True)
+                    # Rechunk to be ~50 MB per chunk
+                    raise NotImplementedError
 
-    _move_data(study)
+    if config.scratch_dir:
+        _move_data(study)
 
     ######################
     # Data Visualization #
