@@ -43,7 +43,7 @@ class StudyConfig(BaseSettings):
     partition: str | None = None
     buffer_gpus: int = 20
     hyperparam_sweeps: int = 1000
-    max_epochs: int = 500
+    max_epochs: int = 1000
     epochs_per_val: int = 20
     wandb_entity: str | None = None
 
@@ -73,6 +73,7 @@ if config.debug:
     config.max_epochs = 2
     config.epochs_per_val = 1
     config.hyperparam_sweeps = 2
+    config.hp_test_set_size = 2
 
 # Device-specific configs loaded separately to avoid namespace collisions
 config.d3d = Dynaconf(

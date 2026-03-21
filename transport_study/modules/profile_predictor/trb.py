@@ -72,13 +72,17 @@ class ProfilePredictorTRB(TrainRunBuilder):
         ds_train = ds_train.drop_vars(TIME_DIM, errors="ignore")
         ds_val = ds_val.drop_vars(TIME_DIM, errors="ignore")
 
+        input_vars = dataloader_config["input_vars"]
+        target_vars = dataloader_config["target_vars"]
+        extra_vars = dataloader_config.get("extra_vars", None)
+
         train_dl, val_dl = make_dataloaders(
             datasets=(ds_train, ds_val),
             time_coord=TIME_COORD,
             episode_coord=EPISODE_DIM,
-            input_vars=dataloader_config["input_vars"],
-            target_vars=dataloader_config["target_vars"],
-            extra_vars=dataloader_config.get("extra_vars", None),
+            input_vars=input_vars,
+            target_vars=target_vars,
+            extra_vars=extra_vars,
             batch_size=dataloader_config.get("batch_size", None),
             shuffle=[True, False],
             convert_xr_to_jnp=False,  # Needed to keep the coords for calculating loss

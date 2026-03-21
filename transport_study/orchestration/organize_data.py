@@ -52,6 +52,7 @@ REQUIRED_SIGNALS_POWER_BALANCE = [
 INPUT_POWER_SIGNALS = ["P_ECRH_MW", "P_NBI_MW", "P_ICRF_MW", "P_LH_MW"]
 
 REQUIRED_SIGNALS_PROFILE_TRANSFER = [
+    "time",
     "Te_keV_psi",
     "ne20_psi",
     "fresh_profiles",
@@ -140,18 +141,14 @@ def get_ds(
         ds = ds.isel(shot=slice(0, 10))  # Limit to 10 shots
 
     def _profile_transfer(ds: xr.Dataset) -> xr.Dataset:
-        for signal in REQUIRED_SIGNALS_PROFILE_TRANSFER:
-            if signal not in ds:
-                raise ValueError(
-                    f"Required signal for training {signal} not found in dataset."
-                )
+        ds = ds[REQUIRED_SIGNALS_PROFILE_TRANSFER]
 
         # Only keep fresh profiles for training
         ds = ds.where(ds["fresh_profiles"] == 1, drop=True)
         # TCV only has profile data out to rho=1 / psi_n=1
         # Put all the datasets on a uniform 51 point psi_n grid for consistency
         psi_n_grid = np.linspace(0, 1, 51)
-        ds = ds.interp(psi_n=psi_n_grid)
+        ds = ds.interp(psi_n=psi_n_grid, kwargs={"fill_value": "extrapolate"})
 
         # Compute means and shapes.
         ds["Te_keV_line_avg"] = ds["Te_keV_psi"].integrate("psi_n")
