@@ -32,8 +32,8 @@ def get_project(project: str, entity: str = config.wandb_entity):
 def get_completed_runs(project: str, entity: str = config.wandb_entity) -> list[Any]:
     api = wandb_api()
 
-    project = get_project(project, entity)
-    if project is None:
+    project_obj = get_project(project, entity)
+    if project_obj is None:
         logger.warning(
             f"No wandb project found for {project}, assuming no completed runs."
         )

@@ -13,6 +13,7 @@ from transport_study.orchestration.slurm_utils import (
     resources_available,
 )
 from transport_study.orchestration.wandb_utils import (
+    get_best_train_config,
     get_completed_runs,
 )
 
@@ -195,6 +196,18 @@ class Study:
                                         f"Found {len(running_jobs)} running jobs, waiting for them to complete before proceeding"
                                     )
                                     return
+                            # No active jobs, put the best config from the completed runs in the tuned config path
+                            best_train_config = get_best_train_config(
+                                self.wandb_project_name(case)
+                            )
+                            os.makedirs(
+                                os.path.dirname(tuned_config_path), exist_ok=True
+                            )
+                            with open(tuned_config_path, "w") as f:
+                                yaml.dump(best_train_config.model_dump(), f, indent=4)
+                            logger.success(
+                                f"Saved best hyperparameter config for {case}"
+                            )
                         else:
                             logger.info(
                                 f"Hyperparameter sweeps incomplete, {len(completed_runs)} out of {config.hyperparam_sweeps} runs"

@@ -481,6 +481,9 @@ class ProfileStudy(Study):
         tuned_config_path = self.tuned_config_path(case)
         if os.path.exists(tuned_config_path):
             tuned_config = TrainConfig.load(tuned_config_path)
+            logger.info(
+                f"Found tuned hyperparameter config for case {case}, using hyperparameters from that config"
+            )
             # Restore hyperparameters from the tuned config, but keep the rest of the settings the same
 
             # Hyperparameters swept for all modules
