@@ -10,7 +10,7 @@ import xarray as xr
 from loguru import logger
 from popsim.ml import DataLoader, TrainRunBuilder
 from popsim.ml.dataloading import make_dataloaders
-from popsim.ml.eval import EvalData, EvaluationSuite
+from popsim.ml.eval import EvalData, EvaluationSuite, batched_model_eval_and_loss
 
 from transport_study import EPISODE_DIM, TIME_COORD, TIME_DIM
 from transport_study.modules.profile_predictor.module import (
@@ -264,6 +264,51 @@ class ProfilePredictorTRB(TrainRunBuilder):
             raise ValueError(
                 f"Invalid model type {model_init_config['model_type']}, must be either 'shape_init' or 'unstructured_nn'"
             )
+
+    @staticmethod
+    def get_val_eval_suite(suite_config) -> EvaluationSuite:
+        """Evaluation suite for validation during training
+
+        We are running with very large datasets.
+        This means that the regular eval function will be uploading too much data to wandb
+        This eval suite basically does the same thing but cuts the vec to be at most 100 long
+        Can still see the distribution, but without all the data
+        """
+
+        # Must be an exact copy of the loss_config used in training
+        loss_config = suite_config["loss_config"]
+        loss_fn = ProfilePredictorTRB.get_loss_fn(loss_config)
+
+        def eval_fn(inp: EvalData) -> float:
+            loss_vecs = []
+            for batch in inp.dataloader:
+                inputs, targets = batch.get_inputs_and_targets()
+                loss_vec = batched_model_eval_and_loss(
+                    inp.model,
+                    loss_fn,
+                    inputs,
+                    targets,
+                )
+                loss_vecs.append(loss_vec)
+            loss_vec = jnp.concatenate(loss_vecs)
+            loss_vec_mean = loss_vec.mean()
+            # Sort loss vec and sample at most 100 points evenly for logging
+            if loss_vec.shape[0] > 100:
+                sorted_indices = jnp.argsort(loss_vec)
+                selected_indices = sorted_indices[
+                    jnp.linspace(0, loss_vec.shape[0] - 1, num=100, dtype=int)
+                ]
+                loss_vec = loss_vec[selected_indices]
+            out = {
+                "mean": loss_vec_mean,
+                "vec": loss_vec,
+            }
+
+            return out
+
+        eval_suite = {"loss": eval_fn}
+
+        return eval_suite
 
     @staticmethod
     def get_test_eval_suite(config) -> EvaluationSuite:  # noqa: PLR0915

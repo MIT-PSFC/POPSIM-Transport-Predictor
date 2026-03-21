@@ -5,16 +5,26 @@ from dataclasses import dataclass
 import yaml
 from loguru import logger
 from popsim.ml import DataLoader, TrainConfig, Trainer
-from popsim.ml.launch import _get_train_run_builder_class
+from popsim.ml.launch import (
+    _get_train_run_builder_class,
+    launch_agent,
+    launch_sweep,
+    launch_train,
+)
 
+from transport_study import PACKAGE_ROOT
 from transport_study.config import config
 from transport_study.orchestration.slurm_utils import (
     count_running_jobs,
+    launch_agent_parallel,
+    launch_sweep_parallel,
+    launch_train_parallel,
     resources_available,
 )
 from transport_study.orchestration.wandb_utils import (
     get_best_train_config,
     get_completed_runs,
+    get_sweep_id,
 )
 
 
@@ -68,6 +78,9 @@ class Study:
 
     def sweep_job_name(self, case: Case) -> str:
         return f"sweep_{case}"
+
+    def agent_job_name(self, case: Case) -> str:
+        return f"agent_{case}"
 
     def train_job_name(self, case: Case) -> str:
         return f"train_{case}"
@@ -140,7 +153,7 @@ class Study:
 
         return True
 
-    def run_case(  # noqa: PLR0912
+    def run_case(  # noqa: PLR0912, PLR0915, PLR0911
         self,
         case: Case,
         skip_tuning: bool,
@@ -160,10 +173,18 @@ class Study:
             return
 
         if self.check_prereq_satisfied(case):
+            if enable_parallelism:
+                if not resources_available():
+                    logger.info(
+                        "No resources currently available, waiting before trying again..."
+                    )
+                    time.sleep(10)
+                    return
+
+            # Prereq is satisfied and we have available resources, can run this case
             logger.opt(colors=True).info(
                 f"<bold><cyan>RUNNING CASE:</cyan></bold>\n{case}"
             )
-            # Prereq is satisfied, can run this case.
             if case.is_hyperparam_case():
                 if skip_tuning:
                     logger.info("Skipping hyperparameter tuning")
@@ -214,8 +235,20 @@ class Study:
                             logger.info(
                                 f"Hyperparameter sweeps incomplete, {len(completed_runs)}/{config.hyperparam_sweeps} runs"
                             )
+
+                            if enable_parallelism:
+                                running_jobs = count_running_jobs(
+                                    self.sweep_job_name(case), config.partition
+                                )
+                                if len(running_jobs) > 0:
+                                    logger.info(
+                                        f"Found {len(running_jobs)} running sweep initialization jobs, waiting for them to complete before proceeding"
+                                    )
+                                    return
                             logger.info("Launching hyperparameter sweep")
-                            self.launch_sweep(case)
+                            self.launch_sweep(
+                                case, enable_parallelism=enable_parallelism
+                            )
                             return
 
             # At this point, we know the tuned config is available at tuned_config_path, so we can proceed to training
@@ -228,13 +261,6 @@ class Study:
                         f"Found {running_jobs} running training jobs, waiting for them to complete before proceeding"
                     )
                     return
-                if not resources_available():
-                    logger.info(
-                        "No resources currently available, waiting before trying again..."
-                    )
-                    time.sleep(10)
-                    return
-
             self.launch_train(case, enable_parallelism=enable_parallelism)
 
         else:
@@ -249,6 +275,81 @@ class Study:
                         enable_parallelism=enable_parallelism,
                     )
                     return
+
+    def launch_sweep(self, case: Case, enable_parallelism: bool = False):
+        """Launch a wandb hyperparameter sweep for the given case."""
+        train_config = self.make_train_config(case)
+        # Remove the test_eval_suite_config since that's for final results only
+        train_config = train_config.model_copy(update={"test_eval_suite_config": None})
+        wandb_project_name = self.wandb_project_name(case)
+        sweep_id = get_sweep_id(wandb_project_name)
+        kwargs_agent = {"count": 1}  # One training run per agent
+
+        if not sweep_id:
+            logger.info(
+                f"No existing sweep found for case {case}, creating a new sweep"
+            )
+            sweep_config_path = os.path.join(
+                PACKAGE_ROOT,
+                "profile_transfer",
+                "sweep_configs",
+                f"{case.model_type}.yaml",
+            )
+            if enable_parallelism:
+                sweep_job_name = self.sweep_job_name(case)
+                logger.info(f"Launching sweep job {sweep_job_name} for case\n{case}")
+                launch_sweep_parallel(
+                    train_config,
+                    sweep_config_path,
+                    kwargs_agent,
+                    sweep_job_name,
+                    os.path.join(self.result_dir, "logs_sweep"),
+                )
+            else:
+                logger.info("Launching sweep serially")
+                launch_sweep(train_config, sweep_config_path, kwargs_agent=kwargs_agent)
+        elif enable_parallelism:
+            agent_job_name = self.agent_job_name(case)
+            logger.info(f"Launching agent job {agent_job_name} for case\n{case}")
+            launch_agent_parallel(
+                train_config,
+                sweep_id,
+                kwargs_agent,
+                agent_job_name,
+                os.path.join(self.result_dir, "logs_sweep"),
+            )
+        else:
+            logger.info("Launching agent serially")
+            launch_agent(train_config, sweep_id, kwargs_agent=kwargs_agent)
+
+    def launch_train(self, case: Case, enable_parallelism: bool = False):
+        """Launch a training job for the given case."""
+        if case.is_impossible():
+            raise ValueError(
+                f"Case {case} is not a possible case to run, check the logic in the Case dataclass to see why this is. This should have been caught earlier!"
+            )
+
+        logger.opt(colors=True).info(
+            f"<bold><red>LAUNCHING TRAINING for case\n{case}</red></bold>"
+        )
+
+        train_config = self.make_train_config(case)
+        result_path = self.result_path(case)
+        if enable_parallelism:
+            train_job_name = self.train_job_name(case)
+            logger.info(f"Launching training job {train_job_name} for case\n{case}")
+            launch_train_parallel(
+                train_config,
+                train_job_name,
+                result_path,
+                os.path.join(self.result_dir, "logs"),
+            )
+        else:
+            logger.info("Launching training serially")
+            _, _, _, _, result_dict = launch_train(train_config)
+            ds = result_dict["test/study_results"]
+            os.makedirs(os.path.dirname(result_path), exist_ok=True)
+            ds.to_netcdf(result_path)
 
     ##############
     # COLLECTION #

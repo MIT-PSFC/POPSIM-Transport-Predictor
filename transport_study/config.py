@@ -39,6 +39,7 @@ class StudyConfig(BaseSettings):
     debug: bool = True  # Debug does everything but with reduced scope (less data, fewer epochs, etc.)
     dry_run: bool = False  # Dry run skips training and evaluation and just runs the orchestration logic to make sure everything is set up correctly
     hp_test_set_size: int = 65
+    max_ds_size: int = 1000
 
     partition: str | None = None
     buffer_gpus: int = 20

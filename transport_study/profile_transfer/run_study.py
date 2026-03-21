@@ -9,20 +9,11 @@ import netCDF4  # noqa: F401
 import xarray as xr
 from loguru import logger
 from popsim.ml import TrainConfig
-from popsim.ml.launch import (
-    launch_agent,
-    launch_sweep,
-    launch_train,
-)
 
 from transport_study import PACKAGE_ROOT
 from transport_study.config import config
-from transport_study.orchestration.slurm_utils import (
-    launch_train_parallel,
-)
 from transport_study.orchestration.study import Study
 from transport_study.orchestration.wandb_utils import (
-    get_sweep_id,
     run_clean_sweeps,
 )
 
@@ -357,6 +348,9 @@ class ProfileStudy(Study):
             "lrf": 5e-4,
             "weight_decay": 2e-4,
         }
+        val_eval_suite_config_base = {
+            "loss_config": loss_config_base,
+        }
         test_eval_suite_config_base = {
             "result_path": self.result_path(case),
         }
@@ -418,6 +412,7 @@ class ProfileStudy(Study):
                     },
                     loss_config=loss_config_base,
                     optimizer_config=optimizer_config_base,
+                    val_eval_suite_config=val_eval_suite_config_base,
                     test_eval_suite_config=test_eval_suite_config_base,
                 )
             elif case.model_type == "unstructured_nn":
@@ -446,6 +441,7 @@ class ProfileStudy(Study):
                     },
                     loss_config=loss_config_base,
                     optimizer_config=optimizer_config_base,
+                    val_eval_suite_config=val_eval_suite_config_base,
                     test_eval_suite_config=test_eval_suite_config_base,
                 )
             else:
@@ -528,58 +524,6 @@ class ProfileStudy(Study):
             train_config = train_config_base
 
         return train_config
-
-    def launch_sweep(self, case: Case):
-        """Launch a wandb hyperparameter sweep for the given case."""
-        train_config = self.make_train_config(case)
-        # Remove the test_eval_suite_config since that's for final results only
-        train_config = train_config.model_copy(update={"test_eval_suite_config": None})
-        wandb_project_name = self.wandb_project_name(case)
-        sweep_id = get_sweep_id(wandb_project_name)
-        kwargs_agent = {"count": 1}  # One training run per agent
-
-        if not sweep_id:
-            logger.info(
-                f"No existing sweep found for case {case}, creating a new sweep"
-            )
-            sweep_config_path = os.path.join(
-                PACKAGE_ROOT,
-                "profile_transfer",
-                "sweep_configs",
-                f"{case.model_type}.yaml",
-            )
-            launch_sweep(train_config, sweep_config_path, kwargs_agent=kwargs_agent)
-        else:
-            launch_agent(train_config, sweep_id, kwargs_agent=kwargs_agent)
-
-    def launch_train(self, case: Case, enable_parallelism: bool = False):
-        """Launch a training job for the given case."""
-        if case.is_impossible():
-            raise ValueError(
-                f"Case {case} is not a possible case to run, check the logic in the Case dataclass to see why this is. This should have been caught earlier!"
-            )
-
-        logger.opt(colors=True).info(
-            f"<bold><red>LAUNCHING TRAINING for case\n{case}</red></bold>"
-        )
-
-        train_config = self.make_train_config(case)
-        result_path = self.result_path(case)
-        train_job_name = self.train_job_name(case)
-        if enable_parallelism:
-            logger.info(f"Launching training job {train_job_name} for case\n{case}")
-            launch_train_parallel(
-                train_config,
-                train_job_name,
-                result_path,
-                os.path.join(self.result_dir, "logs"),
-            )
-        else:
-            logger.info("Launching training serially")
-            _, _, _, _, result_dict = launch_train(train_config)
-            ds = result_dict["test/study_results"]
-            os.makedirs(os.path.dirname(result_path), exist_ok=True)
-            ds.to_netcdf(result_path)
 
     ##############
     # COLLECTION #

@@ -14,7 +14,7 @@ parameters:
       nn_depth:
         values: [2, 3, 4]
       n_points:
-        values: [21, 41, 61, 81]
+        values: [21, 31, 41, 51]
       softmax_temp:
         distribution: log_uniform_values
         min: 0.1

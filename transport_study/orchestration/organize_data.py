@@ -139,6 +139,9 @@ def get_ds(
 
     if debug:
         ds = ds.isel(shot=slice(0, 10))  # Limit to 10 shots
+    else:
+        # Sort dataset by shot count, get the X most recent as set by config
+        ds = ds.sortby("shot", ascending=False).isel(shot=slice(0, config.max_ds_size))
 
     def _profile_transfer(ds: xr.Dataset) -> xr.Dataset:
         ds = ds[REQUIRED_SIGNALS_PROFILE_TRANSFER]
