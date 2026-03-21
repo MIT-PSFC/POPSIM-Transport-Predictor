@@ -45,7 +45,7 @@ class StudyConfig(BaseSettings):
     buffer_gpus: int = 20
     hyperparam_sweeps: int = 1000
     max_epochs: int = 1000
-    epochs_per_val: int = 20
+    epochs_per_val: int = 50
     wandb_entity: str | None = None
 
     scratch_dir: Path | None = (

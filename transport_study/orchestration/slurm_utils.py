@@ -174,15 +174,13 @@ def launch_agent_parallel(
     """
     os.makedirs(log_dir, exist_ok=True)
 
-    with tempfile.NamedTemporaryFile(
-        mode="w",
-        suffix=".yaml",
-        delete=False,
-        prefix=f"{job_name}_config_",
-        dir=log_dir,
-    ) as f:
+    run_dir = tempfile.mkdtemp(prefix=f"{job_name}_", dir=log_dir)
+    config_path = os.path.join(run_dir, "config.yaml")
+    script_path = os.path.join(run_dir, "run_agent.py")
+    log_path = os.path.join(run_dir, "slurm.log")
+
+    with open(config_path, "w") as f:
         yaml.dump(train_config.model_dump(), f, indent=4)
-        config_path = f.name
 
     py_script = f"""\
 import os
@@ -201,13 +199,9 @@ launch_agent(
 os.remove({config_path!r})
 """
 
-    with tempfile.NamedTemporaryFile(
-        mode="w", suffix=".py", delete=False, prefix=f"{job_name}_script_", dir=log_dir
-    ) as f:
+    with open(script_path, "w") as f:
         f.write(py_script)
-        script_path = f.name
 
-    log_path = os.path.join(log_dir, f"{job_name}.log")
     sbatch_script = f"""\
 #!/bin/bash
 #SBATCH --job-name={job_name}
