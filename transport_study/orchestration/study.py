@@ -297,14 +297,17 @@ class Study:
 
         if enable_parallelism:
             agent_job_name = self.agent_job_name(case)
-            logger.info(f"Launching agent job {agent_job_name} for case\n{case}")
-            launch_agent_parallel(
-                train_config,
-                sweep_id,
-                kwargs_agent,
-                agent_job_name,
-                os.path.join(self.result_dir, "logs_sweep"),
+            logger.info(
+                f"Launching {config.parallel_sweeps} agent job(s) {agent_job_name} for case\n{case}"
             )
+            for _ in range(config.parallel_sweeps):
+                launch_agent_parallel(
+                    train_config,
+                    sweep_id,
+                    kwargs_agent,
+                    agent_job_name,
+                    os.path.join(self.result_dir, "logs_sweep"),
+                )
         else:
             logger.info("Launching agent serially")
             launch_agent(train_config, sweep_id, kwargs_agent=kwargs_agent)
