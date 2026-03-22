@@ -7,15 +7,52 @@ from popsim.math_utils import soft_clip
 from popsim.ml.envs import ModuleTrainingEnv
 from popsim.simulate import StepperType
 
-from transport_study.modules.profile_trajectory.profile_predictor.module import (
+from transport_study.modules.profile_predictor.module import (
     Inputs as ProfilePredictorInputs,
 )
-from transport_study.modules.profile_trajectory.profile_predictor.module import (
+from transport_study.modules.profile_predictor.module import (
     Outputs as ProfilePredictorOutputs,
 )
-from transport_study.modules.profile_trajectory.profile_predictor.module import (
+from transport_study.modules.profile_predictor.module import (
     ProfilePredictor,
 )
+
+
+@chex.dataclass
+class PCSInputMapper:
+    """Goes from the things we can control to the inputs the profile predictor needs
+    NOTE: The DIII-D PCS ABSOLUTELY MUST BE IN THE PROPER CONTROL MODE
+    otherwise this mapping from inputs to what the plasma does will be entirely different!
+
+    See transport_study/tests/datasets/test_d3d_dataset_prof.py for an example of verifying that these line up
+    """
+
+    R0: Array  # Geometric major radius [m]
+    gapin: Array  # Inner gap [m]
+    rxpt1: Array  # Lower X-point R [m]
+    zxpt1: Array  # Lower X-point Z [m]
+    rxpt2: Array  # Upper X-point R [m]
+    zxpt2: Array  # Upper X-point Z [m]
+
+    @property
+    def a_minor(self):
+        """Compute the minor radius from the inputs"""
+        return self.R0 - self.gapin - 1.046  # Magic number is location of inner wall
+
+    @property
+    def kappa(self):
+        """Assuming in X-point control!"""
+        return jnp.abs(self.zxpt2 - self.zxpt1) / (self.a_minor * 2)
+
+    @property
+    def delta_bot(self):
+        """The bottom X point is on the LCFS, and we can get the triangularity from how far in it is radially"""
+        return (self.R0 - self.rxpt1) / self.a_minor
+
+    @property
+    def delta_top(self):
+        """The top X point is on the LCFS, and we can get the triangularity from how far in it is radially"""
+        return (self.R0 - self.rxpt2) / self.a_minor
 
 
 class ProfileTrajectoryOptimizer(TimeDepModule):
@@ -27,12 +64,15 @@ class ProfileTrajectoryOptimizer(TimeDepModule):
     psigrid: tuple = eqx.field(static=True)
 
     # These are the things that we can control over time
-    gapin: Array  # Inner gap [m]
+    # Note that the PCS needs to be in the proper control mode for these to actually line up
+    # in shot 201927, they do
+    ne20_edge: Array  # Edge density [10^20 m^-3]
     R0: Array  # Major radius [m]
-    rxpt1: Array  # X-point 1 R [m]
-    zxpt1: Array  # X-point 1 Z [m]
-    rxpt2: Array  # X-point 2 R [m]
-    zxpt2: Array  # X-point 2 Z [m]
+    gapin: Array  # Inner gap [m]
+    rxpt1: Array  # Bottom X-point R [m]
+    zxpt1: Array  # Bottom X-point Z [m]
+    rxpt2: Array  # Top X-point R [m]
+    zxpt2: Array  # Top X-point Z [m]
 
     @chex.dataclass
     class Config:

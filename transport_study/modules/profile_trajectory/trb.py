@@ -10,13 +10,13 @@ from popsim.ml.dataloading import make_dataloaders
 from popsim.ml.split_utils import split_dataset_by_fracs
 from popsim.ml.train_config import load_dict
 
+from transport_study.modules.profile_predictor.trb import (
+    ProfilePredictorTRB,
+)
 from transport_study.modules.profile_trajectory.data import get_ds
 from transport_study.modules.profile_trajectory.module import (
     ProfileTrajectoryOptimizer,
     ProfileTrajectoryOptimizerEnv,
-)
-from transport_study.modules.profile_trajectory.profile_predictor.trb import (
-    ProfilePredictorTRB,
 )
 from transport_study.trajectory_optimization.setup import (
     make_optimization_dataset,

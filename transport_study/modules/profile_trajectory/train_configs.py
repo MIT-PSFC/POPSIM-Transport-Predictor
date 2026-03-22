@@ -1,6 +1,6 @@
 from popsim.simulate import StepperType
 
-from transport_study.modules.profile_trajectory.profile_predictor.train_configs import (
+from transport_study.modules.profile_predictor.train_configs import (
     PROFILE_PREDICTOR_SHAPE_INIT_CONFIG,
 )
 from transport_study.modules.profile_trajectory.trb import (
@@ -22,8 +22,7 @@ PROFILE_TRAJECTORY_OPTIMIZER_CONFIG = {
         "input_vars": [
             "iptipp_MA",
             "B0",
-            "beta",
-            "dstdenp",
+            "betan",
             "traj_time",  # Time is needed to know which point on the trajectory we're at
         ],
         "target_vars": [],  # Trajectory optimization doesn't have traditional targets, since it optimizes directly on the profile predictor's outputs
@@ -51,9 +50,9 @@ PROFILE_TRAJECTORY_OPTIMIZER_CONFIG = {
             "a_minor": {"min": 0.0, "max": 1.0},
             "kappa": {"min": 0.0, "max": 1.0},
             "delta_top": {"min": 0.0, "max": 1.0},
-            "delta_bottom": {"min": 0.0, "max": 1.0},
+            "delta_bot": {"min": 0.0, "max": 1.0},
         },
-        "shape_times": [2.0, 2.5, 3.0, 3.5, 4.0, 4.5, 5.0, 5.5],
+        "traj_times": [2.0, 2.5, 3.0, 3.5, 4.0, 4.5, 5.0, 5.5],
         "submodules": {"profile_predictor": PROFILE_PREDICTOR_SHAPE_INIT_CONFIG},
     },
     "loss_config": {

@@ -1,7 +1,7 @@
-from transport_study.modules.profile_trajectory.profile_predictor.module import (
+from transport_study.modules.profile_predictor.module import (
     ShapeType,
 )
-from transport_study.modules.profile_trajectory.profile_predictor.trb import (
+from transport_study.modules.profile_predictor.trb import (
     ProfilePredictorTRB,
 )
 
@@ -12,18 +12,16 @@ PROFILE_PREDICTOR_SHAPE_INIT_CONFIG = {
     "epochs_per_val": 2,
     "checkpoint_dir": None,
     "dataloader_config": {
-        # DIII-D - specific keys, this will only ever be a submodule of the trajectory optimization
         "input_vars": [
-            "iptipp_MA",
+            "Ip_MA",
             "B0",
-            "beta",
-            "dstdenp",
-            "gapin",
+            "betan",
+            "ne20_edge",
             "R0",
-            "rxpt1",
-            "zxpt1",
-            "rxpt2",
-            "zxpt2",
+            "a_minor",
+            "kappa",
+            "delta_top",
+            "delta_bot",
         ],
         "target_vars": ["ne20_psi", "Te_keV_psi"],
         "extra_vars": ["Te_shape", "ne_shape"],
@@ -61,18 +59,16 @@ PROFILE_PREDICTOR_DIRECT_POINTS_CONFIG = {
     "epochs_per_val": 2,
     "checkpoint_dir": None,
     "dataloader_config": {
-        # DIII-D - specific keys, this will only ever be a submodule of the trajectory optimization
         "input_vars": [
-            "iptipp_MA",
+            "Ip_MA",
             "B0",
-            "beta",
-            "dstdenp",
-            "gapin",
+            "betan",
+            "ne20_edge",
             "R0",
-            "rxpt1",
-            "zxpt1",
-            "rxpt2",
-            "zxpt2",
+            "a_minor",
+            "kappa",
+            "delta_top",
+            "delta_bot",
         ],
         "target_vars": ["ne20_psi", "Te_keV_psi"],
     },
