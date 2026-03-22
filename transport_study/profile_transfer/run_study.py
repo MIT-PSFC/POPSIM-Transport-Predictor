@@ -388,6 +388,7 @@ class ProfileStudy(Study):
                     train_run_builder="transport_study.modules.profile_predictor.trb.ProfilePredictorTRB",
                     max_epochs=config.max_epochs,
                     epochs_per_val=config.epochs_per_val,
+                    patience=config.patience,
                     checkpoint_dir=self.trained_model_dir(
                         case
                     ),  # When doing hyperparameter tuning, this gets overwritten by the wandb agent
@@ -421,6 +422,7 @@ class ProfileStudy(Study):
                     train_run_builder="transport_study.modules.profile_predictor.trb.ProfilePredictorTRB",
                     max_epochs=config.max_epochs,
                     epochs_per_val=config.epochs_per_val,
+                    patience=config.patience,
                     checkpoint_dir=self.trained_model_dir(
                         case
                     ),  # When doing hyperparameter tuning, this gets overwritten by the wandb agent

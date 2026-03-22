@@ -4,7 +4,7 @@ metric:
   goal: "minimize"
 early_terminate:
   type: hyperband
-  min_iter: 1
+  min_iter: 2
   eta: 3
 parameters:
   model_init_config:

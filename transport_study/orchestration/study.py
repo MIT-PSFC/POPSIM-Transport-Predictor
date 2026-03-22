@@ -153,7 +153,7 @@ class Study:
 
         return True
 
-    def run_case(  # noqa: PLR0912
+    def run_case(  # noqa: PLR0912, PLR0915, PLR0911
         self,
         case: Case,
         skip_tuning: bool,
@@ -242,12 +242,20 @@ class Study:
 
             # At this point, we know the tuned config is available at tuned_config_path, so we can proceed to training
             if enable_parallelism:
-                running_jobs = count_running_jobs(
+                running_agent_jobs = count_running_jobs(
+                    self.agent_job_name(case), config.partition
+                )
+                if running_agent_jobs > 0:
+                    logger.info(
+                        f"Found {running_agent_jobs} running agent jobs, waiting for them to complete before proceeding"
+                    )
+                    return
+                running_training_jobs = count_running_jobs(
                     self.train_job_name(case), config.partition
                 )
-                if running_jobs > 0:
+                if running_training_jobs > 0:
                     logger.info(
-                        f"Found {running_jobs} running training jobs, waiting for them to complete before proceeding"
+                        f"Found {running_training_jobs} running training jobs, waiting for them to complete before proceeding"
                     )
                     return
             self.launch_train(case, enable_parallelism=enable_parallelism)
