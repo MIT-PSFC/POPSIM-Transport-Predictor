@@ -131,7 +131,7 @@ class ProfilePredictorTRB(TrainRunBuilder):
 
             module = ProfilePredictorShapeInit.init(
                 n_shapes=model_init_config["n_shapes"],
-                psigrid=train_dl.ds["psi_n"].data,
+                psigrid=np.asarray(train_dl.ds["psi_n"]),
                 nn_width=model_init_config["nn_width"],
                 nn_depth=model_init_config["nn_depth"],
                 in_size=model_init_config["in_size"],
@@ -166,7 +166,7 @@ class ProfilePredictorTRB(TrainRunBuilder):
                 n_points=model_init_config["n_points"],
                 nn_width=model_init_config["nn_width"],
                 nn_depth=model_init_config["nn_depth"],
-                psigrid=train_dl.ds["psi_n"].data,
+                psigrid=np.asarray(train_dl.ds["psi_n"]),
                 key=jax.random.PRNGKey(model_init_config["prng_seed"]),
             )
         else:
