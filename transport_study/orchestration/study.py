@@ -214,9 +214,9 @@ class Study:
                                 running_jobs = count_running_jobs(
                                     self.sweep_job_name(case), config.partition
                                 )
-                                if len(running_jobs) > 0:
+                                if running_jobs > 0:
                                     logger.info(
-                                        f"Found {len(running_jobs)} running jobs, waiting for them to complete before proceeding"
+                                        f"Found {running_jobs} running jobs, waiting for them to complete before proceeding"
                                     )
                                     return
                             # No active jobs, put the best config from the completed runs in the tuned config path

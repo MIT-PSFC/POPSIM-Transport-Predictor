@@ -9,11 +9,11 @@ from popsim.ml.train_config import TrainConfig
 from popsim.modules.transport_predictor.train_configs import update_submodule_configs
 
 from transport_study import PACKAGE_ROOT
-from transport_study.modules.profile_trajectory.data import get_ds
-from transport_study.modules.profile_trajectory.profile_predictor.train_configs import (
+from transport_study.modules.profile_predictor.train_configs import (
     PROFILE_PREDICTOR_DIRECT_POINTS_CONFIG,
     PROFILE_PREDICTOR_SHAPE_INIT_CONFIG,
 )
+from transport_study.modules.profile_trajectory.data import get_ds
 from transport_study.modules.profile_trajectory.train_configs import (
     PROFILE_TRAJECTORY_OPTIMIZER_CONFIG,
 )

@@ -129,10 +129,11 @@ class ProfileStudy(Study):
                 "unstructured_nn",
             ]:
                 raise ValueError(f"Unknown model type: {model_type}")
-            if domain_adaptation is None and num_hp_shots != -1:
-                raise ValueError(
-                    "If domain_adaptation is None, num_hp_shots must be -1 since this means we're training and testing on the same dataset and no high-performance data is being used"
-                )
+            if domain_adaptation is None:
+                if training_data != "exnihilo" and num_hp_shots != -1:
+                    raise ValueError(
+                        "If domain_adaptation is None and training data is not 'exnihilo', num_hp_shots must be -1 since this means we're training and testing on the same dataset and no high-performance data is being used"
+                    )
 
             prereqs = []
 
@@ -173,6 +174,8 @@ class ProfileStudy(Study):
         def __str__(self):
             if self.domain_adaptation:
                 return f"case.{self.model_type}.td_{self.training_data}.da_{self.domain_adaptation}.freeze_{self.freeze_shapes}.hp_{self.num_hp_shots}"
+            elif self.training_data == "exnihilo":
+                return f"case.{self.model_type}.td_{self.training_data}.freeze_{self.freeze_shapes}.hp_{self.num_hp_shots}"
             else:
                 return f"case.{self.model_type}.td_{self.training_data}.freeze_{self.freeze_shapes}"
 
@@ -184,6 +187,16 @@ class ProfileStudy(Study):
                         self.training_data,
                         self.data_normalization,
                         self.domain_adaptation,
+                        self.freeze_shapes,
+                        self.num_hp_shots,
+                    )
+                )
+            elif self.training_data == "exnihilo":
+                return hash(
+                    (
+                        self.model_type,
+                        self.training_data,
+                        self.data_normalization,
                         self.freeze_shapes,
                         self.num_hp_shots,
                     )
@@ -225,8 +238,14 @@ class ProfileStudy(Study):
             freeze_shapes_options,
             num_hp_shots_options,
         ):
-            if domain_adaptation is None and num_hp_shots != -1:
-                continue  # Invalid case, skip
+            if domain_adaptation is None:
+                if training_dataset == "exnihilo":
+                    if num_hp_shots == 0:
+                        continue  # Can't train from nothing with 0 high-performance shots
+                elif num_hp_shots != -1:
+                    continue  # Invalid case, skip
+            if model_type == "unstructured_nn" and not freeze_shapes:
+                continue  # No shapes to freeze, just do one of the two
 
             case = self.Case(
                 model_type=model_type,
