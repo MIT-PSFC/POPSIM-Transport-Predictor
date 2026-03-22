@@ -16,6 +16,7 @@ from popsim.ml.train_config import load_dict
 from transport_study import PACKAGE_ROOT
 from transport_study.config import config
 from transport_study.orchestration.slurm_utils import (
+    count_idle_gpus,
     count_running_jobs,
     launch_agent_parallel,
     launch_train_parallel,
@@ -297,10 +298,11 @@ class Study:
 
         if enable_parallelism:
             agent_job_name = self.agent_job_name(case)
+            sweep_jobs = count_idle_gpus(config.partition, config.buffer_gpus)
             logger.info(
-                f"Launching {config.parallel_sweeps} agent job(s) {agent_job_name} for case\n{case}"
+                f"Launching {sweep_jobs} agent job(s) {agent_job_name} for case\n{case}"
             )
-            for _ in range(config.parallel_sweeps):
+            for _ in range(sweep_jobs):
                 launch_agent_parallel(
                     train_config,
                     sweep_id,

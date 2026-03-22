@@ -35,7 +35,13 @@ def get_completed_runs(project: str, entity: str = config.wandb_entity) -> list[
 
     try:
         project_runs = api.runs(project)
-        completed_runs = [r for r in project_runs if r.state == "finished"]
+        completed_runs = []
+        for run in project_runs:
+            run_state = run.state
+            if run_state == "finished":
+                completed_runs.append(run)
+            elif run_state in ["crashed", "failed"]:
+                run.delete()  # Clean up failed runs since they won't be useful and just take up space
     except Exception as e:
         logger.warning(
             f"No wandb runs found for {project}, assuming no completed runs."

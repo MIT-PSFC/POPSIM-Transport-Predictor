@@ -47,9 +47,6 @@ class StudyConfig(BaseSettings):
     max_epochs: int = 1000
     epochs_per_val: int = 20
     patience: int = 4  # 80 epochs without improvement, stop
-    parallel_sweeps: int = (
-        6  # Number of sweep jobs to launch at a time when running in parallel
-    )
     wandb_entity: str | None = None
 
     scratch_dir: Path | None = (

@@ -34,7 +34,9 @@ def count_running_jobs(job_name: str, partition: str = config.partition) -> int:
     return len(result.stdout.strip().split("\n")) if result.stdout.strip() else 0
 
 
-def count_idle_gpus(partition: str = config.partition) -> int:
+def count_idle_gpus(
+    partition: str = config.partition, buffer_gpus: int = config.buffer_gpus
+) -> int:
     """Count the number of idle GPUs on this partition."""
     result = subprocess.run(
         ["sinfo", "-p", partition, "-N", "--Format=gres,gresused", "--noheader"],
@@ -57,14 +59,16 @@ def count_idle_gpus(partition: str = config.partition) -> int:
         if len(counts) >= 2:
             total += int(counts[0])
             used += int(counts[1])
-    return total - used
+
+    avail = total - used
+    return max(avail - buffer_gpus, 0)  # Don't report negative available GPUs, just 0
 
 
 def resources_available(
     partition: str = config.partition, buffer_gpus: int = config.buffer_gpus
 ) -> bool:
-    idle_gpus = count_idle_gpus(partition)
-    return idle_gpus >= buffer_gpus
+    idle_gpus = count_idle_gpus(partition, buffer_gpus)
+    return idle_gpus > 0
 
 
 def launch_train_parallel(
