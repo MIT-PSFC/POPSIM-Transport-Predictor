@@ -560,6 +560,7 @@ def get_train_val_datasets(
     training_data: str,
     data_normalization: str,
     study_type: str = "profile_transfer",
+    debug: bool | None = config.debug,
 ):
     """
     Split dataset into training and validation sets based on the specified training data case.
@@ -570,7 +571,7 @@ def get_train_val_datasets(
 
     if training_data in ["cmod", "tcv", "d3d_lp"]:
         # Single device historic training data
-        ds, episode_coord = get_ds(training_data, study_type)
+        ds, episode_coord = get_ds(training_data, study_type, debug=debug)
         ds = add_performance(ds, episode_coord)
         train_ds, val_ds = split_dataset_by_fracs(
             ds,
@@ -584,7 +585,7 @@ def get_train_val_datasets(
 
     else:
         # Multi-device historic training data
-        ds_cmod, episode_coord = get_ds("cmod", study_type=study_type)
+        ds_cmod, episode_coord = get_ds("cmod", study_type=study_type, debug=debug)
         ds_cmod = add_performance(ds_cmod, episode_coord)
         train_ds_cmod, val_ds_cmod = split_dataset_by_fracs(
             ds_cmod,
@@ -596,7 +597,7 @@ def get_train_val_datasets(
         train_ds_cmod = train_ds_cmod.assign_coords(ds_source="cmod")
         val_ds_cmod = val_ds_cmod.assign_coords(ds_source="cmod")
 
-        ds_tcv, episode_coord = get_ds("tcv", study_type=study_type)
+        ds_tcv, episode_coord = get_ds("tcv", study_type=study_type, debug=debug)
         ds_tcv = add_performance(ds_tcv, episode_coord)
         train_ds_tcv, val_ds_tcv = split_dataset_by_fracs(
             ds_tcv,
@@ -617,7 +618,9 @@ def get_train_val_datasets(
             )
 
         elif training_data == "cmod_tcv_d3d_lp":
-            ds_d3d_lp, episode_coord = get_ds("d3d_lp", study_type=study_type)
+            ds_d3d_lp, episode_coord = get_ds(
+                "d3d_lp", study_type=study_type, debug=debug
+            )
             ds_d3d_lp = add_performance(ds_d3d_lp, episode_coord)
             train_ds_d3d_lp, val_ds_d3d_lp = split_dataset_by_fracs(
                 ds_d3d_lp,
@@ -658,6 +661,7 @@ def get_train_test_datasets(
     num_hp_shots: int,
     hp_test_set_size: int,
     study_type: str = "profile_transfer",
+    debug: bool | None = config.debug,
 ):
     """
     Split dataset into training and test sets for the target learning case.
@@ -678,7 +682,7 @@ def get_train_test_datasets(
 
     # Load the high-performance dataset and split into train/test
     # No validation needed because we are not tuning hyperparameters on transfer learning data
-    ds_hp, episode_coord = get_ds("d3d_hp", study_type=study_type)
+    ds_hp, episode_coord = get_ds("d3d_hp", study_type=study_type, debug=debug)
     ds_hp = add_performance(ds_hp, episode_coord)
     ds_hp = ds_hp.assign_coords(ds_source="d3d_hp")
     sorted_shots = np.argsort(ds_hp["performance"].values)
@@ -698,11 +702,11 @@ def get_train_test_datasets(
         # Exnihilo still needs historic data for normalization,
         # we will strip out all the data from historic devices later
         train_ds_hist, val_ds_hist = get_train_val_datasets(
-            "cmod_tcv", data_normalization, study_type=study_type
+            "cmod_tcv", data_normalization, study_type=study_type, debug=debug
         )
     else:
         train_ds_hist, val_ds_hist = get_train_val_datasets(
-            training_data, data_normalization, study_type=study_type
+            training_data, data_normalization, study_type=study_type, debug=debug
         )
     train_ds = concat_with_nan_padding(
         [train_ds_hist, val_ds_hist, train_ds_hp],

@@ -55,6 +55,7 @@ class ProfilePredictorTRB(TrainRunBuilder):
                     training_data=dataloader_config["training_data"],
                     data_normalization=dataloader_config["data_normalization"],
                     study_type="profile_transfer",
+                    debug=dataloader_config.get("debug", False),
                 )
             else:
                 ds_train, ds_val = get_train_test_datasets(
@@ -64,6 +65,7 @@ class ProfilePredictorTRB(TrainRunBuilder):
                     num_hp_shots=dataloader_config["num_hp_shots"],
                     hp_test_set_size=dataloader_config.get("hp_test_set_size", None),
                     study_type="profile_transfer",
+                    debug=dataloader_config.get("debug", False),
                 )
                 # Double check there's no historic data anywhere in here
                 if (
@@ -85,6 +87,7 @@ class ProfilePredictorTRB(TrainRunBuilder):
                 num_hp_shots=dataloader_config["num_hp_shots"],
                 hp_test_set_size=dataloader_config.get("hp_test_set_size", None),
                 study_type="profile_transfer",
+                debug=dataloader_config.get("debug", False),
             )
 
         # Drop time_idx as a shared coordinate — it has duplicate values across shots and
