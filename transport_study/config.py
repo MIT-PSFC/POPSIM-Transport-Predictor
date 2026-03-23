@@ -49,9 +49,7 @@ class StudyConfig(BaseSettings):
     patience: int = 4  # 80 epochs without improvement, stop
     wandb_entity: str | None = None
 
-    scratch_dir: Path | None = (
-        None  # Datasets get pared down and copied to here before study gets run
-    )
+    scratch_dir: Path | None = None  # Used for predict-first temp files
     cmod_dataset_path: Path | None = None
     tcv_dataset_path: Path | None = None
     d3d_lp_dataset_path: Path | None = None

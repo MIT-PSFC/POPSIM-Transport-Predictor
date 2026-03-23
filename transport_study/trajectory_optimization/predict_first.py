@@ -8,6 +8,8 @@ import numpy as np
 import xarray as xr
 from loguru import logger
 
+from transport_study.datasets.d3d.d3d_dataset import D3DDataWorkflow
+
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
@@ -46,9 +48,11 @@ BRIGHT_COLORS = [
 
 
 def run_preshot_prediction(  # noqa: PLR0915
+    ref_shot: int,
+    targ_shot: int | None,
     profile_predictor_checkpoint_dir: str,
     optimized_trajectory_checkpoint_dir: str | None = None,
-    ds_path: str = config.d3d_hp_dataset_path,
+    scratch_dir: str | None = config.scratch_dir,
 ):
     """Run selected profile predictor to get distribution of profiles over time
 
@@ -59,11 +63,36 @@ def run_preshot_prediction(  # noqa: PLR0915
     4. Run profile predictor on dataloader
     5. Save predicted profiles as a dataset for later use
     6 + nice plots and gifs with error bars over time, etc.
+
+    Args:
+        ref_shot: int
+            The shot to use as the reference trajectory to perturb around
+        targ_shot: int
+            The shot that we are predicting for (should be programmed with the anticipated optimized trajectory)
+        profile_predictor_checkpoint_dir: str
+            The checkpoint directory to restore the profile predictor from
+        optimized_trajectory_checkpoint_dir: str | None
+            If not None, the checkpoint directory to restore the optimized trajectory from. If None, uses the programmed trajectory from the dataset as-is.
+        scratch_dir: str | None
+            The directory to use for temporary files during prediction. If None, uses the value from config.scratch_dir.
     """
 
-    # Load dataset
-    logger.info(f"Loading dataset from {ds_path}")
-    ds = xr.open_dataset(ds_path)
+    def _setup_directories(scratch_dir):
+        working_dir = os.path.join(scratch_dir, "predict_first")
+        shot_data_dir = os.path.join(working_dir, "shot_data")
+        result_dir = os.path.join(working_dir, f"shot_{targ_shot}")
+        os.makedirs(shot_data_dir, exist_ok=True)
+        os.makedirs(result_dir, exist_ok=True)
+        return working_dir, shot_data_dir, result_dir
+
+    _working_dir, shot_data_dir, result_dir = _setup_directories(scratch_dir)
+
+    # Get trajectories and profiles if they are not already saved in the shot_data_dir
+    ds_ref_path = os.path.join(shot_data_dir, f"{ref_shot}.nc")
+    ds_ref = _get_shot_data(ref_shot, ds_ref_path)
+    if targ_shot is not None:
+        ds_target_path = os.path.join(shot_data_dir, f"{targ_shot}.nc")
+        ds_targ = _get_shot_data(targ_shot, ds_target_path)
 
     # Step 0: Overwrite programmed trajectory if an optimized trajectory is provided
     if optimized_trajectory_checkpoint_dir is not None:
@@ -72,7 +101,6 @@ def run_preshot_prediction(  # noqa: PLR0915
         )
         logger.info(f"Loading optimized trajectory from {traj_path}")
         ds_traj = xr.open_dataset(traj_path)
-        ref_shot = 201927
         # Map PCS signal names → dataset variable names and unit scale factors
         traj_signal_map = {
             "iptipp": ("Ip_MA_prog", 1e-6),  # A → MA
@@ -87,21 +115,23 @@ def run_preshot_prediction(  # noqa: PLR0915
         }
         updated_vars = {}
         for traj_var, (ds_var, scale) in traj_signal_map.items():
-            if traj_var in ds_traj and ds_var in ds:
-                orig = ds[ds_var].load()
+            if traj_var in ds_traj and ds_var in ds_ref:
+                orig = ds_ref[ds_var].load()
                 new_vals = orig.copy()
                 new_vals.loc[{"shot": ref_shot}] = ds_traj[traj_var].values * scale
                 updated_vars[ds_var] = new_vals
         if updated_vars:
-            ds = ds.assign(updated_vars)
+            ds_ref = ds_ref.assign(updated_vars)
 
-    # Actual B0_prog is slightly different
-    ds = correct_B0_prog(ds)
-    ds = add_gapin_prog(ds)
+    ds_ref = correct_B0_prog(ds_ref)
+    ds_ref = add_gapin_prog(ds_ref)
+    if targ_shot is not None:
+        ds_targ = correct_B0_prog(ds_targ)
+        ds_targ = add_gapin_prog(ds_targ)
 
     # Step 1: Make augmented dataset with perturbed inputs
     logger.info("Building augmented dataset with perturbed inputs")
-    ds_aug = make_augmented_dataset(ds, shots_times=FEEDBACK_CONTROL_SHOTS)
+    ds_aug = make_augmented_dataset(ds_ref, shots_times=FEEDBACK_CONTROL_SHOTS)
 
     # Ensure no NaNs
     for var in ds_aug.data_vars:
@@ -151,7 +181,8 @@ def run_preshot_prediction(  # noqa: PLR0915
 
     # Step 4: Run profile predictor on all samples via vmap
     logger.info(
-        f"Running profile predictor on {n_shot_alt * n_time} samples ({n_shot_alt} shot_alts x {n_time} time steps)"
+        f"Running profile predictor on {n_shot_alt * n_time} samples "
+        f"({n_shot_alt} shot_alts x {n_time} time steps)"
     )
 
     def _predict(inputs: Inputs):
@@ -180,23 +211,16 @@ def run_preshot_prediction(  # noqa: PLR0915
             "psi_n": psi_grid,
         },
     )
-    # Attach time as a data variable (may vary per shot_alt due to padding)
     if "time" in ds_aug:
         ds_pred["time"] = ds_aug["time"]
 
-    output_dir = os.path.join(
-        os.path.dirname(profile_predictor_checkpoint_dir),
-        "preshot_prediction",
-        os.path.basename(profile_predictor_checkpoint_dir),
-    )
-    os.makedirs(output_dir, exist_ok=True)
-    pred_path = os.path.join(output_dir, "predicted_profiles.nc")
+    pred_path = os.path.join(result_dir, "predicted_profiles.nc")
     ds_pred.to_netcdf(pred_path)
     logger.info(f"Saved predicted profiles to {pred_path}")
 
     # Step 6: Plots with error bars over time
-    _plot_predictor_inputs(ds_aug, a_minor, kappa, delta_top, delta_bot, output_dir)
-    _plot_preshot_predictions(ds_pred, output_dir)
+    _plot_predictor_inputs(ds_aug, a_minor, kappa, delta_top, delta_bot, result_dir)
+    _plot_preshot_predictions(ds_pred, result_dir)
 
 
 def _plot_predictor_inputs(
@@ -443,6 +467,35 @@ def _plot_preshot_predictions(ds_pred: xr.Dataset, output_dir: str):  # noqa: PL
             plt.close(fig2)
 
     logger.info(f"Saved plots to {plot_dir}")
+
+
+def _get_shot_data(shot: int, ds_path: str) -> xr.Dataset:
+    if not os.path.exists(ds_path):
+        logger.info(
+            f"Extracting shot {shot} data from D3D servers (MUST BE RUN ON OMEGA)"
+        )
+        data_assembly_dir = os.path.dirname(ds_path)
+        # Make a temporary text file with just this shot in it
+        shotlist_path = os.path.join(data_assembly_dir, f"{shot}_shotlist.txt")
+        with open(shotlist_path, "w") as f:
+            f.write(f"{shot}\n")
+
+        workflow = D3DDataWorkflow(
+            ds_name="predict_first_input",
+            shotlist_file=shotlist_path,
+            data_assembly_dir=data_assembly_dir,
+            max_num_shots=1,
+            mode="raw",
+            use_ida=False,  # We're comparing against ZIPFITs, since those are what'll be available on the run day
+        )
+        workflow.make_raw_data_files()
+
+        # Clean up shotlist file
+        os.remove(shotlist_path)
+
+    logger.info(f"Loading shot {shot} data from {ds_path}")
+    ds = xr.open_dataset(ds_path)
+    return ds
 
 
 if __name__ == "__main__":
