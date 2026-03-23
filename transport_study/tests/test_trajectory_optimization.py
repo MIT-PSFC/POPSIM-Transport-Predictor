@@ -5,8 +5,8 @@ from transport_study import PACKAGE_ROOT
 import chex
 
 from transport_study.config import config
-from transport_study.trajectory_optimization.setup import (
-    make_optimization_dataset,
+from transport_study.trajectory_optimization.setup_data import (
+    make_augmented_dataset,
     IP_RAMP_SHOTS,
 )
 from transport_study.modules.profile_trajectory.data import get_ds
@@ -29,8 +29,8 @@ from transport_study.trajectory_optimization.plotting import (
     profile_comparison,
     trajectory_performance_comparison,
 )
-from transport_study.trajectory_optimization.setup import (
-    make_optimization_dataset,
+from transport_study.trajectory_optimization.setup_data import (
+    make_augmented_dataset,
 )
 
 
@@ -41,8 +41,8 @@ def test_optimization_dataset():
     ds_path = config.d3d_dataset_path
     ds, _ = get_ds(ds_path)
 
-    ds_debug_1 = make_optimization_dataset(ds, debug=True)
-    ds_debug_2 = make_optimization_dataset(ds, debug=True)
+    ds_debug_1 = make_augmented_dataset(ds, debug=True)
+    ds_debug_2 = make_augmented_dataset(ds, debug=True)
 
     assert len(ds_debug_1["shot"].values) == len(IP_RAMP_SHOTS.keys()), (
         "Debug dataset should only contain the IP ramp shots"
@@ -52,9 +52,9 @@ def test_optimization_dataset():
         "Datasets with the same seed should be identical"
     )
 
-    ds_normal_1 = make_optimization_dataset(ds, permutations_per_shot=4, debug=False)
-    ds_normal_2 = make_optimization_dataset(ds, permutations_per_shot=4, debug=False)
-    ds_normal_3 = make_optimization_dataset(
+    ds_normal_1 = make_augmented_dataset(ds, permutations_per_shot=4, debug=False)
+    ds_normal_2 = make_augmented_dataset(ds, permutations_per_shot=4, debug=False)
+    ds_normal_3 = make_augmented_dataset(
         ds, permutations_per_shot=4, prng_seed=43, debug=False
     )
 

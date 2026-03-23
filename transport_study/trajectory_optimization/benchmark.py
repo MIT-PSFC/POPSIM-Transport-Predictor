@@ -38,8 +38,8 @@ from transport_study.trajectory_optimization.plotting import (
     trajectory_performance_comparison,
     trajectory_shapes_comparison,
 )
-from transport_study.trajectory_optimization.setup import (
-    make_optimization_dataset,
+from transport_study.trajectory_optimization.setup_data import (
+    make_augmented_dataset,
 )
 
 SAVE_DIR = os.path.join(PACKAGE_ROOT, "../scratch", "trajectory_optimization_benchmark")
@@ -160,9 +160,7 @@ def plot_profiles(
         fresh_profiles=True,  # Only use timesteps where profile data is fresh
         debug=False,
     )
-    ds_opt = make_optimization_dataset(
-        ds, debug=True
-    )  # Get original shots for plotting
+    ds_opt = make_augmented_dataset(ds, debug=True)  # Get original shots for plotting
 
     profile_comparison(
         profile_dir=fig_dir,
@@ -412,7 +410,7 @@ def plot_trajectory_shapes(
         fresh_profiles=False,  # Use all timesteps for trajectory optimization
         debug=optimization_config.dataloader_config["debug"],
     )
-    ds_aug = make_optimization_dataset(
+    ds_aug = make_augmented_dataset(
         ds=ds,
         debug=True,
         prng_seed=optimization_config.dataloader_config["prng_seed"],

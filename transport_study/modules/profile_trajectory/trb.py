@@ -19,8 +19,8 @@ from transport_study.modules.profile_trajectory.module import (
     ProfileTrajectoryOptimizer,
     ProfileTrajectoryOptimizerEnv,
 )
-from transport_study.trajectory_optimization.setup import (
-    make_optimization_dataset,
+from transport_study.trajectory_optimization.setup_data import (
+    make_augmented_dataset,
 )
 
 
@@ -42,7 +42,7 @@ class ProfileTrajectoryOptimizerTRB(TrainRunBuilder):
                 fresh_profiles=False,  # Use all timesteps for trajectory optimization
                 debug=dataloader_config["debug"],
             )
-            ds_aug = make_optimization_dataset(
+            ds_aug = make_augmented_dataset(
                 ds=ds,
                 debug=dataloader_config["debug"],
                 prng_seed=dataloader_config["prng_seed"],
@@ -107,7 +107,7 @@ class ProfileTrajectoryOptimizerTRB(TrainRunBuilder):
         # TODO(ZanderKeith): I suppose this only works when we're sweeping on one shot.
         if not model_init_config.get("optimize_density", False):
             # Use the first sample's time array to look up values by nearest index,
-            # since the time coordinate is 2D after make_optimization_dataset and cannot be used with .sel().
+            # since the time coordinate is 2D after make_augmented_dataset and cannot be used with .sel().
             meta = train_dl.dataset.training_metadata
             sample_dim = meta.sample_dim
             time_dim = meta.time_dep_metadata.time_dim
