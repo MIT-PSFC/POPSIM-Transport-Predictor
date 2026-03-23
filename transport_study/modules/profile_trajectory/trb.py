@@ -1,10 +1,12 @@
 from collections.abc import Callable
 from typing import Any
 
+import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
 import xarray as xr
+from popsim.cfspopcon_jax.density_peaking import calc_effective_collisionality
 from popsim.ml import DataLoader, IntegralLoss, TrainRunBuilder
 from popsim.ml.checkpointing import create_default_checkpoint_manager, restore_model
 from popsim.ml.dataloading import DEFAULT_SAMPLE_DIM, make_dataloaders
@@ -134,22 +136,57 @@ class ProfileTrajectoryOptimizerTRB(TrainRunBuilder):
 
     @staticmethod
     def get_loss_fn(loss_config: dict) -> Callable[[Any, Any], jnp.ndarray]:
+        # Typical Zeff for DIII-D H-mode plasmas
+        Z_EFF = 1.5
+
         def loss_fn(pred, targ):
-            # Loss function right now just minimizes the pressure peaking
-            ne20_psi = pred.profile_predictor_output.ne.data
-            Te_keV_psi = pred.profile_predictor_output.te.data
+            """Loss function based on D-level stability metrics:
 
-            # Ensure arrays have compatible shapes for broadcasting
-            ne20_psi = jnp.asarray(ne20_psi)
-            Te_keV_psi = jnp.asarray(Te_keV_psi)
+            D0 is low risk, D3 is high risk
+            D0 :    q_star > 3.5, nu_e* < 0.3
+            D1 :    3.0 < q_star <= 3.5, 0.3 <= nu_e* < 0.6
+            D2 :    2.5 < q_star <= 3.0, 0.6 <= nu_e* < 1.0
+            D3 :    q_star <= 2.5 or nu_e* >= 1.0
 
-            # Calculate pressure with explicit broadcasting
-            P_psi = jnp.multiply(ne20_psi, Te_keV_psi)
-            avg = jnp.mean(P_psi)
-            # Guard against division by near-zero avg (e.g. for NaN-replaced zero inputs)
-            safe_avg = jnp.maximum(avg, 1e-6)
-            peaking = jnp.max(P_psi) / safe_avg
-            return peaking
+            1. Minimize pressure peaking (most important, high-beta shots typically disrupt from MHD activity)
+            2. Maintain high q_star (proxy for q_min), penalized in D-level brackets
+            3. Have low effective collisionality (nu_e*), penalized in D-level brackets
+            4. Soft Greenwald density limit, penalize approach to fGW = 1.5
+            """
+            ne20_psi = jnp.asarray(pred.profile_predictor_output.ne.data)
+            Te_keV_psi = jnp.asarray(pred.profile_predictor_output.te.data)
+
+            # 1. Pressure peaking (most important)
+            P_psi = ne20_psi * Te_keV_psi
+            avg_P = jnp.mean(P_psi)
+            safe_avg_P = jnp.maximum(avg_P, 1e-6)
+            peaking = jnp.max(P_psi) / safe_avg_P
+
+            # 2. q_star in D-level brackets (lower q_star = higher risk)
+            q_star = pred.q_star
+            q_loss = (
+                jax.nn.relu(3.5 - q_star)  # D0 -> D1 boundary
+                + jax.nn.relu(3.0 - q_star)  # D1 -> D2 boundary
+                + jax.nn.relu(2.5 - q_star)  # D2 -> D3 boundary
+            )
+
+            # 3. Effective collisionality in D-level brackets
+            # calc_effective_collisionality expects ne in [1e19 m^-3]
+            ne_avg_1e19 = jnp.mean(ne20_psi) * 10.0
+            Te_avg_keV = jnp.mean(Te_keV_psi)
+            nu_star = calc_effective_collisionality(
+                ne_avg_1e19, Te_avg_keV, pred.R0, Z_EFF
+            )
+            nu_loss = (
+                jax.nn.relu(nu_star - 0.3)  # D0 -> D1 boundary
+                + jax.nn.relu(nu_star - 0.6)  # D1 -> D2 boundary
+                + jax.nn.relu(nu_star - 1.0)  # D2 -> D3 boundary
+            )
+
+            # 4. Soft Greenwald limit: penalize fGW approaching 1.5
+            gw_loss = jax.nn.softplus(10.0 * (pred.fGW - 1.3))
+
+            return 3.0 * peaking + q_loss + nu_loss + 0.5 * gw_loss
 
         return IntegralLoss(loss_fn, nan_strategy="zero")
 

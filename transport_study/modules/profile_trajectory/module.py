@@ -105,6 +105,9 @@ class ProfileTrajectoryOptimizer(TimeDepModule):
         # Things that are necessary for computing the loss function
         profile_predictor_output: ProfilePredictorOutputs
         psi: Array
+        q_star: float  # Edge safety factor proxy for q_min [~]
+        fGW: float  # Greenwald density fraction [~]
+        R0: float  # Major radius [m], needed for effective collisionality
 
     def __init__(
         self,
@@ -240,6 +243,9 @@ class ProfileTrajectoryOptimizer(TimeDepModule):
         output = ProfileTrajectoryOptimizer.Output(
             profile_predictor_output=profile_predictor_output,
             psi=self.psigrid,
+            q_star=profile_predictor_input.q_star,
+            fGW=profile_predictor_input.fGW,
+            R0=targ_dict["R0"],
         )
 
         # New dummy state
