@@ -7,7 +7,8 @@ import optax
 import xarray as xr
 from popsim.ml import DataLoader, IntegralLoss, TrainRunBuilder
 from popsim.ml.checkpointing import create_default_checkpoint_manager, restore_model
-from popsim.ml.dataloading import make_dataloaders
+from popsim.ml.dataloading import DEFAULT_SAMPLE_DIM, make_dataloaders
+from popsim.ml.eval import EvalData, EvaluationSuite
 from popsim.ml.train_config import load_dict
 
 from transport_study.modules.profile_predictor.trb import (
@@ -67,7 +68,7 @@ class ProfileTrajectoryOptimizerTRB(TrainRunBuilder):
                 f"Called with a module that isn't a profile trajectory optimizer: {dataloader_config.get('module')}"
             )
 
-        return ds, train_dl, val_dl, None
+        return ds, train_dl, val_dl, val_dl
 
     @staticmethod
     def model_init(train_dl: DataLoader, model_init_config: dict) -> Any:
@@ -169,6 +170,32 @@ class ProfileTrajectoryOptimizerTRB(TrainRunBuilder):
             return peaking
 
         return IntegralLoss(loss_fn, nan_strategy="zero")
+
+    @staticmethod
+    def get_test_eval_suite(config: dict) -> EvaluationSuite | None:
+        if not config:
+            return None
+
+        def predicted_profiles(eval_data: EvalData) -> xr.Dataset:
+            """Mean and std of predicted ne/Te profiles across augmented shots."""
+            ne = eval_data.output_ds["output.profile_predictor_output.ne"]
+            te = eval_data.output_ds["output.profile_predictor_output.te"]
+
+            ne_mean = ne.mean(dim=DEFAULT_SAMPLE_DIM, skipna=True)
+            ne_std = ne.std(dim=DEFAULT_SAMPLE_DIM, skipna=True)
+            te_mean = te.mean(dim=DEFAULT_SAMPLE_DIM, skipna=True)
+            te_std = te.std(dim=DEFAULT_SAMPLE_DIM, skipna=True)
+
+            return xr.Dataset(
+                {
+                    "ne_mean": ne_mean,
+                    "ne_std": ne_std,
+                    "te_mean": te_mean,
+                    "te_std": te_std,
+                }
+            )
+
+        return {"predicted_profiles": predicted_profiles}
 
     @staticmethod
     def get_optimizer(optimizer_config: dict) -> optax.GradientTransformation:

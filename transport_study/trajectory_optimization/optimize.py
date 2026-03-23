@@ -25,8 +25,8 @@ from transport_study.profile_transfer.run_study import ProfileStudy
 # These times are informed by our reference shot 201927
 # At most 8 trajectory points to plug in by hand
 TRAJ_TIMES = [
-    2.0,
-    2.5,
+    2.1,
+    2.6,
     3.0,
     3.5,
     4.0,
@@ -137,6 +137,12 @@ class TrajectoryOptimization:
             str(case),
         )
 
+    def result_path(self, case: Case) -> str:
+        """Path to the predicted profiles dataset (test eval results)."""
+        return os.path.join(
+            self.working_dir, "outputs", str(case), "predicted_profiles.nc"
+        )
+
     def output_path(self, case: Case) -> str:
         """Path to the done-marker output dataset for a case. Analogous to result_path in ProfileStudy."""
         return os.path.join(
@@ -232,6 +238,7 @@ class TrajectoryOptimization:
                         "profile_predictor": profile_predictor_config.model_dump(),
                     },
                 },
+                "test_eval_suite_config": {"enabled": True},
             }
         )
 
@@ -251,7 +258,13 @@ class TrajectoryOptimization:
     def run_case(self, case: Case):
         """Run a trajectory optimization case."""
         config = self.setup_optimization_config(case)
-        launch_train(config)
+        _, _, _, _, test_results = launch_train(config)
+        if test_results is not None:
+            ds = test_results.get("test/predicted_profiles")
+            if ds is not None:
+                result_path = self.result_path(case)
+                os.makedirs(os.path.dirname(result_path), exist_ok=True)
+                ds.to_netcdf(result_path)
 
     #######################################################################
     # Output the control signal dataset encoding the optimized trajectory #
