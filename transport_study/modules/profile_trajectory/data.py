@@ -64,9 +64,16 @@ def get_ds(
     ds = ds.sel(
         shot=list(FEEDBACK_CONTROL_SHOTS.keys())
     )  # Limit to specifically these feedback control shots
+    # Also limit to within the time window of interest
+    max_time = max(times["end"] for times in FEEDBACK_CONTROL_SHOTS.values())
+    min_time = min(times["start"] for times in FEEDBACK_CONTROL_SHOTS.values())
+    ds = ds.where((ds["time"] >= min_time) & (ds["time"] <= max_time), drop=True)
 
     if fresh_profiles:
         ds = ds.where(ds["fresh_profiles"] == 1, drop=True)
+    elif debug:
+        # Resample at lower time resolution to speed up training (only every 100 ms)
+        ds = ds.sel(time_idx=ds["time_idx"].values[::100])
 
     # Limit to required signals
     ds = ds[REQUIRED_SIGNALS]
@@ -80,6 +87,14 @@ def get_ds(
     ds["ne20_line_avg"] = ds["ne20_psi"].integrate("psi_n")
     ds["Te_shape"] = ds["Te_keV_psi"] / ds["Te_keV_line_avg"]
     ds["ne_shape"] = ds["ne20_psi"] / ds["ne20_line_avg"]
+
+    # Bridge low values in B0_prog with L/R interpolation.
+    # B0_prog can be small during field program switches even though the actual field (with L/R time constant)
+    # remains ~1.5 T. Treat low values as missing and interpolate between surrounding valid values.
+    B0_prog = ds["B0_prog"].where(ds["B0_prog"] > 1)
+    B0_prog = B0_prog.interpolate_na(dim="time_idx")
+    B0_prog = B0_prog.ffill(dim="time_idx").bfill(dim="time_idx")
+    ds["B0_prog"] = B0_prog
 
     # Add a data variable for the trajectory time
     ds["traj_time"] = ds["time"].copy()

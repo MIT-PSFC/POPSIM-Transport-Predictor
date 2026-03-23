@@ -7,6 +7,7 @@ from popsim.math_utils import soft_clip
 from popsim.ml.envs import ModuleTrainingEnv
 from popsim.simulate import StepperType
 
+from transport_study.datasets.d3d.d3d_dataset import INNER_WALL
 from transport_study.modules.profile_predictor.module import (
     Inputs as ProfilePredictorInputs,
 )
@@ -37,7 +38,7 @@ class PCSInputMapper:
     @property
     def a_minor(self):
         """Compute the minor radius from the inputs"""
-        return self.R0 - self.gapin - 1.046  # Magic number is location of inner wall
+        return self.R0 - self.gapin - INNER_WALL
 
     @property
     def kappa(self):
@@ -152,9 +153,9 @@ class ProfileTrajectoryOptimizer(TimeDepModule):
         self, time: float, clip_sharpness: float = 10.0
     ) -> dict[str, float]:
         """Output the target parameters at a given time"""
-        idx = jnp.searchsorted(self.config.shape_times, time, side="right") - 1
+        idx = jnp.searchsorted(self.config.traj_times, time, side="right") - 1
         idx = jnp.clip(
-            idx, 0, len(self.config.shape_times) - 1
+            idx, 0, len(self.config.traj_times) - 1
         )  # Ensure idx is within bounds
 
         targ_dict = {
@@ -208,18 +209,27 @@ class ProfileTrajectoryOptimizer(TimeDepModule):
         # Get the target parameters at this point in the trajectory
         targ_dict = self.resolve_targets(inputs.traj_time)
 
-        # Create the input for the profile predictor
-        profile_predictor_input = ProfilePredictorInputs(
-            Ip=inputs.Ip_MA,
-            B0=inputs.B0,
-            beta=inputs.beta,
-            gapin=targ_dict["gapin"],
+        # Map PCS control inputs to shape parameters
+        pcs_inputs = PCSInputMapper(
             R0=targ_dict["R0"],
+            gapin=targ_dict["gapin"],
             rxpt1=targ_dict["rxpt1"],
             zxpt1=targ_dict["zxpt1"],
             rxpt2=targ_dict["rxpt2"],
             zxpt2=targ_dict["zxpt2"],
+        )
+
+        # Create the input for the profile predictor
+        profile_predictor_input = ProfilePredictorInputs(
+            Ip=inputs.Ip_MA,
+            B0=inputs.B0,
+            betan=inputs.betan,
             ne20=targ_dict["ne20_edge"],
+            R0=targ_dict["R0"],
+            a_minor=pcs_inputs.a_minor,
+            kappa=pcs_inputs.kappa,
+            delta_top=pcs_inputs.delta_top,
+            delta_bot=pcs_inputs.delta_bot,
             psi=jnp.array(self.psigrid),
         )
 
@@ -256,6 +266,7 @@ class ProfileTrajectoryOptimizer(TimeDepModule):
 class ProfileTrajectoryOptimizerEnv(ModuleTrainingEnv):
     module: ProfileTrajectoryOptimizer
     stepper: StepperType = eqx.field(static=True, default=StepperType.SIMPLE_EULER)
+    optimize_density: bool = eqx.field(static=True, default=False)
 
     @staticmethod
     def create_state(
@@ -274,7 +285,7 @@ class ProfileTrajectoryOptimizerEnv(ModuleTrainingEnv):
             betan=inputs["betan_prog"].data,
         )
 
-    def get_trainable(self, model_init_config: dict):
+    def get_trainable(self):
         # Get only the time-dependent controllable parameters
         trainable = {
             "R0": self.module.R0,
@@ -284,5 +295,6 @@ class ProfileTrajectoryOptimizerEnv(ModuleTrainingEnv):
             "rxpt2": self.module.rxpt2,
             "zxpt2": self.module.zxpt2,
         }
-        if model_init_config.get("optimize_ne20_edge", False):
+        if self.optimize_density:
             trainable["ne20_edge"] = self.module.ne20_edge
+        return trainable

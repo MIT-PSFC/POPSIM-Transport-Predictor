@@ -2,6 +2,7 @@ from collections.abc import Callable
 from typing import Any
 
 import jax.numpy as jnp
+import numpy as np
 import optax
 import xarray as xr
 from popsim.ml import DataLoader, IntegralLoss, TrainRunBuilder
@@ -104,11 +105,25 @@ class ProfileTrajectoryOptimizerTRB(TrainRunBuilder):
         # If we aren't optimizing density, fill in the trajectory with the programmed points
         # TODO(ZanderKeith): I suppose this only works when we're sweeping on one shot.
         if not model_init_config.get("optimize_density", False):
+            # Use the first sample's time array to look up values by nearest index,
+            # since the time coordinate is 2D after make_optimization_dataset and cannot be used with .sel().
+            meta = train_dl.dataset.training_metadata
+            sample_dim = meta.sample_dim
+            time_dim = meta.time_dep_metadata.time_dim
+            ds_first = train_dl.ds.isel({sample_dim: 0})
+            time_arr = (
+                ds_first["time"].values
+                if "time" in ds_first
+                else ds_first[time_dim].values
+            )
+            ne20_arr = ds_first["ne20_edge_prog"].values
             trajectory = {
-                "ne20_edge": [
-                    train_dl.ds["ne20_edge_prog"].sel(time=t).data
-                    for t in config.traj_times
-                ],
+                "ne20_edge": jnp.array(
+                    [
+                        ne20_arr[int(np.argmin(np.abs(time_arr - float(t))))]
+                        for t in config.traj_times
+                    ]
+                ),
             }
         else:
             trajectory = None
@@ -121,7 +136,10 @@ class ProfileTrajectoryOptimizerTRB(TrainRunBuilder):
         )
 
         # Wrap the module in an environment since it's time-dependent
-        env = ProfileTrajectoryOptimizerEnv(module=module)
+        env = ProfileTrajectoryOptimizerEnv(
+            module=module,
+            optimize_density=model_init_config.get("optimize_density", False),
+        )
 
         if model_init_config.get("restore_main_module", False):
             manager = create_default_checkpoint_manager(
@@ -145,10 +163,12 @@ class ProfileTrajectoryOptimizerTRB(TrainRunBuilder):
             # Calculate pressure with explicit broadcasting
             P_psi = jnp.multiply(ne20_psi, Te_keV_psi)
             avg = jnp.mean(P_psi)
-            peaking = jnp.max(P_psi) / avg
+            # Guard against division by near-zero avg (e.g. for NaN-replaced zero inputs)
+            safe_avg = jnp.maximum(avg, 1e-6)
+            peaking = jnp.max(P_psi) / safe_avg
             return peaking
 
-        return IntegralLoss(loss_fn)
+        return IntegralLoss(loss_fn, nan_strategy="zero")
 
     @staticmethod
     def get_optimizer(optimizer_config: dict) -> optax.GradientTransformation:
@@ -158,7 +178,10 @@ class ProfileTrajectoryOptimizerTRB(TrainRunBuilder):
             decay_rate=optimizer_config["decay_rate"],
             end_value=optimizer_config["lrf"],
         )
-        opt = optax.adamw(
-            learning_rate=schedule, weight_decay=optimizer_config["weight_decay"]
+        opt = optax.chain(
+            optax.clip_by_global_norm(optimizer_config.get("max_grad_norm", 1.0)),
+            optax.adamw(
+                learning_rate=schedule, weight_decay=optimizer_config["weight_decay"]
+            ),
         )
         return opt

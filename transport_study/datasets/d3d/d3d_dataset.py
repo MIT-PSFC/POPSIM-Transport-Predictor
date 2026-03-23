@@ -26,6 +26,10 @@ from transport_study.datasets.d3d.utils import (
 from transport_study.datasets.dispy_utils import summary
 from transport_study.datasets.workflow import DataWorkflow
 
+INNER_WALL = (
+    1.05  # Location of the inner wall, used to calculate minor radius from gapin and R0
+)
+
 
 class D3DDataWorkflow(DataWorkflow):
     """DIII-D specific data workflow for creating and processing datasets.
@@ -86,15 +90,15 @@ class D3DDataWorkflow(DataWorkflow):
     rxbot
     - measured: rxpt1 (dispy)
     - programmed: idtrxbot (toksearch)
-    zxtop
+    zxbot
     - measured: zxpt1 (dispy)
-    - programmed: idtzxtop (toksearch)
+    - programmed: idtzxbot (toksearch)
     rxtop
     - measured: rxpt2 (dispy)
     - programmed: idtrxtop (toksearch)
-    rxbot
+    zxtop
     - measured: zxpt2 (dispy)
-    - programmed: idtzxbot (toksearch)
+    - programmed: idtzxtop (toksearch)
 
     OTHER COMPARISON THINGS
     betap
