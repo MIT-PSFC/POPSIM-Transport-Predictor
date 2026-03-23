@@ -3,116 +3,20 @@ import xarray as xr
 
 from transport_study.trajectory_optimization import (
     FEEDBACK_CONTROL_SHOTS,
-    IP_RAMP_SHOTS,
 )
 
-# TODO(ZanderKeith) must redo these!
+# Obtained by running characterize_dataset.py
 PROG_INPUT_ERRORS = {
-    "Ip_MA_prog": 0.01,
-    "B0_prog": 0.01,
-    "betan_prog": 0.22,
-    "ne20_edge_prog": 0.04,
+    "Ip_MA_prog": 0.00449,
+    "B0_prog": 0.13623,
+    "betan_prog": 0.10511,
+    "ne20_edge_prog": 0.03995,
+    "R0_prog": 0.00258,
+    "rxbot_prog": 0.00254,
+    "zxbot_prog": 0.00300,
+    "rxtop_prog": 0.00416,
+    "zxtop_prog": 0.00407,
 }
-
-
-def get_trajectory_input_ranges(
-    ds: xr.Dataset,
-    inputs: list[str],
-    shots_times: dict[int, dict[str, float]] = IP_RAMP_SHOTS,
-) -> dict[str, dict[str, float]]:
-    """Find the typical ranges of trajectory parameters during the portion of the shot we are interested in
-
-    For this study, this finds the ranges of R0, a_minor, kappa, delta_top, and delta_bottom
-
-    Args:
-        ds: xr.Dataset
-            The full DIII-D HBP dataset
-        inputs: list[str]
-            The list of input parameters to find the ranges for
-
-    Returns:
-        dict[str, dict[str, float]]: A dictionary mapping each input parameter to a dictionary with keys "min", "max", "mean", "std", "median", "q1", and "q3" for the respective statistics of that parameter across the relevant portion of the shots
-    """
-
-    shot_datasets = []
-    for shot, times in shots_times.items():
-        if shot in ds["shot"]:
-            ds_shot = ds.sel(shot=shot)
-            ds_ramp = ds_shot.where(
-                (ds_shot["time"] >= times["start"]) & (ds_shot["time"] <= times["end"]),
-                drop=True,
-            )
-            shot_datasets.append(ds_ramp)
-
-    ds_trajectory = xr.concat(
-        shot_datasets, dim="time_idx", coords="minimal", compat="override"
-    )
-
-    input_ranges = {}
-    for input_var in inputs:
-        # Get data for this input var where it's not nan
-        input_data = ds_trajectory[input_var].values
-        input_data = input_data[~np.isnan(input_data)]
-        input_ranges[input_var] = {
-            "min": float(input_data.min()),
-            "max": float(input_data.max()),
-            "mean": float(input_data.mean()),
-            "std": float(input_data.std()),
-            "median": float(np.median(input_data)),
-            "q1": float(np.percentile(input_data, 25)),
-            "q3": float(np.percentile(input_data, 75)),
-        }
-
-    return input_ranges
-
-
-def get_controllable_input_ranges(
-    ds: xr.Dataset,
-    inputs: list[str],
-    shots_times: dict[int, dict[str, float]] = IP_RAMP_SHOTS,
-) -> dict[str, float]:
-    """Find the characteristic distributions of controllable input parameters during the portion of the shot we are interested in
-
-    For this study, this finds the typical error of iptipp_MA, B0, dstdenp, and beta
-    TODO(ZanderKeith): Yeah yeah I know to do this rigorously I'd want to look at the difference to the actual control waveforms, I'll do that if I have time
-
-    Args:
-        ds: xr.Dataset
-            The full DIII-D HBP dataset
-        inputs: list[str]
-            The list of input parameters to find the ranges for
-
-    Returns:
-        dict[str, float]: A dictionary mapping each input parameter to a characteristic error value (e.g. standard deviation of the error)
-    """
-
-    all_chunk_stds = []
-
-    for shot, times in shots_times.items():
-        if shot in ds["shot"]:
-            ds_shot = ds.sel(shot=shot)[inputs]
-            # Slice to the specific window of interest
-            ds_ramp = ds_shot.where(
-                (ds_shot["time"] >= times["start"]) & (ds_shot["time"] <= times["end"]),
-                drop=True,
-            )
-
-            # Coarsen this shot individually
-            # This avoids "bleeding" data from Shot A into Shot B
-            shot_chunks = ds_ramp.coarsen(time_idx=100, boundary="trim").std()
-            shot_chunks = shot_chunks.rename({"time_idx": "chunk_idx"})
-            all_chunk_stds.append(shot_chunks)
-
-    # Combine all the standard deviation "snippets" from all shots
-    # We can just use a simple list merge or xr.concat if we want to keep it as an xarray object
-    ds_all_stds = xr.concat(all_chunk_stds, dim="chunk_idx", coords="different")
-
-    input_ranges = {}
-    for input_var in inputs:
-        # Average the standard deviations across ALL chunks from ALL shots
-        input_ranges[input_var] = float(ds_all_stds[input_var].mean())
-
-    return input_ranges
 
 
 def make_optimization_dataset(

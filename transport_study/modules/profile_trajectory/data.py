@@ -41,6 +41,7 @@ REQUIRED_SIGNALS = [
 
 def get_ds(
     ds_path: str,
+    selected_shots: list[dict[str, float]] = FEEDBACK_CONTROL_SHOTS,
     fresh_profiles: bool = False,
     debug: bool | None = False,
 ) -> tuple[xr.Dataset, str]:
@@ -48,6 +49,7 @@ def get_ds(
 
     Args:
         ds_path (str): Path to the dataset.
+        selected_shots (list[dict[str, float]], optional): A list of dictionaries specifying the shots and time windows to include. Defaults to FEEDBACK_CONTROL_SHOTS.
         fresh_profiles (bool, optional): Whether to filter the dataset to only include time steps where we have fresh profile measurements. Defaults to False.
         debug (bool, optional): Whether to enable debug mode, reducing dataset size to at most 50 shots.
 
@@ -62,11 +64,11 @@ def get_ds(
         ds = xr.open_dataset(ds_path).astype(jax.numpy.float32)
 
     ds = ds.sel(
-        shot=list(FEEDBACK_CONTROL_SHOTS.keys())
+        shot=list(selected_shots.keys())
     )  # Limit to specifically these feedback control shots
     # Also limit to within the time window of interest
-    max_time = max(times["end"] for times in FEEDBACK_CONTROL_SHOTS.values())
-    min_time = min(times["start"] for times in FEEDBACK_CONTROL_SHOTS.values())
+    max_time = max(times["end"] for times in selected_shots.values())
+    min_time = min(times["start"] for times in selected_shots.values())
     ds = ds.where((ds["time"] >= min_time) & (ds["time"] <= max_time), drop=True)
 
     if fresh_profiles:
