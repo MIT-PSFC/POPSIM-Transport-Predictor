@@ -181,6 +181,33 @@ class D3DDataWorkflow(DataWorkflow):
             },
         }
 
+    def _ensure_unique_time(self, ds: xr.Dataset, shot: int, source: str) -> xr.Dataset:
+        """Sort and de-duplicate the time coordinate to make reindex safe."""
+        if "time" not in ds.coords:
+            return ds
+
+        n_time = ds.sizes.get("time", 0)
+        if n_time <= 1:
+            return ds
+
+        # Sort first so duplicate removal is deterministic.
+        sort_idx = np.argsort(ds["time"].values, kind="stable")
+        if not np.array_equal(sort_idx, np.arange(n_time)):
+            ds = ds.isel(time=sort_idx)
+
+        # Keep the last sample for each duplicated timestamp.
+        reversed_times = ds["time"].values[::-1]
+        _, reversed_unique_idx = np.unique(reversed_times, return_index=True)
+        keep_idx = np.sort((n_time - 1) - reversed_unique_idx)
+        if keep_idx.size != n_time:
+            n_removed = n_time - keep_idx.size
+            logger.warning(
+                f"Shot {shot}: removed {n_removed} duplicate time values from {source}."
+            )
+            ds = ds.isel(time=keep_idx)
+
+        return ds
+
     def _get_shotlist_from_source(self) -> list[int]:
         """Retrieve shotlist from DIII-D SQL database.
 
@@ -493,10 +520,16 @@ class D3DDataWorkflow(DataWorkflow):
         """
 
         efit_result = self._get_efit_dataset(shot)
+        efit_result = self._ensure_unique_time(efit_result, shot, "efit")
 
         toksearch_result = self._toksearch_signals(
             shot, max_time_ms=int(efit_result["time"].max().item() * 1e3)
         )
+        toksearch_result = self._ensure_unique_time(toksearch_result, shot, "toksearch")
+
+        # Toksearch can contain NaNs exactly at 1 ms grid points even when nearby
+        # samples are valid; fill on the native axis before aligning to EFIT.
+        toksearch_result = toksearch_result.ffill("time")
 
         # Put toksearch result on the same timebase as efit
         toksearch_result = toksearch_result.reindex(
@@ -539,8 +572,6 @@ class D3DDataWorkflow(DataWorkflow):
             log_settings=LogSettings(file_path=None),
             num_processes=1,
         )
-        # Keep original dims/coords from disruption_py and just rename variables/coords
-        # to match what the training pipeline expects.
         ds = profile_result[["te_rho", "ne_rho"]].rename(
             {
                 "te_rho": "Te_psi",
@@ -548,6 +579,21 @@ class D3DDataWorkflow(DataWorkflow):
                 "rho": "psi_n",  # Keep using rho as psi_n for ZIPFIT parity
             }
         )
+
+        ds["Te_psi"] = ds["Te_psi"] * 1e3  # Convert keV to eV to match IDA units
+        ds["ne_psi"] = (
+            ds["ne_psi"] * 1e19
+        )  # Convert 10^19 m^-3 to m^-3 to match IDA units
+
+        # ZIPFIT output uses idx as the sample dimension with time as an idx coordinate.
+        # Swap to a true time dimension, then add shot as an explicit dimension.
+        if "idx" in ds.dims:
+            ds = ds.assign_coords(time=("idx", profile_result["time"].values))
+            ds = ds.swap_dims({"idx": "time"}).drop_vars("idx", errors="ignore")
+
+        shot_value = int(np.asarray(profile_result["shot"].values).item())
+        ds = ds.expand_dims(shot=[shot_value])
+        ds = ds.transpose("shot", "time", "psi_n")
 
         return ds
 
@@ -628,6 +674,8 @@ class D3DDataWorkflow(DataWorkflow):
                         )
 
                 ds_0d = self._get_0D_dataset(shot)
+                ds_profile = self._ensure_unique_time(ds_profile, shot, "profile")
+                ds_0d = self._ensure_unique_time(ds_0d, shot, "0D")
 
                 # Put each dataset on a 1 kHz timebase, using previous value fill
                 max_time = max(

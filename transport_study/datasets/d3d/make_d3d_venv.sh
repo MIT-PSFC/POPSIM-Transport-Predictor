@@ -17,5 +17,10 @@ pip install -e .
 pip install numpy==1.26.4
 pip install freeqdsk
 pip install fsspec
+pip install joblib
+pip install ray
+pip install pyspark
+pip install bottleneck
+pip install "numcodecs<0.16"
 pip install zarr==2.18.3
 pip install -e submodules/toksearch
