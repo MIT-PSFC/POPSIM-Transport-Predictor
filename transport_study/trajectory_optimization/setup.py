@@ -1,13 +1,17 @@
 import numpy as np
 import xarray as xr
 
-from transport_study.trajectory_optimization import IP_RAMP_SHOTS
+from transport_study.trajectory_optimization import (
+    FEEDBACK_CONTROL_SHOTS,
+    IP_RAMP_SHOTS,
+)
 
+# TODO(ZanderKeith) must redo these!
 PROG_INPUT_ERRORS = {
-    "iptipp_MA": 0.01,
-    "B0": 0.01,
-    "dstdenp": 0.4,
-    "beta": 0.22,
+    "Ip_MA_prog": 0.01,
+    "B0_prog": 0.01,
+    "betan_prog": 0.22,
+    "ne20_edge_prog": 0.04,
 }
 
 
@@ -113,9 +117,9 @@ def get_controllable_input_ranges(
 
 def make_optimization_dataset(
     ds: xr.Dataset,
-    shots_times: dict[int, dict[str, float]] = IP_RAMP_SHOTS,
+    shots_times: dict[int, dict[str, float]] = FEEDBACK_CONTROL_SHOTS,
     prog_input_errors: dict[str, float] = PROG_INPUT_ERRORS,
-    permutations_per_shot: int = 20,
+    permutations_per_shot: int = 100,
     prng_seed: int = 42,
     debug: bool | None = False,
 ) -> xr.Dataset:
@@ -139,12 +143,15 @@ def make_optimization_dataset(
         prng_seed: int
             The seed to use for the pseudo-random number generator when sampling offsets for the input parameters
         debug: bool, optional
-            If True, returns a dataset with unmodified source shots.
+            If True, returns a dataset with only 2 permutations per shot
 
     Returns:
         xr.Dataset: Dataset with episode_dim being 'shot_alt', with the modified trajectories to optimize across
     """
     rng = np.random.default_rng(seed=prng_seed)
+
+    if debug:
+        permutations_per_shot = 2
 
     ds_shot_list = []
     for shot, times in shots_times.items():
@@ -166,10 +173,6 @@ def make_optimization_dataset(
                 {"shot_alt": [f"{shot}_{i}"]}, axis=0
             )
             ds_shot_list.append(ds_ramp_permuted)
-
-            if debug:
-                # If we're in debug mode, only make one permutation per shot (the unmodified one)
-                break
 
     # Pad all shots to the same length and combine into one big dataset
     max_time_len = max(len(ds_shot["time_idx"]) for ds_shot in ds_shot_list)

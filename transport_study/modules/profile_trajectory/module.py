@@ -66,18 +66,18 @@ class ProfileTrajectoryOptimizer(TimeDepModule):
     # These are the things that we can control over time
     # Note that the PCS needs to be in the proper control mode for these to actually line up
     # in shot 201927, they do
-    ne20_edge: Array  # Edge density [10^20 m^-3]
     R0: Array  # Major radius [m]
     gapin: Array  # Inner gap [m]
     rxpt1: Array  # Bottom X-point R [m]
     zxpt1: Array  # Bottom X-point Z [m]
     rxpt2: Array  # Top X-point R [m]
     zxpt2: Array  # Top X-point Z [m]
+    ne20_edge: Array  # Edge density [10^20 m^-3]
 
     @chex.dataclass
     class Config:
-        shape_times: (
-            Array  # The times at which we specify the desired profile shapes [s]
+        traj_times: (
+            Array  # The times at which we specify the our desired trajectory [s]
         )
         # I think that including these ranges should prevent the autodiff from finding a gradient that pushes it out of range
         # because if you put it into a softclip it kinda makes a wall that the input can't get nudged into
@@ -97,8 +97,7 @@ class ProfileTrajectoryOptimizer(TimeDepModule):
         # Plug in the waveforms for these in advance, and we expect them to be reasonably accurate
         Ip_MA: float  # [MA]
         B0: float  # On axis magnetic field [T]
-        ne20: float  # Electron density [10^20 m^-3]
-        beta: float  # Plasma beta [%]
+        betan: float  # Plasma beta [%]
 
     @chex.dataclass
     class Output:
@@ -117,59 +116,48 @@ class ProfileTrajectoryOptimizer(TimeDepModule):
         self.profile_predictor = profile_predictor
         self.psigrid = psigrid
 
-        num_times = len(config.shape_times)
+        num_times = len(config.traj_times)
 
         if trajectory is None:
-            # Initialize input trajectories at the center of the input ranges
-            self.gapin = (
-                jnp.ones(num_times)
-                * (config.input_ranges["gapin"][0] + config.input_ranges["gapin"][1])
-                / 2
-            )
-            self.R0 = (
-                jnp.ones(num_times)
-                * (config.input_ranges["R0"][0] + config.input_ranges["R0"][1])
-                / 2
-            )
-            self.rxpt1 = (
-                jnp.ones(num_times)
-                * (config.input_ranges["rxpt1"][0] + config.input_ranges["rxpt1"][1])
-                / 2
-            )
-            self.zxpt1 = (
-                jnp.ones(num_times)
-                * (config.input_ranges["zxpt1"][0] + config.input_ranges["zxpt1"][1])
-                / 2
-            )
-            self.rxpt2 = (
-                jnp.ones(num_times)
-                * (config.input_ranges["rxpt2"][0] + config.input_ranges["rxpt2"][1])
-                / 2
-            )
-            self.zxpt2 = (
-                jnp.ones(num_times)
-                * (config.input_ranges["zxpt2"][0] + config.input_ranges["zxpt2"][1])
-                / 2
-            )
-        else:
-            # Load trajectories from the provided dictionary
-            self.gapin = trajectory["gapin"]
-            self.R0 = trajectory["R0"]
-            self.rxpt1 = trajectory["rxpt1"]
-            self.zxpt1 = trajectory["zxpt1"]
-            self.rxpt2 = trajectory["rxpt2"]
-            self.zxpt2 = trajectory["zxpt2"]
+            trajectory = {}
 
-    def resolve_shapes(
+        for input_name in [
+            "R0",
+            "gapin",
+            "rxpt1",
+            "zxpt1",
+            "rxpt2",
+            "zxpt2",
+            "ne20_edge",
+        ]:
+            if input_name not in trajectory:
+                trajectory[input_name] = (
+                    jnp.ones(num_times)
+                    * (
+                        config.input_ranges[input_name][0]
+                        + config.input_ranges[input_name][1]
+                    )
+                    / 2
+                )
+
+        self.R0 = trajectory["R0"]
+        self.gapin = trajectory["gapin"]
+        self.rxpt1 = trajectory["rxpt1"]
+        self.zxpt1 = trajectory["zxpt1"]
+        self.rxpt2 = trajectory["rxpt2"]
+        self.zxpt2 = trajectory["zxpt2"]
+        self.ne20_edge = trajectory["ne20_edge"]
+
+    def resolve_targets(
         self, time: float, clip_sharpness: float = 10.0
     ) -> dict[str, float]:
-        """Output the shape parameters at a given time"""
+        """Output the target parameters at a given time"""
         idx = jnp.searchsorted(self.config.shape_times, time, side="right") - 1
         idx = jnp.clip(
             idx, 0, len(self.config.shape_times) - 1
         )  # Ensure idx is within bounds
 
-        shape_dict = {
+        targ_dict = {
             "gapin": soft_clip(
                 self.gapin[idx],
                 self.config.input_ranges["gapin"][0],
@@ -206,26 +194,32 @@ class ProfileTrajectoryOptimizer(TimeDepModule):
                 self.config.input_ranges["zxpt2"][1],
                 sharpness=clip_sharpness,
             ),
+            "ne20_edge": soft_clip(
+                self.ne20_edge[idx],
+                self.config.input_ranges["ne20_edge"][0],
+                self.config.input_ranges["ne20_edge"][1],
+                sharpness=clip_sharpness,
+            ),
         }
 
-        return shape_dict
+        return targ_dict
 
     def __call__(self, state: "State", inputs: "Inputs") -> tuple[State, Output]:
-        # Get the shape at this point in the trajectory
-        shape_dict = self.resolve_shapes(inputs.traj_time)
+        # Get the target parameters at this point in the trajectory
+        targ_dict = self.resolve_targets(inputs.traj_time)
 
         # Create the input for the profile predictor
         profile_predictor_input = ProfilePredictorInputs(
             Ip=inputs.Ip_MA,
             B0=inputs.B0,
-            ne20=inputs.ne20,
             beta=inputs.beta,
-            gapin=shape_dict["gapin"],
-            R0=shape_dict["R0"],
-            rxpt1=shape_dict["rxpt1"],
-            zxpt1=shape_dict["zxpt1"],
-            rxpt2=shape_dict["rxpt2"],
-            zxpt2=shape_dict["zxpt2"],
+            gapin=targ_dict["gapin"],
+            R0=targ_dict["R0"],
+            rxpt1=targ_dict["rxpt1"],
+            zxpt1=targ_dict["zxpt1"],
+            rxpt2=targ_dict["rxpt2"],
+            zxpt2=targ_dict["zxpt2"],
+            ne20=targ_dict["ne20_edge"],
             psi=jnp.array(self.psigrid),
         )
 
@@ -249,11 +243,13 @@ class ProfileTrajectoryOptimizer(TimeDepModule):
         config: Config,
         profile_predictor: ProfilePredictor,
         psigrid: Array,
+        trajectory: dict[str, Array] | None = None,
     ):
         return cls(
             config=config,
             profile_predictor=profile_predictor,
             psigrid=tuple(psigrid.tolist()),
+            trajectory=trajectory,
         )
 
 
@@ -273,19 +269,20 @@ class ProfileTrajectoryOptimizerEnv(ModuleTrainingEnv):
     ) -> ProfileTrajectoryOptimizer.Inputs:
         return ProfileTrajectoryOptimizer.Inputs(
             traj_time=inputs["traj_time"].data,
-            Ip_MA=inputs["iptipp_MA"].data,
-            B0=inputs["B0"].data,
-            ne20=inputs["dstdenp"].data / 10,
-            beta=inputs["beta"].data,
+            Ip_MA=inputs["Ip_MA_prog"].data,
+            B0=inputs["B0_prog"].data,
+            betan=inputs["betan_prog"].data,
         )
 
-    def get_trainable(self):
+    def get_trainable(self, model_init_config: dict):
         # Get only the time-dependent controllable parameters
-        return {
-            "gapin": self.module.gapin,
+        trainable = {
             "R0": self.module.R0,
+            "gapin": self.module.gapin,
             "rxpt1": self.module.rxpt1,
             "zxpt1": self.module.zxpt1,
             "rxpt2": self.module.rxpt2,
             "zxpt2": self.module.zxpt2,
         }
+        if model_init_config.get("optimize_ne20_edge", False):
+            trainable["ne20_edge"] = self.module.ne20_edge

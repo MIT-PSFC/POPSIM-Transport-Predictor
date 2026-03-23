@@ -18,11 +18,19 @@ PROFILE_TRAJECTORY_OPTIMIZER_CONFIG = {
         "debug": True,
         "module": "profile_trajectory",
         "split_fracs": (0.8, 0.2),  # Only used for submodule training
-        "state_vars": ["iptipp_MA"],  # Dummy
+        "state_vars": ["Ip_MA_prog"],  # Dummy to make this time-dependent
         "input_vars": [
-            "iptipp_MA",
-            "B0",
-            "betan",
+            # Bring all these along as input vars
+            # If we aren't sweeping something, still init the starting value to what it was originally
+            "Ip_MA_prog",
+            "B0_prog",
+            "betan_prog",
+            "ne20_edge_prog",
+            "R0_prog",
+            "rxbot_prog",
+            "zxbot_prog",
+            "rxtop_prog",
+            "zxtop_prog",
             "traj_time",  # Time is needed to know which point on the trajectory we're at
         ],
         "target_vars": [],  # Trajectory optimization doesn't have traditional targets, since it optimizes directly on the profile predictor's outputs

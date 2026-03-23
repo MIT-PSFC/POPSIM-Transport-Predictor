@@ -98,7 +98,6 @@ class TrajectoryOptimization:
         name: str,
         working_dir_base: str,
         profile_module_checkpoint_dir: str,
-        ds_path: str,
         traj_times: list[float],
         max_num_traj_times: int,
     ):
@@ -109,7 +108,6 @@ class TrajectoryOptimization:
 
         self.name = name
         self.profile_module_checkpoint_dir = profile_module_checkpoint_dir
-        self.ds_path = ds_path
         self.traj_times = traj_times
         self.max_num_traj_times = max_num_traj_times
 
@@ -139,8 +137,7 @@ class TrajectoryOptimization:
         Based on the dataset, we determine the allowable ranges for optimization variables and update the config accordingly.
 
         Args:
-            ds_path (str): Path to the dataset.
-            shape_times (list[float] | None, optional): List of shape times to use for the trajectory optimization.
+        case (Case): The trajectory optimization case to set up the config for.
 
         Returns:
             TrainConfig: The training config for trajectory optimization.
@@ -203,7 +200,7 @@ class TrajectoryOptimization:
                 "checkpoint_dir": self.checkpoint_dir(case),
                 "dataloader_config": {
                     **base_trajopt_config.dataloader_config,
-                    "ds_path": self.ds_path,
+                    "ds_path": config.d3d_hp_dataset_path,
                     "debug": config.debug,
                 },
                 "model_init_config": {
@@ -272,7 +269,6 @@ def run_trajectory_optimization(
     trajopt_name: str,
     working_dir_base: str,
     profile_module_checkpoint_dir: str,
-    ds_path: str | None = config.d3d_hp_dataset_path,
     traj_times: list[float] | None = TRAJ_TIMES,
     max_num_traj_times: int | None = 1,
     clean: bool | None = False,
@@ -283,7 +279,6 @@ def run_trajectory_optimization(
         trajopt_name (str): Name of the trajectory optimization run, used for naming the checkpoint directory.
         working_dir_base (str): Base directory for checkpoints and logs. The actual checkpoint directory will be working_dir_base/trajopt_name.
         profile_module_checkpoint_dir (str): Checkpoint directory for the profile predictor submodule, taken from the ProfileStudy runs.
-        ds_path (str): Path to the dataset.
         traj_times (list[float] | None): The times at which to optimize the trajectory.
         max_num_traj_times (int | None): The maximum number of times to change the shape during the trajectory.
         clean (bool, optional): Whether to clean the checkpoint directory before training.
@@ -296,7 +291,6 @@ def run_trajectory_optimization(
         name=trajopt_name,
         working_dir_base=working_dir_base,
         profile_module_checkpoint_dir=profile_module_checkpoint_dir,
-        ds_path=ds_path,
         traj_times=traj_times,
         max_num_traj_times=max_num_traj_times,
     )

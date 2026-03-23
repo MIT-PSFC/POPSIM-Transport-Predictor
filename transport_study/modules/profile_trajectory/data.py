@@ -2,22 +2,36 @@ import jax
 import numpy as np
 import xarray as xr
 
-from transport_study.trajectory_optimization import IP_RAMP_SHOTS
+from transport_study.trajectory_optimization import FEEDBACK_CONTROL_SHOTS
 
 REQUIRED_SIGNALS = [
     "time",
-    # DIII-D PCS handles these
-    "iptipp_MA",
+    # Programmed into DIII-D PCS, unchanged
+    "Ip_MA_prog",
+    "B0_prog",
+    "betan_prog",
+    # Things our controller may replace
+    "ne20_edge_prog",
+    "R0_prog",
+    "rxbot_prog",
+    "zxbot_prog",
+    "rxtop_prog",
+    "zxtop_prog",
+    # Measured equivalents for comparison
+    "Ip_MA",
     "B0",
-    "beta",
-    "dstdenp",
-    # Our trajectory optimization is over these variables
-    "gapin",
+    "betan",
+    "ne20_edge",
     "R0",
-    "rxpt1",
-    "zxpt1",
-    "rxpt2",
-    "zxpt2",
+    "rxbot",
+    "zxbot",
+    "rxtop",
+    "zxtop",
+    "gapin",  # <- special handling
+    "a_minor",
+    "kappa",
+    "delta_top",
+    "delta_bot",
     # Target profiles for the loss function
     "ne20_psi",
     "Te_keV_psi",
@@ -47,19 +61,9 @@ def get_ds(
     else:
         ds = xr.open_dataset(ds_path).astype(jax.numpy.float32)
 
-    if debug:
-        ds = ds.sel(
-            shot=list(IP_RAMP_SHOTS.keys())
-        )  # Limit to specifically these Ip ramp shots
-
-    # If signals are in terms of rho replace them with psi
-    # TODO(ZanderKeith) this is sloppy dataset creation on my end, should really standardize this naming scheme
-    # Double check if the TCV dataset is in terms of rho or psi and handle accordingly
-    if "rho" in ds.coords and "psi" not in ds.coords:
-        ds = ds.rename({"rho": "psi"})
-        for signal in ["ne20_rho", "Te_keV_rho"]:
-            if signal in ds:
-                ds = ds.rename({signal: signal.replace("rho", "psi")})
+    ds = ds.sel(
+        shot=list(FEEDBACK_CONTROL_SHOTS.keys())
+    )  # Limit to specifically these feedback control shots
 
     if fresh_profiles:
         ds = ds.where(ds["fresh_profiles"] == 1, drop=True)
@@ -67,13 +71,15 @@ def get_ds(
     # Limit to required signals
     ds = ds[REQUIRED_SIGNALS]
 
-    # Put dataset on an even psi grid [0, 1.2]
-    psigrid = np.linspace(0, 1.2, 61)
-    ds = ds.interp(psi=psigrid, kwargs={"fill_value": "extrapolate"})
+    # Put dataset on an even psi grid [0, 1]
+    psi_n_grid = np.linspace(0, 1.0, 51)
+    ds = ds.interp(psi_n=psi_n_grid, kwargs={"fill_value": "extrapolate"})
 
-    # Calculate shape variables
-    ds["ne_shape"] = ds["ne20_psi"] / ds["ne20_psi"].integrate("psi")
-    ds["Te_shape"] = ds["Te_keV_psi"] / ds["Te_keV_psi"].integrate("psi")
+    # Compute means and shapes.
+    ds["Te_keV_line_avg"] = ds["Te_keV_psi"].integrate("psi_n")
+    ds["ne20_line_avg"] = ds["ne20_psi"].integrate("psi_n")
+    ds["Te_shape"] = ds["Te_keV_psi"] / ds["Te_keV_line_avg"]
+    ds["ne_shape"] = ds["ne20_psi"] / ds["ne20_line_avg"]
 
     # Add a data variable for the trajectory time
     ds["traj_time"] = ds["time"].copy()

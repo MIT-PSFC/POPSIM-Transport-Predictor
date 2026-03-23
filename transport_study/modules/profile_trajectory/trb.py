@@ -7,7 +7,6 @@ import xarray as xr
 from popsim.ml import DataLoader, IntegralLoss, TrainRunBuilder
 from popsim.ml.checkpointing import create_default_checkpoint_manager, restore_model
 from popsim.ml.dataloading import make_dataloaders
-from popsim.ml.split_utils import split_dataset_by_fracs
 from popsim.ml.train_config import load_dict
 
 from transport_study.modules.profile_predictor.trb import (
@@ -35,33 +34,8 @@ class ProfileTrajectoryOptimizerTRB(TrainRunBuilder):
         Profile predictor gets time-independent dataloaders (just train and val),
         while trajectory optimization gets two identical time-dependent dataloaders with a lot of augmented traces
         """
-
-        if dataloader_config.get("module") == "profile_predictor":
-            ds, episode_coord = get_ds(
-                dataloader_config["ds_path"],
-                fresh_profiles=True,  # Only use timesteps where profile data is fresh
-                debug=dataloader_config["debug"],
-            )
-            ds_train, ds_val = split_dataset_by_fracs(
-                ds,
-                fracs=dataloader_config["split_fracs"],
-                dim=episode_coord,
-                seed=dataloader_config["prng_seed"],
-            )
-            train_dl, val_dl = make_dataloaders(
-                datasets=[ds_train, ds_val],
-                time_coord="time",
-                episode_coord=episode_coord,
-                input_vars=dataloader_config["input_vars"],
-                target_vars=dataloader_config["target_vars"],
-                extra_vars=dataloader_config.get("extra_vars", None),
-                convert_xr_to_jnp=dataloader_config["convert_xr_to_jnp"],
-                batch_size=dataloader_config["batch_size"],
-                shuffle=[True, False],
-            )
-        elif dataloader_config.get("module") == "profile_trajectory":
-            # TODO(ZanderKeith) add an augmentation config aug_config = dataloader_config["augmentation"]
-            ds, episode_coord = get_ds(
+        if dataloader_config.get("module") == "profile_trajectory":
+            ds, _ = get_ds(
                 dataloader_config["ds_path"],
                 fresh_profiles=False,  # Use all timesteps for trajectory optimization
                 debug=dataloader_config["debug"],
@@ -88,57 +62,62 @@ class ProfileTrajectoryOptimizerTRB(TrainRunBuilder):
             )
             ds = ds_aug
         else:
-            raise ValueError(f"Unknown module type {dataloader_config.get('module')}")
+            raise ValueError(
+                f"Called with a module that isn't a profile trajectory optimizer: {dataloader_config.get('module')}"
+            )
 
-        # Test dataloader is only for fresh profile timesteps in the ramp dataset
-        ds_test, _episode_coord = get_ds(
-            dataloader_config["ds_path"],
-            fresh_profiles=True,  # Only use timesteps where profile data is fresh
-            debug=False,
-        )
-        ds_test_aug = make_optimization_dataset(
-            ds=ds_test,
-            debug=True,
-        )
-        test_dl = make_dataloaders(
-            datasets=[ds_test_aug],
-            time_coord="time",
-            episode_coord="shot_alt",
-            input_vars=dataloader_config["input_vars"],
-            target_vars=dataloader_config["target_vars"],
-            convert_xr_to_jnp=dataloader_config["convert_xr_to_jnp"],
-            state_init_vars=dataloader_config.get("state_vars", None),
-            extra_vars=dataloader_config.get("extra_vars", None),
-            batch_size=dataloader_config["batch_size"],
-            shuffle=[False],
-        )[0]
-
-        return ds, train_dl, val_dl, test_dl
+        return ds, train_dl, val_dl, None
 
     @staticmethod
     def model_init(train_dl: DataLoader, model_init_config: dict) -> Any:
         """Initialize the model to be trained"""
-        psigrid = jnp.asarray(train_dl.ds["psi"].data)
+        psigrid = jnp.asarray(train_dl.ds["psi_n"].data)
         submodule_configs = model_init_config["submodules"]
 
         config = ProfileTrajectoryOptimizer.Config(
-            shape_times=jnp.asarray(model_init_config["shape_times"]),
+            traj_times=jnp.asarray(model_init_config["traj_times"]),
             input_ranges=model_init_config["input_ranges"],
         )
 
-        profile_predictor_config = load_dict(submodule_configs["profile_predictor"])
-        profile_predictor = ProfilePredictorTRB.model_init(
-            train_dl, profile_predictor_config["model_init_config"]
+        def _restore_profile_predictor(profile_predictor_config):
+            # The shape_init profile predictors need the historic data to set themselves up
+            _, profile_predictor_train_dl, _, _ = ProfilePredictorTRB.get_dataloaders(
+                profile_predictor_config["dataloader_config"]
+            )
+
+            profile_predictor = ProfilePredictorTRB.model_init(
+                profile_predictor_train_dl,
+                profile_predictor_config["model_init_config"],
+            )
+            profile_predictor_manager = create_default_checkpoint_manager(
+                profile_predictor_config["checkpoint_dir"]
+            )
+            profile_predictor = restore_model(
+                profile_predictor_manager, profile_predictor
+            )
+            return profile_predictor
+
+        profile_predictor = _restore_profile_predictor(
+            load_dict(submodule_configs["profile_predictor"])
         )
-        profile_predictor_manager = create_default_checkpoint_manager(
-            profile_predictor_config["checkpoint_dir"]
-        )
-        profile_predictor = restore_model(profile_predictor_manager, profile_predictor)
+
+        # If we aren't optimizing density, fill in the trajectory with the programmed points
+        # TODO(ZanderKeith): I suppose this only works when we're sweeping on one shot.
+        if not model_init_config.get("optimize_density", False):
+            trajectory = {
+                "ne20_edge": [
+                    train_dl.ds["ne20_edge_prog"].sel(time=t).data
+                    for t in config.traj_times
+                ],
+            }
+        else:
+            trajectory = None
 
         module = ProfileTrajectoryOptimizer.init(
             config=config,
             profile_predictor=profile_predictor,
             psigrid=psigrid,
+            trajectory=trajectory,
         )
 
         # Wrap the module in an environment since it's time-dependent
