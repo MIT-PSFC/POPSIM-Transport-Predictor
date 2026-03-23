@@ -1,6 +1,7 @@
 import getpass
 import os
 import shutil
+import time
 from datetime import datetime
 
 import fire
@@ -13,6 +14,11 @@ from popsim.modules.transport_predictor.train_configs import update_submodule_co
 from transport_study.config import config
 from transport_study.modules.profile_trajectory.train_configs import (
     PROFILE_TRAJECTORY_OPTIMIZER_CONFIG,
+)
+from transport_study.orchestration.slurm_utils import (
+    count_running_jobs,
+    launch_trajopt_case_parallel,
+    resources_available,
 )
 from transport_study.profile_transfer.run_study import ProfileStudy
 
@@ -130,6 +136,15 @@ class TrajectoryOptimization:
             "checkpoints",
             str(case),
         )
+
+    def output_path(self, case: Case) -> str:
+        """Path to the done-marker output dataset for a case. Analogous to result_path in ProfileStudy."""
+        return os.path.join(
+            self.working_dir, "outputs", str(case), "optimized_trajectory.nc"
+        )
+
+    def train_job_name(self, case: Case) -> str:
+        return f"trajopt_{case}"
 
     ######################
     # Set up the configs #
@@ -809,13 +824,14 @@ class TrajectoryOptimization:
 ###############################################
 
 
-def run_trajectory_optimization(
+def run_trajectory_optimization(  # noqa: PLR0912
     trajopt_name: str,
     working_dir_base: str,
     profile_module_checkpoint_dir: str,
     traj_times: list[float] | None = TRAJ_TIMES,
     max_num_traj_times: int | None = 1,
     clean: bool | None = False,
+    enable_parallelism: bool | None = False,
 ):
     """Run trajectory optimization.
 
@@ -825,7 +841,8 @@ def run_trajectory_optimization(
         profile_module_checkpoint_dir (str): Checkpoint directory for the profile predictor submodule, taken from the ProfileStudy runs.
         traj_times (list[float] | None): The times at which to optimize the trajectory.
         max_num_traj_times (int | None): The maximum number of times to change the shape during the trajectory.
-        clean (bool, optional): Whether to clean the checkpoint directory before training.
+        clean (bool, optional): Whether to clean the checkpoint and output directories before training.
+        enable_parallelism (bool, optional): If True, submit each case as a SLURM job and loop until all outputs exist.
     """
 
     if config.debug:
@@ -839,22 +856,52 @@ def run_trajectory_optimization(
         max_num_traj_times=max_num_traj_times,
     )
 
-    trajopt.output_optimized_trajectory(
-        trajopt.cases[3]
-    )  # Just output the optimized trajectory for the first case for now
-
-    for case in trajopt.cases:
-        if not os.path.exists(trajopt.checkpoint_dir(case)) or clean:
+    if clean:
+        if enable_parallelism:
+            raise ValueError(
+                "Cleaning is not supported when parallelism is enabled, to avoid accidentally deleting in-progress jobs. Please clean manually if desired."
+            )
+        for case in trajopt.cases:
             shutil.rmtree(trajopt.checkpoint_dir(case), ignore_errors=True)
-            trajopt.run_case(case)
-        else:
-            logger.info(
-                f"Checkpoint directory already exists, skipping trajectory optimization... for case \n{case}"
+            shutil.rmtree(
+                os.path.dirname(trajopt.output_path(case)), ignore_errors=True
             )
 
-    #########################
-    # Collect results, etc. #
-    #########################
+    unfinished_cases = [
+        case for case in trajopt.cases if not os.path.exists(trajopt.output_path(case))
+    ]
+
+    while len(unfinished_cases) > 0:
+        logger.opt(colors=True).info(
+            f"<bold><green>{len(unfinished_cases)} cases remaining</green></bold>"
+        )
+        for case in unfinished_cases:
+            if os.path.exists(trajopt.output_path(case)):
+                continue
+            if enable_parallelism:
+                running = count_running_jobs(
+                    trajopt.train_job_name(case), config.partition
+                )
+                if running > 0:
+                    logger.info(f"Job already running for {case}, skipping")
+                    continue
+                if not resources_available():
+                    logger.info("No resources available, waiting...")
+                    continue
+                launch_trajopt_case_parallel(trajopt, case)
+            else:
+                if not os.path.exists(trajopt.checkpoint_dir(case)):
+                    trajopt.run_case(case)
+                if not os.path.exists(trajopt.output_path(case)):
+                    trajopt.output_optimized_trajectory(case)
+
+        unfinished_cases = [
+            case
+            for case in unfinished_cases
+            if not os.path.exists(trajopt.output_path(case))
+        ]
+        if len(unfinished_cases) > 0:
+            time.sleep(8)
 
 
 if __name__ == "__main__":

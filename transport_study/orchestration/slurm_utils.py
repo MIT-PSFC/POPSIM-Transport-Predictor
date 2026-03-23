@@ -233,3 +233,69 @@ rm -f {script_path}
         logger.error(f"sbatch failed for job {job_name}: {result.stderr}")
     else:
         logger.info(f"Submitted agent job {job_name}: {result.stdout.strip()}")
+
+
+def launch_trajopt_case_parallel(
+    trajopt,
+    case,
+) -> None:
+    """Submit a SLURM job that trains and generates output for a single trajectory optimization case."""
+    log_dir = os.path.join(trajopt.working_dir, "logs")
+    os.makedirs(log_dir, exist_ok=True)
+
+    init_kwargs = {
+        "name": trajopt.name,
+        "working_dir_base": os.path.dirname(trajopt.working_dir),
+        "profile_module_checkpoint_dir": trajopt.profile_module_checkpoint_dir,
+        "traj_times": trajopt.traj_times,
+        "max_num_traj_times": trajopt.max_num_traj_times,
+    }
+    case_str = str(case)
+
+    py_script = f"""\
+import os
+from transport_study.trajectory_optimization.optimize import TrajectoryOptimization
+
+trajopt = TrajectoryOptimization(**{init_kwargs!r})
+case = next(c for c in trajopt.cases if str(c) == {case_str!r})
+
+if not os.path.exists(trajopt.checkpoint_dir(case)):
+    trajopt.run_case(case)
+
+if not os.path.exists(trajopt.output_path(case)):
+    trajopt.output_optimized_trajectory(case)
+"""
+
+    job_name = trajopt.train_job_name(case)
+    log_path = os.path.join(log_dir, f"{job_name}.log")
+
+    with tempfile.NamedTemporaryFile(
+        mode="w", suffix=".py", delete=False, prefix=f"{job_name}_", dir=log_dir
+    ) as f:
+        f.write(py_script)
+        script_path = f.name
+
+    sbatch_script = f"""\
+#!/bin/bash
+#SBATCH --job-name={job_name}
+#SBATCH --partition={config.partition}
+#SBATCH --gres=gpu:1
+#SBATCH --mem=250G
+#SBATCH --cpus-per-task=4
+#SBATCH --export=ALL
+#SBATCH --exclude=node2301,node2101
+#SBATCH --output={log_path}
+#SBATCH --error={log_path}
+
+export WANDB_MODE=offline
+{sys.executable} {script_path}
+rm -f {script_path}
+"""
+
+    result = subprocess.run(
+        ["sbatch"], input=sbatch_script, check=False, capture_output=True, text=True
+    )
+    if result.returncode != 0:
+        logger.error(f"sbatch failed for {job_name}: {result.stderr}")
+    else:
+        logger.info(f"Submitted SLURM job {job_name}: {result.stdout.strip()}")
