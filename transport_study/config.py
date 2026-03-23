@@ -8,10 +8,10 @@ import os
 from pathlib import Path
 
 from dynaconf import Dynaconf
-from pydantic_settings import BaseSettings, SettingsConfigDict
 
 try:
     from popsim.data import get_path_to_ml_data_dump, get_path_to_ml_data_scratch
+    from pydantic_settings import BaseSettings, SettingsConfigDict
 except ImportError:
     # This is necessary for omega when numpy 1.0 .venv is in use
     def get_path_to_ml_data_dump():
@@ -19,6 +19,19 @@ except ImportError:
 
     def get_path_to_ml_data_scratch():
         return Path(f"/cscratch/{getpass.getuser()}/")
+
+    class BaseSettings:
+        """Again, dummy thing when numpy 1.0 venv in use"""
+
+    class SettingsConfigDict:
+        def __init__(
+            self,
+            env_prefix,
+            env_file,
+            env_file_encoding,
+            extra,
+        ):
+            """Any day now"""
 
 
 # Get package root directory
@@ -55,9 +68,9 @@ class StudyConfig(BaseSettings):
     d3d_lp_dataset_path: Path | None = None
     d3d_hp_dataset_path: Path | None = None
 
-    d3d: dict = {}
-    cmod: dict = {}
-    tcv: dict = {}
+    d3d: dict = {}  # noqa: RUF012
+    cmod: dict = {}  # noqa: RUF012
+    tcv: dict = {}  # noqa: RUF012
 
     model_config = SettingsConfigDict(
         env_prefix="PTPS_",  # Put in .env like PTPS_CMOD_DATASET_PATH

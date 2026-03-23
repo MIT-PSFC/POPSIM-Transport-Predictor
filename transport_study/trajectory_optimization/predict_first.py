@@ -1,4 +1,5 @@
 import os
+import sys
 
 import fire
 import jax
@@ -491,17 +492,19 @@ workflow = D3DDataWorkflow(
     use_ida=False,  # comparing against ZIPFITs, which are available on run day
 )
 workflow.make_raw_data_files()
-os.remove({shotlist_path!r})
 print("Done. Re-run predict_first.py.")
 """
         with open(script_path, "w") as f:
             f.write(script)
 
-        raise RuntimeError(
-            f"Shot {shot} data not found at {ds_path}.\n"
-            f"Run the following in your omega .venv, then re-run predict_first:\n"
-            f"  python {script_path}"
+        logger.critical(
+            f"HEY BOZO, READ THIS!\n"
+            f"Shot {shot} data not found at\n{ds_path}\n"
+            f"Run the following with the d3d-specific .venv, then re-run predict_first:\n"
+            f"  `python {script_path}`"
+            f"See `transport_study/datasets/d3d/make_d3d_venv.sh` if you have not yet made a d3d-specific .venv"
         )
+        sys.exit()
 
     logger.info(f"Loading shot {shot} data from {ds_path}")
     ds = xr.open_dataset(ds_path)

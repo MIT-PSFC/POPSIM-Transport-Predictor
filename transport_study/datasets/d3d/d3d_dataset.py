@@ -539,10 +539,17 @@ class D3DDataWorkflow(DataWorkflow):
             log_settings=LogSettings(file_path=None),
             num_processes=1,
         )
-        # Make the "time" coordinate the dimension instead of "idx"
-        profile_result = profile_result.swap_dims({"idx": "time"})
+        # Keep original dims/coords from disruption_py and just rename variables/coords
+        # to match what the training pipeline expects.
+        ds = profile_result[["te_rho", "ne_rho"]].rename(
+            {
+                "te_rho": "Te_psi",
+                "ne_rho": "ne_psi",
+                "rho": "psi_n",  # Keep using rho as psi_n for ZIPFIT parity
+            }
+        )
 
-        return profile_result
+        return ds
 
     def _get_profile_dataset_ida(self, shot: int) -> xr.Dataset | None:
         """Retrieve profile data from IDA (Integrated Data Analysis).
@@ -610,9 +617,15 @@ class D3DDataWorkflow(DataWorkflow):
                     ds_profile = self._get_profile_dataset_ida(shot)
                     if ds_profile is None:
                         logger.info(
-                            f"Skipping shot {shot} since IDA profiles are not available and skip_profiles is False"
+                            f"Skipping shot {shot} since IDA profiles are not available"
                         )
                         continue
+                else:
+                    ds_profile = self._get_profile_dataset_zipfit(shot)
+                    if ds_profile is None:
+                        logger.info(
+                            f"Skipping shot {shot} since ZIPFITs are not available"
+                        )
 
                 ds_0d = self._get_0D_dataset(shot)
 
