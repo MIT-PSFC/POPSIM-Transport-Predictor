@@ -14,6 +14,10 @@ import matplotlib.pyplot as plt
 from transport_study.config import config
 from transport_study.datasets.d3d.d3d_dataset import INNER_WALL
 from transport_study.modules.profile_predictor.module import Inputs
+from transport_study.modules.profile_trajectory.data import (
+    add_gapin_prog,
+    correct_B0_prog,
+)
 from transport_study.profile_transfer.restore_predictor import (
     restore_profile_predictor_from_checkpoint,
 )
@@ -29,6 +33,16 @@ TITLE_FONTSIZE = 18
 LABEL_FONTSIZE = 16
 TICK_FONTSIZE = 14
 LEGEND_FONTSIZE = 13
+
+# Bright colors ordered warm→cool (core psi=0 → edge psi=1), all visible on dark backgrounds
+BRIGHT_COLORS = [
+    "#FF2400",  # red       (core)
+    "#FF8C00",  # orange
+    "#FFD700",  # gold
+    "#00FF80",  # spring green
+    "#00FFFF",  # cyan
+    "#00BFFF",  # sky blue  (edge)
+]
 
 
 def run_preshot_prediction(  # noqa: PLR0915
@@ -81,6 +95,10 @@ def run_preshot_prediction(  # noqa: PLR0915
         if updated_vars:
             ds = ds.assign(updated_vars)
 
+    # Actual B0_prog is slightly different
+    ds = correct_B0_prog(ds)
+    ds = add_gapin_prog(ds)
+
     # Step 1: Make augmented dataset with perturbed inputs
     logger.info("Building augmented dataset with perturbed inputs")
     ds_aug = make_augmented_dataset(ds, shots_times=FEEDBACK_CONTROL_SHOTS)
@@ -92,13 +110,13 @@ def run_preshot_prediction(  # noqa: PLR0915
 
     # Step 2: Derive shape variables from programmed signals (matches PCSInputMapper logic)
     R0_prog = ds_aug["R0_prog"].values  # (shot_alt, time_idx)
-    gapin = ds_aug["gapin"].values
+    gapin_prog = ds_aug["gapin_prog"].values
     rxbot_prog = ds_aug["rxbot_prog"].values
     zxbot_prog = ds_aug["zxbot_prog"].values
     rxtop_prog = ds_aug["rxtop_prog"].values
     zxtop_prog = ds_aug["zxtop_prog"].values
 
-    a_minor = R0_prog - gapin - INNER_WALL
+    a_minor = R0_prog - gapin_prog - INNER_WALL
     kappa = np.abs(zxtop_prog - zxbot_prog) / (a_minor * 2)
     delta_bot = (R0_prog - rxbot_prog) / a_minor
     delta_top = (R0_prog - rxtop_prog) / a_minor
@@ -119,15 +137,15 @@ def run_preshot_prediction(  # noqa: PLR0915
     psi_tiled = jnp.tile(jnp.array(psi_grid), (n_shot_alt * n_time, 1))
 
     inputs_batched = Inputs(
-        Ip=ds_aug["Ip_MA_prog"].values,
-        B0=ds_aug["B0_prog"].values,
-        betan=ds_aug["betan_prog"].values,
-        ne20=ds_aug["ne20_edge_prog"].values,
-        R0=R0_prog,
-        a_minor=a_minor,
-        kappa=kappa,
-        delta_top=delta_top,
-        delta_bot=delta_bot,
+        Ip=ds_aug["Ip_MA_prog"].values.reshape(-1),
+        B0=ds_aug["B0_prog"].values.reshape(-1),
+        betan=ds_aug["betan_prog"].values.reshape(-1),
+        ne20=ds_aug["ne20_edge_prog"].values.reshape(-1),
+        R0=R0_prog.reshape(-1),
+        a_minor=a_minor.reshape(-1),
+        kappa=kappa.reshape(-1),
+        delta_top=delta_top.reshape(-1),
+        delta_bot=delta_bot.reshape(-1),
         psi=psi_tiled,
     )
 
@@ -177,9 +195,108 @@ def run_preshot_prediction(  # noqa: PLR0915
     logger.info(f"Saved predicted profiles to {pred_path}")
 
     # Step 6: Plots with error bars over time
+    _plot_predictor_inputs(ds_aug, a_minor, kappa, delta_top, delta_bot, output_dir)
     _plot_preshot_predictions(ds_pred, output_dir)
 
-    return ds_pred
+
+def _plot_predictor_inputs(
+    ds_aug: xr.Dataset,
+    a_minor: np.ndarray,
+    kappa: np.ndarray,
+    delta_top: np.ndarray,
+    delta_bot: np.ndarray,
+    output_dir: str,
+):
+    """Plot mean ± 1 std of all 9 profile-predictor input signals across augmented perturbations.
+
+    Saves one figure per base shot: a 3x3 grid showing each input signal over time.
+    """
+    plot_dir = os.path.join(output_dir, "plots")
+    os.makedirs(plot_dir, exist_ok=True)
+
+    shot_alt_vals = ds_aug["shot_alt"].values
+    base_shots = list(dict.fromkeys(str(sa).split("_")[0] for sa in shot_alt_vals))
+
+    # Bundle all inputs into a single dict of (shot_alt, time_idx) arrays
+    input_signals = {
+        "Ip_MA_prog [MA]": ds_aug["Ip_MA_prog"].values,
+        "B0_prog [T]": ds_aug["B0_prog"].values,
+        "betan_prog": ds_aug["betan_prog"].values,
+        "ne20_edge_prog [1e20/m³]": ds_aug["ne20_edge_prog"].values,
+        "R0_prog [m]": ds_aug["R0_prog"].values,
+        "a_minor [m]": a_minor,
+        "kappa": kappa,
+        "delta_top": delta_top,
+        "delta_bot": delta_bot,
+    }
+
+    n_signals = len(input_signals)
+    n_cols = 3
+    n_rows = (n_signals + n_cols - 1) // n_cols
+
+    for base_shot in base_shots:
+        mask = np.array([str(sa).startswith(f"{base_shot}_") for sa in shot_alt_vals])
+
+        # Time values (same for all permutations of the same base shot)
+        if "time" in ds_aug:
+            time_2d = ds_aug["time"].values  # (shot_alt, time_idx)
+            time_vals = time_2d[mask][0]
+        else:
+            time_vals = ds_aug["time_idx"].values.astype(float)
+        valid_t = ~np.isnan(time_vals)
+        t = time_vals[valid_t]
+
+        fig, axes = plt.subplots(n_rows, n_cols, figsize=(6 * n_cols, 4 * n_rows))
+        fig.patch.set_facecolor(BACKGROUND_COLOR)
+        fig.suptitle(
+            f"Predictor Inputs — Shot {base_shot} ({mask.sum()} perturbations)",
+            fontsize=TITLE_FONTSIZE,
+            color=TEXT_COLOR,
+        )
+        axes_flat = axes.reshape(-1)
+
+        for ax, (label, arr) in zip(axes_flat, input_signals.items(), strict=False):
+            perturbed = arr[mask]  # (n_perturb, time_idx)
+            mean_t = np.nanmean(perturbed, axis=0)[valid_t]
+            std_t = np.nanstd(perturbed, axis=0)[valid_t]
+
+            ax.set_facecolor(FACE_COLOR)
+            ax.grid(True, color="gray", linestyle="--", linewidth=0.5)
+            ax.tick_params(axis="both", labelsize=TICK_FONTSIZE, colors=TEXT_COLOR)
+            for spine in ax.spines.values():
+                spine.set_color(TEXT_COLOR)
+
+            ax.plot(t, mean_t, color="cyan", linewidth=2, label="mean")
+            ax.fill_between(
+                t,
+                mean_t - std_t,
+                mean_t + std_t,
+                color="cyan",
+                alpha=0.3,
+                label="±1 std",
+            )
+
+            ax.set_title(label, fontsize=LABEL_FONTSIZE, color=TEXT_COLOR)
+            ax.set_xlabel("Time [s]", fontsize=TICK_FONTSIZE, color=TEXT_COLOR)
+            legend = ax.legend(
+                fontsize=LEGEND_FONTSIZE - 2,
+                facecolor=BACKGROUND_COLOR,
+                edgecolor=BACKGROUND_COLOR,
+            )
+            for text in legend.get_texts():
+                text.set_color(TEXT_COLOR)
+
+        # Hide any unused subplot panels
+        for ax in axes_flat[n_signals:]:
+            ax.set_visible(False)
+
+        fig.tight_layout()
+        fig.savefig(
+            os.path.join(plot_dir, f"shot_{base_shot}_predictor_inputs.png"),
+            dpi=150,
+            facecolor=fig.get_facecolor(),
+        )
+        plt.close(fig)
 
 
 def _plot_preshot_predictions(ds_pred: xr.Dataset, output_dir: str):  # noqa: PLR0915
@@ -195,7 +312,7 @@ def _plot_preshot_predictions(ds_pred: xr.Dataset, output_dir: str):  # noqa: PL
     shot_alt_vals = ds_pred["shot_alt"].values
     base_shots = list(dict.fromkeys(str(sa).split("_")[0] for sa in shot_alt_vals))
     psi_plot_vals = [0.0, 0.2, 0.4, 0.6, 0.8, 1.0]
-    psi_colors = plt.cm.plasma(np.linspace(0.1, 0.9, len(psi_plot_vals)))
+    psi_colors = BRIGHT_COLORS[: len(psi_plot_vals)]
 
     for base_shot in base_shots:
         mask = np.array([str(sa).startswith(f"{base_shot}_") for sa in shot_alt_vals])
@@ -244,7 +361,7 @@ def _plot_preshot_predictions(ds_pred: xr.Dataset, output_dir: str):  # noqa: PL
                 t = time_vals[valid_t]
                 m = mean_ts[valid_t]
                 s = std_ts[valid_t]
-                ax.plot(t, m, color=color, linewidth=2, label=f"ψ={psi_val:.1f}")
+                ax.plot(t, m, color=color, linewidth=2, label=f"psi={psi_val:.1f}")
                 ax.fill_between(t, m - s, m + s, color=color, alpha=0.25)
 
             ax.set_ylabel(ylabel, fontsize=LABEL_FONTSIZE, color=TEXT_COLOR)
@@ -273,7 +390,7 @@ def _plot_preshot_predictions(ds_pred: xr.Dataset, output_dir: str):  # noqa: PL
                     np.linspace(0, len(valid_idx) - 1, min(5, len(valid_idx)))
                 ).astype(int)
             ]
-            snap_colors = plt.cm.viridis(np.linspace(0.1, 0.9, len(snap_idx)))
+            snap_colors = BRIGHT_COLORS[: len(snap_idx)]
             psi_grid_vals = ds_pred["psi_n"].values
 
             fig2, axes2 = plt.subplots(1, 2, figsize=(14, 6))

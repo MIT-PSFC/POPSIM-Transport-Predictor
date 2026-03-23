@@ -2,7 +2,9 @@ import jax
 import numpy as np
 import xarray as xr
 
-from transport_study.trajectory_optimization import FEEDBACK_CONTROL_SHOTS
+from transport_study.trajectory_optimization.setup_data import (
+    FEEDBACK_CONTROL_SHOTS,
+)
 
 REQUIRED_SIGNALS = [
     "time",
@@ -37,6 +39,39 @@ REQUIRED_SIGNALS = [
     "Te_keV_psi",
     "fresh_profiles",
 ]
+
+
+def correct_B0_prog(ds: xr.Dataset) -> xr.Dataset:
+    """
+    Programmed B0 is extremly wonk on DIII-D
+
+    Either the signal goes to 0 and it follows an L/R curve,
+    or another part of the PCS completely ignores the programmed signal and does something else.
+
+    I'm gonna say that we can know what the B0 will be in advance if we want to, minus noise.
+    As such, overwrite the B0_prog with a smoothed version of the actual B0
+    This means we avoid having to deal with weird edge cases in the dataset where the programmed B0 is completely wrong,
+    and we can still capture the typical noise in the B0 signal that the predictor will have to deal with
+    """
+    smoothed_B0 = ds["B0"].rolling(time_idx=100, center=False, min_periods=1).mean()
+    ds = ds.assign(B0_prog=smoothed_B0)
+    return ds
+
+
+def add_gapin_prog(ds: xr.Dataset) -> xr.Dataset:
+    """
+    Similar to B0_prog, there isn't really a 'programmed inner gap' signal
+
+    I know it should probably be changing slowly, so do a similar thing to B0_prog where
+    we make the programmed gapin a smoothed version of the actual gapin,
+    so that we can still capture typical noise in the gapin signal that the predictor will have to deal with
+    """
+
+    smoothed_gapin = (
+        ds["gapin"].rolling(time_idx=100, center=False, min_periods=1).mean()
+    )
+    ds = ds.assign(gapin_prog=smoothed_gapin)
+    return ds
 
 
 def get_ds(
@@ -90,13 +125,7 @@ def get_ds(
     ds["Te_shape"] = ds["Te_keV_psi"] / ds["Te_keV_line_avg"]
     ds["ne_shape"] = ds["ne20_psi"] / ds["ne20_line_avg"]
 
-    # Bridge low values in B0_prog with L/R interpolation.
-    # B0_prog can be small during field program switches even though the actual field (with L/R time constant)
-    # remains ~1.5 T. Treat low values as missing and interpolate between surrounding valid values.
-    B0_prog = ds["B0_prog"].where(ds["B0_prog"] > 1)
-    B0_prog = B0_prog.interpolate_na(dim="time_idx")
-    B0_prog = B0_prog.ffill(dim="time_idx").bfill(dim="time_idx")
-    ds["B0_prog"] = B0_prog
+    ds = correct_B0_prog(ds)
 
     # Add a data variable for the trajectory time
     ds["traj_time"] = ds["time"].copy()
