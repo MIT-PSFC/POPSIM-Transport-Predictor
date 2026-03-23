@@ -11,13 +11,13 @@ from popsim.ml.dataloading import DEFAULT_SAMPLE_DIM, make_dataloaders
 from popsim.ml.eval import EvalData, EvaluationSuite
 from popsim.ml.train_config import load_dict
 
-from transport_study.modules.profile_predictor.trb import (
-    ProfilePredictorTRB,
-)
 from transport_study.modules.profile_trajectory.data import get_ds
 from transport_study.modules.profile_trajectory.module import (
     ProfileTrajectoryOptimizer,
     ProfileTrajectoryOptimizerEnv,
+)
+from transport_study.profile_transfer.restore_predictor import (
+    restore_profile_predictor,
 )
 from transport_study.trajectory_optimization.setup_data import (
     make_augmented_dataset,
@@ -81,25 +81,7 @@ class ProfileTrajectoryOptimizerTRB(TrainRunBuilder):
             input_ranges=model_init_config["input_ranges"],
         )
 
-        def _restore_profile_predictor(profile_predictor_config):
-            # The shape_init profile predictors need the historic data to set themselves up
-            _, profile_predictor_train_dl, _, _ = ProfilePredictorTRB.get_dataloaders(
-                profile_predictor_config["dataloader_config"]
-            )
-
-            profile_predictor = ProfilePredictorTRB.model_init(
-                profile_predictor_train_dl,
-                profile_predictor_config["model_init_config"],
-            )
-            profile_predictor_manager = create_default_checkpoint_manager(
-                profile_predictor_config["checkpoint_dir"]
-            )
-            profile_predictor = restore_model(
-                profile_predictor_manager, profile_predictor
-            )
-            return profile_predictor
-
-        profile_predictor = _restore_profile_predictor(
+        profile_predictor = restore_profile_predictor(
             load_dict(submodule_configs["profile_predictor"])
         )
 

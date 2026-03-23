@@ -20,7 +20,9 @@ from transport_study.orchestration.slurm_utils import (
     launch_trajopt_case_parallel,
     resources_available,
 )
-from transport_study.profile_transfer.run_study import ProfileStudy
+from transport_study.profile_transfer.restore_predictor import (
+    checkpoint_to_profile_config,
+)
 
 # These times are informed by our reference shot 201927
 # At most 8 trajectory points to plug in by hand
@@ -54,42 +56,6 @@ class TrajectoryOptimization:
 
         def __str__(self):
             return f"trajopt.{self.num_traj_times}.od_{self.optimize_density}.{self.profile_predictor}"
-
-    def _path_to_profile_case(self, path: str) -> ProfileStudy.Case:
-        # Extract the case name from the path, assuming it's the name of the last directory in the path
-        case_name = path.split("/")[-1]
-        case_pieces = case_name.split(".")
-        model_type = case_pieces[1]
-        training_data = case_pieces[2][3:]  # remove "td_" prefix
-        data_normalization = "physics"  # Always using this for profile predictor
-
-        if len(case_pieces) == 4:
-            raise NotImplementedError(
-                "Don't have a case with 4 pieces, need to update the parsing logic if we want to add one"
-            )
-        elif len(case_pieces) == 5:
-            raise NotImplementedError(
-                "Don't have a case with 5 pieces, need to update the parsing logic if we want to add one"
-            )
-        elif len(case_pieces) == 6:
-            domain_adaptation = case_pieces[3][3:]  # remove "da_" prefix
-            freeze_shapes = (
-                case_pieces[4][7:] == "True"
-            )  # remove "freeze_" prefix and convert to bool
-            num_hp_shots = int(
-                case_pieces[5][3:]
-            )  # remove "hp_" prefix and convert to int
-        else:
-            raise ValueError(f"Unexpected case name format: {case_name}")
-
-        return ProfileStudy.Case(
-            model_type=model_type,
-            training_data=training_data,
-            data_normalization=data_normalization,
-            domain_adaptation=domain_adaptation,
-            freeze_shapes=freeze_shapes,
-            num_hp_shots=num_hp_shots,
-        )
 
     def _make_cases(self):
         cases = []
@@ -181,34 +147,8 @@ class TrajectoryOptimization:
 
         base_trajopt_config = TrainConfig.load(PROFILE_TRAJECTORY_OPTIMIZER_CONFIG)
 
-        def _make_profile_predictor_config(
-            case: ProfileStudy.Case, checkpoint_dir: str
-        ) -> TrainConfig:
-            profile_working_dir = os.path.dirname(checkpoint_dir)
-            hyperparam_case = case.get_hyperparam_prereq()
-            tuned_config_path = os.path.join(
-                profile_working_dir, str(hyperparam_case), "tuned_config.yaml"
-            )
-            if not os.path.exists(tuned_config_path):
-                raise FileNotFoundError(
-                    f"Tuned config not found for profile predictor case {case} at path {tuned_config_path}"
-                )
-
-            profile_predictor_config_base = TrainConfig.load(tuned_config_path)
-            if case.model_type != "unstructured_nn":
-                # TODO(ZanderKeith) for the shape_init models, need to update their dataloader config
-                # so the Te_shapes and ne_shapes get created properly
-                # For now, unstructured_nn just needs the model_init_config
-                raise NotImplementedError(
-                    f"Don't have logic to update the profile predictor config for model type {case.model_type}, need to implement that if we want to use something other than unstructured_nn"
-                )
-            else:
-                profile_predictor_config = profile_predictor_config_base
-
-            return profile_predictor_config
-
-        profile_predictor_config = _make_profile_predictor_config(
-            self.predictor_case, self.profile_module_checkpoint_dir
+        profile_predictor_config = checkpoint_to_profile_config(
+            self.profile_module_checkpoint_dir
         )
 
         # Special case because if we aren't changing density I want it to be exactly the same as the original shot,
