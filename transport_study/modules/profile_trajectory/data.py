@@ -68,8 +68,10 @@ def add_gapin_prog(ds: xr.Dataset) -> xr.Dataset:
     """
 
     smoothed_gapin = (
-        ds["gapin"].rolling(time_idx=100, center=False, min_periods=1).mean()
+        ds["gapin"].rolling(time_idx=100, center=False, min_periods=1).mean(skipna=True)
     )
+    # Fill leading/trailing NaNs (e.g. before EFIT is valid) by propagating nearest valid value
+    smoothed_gapin = smoothed_gapin.bfill("time_idx").ffill("time_idx")
     ds = ds.assign(gapin_prog=smoothed_gapin)
     return ds
 
@@ -126,6 +128,7 @@ def get_ds(
     ds["ne_shape"] = ds["ne20_psi"] / ds["ne20_line_avg"]
 
     ds = correct_B0_prog(ds)
+    ds = add_gapin_prog(ds)
 
     # Add a data variable for the trajectory time
     ds["traj_time"] = ds["time"].copy()

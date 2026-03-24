@@ -522,8 +522,12 @@ class D3DDataWorkflow(DataWorkflow):
         efit_result = self._get_efit_dataset(shot)
         efit_result = self._ensure_unique_time(efit_result, shot, "efit")
 
+        efit_max_ms = int(efit_result["time"].max().item() * 1e3)
         toksearch_result = self._toksearch_signals(
-            shot, max_time_ms=int(efit_result["time"].max().item() * 1e3)
+            shot,
+            max_time_ms=max(
+                efit_max_ms, 8000
+            ),  # extend to cover full programmed waveforms
         )
         toksearch_result = self._ensure_unique_time(toksearch_result, shot, "toksearch")
 
@@ -531,15 +535,12 @@ class D3DDataWorkflow(DataWorkflow):
         # samples are valid; fill on the native axis before aligning to EFIT.
         toksearch_result = toksearch_result.ffill("time")
 
-        # Put toksearch result on the same timebase as efit
-        toksearch_result = toksearch_result.reindex(
-            time=efit_result["time"], method="ffill"
-        )
-
+        # Merge with outer join so programmed waveforms beyond EFIT end are preserved.
+        # EFIT variables will be NaN after plasma termination, which is correct.
         result = xr.merge(
             [efit_result, toksearch_result],
             compat="override",
-            join="exact",
+            join="outer",
         )
 
         return result

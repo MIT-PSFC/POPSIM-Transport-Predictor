@@ -132,6 +132,7 @@ def characterize_dataset(ds_path: str = config.d3d_hp_dataset_path) -> None:
             ("betan_prog", "betan"),
             ("ne20_edge_prog", "ne20_edge"),
             ("R0_prog", "R0"),
+            ("gapin_prog", "gapin"),
             ("rxbot_prog", "rxbot"),
             ("zxbot_prog", "zxbot"),
             ("rxtop_prog", "rxtop"),

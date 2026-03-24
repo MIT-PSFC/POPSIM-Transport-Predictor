@@ -25,7 +25,6 @@ from transport_study.profile_transfer.restore_predictor import (
     restore_profile_predictor_from_checkpoint,
 )
 from transport_study.trajectory_optimization.setup_data import (
-    FEEDBACK_CONTROL_SHOTS,
     make_augmented_dataset,
 )
 
@@ -132,11 +131,11 @@ def run_preshot_prediction(  # noqa: PLR0915
 
     # Step 1: Make augmented dataset with perturbed inputs
     logger.info("Building augmented dataset with perturbed inputs")
-    ds_aug = make_augmented_dataset(ds_ref, shots_times=FEEDBACK_CONTROL_SHOTS)
+    ds_aug = make_augmented_dataset(ds_ref)
 
-    # Ensure no NaNs
+    # Ensure no NaNs in programmed variables after augmentation
     for var in ds_aug.data_vars:
-        if ds_aug[var].isnull().any():
+        if ds_aug[var].isnull().any() and var.endswith("_prog"):
             logger.critical(f"Variable {var} contains NaNs after augmentation!")
 
     # Step 2: Derive shape variables from programmed signals (matches PCSInputMapper logic)
