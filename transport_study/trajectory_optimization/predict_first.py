@@ -80,7 +80,12 @@ def run_preshot_prediction(  # noqa: PLR0915, PLR0912
     def _setup_directories(scratch_dir):
         working_dir = os.path.join(scratch_dir, "predict_first")
         shot_data_dir = os.path.join(working_dir, "raw_data")
-        result_dir = os.path.join(working_dir, f"shot_{targ_shot}")
+        result_dir = os.path.join(
+            working_dir,
+            f"ref_{ref_shot}",
+            f"targ_{targ_shot}",
+            f"{os.path.basename(profile_predictor_checkpoint_dir)}",
+        )
         os.makedirs(shot_data_dir, exist_ok=True)
         os.makedirs(result_dir, exist_ok=True)
         return working_dir, shot_data_dir, result_dir
