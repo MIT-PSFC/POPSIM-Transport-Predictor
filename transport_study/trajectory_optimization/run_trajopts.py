@@ -47,15 +47,10 @@ PROFILE_MODULES = [
     "shape_init_pca.cmod_tcv.physics.transfer.False.32",
     "shape_init_pca.cmod.physics.transfer.False.32",
     # Best on target shot compared to IDA
-    "shape_init_pca.tcv.transfer.False.-1",
-    "shape_init_pca.exnihilo.None.False.-1",
-    "shape_init_kmeans.cmod.mixing.True.32",
-    "shape_init_pca.cmod.transfer.False.32",
+    "shape_init_pca.tcv.physics.transfer.False.-1",
+    "shape_init_pca.exnihilo.physics..False.-1",
+    "shape_init_kmeans.cmod.physics.mixing.True.32",
 ]
-
-for i in range(len(PROFILE_MODULES)):
-    if "physics" not in PROFILE_MODULES[i]:
-        PROFILE_MODULES[i] = PROFILE_MODULES[i].replace("..", ".physics..")
 
 
 def _profile_module_to_checkpoint_dir(
