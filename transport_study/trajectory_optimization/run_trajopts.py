@@ -20,6 +20,7 @@ from transport_study.modules.profile_predictor.module import (
 from transport_study.modules.profile_trajectory.data import (
     add_gapin_prog,
     correct_B0_prog,
+    get_ds,
 )
 from transport_study.profile_transfer.restore_predictor import (
     restore_profile_predictor_from_checkpoint,
@@ -36,14 +37,14 @@ BACKGROUND_COLOR = "#2F2F2F"
 FACE_COLOR = "#1A1A1A"
 TEXT_COLOR = "white"
 
-MAX_NUM_TRAJ_TIMES = 2
+MAX_NUM_TRAJ_TIMES = 6
 Z_EFF = 1.5  # Typical Zeff for DIII-D H-mode plasmas, matching trb.py
 
 PROFILE_MODULES = [
     "shape_init_pca.cmod_tcv.physics.transfer.False.32",
     "shape_init_pca.cmod.physics.transfer.False.32",
-    # "unstructured_nn.cmod.physics..True.-1",
-    # "shape_init_kmeans.tcv.physics..True.-1",
+    "unstructured_nn.cmod.physics..True.-1",
+    "shape_init_kmeans.tcv.physics..True.-1",
 ]
 
 
@@ -225,20 +226,15 @@ def run_trajopts(
     profopt_models_dir: str,
 ):
     for profile_module in PROFILE_MODULES:
-        if config.debug:
-            trajopt_name = f"{profile_module}_debug"
-        else:
-            trajopt_name = profile_module
-
         run_trajectory_optimization(
-            trajopt_name=trajopt_name,
+            trajopt_name=profile_module,
             working_dir_base=working_dir_base,
             profile_module_checkpoint_dir=_profile_module_to_checkpoint_dir(
                 profile_module, profopt_models_dir
             ),
             traj_times=TRAJ_TIMES,
             max_num_traj_times=MAX_NUM_TRAJ_TIMES,
-            enable_parallelism=False,
+            enable_parallelism=True,
         )
 
 
@@ -255,7 +251,16 @@ def compare_trajopts(
     """
     shot_data_dir = os.path.join(config.scratch_dir, "predict_first", "raw_data")
     ds_ref_path = os.path.join(shot_data_dir, f"{config.ref_shot}.nc")
-    ds_ref_raw = get_traj_shot_data(config.ref_shot, ds_ref_path)
+    # Ensure the data file exists (fetches if needed), then load with the same
+    # windowing/resampling used by output_optimized_trajectory so that the
+    # saved trajectory waveforms (126 pts) match ds_ref's time dimension.
+    get_traj_shot_data(config.ref_shot, ds_ref_path)
+    ds_ref, _ = get_ds(
+        ds_ref_path,
+        selected_shots={config.ref_shot: {"start": 2.6, "end": 5.1}},
+        fresh_profiles=False,
+        debug=False,
+    )
 
     # metrics[profile_module][(num_traj_times, optimize_density)] = dict of scalars
     all_metrics: dict[str, dict[tuple, dict]] = {}
@@ -267,10 +272,8 @@ def compare_trajopts(
         )
         profile_predictor = restore_profile_predictor_from_checkpoint(checkpoint_dir)
 
-        if config.debug:
-            trajopt_name = f"{profile_module}_debug"
-        else:
-            trajopt_name = profile_module
+        # Mirror the debug-suffix logic from run_trajectory_optimization
+        trajopt_name = f"{profile_module}_debug" if config.debug else profile_module
 
         trajopt = TrajectoryOptimization(
             name=trajopt_name,
@@ -285,7 +288,7 @@ def compare_trajopts(
         # Baseline: programmed trajectory, no optimization
         logger.info("  baseline")
         module_metrics[(0, True)] = _compute_loss_metrics(
-            ds_ref_raw, profile_predictor, None
+            ds_ref, profile_predictor, None
         )
         module_metrics[(0, False)] = module_metrics[
             (0, True)
@@ -298,7 +301,7 @@ def compare_trajopts(
             logger.info(f"  {case}")
             output_dir = os.path.dirname(trajopt.output_path(case))
             module_metrics[(case.num_traj_times, case.optimize_density)] = (
-                _compute_loss_metrics(ds_ref_raw, profile_predictor, output_dir)
+                _compute_loss_metrics(ds_ref, profile_predictor, output_dir)
             )
 
         all_metrics[profile_module] = module_metrics
