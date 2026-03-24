@@ -113,7 +113,19 @@ def characterize_dataset(ds_path: str = config.d3d_hp_dataset_path) -> None:
 
     input_ranges = get_trajectory_input_ranges(
         ds_path,
-        ["ne20_edge", "R0", "gapin", "rxbot", "zxbot", "rxtop", "zxtop"],
+        [
+            "ne20_edge",
+            "R0",
+            "gapin",
+            "rxbot",
+            "zxbot",
+            "rxtop",
+            "zxtop",
+            "a_minor",
+            "kappa",
+            "delta_top",
+            "delta_bot",
+        ],
         shots_times=IP_RAMP_SHOTS,
     )
 

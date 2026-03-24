@@ -147,10 +147,10 @@ class TrajectoryOptimization:
         }
         # Soft limits on derived shape quantities (None = no bound on that side)
         derived_shape_ranges = {
-            "a_minor": (0.50, 0.65),  # Minor radius [m]
-            "kappa": (0, 2.1),  # Elongation
-            "delta_top": (0, 1.2),  # Upper triangularity
-            "delta_bot": (0, 1.2),  # Lower triangularity
+            "a_minor": (0.50, 0.61),  # Minor radius [m]
+            "kappa": (0.8, 1.9),  # Elongation (Max according to Siye)
+            "delta_top": (0.1, 0.98),  # Upper triangularity
+            "delta_bot": (0, 0.98),  # Lower triangularity
         }
 
         base_trajopt_config = TrainConfig.load(PROFILE_TRAJECTORY_OPTIMIZER_CONFIG)

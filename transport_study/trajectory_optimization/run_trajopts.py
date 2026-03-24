@@ -41,11 +41,21 @@ MAX_NUM_TRAJ_TIMES = 6
 Z_EFF = 1.5  # Typical Zeff for DIII-D H-mode plasmas, matching trb.py
 
 PROFILE_MODULES = [
-    "shape_init_pca.cmod_tcv.physics.transfer.False.32",
-    "shape_init_pca.cmod.physics.transfer.False.32",
+    # Best overall on historic data
     "unstructured_nn.cmod.physics..True.-1",
     "shape_init_kmeans.tcv.physics..True.-1",
+    "shape_init_pca.cmod_tcv.physics.transfer.False.32",
+    "shape_init_pca.cmod.physics.transfer.False.32",
+    # Best on target shot compared to IDA
+    "shape_init_pca.tcv.transfer.False.-1",
+    "shape_init_pca.exnihilo.None.False.-1",
+    "shape_init_kmeans.cmod.mixing.True.32",
+    "shape_init_pca.cmod.transfer.False.32",
 ]
+
+for i in range(len(PROFILE_MODULES)):
+    if "physics" not in PROFILE_MODULES[i]:
+        PROFILE_MODULES[i] = PROFILE_MODULES[i].replace("..", ".physics..")
 
 
 def _profile_module_to_checkpoint_dir(
@@ -316,6 +326,9 @@ def compare_trajopts(
 
 
 def _plot_comparison(all_metrics: dict, plot_dir: str):
+    from matplotlib import gridspec
+    from matplotlib.lines import Line2D
+
     loss_components = [
         ("total", "Total loss", "Loss"),
         ("peaking", "Pressure peaking factor", "P_max / P_avg"),
@@ -328,10 +341,18 @@ def _plot_comparison(all_metrics: dict, plot_dir: str):
     module_colors = {m: colors(i) for i, m in enumerate(PROFILE_MODULES)}
     linestyles = {True: "-", False: "--"}
 
-    fig, axes = plt.subplots(
-        1, len(loss_components), figsize=(5 * len(loss_components), 5)
-    )
+    n_metrics = len(loss_components)
+    fig = plt.figure(figsize=(5 * n_metrics + 3, 5))
     fig.patch.set_facecolor(BACKGROUND_COLOR)
+    gs = gridspec.GridSpec(
+        1,
+        n_metrics + 1,
+        width_ratios=[5] * n_metrics + [2.5],
+        figure=fig,
+        wspace=0.35,
+    )
+    axes = [fig.add_subplot(gs[0, i]) for i in range(n_metrics)]
+    legend_ax = fig.add_subplot(gs[0, -1])
 
     for ax, (key, title, ylabel) in zip(axes, loss_components, strict=True):
         ax.set_facecolor(FACE_COLOR)
@@ -352,11 +373,6 @@ def _plot_comparison(all_metrics: dict, plot_dir: str):
                             xs.append(n)
                             ys.append(metrics[key])
                 if xs:
-                    label = (
-                        f"{profile_module}\nod={optimize_density}"
-                        if key == "total"
-                        else None
-                    )
                     ax.plot(
                         xs,
                         ys,
@@ -365,21 +381,52 @@ def _plot_comparison(all_metrics: dict, plot_dir: str):
                         marker="o",
                         markersize=4,
                         linewidth=1.5,
-                        label=label,
                     )
 
-    # Single legend on the first axis
-    axes[0].legend(
-        fontsize=6,
-        facecolor=BACKGROUND_COLOR,
-        labelcolor=TEXT_COLOR,
-        edgecolor=TEXT_COLOR,
-        loc="upper right",
-    )
+    # Dedicated legend panel — no axes decoration
+    legend_ax.set_facecolor(FACE_COLOR)
+    for spine in legend_ax.spines.values():
+        spine.set_visible(False)
+    legend_ax.set_xticks([])
+    legend_ax.set_yticks([])
 
-    # Add line style legend for optimize_density
-    for ax in axes:
-        ax.axhline(y=ax.get_ylim()[0], color="none")  # force ylim computation
+    # Color handles: one per profile module (shortened to model_type.training_data)
+    module_handles = [
+        Line2D(
+            [0],
+            [0],
+            color=module_colors[m],
+            linewidth=2,
+            label=".".join(m.split(".")[:2]),
+        )
+        for m in PROFILE_MODULES
+        if m in all_metrics
+    ]
+    # Line style handles: solid = density optimized, dashed = density fixed
+    style_handles = [
+        Line2D(
+            [0], [0], color="white", linewidth=2, linestyle="-", label="density opt."
+        ),
+        Line2D(
+            [0], [0], color="white", linewidth=2, linestyle="--", label="density fixed"
+        ),
+    ]
+
+    # Blank separator
+    spacer = Line2D([], [], color="none", label="")
+
+    legend_ax.legend(
+        handles=[*module_handles, spacer, *style_handles],
+        loc="center",
+        fontsize=8,
+        facecolor=BACKGROUND_COLOR,
+        edgecolor=TEXT_COLOR,
+        labelcolor=TEXT_COLOR,
+        framealpha=0.9,
+        title="Profile module",
+        title_fontsize=9,
+    )
+    legend_ax.get_legend().get_title().set_color(TEXT_COLOR)
 
     fig.suptitle(
         f"Trajectory optimization comparison - ref shot {config.ref_shot}",
