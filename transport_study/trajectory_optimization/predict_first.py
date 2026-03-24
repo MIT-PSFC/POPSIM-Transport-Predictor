@@ -13,6 +13,7 @@ from loguru import logger
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
+from transport_study import PACKAGE_ROOT
 from transport_study.config import config
 from transport_study.datasets.d3d.d3d_dataset import INNER_WALL
 from transport_study.modules.profile_predictor.module import Inputs
@@ -882,11 +883,11 @@ def _make_profile_gif(  # noqa: PLR0915
 
 
 def _get_shot_data(shot: int, ds_path: str) -> xr.Dataset:
-    if not os.path.exists(ds_path):
-        data_assembly_dir = os.path.dirname(ds_path)
-        script_path = os.path.join(data_assembly_dir, f"fetch_{shot}.py")
-        shotlist_path = os.path.join(data_assembly_dir, f"{shot}_shotlist.txt")
+    data_assembly_dir = os.path.dirname(ds_path)
+    script_path = os.path.join(str(PACKAGE_ROOT), f"fetch_{shot}.py")
+    shotlist_path = os.path.join(data_assembly_dir, f"{shot}_shotlist.txt")
 
+    if not os.path.exists(ds_path):
         with open(shotlist_path, "w") as f:
             f.write(f"{shot}\n")
 
@@ -918,6 +919,11 @@ print("Done. Re-run predict_first.py.")
             f"See `transport_study/datasets/d3d/make_d3d_venv.sh` if you have not yet made a d3d-specific .venv"
         )
         sys.exit()
+
+    for tmp in (script_path, shotlist_path):
+        if os.path.exists(tmp):
+            os.remove(tmp)
+            logger.debug(f"Cleaned up temporary file {tmp}")
 
     logger.info(f"Loading shot {shot} data from {ds_path}")
     ds = xr.open_dataset(ds_path)
