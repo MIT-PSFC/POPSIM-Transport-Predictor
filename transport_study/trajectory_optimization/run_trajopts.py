@@ -42,10 +42,10 @@ Z_EFF = 1.5  # Typical Zeff for DIII-D H-mode plasmas, matching trb.py
 
 PROFILE_MODULES = [
     # Best overall on historic data
-    "unstructured_nn.cmod.physics..True.-1",
-    "shape_init_kmeans.tcv.physics..True.-1",
-    "shape_init_pca.cmod_tcv.physics.transfer.False.32",
-    "shape_init_pca.cmod.physics.transfer.False.32",
+    # "unstructured_nn.cmod.physics..True.-1",
+    # "shape_init_kmeans.tcv.physics..True.-1",
+    # "shape_init_pca.cmod_tcv.physics.transfer.False.32",
+    # "shape_init_pca.cmod.physics.transfer.False.32",
     # Best on target shot compared to IDA
     "shape_init_pca.tcv.physics.transfer.False.-1",
     "shape_init_pca.exnihilo.physics..False.-1",
@@ -177,6 +177,19 @@ def _compute_loss_metrics(  # noqa: PLR0915
 
     ne = np.array(ne_flat).reshape(n_shot_alt, n_time, -1)  # (shot_alt, time, psi)
     te = np.array(te_flat).reshape(n_shot_alt, n_time, -1)
+
+    ne_nan_frac = np.isnan(ne).mean()
+    if ne_nan_frac > 0.5:
+        label = (
+            f"optimized_trajectory_dir={optimized_trajectory_dir!r}"
+            if optimized_trajectory_dir
+            else "baseline"
+        )
+        logger.warning(
+            f"[_compute_loss_metrics] {ne_nan_frac:.1%} of ne predictions are NaN for {label}. "
+            "Loss metrics will be unreliable. This usually means the trajectory contains out-of-range "
+            "shape parameters — check gapin_opt values and derived shape bounds."
+        )
 
     # Compute q_star and fGW from ProfilePredictorInputs properties via scalar vmap
     q_star_flat = np.array(jax.vmap(lambda inp: inp.q_star)(inputs_batched))
