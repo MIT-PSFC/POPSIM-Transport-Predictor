@@ -47,7 +47,7 @@ BRIGHT_COLORS = [
 ]
 
 
-def run_preshot_prediction(  # noqa: PLR0915
+def run_preshot_prediction(  # noqa: PLR0915, PLR0912
     ref_shot: int,
     targ_shot: int | None,
     profile_predictor_checkpoint_dir: str,
@@ -129,7 +129,16 @@ def run_preshot_prediction(  # noqa: PLR0915
     if optimized_trajectory_checkpoint_dir is not None and "gapin_opt" in ds_traj:
         orig = ds_ref["gapin_prog"].load()
         new_vals = orig.copy()
-        new_vals.loc[{"shot": ref_shot}] = ds_traj["gapin_opt"].values
+        gapin_opt_vals = ds_traj["gapin_opt"].values.copy().astype(float)
+        # Fill any NaN edge values (float32/float64 mask mismatch in older saved files)
+        nan_mask = np.isnan(gapin_opt_vals)
+        if nan_mask.any():
+            valid_idxs = np.where(~nan_mask)[0]
+            if len(valid_idxs):
+                gapin_opt_vals[nan_mask] = np.interp(
+                    np.where(nan_mask)[0], valid_idxs, gapin_opt_vals[valid_idxs]
+                )
+        new_vals.loc[{"shot": ref_shot}] = gapin_opt_vals
         ds_ref = ds_ref.assign({"gapin_prog": new_vals})
     if targ_shot is not None:
         ds_targ = correct_B0_prog(ds_targ)

@@ -47,9 +47,9 @@ PROFILE_MODULES = [
     # "shape_init_pca.cmod_tcv.physics.transfer.False.32",
     # "shape_init_pca.cmod.physics.transfer.False.32",
     # Best on target shot compared to IDA
-    "shape_init_pca.tcv.physics.transfer.False.-1",
+    # "shape_init_pca.tcv.physics.transfer.False.-1",
     "shape_init_pca.exnihilo.physics..False.-1",
-    "shape_init_kmeans.cmod.physics.mixing.True.32",
+    # "shape_init_kmeans.cmod.physics.mixing.True.32",
 ]
 
 
@@ -128,7 +128,21 @@ def _compute_loss_metrics(  # noqa: PLR0915
     if optimized_trajectory_dir is not None and "gapin_opt" in ds_traj:
         orig = ds["gapin_prog"].load()
         new_vals = orig.copy()
-        new_vals.loc[{"shot": config.ref_shot}] = ds_traj["gapin_opt"].values
+        gapin_opt_vals = ds_traj["gapin_opt"].values.copy().astype(float)
+        # Back-fill then forward-fill any NaN edge values (float32/float64 mask
+        # mismatch in _build_opt_waveform can leave the first index as NaN in
+        # older saved trajectories)
+        nan_mask = np.isnan(gapin_opt_vals)
+        if nan_mask.any():
+            valid_idxs = np.where(~nan_mask)[0]
+            if len(valid_idxs):
+                fill = np.interp(
+                    np.arange(len(gapin_opt_vals)),
+                    valid_idxs,
+                    gapin_opt_vals[valid_idxs],
+                )
+                gapin_opt_vals[nan_mask] = fill[nan_mask]
+        new_vals.loc[{"shot": config.ref_shot}] = gapin_opt_vals
         ds = ds.assign({"gapin_prog": new_vals})
     ds_aug = make_augmented_dataset(ds)
 
@@ -249,6 +263,7 @@ def run_trajopts(
     working_dir_base: str,
     profopt_models_dir: str,
 ):
+    working_dir_base = os.path.join(working_dir_base, f"trajopt_{config.ref_shot}")
     for profile_module in PROFILE_MODULES:
         run_trajectory_optimization(
             trajopt_name=profile_module,
@@ -273,6 +288,7 @@ def compare_trajopts(
     All comparisons are made on the same augmented dataset (100 perturbed trajectories
     around the reference shot) to ensure a fair comparison.
     """
+    working_dir_base = os.path.join(working_dir_base, f"trajopt_{config.ref_shot}")
     shot_data_dir = os.path.join(config.scratch_dir, "predict_first", "raw_data")
     ds_ref_path = os.path.join(shot_data_dir, f"{config.ref_shot}.nc")
     # Ensure the data file exists (fetches if needed), then load with the same

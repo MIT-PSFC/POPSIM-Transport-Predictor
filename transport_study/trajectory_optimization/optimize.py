@@ -137,20 +137,20 @@ class TrajectoryOptimization:
         """
         # Informed by the dataset characterization and Jayson Barr
         control_input_ranges = {
-            "ne20_edge": (0.4, 0.55),  # Pedestal density [10^20 m^-3]
-            "R0": (1.63, 1.95),  # Major radius [m]
-            "gapin": (0.01, 0.12),  # Inner gap [m]
-            "rxpt1": (1.09, 1.29),  # Lower X-point R [m]
-            "zxpt1": (-1.25, -0.85),  # Lower X-point Z [m] (From Jayson Barr)
-            "rxpt2": (1.08, 1.25),  # Upper X-point R [m]
-            "zxpt2": (0.85, 1.25),  # Upper X-point Z [m]  (From Jayson Barr)
+            "ne20_edge": (0.47, 0.75),  # Pedestal density [10^20 m^-3]
+            "R0": (1.66, 1.69),  # Major radius [m]
+            "gapin": (0.025, 0.04),  # Inner gap [m]
+            "rxpt1": (1.1, 1.15),  # Lower X-point R [m]
+            "zxpt1": (-1.2, -1.15),  # Lower X-point Z [m] (From Jayson Barr)
+            "rxpt2": (1.1, 1.15),  # Upper X-point R [m]
+            "zxpt2": (1.1, 1.2),  # Upper X-point Z [m]  (From Jayson Barr)
         }
         # Soft limits on derived shape quantities (None = no bound on that side)
         derived_shape_ranges = {
-            "a_minor": (0.50, 0.61),  # Minor radius [m]
-            "kappa": (0.8, 2.0),  # Elongation (Max according to Siye and Arunav)
-            "delta_top": (None, 0.98),  # Upper triangularity
-            "delta_bot": (None, 0.98),  # Lower triangularity
+            "a_minor": (0.57, 0.61),  # Minor radius [m]
+            "kappa": (1.9, 2.0),  # Elongation (Max according to Siye and Arunav)
+            "delta_top": (0.9, 0.98),  # Upper triangularity
+            "delta_bot": (0.9, 0.98),  # Lower triangularity
         }
 
         base_trajopt_config = TrainConfig.load(PROFILE_TRAJECTORY_OPTIMIZER_CONFIG)
@@ -318,6 +318,7 @@ class TrajectoryOptimization:
                     "zxtop": np.array([r["zxpt2"] for r in resolved]),  # upper X-pt Z
                     "ne20_edge": np.array([r["ne20_edge"] for r in resolved]),
                     "input_ranges": module.config.input_ranges,
+                    "derived_shape_ranges": module.config.derived_shape_ranges,
                 }
             else:
                 logger.critical(
@@ -339,6 +340,7 @@ class TrajectoryOptimization:
         optimized_trajectory = _get_optimized_trajectory()
         traj_times = np.array(optimized_trajectory["time"])
         input_ranges = optimized_trajectory.get("input_ranges", {})
+        derived_shape_ranges = optimized_trajectory.get("derived_shape_ranges", {})
 
         # Derived shape quantities — replicates PCSInputMapper logic
         R0 = np.array(optimized_trajectory["R0"])
@@ -356,7 +358,9 @@ class TrajectoryOptimization:
             """Return a full waveform over shot_time: follows ds_shot[prog_sig] up to
             traj_times[0], then forward-fills opt_vals from that point onward."""
             base = ds_shot[prog_sig].values.copy().astype(float)
-            mask = shot_time >= traj_times[0]
+            # Cast to float64 to avoid float32 vs float64 precision mismatch
+            # (shot_time is float32; traj_times[0] is float64, so 2.6f32 < 2.6f64)
+            mask = shot_time.astype(np.float64) >= traj_times[0]
             if mask.any():
                 idx = np.clip(
                     np.searchsorted(traj_times, shot_time[mask], side="right") - 1,
@@ -412,6 +416,7 @@ class TrajectoryOptimization:
             attrs={
                 "description": f"Optimized trajectory for DIII-D reference shot {config.ref_shot}",
                 "case": str(case),
+                "traj_times": list(traj_times),
             },
         )
 
@@ -662,6 +667,16 @@ class TrajectoryOptimization:
                         label="upper bound",
                     )
 
+            # Expand y-limits to include bounds if provided, with 10% padding
+            if lb is not None or ub is not None:
+                ymin, ymax = ax.get_ylim()
+                if lb is not None:
+                    ymin = min(ymin, lb)
+                if ub is not None:
+                    ymax = max(ymax, ub)
+                pad = 0.1 * (ymax - ymin) if ymax > ymin else 0.1 * abs(ymax)
+                ax.set_ylim(ymin - pad, ymax + pad)
+
             full_title = title + (f"\n[{pcs_name}]" if pcs_name else "")
             _style(ax, full_title, ylabel)
             ax.legend(
@@ -734,6 +749,8 @@ class TrajectoryOptimization:
             r"$a$ [m]",
             "derived",
             prog_vals=a_minor_prog,
+            lb=derived_shape_ranges.get("a_minor", (None, None))[0],
+            ub=derived_shape_ranges.get("a_minor", (None, None))[1],
         )
         _plot_signal(
             axes[2, 1],
@@ -743,6 +760,8 @@ class TrajectoryOptimization:
             r"$\kappa$",
             "derived",
             prog_vals=kappa_prog,
+            lb=derived_shape_ranges.get("kappa", (None, None))[0],
+            ub=derived_shape_ranges.get("kappa", (None, None))[1],
         )
         _plot_signal(
             axes[3, 1],
@@ -752,6 +771,8 @@ class TrajectoryOptimization:
             r"$\delta_{top}$",
             "derived",
             prog_vals=delta_top_prog,
+            lb=derived_shape_ranges.get("delta_top", (None, None))[0],
+            ub=derived_shape_ranges.get("delta_top", (None, None))[1],
         )
         _plot_signal(
             axes[4, 1],
@@ -761,6 +782,8 @@ class TrajectoryOptimization:
             r"$\delta_{bot}$",
             "derived",
             prog_vals=delta_bot_prog,
+            lb=derived_shape_ranges.get("delta_bot", (None, None))[0],
+            ub=derived_shape_ranges.get("delta_bot", (None, None))[1],
         )
 
         # column 3: gapin (suggested), rxbot, zxbot, rxtop, zxtop
