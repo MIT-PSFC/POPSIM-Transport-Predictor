@@ -92,6 +92,7 @@ class ProfileTrajectoryOptimizerTRB(TrainRunBuilder):
         config = ProfileTrajectoryOptimizer.Config(
             traj_times=jnp.asarray(model_init_config["traj_times"]),
             input_ranges=model_init_config["input_ranges"],
+            derived_shape_ranges=model_init_config.get("derived_shape_ranges", {}),
         )
 
         profile_predictor = restore_profile_predictor(
@@ -200,7 +201,7 @@ class ProfileTrajectoryOptimizerTRB(TrainRunBuilder):
             # 4. Soft Greenwald limit: penalize fGW approaching 1.5
             gw_loss = jax.nn.softplus(10.0 * (pred.fGW - 1.3))
 
-            return 3.0 * peaking + q_loss + nu_loss + 0.5 * gw_loss
+            return 3.0 * peaking + q_loss + nu_loss + 0.5 * gw_loss + pred.shape_penalty
 
         return IntegralLoss(loss_fn, nan_strategy="zero")
 

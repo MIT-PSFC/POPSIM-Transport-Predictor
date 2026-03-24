@@ -1,5 +1,6 @@
 import chex
 import equinox as eqx
+import jax
 import jax.numpy as jnp
 from jaxtyping import Array, ArrayLike
 from popsim import TimeDepModule
@@ -85,6 +86,9 @@ class ProfileTrajectoryOptimizer(TimeDepModule):
         input_ranges: dict[
             str, tuple[float, float]
         ]  # The ranges for the input parameters during the trajectory
+        derived_shape_ranges: dict[
+            str, tuple[float | None, float | None]
+        ]  # Optional bounds on derived shape quantities: a_minor, kappa, delta_top, delta_bot
 
     @chex.dataclass
     class State:
@@ -108,6 +112,7 @@ class ProfileTrajectoryOptimizer(TimeDepModule):
         q_star: float  # Edge safety factor proxy for q_min [~]
         fGW: float  # Greenwald density fraction [~]
         R0: float  # Major radius [m], needed for effective collisionality
+        shape_penalty: float  # Soft penalty for derived shape quantities exceeding derived_shape_ranges
 
     def __init__(
         self,
@@ -239,6 +244,27 @@ class ProfileTrajectoryOptimizer(TimeDepModule):
         # Get the output from the profile predictor
         profile_predictor_output = self.profile_predictor(profile_predictor_input)
 
+        # Soft penalties for derived shape quantities that exceed their bounds.
+        # Same softplus approach as gw_loss — high sharpness approximates a hard wall.
+        _SHAPE_SHARPNESS = 10.0
+        derived_vals = {
+            "a_minor": pcs_inputs.a_minor,
+            "kappa": pcs_inputs.kappa,
+            "delta_top": pcs_inputs.delta_top,
+            "delta_bot": pcs_inputs.delta_bot,
+        }
+        shape_penalty = jnp.zeros(())
+        for name, (lo, hi) in self.config.derived_shape_ranges.items():
+            val = derived_vals[name]
+            if lo is not None:
+                shape_penalty = shape_penalty + jax.nn.softplus(
+                    _SHAPE_SHARPNESS * (lo - val)
+                )
+            if hi is not None:
+                shape_penalty = shape_penalty + jax.nn.softplus(
+                    _SHAPE_SHARPNESS * (val - hi)
+                )
+
         # Create the output for this module
         output = ProfileTrajectoryOptimizer.Output(
             profile_predictor_output=profile_predictor_output,
@@ -246,6 +272,7 @@ class ProfileTrajectoryOptimizer(TimeDepModule):
             q_star=profile_predictor_input.q_star,
             fGW=profile_predictor_input.fGW,
             R0=targ_dict["R0"],
+            shape_penalty=shape_penalty,
         )
 
         # New dummy state

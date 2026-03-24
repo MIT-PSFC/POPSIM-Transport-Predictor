@@ -145,6 +145,13 @@ class TrajectoryOptimization:
             "rxpt2": (1.08, 1.25),  # Upper X-point R [m]
             "zxpt2": (0.85, 1.25),  # Upper X-point Z [m]  (From Jayson Barr)
         }
+        # Soft limits on derived shape quantities (None = no bound on that side)
+        derived_shape_ranges = {
+            "a_minor": (0.50, 0.65),  # Minor radius [m]
+            "kappa": (0, 2.1),  # Elongation
+            "delta_top": (0, 1.2),  # Upper triangularity
+            "delta_bot": (0, 1.2),  # Lower triangularity
+        }
 
         base_trajopt_config = TrainConfig.load(PROFILE_TRAJECTORY_OPTIMIZER_CONFIG)
 
@@ -169,6 +176,7 @@ class TrajectoryOptimization:
                 "model_init_config": {
                     **base_trajopt_config.model_init_config,
                     "input_ranges": control_input_ranges,
+                    "derived_shape_ranges": derived_shape_ranges,
                     "traj_times": traj_times,
                     "optimize_density": case.optimize_density,
                     "submodules": {

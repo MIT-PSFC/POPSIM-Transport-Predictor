@@ -74,10 +74,11 @@ def evaluate_checkpoint(checkpoint_dir: str, ds_valid: xr.Dataset) -> dict | Non
         )
         return None
 
-    # Use dataset psi_n grid so predictions land on the same grid as targets.
-    psi_n = ds_valid["psi_n"].values  # (n_psi,)
+    # Predictor evaluates on its own psigrid; targets must be interpolated onto it.
+    psi_pred = np.array(predictor.psigrid)  # (n_pred_psi,)
+    psi_ds = ds_valid["psi_n"].values  # (n_ds_psi,)
     n_ts = ds_valid.sizes["time_idx"]
-    psi_tiled = jnp.tile(jnp.array(psi_n), (n_ts, 1))
+    psi_tiled = jnp.tile(jnp.array(psi_pred), (n_ts, 1))
 
     inputs_batched = Inputs(
         Ip=jnp.array(ds_valid["Ip_MA"].values),
@@ -104,18 +105,25 @@ def evaluate_checkpoint(checkpoint_dir: str, ds_valid: xr.Dataset) -> dict | Non
         )
         return None
 
-    ne_pred = np.array(ne_pred)  # (n_ts, n_psi)
+    ne_pred = np.array(ne_pred)  # (n_ts, n_pred_psi)
     te_pred = np.array(te_pred)
 
-    ne_targ = ds_valid["ne20_psi"].values  # (n_ts, n_psi)
-    te_targ = ds_valid["Te_keV_psi"].values
+    # Interpolate IDA targets from dataset psi grid onto predictor psigrid
+    ne_targ_raw = ds_valid["ne20_psi"].values  # (n_ts, n_ds_psi)
+    te_targ_raw = ds_valid["Te_keV_psi"].values
+    ne_targ = np.stack(
+        [np.interp(psi_pred, psi_ds, ne_targ_raw[i]) for i in range(n_ts)]
+    )
+    te_targ = np.stack(
+        [np.interp(psi_pred, psi_ds, te_targ_raw[i]) for i in range(n_ts)]
+    )
 
     # Psi-integrated relative error per timeslice
     ne_err_rel = np.trapezoid(
-        np.abs(ne_pred - ne_targ) / (np.abs(ne_targ) + 0.1), psi_n, axis=-1
+        np.abs(ne_pred - ne_targ) / (np.abs(ne_targ) + 0.1), psi_pred, axis=-1
     )
     te_err_rel = np.trapezoid(
-        np.abs(te_pred - te_targ) / (np.abs(te_targ) + 0.1), psi_n, axis=-1
+        np.abs(te_pred - te_targ) / (np.abs(te_targ) + 0.1), psi_pred, axis=-1
     )
     err_rel_ts = 0.5 * (ne_err_rel + te_err_rel)
 
