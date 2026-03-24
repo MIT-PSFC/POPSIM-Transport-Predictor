@@ -37,7 +37,7 @@ REQUIRED_SIGNALS = [
     # Target profiles for the loss function
     "ne20_psi",
     "Te_keV_psi",
-    "fresh_profiles",
+    # "fresh_profiles",
 ]
 
 
@@ -53,7 +53,9 @@ def correct_B0_prog(ds: xr.Dataset) -> xr.Dataset:
     This means we avoid having to deal with weird edge cases in the dataset where the programmed B0 is completely wrong,
     and we can still capture the typical noise in the B0 signal that the predictor will have to deal with
     """
-    smoothed_B0 = ds["B0"].rolling(time_idx=100, center=False, min_periods=1).mean()
+    smoothed_B0 = (
+        ds["B0"].rolling(time_idx=100, center=False, min_periods=1).mean(skipna=True)
+    )
     ds = ds.assign(B0_prog=smoothed_B0)
     return ds
 
@@ -110,12 +112,11 @@ def get_ds(
 
     if fresh_profiles:
         ds = ds.where(ds["fresh_profiles"] == 1, drop=True)
-    elif debug:
-        # Resample at lower time resolution to speed up training (only every 100 ms)
-        ds = ds.sel(time_idx=ds["time_idx"].values[::100])
 
-    # Limit to required signals
-    ds = ds[REQUIRED_SIGNALS]
+    # Resample at every 20 ms to reduce dataset size and speed up training
+    # since our inputs change relatively slowly
+    # we don't need super high time resolution for the trajectory optimization
+    ds = ds.sel(time_idx=ds["time_idx"].values[::20])
 
     # Put dataset on an even psi grid [0, 1]
     psi_n_grid = np.linspace(0, 1.0, 51)

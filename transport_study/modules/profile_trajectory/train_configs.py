@@ -27,6 +27,7 @@ PROFILE_TRAJECTORY_OPTIMIZER_CONFIG = {
             "betan_prog",
             "ne20_edge_prog",
             "R0_prog",
+            "gapin_prog",
             "rxbot_prog",
             "zxbot_prog",
             "rxtop_prog",
@@ -34,13 +35,6 @@ PROFILE_TRAJECTORY_OPTIMIZER_CONFIG = {
             "traj_time",  # Time is needed to know which point on the trajectory we're at
         ],
         "target_vars": [],  # Trajectory optimization doesn't have traditional targets, since it optimizes directly on the profile predictor's outputs
-        "extra_vars": [
-            "ne20_psi",
-            "Te_keV_psi",
-            "ne_shape",
-            "Te_shape",
-            "fresh_profiles",
-        ],  # For easy comparison at the end and to pass the psi coord to the profile_predictor submodule
         "convert_xr_to_jnp": False,
         "prng_seed": 42,
         # Segment should be the full shot every time, to get the full trajectory
@@ -65,12 +59,11 @@ PROFILE_TRAJECTORY_OPTIMIZER_CONFIG = {
     },
     "loss_config": {
         "huber_delta": 0.1,
-        "time_penalty": 1.0,  # Penalty to avoid trajectory shapes changing too much between timesteps
     },
     "optimizer_config": {
         "lr0": 1e-3,
-        "transition_steps": 500,
-        "decay_rate": 0.5,
+        "transition_steps": 10000,
+        "decay_rate": 0.95,
         "lrf": 5e-4,
         "weight_decay": 2e-4,
     },

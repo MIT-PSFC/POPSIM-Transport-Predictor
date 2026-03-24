@@ -1,3 +1,4 @@
+import os
 from collections.abc import Callable
 from typing import Any
 
@@ -39,13 +40,24 @@ class ProfileTrajectoryOptimizerTRB(TrainRunBuilder):
         while trajectory optimization gets two identical time-dependent dataloaders with a lot of augmented traces
         """
         if dataloader_config.get("module") == "profile_trajectory":
-            ds, _ = get_ds(
-                dataloader_config["ds_path"],
-                fresh_profiles=False,  # Use all timesteps for trajectory optimization
+            ds_ref_dir = os.path.join(
+                dataloader_config["scratch_dir"], "predict_first", "raw_data"
+            )
+            ds_ref, _ = get_ds(
+                os.path.join(ds_ref_dir, f"{dataloader_config['ref_shot']}.nc"),
+                selected_shots={
+                    # TODO(ZanderKeith) make this not hardcoded
+                    dataloader_config["ref_shot"]: {
+                        "start": 2.6,
+                        "end": 5.1,
+                    }
+                },
+                fresh_profiles=False,
                 debug=dataloader_config["debug"],
             )
+
             ds_aug = make_augmented_dataset(
-                ds=ds,
+                ds=ds_ref,
                 debug=dataloader_config["debug"],
                 prng_seed=dataloader_config["prng_seed"],
             )
@@ -75,7 +87,6 @@ class ProfileTrajectoryOptimizerTRB(TrainRunBuilder):
     @staticmethod
     def model_init(train_dl: DataLoader, model_init_config: dict) -> Any:
         """Initialize the model to be trained"""
-        psigrid = jnp.asarray(train_dl.ds["psi_n"].data)
         submodule_configs = model_init_config["submodules"]
 
         config = ProfileTrajectoryOptimizer.Config(
@@ -87,36 +98,39 @@ class ProfileTrajectoryOptimizerTRB(TrainRunBuilder):
             load_dict(submodule_configs["profile_predictor"])
         )
 
-        # If we aren't optimizing density, fill in the trajectory with the programmed points
-        # TODO(ZanderKeith): I suppose this only works when we're sweeping on one shot.
-        if not model_init_config.get("optimize_density", False):
-            # Use the first sample's time array to look up values by nearest index,
-            # since the time coordinate is 2D after make_augmented_dataset and cannot be used with .sel().
-            meta = train_dl.dataset.training_metadata
-            sample_dim = meta.sample_dim
-            time_dim = meta.time_dep_metadata.time_dim
-            ds_first = train_dl.ds.isel({sample_dim: 0})
-            time_arr = (
-                ds_first["time"].values
-                if "time" in ds_first
-                else ds_first[time_dim].values
+        # Seed all trajectory variables from the programmed waveforms of sample 0.
+        # Use nearest-index lookup since the time coordinate is 2D after make_augmented_dataset.
+        meta = train_dl.dataset.training_metadata
+        sample_dim = meta.sample_dim
+        time_dim = meta.time_dep_metadata.time_dim
+        ds_first = train_dl.ds.isel({sample_dim: 0})
+        time_arr = (
+            ds_first["time"].values if "time" in ds_first else ds_first[time_dim].values
+        )
+
+        def _at_traj_times(sig_name: str) -> jnp.ndarray:
+            arr = ds_first[sig_name].values
+            return jnp.array(
+                [
+                    arr[int(np.argmin(np.abs(time_arr - float(t))))]
+                    for t in config.traj_times
+                ]
             )
-            ne20_arr = ds_first["ne20_edge_prog"].values
-            trajectory = {
-                "ne20_edge": jnp.array(
-                    [
-                        ne20_arr[int(np.argmin(np.abs(time_arr - float(t))))]
-                        for t in config.traj_times
-                    ]
-                ),
-            }
-        else:
-            trajectory = None
+
+        trajectory = {
+            "R0": _at_traj_times("R0_prog"),
+            "gapin": _at_traj_times("gapin_prog"),
+            "rxpt1": _at_traj_times("rxbot_prog"),
+            "zxpt1": _at_traj_times("zxbot_prog"),
+            "rxpt2": _at_traj_times("rxtop_prog"),
+            "zxpt2": _at_traj_times("zxtop_prog"),
+            "ne20_edge": _at_traj_times("ne20_edge_prog"),
+        }
 
         module = ProfileTrajectoryOptimizer.init(
             config=config,
             profile_predictor=profile_predictor,
-            psigrid=psigrid,
+            psigrid=profile_predictor.psigrid,
             trajectory=trajectory,
         )
 

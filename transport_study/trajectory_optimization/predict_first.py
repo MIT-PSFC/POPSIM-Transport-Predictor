@@ -90,9 +90,9 @@ def run_preshot_prediction(  # noqa: PLR0915
     # Get trajectories and profiles if they are not already saved in the shot_data_dir
     if targ_shot is not None:
         ds_target_path = os.path.join(shot_data_dir, f"{targ_shot}.nc")
-        ds_targ = _get_shot_data(targ_shot, ds_target_path)
+        ds_targ = get_traj_shot_data(targ_shot, ds_target_path)
     ds_ref_path = os.path.join(shot_data_dir, f"{ref_shot}.nc")
-    ds_ref = _get_shot_data(ref_shot, ds_ref_path)
+    ds_ref = get_traj_shot_data(ref_shot, ds_ref_path)
 
     # Step 0: Overwrite programmed trajectory if an optimized trajectory is provided
     if optimized_trajectory_checkpoint_dir is not None:
@@ -952,7 +952,7 @@ def _make_profile_gif(  # noqa: PLR0915, PLR0912
     logger.info(f"Saved profile GIF to {gif_path}")
 
 
-def _get_shot_data(shot: int, ds_path: str) -> xr.Dataset:
+def get_traj_shot_data(shot: int, ds_path: str) -> xr.Dataset:
     raw_data_dir = os.path.dirname(ds_path)
     working_dir = os.path.dirname(raw_data_dir)
     script_path = os.path.join(os.path.dirname(PACKAGE_ROOT), f"fetch_{shot}.py")

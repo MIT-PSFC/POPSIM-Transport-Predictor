@@ -66,7 +66,7 @@ class ProfileTrajectoryOptimizer(TimeDepModule):
 
     # These are the things that we can control over time
     # Note that the PCS needs to be in the proper control mode for these to actually line up
-    # in shot 201927, they do
+    # in shots 201927 and 206364, they do
     R0: Array  # Major radius [m]
     gapin: Array  # Inner gap [m]
     rxpt1: Array  # Bottom X-point R [m]
@@ -261,10 +261,13 @@ class ProfileTrajectoryOptimizer(TimeDepModule):
         psigrid: Array,
         trajectory: dict[str, Array] | None = None,
     ):
+        if not isinstance(psigrid, tuple):
+            psigrid = tuple(psigrid.tolist())
+
         return cls(
             config=config,
             profile_predictor=profile_predictor,
-            psigrid=tuple(psigrid.tolist()),
+            psigrid=psigrid,
             trajectory=trajectory,
         )
 

@@ -20,7 +20,6 @@ for i, shotlist_file in enumerate(HP_SHOTLIST_FILES):
         shot_numbers = [int(line.strip()) for line in lines if line.strip().isdigit()]
     sd[i] = shot_numbers
 
-# Our target shot is 201927
 HP_SHOTLIST = sorted(set().union(*sd.values()))
 
 D3D_DATASET_SIGNALS = [

@@ -12,6 +12,7 @@ from popsim.ml.train_config import TrainConfig
 from popsim.modules.transport_predictor.train_configs import update_submodule_configs
 
 from transport_study.config import config
+from transport_study.modules.profile_trajectory.data import get_ds
 from transport_study.modules.profile_trajectory.train_configs import (
     PROFILE_TRAJECTORY_OPTIMIZER_CONFIG,
 )
@@ -21,21 +22,21 @@ from transport_study.orchestration.slurm_utils import (
     resources_available,
 )
 from transport_study.profile_transfer.restore_predictor import (
+    checkpoint_to_profile_case,
     checkpoint_to_profile_config,
 )
 
-# These times are informed by our reference shot 201927
-# At most 8 trajectory points to plug in by hand
+# These times are informed by our reference shot
+# At most 6 trajectory points to plug in by hand
 TRAJ_TIMES = [
-    2.1,
     2.6,
-    3.0,
-    3.5,
-    4.0,
-    4.5,
-    5.0,
-    5.5,
+    3.1,
+    3.6,
+    4.1,
+    4.6,
+    5.1,
 ]
+FINAL_TIME = 5.5  # Ip rampdown starts here
 import xarray as xr
 
 from transport_study.datasets.d3d.d3d_dataset import INNER_WALL
@@ -90,7 +91,7 @@ class TrajectoryOptimization:
 
         self.working_dir = os.path.join(working_dir_base, name)
         os.makedirs(self.working_dir, exist_ok=True)
-        self.predictor_case = self._path_to_profile_case(profile_module_checkpoint_dir)
+        self.predictor_case = checkpoint_to_profile_case(profile_module_checkpoint_dir)
         self.cases = self._make_cases()
 
     ###########################
@@ -136,7 +137,7 @@ class TrajectoryOptimization:
         """
         # Informed by the dataset characterization and Jayson Barr
         control_input_ranges = {
-            "ne20_edge": (0.3, 0.4),  # Pedestal density [10^20 m^-3]
+            "ne20_edge": (0.4, 0.55),  # Pedestal density [10^20 m^-3]
             "R0": (1.63, 1.95),  # Major radius [m]
             "gapin": (0.01, 0.12),  # Inner gap [m]
             "rxpt1": (1.09, 1.29),  # Lower X-point R [m]
@@ -151,13 +152,7 @@ class TrajectoryOptimization:
             self.profile_module_checkpoint_dir
         )
 
-        # Special case because if we aren't changing density I want it to be exactly the same as the original shot,
-        # and dstdenp is fixed after t = 2.5s
-        if case.num_traj_times == 1 and self.traj_times == TRAJ_TIMES:
-            traj_times = [self.traj_times[1]]
-        else:
-            traj_times = self.traj_times[: case.num_traj_times]
-
+        traj_times = self.traj_times[: case.num_traj_times]
         trajopt_config = base_trajopt_config.model_copy(
             update={
                 "max_epochs": config.max_epochs,
@@ -166,7 +161,9 @@ class TrajectoryOptimization:
                 "checkpoint_dir": self.checkpoint_dir(case),
                 "dataloader_config": {
                     **base_trajopt_config.dataloader_config,
-                    "ds_path": config.d3d_hp_dataset_path,
+                    "ds_path": config.d3d_hp_dataset_path,  # Needed for profile predictor submodule
+                    "ref_shot": config.ref_shot,  # The shot we are basing our optimization on
+                    "scratch_dir": config.scratch_dir,
                     "debug": config.debug,
                 },
                 "model_init_config": {
@@ -212,7 +209,7 @@ class TrajectoryOptimization:
     def output_optimized_trajectory(self, case: Case):  # noqa: PLR0915
         """Output the optimized trajectory as a dataset and as an instruction set to give to DIII-D physics operator
 
-        Taken directly from 201927:
+        Taken directly from reference shot:
         iptipp (plasma current [A])
         bttbt (toroidal magnetic field [T])
         bmtpwrtar (normalized plasma beta) <- MAKE IT CLEAR THIS IS BETAN
@@ -235,7 +232,7 @@ class TrajectoryOptimization:
         Output a text file with a human readable instruction set for the physics operator,
 
         The format should be something like a big paragraph that says
-        "Reproducing shot 201927.
+        "Reproducing shot {config.ref_shot}.
         Ensure the control system is in the following mode:
         betan control
         (I'll fill this in later)
@@ -263,8 +260,20 @@ class TrajectoryOptimization:
             ProfileTrajectoryOptimizerTRB,
         )
 
-        ds_orig = xr.open_dataset(config.d3d_hp_dataset_path)
-        ds_shot = ds_orig.sel(shot=201927)
+        ds_ref_dir = os.path.join(config.scratch_dir, "predict_first", "raw_data")
+        ds_ref, _ = get_ds(
+            os.path.join(ds_ref_dir, f"{config.ref_shot}.nc"),
+            selected_shots={
+                # TODO(ZanderKeith) make this not hardcoded
+                config.ref_shot: {
+                    "start": 2.6,
+                    "end": 5.1,
+                }
+            },
+            fresh_profiles=False,
+            debug=config.debug,
+        )
+        ds_shot = ds_ref.sel(shot=config.ref_shot)
         shot_time = ds_shot["time"].values  # 1-D time array [s] indexed by time_idx
 
         def _get_optimized_trajectory():
@@ -273,10 +282,7 @@ class TrajectoryOptimization:
             checkpoint_dir = self.checkpoint_dir(case)
 
             # Replicate the traj_times selection logic from setup_optimization_config
-            if case.num_traj_times == 1 and self.traj_times == TRAJ_TIMES:
-                traj_times = np.array([self.traj_times[1]])
-            else:
-                traj_times = np.array(self.traj_times[: case.num_traj_times])
+            traj_times = np.array(self.traj_times[: case.num_traj_times])
 
             if os.path.exists(checkpoint_dir):
                 trajopt_config = self.setup_optimization_config(case)
@@ -374,13 +380,13 @@ class TrajectoryOptimization:
             {
                 "iptipp": _var(
                     ds_shot["Ip_MA_prog"].values * 1e6
-                ),  # [A]            — unchanged from 201927
+                ),  # [A]            — unchanged from ref
                 "bttbt": _var(
                     ds_shot["B0_prog"].values
-                ),  # [T]            — unchanged from 201927
+                ),  # [T]            — unchanged from ref
                 "bmtpwrtar": _var(
                     ds_shot["betan_prog"].values
-                ),  #                — unchanged from 201927
+                ),  #                — unchanged from ref
                 "dstdenp": _var(ne20_wave * 10),  # [10^19 m^-3]
                 "idtrp": _var(R0_wave),  # [m]
                 "gapin_opt": _var(
@@ -396,7 +402,7 @@ class TrajectoryOptimization:
                 "time": ("time_idx", shot_time),
             },
             attrs={
-                "description": "Optimized trajectory for DIII-D reference shot 201927",
+                "description": f"Optimized trajectory for DIII-D reference shot {config.ref_shot}",
                 "case": str(case),
             },
         )
@@ -414,7 +420,7 @@ class TrajectoryOptimization:
         instruction_path = os.path.join(output_dir, "instructions.txt")
         with open(instruction_path, "w") as f:
             f.write("TRAJECTORY OPTIMIZATION PHYSICS OPERATOR INSTRUCTIONS\n")
-            f.write("Reproducing shot 201927\n\n")
+            f.write(f"Reproducing shot {config.ref_shot}\n\n")
             f.write("Ensure the control system is in the following mode:\n")
             f.write("  - Betan control (bmtpwrtar waveform follows betanf)\n")
             f.write(
@@ -424,11 +430,11 @@ class TrajectoryOptimization:
                 "  - X-point shape control (idtrxbot, idtzxbot, idtrxtop, idtzxtop)\n\n"
             )
             f.write(
-                "The following signals are UNCHANGED from shot 201927\n"
-                "and should be programmed identically:\n"
-                "  iptipp    — programmed plasma current [A]\n"
-                "  bttbt     — programmed toroidal field [T]\n"
-                "  bmtpwrtar — programmed normalized beta\n\n"
+                f"The following signals are UNCHANGED from shot {config.ref_shot}\n"
+                f"and should be programmed identically:\n"
+                f"  iptipp    — programmed plasma current [A]\n"
+                f"  bttbt     — programmed toroidal field [T]\n"
+                f"  bmtpwrtar — programmed normalized beta\n\n"
             )
             f.write(
                 "Optimized control waveform updates.\n"
@@ -524,7 +530,7 @@ class TrajectoryOptimization:
         fig, axes = plt.subplots(5, 3, figsize=(18, 20))
         fig.patch.set_facecolor(BACKGROUND_COLOR)
         fig.suptitle(
-            f"Trajectory: 201927 original vs optimized\n{case}",
+            f"Trajectory: {config.ref_shot} original vs optimized\n{case}",
             color=TEXT_COLOR,
             fontsize=13,
             y=0.98,
@@ -564,7 +570,7 @@ class TrajectoryOptimization:
                     prog_vals[prog_valid],
                     color=ORIG_COLOR,
                     linewidth=1.2,
-                    label="201927 prog",
+                    label=f"{config.ref_shot} prog",
                     alpha=0.85,
                 )
                 meas = ds_shot[orig_sig].values
@@ -575,7 +581,7 @@ class TrajectoryOptimization:
                     color=MEAS_COLOR,
                     linewidth=1.0,
                     linestyle=":",
-                    label="201927 meas",
+                    label=f"{config.ref_shot} meas",
                     alpha=0.8,
                 )
                 base = prog_vals
@@ -587,7 +593,7 @@ class TrajectoryOptimization:
                     orig[valid],
                     color=ORIG_COLOR,
                     linewidth=1.2,
-                    label="201927 prog",
+                    label=f"{config.ref_shot} prog",
                     alpha=0.85,
                 )
                 if measured_sig is not None:
@@ -599,7 +605,7 @@ class TrajectoryOptimization:
                         color=MEAS_COLOR,
                         linewidth=1.0,
                         linestyle=":",
-                        label="201927 meas",
+                        label=f"{config.ref_shot} meas",
                         alpha=0.8,
                     )
                 base = orig

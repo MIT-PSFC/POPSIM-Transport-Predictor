@@ -59,7 +59,10 @@ def checkpoint_to_profile_config(checkpoint_dir: str) -> TrainConfig:
             f"Tuned config not found for profile predictor case {case} at path {tuned_config_path}"
         )
     profile_predictor_config = TrainConfig.load(tuned_config_path)
-
+    # Make sure the checkpoint_dir in the config matches the one we're trying to restore from
+    profile_predictor_config = profile_predictor_config.model_copy(
+        update={"checkpoint_dir": checkpoint_dir}
+    )
     return profile_predictor_config
 
 

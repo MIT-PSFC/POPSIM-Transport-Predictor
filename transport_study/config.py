@@ -72,6 +72,8 @@ class StudyConfig(BaseSettings):
     cmod: dict = {}  # noqa: RUF012
     tcv: dict = {}  # noqa: RUF012
 
+    ref_shot: int = 206364
+
     model_config = SettingsConfigDict(
         env_prefix="PTPS_",  # Put in .env like PTPS_CMOD_DATASET_PATH
         env_file=".env",
