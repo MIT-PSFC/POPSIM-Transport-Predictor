@@ -78,7 +78,7 @@ def run_preshot_prediction(  # noqa: PLR0915
 
     def _setup_directories(scratch_dir):
         working_dir = os.path.join(scratch_dir, "predict_first")
-        shot_data_dir = os.path.join(working_dir, "shot_data")
+        shot_data_dir = os.path.join(working_dir, "raw_data")
         result_dir = os.path.join(working_dir, f"shot_{targ_shot}")
         os.makedirs(shot_data_dir, exist_ok=True)
         os.makedirs(result_dir, exist_ok=True)
