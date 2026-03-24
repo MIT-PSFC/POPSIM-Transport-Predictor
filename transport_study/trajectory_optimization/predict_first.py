@@ -744,7 +744,7 @@ def _plot_prediction_vs_measured(
     logger.info(f"Saved prediction vs measured plot to {plot_dir}")
 
 
-def _make_profile_gif(  # noqa: PLR0915
+def _make_profile_gif(  # noqa: PLR0915, PLR0912
     ds_pred: xr.Dataset,
     ds_targ: xr.Dataset,
     targ_shot: int,
@@ -780,18 +780,41 @@ def _make_profile_gif(  # noqa: PLR0915
     te_meas = ds_t["Te_keV_psi"].values
     psi_targ = ds_targ["psi_n"].values
 
-    # Interpolate measured profiles onto the prediction psi grid so we can overlay directly
-    def _interp_to_psi_pred(meas_2d: np.ndarray) -> np.ndarray:
+    # Interpolate a 2-D profile array onto the prediction psi grid
+    def _interp_to_psi_pred(meas_2d: np.ndarray, src_psi: np.ndarray) -> np.ndarray:
         out = np.full((meas_2d.shape[0], len(psi_pred)), np.nan)
         for i in range(meas_2d.shape[0]):
             row = meas_2d[i]
             valid = ~np.isnan(row)
             if valid.sum() >= 2:
-                out[i] = np.interp(psi_pred, psi_targ[valid], row[valid])
+                out[i] = np.interp(psi_pred, src_psi[valid], row[valid])
         return out
 
-    ne_meas_on_pred_psi = _interp_to_psi_pred(ne_meas)
-    te_meas_on_pred_psi = _interp_to_psi_pred(te_meas)
+    ne_meas_on_pred_psi = _interp_to_psi_pred(ne_meas, psi_targ)
+    te_meas_on_pred_psi = _interp_to_psi_pred(te_meas, psi_targ)
+
+    # Try to load IDA profiles for this shot from the hp dataset
+    ida_t: np.ndarray | None = None
+    ida_ne: np.ndarray | None = None
+    ida_te: np.ndarray | None = None
+    if config.d3d_hp_dataset_path is not None and os.path.exists(
+        str(config.d3d_hp_dataset_path)
+    ):
+        try:
+            ds_hp = xr.open_dataset(config.d3d_hp_dataset_path)
+            if targ_shot in ds_hp["shot"].values:
+                ds_hp_shot = ds_hp.sel(shot=targ_shot)
+                psi_hp = ds_hp["psi_n"].values
+                ida_t = ds_hp_shot["time"].values
+                ida_ne = _interp_to_psi_pred(ds_hp_shot["ne20_psi"].values, psi_hp)
+                ida_te = _interp_to_psi_pred(ds_hp_shot["Te_keV_psi"].values, psi_hp)
+                logger.info(f"Loaded IDA profiles for shot {targ_shot} from hp dataset")
+            else:
+                logger.info(
+                    f"Shot {targ_shot} not found in hp dataset — skipping IDA overlay"
+                )
+        except Exception as e:
+            logger.warning(f"Could not load IDA profiles for shot {targ_shot}: {e}")
 
     # Identify fresh timesteps (profile actually changed — not a forward-filled repeat)
     fresh = _fresh_timestep_mask(ne_meas)
@@ -809,6 +832,28 @@ def _make_profile_gif(  # noqa: PLR0915
 
     logger.info(f"Creating GIF with {len(fresh_idx)} frames for shot {targ_shot}")
 
+    # Pre-compute which IDA rows have any valid (non-NaN) data so nearest-neighbour
+    # lookup is restricted to rows that actually contain a profile.
+    ida_valid_idx_arr: np.ndarray | None = None
+    if ida_ne is not None and ida_t is not None:
+        valid_mask = ~np.all(np.isnan(ida_ne), axis=1) & ~np.isnan(ida_t)
+        ida_valid_idx_arr = np.where(valid_mask)[0]
+        if len(ida_valid_idx_arr) == 0:
+            logger.warning(
+                f"IDA profiles for shot {targ_shot} are all NaN — skipping IDA overlay"
+            )
+            ida_ne = ida_te = ida_t = None
+
+    # Compute uniform Y-axis limits across all frames (0 to 1.05 x global max)
+    ne_global_max = max(float(np.nanmax(ne_max)), float(np.nanmax(ne_meas_on_pred_psi)))
+    te_global_max = max(float(np.nanmax(te_max)), float(np.nanmax(te_meas_on_pred_psi)))
+    if ida_ne is not None:
+        ne_global_max = max(ne_global_max, float(np.nanmax(ida_ne)))
+    if ida_te is not None:
+        te_global_max = max(te_global_max, float(np.nanmax(ida_te)))
+    ne_ylim = (0.0, ne_global_max * 1.05)
+    te_ylim = (0.0, te_global_max * 1.05)
+
     frames: list = []
     for tidx in fresh_idx:
         t_now = t_targ[tidx]
@@ -822,19 +867,23 @@ def _make_profile_gif(  # noqa: PLR0915
             color=TEXT_COLOR,
         )
 
-        for ax, (lo, hi, meas_row, ylabel) in zip(
+        for ax, (lo, hi, meas_row, ida_arr, ylim, ylabel) in zip(
             axes,
             [
                 (
                     ne_min[pred_tidx],
                     ne_max[pred_tidx],
                     ne_meas_on_pred_psi[tidx],
+                    ida_ne,
+                    ne_ylim,
                     r"$n_e$ [$10^{20}$ m$^{-3}$]",
                 ),
                 (
                     te_min[pred_tidx],
                     te_max[pred_tidx],
                     te_meas_on_pred_psi[tidx],
+                    ida_te,
+                    te_ylim,
                     r"$T_e$ [keV]",
                 ),
             ],
@@ -850,9 +899,31 @@ def _make_profile_gif(  # noqa: PLR0915
                 psi_pred, lo, hi, color="cyan", alpha=0.4, label="Predicted range"
             )
             ax.plot(
-                psi_pred, meas_row, color="#FF6347", linewidth=2.5, label="Measured"
+                psi_pred,
+                meas_row,
+                color="#FF6347",
+                linewidth=2.5,
+                label="ZIPFIT (meas)",
             )
 
+            if (
+                ida_arr is not None
+                and ida_t is not None
+                and ida_valid_idx_arr is not None
+            ):
+                ida_tidx = ida_valid_idx_arr[
+                    int(np.argmin(np.abs(ida_t[ida_valid_idx_arr] - t_now)))
+                ]
+                ax.plot(
+                    psi_pred,
+                    ida_arr[ida_tidx],
+                    color="#FFD700",
+                    linewidth=2.5,
+                    linestyle="--",
+                    label="IDA (meas)",
+                )
+
+            ax.set_ylim(ylim)
             ax.set_xlabel(r"$\psi_n$", fontsize=LABEL_FONTSIZE, color=TEXT_COLOR)
             ax.set_ylabel(ylabel, fontsize=LABEL_FONTSIZE, color=TEXT_COLOR)
             legend = ax.legend(

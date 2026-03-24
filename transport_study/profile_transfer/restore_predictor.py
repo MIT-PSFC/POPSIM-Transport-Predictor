@@ -23,9 +23,11 @@ def checkpoint_to_profile_case(checkpoint_dir: str) -> ProfileStudy.Case:
             "Don't have a case with 4 pieces, need to update the parsing logic if we want to add one"
         )
     elif len(case_pieces) == 5:
-        raise NotImplementedError(
-            "Don't have a case with 5 pieces, need to update the parsing logic if we want to add one"
-        )
+        domain_adaptation = None
+        freeze_shapes = (
+            case_pieces[4][7:] == "True"
+        )  # remove "freeze_" prefix and convert to bool
+        num_hp_shots = -1
     elif len(case_pieces) == 6:
         domain_adaptation = case_pieces[3][3:]  # remove "da_" prefix
         freeze_shapes = (
@@ -89,5 +91,7 @@ def restore_profile_predictor(
 def restore_profile_predictor_from_checkpoint(checkpoint_dir: str):
     """Restore the profile predictor from the given checkpoint directory"""
     profile_predictor_config = checkpoint_to_profile_config(checkpoint_dir)
-    profile_predictor = restore_profile_predictor(profile_predictor_config)
+    config_dict = profile_predictor_config.model_dump()
+    config_dict["checkpoint_dir"] = checkpoint_dir
+    profile_predictor = restore_profile_predictor(config_dict)
     return profile_predictor
