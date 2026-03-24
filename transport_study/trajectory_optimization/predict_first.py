@@ -125,6 +125,12 @@ def run_preshot_prediction(  # noqa: PLR0915
 
     ds_ref = correct_B0_prog(ds_ref)
     ds_ref = add_gapin_prog(ds_ref)
+    # gapin_opt must be applied AFTER add_gapin_prog, which overwrites gapin_prog
+    if optimized_trajectory_checkpoint_dir is not None and "gapin_opt" in ds_traj:
+        orig = ds_ref["gapin_prog"].load()
+        new_vals = orig.copy()
+        new_vals.loc[{"shot": ref_shot}] = ds_traj["gapin_opt"].values
+        ds_ref = ds_ref.assign({"gapin_prog": new_vals})
     if targ_shot is not None:
         ds_targ = correct_B0_prog(ds_targ)
         ds_targ = add_gapin_prog(ds_targ)

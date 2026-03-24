@@ -19,9 +19,11 @@ def checkpoint_to_profile_case(checkpoint_dir: str) -> ProfileStudy.Case:
     data_normalization = "physics"  # Always using this for profile predictor
 
     if len(case_pieces) == 4:
-        raise NotImplementedError(
-            "Don't have a case with 4 pieces, need to update the parsing logic if we want to add one"
-        )
+        domain_adaptation = None
+        freeze_shapes = (
+            case_pieces[3][7:] == "True"
+        )  # remove "freeze_" prefix and convert to bool
+        num_hp_shots = -1
     elif len(case_pieces) == 5:
         domain_adaptation = None
         freeze_shapes = (

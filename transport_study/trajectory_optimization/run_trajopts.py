@@ -119,6 +119,12 @@ def _compute_loss_metrics(  # noqa: PLR0915
 
     ds = correct_B0_prog(ds)
     ds = add_gapin_prog(ds)
+    # gapin_opt must be applied AFTER add_gapin_prog, which overwrites gapin_prog
+    if optimized_trajectory_dir is not None and "gapin_opt" in ds_traj:
+        orig = ds["gapin_prog"].load()
+        new_vals = orig.copy()
+        new_vals.loc[{"shot": config.ref_shot}] = ds_traj["gapin_opt"].values
+        ds = ds.assign({"gapin_prog": new_vals})
     ds_aug = make_augmented_dataset(ds)
 
     # Derive shape variables (matches predict_first logic)

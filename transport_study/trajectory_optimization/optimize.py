@@ -295,23 +295,21 @@ class TrajectoryOptimization:
                 manager = create_default_checkpoint_manager(checkpoint_dir)
                 env = restore_model(manager, env)
                 module = env.module
+                # Use resolve_targets (which applies soft_clip) so stored values
+                # exactly match what was used during every forward pass.
+                resolved = [
+                    module.resolve_targets(float(t)) for t in module.config.traj_times
+                ]
                 return {
                     "time": np.array(module.config.traj_times),
-                    "R0": np.array(module.R0),
-                    "gapin": np.array(module.gapin),
-                    "rxbot": np.array(
-                        module.rxpt1
-                    ),  # lower X-pt R (rxpt1 in module → rxbot in dataset)
-                    "zxbot": np.array(
-                        module.zxpt1
-                    ),  # lower X-pt Z (zxpt1 in module → zxbot in dataset)
-                    "rxtop": np.array(
-                        module.rxpt2
-                    ),  # upper X-pt R (rxpt2 in module → rxtop in dataset)
-                    "zxtop": np.array(
-                        module.zxpt2
-                    ),  # upper X-pt Z (zxpt2 in module → zxtop in dataset)
-                    "ne20_edge": np.array(module.ne20_edge),
+                    "R0": np.array([r["R0"] for r in resolved]),
+                    "gapin": np.array([r["gapin"] for r in resolved]),
+                    "rxbot": np.array([r["rxpt1"] for r in resolved]),  # lower X-pt R
+                    "zxbot": np.array([r["zxpt1"] for r in resolved]),  # lower X-pt Z
+                    "rxtop": np.array([r["rxpt2"] for r in resolved]),  # upper X-pt R
+                    "zxtop": np.array([r["zxpt2"] for r in resolved]),  # upper X-pt Z
+                    "ne20_edge": np.array([r["ne20_edge"] for r in resolved]),
+                    "input_ranges": module.config.input_ranges,
                 }
             else:
                 logger.critical(
@@ -327,10 +325,12 @@ class TrajectoryOptimization:
                     "rxtop": [1.150, 1.12],
                     "zxtop": [1.16, 1.14],
                     "ne20_edge": [0.55, 0.45],
+                    "input_ranges": {},
                 }
 
         optimized_trajectory = _get_optimized_trajectory()
         traj_times = np.array(optimized_trajectory["time"])
+        input_ranges = optimized_trajectory.get("input_ranges", {})
 
         # Derived shape quantities — replicates PCSInputMapper logic
         R0 = np.array(optimized_trajectory["R0"])
@@ -554,6 +554,8 @@ class TrajectoryOptimization:
             pcs_name="",
             measured_sig=None,
             prog_vals=None,
+            lb=None,
+            ub=None,
         ):
             """Plot original programmed, optional measured, and optional optimized traces.
 
@@ -632,6 +634,26 @@ class TrajectoryOptimization:
                     label="optimized",
                 )
 
+            if opt_vals is not None:
+                if lb is not None:
+                    ax.axhline(
+                        lb,
+                        color="red",
+                        linewidth=1.0,
+                        linestyle="--",
+                        alpha=0.7,
+                        label="lower bound",
+                    )
+                if ub is not None:
+                    ax.axhline(
+                        ub,
+                        color="red",
+                        linewidth=1.0,
+                        linestyle="--",
+                        alpha=0.7,
+                        label="upper bound",
+                    )
+
             full_title = title + (f"\n[{pcs_name}]" if pcs_name else "")
             _style(ax, full_title, ylabel)
             ax.legend(
@@ -678,6 +700,8 @@ class TrajectoryOptimization:
             r"$n_{e,edge}$ [$10^{20}$ m$^{-3}$]",
             "dstdenp÷10",
             measured_sig="ne20_edge",
+            lb=input_ranges.get("ne20_edge", (None, None))[0],
+            ub=input_ranges.get("ne20_edge", (None, None))[1],
         )
         axes[4, 0].set_visible(False)
 
@@ -691,6 +715,8 @@ class TrajectoryOptimization:
             r"$R_0$ [m]",
             "idtrp",
             measured_sig="R0",
+            lb=input_ranges.get("R0", (None, None))[0],
+            ub=input_ranges.get("R0", (None, None))[1],
         )
         _plot_signal(
             axes[1, 1],
@@ -732,7 +758,13 @@ class TrajectoryOptimization:
         # column 3: gapin (suggested), rxbot, zxbot, rxtop, zxtop
         # X-point cols show programmed values as primary reference and measured as secondary reference
         _plot_signal(
-            axes[0, 2], "gapin", gapin, "Inner Gap (suggested)", r"$g_{in}$ [m]"
+            axes[0, 2],
+            "gapin",
+            gapin,
+            "Inner Gap (suggested)",
+            r"$g_{in}$ [m]",
+            lb=input_ranges.get("gapin", (None, None))[0],
+            ub=input_ranges.get("gapin", (None, None))[1],
         )
         _plot_signal(
             axes[1, 2],
@@ -742,6 +774,8 @@ class TrajectoryOptimization:
             r"$R_{x,bot}$ [m]",
             "idtrxbot",
             measured_sig="rxbot",
+            lb=input_ranges.get("rxpt1", (None, None))[0],
+            ub=input_ranges.get("rxpt1", (None, None))[1],
         )
         _plot_signal(
             axes[2, 2],
@@ -751,6 +785,8 @@ class TrajectoryOptimization:
             r"$Z_{x,bot}$ [m]",
             "idtzxbot",
             measured_sig="zxbot",
+            lb=input_ranges.get("zxpt1", (None, None))[0],
+            ub=input_ranges.get("zxpt1", (None, None))[1],
         )
         _plot_signal(
             axes[3, 2],
@@ -760,6 +796,8 @@ class TrajectoryOptimization:
             r"$R_{x,top}$ [m]",
             "idtrxtop",
             measured_sig="rxtop",
+            lb=input_ranges.get("rxpt2", (None, None))[0],
+            ub=input_ranges.get("rxpt2", (None, None))[1],
         )
         _plot_signal(
             axes[4, 2],
@@ -769,6 +807,8 @@ class TrajectoryOptimization:
             r"$Z_{x,top}$ [m]",
             "idtzxtop",
             measured_sig="zxtop",
+            lb=input_ranges.get("zxpt2", (None, None))[0],
+            ub=input_ranges.get("zxpt2", (None, None))[1],
         )
 
         fig.tight_layout(rect=[0, 0, 1, 0.97])
