@@ -3,9 +3,24 @@
 Runs each predictor on measured (non-prog) inputs from the reference shot and computes
 the psi-integrated relative error against IDA ne/Te profiles. Output formatted similar
 to best_cases.py.
+
+Each evaluation is submitted as an independent SLURM job; the main script waits for all
+results before printing the ranked tables and bar chart.
+
+Usage:
+    # Submit jobs and wait for results:
+    python runday_eval.py runday_eval --profopt_models_dir <path>
+
+    # (Internal) called by each SLURM worker:
+    python runday_eval.py _eval_worker --checkpoint_dir <path> --result_path <path>
 """
 
+import json
 import os
+import subprocess
+import sys
+import tempfile
+import time
 import traceback
 
 import fire
@@ -19,6 +34,10 @@ from loguru import logger
 
 from transport_study.config import config
 from transport_study.modules.profile_predictor.module import Inputs
+from transport_study.orchestration.slurm_utils import (
+    count_idle_gpus,
+    resources_available,
+)
 from transport_study.profile_transfer.restore_predictor import (
     checkpoint_to_profile_case,
     restore_profile_predictor_from_checkpoint,
@@ -47,6 +66,8 @@ INPUT_VARS = [
     "delta_top",
     "delta_bot",
 ]
+
+POLL_INTERVAL_S = 15
 
 
 def load_valid_timeslices(ref_shot_path: str) -> xr.Dataset:
@@ -108,7 +129,7 @@ def evaluate_checkpoint(checkpoint_dir: str, ds_valid: xr.Dataset) -> dict | Non
     ne_pred = np.array(ne_pred)  # (n_ts, n_pred_psi)
     te_pred = np.array(te_pred)
 
-    # Interpolate IDA targets from dataset psi grid onto predictor psigrid
+    # Interpolate profile targets from dataset psi grid onto predictor psigrid
     ne_targ_raw = ds_valid["ne20_psi"].values  # (n_ts, n_ds_psi)
     te_targ_raw = ds_valid["Te_keV_psi"].values
     ne_targ = np.stack(
@@ -136,47 +157,166 @@ def evaluate_checkpoint(checkpoint_dir: str, ds_valid: xr.Dataset) -> dict | Non
     }
 
 
+def _eval_worker(checkpoint_dir: str, result_path: str, ref_shot_path: str):
+    """Entry point for each SLURM worker. Evaluates one checkpoint and writes a JSON result."""
+    ds_valid = load_valid_timeslices(ref_shot_path)
+    metrics = evaluate_checkpoint(checkpoint_dir, ds_valid)
+    os.makedirs(os.path.dirname(result_path), exist_ok=True)
+    payload = metrics if metrics is not None else {"error": "evaluation failed"}
+    with open(result_path, "w") as f:
+        json.dump(payload, f)
+    logger.info(f"Saved result to {result_path}")
+
+
+def _launch_eval_job(
+    checkpoint_dir: str,
+    result_path: str,
+    ref_shot_path: str,
+    log_dir: str,
+    partition: str,
+) -> None:
+    """Submit a SLURM job that runs _eval_worker for one checkpoint."""
+    os.makedirs(log_dir, exist_ok=True)
+    name = os.path.basename(checkpoint_dir)
+    log_path = os.path.join(log_dir, f"{name}.log")
+
+    # Write a small launcher script so the sbatch command stays clean
+    with tempfile.NamedTemporaryFile(
+        mode="w", suffix=".py", delete=False, prefix=f"rde_{name[:20]}_", dir=log_dir
+    ) as f:
+        f.write(
+            f"from transport_study.profile_transfer.runday_eval import _eval_worker\n"
+            f"_eval_worker(\n"
+            f"    checkpoint_dir={checkpoint_dir!r},\n"
+            f"    result_path={result_path!r},\n"
+            f"    ref_shot_path={ref_shot_path!r},\n"
+            f")\n"
+        )
+        script_path = f.name
+
+    sbatch_script = f"""\
+#!/bin/bash
+#SBATCH --job-name=rde.{name[:40]}
+#SBATCH --partition={partition}
+#SBATCH --gres=gpu:1
+#SBATCH --mem=60G
+#SBATCH --cpus-per-task=4
+#SBATCH --export=ALL
+#SBATCH --exclude=node2301,node2101
+#SBATCH --output={log_path}
+#SBATCH --error={log_path}
+
+export WANDB_MODE=offline
+{sys.executable} {script_path}
+rm -f {script_path}
+"""
+
+    result = subprocess.run(
+        ["sbatch"], input=sbatch_script, check=False, capture_output=True, text=True
+    )
+    if result.returncode != 0:
+        logger.error(f"sbatch failed for {name}: {result.stderr}")
+    else:
+        logger.info(f"Submitted {name}: {result.stdout.strip()}")
+
+
 def runday_eval(  # noqa: PLR0915
     profopt_models_dir: str,
+    partition: str = config.partition,
 ):
     ref_shot_path = os.path.join(
         config.scratch_dir, "predict_first/raw_data", f"{config.ref_shot}.nc"
     )
-    ds_valid = load_valid_timeslices(ref_shot_path)
+    ref_shot = str(config.ref_shot)
 
-    ref_shot = os.path.basename(ref_shot_path).split(".")[0]
-    checkpoint_dirs = sorted(
+    results_dir = os.path.join(config.scratch_dir, "runday_eval", "results")
+    log_dir = os.path.join(config.scratch_dir, "runday_eval", "logs")
+    os.makedirs(results_dir, exist_ok=True)
+
+    checkpoint_names = sorted(
         d for d in os.listdir(profopt_models_dir) if d.startswith("case.")
     )
 
-    rows = []
-    for name in checkpoint_dirs:
+    # Map each valid case name -> expected result JSON path
+    case_result_paths: dict[str, str] = {}
+    for name in checkpoint_names:
         checkpoint_dir = os.path.join(profopt_models_dir, name)
         try:
-            case = checkpoint_to_profile_case(checkpoint_dir)
+            checkpoint_to_profile_case(checkpoint_dir)
         except Exception:
-            logger.warning(f"Could not parse case from {name}")
+            logger.warning(f"Could not parse case from {name}, skipping")
+            continue
+        case_result_paths[name] = os.path.join(results_dir, f"{name}.json")
+
+    total = len(case_result_paths)
+    logger.info(f"Total cases to evaluate: {total}")
+
+    # Submit jobs for any case whose result doesn't exist yet, respecting cluster availability
+    pending = [
+        name
+        for name, result_path in case_result_paths.items()
+        if not os.path.exists(result_path)
+    ]
+    submitted = 0
+    for name in pending:
+        while not resources_available(partition=partition):
+            idle = count_idle_gpus(partition=partition)
+            logger.info(
+                f"No resources available (idle GPUs after buffer: {idle}) — "
+                f"waiting {POLL_INTERVAL_S}s before submitting next job "
+                f"({submitted}/{len(pending)} submitted so far)"
+            )
+            time.sleep(POLL_INTERVAL_S)
+        _launch_eval_job(
+            checkpoint_dir=os.path.join(profopt_models_dir, name),
+            result_path=case_result_paths[name],
+            ref_shot_path=ref_shot_path,
+            log_dir=log_dir,
+            partition=partition,
+        )
+        submitted += 1
+
+    if submitted == 0:
+        logger.info("All results already present, skipping submission.")
+    else:
+        logger.info(f"Submitted {submitted} SLURM jobs.")
+
+    # Poll until all results exist
+    while True:
+        done = sum(1 for p in case_result_paths.values() if os.path.exists(p))
+        remaining = total - done
+        if remaining == 0:
+            logger.info(f"All {total} results collected.")
+            break
+        logger.info(
+            f"Progress: {done}/{total} done, {remaining} remaining — checking again in {POLL_INTERVAL_S}s"
+        )
+        time.sleep(POLL_INTERVAL_S)
+
+    # Collect results into a DataFrame
+    rows = []
+    for name, result_path in case_result_paths.items():
+        with open(result_path) as f:
+            payload = json.load(f)
+        if "error" in payload:
+            logger.warning(f"Case {name} failed: {payload['error']}")
             continue
 
-        logger.info(f"Evaluating {name}")
-        metrics = evaluate_checkpoint(checkpoint_dir, ds_valid)
-        if metrics is None:
-            continue
-
+        checkpoint_dir = os.path.join(profopt_models_dir, name)
+        case = checkpoint_to_profile_case(checkpoint_dir)
         row = {
             "model_type": case.model_type,
             "training_data": case.training_data,
             "domain_adaptation": str(case.domain_adaptation),
             "freeze_shapes": case.freeze_shapes,
             "num_hp_shots": case.num_hp_shots,
-            **metrics,
+            **payload,
         }
         row["case"] = ".".join(str(row[c]) for c in CASE_COORDS)
         rows.append(row)
-        logger.info(f"  err_rel_ts_mean={metrics['err_rel_ts_mean']:.4f}")
 
     if not rows:
-        logger.error("No results collected.")
+        logger.error("No successful results to display.")
         return
 
     df = pd.DataFrame(rows)
@@ -239,7 +379,7 @@ def runday_eval(  # noqa: PLR0915
 
     fig, axes = plt.subplots(1, 2, figsize=(14, 5))
     fig.patch.set_facecolor(BACKGROUND_COLOR)
-    bar_chart(axes[0], df, "All cases — sorted by err_rel_ts_mean")
+    bar_chart(axes[0], df, "All cases - sorted by err_rel_ts_mean")
     bar_chart(
         axes[1],
         df_hp if not df_hp.empty else df,
@@ -258,5 +398,6 @@ if __name__ == "__main__":
     fire.Fire(
         {
             "runday_eval": runday_eval,
+            "_eval_worker": _eval_worker,
         }
     )
