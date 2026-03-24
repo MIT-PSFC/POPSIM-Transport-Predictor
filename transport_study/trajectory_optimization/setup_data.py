@@ -26,7 +26,7 @@ FEEDBACK_CONTROL_SHOTS = {201927: {"start": 0.7, "end": 4.7}}
 # Obtained by running characterize_dataset.py
 PROG_INPUT_ERRORS = {
     "Ip_MA_prog": 0.00449,
-    "B0_prog": 0.13623,
+    "B0_prog": 0.02,
     "betan_prog": 0.10511,
     "ne20_edge_prog": 0.03995,
     "R0_prog": 0.00258,

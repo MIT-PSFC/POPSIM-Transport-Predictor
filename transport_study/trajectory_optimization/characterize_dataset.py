@@ -4,7 +4,7 @@ from loguru import logger
 
 from transport_study.config import config
 from transport_study.modules.profile_trajectory.data import get_ds
-from transport_study.trajectory_optimization import (
+from transport_study.trajectory_optimization.setup_data import (
     FEEDBACK_CONTROL_SHOTS,
     IP_RAMP_SHOTS,
 )
