@@ -224,3 +224,4 @@ transport_study/datasets/d3d/debug*
 submodules/toksearch
 checkpoints
 transport_study/tests/test_outputs/
+fetch_*

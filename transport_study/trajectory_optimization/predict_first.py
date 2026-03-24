@@ -883,9 +883,10 @@ def _make_profile_gif(  # noqa: PLR0915
 
 
 def _get_shot_data(shot: int, ds_path: str) -> xr.Dataset:
-    data_assembly_dir = os.path.dirname(ds_path)
-    script_path = os.path.join(str(PACKAGE_ROOT), f"fetch_{shot}.py")
-    shotlist_path = os.path.join(data_assembly_dir, f"{shot}_shotlist.txt")
+    raw_data_dir = os.path.dirname(ds_path)
+    working_dir = os.path.dirname(raw_data_dir)
+    script_path = os.path.join(os.path.dirname(PACKAGE_ROOT), f"fetch_{shot}.py")
+    shotlist_path = os.path.join(raw_data_dir, f"{shot}_shotlist.txt")
 
     if not os.path.exists(ds_path):
         with open(shotlist_path, "w") as f:
@@ -898,11 +899,10 @@ import os
 from transport_study.datasets.d3d.d3d_dataset import D3DDataWorkflow
 
 workflow = D3DDataWorkflow(
-    ds_name="predict_first_input",
+    ds_name="",
     shotlist_file={shotlist_path!r},
-    data_assembly_dir={data_assembly_dir!r},
+    data_assembly_dir={working_dir!r},
     max_num_shots=1,
-    mode="raw",
     use_ida=False,  # comparing against ZIPFITs, which are available on run day
 )
 workflow.make_raw_data_files()
