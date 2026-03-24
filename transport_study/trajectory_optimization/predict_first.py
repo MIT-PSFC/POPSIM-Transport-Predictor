@@ -1,3 +1,4 @@
+import io
 import os
 import sys
 
@@ -87,11 +88,11 @@ def run_preshot_prediction(  # noqa: PLR0915
     _working_dir, shot_data_dir, result_dir = _setup_directories(scratch_dir)
 
     # Get trajectories and profiles if they are not already saved in the shot_data_dir
-    ds_ref_path = os.path.join(shot_data_dir, f"{ref_shot}.nc")
-    ds_ref = _get_shot_data(ref_shot, ds_ref_path)
     if targ_shot is not None:
         ds_target_path = os.path.join(shot_data_dir, f"{targ_shot}.nc")
         ds_targ = _get_shot_data(targ_shot, ds_target_path)
+    ds_ref_path = os.path.join(shot_data_dir, f"{ref_shot}.nc")
+    ds_ref = _get_shot_data(ref_shot, ds_ref_path)
 
     # Step 0: Overwrite programmed trajectory if an optimized trajectory is provided
     if optimized_trajectory_checkpoint_dir is not None:
@@ -220,6 +221,10 @@ def run_preshot_prediction(  # noqa: PLR0915
     # Step 6: Plots with error bars over time
     _plot_predictor_inputs(ds_aug, a_minor, kappa, delta_top, delta_bot, result_dir)
     _plot_preshot_predictions(ds_pred, result_dir)
+    if targ_shot is not None:
+        _plot_trajectory_comparison(ds_ref, ds_targ, ref_shot, targ_shot, result_dir)
+        _plot_prediction_vs_measured(ds_pred, ds_targ, targ_shot, result_dir)
+        _make_profile_gif(ds_pred, ds_targ, targ_shot, result_dir)
 
 
 def _plot_predictor_inputs(
@@ -466,6 +471,414 @@ def _plot_preshot_predictions(ds_pred: xr.Dataset, output_dir: str):  # noqa: PL
             plt.close(fig2)
 
     logger.info(f"Saved plots to {plot_dir}")
+
+
+def _fresh_timestep_mask(profile_2d: np.ndarray) -> np.ndarray:
+    """Return boolean mask where True means the profile changed from the previous timestep.
+
+    Used to identify timesteps with fresh ZIPFIT measurements vs forward-filled repeats.
+    The first timestep is always considered fresh.
+    """
+    prev = profile_2d[:-1].reshape(len(profile_2d) - 1, -1)
+    curr = profile_2d[1:].reshape(len(profile_2d) - 1, -1)
+    same = (curr == prev) | (np.isnan(curr) & np.isnan(prev))
+    changed = ~np.all(same, axis=1)
+    return np.concatenate([[True], changed])
+
+
+def _plot_trajectory_comparison(
+    ds_ref: xr.Dataset,
+    ds_targ: xr.Dataset,
+    ref_shot: int,
+    targ_shot: int,
+    result_dir: str,
+):
+    """Compare all 9 predictor inputs across ref (programmed), target (programmed), target (measured).
+
+    Mirrors the layout of _plot_predictor_inputs but overlays three time-traces per panel:
+      - cyan solid   : reference shot programmed trajectory
+      - orange dashed: target shot programmed trajectory
+      - green solid  : target shot actual measured signal
+
+    The four derived shape quantities (a_minor, kappa, delta_top, delta_bot) are computed
+    from programmed shape variables for the "programmed" traces and read directly from the
+    measured dataset variables for the "measured" trace.
+    """
+    plot_dir = os.path.join(result_dir, "plots")
+    os.makedirs(plot_dir, exist_ok=True)
+
+    def _derive_shape(ds_sel: xr.Dataset):
+        """Return (a_minor, kappa, delta_top, delta_bot) arrays from programmed shape vars."""
+        R0 = ds_sel["R0_prog"].values
+        gapin = ds_sel["gapin_prog"].values
+        rxbot = ds_sel["rxbot_prog"].values
+        zxbot = ds_sel["zxbot_prog"].values
+        rxtop = ds_sel["rxtop_prog"].values
+        zxtop = ds_sel["zxtop_prog"].values
+        a = R0 - gapin - INNER_WALL
+        k = np.abs(zxtop - zxbot) / (a * 2)
+        db = (R0 - rxbot) / a
+        dt = (R0 - rxtop) / a
+        return a, k, dt, db
+
+    ds_r = ds_ref.sel(shot=ref_shot)
+    ds_t = ds_targ.sel(shot=targ_shot)
+
+    t_ref = ds_r["time"].values
+    t_targ = ds_t["time"].values
+
+    a_r, k_r, dt_r, db_r = _derive_shape(ds_r)
+    a_t_prog, k_t_prog, dt_t_prog, db_t_prog = _derive_shape(ds_t)
+
+    # (prog_ref_vals, prog_targ_vals, meas_targ_vals, label)  # noqa:  ERA001
+    signals = [
+        (
+            ds_r["Ip_MA_prog"].values,
+            ds_t["Ip_MA_prog"].values,
+            ds_t["Ip_MA"].values,
+            "Ip_MA_prog [MA]",
+        ),
+        (
+            ds_r["B0_prog"].values,
+            ds_t["B0_prog"].values,
+            ds_t["B0"].values,
+            "B0_prog [T]",
+        ),
+        (
+            ds_r["betan_prog"].values,
+            ds_t["betan_prog"].values,
+            ds_t["betan"].values,
+            "betan_prog",
+        ),
+        (
+            ds_r["ne20_edge_prog"].values,
+            ds_t["ne20_edge_prog"].values,
+            ds_t["ne20_edge"].values,
+            "ne20_edge_prog [1e20/m³]",
+        ),
+        (
+            ds_r["R0_prog"].values,
+            ds_t["R0_prog"].values,
+            ds_t["R0"].values,
+            "R0_prog [m]",
+        ),
+        (a_r, a_t_prog, ds_t["a_minor"].values, "a_minor [m]"),
+        (k_r, k_t_prog, ds_t["kappa"].values, "kappa"),
+        (dt_r, dt_t_prog, ds_t["delta_top"].values, "delta_top"),
+        (db_r, db_t_prog, ds_t["delta_bot"].values, "delta_bot"),
+    ]
+
+    n_signals = len(signals)
+    n_cols = 3
+    n_rows = (n_signals + n_cols - 1) // n_cols
+
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(6 * n_cols, 4 * n_rows))
+    fig.patch.set_facecolor(BACKGROUND_COLOR)
+    fig.suptitle(
+        f"Trajectory Comparison — Ref {ref_shot} vs Target {targ_shot}",
+        fontsize=TITLE_FONTSIZE,
+        color=TEXT_COLOR,
+    )
+    axes_flat = axes.reshape(-1)
+
+    for ax, (ref_prog, targ_prog, targ_meas, label) in zip(
+        axes_flat, signals, strict=False
+    ):
+        ax.set_facecolor(FACE_COLOR)
+        ax.grid(True, color="gray", linestyle="--", linewidth=0.5)
+        ax.tick_params(axis="both", labelsize=TICK_FONTSIZE, colors=TEXT_COLOR)
+        for spine in ax.spines.values():
+            spine.set_color(TEXT_COLOR)
+
+        ax.plot(
+            t_ref, ref_prog, color="cyan", linewidth=2, label=f"Ref {ref_shot} prog"
+        )
+        ax.plot(
+            t_targ,
+            targ_prog,
+            color="#FFA500",
+            linewidth=2,
+            linestyle="--",
+            label=f"Targ {targ_shot} prog",
+        )
+        ax.plot(
+            t_targ,
+            targ_meas,
+            color="#90EE90",
+            linewidth=2,
+            label=f"Targ {targ_shot} meas",
+        )
+
+        ax.set_title(label, fontsize=LABEL_FONTSIZE, color=TEXT_COLOR)
+        ax.set_xlabel("Time [s]", fontsize=TICK_FONTSIZE, color=TEXT_COLOR)
+        legend = ax.legend(
+            fontsize=LEGEND_FONTSIZE - 2,
+            facecolor=BACKGROUND_COLOR,
+            edgecolor=BACKGROUND_COLOR,
+        )
+        for text in legend.get_texts():
+            text.set_color(TEXT_COLOR)
+
+    for ax in axes_flat[n_signals:]:
+        ax.set_visible(False)
+
+    fig.tight_layout()
+    fig.savefig(
+        os.path.join(plot_dir, f"shot_{targ_shot}_trajectory_comparison.png"),
+        dpi=150,
+        facecolor=fig.get_facecolor(),
+    )
+    plt.close(fig)
+    logger.info(f"Saved trajectory comparison plot to {plot_dir}")
+
+
+def _plot_prediction_vs_measured(
+    ds_pred: xr.Dataset,
+    ds_targ: xr.Dataset,
+    targ_shot: int,
+    result_dir: str,
+):
+    """Compare predicted profile range (min/max band) vs measured profiles in target shot over time.
+
+    For each of 6 psi values, overlays the predicted min-max shaded band against the
+    measured profile interpolated onto the prediction timebase.
+    """
+    from matplotlib.patches import Patch
+
+    plot_dir = os.path.join(result_dir, "plots")
+    os.makedirs(plot_dir, exist_ok=True)
+
+    # Predicted time axis (take first shot_alt row; all share the same timebase)
+    if "time" in ds_pred:
+        pred_time = ds_pred["time"].values[0]
+    else:
+        pred_time = ds_pred["time_idx"].values.astype(float)
+    valid_t = ~np.isnan(pred_time)
+    t_pred = pred_time[valid_t]
+
+    psi_pred = ds_pred["psi_n"].values
+    ne_min = ds_pred["ne"].min(dim="shot_alt").values[valid_t, :]
+    ne_max = ds_pred["ne"].max(dim="shot_alt").values[valid_t, :]
+    te_min = ds_pred["te"].min(dim="shot_alt").values[valid_t, :]
+    te_max = ds_pred["te"].max(dim="shot_alt").values[valid_t, :]
+
+    ds_t = ds_targ.sel(shot=targ_shot)
+    t_targ = ds_t["time"].values
+    ne_meas = ds_t["ne20_psi"].values  # (time_idx, psi_n)
+    te_meas = ds_t["Te_keV_psi"].values
+    psi_targ = ds_targ["psi_n"].values
+
+    psi_plot_vals = [0.0, 0.2, 0.4, 0.6, 0.8, 1.0]
+    psi_colors = BRIGHT_COLORS[: len(psi_plot_vals)]
+
+    fig, axes = plt.subplots(2, 1, figsize=(12, 10), sharex=True)
+    fig.patch.set_facecolor(BACKGROUND_COLOR)
+    fig.suptitle(
+        f"Prediction vs Measured — Target Shot {targ_shot}",
+        fontsize=TITLE_FONTSIZE,
+        color=TEXT_COLOR,
+    )
+
+    for ax, (lo_arr, hi_arr, meas_arr, ylabel) in zip(
+        axes,
+        [
+            (ne_min, ne_max, ne_meas, r"$n_e$ [$10^{20}$ m$^{-3}$]"),
+            (te_min, te_max, te_meas, r"$T_e$ [keV]"),
+        ],
+        strict=True,
+    ):
+        ax.set_facecolor(FACE_COLOR)
+        ax.grid(True, color="gray", linestyle="--", linewidth=0.5)
+        ax.tick_params(axis="both", labelsize=TICK_FONTSIZE, colors=TEXT_COLOR)
+        for spine in ax.spines.values():
+            spine.set_color(TEXT_COLOR)
+
+        for psi_val, color in zip(psi_plot_vals, psi_colors, strict=True):
+            psi_idx_pred = int(np.argmin(np.abs(psi_pred - psi_val)))
+            psi_idx_targ = int(np.argmin(np.abs(psi_targ - psi_val)))
+
+            ax.fill_between(
+                t_pred,
+                lo_arr[:, psi_idx_pred],
+                hi_arr[:, psi_idx_pred],
+                color=color,
+                alpha=0.3,
+            )
+
+            meas_col = meas_arr[:, psi_idx_targ]
+            valid_meas = ~np.isnan(t_targ) & ~np.isnan(meas_col)
+            if valid_meas.sum() >= 2:
+                meas_interp = np.interp(
+                    t_pred, t_targ[valid_meas], meas_col[valid_meas]
+                )
+            else:
+                meas_interp = np.full_like(t_pred, np.nan)
+            ax.plot(
+                t_pred, meas_interp, color=color, linewidth=2, label=f"ψ={psi_val:.1f}"
+            )
+
+        ax.set_ylabel(ylabel, fontsize=LABEL_FONTSIZE, color=TEXT_COLOR)
+
+        handles, labels = ax.get_legend_handles_labels()
+        handles.append(Patch(facecolor="white", alpha=0.4, label="Predicted range"))
+        labels.append("Predicted range")
+        legend = ax.legend(
+            handles=handles,
+            labels=labels,
+            fontsize=LEGEND_FONTSIZE - 2,
+            facecolor=BACKGROUND_COLOR,
+            edgecolor=BACKGROUND_COLOR,
+        )
+        for text in legend.get_texts():
+            text.set_color(TEXT_COLOR)
+
+    axes[-1].set_xlabel("Time [s]", fontsize=LABEL_FONTSIZE, color=TEXT_COLOR)
+    fig.tight_layout()
+    fig.savefig(
+        os.path.join(plot_dir, f"shot_{targ_shot}_prediction_vs_measured.png"),
+        dpi=150,
+        facecolor=fig.get_facecolor(),
+    )
+    plt.close(fig)
+    logger.info(f"Saved prediction vs measured plot to {plot_dir}")
+
+
+def _make_profile_gif(  # noqa: PLR0915
+    ds_pred: xr.Dataset,
+    ds_targ: xr.Dataset,
+    targ_shot: int,
+    result_dir: str,
+):
+    """GIF of predicted profile range vs measured profile at each fresh ZIPFIT timestep.
+
+    A frame is created only for timesteps where the measured profile is a genuinely new
+    ZIPFIT sample (not a forward-filled repeat of the previous value).
+    """
+    from PIL import Image
+
+    gif_dir = os.path.join(result_dir, "gifs")
+    os.makedirs(gif_dir, exist_ok=True)
+
+    # Prediction time axis
+    if "time" in ds_pred:
+        pred_time = ds_pred["time"].values[0]
+    else:
+        pred_time = ds_pred["time_idx"].values.astype(float)
+    valid_t = ~np.isnan(pred_time)
+    t_pred = pred_time[valid_t]
+
+    psi_pred = ds_pred["psi_n"].values
+    ne_min = ds_pred["ne"].min(dim="shot_alt").values[valid_t, :]
+    ne_max = ds_pred["ne"].max(dim="shot_alt").values[valid_t, :]
+    te_min = ds_pred["te"].min(dim="shot_alt").values[valid_t, :]
+    te_max = ds_pred["te"].max(dim="shot_alt").values[valid_t, :]
+
+    ds_t = ds_targ.sel(shot=targ_shot)
+    t_targ = ds_t["time"].values
+    ne_meas = ds_t["ne20_psi"].values  # (time_idx, psi_n)
+    te_meas = ds_t["Te_keV_psi"].values
+    psi_targ = ds_targ["psi_n"].values
+
+    # Interpolate measured profiles onto the prediction psi grid so we can overlay directly
+    def _interp_to_psi_pred(meas_2d: np.ndarray) -> np.ndarray:
+        out = np.full((meas_2d.shape[0], len(psi_pred)), np.nan)
+        for i in range(meas_2d.shape[0]):
+            row = meas_2d[i]
+            valid = ~np.isnan(row)
+            if valid.sum() >= 2:
+                out[i] = np.interp(psi_pred, psi_targ[valid], row[valid])
+        return out
+
+    ne_meas_on_pred_psi = _interp_to_psi_pred(ne_meas)
+    te_meas_on_pred_psi = _interp_to_psi_pred(te_meas)
+
+    # Identify fresh timesteps (profile actually changed — not a forward-filled repeat)
+    fresh = _fresh_timestep_mask(ne_meas)
+    fresh_idx = np.where(fresh & ~np.isnan(t_targ))[0]
+
+    # Keep only timesteps that fall within the prediction window
+    in_window = (t_targ[fresh_idx] >= t_pred[0]) & (t_targ[fresh_idx] <= t_pred[-1])
+    fresh_idx = fresh_idx[in_window]
+
+    if len(fresh_idx) == 0:
+        logger.warning(
+            f"No fresh profile timesteps found for shot {targ_shot} in prediction window — skipping GIF"
+        )
+        return
+
+    logger.info(f"Creating GIF with {len(fresh_idx)} frames for shot {targ_shot}")
+
+    frames: list = []
+    for tidx in fresh_idx:
+        t_now = t_targ[tidx]
+        pred_tidx = int(np.argmin(np.abs(t_pred - t_now)))
+
+        fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+        fig.patch.set_facecolor(BACKGROUND_COLOR)
+        fig.suptitle(
+            f"Shot {targ_shot} — t = {t_now:.3f} s",
+            fontsize=TITLE_FONTSIZE,
+            color=TEXT_COLOR,
+        )
+
+        for ax, (lo, hi, meas_row, ylabel) in zip(
+            axes,
+            [
+                (
+                    ne_min[pred_tidx],
+                    ne_max[pred_tidx],
+                    ne_meas_on_pred_psi[tidx],
+                    r"$n_e$ [$10^{20}$ m$^{-3}$]",
+                ),
+                (
+                    te_min[pred_tidx],
+                    te_max[pred_tidx],
+                    te_meas_on_pred_psi[tidx],
+                    r"$T_e$ [keV]",
+                ),
+            ],
+            strict=True,
+        ):
+            ax.set_facecolor(FACE_COLOR)
+            ax.grid(True, color="gray", linestyle="--", linewidth=0.5)
+            ax.tick_params(axis="both", labelsize=TICK_FONTSIZE, colors=TEXT_COLOR)
+            for spine in ax.spines.values():
+                spine.set_color(TEXT_COLOR)
+
+            ax.fill_between(
+                psi_pred, lo, hi, color="cyan", alpha=0.4, label="Predicted range"
+            )
+            ax.plot(
+                psi_pred, meas_row, color="#FF6347", linewidth=2.5, label="Measured"
+            )
+
+            ax.set_xlabel(r"$\psi_n$", fontsize=LABEL_FONTSIZE, color=TEXT_COLOR)
+            ax.set_ylabel(ylabel, fontsize=LABEL_FONTSIZE, color=TEXT_COLOR)
+            legend = ax.legend(
+                fontsize=LEGEND_FONTSIZE,
+                facecolor=BACKGROUND_COLOR,
+                edgecolor=BACKGROUND_COLOR,
+            )
+            for text in legend.get_texts():
+                text.set_color(TEXT_COLOR)
+
+        fig.tight_layout()
+        buf = io.BytesIO()
+        fig.savefig(buf, format="png", dpi=100, facecolor=fig.get_facecolor())
+        plt.close(fig)
+        buf.seek(0)
+        frames.append(Image.open(buf).copy())
+        buf.close()
+
+    gif_path = os.path.join(gif_dir, f"shot_{targ_shot}_profiles.gif")
+    frames[0].save(
+        gif_path,
+        save_all=True,
+        append_images=frames[1:],
+        loop=0,
+        duration=300,
+    )
+    logger.info(f"Saved profile GIF to {gif_path}")
 
 
 def _get_shot_data(shot: int, ds_path: str) -> xr.Dataset:
