@@ -111,30 +111,33 @@ def characterize_dataset(ds_path: str = config.d3d_hp_dataset_path) -> None:
         ds_path (str): Path to the dataset.
     """
 
-    input_ranges = get_trajectory_input_ranges(
-        ds_path,
-        [
-            "ne20_edge",
-            "R0",
-            "gapin",
-            "rxbot",
-            "zxbot",
-            "rxtop",
-            "zxtop",
-            "a_minor",
-            "kappa",
-            "delta_top",
-            "delta_bot",
-        ],
-        shots_times=IP_RAMP_SHOTS,
-    )
-
-    for input_var, stats in input_ranges.items():
-        logger.info(
-            f"Input variable {input_var} has the following statistics during the trajectory portion of the shots:"
+    try:
+        input_ranges = get_trajectory_input_ranges(
+            ds_path,
+            [
+                "ne20_edge",
+                "R0",
+                "gapin",
+                "rxbot",
+                "zxbot",
+                "rxtop",
+                "zxtop",
+                "a_minor",
+                "kappa",
+                "delta_top",
+                "delta_bot",
+            ],
+            shots_times=IP_RAMP_SHOTS,
         )
-        for stat_name, stat_value in stats.items():
-            logger.info(f"    {stat_name}: {stat_value:.5f}")
+
+        for input_var, stats in input_ranges.items():
+            logger.info(
+                f"Input variable {input_var} has the following statistics during the trajectory portion of the shots:"
+            )
+            for stat_name, stat_value in stats.items():
+                logger.info(f"    {stat_name}: {stat_value:.5f}")
+    except Exception as e:
+        logger.error(f"Error characterizing trajectory input ranges: {e}")
 
     controllable_input_ranges = get_controllable_input_errors(
         ds_path,

@@ -863,15 +863,15 @@ def _make_profile_gif(  # noqa: PLR0915, PLR0912
             )
             ida_ne = ida_te = ida_t = None
 
-    # Compute uniform Y-axis limits across all frames (0 to 1.05 x global max)
+    # Compute uniform Y-axis limits across all frames (0 to 1.05 x global max, capped at a reasonable value)
     ne_global_max = max(float(np.nanmax(ne_max)), float(np.nanmax(ne_meas_on_pred_psi)))
     te_global_max = max(float(np.nanmax(te_max)), float(np.nanmax(te_meas_on_pred_psi)))
     if ida_ne is not None:
         ne_global_max = max(ne_global_max, float(np.nanmax(ida_ne)))
     if ida_te is not None:
         te_global_max = max(te_global_max, float(np.nanmax(ida_te)))
-    ne_ylim = (0.0, ne_global_max * 1.05)
-    te_ylim = (0.0, te_global_max * 1.05)
+    ne_ylim = (0.0, min(ne_global_max * 1.05, 2.5))
+    te_ylim = (0.0, min(te_global_max * 1.05, 4))
 
     frames: list = []
     for tidx in fresh_idx:
