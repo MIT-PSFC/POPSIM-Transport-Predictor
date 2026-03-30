@@ -10,3 +10,6 @@
 	path = submodules/gptools
 	url = git@github.com:ZanderKeith/gptools.git
 	branch = zk/cmod-test
+[submodule "submodules/torax"]
+	path = submodules/torax
+	url = https://github.com/google-deepmind/torax.git

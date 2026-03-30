@@ -16,6 +16,7 @@ dependencies = [
     "dynaconf>=3.2.12",
     "wandb>=0.25.0",
     "freeqdsk>=0.5.2",
+    "torax",
 ]
 
 [dependency-groups]
@@ -32,9 +33,9 @@ dev = [
 ]
 
 gpu-orcd = [
-    "jax[cuda12]>=0.7.0,<0.8",
-    "jax-cuda12-plugin==0.7.2",
-    "jax-cuda12-pjrt==0.7.2",
+    "jax[cuda12]",
+    "jax-cuda12-plugin",
+    "jax-cuda12-pjrt",
 ]
 
 [tool.isort]
@@ -47,6 +48,12 @@ packages = ["transport_study"]
 disruption-py = { path = "./submodules/disruption-py", editable = true }
 gptools = { path = "./submodules/gptools", editable = true }
 popsim = { path = "./submodules/popsim", editable = true }
+torax = { path = "./submodules/torax", editable = true }
+
+[tool.uv]
+override-dependencies = [
+    "jax>=0.8.1",
+]
 
 [tool.hatch.build.targets.sdist]
 include = ["transport_study"]
