@@ -33,9 +33,7 @@ dev = [
 ]
 
 gpu-orcd = [
-    "jax[cuda12]",
-    "jax-cuda12-plugin",
-    "jax-cuda12-pjrt",
+    "jax[cuda13]>=0.8.1,<0.9",
 ]
 
 [tool.isort]
@@ -52,7 +50,7 @@ torax = { path = "./submodules/torax", editable = true }
 
 [tool.uv]
 override-dependencies = [
-    "jax>=0.8.1",
+  "jax[cuda13]>=0.8.1,<0.9",
 ]
 
 [tool.hatch.build.targets.sdist]

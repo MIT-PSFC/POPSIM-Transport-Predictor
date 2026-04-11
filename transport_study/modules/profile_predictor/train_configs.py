@@ -1,6 +1,9 @@
 from transport_study.modules.profile_predictor.module import (
     ShapeType,
 )
+from transport_study.modules.profile_predictor.torax_trb import (
+    ProfilePredictorToraxTRB,
+)
 from transport_study.modules.profile_predictor.trb import (
     ProfilePredictorTRB,
 )
@@ -49,6 +52,46 @@ PROFILE_PREDICTOR_SHAPE_INIT_CONFIG = {
     },
     "trainable_getter_config": {
         "freeze_shapes": True,
+    },
+}
+
+PROFILE_PREDICTOR_TORAX_CONFIG = {
+    "project": "profile_predictor_torax",
+    "train_run_builder": ProfilePredictorToraxTRB,
+    "max_epochs": 100,
+    "epochs_per_val": 10,
+    "checkpoint_dir": None,
+    "dataloader_config": {
+        "input_vars": [
+            "Ip_MA",
+            "B0",
+            "betan",
+            "ne20_edge",
+            "R0",
+            "a_minor",
+            "kappa",
+            "delta_top",
+            "delta_bot",
+        ],
+        "target_vars": ["ne20_psi", "Te_keV_psi"],
+    },
+    "model_init_config": {
+        "nn_depth": 3,
+        "nn_width": 32,
+        "dt_steady": 5.0,
+        "n_rho": 25,
+        "t_edge_keV": 0.2,
+        "prng_seed": 42,
+    },
+    "loss_config": {
+        "huber_delta": 0.5,
+    },
+    "optimizer_config": {
+        "lr0": 1e-3,
+        "transition_steps": 200,
+        "decay_rate": 0.5,
+        "lrf": 1e-4,
+        "weight_decay": 1e-4,
     },
 }
 
