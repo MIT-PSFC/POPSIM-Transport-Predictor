@@ -1,0 +1,5 @@
+transport_study/datasets/sample/ filter=lfs diff=lfs merge=lfs -text
+transport_study/datasets/sample/cmod_high.nc filter=lfs diff=lfs merge=lfs -text
+transport_study/datasets/sample/cmod_low_1.nc filter=lfs diff=lfs merge=lfs -text
+transport_study/datasets/sample/cmod_low_2.nc filter=lfs diff=lfs merge=lfs -text
+transport_study/datasets/sample/cmod_recent.nc filter=lfs diff=lfs merge=lfs -text
