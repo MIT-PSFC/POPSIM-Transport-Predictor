@@ -6,8 +6,6 @@ readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "pre-commit>=4.3.0",
-    "disruption-py",
-    "gptools",
     "popsim",
     "xarray",
     "netcdf4",
@@ -43,8 +41,6 @@ profile = "black"
 packages = ["transport_study"]
 
 [tool.uv.sources]
-disruption-py = { path = "./submodules/disruption-py", editable = true }
-gptools = { path = "./submodules/gptools", editable = true }
 popsim = { path = "./submodules/popsim", editable = true }
 torax = { path = "./submodules/torax", editable = true }
 

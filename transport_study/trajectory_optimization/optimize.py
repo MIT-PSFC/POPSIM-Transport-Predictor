@@ -168,7 +168,9 @@ class TrajectoryOptimization:
                 "checkpoint_dir": self.checkpoint_dir(case),
                 "dataloader_config": {
                     **base_trajopt_config.dataloader_config,
-                    "ds_path": config.d3d_hp_dataset_path,  # Needed for profile predictor submodule
+                    "ds_path": config.dataset_paths.get(
+                        config.target_device
+                    ),  # Needed for profile predictor submodule
                     "ref_shot": config.ref_shot,  # The shot we are basing our optimization on
                     "scratch_dir": config.scratch_dir,
                     "debug": config.debug,

@@ -12,7 +12,7 @@ from popsim.ml.eval import EvalData, EvaluationSuite
 
 from transport_study import EPISODE_DIM, TIME_COORD, TIME_DIM
 from transport_study.modules.power_balance.p_rad.module import RadiatedPower
-from transport_study.orchestration.organize_data import DS_SOURCE_TO_IDX
+from transport_study.orchestration.organize_data import dataset_config
 
 
 class RadiatedPowerTRB(TrainRunBuilder):
@@ -78,19 +78,17 @@ class RadiatedPowerTRB(TrainRunBuilder):
     @staticmethod
     def get_loss_fn(loss_config: dict) -> Callable[[Any, Any], jnp.ndarray]:
         if "device_weights" not in loss_config:
-            device_weights = {
-                "cmod": 1.0,
-                "tcv": 1.0,
-                "d3d_lp": 1.0,
-                "d3d_hp": 1.0,
-            }
+            device_weights = dict.fromkeys(dataset_config.dataset_paths, 1.0)
         else:
             device_weights = loss_config["device_weights"]
 
         def loss_fn(pred, targ):
             absolute_error = jnp.abs(pred.P_rad_MW_pred - targ["P_rad_MW"].data)
             for device, weight in device_weights.items():
-                device_mask = targ["ds_source_idx"].data == DS_SOURCE_TO_IDX[device]
+                device_mask = (
+                    targ["ds_source_idx"].data
+                    == dataset_config.ds_source_to_idx[device]
+                )
                 absolute_error = jnp.where(
                     device_mask, weight * absolute_error, absolute_error
                 )

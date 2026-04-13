@@ -104,7 +104,9 @@ def get_controllable_input_errors(
     return input_errors
 
 
-def characterize_dataset(ds_path: str = config.d3d_hp_dataset_path) -> None:
+def characterize_dataset(
+    ds_path: str = config.dataset_paths.get(config.target_device),
+) -> None:
     """Load the dataset and print out some basic statistics to help scope the optimization problem.
 
     Args:

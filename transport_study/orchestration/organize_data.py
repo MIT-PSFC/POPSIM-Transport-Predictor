@@ -1,3 +1,8 @@
+import dataclasses
+import json
+from dataclasses import dataclass
+from pathlib import Path
+
 import jax
 import numpy as np
 import xarray as xr
@@ -11,9 +16,75 @@ from scipy.linalg import fractional_matrix_power
 from transport_study import EPISODE_DIM, TIME_COORD, TIME_DIM
 from transport_study.config import TRAIN_VAL_SPLIT, config
 
-# Canonical idx for each device, used to pass device identity through the dataloader as a float variable.
-DS_SOURCE_TO_IDX: dict[str, int] = {"cmod": 0, "tcv": 1, "d3d_lp": 2, "d3d_hp": 3}
-IDX_TO_DS_SOURCE: dict[int, str] = {v: k for k, v in DS_SOURCE_TO_IDX.items()}
+
+@dataclass(frozen=True)
+class TrainingData:
+    """Specifies which source devices to use for training.
+
+    sources: frozenset of device keys (must be registered in DatasetConfig)
+    exnihilo: if True, load sources for normalization only - strip them from the
+              actual training set, leaving only target device shots.
+    """
+
+    sources: frozenset
+    exnihilo: bool = False
+
+    def __str__(self) -> str:
+        if self.exnihilo:
+            return "exnihilo"
+        return "_".join(sorted(self.sources))
+
+    def __post_init__(self):
+        paths_from_env = set(dataset_config.dataset_paths.keys())
+        if (
+            paths_from_env
+        ):  # Skip validation if dataset_config not yet loaded (e.g. tests)
+            unknown = set(self.sources) - paths_from_env
+            if unknown:
+                raise ValueError(
+                    f"Unknown dataset sources: {unknown}. Known: {paths_from_env}"
+                )
+
+
+@dataclass
+class DatasetConfig:
+    """Locks in the dataset-to-index mapping for a study.
+
+    Saved to the study working directory on first run and checked on subsequent
+    runs to detect env var changes that would shift model checkpoint indices.
+    """
+
+    dataset_paths: dict  # name -> path string
+    ds_source_to_idx: dict  # name -> integer index (sorted for stability)
+    target_device: str | None
+
+    @classmethod
+    def from_env(cls) -> "DatasetConfig":
+        paths = {k: str(v) for k, v in config.dataset_paths.items()}
+        idx = {name: i for i, name in enumerate(sorted(paths))}
+        return cls(
+            dataset_paths=paths,
+            ds_source_to_idx=idx,
+            target_device=config.target_device,
+        )
+
+    def save(self, path: str):
+        with open(path, "w") as f:
+            json.dump(dataclasses.asdict(self), f, indent=2)
+
+    @classmethod
+    def load(cls, path: str) -> "DatasetConfig":
+        with open(path) as f:
+            return cls(**json.load(f))
+
+    @property
+    def idx_to_ds_source(self) -> dict:
+        return {v: k for k, v in self.ds_source_to_idx.items()}
+
+
+# Module-level singleton built from env vars at import time.
+# Imported by study.py (for save/check) and TRBs (for index lookup).
+dataset_config = DatasetConfig.from_env()
 
 
 def _add_ds_source_idx(ds: xr.Dataset) -> xr.Dataset:
@@ -27,13 +98,14 @@ def _add_ds_source_idx(ds: xr.Dataset) -> xr.Dataset:
     ds_source = ds.coords["ds_source"]
     float_type = ds[next(iter(ds.data_vars))].dtype  # match dataset float precision
     if ds_source.dims == ():  # scalar coordinate for single device
-        int_val = DS_SOURCE_TO_IDX[ds_source.item()]
+        int_val = dataset_config.ds_source_to_idx[ds_source.item()]
         arr = np.full(
             (ds.sizes[EPISODE_DIM], ds.sizes[TIME_DIM]), int_val, dtype=float_type
         )
     else:  # per-shot coordinate (shot,)
         int_vals = np.array(
-            [DS_SOURCE_TO_IDX[s] for s in ds_source.values], dtype=float_type
+            [dataset_config.ds_source_to_idx[s] for s in ds_source.values],
+            dtype=float_type,
         )
         arr = np.broadcast_to(
             int_vals[:, None], (len(int_vals), ds.sizes[TIME_DIM])
@@ -42,7 +114,9 @@ def _add_ds_source_idx(ds: xr.Dataset) -> xr.Dataset:
 
 
 REQUIRED_SIGNALS_POWER_BALANCE = [
+    # Target
     "Wtot_MJ",
+    # Inputs
     "Ip_MA",
     "B0",
     "R0",
@@ -52,10 +126,11 @@ REQUIRED_SIGNALS_POWER_BALANCE = [
 INPUT_POWER_SIGNALS = ["P_ECRH_MW", "P_NBI_MW", "P_ICRF_MW", "P_LH_MW"]
 
 REQUIRED_SIGNALS_PROFILE_TRANSFER = [
-    "time",
+    # Target-related
     "Te_keV_psi",
     "ne20_psi",
-    "fresh_profiles",
+    "fresh_profiles",  # Needed so we only train on time points where the profile data is fresh, avoiding forward-filled.
+    # Inputs
     "Ip_MA",
     "B0",
     "betan",
@@ -65,6 +140,8 @@ REQUIRED_SIGNALS_PROFILE_TRANSFER = [
     "kappa",
     "delta_top",
     "delta_bot",
+    # Extra
+    "time",  # TODO(ZanderKeith) I forget why this was here
     "Wtot_MJ",  # Not strictly necessary but used for performance extrapolation
 ]
 
@@ -122,16 +199,11 @@ def get_ds(
     Returns:
         tuple[xr.Dataset, str]: The processed dataset and the dimension along which to group the data
     """
-    if source_ds == "cmod":
-        ds_path = config.cmod_dataset_path
-    elif source_ds == "tcv":
-        ds_path = config.tcv_dataset_path
-    elif source_ds == "d3d_lp":
-        ds_path = config.d3d_lp_dataset_path
-    elif source_ds == "d3d_hp":
-        ds_path = config.d3d_hp_dataset_path
-    else:
-        raise ValueError(f"Unknown source dataset: {source_ds}")
+    if source_ds not in dataset_config.dataset_paths:
+        raise ValueError(
+            f"Unknown source dataset: {source_ds!r}. Available: {set(dataset_config.dataset_paths)}"
+        )
+    ds_path = Path(dataset_config.dataset_paths[source_ds])
 
     ds = xr.open_dataset(ds_path).astype(
         jax.numpy.float64 if jax.config.jax_enable_x64 else jax.numpy.float32
@@ -209,8 +281,8 @@ def add_performance(
     performance metric reaches its 95th percentile for plotting in parameter space
     """
 
-    max_Wtot = ds["Wtot_MJ"].max().item()
-    max_Ip = ds["Ip_MA"].max().item()
+    max_Wtot = float(ds["Wtot_MJ"].max().values)
+    max_Ip = float(ds["Ip_MA"].max().values)
     Wtot_scale = 1.0 / max_Wtot if max_Wtot != 0 else 1.0
     Ip_scale = 1.0 / max_Ip if max_Ip != 0 else 1.0
 
@@ -557,7 +629,7 @@ def normalize_domain(  # noqa: PLR0915
 
 
 def get_train_val_datasets(
-    training_data: str,
+    training_data: "TrainingData",
     data_normalization: str,
     study_type: str = "profile_transfer",
     debug: bool | None = config.debug,
@@ -565,83 +637,42 @@ def get_train_val_datasets(
     """
     Split dataset into training and validation sets based on the specified training data case.
 
-    The reason why we only have train and val sets here is because our true test set is the high-performance D3D shots, handled separately.
-    That means all our historic data can be used for training (with the model) and validation (picking the best checkpoint / hyperparameters).
+    The reason why we only have train and val sets here is because our true test set is the
+    high-performance target device shots, handled separately.
+    That means all historic source data can be used for training and validation.
     """
+    ds_sources: dict[str, tuple] = {}
+    episode_coord = None
 
-    if training_data in ["cmod", "tcv", "d3d_lp"]:
-        # Single device historic training data
-        ds, episode_coord = get_ds(training_data, study_type, debug=debug)
+    for source in sorted(training_data.sources):  # sorted for determinism
+        ds, episode_coord = get_ds(source, study_type, debug=debug)
         ds = add_performance(ds, episode_coord)
-        train_ds, val_ds = split_dataset_by_fracs(
+        train_src, val_src = split_dataset_by_fracs(
             ds,
             fracs=TRAIN_VAL_SPLIT,
             dim=episode_coord,
             seed=42,
             sortby="performance",
         )
-        train_ds = train_ds.assign_coords(ds_source=training_data)
-        val_ds = val_ds.assign_coords(ds_source=training_data)
+        train_src = train_src.assign_coords(ds_source=source)
+        val_src = val_src.assign_coords(ds_source=source)
+        ds_sources[source] = (train_src, val_src)
 
+    if not ds_sources:
+        raise ValueError(
+            "training_data.sources is empty - cannot build train/val datasets"
+        )
+
+    if len(ds_sources) == 1:
+        source = next(iter(ds_sources))
+        train_ds, val_ds = ds_sources[source]
     else:
-        # Multi-device historic training data
-        ds_cmod, episode_coord = get_ds("cmod", study_type=study_type, debug=debug)
-        ds_cmod = add_performance(ds_cmod, episode_coord)
-        train_ds_cmod, val_ds_cmod = split_dataset_by_fracs(
-            ds_cmod,
-            fracs=TRAIN_VAL_SPLIT,
-            dim=episode_coord,
-            seed=42,
-            sortby="performance",
+        train_ds = concat_with_nan_padding(
+            [pair[0] for pair in ds_sources.values()], concat_dim=episode_coord
         )
-        train_ds_cmod = train_ds_cmod.assign_coords(ds_source="cmod")
-        val_ds_cmod = val_ds_cmod.assign_coords(ds_source="cmod")
-
-        ds_tcv, episode_coord = get_ds("tcv", study_type=study_type, debug=debug)
-        ds_tcv = add_performance(ds_tcv, episode_coord)
-        train_ds_tcv, val_ds_tcv = split_dataset_by_fracs(
-            ds_tcv,
-            fracs=TRAIN_VAL_SPLIT,
-            dim=episode_coord,
-            seed=42,
-            sortby="performance",
+        val_ds = concat_with_nan_padding(
+            [pair[1] for pair in ds_sources.values()], concat_dim=episode_coord
         )
-        train_ds_tcv = train_ds_tcv.assign_coords(ds_source="tcv")
-        val_ds_tcv = val_ds_tcv.assign_coords(ds_source="tcv")
-
-        if training_data in ["cmod_tcv"]:
-            train_ds = concat_with_nan_padding(
-                [train_ds_cmod, train_ds_tcv], concat_dim=episode_coord
-            )
-            val_ds = concat_with_nan_padding(
-                [val_ds_cmod, val_ds_tcv], concat_dim=episode_coord
-            )
-
-        elif training_data == "cmod_tcv_d3d_lp":
-            ds_d3d_lp, episode_coord = get_ds(
-                "d3d_lp", study_type=study_type, debug=debug
-            )
-            ds_d3d_lp = add_performance(ds_d3d_lp, episode_coord)
-            train_ds_d3d_lp, val_ds_d3d_lp = split_dataset_by_fracs(
-                ds_d3d_lp,
-                fracs=TRAIN_VAL_SPLIT,
-                dim=episode_coord,
-                seed=42,
-                sortby="performance",
-            )
-            train_ds_d3d_lp = train_ds_d3d_lp.assign_coords(ds_source="d3d_lp")
-            val_ds_d3d_lp = val_ds_d3d_lp.assign_coords(ds_source="d3d_lp")
-
-            train_ds = concat_with_nan_padding(
-                [train_ds_cmod, train_ds_tcv, train_ds_d3d_lp],
-                concat_dim=episode_coord,
-            )
-            val_ds = concat_with_nan_padding(
-                [val_ds_cmod, val_ds_tcv, val_ds_d3d_lp],
-                concat_dim=episode_coord,
-            )
-        else:
-            raise ValueError(f"Unknown training data case: {training_data}")
 
     logger.debug("Historic Training dataset size: {}", train_ds.sizes[episode_coord])
     logger.debug("Historic Validation dataset size: {}", val_ds.sizes[episode_coord])
@@ -655,7 +686,7 @@ def get_train_val_datasets(
 
 
 def get_train_test_datasets(
-    training_data: str,
+    training_data: "TrainingData",
     data_normalization: str,
     domain_adaptation: str,
     num_hp_shots: int,
@@ -665,61 +696,53 @@ def get_train_test_datasets(
 ):
     """
     Split dataset into training and test sets for the target learning case.
-    If domain adaptation is 'mixing', makes a combined training set of historic data and high-performance DIII-D shots,
-    while if domain adaptation is 'transfer' or the training data case is 'exnihilo', removes all historic data from the training set, leaving only the high-performance DIII-D shots.
-    The number of high-performance shots included in training is specified by `num_hp_shots`.
+    If domain adaptation is 'mixing', makes a combined training set of historic data and target
+    device shots. If domain adaptation is 'transfer' or training_data.exnihilo is True, removes
+    all historic data from the training set, leaving only the target device shots.
+    The number of target shots included in training is specified by `num_hp_shots`.
 
-    The test set is always the same set of high-performance DIII-D shots
-    The training set is made up of the historic data specified by `training_data` plus the `num_hp_shots` highest-performing shots from DIII-D.
+    The test set is always the same set of target device shots.
+    The training set is the historic data from training_data.sources plus num_hp_shots target shots.
 
-    There is no validation set in this case, since we are not tuning hyperparameters in this case.
-    We are treating the test set as a validation set in a sense, since we are using it to pick the best checkpoint for evaluation,
-    which I understand is a bit cheaty but given the extremely limited amount of high-performance data in some cases
-    it would be better to do this than train and validate on the same 3-4 high-performance shots.
-
-    Since we're doing this for all the models it should be a fair comparison.
+    There is no validation set here since hyperparameters are not tuned on transfer learning data.
+    We treat the test set as a validation set for checkpoint selection, which is slightly optimistic
+    but consistent across all models so comparisons are fair.
     """
+    target = dataset_config.target_device
+    if target is None:
+        raise ValueError("PTPS_DS_TARGET must be set for transfer learning")
 
-    # Load the high-performance dataset and split into train/test
-    # No validation needed because we are not tuning hyperparameters on transfer learning data
-    ds_hp, episode_coord = get_ds("d3d_hp", study_type=study_type, debug=debug)
+    # Load the target device dataset and split into train/test
+    ds_hp, episode_coord = get_ds(target, study_type=study_type, debug=debug)
     ds_hp = add_performance(ds_hp, episode_coord)
-    ds_hp = ds_hp.assign_coords(ds_source="d3d_hp")
+    ds_hp = ds_hp.assign_coords(ds_source=target)
     sorted_shots = np.argsort(ds_hp["performance"].values)
 
     test_shot_pool = sorted_shots[-hp_test_set_size:]
     test_ds = ds_hp.isel({episode_coord: test_shot_pool})
 
     if num_hp_shots == -1:
-        # If num_hp_shots is -1, put all available high-performance shots in training and testing set (this is cheating, but allows us to see the maximum theoretical performance)
+        # All available target shots in training and testing (upper-bound reference)
         train_ds_hp = ds_hp.isel({episode_coord: sorted_shots})
     else:
         train_shot_pool = sorted_shots[:num_hp_shots]
         train_ds_hp = ds_hp.isel({episode_coord: train_shot_pool})
 
-    # Load historic data and put it all in the training set
-    if training_data == "exnihilo":
-        # Exnihilo still needs historic data for normalization,
-        # we will strip out all the data from historic devices later
-        train_ds_hist, val_ds_hist = get_train_val_datasets(
-            "cmod_tcv", data_normalization, study_type=study_type, debug=debug
-        )
-    else:
-        train_ds_hist, val_ds_hist = get_train_val_datasets(
-            training_data, data_normalization, study_type=study_type, debug=debug
-        )
+    # Load historic source data for training (and for exnihilo: normalization only)
+    # exnihilo.sources contains all non-target devices, so we can pass training_data directly
+    train_ds_hist, val_ds_hist = get_train_val_datasets(
+        training_data, data_normalization, study_type=study_type, debug=debug
+    )
     train_ds = concat_with_nan_padding(
         [train_ds_hist, val_ds_hist, train_ds_hp],
         concat_dim=episode_coord,
     )
-    # Normalize the combined dataset (using only the historic data to calculate normalization parameters to avoid data leakage from the test set)
+    # Normalize using only historic data to avoid leakage from the test set
     train_ds, test_ds = normalize_domain(train_ds, test_ds, method=data_normalization)
 
-    # Now depending on the domain adaptation method / training data case, remove stuff from the training set
-    # Everything should already be set up for the 'mixing' case, but the 'transfer' and 'exnihilo' cases require removing historic data from the training set
-    if domain_adaptation == "transfer" or training_data == "exnihilo":
-        # Remove all the historic data from the training set, leaving only the high-performance DIII-D shots
-        train_ds = train_ds.where(train_ds.coords["ds_source"] == "d3d_hp", drop=True)
+    # For 'transfer' and exnihilo: strip historic data, train only on target device shots
+    if domain_adaptation == "transfer" or training_data.exnihilo:
+        train_ds = train_ds.where(train_ds.coords["ds_source"] == target, drop=True)
 
     logger.debug("HP Training dataset size: {}", train_ds.sizes[episode_coord])
     logger.debug("HP Test dataset size: {}", test_ds.sizes[episode_coord])

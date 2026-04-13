@@ -22,7 +22,7 @@ from transport_study.modules.power_balance.module import (
 from transport_study.modules.power_balance.p_oh.trb import OhmicPowerTRB
 from transport_study.modules.power_balance.p_rad.trb import RadiatedPowerTRB
 from transport_study.orchestration.organize_data import (
-    DS_SOURCE_TO_IDX,
+    dataset_config,
     get_train_test_datasets,
     get_train_val_datasets,
 )
@@ -47,10 +47,11 @@ class PowerBalanceTRB(TrainRunBuilder):
         Also, slightly different from the POPSIM version, we're just returning the validation dataset.
         """
 
+        training_data = dataloader_config["training_data"]
         if dataloader_config["domain_adaptation"] is None:
             logger.info("Using standard learning dataloader")
             ds_train, ds_val = get_train_val_datasets(
-                training_data=dataloader_config["training_data"],
+                training_data=training_data,
                 data_normalization=dataloader_config["data_normalization"],
             )
         else:
@@ -58,7 +59,7 @@ class PowerBalanceTRB(TrainRunBuilder):
                 f"Using transfer learning dataloader with domain adaptation {dataloader_config['domain_adaptation']}"
             )
             ds_train, ds_val = get_train_test_datasets(
-                training_data=dataloader_config["training_data"],
+                training_data=training_data,
                 data_normalization=dataloader_config["data_normalization"],
                 domain_adaptation=dataloader_config["domain_adaptation"],
                 num_hp_shots=dataloader_config["num_hp_shots"],
@@ -240,12 +241,7 @@ class PowerBalanceTRB(TrainRunBuilder):
     @staticmethod
     def get_loss_fn(loss_config: dict) -> Callable[[Any, Any], jnp.ndarray]:
         if "device_weights" not in loss_config:
-            device_weights = {
-                "cmod": 1.0,
-                "tcv": 1.0,
-                "d3d_lp": 1.0,
-                "d3d_hp": 1.0,
-            }
+            device_weights = dict.fromkeys(dataset_config.dataset_paths, 1.0)
         else:
             device_weights = loss_config["device_weights"]
 
@@ -261,7 +257,7 @@ class PowerBalanceTRB(TrainRunBuilder):
             sample_weights = jnp.ones(ds_source_idx.shape, dtype=huber_loss.dtype)
             for device, weight in device_weights.items():
                 sample_weights = jnp.where(
-                    ds_source_idx == DS_SOURCE_TO_IDX[device],
+                    ds_source_idx == dataset_config.ds_source_to_idx[device],
                     weight,
                     sample_weights,
                 )

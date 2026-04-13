@@ -269,16 +269,17 @@ class ProfilePredictorToraxTRB(TrainRunBuilder):
         dataloader_config: dict,
     ) -> tuple[xr.Dataset, tuple[DataLoader, DataLoader, DataLoader]]:
         """Same data-loading logic as :class:`ProfilePredictorTRB`."""
+        training_data = dataloader_config["training_data"]
         if dataloader_config["domain_adaptation"] is None:
             ds_train, ds_val = get_train_val_datasets(
-                training_data=dataloader_config["training_data"],
+                training_data=training_data,
                 data_normalization=dataloader_config["data_normalization"],
                 study_type="profile_transfer",
                 debug=dataloader_config.get("debug", False),
             )
         else:
             ds_train, ds_val = get_train_test_datasets(
-                training_data=dataloader_config["training_data"],
+                training_data=training_data,
                 data_normalization=dataloader_config["data_normalization"],
                 domain_adaptation=dataloader_config["domain_adaptation"],
                 num_hp_shots=dataloader_config["num_hp_shots"],

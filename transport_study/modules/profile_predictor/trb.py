@@ -21,7 +21,7 @@ from transport_study.modules.profile_predictor.module import (
     pca_initial_guess,
 )
 from transport_study.orchestration.organize_data import (
-    DS_SOURCE_TO_IDX,
+    dataset_config,
     get_train_test_datasets,
     get_train_val_datasets,
 )
@@ -48,18 +48,19 @@ class ProfilePredictorTRB(TrainRunBuilder):
         Also, slightly different from the POPSIM version, we're just returning the validation dataset.
         """
 
+        training_data = dataloader_config["training_data"]
         if dataloader_config["domain_adaptation"] is None:
             logger.info("Using standard learning dataloader")
-            if dataloader_config["training_data"] != "exnihilo":
+            if not training_data.exnihilo:
                 ds_train, ds_val = get_train_val_datasets(
-                    training_data=dataloader_config["training_data"],
+                    training_data=training_data,
                     data_normalization=dataloader_config["data_normalization"],
                     study_type="profile_transfer",
                     debug=dataloader_config.get("debug", False),
                 )
             else:
                 ds_train, ds_val = get_train_test_datasets(
-                    training_data=dataloader_config["training_data"],
+                    training_data=training_data,
                     data_normalization=dataloader_config["data_normalization"],
                     domain_adaptation=None,
                     num_hp_shots=dataloader_config["num_hp_shots"],
@@ -67,12 +68,11 @@ class ProfilePredictorTRB(TrainRunBuilder):
                     study_type="profile_transfer",
                     debug=dataloader_config.get("debug", False),
                 )
-                # Double check there's no historic data anywhere in here
-                if (
-                    (ds_train["ds_source"] == "cmod").any()
-                    or (ds_train["ds_source"] == "tcv").any()
-                    or (ds_train["ds_source"] == "d3d_lp").any()
-                ):
+                # Double check there's no source (non-target) data anywhere in here
+                non_target = set(dataset_config.dataset_paths.keys()) - {
+                    dataset_config.target_device
+                }
+                if any((ds_train["ds_source"] == src).any() for src in non_target):
                     raise ValueError(
                         "Historic data found in training set for exnihilo training_data option. Please check the dataset construction logic."
                     )
@@ -81,7 +81,7 @@ class ProfilePredictorTRB(TrainRunBuilder):
                 f"Using transfer learning dataloader with domain adaptation {dataloader_config['domain_adaptation']}"
             )
             ds_train, ds_val = get_train_test_datasets(
-                training_data=dataloader_config["training_data"],
+                training_data=training_data,
                 data_normalization=dataloader_config["data_normalization"],
                 domain_adaptation=dataloader_config["domain_adaptation"],
                 num_hp_shots=dataloader_config["num_hp_shots"],
@@ -182,12 +182,7 @@ class ProfilePredictorTRB(TrainRunBuilder):
     @staticmethod
     def get_loss_fn(loss_config: dict) -> Callable[[Any, Any], jnp.ndarray]:
         if "device_weights" not in loss_config:
-            device_weights = {
-                "cmod": 1.0,
-                "tcv": 1.0,
-                "d3d_lp": 1.0,
-                "d3d_hp": 1.0,
-            }
+            device_weights = dict.fromkeys(dataset_config.dataset_paths, 1.0)
         else:
             device_weights = loss_config["device_weights"]
 
@@ -208,7 +203,9 @@ class ProfilePredictorTRB(TrainRunBuilder):
             sample_weights = jnp.ones(ds_source_idx.shape, dtype=ne_huber.dtype)
             for device, weight in device_weights.items():
                 sample_weights = jnp.where(
-                    ds_source_idx == DS_SOURCE_TO_IDX[device], weight, sample_weights
+                    ds_source_idx == dataset_config.ds_source_to_idx[device],
+                    weight,
+                    sample_weights,
                 )
 
             # Broadcast sample weights across profile/time axes

@@ -20,3 +20,7 @@ All the modules implemented as part of this study
 
 `profile_trajectory`: Used for DIII-D trajectory optimization
 - Has a slightly different version of the profile predictor module
+
+# Generative AI Disclosure
+
+Github Copilot and Claude Code were used for code completion, snippet generation, and code review. However, the results of this were carefully vetted. A human has read and understands every line in this repo.

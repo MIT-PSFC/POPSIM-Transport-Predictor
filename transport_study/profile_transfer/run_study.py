@@ -12,18 +12,38 @@ from popsim.ml import TrainConfig
 
 from transport_study import PACKAGE_ROOT
 from transport_study.config import config
+from transport_study.orchestration.organize_data import TrainingData, dataset_config
 from transport_study.orchestration.study import Study
 from transport_study.orchestration.wandb_utils import (
     run_clean_sweeps,
 )
 
 
+def _parse_training_data(s: str) -> TrainingData:
+    """Convert a string like 'cmod_tcv' or 'exnihilo' to a TrainingData object."""
+    if s == "exnihilo":
+        target = dataset_config.target_device
+        non_target = frozenset(dataset_config.dataset_paths.keys()) - (
+            {target} if target else set()
+        )
+        return TrainingData(sources=non_target, exnihilo=True)
+    return TrainingData(sources=frozenset(s.split("_")))
+
+
 class ProfileStudy(Study):
-    HYPERPARAM_TRAINING_DATA = "cmod_tcv"
     HYPERPARAM_DATA_NORMALIZATION = "physics"
     HYPERPARAM_DOMAIN_ADAPTATION = None
     HYPERPARAM_FREEZE_SHAPES = True
     HYPERPARAM_NUM_HP_SHOTS = -1
+
+    @classmethod
+    def _hyperparam_training_data(cls) -> TrainingData:
+        """All configured non-target source devices - the canonical hyperparam case."""
+        target = dataset_config.target_device
+        sources = frozenset(dataset_config.dataset_paths.keys()) - (
+            {target} if target else set()
+        )
+        return TrainingData(sources=sources)
 
     ##################
     # INITIALIZATION #
@@ -57,18 +77,18 @@ class ProfileStudy(Study):
         """
 
         model_type: str
-        training_data: str  # cmod, tcv, cmod_tcv, exnihilo
+        training_data: TrainingData
         data_normalization: str  # raw, physics, z_score, coral
         domain_adaptation: str  # none, mixing, transfer
         freeze_shapes: bool
-        num_hp_shots: int  # Number of high-performance shots included in training, or -1 for all (should be -1 if domain_adaptation is None)
+        num_hp_shots: int  # Number of target shots included in training, or -1 for all (should be -1 if domain_adaptation is None)
         prereqs: (
             list[Study.Case] | None
         )  # If not None, this case depends on the results of another case, and should only be run after that case has been run
 
         def is_hyperparam_case(self) -> bool:
             if (
-                self.training_data == ProfileStudy.HYPERPARAM_TRAINING_DATA
+                self.training_data == ProfileStudy._hyperparam_training_data()
                 and self.data_normalization
                 == ProfileStudy.HYPERPARAM_DATA_NORMALIZATION
                 and self.domain_adaptation == ProfileStudy.HYPERPARAM_DOMAIN_ADAPTATION
@@ -81,14 +101,14 @@ class ProfileStudy(Study):
 
         def is_impossible(self) -> bool:
             """Some cases don't make sense to run. Mark those cases as impossible and raise an error if we try to run them."""
-            # Can't do transfer learning or training from nothing with 0 high-performance shots.
+            # Can't do transfer learning or training from nothing with 0 target shots.
             if (
-                self.domain_adaptation == "transfer" or self.training_data == "exnihilo"
+                self.domain_adaptation == "transfer" or self.training_data.exnihilo
             ) and self.num_hp_shots == 0:
                 return True
 
-            # The whole point of exnihilo is training from nothing, so it doesn't make sense to have domain adaptation in that case since there's no source domain to adapt from
-            if self.training_data == "exnihilo" and self.domain_adaptation is not None:
+            # exnihilo means training from nothing - no source domain to adapt from
+            if self.training_data.exnihilo and self.domain_adaptation is not None:
                 return True
 
             return False
@@ -99,7 +119,7 @@ class ProfileStudy(Study):
             else:
                 return ProfileStudy.Case(
                     model_type=self.model_type,
-                    training_data=ProfileStudy.HYPERPARAM_TRAINING_DATA,
+                    training_data=ProfileStudy._hyperparam_training_data(),
                     data_normalization=ProfileStudy.HYPERPARAM_DATA_NORMALIZATION,
                     domain_adaptation=ProfileStudy.HYPERPARAM_DOMAIN_ADAPTATION,
                     freeze_shapes=ProfileStudy.HYPERPARAM_FREEZE_SHAPES,
@@ -109,12 +129,14 @@ class ProfileStudy(Study):
         def __init__(
             self,
             model_type: str,
-            training_data: str,
+            training_data: TrainingData | str,
             data_normalization: str,
             domain_adaptation: str,
             freeze_shapes: bool,
             num_hp_shots: int,
         ):
+            if isinstance(training_data, str):
+                training_data = _parse_training_data(training_data)
             self.model_type = model_type
             self.training_data = training_data
             self.data_normalization = data_normalization
@@ -142,7 +164,7 @@ class ProfileStudy(Study):
                 prereqs += [
                     ProfileStudy.Case(
                         model_type=model_type,
-                        training_data=ProfileStudy.HYPERPARAM_TRAINING_DATA,
+                        training_data=ProfileStudy._hyperparam_training_data(),
                         data_normalization=ProfileStudy.HYPERPARAM_DATA_NORMALIZATION,
                         domain_adaptation=ProfileStudy.HYPERPARAM_DOMAIN_ADAPTATION,
                         freeze_shapes=ProfileStudy.HYPERPARAM_FREEZE_SHAPES,
@@ -174,7 +196,7 @@ class ProfileStudy(Study):
         def __str__(self):
             if self.domain_adaptation:
                 return f"case.{self.model_type}.td_{self.training_data}.da_{self.domain_adaptation}.freeze_{self.freeze_shapes}.hp_{self.num_hp_shots}"
-            elif self.training_data == "exnihilo":
+            elif self.training_data.exnihilo:
                 return f"case.{self.model_type}.td_{self.training_data}.freeze_{self.freeze_shapes}.hp_{self.num_hp_shots}"
             else:
                 return f"case.{self.model_type}.td_{self.training_data}.freeze_{self.freeze_shapes}"
@@ -191,7 +213,7 @@ class ProfileStudy(Study):
                         self.num_hp_shots,
                     )
                 )
-            elif self.training_data == "exnihilo":
+            elif self.training_data.exnihilo:
                 return hash(
                     (
                         self.model_type,
@@ -239,9 +261,9 @@ class ProfileStudy(Study):
             num_hp_shots_options,
         ):
             if domain_adaptation is None:
-                if training_dataset == "exnihilo":
+                if training_dataset.exnihilo:
                     if num_hp_shots == 0:
-                        continue  # Can't train from nothing with 0 high-performance shots
+                        continue  # Can't train from nothing with 0 target shots
                 elif num_hp_shots != -1:
                     continue  # Invalid case, skip
             if model_type == "unstructured_nn" and not freeze_shapes:
@@ -280,9 +302,8 @@ class ProfileStudy(Study):
         self,
         name: str,
         working_dir_base: str,
-        dataset_paths: dict[str, str],
         model_types: list[str],
-        training_datasets: list[str],
+        training_datasets: list[TrainingData],
         data_normalization_methods: list[str],
         domain_adaptation_methods: list[str],
         freeze_shapes_options: list[bool],
@@ -296,13 +317,7 @@ class ProfileStudy(Study):
             freeze_shapes_options,
             num_hp_shots_options,
         )
-        super().__init__(name, working_dir_base, dataset_paths, cases)
-
-        logger.info(f"C-Mod dataset path: {dataset_paths.get('cmod', 'Not provided')}")
-        logger.info(f"TCV dataset path: {dataset_paths.get('tcv', 'Not provided')}")
-        logger.info(
-            f"DIII-D high-performance dataset path: {dataset_paths.get('d3d_hp', 'Not provided')}"
-        )
+        super().__init__(name, working_dir_base, cases)
 
         logger.info(f"Model types: {model_types}")
         logger.info(f"Training datasets: {training_datasets}")
@@ -627,7 +642,7 @@ class ProfileStudy(Study):
             ).assign_coords(
                 {
                     "model_type": case.model_type,
-                    "training_data": case.training_data,
+                    "training_data": str(case.training_data),
                     "data_normalization": case.data_normalization,
                     "domain_adaptation": case.domain_adaptation,
                     "freeze_shapes": case.freeze_shapes,
@@ -715,7 +730,15 @@ def run_study(  # noqa: PLR0915
             if model_types is None:
                 model_types = ["shape_init_pca", "shape_init_kmeans", "unstructured_nn"]
             if training_datasets is None:
-                training_datasets = ["cmod", "tcv", "cmod_tcv", "exnihilo"]
+                training_datasets = [
+                    _parse_training_data(s)
+                    for s in ["cmod", "tcv", "cmod_tcv", "exnihilo"]
+                ]
+            else:
+                training_datasets = [
+                    _parse_training_data(s) if isinstance(s, str) else s
+                    for s in training_datasets
+                ]
             if data_normalization_methods is None:
                 data_normalization_methods = ["physics"]
             if domain_adaptation_methods is None:
@@ -764,12 +787,6 @@ def run_study(  # noqa: PLR0915
                 ]:
                     raise ValueError(
                         f"Invalid model type: {model_type}. Must be one of 'shape_init_pca', 'shape_init_kmeans', or 'unstructured_nn'."
-                    )
-
-            for training_dataset in training_datasets:
-                if training_dataset not in ["cmod", "tcv", "cmod_tcv", "exnihilo"]:
-                    raise ValueError(
-                        f"Invalid training dataset: {training_dataset}. Must be one of 'cmod', 'tcv', 'cmod_tcv', or 'exnihilo'."
                     )
 
             for data_normalization in data_normalization_methods:
@@ -828,11 +845,6 @@ def run_study(  # noqa: PLR0915
     study = ProfileStudy(
         name=project_name,
         working_dir_base=working_dir_base,
-        dataset_paths={
-            "cmod": config.cmod_dataset_path,
-            "tcv": config.tcv_dataset_path,
-            "d3d_hp": config.d3d_hp_dataset_path,
-        },
         model_types=model_types,
         training_datasets=training_datasets,
         data_normalization_methods=data_normalization_methods,
@@ -885,12 +897,7 @@ def run_study(  # noqa: PLR0915
 
     def _move_data(study: Study):
         logger.info("Moving data to cluster scratch for faster training")
-        for ds_path in [
-            config.cmod_dataset_path,
-            config.tcv_dataset_path,
-            config.d3d_lp_dataset_path,
-            config.d3d_hp_dataset_path,
-        ]:
+        for ds_path in config.dataset_paths.values():
             if ds_path:
                 _, file_name = os.path.split(ds_path)
                 scratch_dir = os.path.join(config.scratch_dir, study.name)

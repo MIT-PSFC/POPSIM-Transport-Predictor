@@ -3,39 +3,14 @@ Load and parse configuration files for the project.
 This is where we set global variables from env vars or config files
 """
 
-import getpass
 import os
 from pathlib import Path
 
 from dynaconf import Dynaconf
+from popsim.data import get_path_to_ml_data_dump, get_path_to_ml_data_scratch
+from pydantic_settings import BaseSettings, SettingsConfigDict
 
-try:
-    from popsim.data import get_path_to_ml_data_dump, get_path_to_ml_data_scratch
-    from pydantic_settings import BaseSettings, SettingsConfigDict
-except ImportError:
-    # This is necessary for omega when numpy 1.0 .venv is in use
-    def get_path_to_ml_data_dump():
-        return Path("/fusion/projects/disruption_warning/data/popsim/")
-
-    def get_path_to_ml_data_scratch():
-        return Path(f"/cscratch/{getpass.getuser()}/")
-
-    class BaseSettings:
-        """Again, dummy thing when numpy 1.0 venv in use"""
-
-    class SettingsConfigDict:
-        def __init__(
-            self,
-            env_prefix,
-            env_file,
-            env_file_encoding,
-            extra,
-        ):
-            """Any day now"""
-
-
-# Get package root directory
-PACKAGE_ROOT = os.path.dirname(os.path.abspath(__file__))
+from transport_study import PACKAGE_ROOT
 
 # 80/20 between train/val
 # 80/20 between train+val/test
@@ -63,23 +38,31 @@ class StudyConfig(BaseSettings):
     wandb_entity: str | None = None
 
     scratch_dir: Path | None = None  # Used for predict-first temp files
-    cmod_dataset_path: Path | None = None
-    tcv_dataset_path: Path | None = None
-    d3d_lp_dataset_path: Path | None = None
-    d3d_hp_dataset_path: Path | None = None
-
-    d3d: dict = {}  # noqa: RUF012
-    cmod: dict = {}  # noqa: RUF012
-    tcv: dict = {}  # noqa: RUF012
-
-    ref_shot: int = 206364
+    ds_target: str | None = (
+        None  # PTPS_DS_TARGET=DEVICE - which device is the HP target
+    )
 
     model_config = SettingsConfigDict(
-        env_prefix="PTPS_",  # Put in .env like PTPS_CMOD_DATASET_PATH
+        env_prefix="PTPS_",  # Datasets: PTPS_DS_DEVICE1=/path1.nc, PTPS_DS_DEVICE2=/path2.nc, etc.
         env_file=".env",
         env_file_encoding="utf-8",
-        extra="ignore",
+        extra="allow",  # Captures all PTPS_DS_* vars dynamically
     )
+
+    @property
+    def dataset_paths(self) -> dict[str, Path]:
+        """All PTPS_DS_* vars except PTPS_DS_TARGET, keyed by lowercased device name."""
+        return {
+            k.removeprefix("ds_"): Path(v)
+            for k, v in self.model_extra.items()
+            if k.startswith("ds_")
+        }
+
+    @property
+    def target_device(self) -> str | None:
+        if self.ds_target is None:
+            return None
+        return self.ds_target.lower()
 
 
 config = StudyConfig()

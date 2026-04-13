@@ -1,12 +1,11 @@
-import numpy as np
-import pytest
 import os
 import shutil
-from transport_study import PACKAGE_ROOT
+
 import chex
+import numpy as np
+import pytest
 
-from transport_study.config import config
-
+from transport_study import PACKAGE_ROOT
 from transport_study.power_balance_transfer.run_study import PowerBalanceStudy
 
 
@@ -16,11 +15,6 @@ def test_power_balance_transfer_cases():
     study = PowerBalanceStudy(
         name="xfer_test",
         working_dir_base=os.path.join(PACKAGE_ROOT, "tests", "test_outputs"),
-        dataset_paths={
-            "cmod": config.cmod_dataset_path,
-            "tcv": config.tcv_dataset_path,
-            "d3d_hp": config.d3d_hp_dataset_path,
-        },
         model_types=["sciml", "unstructured_nn"],
         training_datasets=["cmod", "cmod_tcv"],
         data_normalization_methods=["raw", "coral"],
@@ -66,7 +60,7 @@ def test_power_balance_transfer_cases():
                 expected_prereqs = [
                     PowerBalanceStudy.Case(
                         model_type="p_oh",
-                        training_data=PowerBalanceStudy.HYPERPARAM_TRAINING_DATA,
+                        training_data=PowerBalanceStudy._hyperparam_training_data(),
                         data_normalization=PowerBalanceStudy.HYPERPARAM_DATA_NORMALIZATION,
                         domain_adaptation=PowerBalanceStudy.HYPERPARAM_DOMAIN_ADAPTATION,
                         freeze_submodules=PowerBalanceStudy.HYPERPARAM_FREEZE_SUBMODULES,
@@ -74,7 +68,7 @@ def test_power_balance_transfer_cases():
                     ),
                     PowerBalanceStudy.Case(
                         model_type="p_rad",
-                        training_data=PowerBalanceStudy.HYPERPARAM_TRAINING_DATA,
+                        training_data=PowerBalanceStudy._hyperparam_training_data(),
                         data_normalization=PowerBalanceStudy.HYPERPARAM_DATA_NORMALIZATION,
                         domain_adaptation=PowerBalanceStudy.HYPERPARAM_DOMAIN_ADAPTATION,
                         freeze_submodules=PowerBalanceStudy.HYPERPARAM_FREEZE_SUBMODULES,
@@ -96,7 +90,7 @@ def test_power_balance_transfer_cases():
                 # The hyperparameter tuning case
                 PowerBalanceStudy.Case(
                     model_type=case.model_type,
-                    training_data=PowerBalanceStudy.HYPERPARAM_TRAINING_DATA,
+                    training_data=PowerBalanceStudy._hyperparam_training_data(),
                     data_normalization=PowerBalanceStudy.HYPERPARAM_DATA_NORMALIZATION,
                     domain_adaptation=PowerBalanceStudy.HYPERPARAM_DOMAIN_ADAPTATION,
                     freeze_submodules=PowerBalanceStudy.HYPERPARAM_FREEZE_SUBMODULES,
@@ -127,7 +121,7 @@ def test_power_balance_transfer_cases():
             expected_prereqs = [
                 PowerBalanceStudy.Case(
                     model_type=case.model_type,
-                    training_data=PowerBalanceStudy.HYPERPARAM_TRAINING_DATA,
+                    training_data=PowerBalanceStudy._hyperparam_training_data(),
                     data_normalization=PowerBalanceStudy.HYPERPARAM_DATA_NORMALIZATION,
                     domain_adaptation=PowerBalanceStudy.HYPERPARAM_DOMAIN_ADAPTATION,
                     freeze_submodules=PowerBalanceStudy.HYPERPARAM_FREEZE_SUBMODULES,
@@ -170,11 +164,6 @@ def test_mix_device_weight():
     study = PowerBalanceStudy(
         name="xfer_test",
         working_dir_base=os.path.join(PACKAGE_ROOT, "tests", "test_outputs"),
-        dataset_paths={
-            "cmod": config.cmod_dataset_path,
-            "tcv": config.tcv_dataset_path,
-            "d3d_hp": config.d3d_hp_dataset_path,
-        },
         model_types=["sciml"],
         training_datasets=["cmod_tcv"],
         data_normalization_methods=["coral"],
@@ -200,11 +189,6 @@ def test_submodule_freezing():
     study = PowerBalanceStudy(
         name="test_submodule_freezing",
         working_dir_base=os.path.join(PACKAGE_ROOT, "tests", "test_outputs"),
-        dataset_paths={
-            "cmod": config.cmod_dataset_path,
-            "tcv": config.tcv_dataset_path,
-            "d3d_hp": config.d3d_hp_dataset_path,
-        },
         model_types=["sciml"],
         training_datasets=["cmod_tcv"],
         data_normalization_methods=["coral"],
@@ -283,11 +267,6 @@ def test_transfer_weights():
     study = PowerBalanceStudy(
         name="test_transfer_weights",
         working_dir_base=os.path.join(PACKAGE_ROOT, "tests", "test_outputs"),
-        dataset_paths={
-            "cmod": config.cmod_dataset_path,
-            "tcv": config.tcv_dataset_path,
-            "d3d_hp": config.d3d_hp_dataset_path,
-        },
         model_types=["unstructured_nn"],
         training_datasets=["cmod_tcv"],
         data_normalization_methods=["coral"],
@@ -388,11 +367,6 @@ def test_transfer_weights_frozen_submodules():
     study = PowerBalanceStudy(
         name="test_transfer_weights_frozen_submodules",
         working_dir_base=os.path.join(PACKAGE_ROOT, "tests", "test_outputs"),
-        dataset_paths={
-            "cmod": config.cmod_dataset_path,
-            "tcv": config.tcv_dataset_path,
-            "d3d_hp": config.d3d_hp_dataset_path,
-        },
         model_types=["sciml"],
         training_datasets=["cmod_tcv"],
         data_normalization_methods=["coral"],
@@ -564,11 +538,6 @@ def test_transfer_weights_unfrozen_submodules():
     study = PowerBalanceStudy(
         name="test_transfer_weights_unfrozen_submodules",
         working_dir_base=os.path.join(PACKAGE_ROOT, "tests", "test_outputs"),
-        dataset_paths={
-            "cmod": config.cmod_dataset_path,
-            "tcv": config.tcv_dataset_path,
-            "d3d_hp": config.d3d_hp_dataset_path,
-        },
         model_types=["sciml"],
         training_datasets=["cmod_tcv"],
         data_normalization_methods=["coral"],
@@ -756,11 +725,6 @@ def test_collect_results():
     study = PowerBalanceStudy(
         name="test_collect_results",
         working_dir_base=os.path.join(PACKAGE_ROOT, "tests", "test_outputs"),
-        dataset_paths={
-            "cmod": config.cmod_dataset_path,
-            "tcv": config.tcv_dataset_path,
-            "d3d_hp": config.d3d_hp_dataset_path,
-        },
         model_types=["sciml"],
         training_datasets=["cmod_tcv"],
         data_normalization_methods=["coral"],

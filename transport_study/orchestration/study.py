@@ -15,6 +15,7 @@ from popsim.ml.train_config import load_dict
 
 from transport_study import PACKAGE_ROOT
 from transport_study.config import config
+from transport_study.orchestration.organize_data import DatasetConfig, dataset_config
 from transport_study.orchestration.slurm_utils import (
     count_idle_gpus,
     count_running_jobs,
@@ -27,6 +28,8 @@ from transport_study.orchestration.wandb_utils import (
     get_completed_runs,
     get_sweep_id,
 )
+
+DATASET_CONFIG_FILENAME = "dataset_config.json"
 
 
 class Study:
@@ -96,65 +99,34 @@ class Study:
                 return False
         return True
 
-    def __init__(
-        self,
-        name: str,
-        working_dir_base: str,
-        dataset_paths: dict[str, str],
-        cases: list[Case],
-    ):
-        """
-        Initialize this study with the given name, dataset paths, and cases.
-        """
-        self.name = name
-        self.dataset_paths = dataset_paths
-        self.cases = cases
-
-        self.working_dir = os.path.join(working_dir_base, name)
-        self.model_dir = os.path.join(self.working_dir, "models")
-        self.result_dir = os.path.join(self.working_dir, "results")
-        self.figure_dir = os.path.join(self.working_dir, "figures")
-
-        log_path = os.path.join(
-            self.working_dir, "logs", f"{os.getpid()}_run_study.log"
-        )
-        logger.add(log_path)
-
-        logger.info("INITIALIZING STUDY")
-        logger.info(f"Study name: {name}")
-        logger.info(f"Working directory base: {working_dir_base}")
-        logger.info(f"Total number of cases: {len(cases)}")
-        logger.info(f"High-performance test set size: {config.hp_test_set_size}")
-
     #############
     # EXECUTION #
     #############
     def check_data_requirements(self, case: Case) -> bool:
-        """Given a case, check if the required data for that case is available. If not, return False and print a message indicating what data is missing."""
-        required_datasets = set()
-
-        if case.training_data in ["cmod", "cmod_tcv"]:
-            required_datasets.add("cmod")
-        if case.training_data in ["tcv", "cmod_tcv"]:
-            required_datasets.add("tcv")
-        if case.training_data == "exnihilo" or case.domain_adaptation in [
+        """Given a case, check if the required data for that case is available."""
+        required = set(case.training_data.sources)
+        if case.training_data.exnihilo or case.domain_adaptation in (
             "mixing",
             "transfer",
-        ]:
-            required_datasets.add("d3d_hp")
+        ):
+            target = self.dataset_config.target_device
+            if target is None:
+                logger.warning(
+                    f"Case {case} requires a target device but PTPS_DS_TARGET is not set. Skipping."
+                )
+                return False
+            required.add(target)
 
-        missing_datasets = [
-            ds for ds in required_datasets if self.dataset_paths[ds] is None
-        ]
-        if len(missing_datasets) > 0:
+        missing = [ds for ds in required if ds not in self.dataset_config.dataset_paths]
+        if missing:
             logger.warning(
-                f"Case {case} is missing required datasets: {missing_datasets}. Skipping this case."
+                f"Case {case} is missing required datasets: {missing}. Skipping this case."
             )
             return False
 
         return True
 
-    def run_case(  # noqa: PLR0912, PLR0915, PLR0911
+    def run_case(
         self,
         case: Case,
         skip_tuning: bool,
@@ -168,111 +140,113 @@ class Study:
             raise ValueError(
                 f"Case {case} does not have the required data to run. This should have been caught earlier!"
             )
-
         if os.path.exists(self.result_path(case)):
             logger.warning(f"Case {case} already has results, skipping.")
             return
-
         if self.check_prereq_satisfied(case):
-            if enable_parallelism:
-                if not resources_available():
-                    logger.info(
-                        "No resources currently available, waiting before trying again..."
-                    )
-                    time.sleep(10)
-                    return
-
-            # Prereq is satisfied and we have available resources, can run this case
-            logger.opt(colors=True).info(
-                f"<bold><cyan>RUNNING CASE:</cyan></bold>\n{case}"
-            )
-            if case.is_hyperparam_case():
-                if skip_tuning:
-                    logger.info("Skipping hyperparameter tuning")
-                    # Copy default config for this module and put it in the trained model dir so the rest of the workflow can find it
-                    default_config = self.make_train_config(case)
-                    tuned_config_path = self.tuned_config_path(case)
-                    os.makedirs(os.path.dirname(tuned_config_path), exist_ok=True)
-                    with open(tuned_config_path, "w") as f:
-                        yaml.dump(default_config.model_dump(), f, indent=4)
-                else:
-                    logger.info("Checking if hyperparameter tuning is already done")
-                    tuned_config_path = self.tuned_config_path(case)
-                    if os.path.exists(tuned_config_path):
-                        logger.info(
-                            f"Hyperparameter tuning completed, tuned config found at {tuned_config_path}"
-                        )
-                    else:
-                        completed_runs = get_completed_runs(
-                            self.wandb_project_name(case)
-                        )
-                        if len(completed_runs) >= config.hyperparam_sweeps:
-                            logger.info(
-                                f"Hyperparameter sweeps completed with {len(completed_runs)}/{config.hyperparam_sweeps} runs"
-                            )
-                            # Check if there are any running jobs for this case
-                            if enable_parallelism:
-                                running_jobs = count_running_jobs(
-                                    self.sweep_job_name(case), config.partition
-                                )
-                                if running_jobs > 0:
-                                    logger.info(
-                                        f"Found {running_jobs} running jobs, waiting for them to complete before proceeding"
-                                    )
-                                    return
-                            # No active jobs, put the best config from the completed runs in the tuned config path
-                            best_train_config = get_best_train_config(
-                                self.wandb_project_name(case)
-                            )
-                            os.makedirs(
-                                os.path.dirname(tuned_config_path), exist_ok=True
-                            )
-                            with open(tuned_config_path, "w") as f:
-                                yaml.dump(best_train_config.model_dump(), f, indent=4)
-                            logger.success(
-                                f"Saved best hyperparameter config for {case}"
-                            )
-                        else:
-                            logger.info(
-                                f"Hyperparameter sweeps incomplete, {len(completed_runs)}/{config.hyperparam_sweeps} runs"
-                            )
-                            self.launch_sweep(
-                                case, enable_parallelism=enable_parallelism
-                            )
-                            return
-
-            # At this point, we know the tuned config is available at tuned_config_path, so we can proceed to training
-            if enable_parallelism:
-                running_agent_jobs = count_running_jobs(
-                    self.agent_job_name(case), config.partition
-                )
-                if running_agent_jobs > 0:
-                    logger.info(
-                        f"Found {running_agent_jobs} running agent jobs, waiting for them to complete before proceeding"
-                    )
-                    return
-                running_training_jobs = count_running_jobs(
-                    self.train_job_name(case), config.partition
-                )
-                if running_training_jobs > 0:
-                    logger.info(
-                        f"Found {running_training_jobs} running training jobs, waiting for them to complete before proceeding"
-                    )
-                    return
-            self.launch_train(case, enable_parallelism=enable_parallelism)
-
+            self._run_ready_case(case, skip_tuning, enable_parallelism)
         else:
-            for prereq in case.prereqs:
-                if not os.path.exists(self.result_path(prereq)):
-                    logger.debug(
-                        f"Prereq not satisfied yet, running that first.\nCase:\t{case}\nPrereq:\t{prereq}"
-                    )
-                    self.run_case(
-                        prereq,
-                        skip_tuning=skip_tuning,
-                        enable_parallelism=enable_parallelism,
-                    )
-                    return
+            self._run_first_unmet_prereq(case, skip_tuning, enable_parallelism)
+
+    def _run_ready_case(self, case: Case, skip_tuning: bool, enable_parallelism: bool):
+        """Execute a case whose prereqs are satisfied."""
+        if enable_parallelism and not resources_available():
+            logger.info(
+                "No resources currently available, waiting before trying again..."
+            )
+            time.sleep(10)
+            return
+        logger.opt(colors=True).info(f"<bold><cyan>RUNNING CASE:</cyan></bold>\n{case}")
+        if case.is_hyperparam_case() and not self._ensure_hyperparams_ready(
+            case, skip_tuning, enable_parallelism
+        ):
+            return
+        if not self._no_blocking_jobs(case, enable_parallelism):
+            return
+        self.launch_train(case, enable_parallelism=enable_parallelism)
+
+    def _ensure_hyperparams_ready(
+        self, case: Case, skip_tuning: bool, enable_parallelism: bool
+    ) -> bool:
+        """Ensure tuned config exists. Returns True if ready to proceed to training."""
+        if skip_tuning:
+            logger.info("Skipping hyperparameter tuning")
+            self._write_tuned_config(case, self.make_train_config(case))
+            return True
+        tuned_config_path = self.tuned_config_path(case)
+        if os.path.exists(tuned_config_path):
+            logger.info(
+                f"Hyperparameter tuning completed, tuned config found at {tuned_config_path}"
+            )
+            return True
+        completed_runs = get_completed_runs(self.wandb_project_name(case))
+        if len(completed_runs) < config.hyperparam_sweeps:
+            logger.info(
+                f"Hyperparameter sweeps incomplete, {len(completed_runs)}/{config.hyperparam_sweeps} runs"
+            )
+            self.launch_sweep(case, enable_parallelism=enable_parallelism)
+            return False
+        return self._finalize_sweep(case, enable_parallelism, completed_runs)
+
+    def _finalize_sweep(
+        self, case: Case, enable_parallelism: bool, completed_runs: list
+    ) -> bool:
+        """Save best config once sweep runs are done. Returns True if ready."""
+        logger.info(
+            f"Hyperparameter sweeps completed with {len(completed_runs)}/{config.hyperparam_sweeps} runs"
+        )
+        if enable_parallelism:
+            running_jobs = count_running_jobs(
+                self.sweep_job_name(case), config.partition
+            )
+            if running_jobs > 0:
+                logger.info(
+                    f"Found {running_jobs} running jobs, waiting for them to complete before proceeding"
+                )
+                return False
+        best_train_config = get_best_train_config(self.wandb_project_name(case))
+        self._write_tuned_config(case, best_train_config)
+        logger.success(f"Saved best hyperparameter config for {case}")
+        return True
+
+    def _write_tuned_config(self, case: Case, train_config: TrainConfig):
+        """Write a train config to the tuned config path for the given case."""
+        tuned_config_path = self.tuned_config_path(case)
+        os.makedirs(os.path.dirname(tuned_config_path), exist_ok=True)
+        with open(tuned_config_path, "w") as f:
+            yaml.dump(train_config.model_dump(), f, indent=4)
+
+    def _no_blocking_jobs(self, case: Case, enable_parallelism: bool) -> bool:
+        """Returns True if no in-flight SLURM jobs are blocking training."""
+        if not enable_parallelism:
+            return True
+        for job_name, label in [
+            (self.agent_job_name(case), "agent"),
+            (self.train_job_name(case), "training"),
+        ]:
+            running = count_running_jobs(job_name, config.partition)
+            if running > 0:
+                logger.info(
+                    f"Found {running} running {label} jobs, waiting for them to complete before proceeding"
+                )
+                return False
+        return True
+
+    def _run_first_unmet_prereq(
+        self, case: Case, skip_tuning: bool, enable_parallelism: bool
+    ):
+        """Find the first unsatisfied prereq and recurse into it."""
+        for prereq in case.prereqs:
+            if not os.path.exists(self.result_path(prereq)):
+                logger.debug(
+                    f"Prereq not satisfied yet, running that first.\nCase:\t{case}\nPrereq:\t{prereq}"
+                )
+                self.run_case(
+                    prereq,
+                    skip_tuning=skip_tuning,
+                    enable_parallelism=enable_parallelism,
+                )
+                return
 
     def launch_sweep(self, case: Case, enable_parallelism: bool = False):
         """Launch a wandb hyperparameter sweep for the given case."""
@@ -392,6 +366,56 @@ class Study:
             trainer.restore_best_checkpoint(path=self.trained_model_dir(case))
 
         return trainer, test_dl
+
+    def __init__(
+        self,
+        name: str,
+        working_dir_base: str,
+        cases: list[Case],
+    ):
+        """
+        Initialize this study with the given name and cases.
+        Dataset paths are read from env vars (PTPS_DS_*) via DatasetConfig.
+        """
+        self.name = name
+        self.cases = cases
+
+        self.working_dir = os.path.join(working_dir_base, name)
+        self.model_dir = os.path.join(self.working_dir, "models")
+        self.result_dir = os.path.join(self.working_dir, "results")
+        self.figure_dir = os.path.join(self.working_dir, "figures")
+
+        os.makedirs(self.working_dir, exist_ok=True)
+
+        # Save DatasetConfig on first run; on subsequent runs check for changes.
+        # This locks in ds_source_to_idx so that checkpoint indices stay stable.
+        config_path = os.path.join(self.working_dir, DATASET_CONFIG_FILENAME)
+        if os.path.exists(config_path):
+            saved = DatasetConfig.load(config_path)
+            if saved != dataset_config:
+                raise RuntimeError(
+                    f"Dataset config changed since study was created.\n"
+                    f"Saved:   {saved}\n"
+                    f"Current: {dataset_config}\n"
+                    f"Delete {config_path} to reset (will invalidate existing results)."
+                )
+        else:
+            dataset_config.save(config_path)
+
+        self.dataset_config = dataset_config
+
+        log_path = os.path.join(
+            self.working_dir, "logs", f"{os.getpid()}_run_study.log"
+        )
+        logger.add(log_path)
+
+        logger.info("INITIALIZING STUDY")
+        logger.info(f"Study name: {name}")
+        logger.info(f"Working directory base: {working_dir_base}")
+        logger.info(f"Total number of cases: {len(cases)}")
+        logger.info(f"High-performance test set size: {config.hp_test_set_size}")
+        logger.info(f"Dataset paths: {dataset_config.dataset_paths}")
+        logger.info(f"Target device: {dataset_config.target_device}")
 
 
 def update_submodule_configs(main_config: dict, submodules: list[str]) -> TrainConfig:

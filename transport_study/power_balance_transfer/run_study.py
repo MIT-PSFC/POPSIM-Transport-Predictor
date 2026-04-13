@@ -17,6 +17,7 @@ from popsim.ml.launch import (
 
 from transport_study import PACKAGE_ROOT
 from transport_study.config import config
+from transport_study.orchestration.organize_data import TrainingData, dataset_config
 from transport_study.orchestration.slurm_utils import (
     launch_train_parallel,
 )
@@ -25,15 +26,36 @@ from transport_study.orchestration.wandb_utils import (
     get_sweep_id,
     run_clean_sweeps,
 )
+
+
+def _parse_training_data(s: str) -> TrainingData:
+    """Convert a string like 'cmod_tcv' or 'exnihilo' to a TrainingData object."""
+    if s == "exnihilo":
+        target = dataset_config.target_device
+        non_target = frozenset(dataset_config.dataset_paths.keys()) - (
+            {target} if target else set()
+        )
+        return TrainingData(sources=non_target, exnihilo=True)
+    return TrainingData(sources=frozenset(s.split("_")))
+
+
 from transport_study.power_balance_transfer.data_visualization import DataVisualization
 
 
 class PowerBalanceStudy(Study):
-    HYPERPARAM_TRAINING_DATA = "cmod_tcv"
     HYPERPARAM_DATA_NORMALIZATION = "coral"
     HYPERPARAM_DOMAIN_ADAPTATION = None
     HYPERPARAM_FREEZE_SUBMODULES = True
     HYPERPARAM_NUM_HP_SHOTS = -1
+
+    @classmethod
+    def _hyperparam_training_data(cls) -> TrainingData:
+        """All configured non-target source devices - the canonical hyperparam case."""
+        target = dataset_config.target_device
+        sources = frozenset(dataset_config.dataset_paths.keys()) - (
+            {target} if target else set()
+        )
+        return TrainingData(sources=sources)
 
     ##################
     # INITIALIZATION #
@@ -70,7 +92,7 @@ class PowerBalanceStudy(Study):
         """
 
         model_type: str  # scaling_law, sciml, unstructured_nn
-        training_data: str  # cmod, tcv, cmod_tcv, exnihilo
+        training_data: TrainingData
         data_normalization: str  # raw, physics, z_score, coral
         domain_adaptation: str  # none, mixing, transfer
         freeze_submodules: bool
@@ -83,7 +105,7 @@ class PowerBalanceStudy(Study):
 
         def is_hyperparam_case(self) -> bool:
             if (
-                self.training_data == PowerBalanceStudy.HYPERPARAM_TRAINING_DATA
+                self.training_data == PowerBalanceStudy._hyperparam_training_data()
                 and self.data_normalization
                 == PowerBalanceStudy.HYPERPARAM_DATA_NORMALIZATION
                 and self.domain_adaptation
@@ -98,9 +120,9 @@ class PowerBalanceStudy(Study):
 
         def is_impossible(self) -> bool:
             """Some cases don't make sense to run. Mark those cases as impossible and raise an error if we try to run them."""
-            # Can't do transfer learning or training from nothing with 0 high-performance shots.
+            # Can't do transfer learning or training from nothing with 0 target shots.
             if (
-                self.domain_adaptation == "transfer" or self.training_data == "exnihilo"
+                self.domain_adaptation == "transfer" or self.training_data.exnihilo
             ) and self.num_hp_shots == 0:
                 return True
 
@@ -112,7 +134,7 @@ class PowerBalanceStudy(Study):
             else:
                 return PowerBalanceStudy.Case(
                     model_type=self.model_type,
-                    training_data=PowerBalanceStudy.HYPERPARAM_TRAINING_DATA,
+                    training_data=PowerBalanceStudy._hyperparam_training_data(),
                     data_normalization=PowerBalanceStudy.HYPERPARAM_DATA_NORMALIZATION,
                     domain_adaptation=PowerBalanceStudy.HYPERPARAM_DOMAIN_ADAPTATION,
                     freeze_submodules=PowerBalanceStudy.HYPERPARAM_FREEZE_SUBMODULES,
@@ -122,12 +144,14 @@ class PowerBalanceStudy(Study):
         def __init__(
             self,
             model_type: str,
-            training_data: str,
+            training_data: TrainingData | str,
             data_normalization: str,
             domain_adaptation: str,
             freeze_submodules: bool,
             num_hp_shots: int,
         ):
+            if isinstance(training_data, str):
+                training_data = _parse_training_data(training_data)
             self.model_type = model_type
             self.training_data = training_data
             self.data_normalization = data_normalization
@@ -163,7 +187,7 @@ class PowerBalanceStudy(Study):
                 prereqs += [
                     PowerBalanceStudy.Case(
                         model_type=model_type,
-                        training_data=PowerBalanceStudy.HYPERPARAM_TRAINING_DATA,
+                        training_data=PowerBalanceStudy._hyperparam_training_data(),
                         data_normalization=PowerBalanceStudy.HYPERPARAM_DATA_NORMALIZATION,
                         domain_adaptation=PowerBalanceStudy.HYPERPARAM_DOMAIN_ADAPTATION,
                         freeze_submodules=PowerBalanceStudy.HYPERPARAM_FREEZE_SUBMODULES,
@@ -301,9 +325,8 @@ class PowerBalanceStudy(Study):
         self,
         name: str,
         working_dir_base: str,
-        dataset_paths: dict[str, str],
         model_types: list[str],
-        training_datasets: list[str],
+        training_datasets: list[TrainingData],
         data_normalization_methods: list[str],
         domain_adaptation_methods: list[str],
         freeze_submodules_options: list[bool],
@@ -318,13 +341,8 @@ class PowerBalanceStudy(Study):
             freeze_submodules_options,
             num_hp_shots_options,
         )
-        super().__init__(name, working_dir_base, dataset_paths, cases, hp_test_set_size)
-
-        logger.info(f"C-Mod dataset path: {dataset_paths.get('cmod', 'Not provided')}")
-        logger.info(f"TCV dataset path: {dataset_paths.get('tcv', 'Not provided')}")
-        logger.info(
-            f"DIII-D high-performance dataset path: {dataset_paths.get('d3d_hp', 'Not provided')}"
-        )
+        super().__init__(name, working_dir_base, cases)
+        self.hp_test_set_size = hp_test_set_size
 
         logger.info(f"Model types: {model_types}")
         logger.info(f"Training datasets: {training_datasets}")
@@ -841,7 +859,7 @@ class PowerBalanceStudy(Study):
             ).assign_coords(
                 {
                     "model_type": case.model_type,
-                    "training_data": case.training_data,
+                    "training_data": str(case.training_data),
                     "data_normalization": case.data_normalization,
                     "domain_adaptation": case.domain_adaptation,
                     "freeze_submodules": case.freeze_submodules,
@@ -932,7 +950,15 @@ def run_study(  # noqa: PLR0915
             if model_types is None:
                 model_types = ["scaling_law", "sciml", "unstructured_nn"]
             if training_datasets is None:
-                training_datasets = ["cmod", "tcv", "cmod_tcv", "exnihilo"]
+                training_datasets = [
+                    _parse_training_data(s)
+                    for s in ["cmod", "tcv", "cmod_tcv", "exnihilo"]
+                ]
+            else:
+                training_datasets = [
+                    _parse_training_data(s) if isinstance(s, str) else s
+                    for s in training_datasets
+                ]
             if data_normalization_methods is None:
                 data_normalization_methods = ["raw", "physics", "z_score", "coral"]
             if domain_adaptation_methods is None:
@@ -982,12 +1008,6 @@ def run_study(  # noqa: PLR0915
                 if model_type not in ["scaling_law", "sciml", "unstructured_nn"]:
                     raise ValueError(
                         f"Invalid model type: {model_type}. Must be one of 'scaling_law', 'sciml', or 'unstructured_nn'."
-                    )
-
-            for training_dataset in training_datasets:
-                if training_dataset not in ["cmod", "tcv", "cmod_tcv", "exnihilo"]:
-                    raise ValueError(
-                        f"Invalid training dataset: {training_dataset}. Must be one of 'cmod', 'tcv', 'cmod_tcv', or 'exnihilo'."
                     )
 
             for data_normalization in data_normalization_methods:
@@ -1046,11 +1066,6 @@ def run_study(  # noqa: PLR0915
     study = PowerBalanceStudy(
         name=project_name,
         working_dir_base=working_dir_base,
-        dataset_paths={
-            "cmod": config.cmod_dataset_path,
-            "tcv": config.tcv_dataset_path,
-            "d3d_hp": config.d3d_hp_dataset_path,
-        },
         model_types=model_types,
         training_datasets=training_datasets,
         data_normalization_methods=data_normalization_methods,

@@ -816,11 +816,10 @@ def _make_profile_gif(  # noqa: PLR0915, PLR0912
     ida_t: np.ndarray | None = None
     ida_ne: np.ndarray | None = None
     ida_te: np.ndarray | None = None
-    if config.d3d_hp_dataset_path is not None and os.path.exists(
-        str(config.d3d_hp_dataset_path)
-    ):
+    _hp_path = config.dataset_paths.get(config.target_device)
+    if _hp_path is not None and os.path.exists(str(_hp_path)):
         try:
-            ds_hp = xr.open_dataset(config.d3d_hp_dataset_path)
+            ds_hp = xr.open_dataset(_hp_path)
             if targ_shot in ds_hp["shot"].values:
                 ds_hp_shot = ds_hp.sel(shot=targ_shot)
                 psi_hp = ds_hp["psi_n"].values
