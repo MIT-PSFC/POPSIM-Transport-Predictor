@@ -215,11 +215,11 @@ def get_ds(
         )
 
     if debug:
-        ds = ds.isel(EPISODE_DIM=slice(0, 10))  # Limit to 10 shots
+        ds = ds.isel({EPISODE_DIM: slice(0, 10)})  # Limit to 10 shots
     else:
         # Sort dataset by shot count, get the X most recent as set by config
         ds = ds.sortby(EPISODE_DIM, ascending=False).isel(
-            EPISODE_DIM=slice(0, config.max_ds_size)
+            {EPISODE_DIM: slice(0, config.max_ds_size)}
         )
 
     def _profile_transfer(ds: xr.Dataset) -> xr.Dataset:
@@ -307,8 +307,8 @@ def add_performance(
     n_shots = ds.sizes[episode_coord]
 
     # Initialize arrays for Ip_MA and Wtot_MJ at p95
-    ip_ma_p95 = np.full(n_shots, np.nan)
-    wtot_mj_p95 = np.full(n_shots, np.nan)
+    Ip_MA_p95 = np.full(n_shots, np.nan)
+    Wtot_MJ_p95 = np.full(n_shots, np.nan)
 
     # For each shot, find the time index closest to 95th percentile
     perf_ts_data = perf_timeseries.values  # shape: (n_shots, n_time)
@@ -331,12 +331,12 @@ def add_performance(
             idx_p95 = np.argmin(abs_diff)
 
             # Extract Ip_MA and Wtot_MJ at that time
-            ip_ma_p95[i] = ip_ma_data[i, idx_p95]
-            wtot_mj_p95[i] = wtot_mj_data[i, idx_p95]
+            Ip_MA_p95[i] = ip_ma_data[i, idx_p95]
+            Wtot_MJ_p95[i] = wtot_mj_data[i, idx_p95]
 
     # Add to dataset
-    ds["Ip_MA_p95"] = (episode_coord, ip_ma_p95)
-    ds["Wtot_MJ_p95"] = (episode_coord, wtot_mj_p95)
+    ds["Ip_MA_p95"] = (episode_coord, Ip_MA_p95)
+    ds["Wtot_MJ_p95"] = (episode_coord, Wtot_MJ_p95)
 
     return ds
 

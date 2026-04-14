@@ -71,8 +71,11 @@ class TestGetDs:
 
 
 class TestAddPerformance:
-    def test_add_performance_adds_variables(self, sample_dataset_config):
-        ds, episode_coord = get_ds("cmod_low_1", "power_balance_transfer", debug=True)
+    @pytest.mark.parametrize(
+        "study_type", ["profile_transfer", "power_balance_transfer"]
+    )
+    def test_add_performance_adds_variables(self, sample_dataset_config, study_type):
+        ds, episode_coord = get_ds("cmod_low_1", study_type, debug=True)
         result = add_performance(ds, episode_coord)
         assert "performance" in result
         assert "Ip_MA_p95" in result
