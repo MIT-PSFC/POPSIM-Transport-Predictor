@@ -91,20 +91,30 @@ class TestAddPerformance:
 
 class TestTrainingData:
     def test_training_data_known_sources_accepted(self, sample_dataset_config):
-        td = TrainingData(sources=frozenset({"cmod_low_1", "cmod_high"}))
+        td = TrainingData(sources_unsorted=frozenset({"cmod_low_1", "cmod_high"}))
         assert "cmod_low_1" in td.sources
 
     def test_training_data_unknown_source_raises(self, sample_dataset_config):
         with pytest.raises(ValueError, match="Unknown dataset sources"):
-            TrainingData(sources=frozenset({"d3d"}))
+            TrainingData(sources_unsorted=frozenset({"d3d"}))
 
     def test_training_data_str_sorted(self, sample_dataset_config):
-        td = TrainingData(sources=frozenset({"cmod_recent", "cmod_high"}))
+        td = TrainingData(sources_unsorted=frozenset({"cmod_recent", "cmod_high"}))
         assert str(td) == "cmod_high_cmod_recent"
 
     def test_training_data_exnihilo_str(self, sample_dataset_config):
-        td = TrainingData(sources=frozenset({"cmod_low_1"}), exnihilo=True)
+        td = TrainingData(sources_unsorted=frozenset({"cmod_low_1"}), exnihilo=True)
         assert str(td) == "exnihilo"
+
+    def test_training_data_source_idx_consistent(self, sample_dataset_config):
+        td_1 = TrainingData(sources_unsorted=frozenset({"cmod_low_1", "cmod_high"}))
+        td_2 = TrainingData(sources_unsorted=frozenset({"cmod_high", "cmod_low_1"}))
+        for i in range(len(td_1.sources)):
+            assert td_1.sources[i] == td_2.sources[i]
+            assert (
+                sample_dataset_config.ds_source_to_idx[td_1.sources[i]]
+                == sample_dataset_config.ds_source_to_idx[td_2.sources[i]]
+            )
 
 
 class TestGetTrainValDatasets:
@@ -112,15 +122,23 @@ class TestGetTrainValDatasets:
     def test_get_train_val_datasets_returns_split(
         self, sample_dataset_config, normalization
     ):
-        td = TrainingData(sources=frozenset({"cmod_low_1", "cmod_low_2"}))
+        td = TrainingData(sources_unsorted=frozenset({"cmod_low_1", "cmod_low_2"}))
         train_ds, val_ds = get_train_val_datasets(
             td, normalization, study_type="power_balance_transfer", debug=True
         )
         assert train_ds.sizes["shot"] > 0
         assert val_ds.sizes["shot"] > 0
+        # Assert that train and val sets are disjoint
+        train_shots = set(train_ds["shot"].values)
+        val_shots = set(val_ds["shot"].values)
+        assert train_shots.isdisjoint(val_shots)
+        # Assert validation shots have higher performance metric
+        train_perf_max = train_ds["performance"].values.max()
+        val_perf_min = val_ds["performance"].values.min()
+        assert val_perf_min >= train_perf_max
 
     def test_get_train_val_datasets_has_ds_source_idx(self, sample_dataset_config):
-        td = TrainingData(sources=frozenset({"cmod_low_1", "cmod_high"}))
+        td = TrainingData(sources_unsorted=frozenset({"cmod_low_1", "cmod_high"}))
         train_ds, val_ds = get_train_val_datasets(
             td, "raw", study_type="power_balance_transfer", debug=True
         )
@@ -129,9 +147,9 @@ class TestGetTrainValDatasets:
 
     def test_get_train_val_datasets_empty_sources_raises(self, sample_dataset_config):
         td = TrainingData.__new__(TrainingData)
-        object.__setattr__(td, "sources", frozenset())
+        object.__setattr__(td, "sources_unsorted", frozenset())
         object.__setattr__(td, "exnihilo", False)
-        with pytest.raises(ValueError, match="sources is empty"):
+        with pytest.raises(ValueError, match="sources_unsorted is empty"):
             get_train_val_datasets(
                 td, "raw", study_type="power_balance_transfer", debug=True
             )

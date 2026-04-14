@@ -26,7 +26,7 @@ class TrainingData:
               actual training set, leaving only target device shots.
     """
 
-    sources: frozenset
+    sources_unsorted: frozenset  # Not necessarily sorted
     exnihilo: bool = False
 
     def __str__(self) -> str:
@@ -44,6 +44,16 @@ class TrainingData:
                 raise ValueError(
                     f"Unknown dataset sources: {unknown}. Known: {paths_from_env}"
                 )
+
+    @property
+    def sources(self) -> list[str]:
+        """Sources in deterministic order for stable concatenation and indexing."""
+        return sorted(self.sources_unsorted)
+
+    @property
+    def source_idxs(self) -> frozenset:
+        """Integer indices for all sources in this TrainingData, looked up from dataset_config."""
+        return frozenset(dataset_config.ds_source_to_idx[s] for s in self.sources)
 
 
 @dataclass
@@ -85,32 +95,6 @@ class DatasetConfig:
 # Module-level singleton built from env vars at import time.
 # Imported by study.py (for save/check) and TRBs (for index lookup).
 dataset_config = DatasetConfig.from_env()
-
-
-def _add_ds_source_idx(ds: xr.Dataset) -> xr.Dataset:
-    """Broadcast the per-shot ds_source coordinate to a (shot, time_idx) data variable.
-
-    `ds_source` is a string coordinate that lives only on the shot dimension and is
-    dropped when the dataloader flattens (shot, time_idx) -> sample.  Converting it to
-    an integer data variable makes it survive that reshape so loss functions can look up
-    per-sample device weights via targ["ds_source_idx"].
-    """
-    ds_source = ds.coords["ds_source"]
-    float_type = ds[next(iter(ds.data_vars))].dtype  # match dataset float precision
-    if ds_source.dims == ():  # scalar coordinate for single device
-        int_val = dataset_config.ds_source_to_idx[ds_source.item()]
-        arr = np.full(
-            (ds.sizes[EPISODE_DIM], ds.sizes[TIME_DIM]), int_val, dtype=float_type
-        )
-    else:  # per-shot coordinate (shot,)
-        int_vals = np.array(
-            [dataset_config.ds_source_to_idx[s] for s in ds_source.values],
-            dtype=float_type,
-        )
-        arr = np.broadcast_to(
-            int_vals[:, None], (len(int_vals), ds.sizes[TIME_DIM])
-        ).copy()
-    return ds.assign({"ds_source_idx": xr.DataArray(arr, dims=[EPISODE_DIM, TIME_DIM])})
 
 
 REQUIRED_SIGNALS_POWER_BALANCE = [
@@ -651,7 +635,7 @@ def get_train_val_datasets(
     ds_sources: dict[str, tuple] = {}
     episode_coord = None
 
-    for source in sorted(training_data.sources):  # sorted for determinism
+    for source in training_data.sources:
         ds, episode_coord = get_ds(source, study_type, debug=debug)
         ds = add_performance(ds, episode_coord)
         train_src, val_src = split_dataset_by_fracs(
@@ -661,8 +645,8 @@ def get_train_val_datasets(
             seed=42,
             sortby="performance",
         )
-        train_src = train_src.assign_coords(ds_source=source)
-        val_src = val_src.assign_coords(ds_source=source)
+        train_src["ds_source_idx"] = dataset_config.ds_source_to_idx[source]
+        val_src["ds_source_idx"] = dataset_config.ds_source_to_idx[source]
         ds_sources[source] = (train_src, val_src)
 
     if not ds_sources:
@@ -685,9 +669,6 @@ def get_train_val_datasets(
     logger.debug("Historic Validation dataset size: {}", val_ds.sizes[episode_coord])
 
     train_ds, val_ds = normalize_domain(train_ds, val_ds, method=data_normalization)
-
-    train_ds = _add_ds_source_idx(train_ds)
-    val_ds = _add_ds_source_idx(val_ds)
 
     return train_ds, val_ds
 
@@ -754,7 +735,7 @@ def get_train_test_datasets(
     logger.debug("HP Training dataset size: {}", train_ds.sizes[episode_coord])
     logger.debug("HP Test dataset size: {}", test_ds.sizes[episode_coord])
 
-    train_ds = _add_ds_source_idx(train_ds)
-    test_ds = _add_ds_source_idx(test_ds)
+    train_ds = training_data.add_ds_source_idx(train_ds)
+    test_ds = training_data.add_ds_source_idx(test_ds)
 
     return train_ds, test_ds
