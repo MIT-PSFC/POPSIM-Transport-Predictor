@@ -2,7 +2,7 @@ import os
 
 import pytest
 
-from transport_study import PACKAGE_ROOT
+from transport_study import EPISODE_DIM, PACKAGE_ROOT, TIME_COORD, TIME_DIM
 from transport_study.orchestration import organize_data
 from transport_study.orchestration.organize_data import (
     DatasetConfig,
@@ -39,37 +39,39 @@ class TestGetDs:
     @pytest.mark.parametrize(
         "study_type", ["profile_transfer", "power_balance_transfer"]
     )
-    def test_get_ds_returns_dataset_and_dim(
-        sample_dataset_config, source_ds, study_type
+    def test_get_ds_returns_dataset_and_dims(
+        self, sample_dataset_config, source_ds, study_type
     ):
-        ds, episode_coord = get_ds(source_ds, study_type, debug=True)
+        ds, episode_dim = get_ds(source_ds, study_type, debug=True)
         assert ds is not None
-        assert episode_coord == "shot"
+        assert episode_dim == EPISODE_DIM
+        assert TIME_COORD in ds.coords
+        assert TIME_DIM in ds.dims
 
     @pytest.mark.parametrize(
         "study_type", ["profile_transfer", "power_balance_transfer"]
     )
-    def test_get_ds_unknown_source_raises(sample_dataset_config, study_type):
+    def test_get_ds_unknown_source_raises(self, sample_dataset_config, study_type):
         with pytest.raises(ValueError, match="Unknown source dataset"):
             get_ds("nonexistent_device", study_type, debug=True)
 
-    def test_get_ds_profile_transfer_has_shape_vars(sample_dataset_config):
+    def test_get_ds_profile_transfer_has_shape_vars(self, sample_dataset_config):
         ds, _ = get_ds("cmod_low_1", "profile_transfer", debug=True)
         assert "Te_shape" in ds
         assert "ne_shape" in ds
         assert "Te_keV_line_avg" in ds
 
-    def test_get_ds_power_balance_has_aux_power(sample_dataset_config):
+    def test_get_ds_power_balance_has_aux_power(self, sample_dataset_config):
         ds, _ = get_ds("cmod_low_1", "power_balance_transfer", debug=True)
         assert "P_aux_MW" in ds
 
-    def test_get_ds_debug_limits_shots(sample_dataset_config):
+    def test_get_ds_debug_limits_shots(self, sample_dataset_config):
         ds, _ = get_ds("cmod_low_1", "power_balance_transfer", debug=True)
         assert ds.sizes["shot"] <= 10
 
 
 class TestAddPerformance:
-    def test_add_performance_adds_variables(sample_dataset_config):
+    def test_add_performance_adds_variables(self, sample_dataset_config):
         ds, episode_coord = get_ds("cmod_low_1", "power_balance_transfer", debug=True)
         result = add_performance(ds, episode_coord)
         assert "performance" in result
@@ -77,7 +79,7 @@ class TestAddPerformance:
         assert "Wtot_MJ_p95" in result
         assert result["performance"].dims == (episode_coord,)
 
-    def test_add_performance_nonnegative(sample_dataset_config):
+    def test_add_performance_nonnegative(self, sample_dataset_config):
         ds, episode_coord = get_ds("cmod_recent", "power_balance_transfer", debug=True)
         result = add_performance(ds, episode_coord)
         valid = result["performance"].values
@@ -85,26 +87,28 @@ class TestAddPerformance:
 
 
 class TestTrainingData:
-    def test_training_data_known_sources_accepted(sample_dataset_config):
+    def test_training_data_known_sources_accepted(self, sample_dataset_config):
         td = TrainingData(sources=frozenset({"cmod_low_1", "cmod_high"}))
         assert "cmod_low_1" in td.sources
 
-    def test_training_data_unknown_source_raises(sample_dataset_config):
+    def test_training_data_unknown_source_raises(self, sample_dataset_config):
         with pytest.raises(ValueError, match="Unknown dataset sources"):
             TrainingData(sources=frozenset({"d3d"}))
 
-    def test_training_data_str_sorted(sample_dataset_config):
+    def test_training_data_str_sorted(self, sample_dataset_config):
         td = TrainingData(sources=frozenset({"cmod_recent", "cmod_high"}))
         assert str(td) == "cmod_high_cmod_recent"
 
-    def test_training_data_exnihilo_str(sample_dataset_config):
+    def test_training_data_exnihilo_str(self, sample_dataset_config):
         td = TrainingData(sources=frozenset({"cmod_low_1"}), exnihilo=True)
         assert str(td) == "exnihilo"
 
 
 class TestGetTrainValDatasets:
     @pytest.mark.parametrize("normalization", ["raw", "z_score"])
-    def test_get_train_val_datasets_returns_split(sample_dataset_config, normalization):
+    def test_get_train_val_datasets_returns_split(
+        self, sample_dataset_config, normalization
+    ):
         td = TrainingData(sources=frozenset({"cmod_low_1", "cmod_low_2"}))
         train_ds, val_ds = get_train_val_datasets(
             td, normalization, study_type="power_balance_transfer", debug=True
@@ -112,7 +116,7 @@ class TestGetTrainValDatasets:
         assert train_ds.sizes["shot"] > 0
         assert val_ds.sizes["shot"] > 0
 
-    def test_get_train_val_datasets_has_ds_source_idx(sample_dataset_config):
+    def test_get_train_val_datasets_has_ds_source_idx(self, sample_dataset_config):
         td = TrainingData(sources=frozenset({"cmod_low_1", "cmod_high"}))
         train_ds, val_ds = get_train_val_datasets(
             td, "raw", study_type="power_balance_transfer", debug=True
@@ -120,7 +124,7 @@ class TestGetTrainValDatasets:
         assert "ds_source_idx" in train_ds
         assert "ds_source_idx" in val_ds
 
-    def test_get_train_val_datasets_empty_sources_raises(sample_dataset_config):
+    def test_get_train_val_datasets_empty_sources_raises(self, sample_dataset_config):
         td = TrainingData.__new__(TrainingData)
         object.__setattr__(td, "sources", frozenset())
         object.__setattr__(td, "exnihilo", False)
