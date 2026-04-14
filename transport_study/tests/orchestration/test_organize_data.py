@@ -9,6 +9,7 @@ from transport_study.orchestration.organize_data import (
     TrainingData,
     add_performance,
     get_ds,
+    get_train_test_datasets,
     get_train_val_datasets,
 )
 
@@ -28,7 +29,7 @@ def sample_dataset_config(monkeypatch):
     cfg = DatasetConfig(
         dataset_paths={k: str(v) for k, v in SAMPLE_PATHS.items()},
         ds_source_to_idx={name: i for i, name in enumerate(sorted_names)},
-        target_device=None,
+        target_device="cmod_high",
     )
     monkeypatch.setattr(organize_data, "dataset_config", cfg)
     return cfg
@@ -118,13 +119,10 @@ class TestTrainingData:
 
 
 class TestGetTrainValDatasets:
-    @pytest.mark.parametrize("normalization", ["raw", "z_score"])
-    def test_get_train_val_datasets_returns_split(
-        self, sample_dataset_config, normalization
-    ):
+    def test_get_train_val_datasets_returns_split(self, sample_dataset_config):
         td = TrainingData(sources_unsorted=frozenset({"cmod_low_1", "cmod_low_2"}))
         train_ds, val_ds = get_train_val_datasets(
-            td, normalization, study_type="power_balance_transfer", debug=True
+            td, study_type="power_balance_transfer", debug=True
         )
         assert train_ds.sizes["shot"] > 0
         assert val_ds.sizes["shot"] > 0
@@ -142,19 +140,62 @@ class TestGetTrainValDatasets:
             val_perf_min = val_subset["performance"].values.min()
             assert val_perf_min >= train_perf_max
 
-    def test_get_train_val_datasets_has_ds_source_idx(self, sample_dataset_config):
-        td = TrainingData(sources_unsorted=frozenset({"cmod_low_1", "cmod_high"}))
-        train_ds, val_ds = get_train_val_datasets(
-            td, "raw", study_type="power_balance_transfer", debug=True
-        )
-        assert "ds_source_idx" in train_ds
-        assert "ds_source_idx" in val_ds
-
     def test_get_train_val_datasets_empty_sources_raises(self, sample_dataset_config):
         td = TrainingData.__new__(TrainingData)
         object.__setattr__(td, "sources_unsorted", frozenset())
         object.__setattr__(td, "exnihilo", False)
-        with pytest.raises(ValueError, match="sources_unsorted is empty"):
+        with pytest.raises(ValueError, match="sources is empty"):
             get_train_val_datasets(
                 td, "raw", study_type="power_balance_transfer", debug=True
+            )
+
+
+class TestGetTrainTestDatasets:
+    def test_get_train_test_datasets_returns_split(self, sample_dataset_config):
+        td = TrainingData(sources_unsorted=frozenset({"cmod_low_1", "cmod_low_2"}))
+        # This is assuming get_ds for the cmod_high dataset returns 10 shots when debug mode is on
+        train_ds, test_ds = get_train_test_datasets(
+            td,
+            domain_adaptation="mixing",
+            num_hp_shots=2,
+            hp_test_set_size=5,
+            study_type="power_balance_transfer",
+            debug=True,
+        )
+        assert train_ds.sizes["shot"] > 0
+        assert test_ds.sizes["shot"] > 0
+        # Assert that train and test sets are disjoint
+        train_shots = set(train_ds["shot"].values)
+        test_shots = set(test_ds["shot"].values)
+        assert train_shots.isdisjoint(test_shots)
+        # Assert test shots have higher performance metric within the same source dataset
+        for source_idx in train_ds["ds_source_idx"].values:
+            train_subset = train_ds.where(
+                train_ds["ds_source_idx"] == source_idx, drop=True
+            )
+            test_subset = test_ds.where(
+                test_ds["ds_source_idx"] == source_idx, drop=True
+            )
+            train_perf_max = train_subset["performance"].values.max()
+            test_perf_min = test_subset["performance"].values.min()
+            assert test_perf_min >= train_perf_max
+
+    def test_get_train_test_datasets_no_target_raises(self):
+        cfg = DatasetConfig(
+            dataset_paths={k: str(v) for k, v in SAMPLE_PATHS.items()},
+            ds_source_to_idx={name: i for i, name in enumerate(sorted(SAMPLE_PATHS))},
+            target_device=None,
+        )
+        organize_data.dataset_config = cfg
+        td = TrainingData(sources_unsorted=frozenset({"cmod_low_1", "cmod_low_2"}))
+        with pytest.raises(
+            ValueError, match="PTPS_DS_TARGET must be set for transfer learning"
+        ):
+            get_train_test_datasets(
+                td,
+                domain_adaptation="mixing",
+                num_hp_shots=5,
+                hp_test_set_size=10,
+                study_type="power_balance_transfer",
+                debug=True,
             )

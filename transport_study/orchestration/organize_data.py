@@ -297,8 +297,8 @@ def add_performance(
     # For each shot, find the time index closest to 95th percentile
     perf_ts_data = perf_timeseries.values  # shape: (n_shots, n_time)
     p95_vals = ds["performance"].values  # shape: (n_shots,)
-    ip_ma_data = ds["Ip_MA"].values
-    wtot_mj_data = ds["Wtot_MJ"].values
+    Ip_MA_data = ds["Ip_MA"].values
+    Wtot_MJ_data = ds["Wtot_MJ"].values
 
     for i in range(n_shots):
         # Get performance timeseries for this shot
@@ -315,8 +315,8 @@ def add_performance(
             idx_p95 = np.argmin(abs_diff)
 
             # Extract Ip_MA and Wtot_MJ at that time
-            Ip_MA_p95[i] = ip_ma_data[i, idx_p95]
-            Wtot_MJ_p95[i] = wtot_mj_data[i, idx_p95]
+            Ip_MA_p95[i] = Ip_MA_data[i, idx_p95]
+            Wtot_MJ_p95[i] = Wtot_MJ_data[i, idx_p95]
 
     # Add to dataset
     ds["Ip_MA_p95"] = (episode_coord, Ip_MA_p95)
@@ -621,7 +621,6 @@ def normalize_domain(  # noqa: PLR0915
 
 def get_train_val_datasets(
     training_data: "TrainingData",
-    data_normalization: str,
     study_type: str = "profile_transfer",
     debug: bool | None = config.debug,
 ):
@@ -668,14 +667,11 @@ def get_train_val_datasets(
     logger.debug("Historic Training dataset size: {}", train_ds.sizes[episode_coord])
     logger.debug("Historic Validation dataset size: {}", val_ds.sizes[episode_coord])
 
-    train_ds, val_ds = normalize_domain(train_ds, val_ds, method=data_normalization)
-
     return train_ds, val_ds
 
 
 def get_train_test_datasets(
     training_data: "TrainingData",
-    data_normalization: str,
     domain_adaptation: str,
     num_hp_shots: int,
     hp_test_set_size: int,
@@ -703,7 +699,7 @@ def get_train_test_datasets(
     # Load the target device dataset and split into train/test
     ds_hp, episode_coord = get_ds(target, study_type=study_type, debug=debug)
     ds_hp = add_performance(ds_hp, episode_coord)
-    ds_hp = ds_hp.assign_coords(ds_source=target)
+    ds_hp["ds_source_idx"] = dataset_config.ds_source_to_idx[target]
     sorted_shots = np.argsort(ds_hp["performance"].values)
 
     test_shot_pool = sorted_shots[-hp_test_set_size:]
@@ -719,23 +715,21 @@ def get_train_test_datasets(
     # Load historic source data for training (and for exnihilo: normalization only)
     # exnihilo.sources contains all non-target devices, so we can pass training_data directly
     train_ds_hist, val_ds_hist = get_train_val_datasets(
-        training_data, data_normalization, study_type=study_type, debug=debug
+        training_data, study_type=study_type, debug=debug
     )
     train_ds = concat_with_nan_padding(
         [train_ds_hist, val_ds_hist, train_ds_hp],
         concat_dim=episode_coord,
     )
-    # Normalize using only historic data to avoid leakage from the test set
-    train_ds, test_ds = normalize_domain(train_ds, test_ds, method=data_normalization)
 
     # For 'transfer' and exnihilo: strip historic data, train only on target device shots
     if domain_adaptation == "transfer" or training_data.exnihilo:
-        train_ds = train_ds.where(train_ds.coords["ds_source"] == target, drop=True)
+        train_ds = train_ds.where(
+            train_ds["ds_source_idx"] == dataset_config.ds_source_to_idx[target],
+            drop=True,
+        )
 
     logger.debug("HP Training dataset size: {}", train_ds.sizes[episode_coord])
     logger.debug("HP Test dataset size: {}", test_ds.sizes[episode_coord])
-
-    train_ds = training_data.add_ds_source_idx(train_ds)
-    test_ds = training_data.add_ds_source_idx(test_ds)
 
     return train_ds, test_ds
