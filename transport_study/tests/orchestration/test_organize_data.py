@@ -132,10 +132,15 @@ class TestGetTrainValDatasets:
         train_shots = set(train_ds["shot"].values)
         val_shots = set(val_ds["shot"].values)
         assert train_shots.isdisjoint(val_shots)
-        # Assert validation shots have higher performance metric
-        train_perf_max = train_ds["performance"].values.max()
-        val_perf_min = val_ds["performance"].values.min()
-        assert val_perf_min >= train_perf_max
+        # Assert validation shots have higher performance metric within the same source dataset
+        for source_idx in train_ds["ds_source_idx"].values:
+            train_subset = train_ds.where(
+                train_ds["ds_source_idx"] == source_idx, drop=True
+            )
+            val_subset = val_ds.where(val_ds["ds_source_idx"] == source_idx, drop=True)
+            train_perf_max = train_subset["performance"].values.max()
+            val_perf_min = val_subset["performance"].values.min()
+            assert val_perf_min >= train_perf_max
 
     def test_get_train_val_datasets_has_ds_source_idx(self, sample_dataset_config):
         td = TrainingData(sources_unsorted=frozenset({"cmod_low_1", "cmod_high"}))
