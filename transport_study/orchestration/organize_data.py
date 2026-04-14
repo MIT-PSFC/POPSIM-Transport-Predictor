@@ -644,8 +644,15 @@ def get_train_val_datasets(
             seed=42,
             sortby="performance",
         )
-        train_src["ds_source_idx"] = dataset_config.ds_source_to_idx[source]
-        val_src["ds_source_idx"] = dataset_config.ds_source_to_idx[source]
+        src_idx = dataset_config.ds_source_to_idx[source]
+        train_src["ds_source_idx"] = (
+            episode_coord,
+            np.full(train_src.sizes[episode_coord], src_idx),
+        )
+        val_src["ds_source_idx"] = (
+            episode_coord,
+            np.full(val_src.sizes[episode_coord], src_idx),
+        )
         ds_sources[source] = (train_src, val_src)
 
     if not ds_sources:
@@ -699,7 +706,10 @@ def get_train_test_datasets(
     # Load the target device dataset and split into train/test
     ds_hp, episode_coord = get_ds(target, study_type=study_type, debug=debug)
     ds_hp = add_performance(ds_hp, episode_coord)
-    ds_hp["ds_source_idx"] = dataset_config.ds_source_to_idx[target]
+    ds_hp["ds_source_idx"] = (
+        episode_coord,
+        np.full(ds_hp.sizes[episode_coord], dataset_config.ds_source_to_idx[target]),
+    )
     sorted_shots = np.argsort(ds_hp["performance"].values)
 
     test_shot_pool = sorted_shots[-hp_test_set_size:]

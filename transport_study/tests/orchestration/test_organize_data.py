@@ -145,9 +145,7 @@ class TestGetTrainValDatasets:
         object.__setattr__(td, "sources_unsorted", frozenset())
         object.__setattr__(td, "exnihilo", False)
         with pytest.raises(ValueError, match="sources is empty"):
-            get_train_val_datasets(
-                td, "raw", study_type="power_balance_transfer", debug=True
-            )
+            get_train_val_datasets(td, study_type="power_balance_transfer", debug=True)
 
 
 class TestGetTrainTestDatasets:
@@ -168,17 +166,21 @@ class TestGetTrainTestDatasets:
         train_shots = set(train_ds["shot"].values)
         test_shots = set(test_ds["shot"].values)
         assert train_shots.isdisjoint(test_shots)
-        # Assert test shots have higher performance metric within the same source dataset
-        for source_idx in train_ds["ds_source_idx"].values:
-            train_subset = train_ds.where(
-                train_ds["ds_source_idx"] == source_idx, drop=True
-            )
-            test_subset = test_ds.where(
-                test_ds["ds_source_idx"] == source_idx, drop=True
-            )
-            train_perf_max = train_subset["performance"].values.max()
-            test_perf_min = test_subset["performance"].values.min()
-            assert test_perf_min >= train_perf_max
+
+        # Assert that only target device shots are in the test set
+        test_ds_idx = sample_dataset_config.ds_source_to_idx[
+            sample_dataset_config.target_device
+        ]
+        assert all(s == test_ds_idx for s in test_ds["ds_source_idx"].values)
+
+        # Only need to check performance separation for the target device
+        train_subset = train_ds.where(
+            train_ds["ds_source_idx"] == test_ds_idx, drop=True
+        )
+        test_subset = test_ds.where(test_ds["ds_source_idx"] == test_ds_idx, drop=True)
+        train_perf_max = train_subset["performance"].values.max()
+        test_perf_min = test_subset["performance"].values.min()
+        assert test_perf_min >= train_perf_max
 
     def test_get_train_test_datasets_no_target_raises(self):
         cfg = DatasetConfig(
