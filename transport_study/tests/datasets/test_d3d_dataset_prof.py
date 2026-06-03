@@ -13,31 +13,39 @@ delta_top
 delta_bot
 """
 
-import os
 import shutil
+import tempfile
+from pathlib import Path
 
 import numpy as np
+import pytest
+
+_DS_PATH = Path(
+    "/fusion/projects/disruption_warning/data/popsim/popsim_studies/profopt/hbp_ida/raw_data/199056.nc"
+)
+if not _DS_PATH.exists():
+    pytest.skip("ds_path not found, skipping module", allow_module_level=True)
+
 import matplotlib.pyplot as plt
-import tempfile
-from transport_study import PACKAGE_ROOT
+import xarray as xr
 from disruption_py.machine.tokamak import Tokamak
-from disruption_py.settings.output_setting import DatasetOutputSetting
 from disruption_py.settings import (
     LogSettings,
     RetrievalSettings,
     TimeSetting,
     TimeSettingParams,
 )
+from disruption_py.settings.output_setting import DatasetOutputSetting
+from disruption_py.settings.time_setting import _postprocess
+from disruption_py.workflow import get_shots_data
+from loguru import logger
+
+from transport_study import PACKAGE_ROOT
 from transport_study.datasets.d3d.d3d_dataset import D3DDataWorkflow
 from transport_study.datasets.d3d.utils import (
     DEFAULT_SHOTLIST_FILE,
     Uniform1kHzTimeSetting,
 )
-
-from disruption_py.workflow import get_shots_data
-from disruption_py.settings.time_setting import _postprocess
-import xarray as xr
-from loguru import logger
 
 
 def test_trajopt_input_mapping():
@@ -45,8 +53,7 @@ def test_trajopt_input_mapping():
     The DIII-D PCS has a unique way to input shapes (gapin, R0, X points).
     We need to have a mapping from these shape parameters to the profile predictor inputs.
     """
-    ds_path = "/fusion/projects/disruption_warning/data/popsim/popsim_studies/profopt/hbp_ida/raw_data/199056.nc"
-    ds = xr.open_dataset(ds_path)
+    ds = xr.open_dataset(_DS_PATH)
     ds = ds.isel(shot=0)
 
     a_minor = ds["a_minor"].values
@@ -92,13 +99,9 @@ def test_trajopt_input_mapping():
     axes[3].legend()
     fig.tight_layout()
 
-    fig_dir = os.path.join(
-        PACKAGE_ROOT,
-        "tests",
-        "test_outputs",
-    )
-    os.makedirs(fig_dir, exist_ok=True)
-    fig.savefig(os.path.join(fig_dir, "input_mapping_reconstruction.png"))
+    fig_dir = PACKAGE_ROOT / "tests" / "test_outputs"
+    fig_dir.mkdir(parents=True, exist_ok=True)
+    fig.savefig(fig_dir / "input_mapping_reconstruction.png")
 
 
 class TimeCheckSetting(TimeSetting):
@@ -117,23 +120,20 @@ class TimeCheckSetting(TimeSetting):
         (efit_time,) = params.mds_conn.get_dims(
             r"\efit_aeqdsk:ali", tree_name="_efit_tree"
         )
-        # If timebase is much slower than 1 kHz, log a warning
-        result_dir = os.path.join(
-            PACKAGE_ROOT, "tests", "test_outputs", "d3d_1kHz_discrepancies"
-        )
-        good_shots_dir = os.path.join(result_dir, "good_shots")
-        bad_shots_dir = os.path.join(result_dir, "bad_shots")
+        result_dir = PACKAGE_ROOT / "tests" / "test_outputs" / "d3d_1kHz_discrepancies"
+        good_shots_dir = result_dir / "good_shots"
+        bad_shots_dir = result_dir / "bad_shots"
         typical_delta = np.median(np.diff(efit_time))
         if typical_delta > 2:
             logger.critical(
                 f"EFIT timebase is much slower than 1 kHz (typical delta: {typical_delta:.3f} ms). This may cause issues with interpolation and data quality."
             )
-            with open(os.path.join(bad_shots_dir, f"{params.shot_id}.txt"), "w") as f:
+            with open(bad_shots_dir / f"{params.shot_id}.txt", "w") as f:
                 f.write(
                     f"EFIT timebase is much slower than 1 kHz (typical delta: {typical_delta:.3f} ms). This may cause issues with interpolation and data quality."
                 )
         else:
-            with open(os.path.join(good_shots_dir, f"{params.shot_id}.txt"), "w") as f:
+            with open(good_shots_dir / f"{params.shot_id}.txt", "w") as f:
                 f.write(
                     f"EFIT timebase is good (typical delta: {typical_delta:.3f} ms)."
                 )
@@ -149,22 +149,22 @@ class TimeCheckSetting(TimeSetting):
 
 
 def find_1kHz_discrepancies():
-    shotlist_file = os.path.join(
-        PACKAGE_ROOT, "transport_study", "datasets", "d3d", DEFAULT_SHOTLIST_FILE
+    shotlist_file = (
+        PACKAGE_ROOT / "transport_study" / "datasets" / "d3d" / DEFAULT_SHOTLIST_FILE
     )
     shotlist_initial = np.loadtxt(shotlist_file, dtype=int)
 
     shotlist_ida = []
     for shot in shotlist_initial:
-        ida_path = f"/fusion/projects/results/ida-results/HBP_database/IDA_{shot}_.cdf"
-        if os.path.exists(ida_path):
+        ida_path = Path(
+            f"/fusion/projects/results/ida-results/HBP_database/IDA_{shot}_.cdf"
+        )
+        if ida_path.exists():
             shotlist_ida.append(shot)
 
-    result_dir = os.path.join(
-        PACKAGE_ROOT, "tests", "test_outputs", "d3d_1kHz_discrepancies"
-    )
-    good_shots_dir = os.path.join(result_dir, "good_shots")
-    bad_shots_dir = os.path.join(result_dir, "bad_shots")
+    result_dir = PACKAGE_ROOT / "tests" / "test_outputs" / "d3d_1kHz_discrepancies"
+    good_shots_dir = result_dir / "good_shots"
+    bad_shots_dir = result_dir / "bad_shots"
 
     retrieval_settings = RetrievalSettings(
         run_methods=["get_efit_parameters"],
@@ -173,10 +173,10 @@ def find_1kHz_discrepancies():
     )
 
     shutil.rmtree(result_dir, ignore_errors=True)
-    os.makedirs(good_shots_dir, exist_ok=True)
-    os.makedirs(bad_shots_dir, exist_ok=True)
+    good_shots_dir.mkdir(parents=True, exist_ok=True)
+    bad_shots_dir.mkdir(parents=True, exist_ok=True)
     for shot in shotlist_ida:
-        efit_result = get_shots_data(
+        get_shots_data(
             tokamak=Tokamak.D3D,
             shotlist_setting=shot,
             retrieval_settings=retrieval_settings,
@@ -187,24 +187,26 @@ def find_1kHz_discrepancies():
 
     shotlist_good = []
     shotlist_bad = []
-    with open(os.path.join(result_dir, "results_good.txt"), "w") as f:
-        for filename in os.listdir(good_shots_dir):
-            f.write(f"{filename[:-4]}\n")
-            shotlist_good.append(int(filename[:-4]))
-    with open(os.path.join(result_dir, "results_bad.txt"), "w") as f:
-        for filename in os.listdir(bad_shots_dir):
-            f.write(f"{filename[:-4]}\n")
-            shotlist_bad.append(int(filename[:-4]))
+    with open(result_dir / "results_good.txt", "w") as f:
+        for p in good_shots_dir.iterdir():
+            f.write(f"{p.stem}\n")
+            shotlist_good.append(int(p.stem))
+    with open(result_dir / "results_bad.txt", "w") as f:
+        for p in bad_shots_dir.iterdir():
+            f.write(f"{p.stem}\n")
+            shotlist_bad.append(int(p.stem))
 
-    disruption_efit_dir = "/fusion/projects/disruption_warning/data/disruption-efit"
+    disruption_efit_dir = Path(
+        "/fusion/projects/disruption_warning/data/disruption-efit"
+    )
     for shot in shotlist_good:
-        if not os.path.exists(os.path.join(disruption_efit_dir, f"{shot}.tgz")):
+        if not (disruption_efit_dir / f"{shot}.tgz").exists():
             logger.warning(
                 f"Shot {shot} is in the good list but does not have a disruption efit file."
             )
 
     for shot in shotlist_bad:
-        if os.path.exists(os.path.join(disruption_efit_dir, f"{shot}.tgz")):
+        if (disruption_efit_dir / f"{shot}.tgz").exists():
             logger.warning(
                 f"Shot {shot} is in the bad list but has a disruption efit file."
             )
@@ -263,13 +265,11 @@ def find_1kHz_discrepancies():
     axs[3].legend()
     fig.tight_layout()
     fig.savefig(
-        os.path.join(
-            PACKAGE_ROOT,
-            "tests",
-            "test_outputs",
-            "d3d_1kHz_discrepancies",
-            "input_mapping_comparison.png",
-        )
+        PACKAGE_ROOT
+        / "tests"
+        / "test_outputs"
+        / "d3d_1kHz_discrepancies"
+        / "input_mapping_comparison.png"
     )
     plt.close(fig)
 
@@ -282,7 +282,9 @@ def correct_betan_source():
     # 2. betan from fast EFIT
     # 3. betan from slow EFIT
     # 4. programmed betan
-    raw_path = "/fusion/projects/disruption_warning/data/popsim/popsim_studies/profopt/hbp_ida/raw_data/201927.nc"
+    raw_path = Path(
+        "/fusion/projects/disruption_warning/data/popsim/popsim_studies/profopt/hbp_ida/raw_data/201927.nc"
+    )
     ds_raw = xr.open_dataset(raw_path).isel(shot=0)
 
     betanf = ds_raw["betan"].values
@@ -313,13 +315,11 @@ def correct_betan_source():
     ax.legend()
     fig.tight_layout()
     fig.savefig(
-        os.path.join(
-            PACKAGE_ROOT,
-            "tests",
-            "test_outputs",
-            "d3d_1kHz_discrepancies",
-            "betan_comparison.png",
-        )
+        PACKAGE_ROOT
+        / "tests"
+        / "test_outputs"
+        / "d3d_1kHz_discrepancies"
+        / "betan_comparison.png"
     )
     plt.close(fig)
 

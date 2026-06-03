@@ -1,6 +1,6 @@
-from importlib.resources import files
+from pathlib import Path
 
-PACKAGE_ROOT = files("transport_study")
+PACKAGE_ROOT = Path(__file__).parent
 
 EPISODE_DIM = "shot"
 TIME_COORD = "time"
