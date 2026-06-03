@@ -36,14 +36,10 @@ class TrainingData:
 
     def __post_init__(self):
         paths_from_env = set(dataset_config.dataset_paths.keys())
-        if (
-            paths_from_env
-        ):  # Skip validation if dataset_config not yet loaded (e.g. tests)
+        if paths_from_env:  # Skip validation if dataset_config not yet loaded (e.g. tests)
             unknown = set(self.sources) - paths_from_env
             if unknown:
-                raise ValueError(
-                    f"Unknown dataset sources: {unknown}. Known: {paths_from_env}"
-                )
+                raise ValueError(f"Unknown dataset sources: {unknown}. Known: {paths_from_env}")
 
     @property
     def sources(self) -> list[str]:
@@ -150,9 +146,7 @@ def concat_with_nan_padding(
 
     # Align only along pad_dim to avoid creating duplicates along concat_dim
     if len(prepared_datasets) > 1 and pad_dim in prepared_datasets[0].dims:
-        aligned_datasets = xr.align(
-            *prepared_datasets, join="outer", fill_value=np.nan, exclude=concat_dim
-        )
+        aligned_datasets = xr.align(*prepared_datasets, join="outer", fill_value=np.nan, exclude=concat_dim)
     else:
         aligned_datasets = prepared_datasets
 
@@ -184,27 +178,19 @@ def get_ds(
         tuple[xr.Dataset, str]: The processed dataset and the dimension along which to group the data
     """
     if source_ds not in dataset_config.dataset_paths:
-        raise ValueError(
-            f"Unknown source dataset: {source_ds!r}. Available: {set(dataset_config.dataset_paths)}"
-        )
+        raise ValueError(f"Unknown source dataset: {source_ds!r}. Available: {set(dataset_config.dataset_paths)}")
     ds_path = Path(dataset_config.dataset_paths[source_ds])
 
-    ds = xr.open_dataset(ds_path).astype(
-        jax.numpy.float64 if jax.config.jax_enable_x64 else jax.numpy.float32
-    )
+    ds = xr.open_dataset(ds_path).astype(jax.numpy.float64 if jax.config.jax_enable_x64 else jax.numpy.float32)
 
     if EPISODE_DIM not in ds.dims:
-        raise ValueError(
-            f"Expected dataset to have {EPISODE_DIM} dimension, but it was not found. Found dimensions: {ds.dims}"
-        )
+        raise ValueError(f"Expected dataset to have {EPISODE_DIM} dimension, but it was not found. Found dimensions: {ds.dims}")
 
     if debug:
         ds = ds.isel({EPISODE_DIM: slice(0, 10)})  # Limit to 10 shots
     else:
         # Sort dataset by shot count, get the X most recent as set by config
-        ds = ds.sortby(EPISODE_DIM, ascending=False).isel(
-            {EPISODE_DIM: slice(0, config.max_ds_size)}
-        )
+        ds = ds.sortby(EPISODE_DIM, ascending=False).isel({EPISODE_DIM: slice(0, config.max_ds_size)})
 
     def _profile_transfer(ds: xr.Dataset) -> xr.Dataset:
         ds = ds[REQUIRED_SIGNALS_PROFILE_TRANSFER]
@@ -227,9 +213,7 @@ def get_ds(
         # Ensure all required signals are present
         for signal in REQUIRED_SIGNALS_POWER_BALANCE:
             if signal not in ds:
-                raise ValueError(
-                    f"Required signal for training {signal} not found in dataset."
-                )
+                raise ValueError(f"Required signal for training {signal} not found in dataset.")
 
         # Additional signals and duplicates for slight renames between submodules
         # This is for the individual submodule training to work, since when they're running on their own they expect these names.
@@ -238,9 +222,7 @@ def get_ds(
                 ds[signal] = xr.zeros_like(ds["Ip_MA"])
 
         # Calculate aux power and absorbed power
-        ds["P_aux_MW"] = (
-            ds["P_NBI_MW"] + ds["P_ECRH_MW"] + ds["P_ICRF_MW"] + ds["P_LH_MW"]
-        )
+        ds["P_aux_MW"] = ds["P_NBI_MW"] + ds["P_ECRH_MW"] + ds["P_ICRF_MW"] + ds["P_LH_MW"]
 
         return ds
 
@@ -278,9 +260,7 @@ def add_performance(
     Ip_scale = 1.0 / max_Ip if max_Ip != 0 else 1.0
 
     # Calculate performance at each time step (once for all shots)
-    perf_timeseries = ds.eval(
-        f"(({Wtot_scale} * Wtot_MJ)**2 + ({Ip_scale} * Ip_MA)**2)**0.5"
-    )
+    perf_timeseries = ds.eval(f"(({Wtot_scale} * Wtot_MJ)**2 + ({Ip_scale} * Ip_MA)**2)**0.5")
 
     # Get the 95th percentile value per shot
     if TIME_DIM in ds.dims:
@@ -362,21 +342,14 @@ def normalize_domain(  # noqa: PLR0915
 
     def _separate_devices(ds: xr.Dataset) -> dict[str, xr.Dataset]:
         devices = np.unique(ds.coords["ds_source"].values)
-        return {
-            device: ds.where(ds.coords["ds_source"] == device, drop=True)
-            for device in devices
-        }
+        return {device: ds.where(ds.coords["ds_source"] == device, drop=True) for device in devices}
 
     def _physics_normalization(ds_source: xr.Dataset, ds_target: xr.Dataset | None):
         def _epsilon(ds: xr.Dataset) -> xr.DataArray:
             return ds["a_minor"] / ds["R0"]
 
         def _beta(ds: xr.Dataset) -> xr.DataArray:
-            avg_pressure = (
-                (2.0 / 3.0)
-                * (ds["Wtot_MJ"] * 1e6)
-                / calc_plasma_volume(ds["R0"], ds["epsilon"], ds["kappa"])
-            )
+            avg_pressure = (2.0 / 3.0) * (ds["Wtot_MJ"] * 1e6) / calc_plasma_volume(ds["R0"], ds["epsilon"], ds["kappa"])
             magnetic_pressure = (ds["B0"] ** 2) / (2 * mu_0)
             beta = 100 * avg_pressure / magnetic_pressure
             return beta
@@ -384,12 +357,8 @@ def normalize_domain(  # noqa: PLR0915
         def _q_star(ds: xr.Dataset) -> xr.DataArray:
             # TODO(ZanderKeith) using 0 triangularity because it isn't part of H89/H98.
             # Do we care about doing that comparison? If not, could easily add delta_top and delta_bottom to the dataset and use them here.
-            f_shaping = calc_f_shaping(
-                ds["epsilon"], ds["kappa"], xr.zeros_like(ds["epsilon"])
-            )
-            q_star = calc_q_star(
-                ds["B0"], ds["R0"], ds["epsilon"], ds["Ip_MA"], f_shaping
-            )
+            f_shaping = calc_f_shaping(ds["epsilon"], ds["kappa"], xr.zeros_like(ds["epsilon"]))
+            q_star = calc_q_star(ds["B0"], ds["R0"], ds["epsilon"], ds["Ip_MA"], f_shaping)
             return q_star
 
         def _greenwald_fraction(ds: xr.Dataset) -> xr.DataArray:
@@ -402,9 +371,7 @@ def normalize_domain(  # noqa: PLR0915
             return aB0
 
         def _surface_power_density(ds: xr.Dataset) -> xr.DataArray:
-            surface_area = calc_plasma_surface_area(
-                ds["R0"], ds["epsilon"], ds["kappa"]
-            )
+            surface_area = calc_plasma_surface_area(ds["R0"], ds["epsilon"], ds["kappa"])
             if "P_aux_MW" not in ds:
                 power_density = xr.zeros_like(surface_area)
             else:
@@ -453,9 +420,7 @@ def normalize_domain(  # noqa: PLR0915
                     mean_val = device_params[var]["mean"]
                     std_val = device_params[var]["std"]
                     mask = ds_source_norm.coords["ds_source"] == device
-                    z_var = z_var.where(
-                        ~mask, (ds_source_norm[var] - mean_val) / std_val
-                    )
+                    z_var = z_var.where(~mask, (ds_source_norm[var] - mean_val) / std_val)
             ds_source_norm[f"{var}_z"] = z_var
 
         # Apply same normalization to target dataset if provided
@@ -468,16 +433,14 @@ def normalize_domain(  # noqa: PLR0915
                         mean_val = device_params[var]["mean"]
                         std_val = device_params[var]["std"]
                         mask = ds_target_norm.coords["ds_source"] == device
-                        z_var = z_var.where(
-                            ~mask, (ds_target_norm[var] - mean_val) / std_val
-                        )
+                        z_var = z_var.where(~mask, (ds_target_norm[var] - mean_val) / std_val)
                 ds_target_norm[f"{var}_z"] = z_var
         else:
             ds_target_norm = None
 
         return ds_source_norm, ds_target_norm
 
-    def _coral_normalization(ds_source: xr.Dataset, ds_target: xr.Dataset | None):  # noqa: PLR0915
+    def _coral_normalization(ds_source: xr.Dataset, ds_target: xr.Dataset | None):
         # CORAL aligns second-order statistics (covariance) across domains.
         # We use the pooled source data as the reference domain and transform
         # each device's features so their covariance matches the reference.
@@ -656,20 +619,14 @@ def get_train_val_datasets(
         ds_sources[source] = (train_src, val_src)
 
     if not ds_sources:
-        raise ValueError(
-            "training_data.sources is empty - cannot build train/val datasets"
-        )
+        raise ValueError("training_data.sources is empty - cannot build train/val datasets")
 
     if len(ds_sources) == 1:
         source = next(iter(ds_sources))
         train_ds, val_ds = ds_sources[source]
     else:
-        train_ds = concat_with_nan_padding(
-            [pair[0] for pair in ds_sources.values()], concat_dim=episode_coord
-        )
-        val_ds = concat_with_nan_padding(
-            [pair[1] for pair in ds_sources.values()], concat_dim=episode_coord
-        )
+        train_ds = concat_with_nan_padding([pair[0] for pair in ds_sources.values()], concat_dim=episode_coord)
+        val_ds = concat_with_nan_padding([pair[1] for pair in ds_sources.values()], concat_dim=episode_coord)
 
     logger.debug("Historic Training dataset size: {}", train_ds.sizes[episode_coord])
     logger.debug("Historic Validation dataset size: {}", val_ds.sizes[episode_coord])
@@ -724,9 +681,7 @@ def get_train_test_datasets(
 
     # Load historic source data for training (and for exnihilo: normalization only)
     # exnihilo.sources contains all non-target devices, so we can pass training_data directly
-    train_ds_hist, val_ds_hist = get_train_val_datasets(
-        training_data, study_type=study_type, debug=debug
-    )
+    train_ds_hist, val_ds_hist = get_train_val_datasets(training_data, study_type=study_type, debug=debug)
     train_ds = concat_with_nan_padding(
         [train_ds_hist, val_ds_hist, train_ds_hp],
         concat_dim=episode_coord,

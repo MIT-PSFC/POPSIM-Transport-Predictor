@@ -6,7 +6,7 @@ import matplotlib.pyplot as plt
 import xarray as xr
 
 
-def scope_shot(thomson_dir: str, profile_dir: str, figure_dir: str, shot: int):  # noqa: PLR0915
+def scope_shot(thomson_dir: str, profile_dir: str, figure_dir: str, shot: int):
     """Make a plot for a single shot comparing Thomson and profile data."""
     os.makedirs(figure_dir, exist_ok=True)
 
@@ -34,12 +34,8 @@ def scope_shot(thomson_dir: str, profile_dir: str, figure_dir: str, shot: int): 
         te_gp = ds_profile_time["Te_keV_psi"].values
         ne_gp = ds_profile_time["ne20_psi"].values
 
-        ds_core = ds_thomson_time.where(
-            ds_thomson_time["ts_array"] == "core", drop=True
-        )
-        ds_edge = ds_thomson_time.where(
-            ds_thomson_time["ts_array"] == "edge", drop=True
-        )
+        ds_core = ds_thomson_time.where(ds_thomson_time["ts_array"] == "core", drop=True)
+        ds_edge = ds_thomson_time.where(ds_thomson_time["ts_array"] == "edge", drop=True)
 
         rho_ts_core = ds_core["ts_channel_rho"].values
         te_ts_core = ds_core["ts_channel_te"].values
@@ -122,10 +118,7 @@ def scope_all_shots_freestyle(profile_dir: str):
     os.makedirs(figure_dir, exist_ok=True)
 
     fitted_shot_data_files = glob.glob(os.path.join(profile_dir, "*.nc"))
-    fitted_shots = [
-        int(os.path.basename(f).split("/")[-1].split(".")[0])
-        for f in fitted_shot_data_files
-    ]
+    fitted_shots = [int(os.path.basename(f).split("/")[-1].split(".")[0]) for f in fitted_shot_data_files]
 
     for shot in fitted_shots:
         shot_dir = os.path.join(figure_dir, str(shot))
@@ -141,10 +134,7 @@ def scope_all_shots(save_dir: str):
     os.makedirs(figure_dir, exist_ok=True)
 
     fitted_shot_data_files = glob.glob(os.path.join(profile_dir, "*.nc"))
-    fitted_shots = [
-        int(os.path.basename(f).split("/")[-1].split(".")[0])
-        for f in fitted_shot_data_files
-    ]
+    fitted_shots = [int(os.path.basename(f).split("/")[-1].split(".")[0]) for f in fitted_shot_data_files]
 
     for shot in fitted_shots:
         shot_dir = os.path.join(figure_dir, str(shot))

@@ -55,9 +55,7 @@ class PowerBalanceTRB(TrainRunBuilder):
                 data_normalization=dataloader_config["data_normalization"],
             )
         else:
-            logger.info(
-                f"Using transfer learning dataloader with domain adaptation {dataloader_config['domain_adaptation']}"
-            )
+            logger.info(f"Using transfer learning dataloader with domain adaptation {dataloader_config['domain_adaptation']}")
             ds_train, ds_val = get_train_test_datasets(
                 training_data=training_data,
                 data_normalization=dataloader_config["data_normalization"],
@@ -107,7 +105,7 @@ class PowerBalanceTRB(TrainRunBuilder):
         return ds_val, train_dl, val_dl, val_dl
 
     @staticmethod
-    def model_init(train_dl: DataLoader, model_init_config: dict) -> Any:  # noqa: PLR0915
+    def model_init(train_dl: DataLoader, model_init_config: dict) -> Any:
         """
         Instantiate and return your model given a training DataLoader
         and a model config dict.
@@ -119,23 +117,15 @@ class PowerBalanceTRB(TrainRunBuilder):
                 p_oh_config = model_init_config["submodules"]["p_oh_predictor"]
                 if isinstance(p_oh_config, TrainConfig):
                     p_oh_config = p_oh_config.model_dump()
-                p_oh_predictor = OhmicPowerTRB.model_init(
-                    train_dl, p_oh_config["model_init_config"]
-                )
+                p_oh_predictor = OhmicPowerTRB.model_init(train_dl, p_oh_config["model_init_config"])
                 p_rad_config = model_init_config["submodules"]["p_rad_predictor"]
                 if isinstance(p_rad_config, TrainConfig):
                     p_rad_config = p_rad_config.model_dump()
-                p_rad_predictor = RadiatedPowerTRB.model_init(
-                    train_dl, p_rad_config["model_init_config"]
-                )
+                p_rad_predictor = RadiatedPowerTRB.model_init(train_dl, p_rad_config["model_init_config"])
                 if model_init_config["restore_submodules"]:
-                    p_oh_manager = create_default_checkpoint_manager(
-                        p_oh_config["checkpoint_dir"]
-                    )
+                    p_oh_manager = create_default_checkpoint_manager(p_oh_config["checkpoint_dir"])
                     p_oh_predictor = restore_model(p_oh_manager, p_oh_predictor)
-                    p_rad_manager = create_default_checkpoint_manager(
-                        p_rad_config["checkpoint_dir"]
-                    )
+                    p_rad_manager = create_default_checkpoint_manager(p_rad_config["checkpoint_dir"])
                     p_rad_predictor = restore_model(p_rad_manager, p_rad_predictor)
 
             if model_type == "scaling_law":
@@ -168,9 +158,7 @@ class PowerBalanceTRB(TrainRunBuilder):
                     prng_seed=model_init_config.get("prng_seed", 42),
                 )
             else:
-                raise ValueError(
-                    f"Invalid model case: {model_init_config['model_case']}"
-                )
+                raise ValueError(f"Invalid model case: {model_init_config['model_case']}")
 
             return module
 
@@ -189,9 +177,7 @@ class PowerBalanceTRB(TrainRunBuilder):
         )
 
         if model_init_config.get("transfer_checkpoint", False):
-            transfer_manager = create_default_checkpoint_manager(
-                model_init_config["transfer_checkpoint"]
-            )
+            transfer_manager = create_default_checkpoint_manager(model_init_config["transfer_checkpoint"])
             env = restore_model(transfer_manager, env)
             # Restoring the main module overwrote the submodules new weights with the old one, must go back and fix it
             # TODO(ZanderKeith) there's gotta be a cleaner way to do this...
@@ -203,36 +189,24 @@ class PowerBalanceTRB(TrainRunBuilder):
                 if isinstance(p_rad_config, TrainConfig):
                     p_rad_config = p_rad_config.model_dump()
 
-                p_oh_manager = create_default_checkpoint_manager(
-                    p_oh_config["checkpoint_dir"]
-                )
+                p_oh_manager = create_default_checkpoint_manager(p_oh_config["checkpoint_dir"])
                 p_oh_restored = restore_model(p_oh_manager, env.module.p_oh_predictor)
-                p_rad_manager = create_default_checkpoint_manager(
-                    p_rad_config["checkpoint_dir"]
-                )
-                p_rad_restored = restore_model(
-                    p_rad_manager, env.module.p_rad_predictor
-                )
+                p_rad_manager = create_default_checkpoint_manager(p_rad_config["checkpoint_dir"])
+                p_rad_restored = restore_model(p_rad_manager, env.module.p_rad_predictor)
                 env = eqx.tree_at(
                     lambda e: (e.module.p_oh_predictor, e.module.p_rad_predictor),
                     env,
                     (p_oh_restored, p_rad_restored),
                 )
 
-            logger.debug(
-                f"Restoring module from tranfer learning pretrained checkpoint\n{model_init_config['transfer_checkpoint']}"
-            )
+            logger.debug(f"Restoring module from tranfer learning pretrained checkpoint\n{model_init_config['transfer_checkpoint']}")
 
         # This restoration of the main module is separate from the transfer learning restoration
         # This would get the post-trained model, AFTER transfer learning has already been done
         if model_init_config.get("restore_main_module", False):
-            manager = create_default_checkpoint_manager(
-                model_init_config["checkpoint_dir"]
-            )
+            manager = create_default_checkpoint_manager(model_init_config["checkpoint_dir"])
             env = restore_model(manager, env)
-            logger.debug(
-                f"Restoring module from post-training checkpoint\n{model_init_config['checkpoint_dir']}"
-            )
+            logger.debug(f"Restoring module from post-training checkpoint\n{model_init_config['checkpoint_dir']}")
         else:
             logger.warning("Not restoring main module from post-training checkpoint.")
 
@@ -295,9 +269,7 @@ class PowerBalanceTRB(TrainRunBuilder):
 
             # Unstack sample MultiIndex -> (shot, time_idx) and sqeeze out batch dimension so we can integrate per shot
             targ = eval_data.input_ds.Wtot_MJ.unstack("sample").squeeze()
-            pred = (
-                eval_data.output_ds["output.Wtot_MJ_pred"].unstack("sample").squeeze()
-            )
+            pred = eval_data.output_ds["output.Wtot_MJ_pred"].unstack("sample").squeeze()
             time_2d = eval_data.input_ds[TIME_COORD].unstack("sample").squeeze()
 
             # time-dependent modules modify the time dimension name, change it back to avoid confusion
@@ -337,14 +309,10 @@ class PowerBalanceTRB(TrainRunBuilder):
             ds_source = eval_data.input_ds["ds_source"]
             if "sample" in ds_source.dims:
                 # Case when there are multiple source datasets present
-                ds_source_array = (
-                    eval_data.input_ds["ds_source"].unstack("sample").squeeze().values
-                )
+                ds_source_array = eval_data.input_ds["ds_source"].unstack("sample").squeeze().values
             else:
                 # Case when there is a single source dataset present
-                ds_source_array = np.array(
-                    [ds_source.values.item() for _ in range(targ.sizes["shot"])]
-                )
+                ds_source_array = np.array([ds_source.values.item() for _ in range(targ.sizes["shot"])])
 
             ds = xr.Dataset(
                 data_vars={

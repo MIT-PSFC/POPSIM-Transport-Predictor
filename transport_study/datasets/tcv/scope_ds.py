@@ -45,7 +45,7 @@ def ds_target_info(ds_target: str):
     return shotlist, data_vars
 
 
-def transfer_ds():  # noqa: PLR0915 PLR0912
+def transfer_ds():  # noqa: PLR0915
     # I know the dataset at "/orcd/nese/psfc/001/allenw/ml_data_dump/TCV/zkeith/TCV_transport_dataset/full/dataset.nc" is right
     ds_path_src = "/orcd/nese/psfc/001/allenw/ml_data_dump/TCV/zkeith/TCV_transport_dataset/full/dataset.nc"
 
@@ -127,9 +127,7 @@ def transfer_ds():  # noqa: PLR0915 PLR0912
 
     # Reject unrealistic data points and data points at low temperature and density, when Thomson scattering can be unreliable
     # Only keep data where NEavg is above 0.1e20
-    ds["ne20_line_avg"] = xr.where(
-        ds["ne20_line_avg"] > 0.1, ds["ne20_line_avg"], np.nan
-    )
+    ds["ne20_line_avg"] = xr.where(ds["ne20_line_avg"] > 0.1, ds["ne20_line_avg"], np.nan)
 
     # Only keep data where Wtot is above 1e3 J
     ds["Wtot_MJ"] = xr.where(ds["Wtot_MJ"] > 1e-3, ds["Wtot_MJ"], np.nan)
@@ -173,17 +171,10 @@ def transfer_ds():  # noqa: PLR0915 PLR0912
 
     # Drop shots where radiated power exceeds 300% of input power for 20% of the valid time points
     shots_before = ds.shot
-    power_in = (
-        ds["P_NBI_MW"]
-        + ds["P_ECRH_MW"]
-        + ds["P_LH_MW"]
-        + ds["P_ICRF_MW"]
-        + ds["P_oh_MW"]
-    )
+    power_in = ds["P_NBI_MW"] + ds["P_ECRH_MW"] + ds["P_LH_MW"] + ds["P_ICRF_MW"] + ds["P_oh_MW"]
     power_rad_frac = ds["P_rad_MW"] / power_in
     ds = ds.where(
-        (power_rad_frac >= 3.0).sum(dim="time") / ds["Ip_MA"].notnull().sum(dim="time")
-        <= 0.2,
+        (power_rad_frac >= 3.0).sum(dim="time") / ds["Ip_MA"].notnull().sum(dim="time") <= 0.2,
         drop=True,
     )
     dropped_shots = set(shots_before.values) - set(ds.shot.values)
@@ -200,9 +191,7 @@ def transfer_ds():  # noqa: PLR0915 PLR0912
     # Drop shots where `ne20_line_avg` is NaN for more than 10% of valid time points
     shots_before = ds.shot
     ds = ds.where(
-        ds["ne20_line_avg"].notnull().sum(dim="time")
-        / ds["Ip_MA"].notnull().sum(dim="time")
-        >= 0.9,
+        ds["ne20_line_avg"].notnull().sum(dim="time") / ds["Ip_MA"].notnull().sum(dim="time") >= 0.9,
         drop=True,
     )
     dropped_shots = set(shots_before.values) - set(ds.shot.values)
@@ -232,7 +221,7 @@ def transfer_ds():  # noqa: PLR0915 PLR0912
     ds.to_netcdf(DS_PATH_TCV)
 
 
-def ds_time_plot(fig_dir: str, num_shots: int = 2):  # noqa: PLR0915
+def ds_time_plot(fig_dir: str, num_shots: int = 2):
     """Plot time traces of signals from the dataset"""
     ds = xr.open_dataset(DS_PATH_TCV)
 
@@ -282,27 +271,17 @@ def ds_time_plot(fig_dir: str, num_shots: int = 2):  # noqa: PLR0915
         ax_ip.set_ylabel("Ip [MA]", fontsize=LABEL_FONTSIZE, color="cyan")
         ax_ip.set_ylim(ylim_ip)
         ax_wtot = ax_ip.twinx()
-        ax_wtot.plot(
-            shot_ds["time"], shot_ds["Wtot_MJ"], label="Wtot [MJ]", color="red"
-        )
+        ax_wtot.plot(shot_ds["time"], shot_ds["Wtot_MJ"], label="Wtot [MJ]", color="red")
         ax_wtot.set_ylabel("Wtot [MJ]", fontsize=LABEL_FONTSIZE, color="red")
         ax_wtot.set_ylim(ylim_wtot)
         ax_wtot.tick_params(axis="y", labelsize=TICK_FONTSIZE, colors=TEXT_COLOR)
 
         # powers
         ax_power = axes[1]
-        ax_power.plot(
-            shot_ds["time"], shot_ds["P_oh_MW"], label="P_oh [MW]", color="orange"
-        )
-        ax_power.plot(
-            shot_ds["time"], shot_ds["P_rad_MW"], label="P_rad [MW]", color="red"
-        )
-        ax_power.plot(
-            shot_ds["time"], shot_ds["P_NBI_MW"], label="P_NBI [MW]", color="cyan"
-        )
-        ax_power.plot(
-            shot_ds["time"], shot_ds["P_ECRH_MW"], label="P_ECRH [MW]", color="lime"
-        )
+        ax_power.plot(shot_ds["time"], shot_ds["P_oh_MW"], label="P_oh [MW]", color="orange")
+        ax_power.plot(shot_ds["time"], shot_ds["P_rad_MW"], label="P_rad [MW]", color="red")
+        ax_power.plot(shot_ds["time"], shot_ds["P_NBI_MW"], label="P_NBI [MW]", color="cyan")
+        ax_power.plot(shot_ds["time"], shot_ds["P_ECRH_MW"], label="P_ECRH [MW]", color="lime")
         ax_power.plot(
             shot_ds["time"],
             shot_ds["LH_transition_threshold_MW"] / 1e6,
@@ -334,9 +313,7 @@ def ds_time_plot(fig_dir: str, num_shots: int = 2):  # noqa: PLR0915
         ax_shape = axes[3]
         ax_shape.plot(shot_ds["time"], shot_ds["a_minor"], label="a_minor", color="red")
         ax_shape.plot(shot_ds["time"], shot_ds["kappa"], label="kappa", color="yellow")
-        ax_shape.plot(
-            shot_ds["time"], shot_ds["delta_top"], label="delta_top", color="lime"
-        )
+        ax_shape.plot(shot_ds["time"], shot_ds["delta_top"], label="delta_top", color="lime")
         ax_shape.plot(
             shot_ds["time"],
             shot_ds["delta_bot"],
@@ -399,12 +376,8 @@ def ds_profile_plot(profile_dir: str, num_shots: int = 2):
             te_profile = time_ds["Te_keV_rho"].values
 
             # Skip if profiles are identical to previous (rectilinear interpolation duplicates)
-            ne_same = prev_ne_profile is not None and np.allclose(
-                ne_profile, prev_ne_profile, equal_nan=True
-            )
-            te_same = prev_te_profile is not None and np.allclose(
-                te_profile, prev_te_profile, equal_nan=True
-            )
+            ne_same = prev_ne_profile is not None and np.allclose(ne_profile, prev_ne_profile, equal_nan=True)
+            te_same = prev_te_profile is not None and np.allclose(te_profile, prev_te_profile, equal_nan=True)
             if ne_same and te_same:
                 continue
 
@@ -427,9 +400,7 @@ def ds_profile_plot(profile_dir: str, num_shots: int = 2):
             # Density profile
             ax_ne = axes[0]
             ax_ne.plot(rho, ne_profile, label="ne20", color="cyan", linewidth=2)
-            ax_ne.set_ylabel(
-                r"$n_e$ [$10^{20}$ m$^{-3}$]", fontsize=LABEL_FONTSIZE, color=TEXT_COLOR
-            )
+            ax_ne.set_ylabel(r"$n_e$ [$10^{20}$ m$^{-3}$]", fontsize=LABEL_FONTSIZE, color=TEXT_COLOR)
             ax_ne.set_ylim(ylim_ne)
             ax_ne.legend(
                 fontsize=LEGEND_FONTSIZE,
@@ -511,9 +482,7 @@ def ds_profile_time_plot(fig_dir: str, num_shots: int = 2):
 
         # Plot density heatmap
         ne_plot_data = ne_data.copy()
-        ne_plot_data[:, ne_nan_mask] = (
-            np.nan
-        )  # Set NaN timesteps to NaN for proper masking
+        ne_plot_data[:, ne_nan_mask] = np.nan  # Set NaN timesteps to NaN for proper masking
         im_ne = ax_ne.imshow(
             ne_plot_data,
             cmap="viridis",
@@ -536,17 +505,13 @@ def ds_profile_time_plot(fig_dir: str, num_shots: int = 2):
             )
 
         ax_ne.set_ylabel(r"$\rho$", fontsize=LABEL_FONTSIZE, color=TEXT_COLOR)
-        ax_ne.set_title(
-            r"$n_e$ [$10^{20}$ m$^{-3}$]", fontsize=LABEL_FONTSIZE, color=TEXT_COLOR
-        )
+        ax_ne.set_title(r"$n_e$ [$10^{20}$ m$^{-3}$]", fontsize=LABEL_FONTSIZE, color=TEXT_COLOR)
         cbar_ne = plt.colorbar(im_ne, ax=ax_ne)
         cbar_ne.ax.tick_params(labelsize=TICK_FONTSIZE, colors=TEXT_COLOR)
 
         # Plot temperature heatmap
         te_plot_data = te_data.copy()
-        te_plot_data[:, te_nan_mask] = (
-            np.nan
-        )  # Set NaN timesteps to NaN for proper masking
+        te_plot_data[:, te_nan_mask] = np.nan  # Set NaN timesteps to NaN for proper masking
         im_te = ax_te.imshow(
             te_plot_data,
             cmap="plasma",
@@ -591,6 +556,4 @@ if __name__ == "__main__":
     num_shots = 999
     ds_time_plot(os.path.join(scope_dir, "time_plots"), num_shots=num_shots)
     ds_profile_plot(os.path.join(scope_dir, "profile_plots"), num_shots=num_shots)
-    ds_profile_time_plot(
-        os.path.join(scope_dir, "profile_heatmaps"), num_shots=num_shots
-    )
+    ds_profile_time_plot(os.path.join(scope_dir, "profile_heatmaps"), num_shots=num_shots)

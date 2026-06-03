@@ -53,9 +53,7 @@ PROFILE_MODULES = [
 ]
 
 
-def _profile_module_to_checkpoint_dir(
-    profile_module: str, profopt_models_dir: str
-) -> str:
+def _profile_module_to_checkpoint_dir(profile_module: str, profopt_models_dir: str) -> str:
     """Convert a dot-separated profile module string into the ProfileStudy checkpoint directory.
 
     Input format:  model_type.training_data.data_normalization.domain_adaptation.freeze_shapes.num_hp_shots
@@ -64,9 +62,7 @@ def _profile_module_to_checkpoint_dir(
 
     Replicates ProfileStudy.Case.__str__() naming logic.
     """
-    model_type, training_data, _data_norm, domain_adaptation, freeze_str, num_hp_str = (
-        profile_module.split(".")
-    )
+    model_type, training_data, _data_norm, domain_adaptation, freeze_str, num_hp_str = profile_module.split(".")
     freeze_shapes = freeze_str == "True"
     num_hp_shots = int(num_hp_str)
 
@@ -80,7 +76,7 @@ def _profile_module_to_checkpoint_dir(
     return os.path.join(profopt_models_dir, case_str)
 
 
-def _compute_loss_metrics(  # noqa: PLR0915
+def _compute_loss_metrics(
     ds_ref: xr.Dataset,
     profile_predictor,
     optimized_trajectory_dir: str | None,
@@ -115,9 +111,7 @@ def _compute_loss_metrics(  # noqa: PLR0915
             if traj_var in ds_traj and ds_var in ds:
                 orig = ds[ds_var].load()
                 new_vals = orig.copy()
-                new_vals.loc[{"shot": config.ref_shot}] = (
-                    ds_traj[traj_var].values * scale
-                )
+                new_vals.loc[{"shot": config.ref_shot}] = ds_traj[traj_var].values * scale
                 updated[ds_var] = new_vals
         if updated:
             ds = ds.assign(updated)
@@ -194,11 +188,7 @@ def _compute_loss_metrics(  # noqa: PLR0915
 
     ne_nan_frac = np.isnan(ne).mean()
     if ne_nan_frac > 0.5:
-        label = (
-            f"optimized_trajectory_dir={optimized_trajectory_dir!r}"
-            if optimized_trajectory_dir
-            else "baseline"
-        )
+        label = f"optimized_trajectory_dir={optimized_trajectory_dir!r}" if optimized_trajectory_dir else "baseline"
         logger.warning(
             f"[_compute_loss_metrics] {ne_nan_frac:.1%} of ne predictions are NaN for {label}. "
             "Loss metrics will be unreliable. This usually means the trajectory contains out-of-range "
@@ -217,28 +207,18 @@ def _compute_loss_metrics(  # noqa: PLR0915
     safe_avg_P = np.maximum(avg_P, 1e-6)
     peaking = np.nanmax(P, axis=-1) / safe_avg_P
 
-    q_loss = (
-        np.maximum(3.5 - q_star, 0)
-        + np.maximum(3.0 - q_star, 0)
-        + np.maximum(2.5 - q_star, 0)
-    )
+    q_loss = np.maximum(3.5 - q_star, 0) + np.maximum(3.0 - q_star, 0) + np.maximum(2.5 - q_star, 0)
 
     ne_avg_1e19 = np.nanmean(ne, axis=-1) * 10.0  # (shot_alt, time)
     te_avg_keV = np.nanmean(te, axis=-1)
     R0_2d = R0  # already (shot_alt, time)
     nu_star = np.array(
-        jax.vmap(
-            lambda ne_i, te_i, r0_i: calc_effective_collisionality(
-                ne_i, te_i, r0_i, Z_EFF
-            )
-        )(ne_avg_1e19.reshape(-1), te_avg_keV.reshape(-1), R0_2d.reshape(-1))
+        jax.vmap(lambda ne_i, te_i, r0_i: calc_effective_collisionality(ne_i, te_i, r0_i, Z_EFF))(
+            ne_avg_1e19.reshape(-1), te_avg_keV.reshape(-1), R0_2d.reshape(-1)
+        )
     ).reshape(n_shot_alt, n_time)
 
-    nu_loss = (
-        np.maximum(nu_star - 0.3, 0)
-        + np.maximum(nu_star - 0.6, 0)
-        + np.maximum(nu_star - 1.0, 0)
-    )
+    nu_loss = np.maximum(nu_star - 0.3, 0) + np.maximum(nu_star - 0.6, 0) + np.maximum(nu_star - 1.0, 0)
 
     gw_loss = np.log1p(np.exp(10.0 * (fGW - 1.3)))  # softplus
 
@@ -268,9 +248,7 @@ def run_trajopts(
         run_trajectory_optimization(
             trajopt_name=profile_module,
             working_dir_base=working_dir_base,
-            profile_module_checkpoint_dir=_profile_module_to_checkpoint_dir(
-                profile_module, profopt_models_dir
-            ),
+            profile_module_checkpoint_dir=_profile_module_to_checkpoint_dir(profile_module, profopt_models_dir),
             traj_times=TRAJ_TIMES,
             max_num_traj_times=MAX_NUM_TRAJ_TIMES,
             enable_parallelism=True,
@@ -307,9 +285,7 @@ def compare_trajopts(
 
     for profile_module in PROFILE_MODULES:
         logger.info(f"Evaluating {profile_module}")
-        checkpoint_dir = _profile_module_to_checkpoint_dir(
-            profile_module, profopt_models_dir
-        )
+        checkpoint_dir = _profile_module_to_checkpoint_dir(profile_module, profopt_models_dir)
         profile_predictor = restore_profile_predictor_from_checkpoint(checkpoint_dir)
 
         # Mirror the debug-suffix logic from run_trajectory_optimization
@@ -327,12 +303,8 @@ def compare_trajopts(
 
         # Baseline: programmed trajectory, no optimization
         logger.info("  baseline")
-        module_metrics[(0, True)] = _compute_loss_metrics(
-            ds_ref, profile_predictor, None
-        )
-        module_metrics[(0, False)] = module_metrics[
-            (0, True)
-        ]  # same baseline for both od flags
+        module_metrics[(0, True)] = _compute_loss_metrics(ds_ref, profile_predictor, None)
+        module_metrics[(0, False)] = module_metrics[(0, True)]  # same baseline for both od flags
 
         for case in trajopt.cases:
             if not os.path.exists(trajopt.output_path(case)):
@@ -340,9 +312,7 @@ def compare_trajopts(
                 continue
             logger.info(f"  {case}")
             output_dir = os.path.dirname(trajopt.output_path(case))
-            module_metrics[(case.num_traj_times, case.optimize_density)] = (
-                _compute_loss_metrics(ds_ref, profile_predictor, output_dir)
-            )
+            module_metrics[(case.num_traj_times, case.optimize_density)] = _compute_loss_metrics(ds_ref, profile_predictor, output_dir)
 
         all_metrics[profile_module] = module_metrics
 
@@ -428,12 +398,8 @@ def _plot_comparison(all_metrics: dict, plot_dir: str):
     ]
     # Line style handles: solid = density optimized, dashed = density fixed
     style_handles = [
-        Line2D(
-            [0], [0], color="white", linewidth=2, linestyle="-", label="density opt."
-        ),
-        Line2D(
-            [0], [0], color="white", linewidth=2, linestyle="--", label="density fixed"
-        ),
+        Line2D([0], [0], color="white", linewidth=2, linestyle="-", label="density opt."),
+        Line2D([0], [0], color="white", linewidth=2, linestyle="--", label="density fixed"),
     ]
 
     # Blank separator

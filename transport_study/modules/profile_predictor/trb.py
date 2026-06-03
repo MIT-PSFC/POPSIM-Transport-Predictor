@@ -69,17 +69,13 @@ class ProfilePredictorTRB(TrainRunBuilder):
                     debug=dataloader_config.get("debug", False),
                 )
                 # Double check there's no source (non-target) data anywhere in here
-                non_target = set(dataset_config.dataset_paths.keys()) - {
-                    dataset_config.target_device
-                }
+                non_target = set(dataset_config.dataset_paths.keys()) - {dataset_config.target_device}
                 if any((ds_train["ds_source"] == src).any() for src in non_target):
                     raise ValueError(
                         "Historic data found in training set for exnihilo training_data option. Please check the dataset construction logic."
                     )
         else:
-            logger.info(
-                f"Using transfer learning dataloader with domain adaptation {dataloader_config['domain_adaptation']}"
-            )
+            logger.info(f"Using transfer learning dataloader with domain adaptation {dataloader_config['domain_adaptation']}")
             ds_train, ds_val = get_train_test_datasets(
                 training_data=training_data,
                 data_normalization=dataloader_config["data_normalization"],
@@ -148,13 +144,9 @@ class ProfilePredictorTRB(TrainRunBuilder):
             sample_dim = train_dl.dataset.training_metadata.sample_dim
 
             if shape_type == ShapeType.PCA_LIKE:
-                te_shapes, ne_shapes = pca_initial_guess(
-                    n_shapes, ds[te_shape_var], ds[ne_shape_var], sample_dim
-                )
+                te_shapes, ne_shapes = pca_initial_guess(n_shapes, ds[te_shape_var], ds[ne_shape_var], sample_dim)
             elif shape_type == ShapeType.CONVEX_COMBINATION:
-                te_shapes, ne_shapes = kmeans_initial_guess(
-                    n_shapes, ds[te_shape_var], ds[ne_shape_var], sample_dim
-                )
+                te_shapes, ne_shapes = kmeans_initial_guess(n_shapes, ds[te_shape_var], ds[ne_shape_var], sample_dim)
             else:
                 raise ValueError(f"Invalid shape type: {shape_type}")
 
@@ -173,9 +165,7 @@ class ProfilePredictorTRB(TrainRunBuilder):
                 key=jax.random.PRNGKey(model_init_config["prng_seed"]),
             )
         else:
-            raise ValueError(
-                f"Invalid model type {model_init_config['model_type']}, must be either 'shape_init' or 'unstructured_nn'"
-            )
+            raise ValueError(f"Invalid model type {model_init_config['model_type']}, must be either 'shape_init' or 'unstructured_nn'")
 
         return module
 
@@ -240,15 +230,9 @@ class ProfilePredictorTRB(TrainRunBuilder):
         def get_trainable_shape_init(module: ProfilePredictorShapeInit):
             # Get all leaves that are not a part of te_shapes and ne_shapes.
             # All of these leaves are trainable.
-            ids_of_shape_leaves = [
-                id(x) for x in jax.tree.leaves((module.te_shapes, module.ne_shapes))
-            ]
+            ids_of_shape_leaves = [id(x) for x in jax.tree.leaves((module.te_shapes, module.ne_shapes))]
             if model_init_config["freeze_shapes"]:
-                return [
-                    x
-                    for x in jax.tree.leaves(module)
-                    if id(x) not in ids_of_shape_leaves
-                ]
+                return [x for x in jax.tree.leaves(module) if id(x) not in ids_of_shape_leaves]
             else:
                 return jax.tree.leaves(module)
 
@@ -261,9 +245,7 @@ class ProfilePredictorTRB(TrainRunBuilder):
         elif model_init_config["model_type"] == "unstructured_nn":
             return get_trainable_nn
         else:
-            raise ValueError(
-                f"Invalid model type {model_init_config['model_type']}, must be either 'shape_init' or 'unstructured_nn'"
-            )
+            raise ValueError(f"Invalid model type {model_init_config['model_type']}, must be either 'shape_init' or 'unstructured_nn'")
 
     @staticmethod
     def get_val_eval_suite(suite_config) -> EvaluationSuite:
@@ -295,9 +277,7 @@ class ProfilePredictorTRB(TrainRunBuilder):
             # Sort loss vec and sample at most 100 points evenly for logging
             if loss_vec.shape[0] > 100:
                 sorted_indices = jnp.argsort(loss_vec)
-                selected_indices = sorted_indices[
-                    jnp.linspace(0, loss_vec.shape[0] - 1, num=100, dtype=int)
-                ]
+                selected_indices = sorted_indices[jnp.linspace(0, loss_vec.shape[0] - 1, num=100, dtype=int)]
                 loss_vec = loss_vec[selected_indices]
             out = {
                 "mean": loss_vec_mean,
@@ -311,10 +291,10 @@ class ProfilePredictorTRB(TrainRunBuilder):
         return eval_suite
 
     @staticmethod
-    def get_test_eval_suite(config) -> EvaluationSuite:  # noqa: PLR0915
+    def get_test_eval_suite(config) -> EvaluationSuite:
         """Evaluation suite for testing after training."""
 
-        def study_results(eval_data: EvalData) -> xr.Dataset:  # noqa: PLR0915
+        def study_results(eval_data: EvalData) -> xr.Dataset:
             """Calculate final study results for profile prediction.
                 - Target vs predicted ne20_psi and Te_keV_psi profiles
                 - Per-timeslice profile-integrated absolute/relative errors
@@ -327,24 +307,18 @@ class ProfilePredictorTRB(TrainRunBuilder):
                 # Keep episode/time axes even when they have length 1.
                 # Single-shot eval splits are valid and should retain the shot dimension.
                 protected_dims = {EPISODE_DIM, TIME_DIM, TIME_DIM + "_input"}
-                squeeze_dims = [
-                    d for d, n in da.sizes.items() if n == 1 and d not in protected_dims
-                ]
+                squeeze_dims = [d for d, n in da.sizes.items() if n == 1 and d not in protected_dims]
                 if squeeze_dims:
                     da = da.squeeze(dim=squeeze_dims, drop=True)
                 if TIME_DIM + "_input" in da.dims:
                     da = da.rename({TIME_DIM + "_input": TIME_DIM})
                 return da
 
-            def _get_first_present(
-                ds: xr.Dataset, candidates: list[str]
-            ) -> xr.DataArray:
+            def _get_first_present(ds: xr.Dataset, candidates: list[str]) -> xr.DataArray:
                 for name in candidates:
                     if name in ds.data_vars:
                         return ds[name]
-                raise KeyError(
-                    f"None of the candidate output vars were found: {candidates}"
-                )
+                raise KeyError(f"None of the candidate output vars were found: {candidates}")
 
             # Targets from input dataset
             ne_targ = _unstack_and_rename_time(eval_data.input_ds["ne20_psi"])
@@ -368,12 +342,8 @@ class ProfilePredictorTRB(TrainRunBuilder):
             ne_error_abs_profile = xr.apply_ufunc(np.abs, ne_pred - ne_targ)
             te_error_abs_profile = xr.apply_ufunc(np.abs, te_pred - te_targ)
 
-            ne_error_rel_profile = ne_error_abs_profile / (
-                xr.apply_ufunc(np.abs, ne_targ) + 0.1
-            )
-            te_error_rel_profile = te_error_abs_profile / (
-                xr.apply_ufunc(np.abs, te_targ) + 0.1
-            )
+            ne_error_rel_profile = ne_error_abs_profile / (xr.apply_ufunc(np.abs, ne_targ) + 0.1)
+            te_error_rel_profile = te_error_abs_profile / (xr.apply_ufunc(np.abs, te_targ) + 0.1)
 
             # Integrate profile error over psi for each timeslice
             ne_error_abs_ts = ne_error_abs_profile.integrate("psi_n")
@@ -430,35 +400,22 @@ class ProfilePredictorTRB(TrainRunBuilder):
             ds_source = eval_data.input_ds["ds_source"]
             if "sample" in ds_source.dims:
                 ds_source_unstacked = ds_source.unstack("sample")
-                if (
-                    EPISODE_DIM in ds_source_unstacked.dims
-                    and ds_source_unstacked.ndim > 1
-                ):
-                    other_dims = [
-                        d for d in ds_source_unstacked.dims if d != EPISODE_DIM
-                    ]
-                    ds_source_stacked = ds_source_unstacked.stack(
-                        _other=other_dims
-                    ).transpose(EPISODE_DIM, "_other")
+                if EPISODE_DIM in ds_source_unstacked.dims and ds_source_unstacked.ndim > 1:
+                    other_dims = [d for d in ds_source_unstacked.dims if d != EPISODE_DIM]
+                    ds_source_stacked = ds_source_unstacked.stack(_other=other_dims).transpose(EPISODE_DIM, "_other")
                     ds_source_vals = ds_source_stacked.values
                     ds_source_valid = ds_source_stacked.notnull().values
                     ds_source_array = np.array(
                         [
-                            row[np.flatnonzero(valid_mask)[0]]
-                            if np.any(valid_mask)
-                            else np.nan
-                            for row, valid_mask in zip(
-                                ds_source_vals, ds_source_valid, strict=True
-                            )
+                            row[np.flatnonzero(valid_mask)[0]] if np.any(valid_mask) else np.nan
+                            for row, valid_mask in zip(ds_source_vals, ds_source_valid, strict=True)
                         ],
                         dtype=object,
                     )
                 else:
                     ds_source_array = ds_source_unstacked.values
             else:
-                ds_source_array = np.array(
-                    [ds_source.values.item() for _ in range(ne_targ.sizes[EPISODE_DIM])]
-                )
+                ds_source_array = np.array([ds_source.values.item() for _ in range(ne_targ.sizes[EPISODE_DIM])])
 
             ds = xr.Dataset(
                 data_vars={

@@ -66,6 +66,7 @@ testpaths = ["transport_study"]
 
 [tool.ruff]
 fix = true
+line-length = 140
 lint.select = [
   "A", # avoid shadowing
   "B", # flake8-bugbear
@@ -100,4 +101,8 @@ lint.ignore = [
 
 lint.pyupgrade.keep-runtime-typing=true
 lint.pydocstyle.convention = "google"
+
+[tool.ruff.lint.pylint]
+max-branches = 20
+max-statements = 80
 

@@ -14,7 +14,7 @@ TICK_FONTSIZE = 18
 LEGEND_FONTSIZE = 18
 
 
-def profile_comparison(  # noqa: PLR0915, PLR0912
+def profile_comparison(  # noqa: PLR0912
     profile_dir: str,
     ds_targ: xr.Dataset,
     ds_pred_list: list[xr.Dataset] | None = None,
@@ -56,9 +56,7 @@ def profile_comparison(  # noqa: PLR0915, PLR0912
         if ds_pred_list is not None:
             for ds_pred in ds_pred_list:
                 try:
-                    shot_ds_pred = ds_pred.where(
-                        ds_pred["shot"] == shot, drop=True
-                    ).squeeze()
+                    shot_ds_pred = ds_pred.where(ds_pred["shot"] == shot, drop=True).squeeze()
                     shot_ds_pred_list.append(shot_ds_pred)
                 except (KeyError, ValueError):
                     # Shot not found in prediction dataset or other error
@@ -72,9 +70,7 @@ def profile_comparison(  # noqa: PLR0915, PLR0912
         psi = shot_ds_targ["psi"].values
 
         for _, time in enumerate(shot_ds_targ["time"].values):
-            time_ds_targ = shot_ds_targ.where(
-                shot_ds_targ["time"] == time, drop=True
-            ).squeeze()
+            time_ds_targ = shot_ds_targ.where(shot_ds_targ["time"] == time, drop=True).squeeze()
 
             ne_profile_targ = time_ds_targ["ne20_psi"].values
             te_profile_targ = time_ds_targ["Te_keV_psi"].values
@@ -101,14 +97,10 @@ def profile_comparison(  # noqa: PLR0915, PLR0912
 
             # Plot all predictions
             if ds_pred_list is not None:
-                for i, (shot_ds_pred, label) in enumerate(
-                    zip(shot_ds_pred_list, ds_pred_labels, strict=True)
-                ):
+                for i, (shot_ds_pred, label) in enumerate(zip(shot_ds_pred_list, ds_pred_labels, strict=True)):
                     if shot_ds_pred is not None:
                         try:
-                            time_ds_pred = shot_ds_pred.where(
-                                shot_ds_pred["time"] == time, drop=True
-                            ).squeeze()
+                            time_ds_pred = shot_ds_pred.where(shot_ds_pred["time"] == time, drop=True).squeeze()
                             ne_profile_pred = time_ds_pred["ne"].values
                             color = pred_colors[i % len(pred_colors)]
                             ax_ne.plot(
@@ -123,9 +115,7 @@ def profile_comparison(  # noqa: PLR0915, PLR0912
                             # Time not found in prediction or other error
                             continue
 
-            ax_ne.set_ylabel(
-                r"$n_e$ [$10^{20}$ m$^{-3}$]", fontsize=LABEL_FONTSIZE, color=TEXT_COLOR
-            )
+            ax_ne.set_ylabel(r"$n_e$ [$10^{20}$ m$^{-3}$]", fontsize=LABEL_FONTSIZE, color=TEXT_COLOR)
             ax_ne.set_ylim(ylim_ne)
             ax_ne.legend(
                 fontsize=LEGEND_FONTSIZE,
@@ -140,14 +130,10 @@ def profile_comparison(  # noqa: PLR0915, PLR0912
 
             # Plot all predictions
             if ds_pred_list is not None:
-                for i, (shot_ds_pred, label) in enumerate(
-                    zip(shot_ds_pred_list, ds_pred_labels, strict=True)
-                ):
+                for i, (shot_ds_pred, label) in enumerate(zip(shot_ds_pred_list, ds_pred_labels, strict=True)):
                     if shot_ds_pred is not None:
                         try:
-                            time_ds_pred = shot_ds_pred.where(
-                                shot_ds_pred["time"] == time, drop=True
-                            ).squeeze()
+                            time_ds_pred = shot_ds_pred.where(shot_ds_pred["time"] == time, drop=True).squeeze()
                             te_profile_pred = time_ds_pred["te"].values
                             color = pred_colors[i % len(pred_colors)]
                             ax_te.plot(
@@ -221,9 +207,7 @@ def trajectory_performance_comparison(
         fig, ax = plt.subplots(figsize=(12, 6))
         fig.patch.set_facecolor(BACKGROUND_COLOR)
         box_dict = ax.boxplot(perf_list, labels=ds_perf_labels)
-        ax.set_title(
-            f"{title} - {perf_label}", fontsize=TITLE_FONTSIZE, color=TEXT_COLOR
-        )
+        ax.set_title(f"{title} - {perf_label}", fontsize=TITLE_FONTSIZE, color=TEXT_COLOR)
         ax.set_ylabel("Peaking Factor", fontsize=LABEL_FONTSIZE, color=TEXT_COLOR)
         ax.set_facecolor(FACE_COLOR)
         ax.grid(True, color="gray", linestyle="--", linewidth=0.5)
@@ -241,13 +225,11 @@ def trajectory_performance_comparison(
             flier.set(marker="o", markeredgecolor="white", markersize=4)
 
         fig.tight_layout()
-        fig.savefig(
-            os.path.join(save_dir, f"performance_comparison_{perf_label.lower()}.png")
-        )
+        fig.savefig(os.path.join(save_dir, f"performance_comparison_{perf_label.lower()}.png"))
         plt.close(fig)
 
 
-def trajectory_shapes_comparison(  # noqa: PLR0912, PLR0915
+def trajectory_shapes_comparison(  # noqa: PLR0915
     trajectory_shapes: list[dict],
     trajectory_labels: list[str],
     orig_traj: xr.Dataset,
@@ -272,9 +254,7 @@ def trajectory_shapes_comparison(  # noqa: PLR0912, PLR0915
     if not os.path.exists(save_dir):
         os.makedirs(save_dir)
 
-    trajectory_vars = [
-        var for var in trajectory_shapes[0].keys() if var != "shape_times"
-    ]
+    trajectory_vars = [var for var in trajectory_shapes[0].keys() if var != "shape_times"]
     n_vars = len(trajectory_vars)
 
     # 3 columns: [all-grey, 201xxx series, 199xxx series]
@@ -295,10 +275,7 @@ def trajectory_shapes_comparison(  # noqa: PLR0912, PLR0915
         return str(shot_alt).split("_")[0]
 
     unique_shot_numbers = list(dict.fromkeys(_shot_number(sa) for sa in shot_alts))
-    shot_color_map = {
-        sn: orig_palette[i % len(orig_palette)]
-        for i, sn in enumerate(unique_shot_numbers)
-    }
+    shot_color_map = {sn: orig_palette[i % len(orig_palette)] for i, sn in enumerate(unique_shot_numbers)}
 
     # Classify shot_alts into series
     def _series(shot_alt: str) -> str:
@@ -316,9 +293,7 @@ def trajectory_shapes_comparison(  # noqa: PLR0912, PLR0915
         for spine in ax.spines.values():
             spine.set_color(TEXT_COLOR)
 
-    def _plot_orig_shots(
-        ax: plt.Axes, var: str, series_filter: str | None, colored: bool
-    ) -> None:
+    def _plot_orig_shots(ax: plt.Axes, var: str, series_filter: str | None, colored: bool) -> None:
         """Plot original shot trajectories on ax.  If series_filter is set, only
         shots from that series are drawn.  colored=True uses per-shot colors;
         colored=False uses grey."""
@@ -351,9 +326,7 @@ def trajectory_shapes_comparison(  # noqa: PLR0912, PLR0915
             labeled.add(sn)
 
     def _plot_optimized(ax: plt.Axes, var: str) -> None:
-        for i, (traj, label) in enumerate(
-            zip(trajectory_shapes, trajectory_labels, strict=True)
-        ):
+        for i, (traj, label) in enumerate(zip(trajectory_shapes, trajectory_labels, strict=True)):
             shape_times = np.array(traj["shape_times"])
             var_vals = np.array(traj[var])
             color = pred_colors[i % len(pred_colors)]
@@ -429,9 +402,7 @@ def trajectory_shapes_comparison(  # noqa: PLR0912, PLR0915
     # Gather optimized + bounds labels first (from col 0), then shot labels (cols 1+2)
     for col in range(3):
         for row in range(n_vars):
-            for handle, label in zip(
-                *axes_grid[row, col].get_legend_handles_labels(), strict=True
-            ):
+            for handle, label in zip(*axes_grid[row, col].get_legend_handles_labels(), strict=True):
                 if label not in seen_labels:
                     seen_labels.add(label)
                     legend_handles.append(handle)

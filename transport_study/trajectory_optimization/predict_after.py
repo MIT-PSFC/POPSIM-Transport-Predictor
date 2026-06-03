@@ -68,9 +68,7 @@ def _fill_nan(arr: np.ndarray) -> np.ndarray:
     if len(valid) == 0:
         return arr
     # forward-fill then backward-fill via nearest-neighbour extrapolation
-    arr[nan_mask] = arr[
-        valid[np.searchsorted(valid, np.where(nan_mask)[0]).clip(0, len(valid) - 1)]
-    ]
+    arr[nan_mask] = arr[valid[np.searchsorted(valid, np.where(nan_mask)[0]).clip(0, len(valid) - 1)]]
     # backward-fill any leading NaN (where searchsorted returns 0 for indices before valid[0])
     still_nan = np.isnan(arr)
     if still_nan.any():
@@ -113,7 +111,7 @@ def _overwrite_prog_with_measured(ds: xr.Dataset, shot: int) -> xr.Dataset:
     return ds.assign(updates)
 
 
-def run_postshot_prediction(  # noqa: PLR0915
+def run_postshot_prediction(
     shot: int,
     profile_predictor_checkpoint_dir: str,
     scratch_dir: str | None = config.scratch_dir,
@@ -176,9 +174,7 @@ def run_postshot_prediction(  # noqa: PLR0915
     delta_top = (R0_prog - rxtop_prog) / a_minor
 
     # Step 3: Restore profile predictor
-    profile_predictor = restore_profile_predictor_from_checkpoint(
-        profile_predictor_checkpoint_dir
-    )
+    profile_predictor = restore_profile_predictor_from_checkpoint(profile_predictor_checkpoint_dir)
 
     # Build batched Inputs for vmap
     n_shot_alt, n_time = R0_prog.shape
@@ -204,10 +200,7 @@ def run_postshot_prediction(  # noqa: PLR0915
     )
 
     # Step 4: Run profile predictor
-    logger.info(
-        f"Running profile predictor on {n_shot_alt * n_time} samples "
-        f"({n_shot_alt} shot_alts x {n_time} time steps)"
-    )
+    logger.info(f"Running profile predictor on {n_shot_alt * n_time} samples ({n_shot_alt} shot_alts x {n_time} time steps)")
 
     def _predict(inputs: Inputs):
         outputs = profile_predictor(inputs)

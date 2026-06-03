@@ -32,9 +32,7 @@ def _parse_training_data(s: str) -> TrainingData:
     """Convert a string like 'cmod_tcv' or 'exnihilo' to a TrainingData object."""
     if s == "exnihilo":
         target = dataset_config.target_device
-        non_target = frozenset(dataset_config.dataset_paths.keys()) - (
-            {target} if target else set()
-        )
+        non_target = frozenset(dataset_config.dataset_paths.keys()) - ({target} if target else set())
         return TrainingData(sources=non_target, exnihilo=True)
     return TrainingData(sources=frozenset(s.split("_")))
 
@@ -52,9 +50,7 @@ class PowerBalanceStudy(Study):
     def _hyperparam_training_data(cls) -> TrainingData:
         """All configured non-target source devices - the canonical hyperparam case."""
         target = dataset_config.target_device
-        sources = frozenset(dataset_config.dataset_paths.keys()) - (
-            {target} if target else set()
-        )
+        sources = frozenset(dataset_config.dataset_paths.keys()) - ({target} if target else set())
         return TrainingData(sources=sources)
 
     ##################
@@ -96,7 +92,9 @@ class PowerBalanceStudy(Study):
         data_normalization: str  # raw, physics, z_score, coral
         domain_adaptation: str  # none, mixing, transfer
         freeze_submodules: bool
-        num_hp_shots: int  # Number of high-performance shots included in training, or -1 for all (should be -1 if domain_adaptation is None)
+        num_hp_shots: (
+            int  # Number of high-performance shots included in training, or -1 for all (should be -1 if domain_adaptation is None)
+        )
         # So that's 3 (model type) x 4 (training data) x 4 (normalization) x 3 (domain adaptation) x 2 (freeze or not) x 6 (hp shots included) = 1728 results
         # Even less since the hyperparameter tuning is only done for a subset of cases
         prereqs: (
@@ -106,12 +104,9 @@ class PowerBalanceStudy(Study):
         def is_hyperparam_case(self) -> bool:
             if (
                 self.training_data == PowerBalanceStudy._hyperparam_training_data()
-                and self.data_normalization
-                == PowerBalanceStudy.HYPERPARAM_DATA_NORMALIZATION
-                and self.domain_adaptation
-                == PowerBalanceStudy.HYPERPARAM_DOMAIN_ADAPTATION
-                and self.freeze_submodules
-                == PowerBalanceStudy.HYPERPARAM_FREEZE_SUBMODULES
+                and self.data_normalization == PowerBalanceStudy.HYPERPARAM_DATA_NORMALIZATION
+                and self.domain_adaptation == PowerBalanceStudy.HYPERPARAM_DOMAIN_ADAPTATION
+                and self.freeze_submodules == PowerBalanceStudy.HYPERPARAM_FREEZE_SUBMODULES
                 and self.num_hp_shots == PowerBalanceStudy.HYPERPARAM_NUM_HP_SHOTS
             ):
                 return True
@@ -121,9 +116,7 @@ class PowerBalanceStudy(Study):
         def is_impossible(self) -> bool:
             """Some cases don't make sense to run. Mark those cases as impossible and raise an error if we try to run them."""
             # Can't do transfer learning or training from nothing with 0 target shots.
-            if (
-                self.domain_adaptation == "transfer" or self.training_data.exnihilo
-            ) and self.num_hp_shots == 0:
+            if (self.domain_adaptation == "transfer" or self.training_data.exnihilo) and self.num_hp_shots == 0:
                 return True
 
             return False
@@ -172,10 +165,7 @@ class PowerBalanceStudy(Study):
                 raise ValueError(
                     "If domain_adaptation is None, num_hp_shots must be -1 since this means we're training and testing on the same dataset and no high-performance data is being used"
                 )
-            if (
-                model_type in ["p_oh", "p_rad"]
-                and freeze_submodules != PowerBalanceStudy.HYPERPARAM_FREEZE_SUBMODULES
-            ):
+            if model_type in ["p_oh", "p_rad"] and freeze_submodules != PowerBalanceStudy.HYPERPARAM_FREEZE_SUBMODULES:
                 raise ValueError(
                     f"freeze_submodules should be a dummy value ({PowerBalanceStudy.HYPERPARAM_FREEZE_SUBMODULES}) for submodule {model_type}"
                 )
@@ -315,9 +305,7 @@ class PowerBalanceStudy(Study):
             _unwrap_prereqs(case)
 
         unique_cases = list(set(unwrapped_cases))  # Remove duplicates
-        possible_cases = [
-            case for case in unique_cases if not case.is_impossible()
-        ]  # Remove impossible cases
+        possible_cases = [case for case in unique_cases if not case.is_impossible()]  # Remove impossible cases
 
         return possible_cases
 
@@ -701,12 +689,8 @@ class PowerBalanceStudy(Study):
                 update={
                     "dataloader_config": {
                         **train_config_base.dataloader_config,
-                        "segment_length_train": tuned_config.dataloader_config[
-                            "segment_length_train"
-                        ],
-                        "segment_overlap_train": tuned_config.dataloader_config[
-                            "segment_overlap_train"
-                        ],
+                        "segment_length_train": tuned_config.dataloader_config["segment_length_train"],
+                        "segment_overlap_train": tuned_config.dataloader_config["segment_overlap_train"],
                         "batch_size": tuned_config.dataloader_config["batch_size"],
                     },
                     "optimizer_config": tuned_config.optimizer_config,
@@ -735,9 +719,7 @@ class PowerBalanceStudy(Study):
         sweep_id = get_sweep_id(self.wandb_project_name(case))
 
         if not sweep_id:
-            logger.info(
-                f"No existing sweep found for case {case}, creating a new sweep"
-            )
+            logger.info(f"No existing sweep found for case {case}, creating a new sweep")
             sweep_config_path = os.path.join(
                 PACKAGE_ROOT,
                 "transport_study",
@@ -756,9 +738,7 @@ class PowerBalanceStudy(Study):
                 f"Case {case} is not a possible case to run, check the logic in the Case dataclass to see why this is. This should have been caught earlier!"
             )
 
-        logger.opt(colors=True).info(
-            f"<bold><red>LAUNCHING TRAINING for case\n{case}</red></bold>"
-        )
+        logger.opt(colors=True).info(f"<bold><red>LAUNCHING TRAINING for case\n{case}</red></bold>")
 
         train_config = self.make_train_config(case)
         result_path = self.result_path(case)
@@ -822,23 +802,15 @@ class PowerBalanceStudy(Study):
                     "err_abs_shot_mean": err_abs_shot.mean(),
                     "err_abs_shot_std": err_abs_shot.std(),
                     "err_abs_shot_med": err_abs_shot.median(),
-                    "err_abs_shot_p25": err_abs_shot.quantile(0.25).drop_vars(
-                        "quantile"
-                    ),
-                    "err_abs_shot_p75": err_abs_shot.quantile(0.75).drop_vars(
-                        "quantile"
-                    ),
+                    "err_abs_shot_p25": err_abs_shot.quantile(0.25).drop_vars("quantile"),
+                    "err_abs_shot_p75": err_abs_shot.quantile(0.75).drop_vars("quantile"),
                     "err_abs_shot_min": err_abs_shot.min(),
                     "err_abs_shot_max": err_abs_shot.max(),
                     "err_rel_shot_mean": err_rel_shot.mean(),
                     "err_rel_shot_std": err_rel_shot.std(),
                     "err_rel_shot_med": err_rel_shot.median(),
-                    "err_rel_shot_p25": err_rel_shot.quantile(0.25).drop_vars(
-                        "quantile"
-                    ),
-                    "err_rel_shot_p75": err_rel_shot.quantile(0.75).drop_vars(
-                        "quantile"
-                    ),
+                    "err_rel_shot_p25": err_rel_shot.quantile(0.25).drop_vars("quantile"),
+                    "err_rel_shot_p75": err_rel_shot.quantile(0.75).drop_vars("quantile"),
                     "err_rel_shot_min": err_rel_shot.min(),
                     "err_rel_shot_max": err_rel_shot.max(),
                     "err_abs_ts_mean": err_abs_ts.mean(),
@@ -872,7 +844,7 @@ class PowerBalanceStudy(Study):
         return ds_merged
 
 
-def run_study(  # noqa: PLR0915
+def run_study(
     project_name: str,
     working_dir_base: str | None,
     model_types: list[str] | None = None,
@@ -950,15 +922,9 @@ def run_study(  # noqa: PLR0915
             if model_types is None:
                 model_types = ["scaling_law", "sciml", "unstructured_nn"]
             if training_datasets is None:
-                training_datasets = [
-                    _parse_training_data(s)
-                    for s in ["cmod", "tcv", "cmod_tcv", "exnihilo"]
-                ]
+                training_datasets = [_parse_training_data(s) for s in ["cmod", "tcv", "cmod_tcv", "exnihilo"]]
             else:
-                training_datasets = [
-                    _parse_training_data(s) if isinstance(s, str) else s
-                    for s in training_datasets
-                ]
+                training_datasets = [_parse_training_data(s) if isinstance(s, str) else s for s in training_datasets]
             if data_normalization_methods is None:
                 data_normalization_methods = ["raw", "physics", "z_score", "coral"]
             if domain_adaptation_methods is None:
@@ -1006,9 +972,7 @@ def run_study(  # noqa: PLR0915
         ):
             for model_type in model_types:
                 if model_type not in ["scaling_law", "sciml", "unstructured_nn"]:
-                    raise ValueError(
-                        f"Invalid model type: {model_type}. Must be one of 'scaling_law', 'sciml', or 'unstructured_nn'."
-                    )
+                    raise ValueError(f"Invalid model type: {model_type}. Must be one of 'scaling_law', 'sciml', or 'unstructured_nn'.")
 
             for data_normalization in data_normalization_methods:
                 if data_normalization not in ["raw", "physics", "z_score", "coral"]:
@@ -1085,9 +1049,7 @@ def run_study(  # noqa: PLR0915
         logger.info(f"Clean results: {clean_results}")
         logger.info(f"Clean figures: {clean_figures}")
 
-        if (
-            clean_sweeps or clean_models or clean_results or clean_figures
-        ) and enable_parallelism:
+        if (clean_sweeps or clean_models or clean_results or clean_figures) and enable_parallelism:
             raise ValueError(
                 "Cannot clean models, results, or figures when parallelism is enabled, as this would interfere with jobs currently running or queued."
             )
@@ -1116,9 +1078,7 @@ def run_study(  # noqa: PLR0915
     # Data Visualization #
     ######################
     if not skip_visualization:
-        logger.opt(colors=True).info(
-            "<bold><magenta>DATA VISUALIZATION</magenta></bold>"
-        )
+        logger.opt(colors=True).info("<bold><magenta>DATA VISUALIZATION</magenta></bold>")
         DataVisualization.performance_extrapolation(study.figure_dir)
         DataVisualization.domain_overlap(study.figure_dir)
 
@@ -1134,15 +1094,10 @@ def run_study(  # noqa: PLR0915
 
         # Unfinished cases are those we have data to run but haven't gotten results for yet
         unfinished_cases = [
-            case
-            for case in study.cases
-            if not os.path.exists(study.result_path(case))
-            and study.check_data_requirements(case)
+            case for case in study.cases if not os.path.exists(study.result_path(case)) and study.check_data_requirements(case)
         ]
         while len(unfinished_cases) > 0:
-            logger.opt(colors=True).info(
-                f"<<bold><green>{len(unfinished_cases)} cases remain</green></bold>>"
-            )
+            logger.opt(colors=True).info(f"<<bold><green>{len(unfinished_cases)} cases remain</green></bold>>")
             for case in unfinished_cases:
                 # TODO(ZanderKeith): Duplicates are happening somehow, but going fast
                 if not os.path.exists(study.result_path(case)):
@@ -1153,11 +1108,7 @@ def run_study(  # noqa: PLR0915
                     )
 
             # Check which cases are still unfinished
-            unfinished_cases = [
-                case
-                for case in unfinished_cases
-                if not os.path.exists(study.result_path(case))
-            ]
+            unfinished_cases = [case for case in unfinished_cases if not os.path.exists(study.result_path(case))]
             # Sleep for a bit before checking again to avoid spamming slurm
             time.sleep(8)
 

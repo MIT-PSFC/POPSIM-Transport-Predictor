@@ -80,9 +80,7 @@ class TrajectoryOptimization:
         max_num_traj_times: int,
     ):
         if max_num_traj_times > len(traj_times):
-            raise ValueError(
-                f"max_num_traj_times {max_num_traj_times} cannot be greater than the number of traj_times {len(traj_times)}"
-            )
+            raise ValueError(f"max_num_traj_times {max_num_traj_times} cannot be greater than the number of traj_times {len(traj_times)}")
 
         self.name = name
         self.profile_module_checkpoint_dir = profile_module_checkpoint_dir
@@ -106,15 +104,11 @@ class TrajectoryOptimization:
 
     def result_path(self, case: Case) -> str:
         """Path to the predicted profiles dataset (test eval results)."""
-        return os.path.join(
-            self.working_dir, "outputs", str(case), "predicted_profiles.nc"
-        )
+        return os.path.join(self.working_dir, "outputs", str(case), "predicted_profiles.nc")
 
     def output_path(self, case: Case) -> str:
         """Path to the done-marker output dataset for a case. Analogous to result_path in ProfileStudy."""
-        return os.path.join(
-            self.working_dir, "outputs", str(case), "optimized_trajectory.nc"
-        )
+        return os.path.join(self.working_dir, "outputs", str(case), "optimized_trajectory.nc")
 
     def train_job_name(self, case: Case) -> str:
         return f"trajopt_{case}"
@@ -155,9 +149,7 @@ class TrajectoryOptimization:
 
         base_trajopt_config = TrainConfig.load(PROFILE_TRAJECTORY_OPTIMIZER_CONFIG)
 
-        profile_predictor_config = checkpoint_to_profile_config(
-            self.profile_module_checkpoint_dir
-        )
+        profile_predictor_config = checkpoint_to_profile_config(self.profile_module_checkpoint_dir)
 
         traj_times = self.traj_times[: case.num_traj_times]
         trajopt_config = base_trajopt_config.model_copy(
@@ -168,9 +160,7 @@ class TrajectoryOptimization:
                 "checkpoint_dir": self.checkpoint_dir(case),
                 "dataloader_config": {
                     **base_trajopt_config.dataloader_config,
-                    "ds_path": config.dataset_paths.get(
-                        config.target_device
-                    ),  # Needed for profile predictor submodule
+                    "ds_path": config.dataset_paths.get(config.target_device),  # Needed for profile predictor submodule
                     "ref_shot": config.ref_shot,  # The shot we are basing our optimization on
                     "scratch_dir": config.scratch_dir,
                     "debug": config.debug,
@@ -296,20 +286,14 @@ class TrajectoryOptimization:
 
             if os.path.exists(checkpoint_dir):
                 trajopt_config = self.setup_optimization_config(case)
-                _, train_dl, _, _ = ProfileTrajectoryOptimizerTRB.get_dataloaders(
-                    trajopt_config.dataloader_config
-                )
-                env = ProfileTrajectoryOptimizerTRB.model_init(
-                    train_dl, trajopt_config.model_init_config
-                )
+                _, train_dl, _, _ = ProfileTrajectoryOptimizerTRB.get_dataloaders(trajopt_config.dataloader_config)
+                env = ProfileTrajectoryOptimizerTRB.model_init(train_dl, trajopt_config.model_init_config)
                 manager = create_default_checkpoint_manager(checkpoint_dir)
                 env = restore_model(manager, env)
                 module = env.module
                 # Use resolve_targets (which applies soft_clip) so stored values
                 # exactly match what was used during every forward pass.
-                resolved = [
-                    module.resolve_targets(float(t)) for t in module.config.traj_times
-                ]
+                resolved = [module.resolve_targets(float(t)) for t in module.config.traj_times]
                 return {
                     "time": np.array(module.config.traj_times),
                     "R0": np.array([r["R0"] for r in resolved]),
@@ -323,10 +307,7 @@ class TrajectoryOptimization:
                     "derived_shape_ranges": module.config.derived_shape_ranges,
                 }
             else:
-                logger.critical(
-                    f"No checkpoint found at {checkpoint_dir}. "
-                    "Falling back to sample for debugging"
-                )
+                logger.critical(f"No checkpoint found at {checkpoint_dir}. Falling back to sample for debugging")
                 return {
                     "time": traj_times,
                     "R0": [1.665, 1.670],
@@ -374,16 +355,12 @@ class TrajectoryOptimization:
 
         # Full optimized waveforms over shot_time
         R0_wave = _build_opt_waveform("R0_prog", R0)
-        gapin_wave = _build_opt_waveform(
-            "gapin", gapin
-        )  # no gapin_prog, use measured as base
+        gapin_wave = _build_opt_waveform("gapin", gapin)  # no gapin_prog, use measured as base
         rxbot_wave = _build_opt_waveform("rxbot_prog", rxpt1)
         zxbot_wave = _build_opt_waveform("zxbot_prog", zxpt1)
         rxtop_wave = _build_opt_waveform("rxtop_prog", rxpt2)
         zxtop_wave = _build_opt_waveform("zxtop_prog", zxpt2)
-        ne20_wave = _build_opt_waveform(
-            "ne20_edge_prog", np.array(optimized_trajectory["ne20_edge"])
-        )
+        ne20_wave = _build_opt_waveform("ne20_edge_prog", np.array(optimized_trajectory["ne20_edge"]))
 
         def _var(arr):
             return ("time_idx", arr)
@@ -392,20 +369,12 @@ class TrajectoryOptimization:
         # Signal names and units match DIII-D PCS conventions.
         ds_traj = xr.Dataset(
             {
-                "iptipp": _var(
-                    ds_shot["Ip_MA_prog"].values * 1e6
-                ),  # [A]            — unchanged from ref
-                "bttbt": _var(
-                    ds_shot["B0_prog"].values
-                ),  # [T]            — unchanged from ref
-                "bmtpwrtar": _var(
-                    ds_shot["betan_prog"].values
-                ),  #                — unchanged from ref
+                "iptipp": _var(ds_shot["Ip_MA_prog"].values * 1e6),  # [A]            — unchanged from ref
+                "bttbt": _var(ds_shot["B0_prog"].values),  # [T]            — unchanged from ref
+                "bmtpwrtar": _var(ds_shot["betan_prog"].values),  #                — unchanged from ref
                 "dstdenp": _var(ne20_wave * 10),  # [10^19 m^-3]
                 "idtrp": _var(R0_wave),  # [m]
-                "gapin_opt": _var(
-                    gapin_wave
-                ),  # [m] — no clean PCS mapping (ieeseg06/07 not equivalent)
+                "gapin_opt": _var(gapin_wave),  # [m] — no clean PCS mapping (ieeseg06/07 not equivalent)
                 "idtrxbot": _var(rxbot_wave),  # [m]
                 "idtzxbot": _var(zxbot_wave),  # [m]
                 "idtrxtop": _var(rxtop_wave),  # [m]
@@ -438,12 +407,8 @@ class TrajectoryOptimization:
             f.write(f"Reproducing shot {config.ref_shot}\n\n")
             f.write("Ensure the control system is in the following mode:\n")
             f.write("  - Betan control (bmtpwrtar waveform follows betanf)\n")
-            f.write(
-                "  - Pedestal density feedback (dstdenp waveform follows dssneped)\n"
-            )
-            f.write(
-                "  - X-point shape control (idtrxbot, idtzxbot, idtrxtop, idtzxtop)\n\n"
-            )
+            f.write("  - Pedestal density feedback (dstdenp waveform follows dssneped)\n")
+            f.write("  - X-point shape control (idtrxbot, idtzxbot, idtrxtop, idtzxtop)\n\n")
             f.write(
                 f"The following signals are UNCHANGED from shot {config.ref_shot}\n"
                 f"and should be programmed identically:\n"
@@ -472,10 +437,7 @@ class TrajectoryOptimization:
                 "delta_bot",
             ]
             sig_values = [
-                [
-                    f"{optimized_trajectory['ne20_edge'][i] * 10:.3f}"
-                    for i in range(len(traj_times))
-                ],
+                [f"{optimized_trajectory['ne20_edge'][i] * 10:.3f}" for i in range(len(traj_times))],
                 [f"{R0[i]:.3f}" for i in range(len(traj_times))],
                 [f"{gapin[i]:.3f}" for i in range(len(traj_times))],
                 [f"{rxpt1[i]:.3f}" for i in range(len(traj_times))],
@@ -492,19 +454,10 @@ class TrajectoryOptimization:
             label_w = max(len(s) for s in sig_labels) + 2
             col_w = 12
             # Header row
-            f.write(
-                " " * label_w + "  ".join(h.ljust(col_w) for h in time_headers) + "\n"
-            )
-            f.write(
-                "-" * (label_w + col_w * len(traj_times) + 2 * (len(traj_times) - 1))
-                + "\n"
-            )
+            f.write(" " * label_w + "  ".join(h.ljust(col_w) for h in time_headers) + "\n")
+            f.write("-" * (label_w + col_w * len(traj_times) + 2 * (len(traj_times) - 1)) + "\n")
             for label, values in zip(sig_labels, sig_values, strict=True):
-                f.write(
-                    label.ljust(label_w)
-                    + "  ".join(v.ljust(col_w) for v in values)
-                    + "\n"
-                )
+                f.write(label.ljust(label_w) + "  ".join(v.ljust(col_w) for v in values) + "\n")
             f.write(
                 "\n* gapin: there is no clean mapping from gapin to a PCS signal\n"
                 "  (ieeseg06/07 are related but not equivalent).\n"
@@ -514,9 +467,7 @@ class TrajectoryOptimization:
                 "If the desired shape cannot be achieved exactly due to the imperfect mapping to PCS signals, prioritize\n"
                 "achieving the derived shape values over matching the exact idtrx/zx values\n\n"
             )
-            f.write(
-                f"\nGenerated by {getpass.getuser()} on {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
-            )
+            f.write(f"\nGenerated by {getpass.getuser()} on {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
         logger.info(f"Saved instruction text to {instruction_path}")
 
         ###########################################################################
@@ -856,7 +807,7 @@ class TrajectoryOptimization:
 ###############################################
 
 
-def run_trajectory_optimization(  # noqa: PLR0912
+def run_trajectory_optimization(
     trajopt_name: str,
     working_dir_base: str,
     profile_module_checkpoint_dir: str,
@@ -895,25 +846,17 @@ def run_trajectory_optimization(  # noqa: PLR0912
             )
         for case in trajopt.cases:
             shutil.rmtree(trajopt.checkpoint_dir(case), ignore_errors=True)
-            shutil.rmtree(
-                os.path.dirname(trajopt.output_path(case)), ignore_errors=True
-            )
+            shutil.rmtree(os.path.dirname(trajopt.output_path(case)), ignore_errors=True)
 
-    unfinished_cases = [
-        case for case in trajopt.cases if not os.path.exists(trajopt.output_path(case))
-    ]
+    unfinished_cases = [case for case in trajopt.cases if not os.path.exists(trajopt.output_path(case))]
 
     while len(unfinished_cases) > 0:
-        logger.opt(colors=True).info(
-            f"<bold><green>{len(unfinished_cases)} cases remaining</green></bold>"
-        )
+        logger.opt(colors=True).info(f"<bold><green>{len(unfinished_cases)} cases remaining</green></bold>")
         for case in unfinished_cases:
             if os.path.exists(trajopt.output_path(case)):
                 continue
             if enable_parallelism:
-                running = count_running_jobs(
-                    trajopt.train_job_name(case), config.partition
-                )
+                running = count_running_jobs(trajopt.train_job_name(case), config.partition)
                 if running > 0:
                     logger.info(f"Job already running for {case}, skipping")
                     continue
@@ -927,11 +870,7 @@ def run_trajectory_optimization(  # noqa: PLR0912
                 if not os.path.exists(trajopt.output_path(case)):
                     trajopt.output_optimized_trajectory(case)
 
-        unfinished_cases = [
-            case
-            for case in unfinished_cases
-            if not os.path.exists(trajopt.output_path(case))
-        ]
+        unfinished_cases = [case for case in unfinished_cases if not os.path.exists(trajopt.output_path(case))]
         if len(unfinished_cases) > 0:
             time.sleep(8)
 

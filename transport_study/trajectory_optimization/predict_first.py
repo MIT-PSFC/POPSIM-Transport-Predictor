@@ -47,7 +47,7 @@ BRIGHT_COLORS = [
 ]
 
 
-def run_preshot_prediction(  # noqa: PLR0915, PLR0912
+def run_preshot_prediction(  # noqa: PLR0915
     ref_shot: int,
     targ_shot: int | None,
     profile_predictor_checkpoint_dir: str,
@@ -101,9 +101,7 @@ def run_preshot_prediction(  # noqa: PLR0915, PLR0912
 
     # Step 0: Overwrite programmed trajectory if an optimized trajectory is provided
     if optimized_trajectory_checkpoint_dir is not None:
-        traj_path = os.path.join(
-            optimized_trajectory_checkpoint_dir, "optimized_trajectory.nc"
-        )
+        traj_path = os.path.join(optimized_trajectory_checkpoint_dir, "optimized_trajectory.nc")
         logger.info(f"Loading optimized trajectory from {traj_path}")
         ds_traj = xr.open_dataset(traj_path)
         # Map PCS signal names → dataset variable names and unit scale factors
@@ -140,9 +138,7 @@ def run_preshot_prediction(  # noqa: PLR0915, PLR0912
         if nan_mask.any():
             valid_idxs = np.where(~nan_mask)[0]
             if len(valid_idxs):
-                gapin_opt_vals[nan_mask] = np.interp(
-                    np.where(nan_mask)[0], valid_idxs, gapin_opt_vals[valid_idxs]
-                )
+                gapin_opt_vals[nan_mask] = np.interp(np.where(nan_mask)[0], valid_idxs, gapin_opt_vals[valid_idxs])
         new_vals.loc[{"shot": ref_shot}] = gapin_opt_vals
         ds_ref = ds_ref.assign({"gapin_prog": new_vals})
     if targ_shot is not None:
@@ -172,9 +168,7 @@ def run_preshot_prediction(  # noqa: PLR0915, PLR0912
     delta_top = (R0_prog - rxtop_prog) / a_minor
 
     # Step 3: Restore profile predictor from checkpoint
-    profile_predictor = restore_profile_predictor_from_checkpoint(
-        profile_predictor_checkpoint_dir
-    )
+    profile_predictor = restore_profile_predictor_from_checkpoint(profile_predictor_checkpoint_dir)
 
     # Build batched Inputs for vmap
     n_shot_alt, n_time = R0_prog.shape
@@ -200,10 +194,7 @@ def run_preshot_prediction(  # noqa: PLR0915, PLR0912
     )
 
     # Step 4: Run profile predictor on all samples via vmap
-    logger.info(
-        f"Running profile predictor on {n_shot_alt * n_time} samples "
-        f"({n_shot_alt} shot_alts x {n_time} time steps)"
-    )
+    logger.info(f"Running profile predictor on {n_shot_alt * n_time} samples ({n_shot_alt} shot_alts x {n_time} time steps)")
 
     def _predict(inputs: Inputs):
         outputs = profile_predictor(inputs)
@@ -347,7 +338,7 @@ def _plot_predictor_inputs(
         plt.close(fig)
 
 
-def _plot_preshot_predictions(ds_pred: xr.Dataset, output_dir: str):  # noqa: PLR0915
+def _plot_preshot_predictions(ds_pred: xr.Dataset, output_dir: str):
     """Plot predicted profiles with mean ± 1 std across perturbations.
 
     For each base shot, produces:
@@ -433,11 +424,7 @@ def _plot_preshot_predictions(ds_pred: xr.Dataset, output_dir: str):  # noqa: PL
         # --- Profile snapshot plot: pick up to 5 evenly-spaced valid times ---
         valid_idx = np.where(valid_t)[0]
         if len(valid_idx) >= 2:
-            snap_idx = valid_idx[
-                np.round(
-                    np.linspace(0, len(valid_idx) - 1, min(5, len(valid_idx)))
-                ).astype(int)
-            ]
+            snap_idx = valid_idx[np.round(np.linspace(0, len(valid_idx) - 1, min(5, len(valid_idx)))).astype(int)]
             snap_colors = BRIGHT_COLORS[: len(snap_idx)]
             psi_grid_vals = ds_pred["psi_n"].values
 
@@ -468,9 +455,7 @@ def _plot_preshot_predictions(ds_pred: xr.Dataset, output_dir: str):  # noqa: PL
                     m = mean_da.isel(time_idx=tidx).values
                     s = std_da.isel(time_idx=tidx).values
                     ax2.plot(psi_grid_vals, m, color=color, linewidth=2, label=t_label)
-                    ax2.fill_between(
-                        psi_grid_vals, m - s, m + s, color=color, alpha=0.25
-                    )
+                    ax2.fill_between(psi_grid_vals, m - s, m + s, color=color, alpha=0.25)
 
                 ax2.set_xlabel(r"$\psi_n$", fontsize=LABEL_FONTSIZE, color=TEXT_COLOR)
                 ax2.set_ylabel(ylabel, fontsize=LABEL_FONTSIZE, color=TEXT_COLOR)
@@ -601,18 +586,14 @@ def _plot_trajectory_comparison(
     )
     axes_flat = axes.reshape(-1)
 
-    for ax, (ref_prog, targ_prog, targ_meas, label) in zip(
-        axes_flat, signals, strict=False
-    ):
+    for ax, (ref_prog, targ_prog, targ_meas, label) in zip(axes_flat, signals, strict=False):
         ax.set_facecolor(FACE_COLOR)
         ax.grid(True, color="gray", linestyle="--", linewidth=0.5)
         ax.tick_params(axis="both", labelsize=TICK_FONTSIZE, colors=TEXT_COLOR)
         for spine in ax.spines.values():
             spine.set_color(TEXT_COLOR)
 
-        ax.plot(
-            t_ref, ref_prog, color="cyan", linewidth=2, label=f"Ref {ref_shot} prog"
-        )
+        ax.plot(t_ref, ref_prog, color="cyan", linewidth=2, label=f"Ref {ref_shot} prog")
         ax.plot(
             t_targ,
             targ_prog,
@@ -728,14 +709,10 @@ def _plot_prediction_vs_measured(
             meas_col = meas_arr[:, psi_idx_targ]
             valid_meas = ~np.isnan(t_targ) & ~np.isnan(meas_col)
             if valid_meas.sum() >= 2:
-                meas_interp = np.interp(
-                    t_pred, t_targ[valid_meas], meas_col[valid_meas]
-                )
+                meas_interp = np.interp(t_pred, t_targ[valid_meas], meas_col[valid_meas])
             else:
                 meas_interp = np.full_like(t_pred, np.nan)
-            ax.plot(
-                t_pred, meas_interp, color=color, linewidth=2, label=f"ψ={psi_val:.1f}"
-            )
+            ax.plot(t_pred, meas_interp, color=color, linewidth=2, label=f"ψ={psi_val:.1f}")
 
         ax.set_ylabel(ylabel, fontsize=LABEL_FONTSIZE, color=TEXT_COLOR)
 
@@ -763,7 +740,7 @@ def _plot_prediction_vs_measured(
     logger.info(f"Saved prediction vs measured plot to {plot_dir}")
 
 
-def _make_profile_gif(  # noqa: PLR0915, PLR0912
+def _make_profile_gif(  # noqa: PLR0915
     ds_pred: xr.Dataset,
     ds_targ: xr.Dataset,
     targ_shot: int,
@@ -828,9 +805,7 @@ def _make_profile_gif(  # noqa: PLR0915, PLR0912
                 ida_te = _interp_to_psi_pred(ds_hp_shot["Te_keV_psi"].values, psi_hp)
                 logger.info(f"Loaded IDA profiles for shot {targ_shot} from hp dataset")
             else:
-                logger.info(
-                    f"Shot {targ_shot} not found in hp dataset — skipping IDA overlay"
-                )
+                logger.info(f"Shot {targ_shot} not found in hp dataset — skipping IDA overlay")
         except Exception as e:
             logger.warning(f"Could not load IDA profiles for shot {targ_shot}: {e}")
 
@@ -843,9 +818,7 @@ def _make_profile_gif(  # noqa: PLR0915, PLR0912
     fresh_idx = fresh_idx[in_window]
 
     if len(fresh_idx) == 0:
-        logger.warning(
-            f"No fresh profile timesteps found for shot {targ_shot} in prediction window — skipping GIF"
-        )
+        logger.warning(f"No fresh profile timesteps found for shot {targ_shot} in prediction window — skipping GIF")
         return
 
     logger.info(f"Creating GIF with {len(fresh_idx)} frames for shot {targ_shot}")
@@ -857,9 +830,7 @@ def _make_profile_gif(  # noqa: PLR0915, PLR0912
         valid_mask = ~np.all(np.isnan(ida_ne), axis=1) & ~np.isnan(ida_t)
         ida_valid_idx_arr = np.where(valid_mask)[0]
         if len(ida_valid_idx_arr) == 0:
-            logger.warning(
-                f"IDA profiles for shot {targ_shot} are all NaN — skipping IDA overlay"
-            )
+            logger.warning(f"IDA profiles for shot {targ_shot} are all NaN — skipping IDA overlay")
             ida_ne = ida_te = ida_t = None
 
     # Compute uniform Y-axis limits across all frames (0 to 1.05 x global max, capped at a reasonable value)
@@ -913,9 +884,7 @@ def _make_profile_gif(  # noqa: PLR0915, PLR0912
             for spine in ax.spines.values():
                 spine.set_color(TEXT_COLOR)
 
-            ax.fill_between(
-                psi_pred, lo, hi, color="cyan", alpha=0.4, label="Predicted range"
-            )
+            ax.fill_between(psi_pred, lo, hi, color="cyan", alpha=0.4, label="Predicted range")
             ax.plot(
                 psi_pred,
                 meas_row,
@@ -924,14 +893,8 @@ def _make_profile_gif(  # noqa: PLR0915, PLR0912
                 label="ZIPFIT (meas)",
             )
 
-            if (
-                ida_arr is not None
-                and ida_t is not None
-                and ida_valid_idx_arr is not None
-            ):
-                ida_tidx = ida_valid_idx_arr[
-                    int(np.argmin(np.abs(ida_t[ida_valid_idx_arr] - t_now)))
-                ]
+            if ida_arr is not None and ida_t is not None and ida_valid_idx_arr is not None:
+                ida_tidx = ida_valid_idx_arr[int(np.argmin(np.abs(ida_t[ida_valid_idx_arr] - t_now)))]
                 ax.plot(
                     psi_pred,
                     ida_arr[ida_tidx],

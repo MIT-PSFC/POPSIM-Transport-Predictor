@@ -14,7 +14,7 @@ TICK_FONTSIZE = 18
 LEGEND_FONTSIZE = 18
 
 
-def ds_power_balance_time_plot(  # noqa: PLR0915 PLR0912
+def ds_power_balance_time_plot(  # noqa: PLR0915
     ds: str | xr.Dataset,
     fig_dir: str,
     num_shots: int | None = 9999,
@@ -50,9 +50,7 @@ def ds_power_balance_time_plot(  # noqa: PLR0915 PLR0912
     ylim_power = (0, max(power_max, lh_thresh_max) * 1.1)
 
     density_signals = ["ne20_line_avg", "ne20_edge"]
-    density_max = min(
-        max(float(np.nanmax(ds[sig].values)) for sig in density_signals), 5
-    )
+    density_max = min(max(float(np.nanmax(ds[sig].values)) for sig in density_signals), 5)
     ylim_ne = (0, density_max * 1.1)
 
     # B0 y-limits for density plot right axis
@@ -91,9 +89,7 @@ def ds_power_balance_time_plot(  # noqa: PLR0915 PLR0912
         ax_ip.set_ylim(ylim_ip)
         ax_wtot = ax_ip.twinx()
         if "Wtot_MJ" in shot_ds:
-            ax_wtot.plot(
-                shot_ds["time"], shot_ds["Wtot_MJ"], label="Wtot [MJ]", color="red"
-            )
+            ax_wtot.plot(shot_ds["time"], shot_ds["Wtot_MJ"], label="Wtot [MJ]", color="red")
         if "Wmhd_MJ" in shot_ds:
             ax_wtot.plot(
                 shot_ds["time"],
@@ -108,18 +104,10 @@ def ds_power_balance_time_plot(  # noqa: PLR0915 PLR0912
 
         # powers
         ax_power = axes[1]
-        ax_power.plot(
-            shot_ds["time"], shot_ds["P_oh_MW"], label="P_oh [MW]", color="orange"
-        )
-        ax_power.plot(
-            shot_ds["time"], shot_ds["P_rad_MW"], label="P_rad [MW]", color="red"
-        )
-        ax_power.plot(
-            shot_ds["time"], shot_ds["P_NBI_MW"], label="P_NBI [MW]", color="cyan"
-        )
-        ax_power.plot(
-            shot_ds["time"], shot_ds["P_ECRH_MW"], label="P_ECRH [MW]", color="lime"
-        )
+        ax_power.plot(shot_ds["time"], shot_ds["P_oh_MW"], label="P_oh [MW]", color="orange")
+        ax_power.plot(shot_ds["time"], shot_ds["P_rad_MW"], label="P_rad [MW]", color="red")
+        ax_power.plot(shot_ds["time"], shot_ds["P_NBI_MW"], label="P_NBI [MW]", color="cyan")
+        ax_power.plot(shot_ds["time"], shot_ds["P_ECRH_MW"], label="P_ECRH [MW]", color="lime")
         if "LH_transition_threshold_MW" in shot_ds:
             ax_power.plot(
                 shot_ds["time"],
@@ -181,9 +169,7 @@ def ds_power_balance_time_plot(  # noqa: PLR0915 PLR0912
         ax_shape = axes[3]
         ax_shape.plot(shot_ds["time"], shot_ds["a_minor"], label="a_minor", color="red")
         ax_shape.plot(shot_ds["time"], shot_ds["kappa"], label="kappa", color="yellow")
-        ax_shape.plot(
-            shot_ds["time"], shot_ds["delta_top"], label="delta_top", color="lime"
-        )
+        ax_shape.plot(shot_ds["time"], shot_ds["delta_top"], label="delta_top", color="lime")
         ax_shape.plot(
             shot_ds["time"],
             shot_ds["delta_bot"],
@@ -229,7 +215,7 @@ def ds_power_balance_time_plot(  # noqa: PLR0915 PLR0912
         plt.close(fig)
 
 
-def ds_profile_time_plot(  # noqa: PLR0915 PLR0912
+def ds_profile_time_plot(  # noqa: PLR0915
     ds: str | xr.Dataset,
     fig_dir: str,
     num_shots: int | None = 9999,
@@ -250,9 +236,7 @@ def ds_profile_time_plot(  # noqa: PLR0915 PLR0912
     ylim_betan = (0, float(np.nanmax(ds["betan"].values)) * 1.1)
 
     density_signals = ["ne20_edge"]
-    density_max = min(
-        max(float(np.nanmax(ds[sig].values)) for sig in density_signals), 5
-    )
+    density_max = min(max(float(np.nanmax(ds[sig].values)) for sig in density_signals), 5)
     ylim_ne = (0, density_max * 1.1)
 
     # B0 y-limits for density plot right axis
@@ -305,9 +289,7 @@ def ds_profile_time_plot(  # noqa: PLR0915 PLR0912
         ax_ip.set_ylim(ylim_ip)
         ax_betan = ax_ip.twinx()
         if "betan" in shot_ds:
-            ax_betan.plot(
-                shot_ds["time"], shot_ds["betan"], label="betan", color="magenta"
-            )
+            ax_betan.plot(shot_ds["time"], shot_ds["betan"], label="betan", color="magenta")
         ax_betan.set_ylabel("Normalized Beta", fontsize=LABEL_FONTSIZE, color="red")
         ax_betan.set_ylim(ylim_betan)
         ax_betan.tick_params(axis="y", labelsize=TICK_FONTSIZE, colors=TEXT_COLOR)
@@ -350,9 +332,7 @@ def ds_profile_time_plot(  # noqa: PLR0915 PLR0912
         ax_shape = axes[2]
         ax_shape.plot(shot_ds["time"], shot_ds["a_minor"], label="a_minor", color="red")
         ax_shape.plot(shot_ds["time"], shot_ds["kappa"], label="kappa", color="yellow")
-        ax_shape.plot(
-            shot_ds["time"], shot_ds["delta_top"], label="delta_top", color="lime"
-        )
+        ax_shape.plot(shot_ds["time"], shot_ds["delta_top"], label="delta_top", color="lime")
         ax_shape.plot(
             shot_ds["time"],
             shot_ds["delta_bot"],
@@ -441,9 +421,7 @@ def ds_profile_plot(
 
         # Plot density heatmap
         ne_plot_data = ne_data.copy()
-        ne_plot_data[:, ne_nan_mask] = (
-            np.nan
-        )  # Set NaN timesteps to NaN for proper masking
+        ne_plot_data[:, ne_nan_mask] = np.nan  # Set NaN timesteps to NaN for proper masking
         im_ne = ax_ne.imshow(
             ne_plot_data,
             cmap="viridis",
@@ -466,17 +444,13 @@ def ds_profile_plot(
             )
 
         ax_ne.set_ylabel(r"$\psi_n$", fontsize=LABEL_FONTSIZE, color=TEXT_COLOR)
-        ax_ne.set_title(
-            r"$n_e$ [$10^{20}$ m$^{-3}$]", fontsize=LABEL_FONTSIZE, color=TEXT_COLOR
-        )
+        ax_ne.set_title(r"$n_e$ [$10^{20}$ m$^{-3}$]", fontsize=LABEL_FONTSIZE, color=TEXT_COLOR)
         cbar_ne = plt.colorbar(im_ne, ax=ax_ne)
         cbar_ne.ax.tick_params(labelsize=TICK_FONTSIZE, colors=TEXT_COLOR)
 
         # Plot temperature heatmap
         te_plot_data = te_data.copy()
-        te_plot_data[:, te_nan_mask] = (
-            np.nan
-        )  # Set NaN timesteps to NaN for proper masking
+        te_plot_data[:, te_nan_mask] = np.nan  # Set NaN timesteps to NaN for proper masking
         im_te = ax_te.imshow(
             te_plot_data,
             cmap="plasma",
@@ -516,7 +490,7 @@ def ds_profile_plot(
         plt.close(fig)
 
 
-def compare_powers(  # noqa: PLR0912
+def compare_powers(
     ds_path: str,
     fig_dir: str,
     title: str = "Power Signal Comparison",
@@ -554,9 +528,7 @@ def compare_powers(  # noqa: PLR0912
     # Compute global y-limits for each signal pair
     signal_ylims = {}
     for sig, alt_sig in available_comparisons:
-        max_val = max(
-            float(np.nanmax(ds[sig].values)), float(np.nanmax(ds[alt_sig].values))
-        )
+        max_val = max(float(np.nanmax(ds[sig].values)), float(np.nanmax(ds[alt_sig].values)))
         signal_ylims[sig] = (0, max_val * 1.1)
 
     for shot in ds["shot"].data[:num_shots]:
@@ -564,16 +536,12 @@ def compare_powers(  # noqa: PLR0912
 
         # Create subplots - one for each power signal comparison
         num_comparisons = len(available_comparisons)
-        fig, axes = plt.subplots(
-            num_comparisons, 1, figsize=(16, 4 * num_comparisons), sharex=True
-        )
+        fig, axes = plt.subplots(num_comparisons, 1, figsize=(16, 4 * num_comparisons), sharex=True)
         if num_comparisons == 1:
             axes = [axes]  # Make it iterable for single subplot
 
         fig.patch.set_facecolor(BACKGROUND_COLOR)
-        fig.suptitle(
-            f"{title} - Shot {shot}", fontsize=TITLE_FONTSIZE, color=TEXT_COLOR
-        )
+        fig.suptitle(f"{title} - Shot {shot}", fontsize=TITLE_FONTSIZE, color=TEXT_COLOR)
 
         for i, (sig, alt_sig) in enumerate(available_comparisons):
             ax = axes[i]
@@ -598,9 +566,7 @@ def compare_powers(  # noqa: PLR0912
             )
 
             # Calculate and plot difference if both signals have data
-            if not (
-                np.all(np.isnan(shot_ds[sig])) or np.all(np.isnan(shot_ds[alt_sig]))
-            ):
+            if not (np.all(np.isnan(shot_ds[sig])) or np.all(np.isnan(shot_ds[alt_sig]))):
                 diff = shot_ds[sig] - shot_ds[alt_sig]
                 ax_diff = ax.twinx()
                 ax_diff.plot(
@@ -611,9 +577,7 @@ def compare_powers(  # noqa: PLR0912
                     alpha=0.7,
                     linewidth=1,
                 )
-                ax_diff.set_ylabel(
-                    "Difference [MW]", fontsize=LABEL_FONTSIZE, color="red"
-                )
+                ax_diff.set_ylabel("Difference [MW]", fontsize=LABEL_FONTSIZE, color="red")
                 ax_diff.tick_params(axis="y", labelsize=TICK_FONTSIZE, colors="red")
 
             ax.set_ylabel("Power [MW]", fontsize=LABEL_FONTSIZE, color="white")
@@ -640,15 +604,11 @@ def compare_powers(  # noqa: PLR0912
                 pass
 
         fig.tight_layout()
-        fig.savefig(
-            f"{fig_dir}/power_comparison_{shot}.png", dpi=150, bbox_inches="tight"
-        )
+        fig.savefig(f"{fig_dir}/power_comparison_{shot}.png", dpi=150, bbox_inches="tight")
         plt.close(fig)
 
 
 if __name__ == "__main__":
-    ds_path = (
-        "/fusion/projects/disruption_warning/data/popsim/tpt_d3d_final/d3d_hp.zarr"
-    )
+    ds_path = "/fusion/projects/disruption_warning/data/popsim/tpt_d3d_final/d3d_hp.zarr"
     fig_dir = "/fusion/projects/disruption_warning/data/popsim/tpt_d3d_final/power_comparisons"
     compare_powers(ds_path, fig_dir, title="DIII-D Power Signal Comparison")
