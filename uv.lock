@@ -2497,7 +2497,7 @@ wheels = [
 [[package]]
 name = "popsim"
 version = "0.1.0"
-source = { editable = "submodules/popsim" }
+source = { editable = "submodules/popsim-public" }
 dependencies = [
     { name = "bottleneck" },
     { name = "certifi" },
@@ -2564,7 +2564,6 @@ requires-dist = [
 ]
 
 [package.metadata.requires-dev]
-data = [{ name = "disruption-py", git = "https://github.com/MIT-PSFC/disruption-py.git?rev=zk%2Fpopsim" }]
 dev = [
     { name = "black", specifier = ">=24.8.0,<25" },
     { name = "jupyter", specifier = ">=1.0.0,<2" },
@@ -2583,6 +2582,7 @@ dev = [
     { name = "pytest-rerunfailures", specifier = ">=16.0.1" },
     { name = "pytest-xdist", specifier = ">=3.6.1,<4" },
     { name = "ruff", specifier = ">=0.1.5,<0.2" },
+    { name = "wandb", specifier = ">=0.25.1" },
 ]
 gpu = [{ name = "jax", extras = ["cuda12"], specifier = ">=0.7.0,<0.8" }]
 gpu-orcd = [
@@ -2629,7 +2629,7 @@ requires-dist = [
     { name = "fire", specifier = ">=0.7.1" },
     { name = "freeqdsk", specifier = ">=0.5.2" },
     { name = "netcdf4" },
-    { name = "popsim", editable = "submodules/popsim" },
+    { name = "popsim", editable = "submodules/popsim-public" },
     { name = "pre-commit", specifier = ">=4.3.0" },
     { name = "pydantic-settings", specifier = ">=2.12.0" },
     { name = "torax", editable = "submodules/torax" },

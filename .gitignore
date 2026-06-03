@@ -218,6 +218,7 @@ CLAUDE.md
 
 # Scratch and other scripts
 scratch
+ref
 popsim_transport_predictor/checkpoints
 popsim_transport_predictor/datasets/d3d/debug*
 transport_study/checkpoints

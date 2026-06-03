@@ -2,10 +2,6 @@
 	path = submodules/disruption-py
 	url = git@github.com:MIT-PSFC/disruption-py.git
 	branch = zk/popsim
-[submodule "submodules/popsim"]
-	path = submodules/popsim
-	url = git@github.com:cfs-energy-internal/POPSIM.git
-	branch = zk/trainer-nan
 [submodule "submodules/gptools"]
 	path = submodules/gptools
 	url = git@github.com:ZanderKeith/gptools.git
@@ -13,3 +9,6 @@
 [submodule "submodules/torax"]
 	path = submodules/torax
 	url = https://github.com/google-deepmind/torax.git
+[submodule "submodules/popsim-public"]
+	path = submodules/popsim-public
+	url = git@github.com:MIT-PSFC/POPSIM-Public.git

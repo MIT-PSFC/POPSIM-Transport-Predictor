@@ -41,7 +41,7 @@ profile = "black"
 packages = ["transport_study"]
 
 [tool.uv.sources]
-popsim = { path = "./submodules/popsim", editable = true }
+popsim = { path = "./submodules/popsim-public", editable = true }
 torax = { path = "./submodules/torax", editable = true }
 
 [tool.uv]
