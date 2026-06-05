@@ -3,6 +3,7 @@ from pathlib import Path
 import pytest
 
 from transport_study import EPISODE_DIM, PACKAGE_ROOT, TIME_COORD, TIME_DIM
+from transport_study.config import _ConfigProxy
 from transport_study.orchestration import organize_data
 from transport_study.orchestration.organize_data import (
     DatasetConfig,
@@ -13,37 +14,36 @@ from transport_study.orchestration.organize_data import (
     get_train_val_datasets,
 )
 
+
+@pytest.fixture(autouse=True)
+def reset_config():
+    _ConfigProxy._cfg = None
+    _ConfigProxy.initialized = False
+    yield
+    _ConfigProxy._cfg = None
+    _ConfigProxy.initialized = False
+
+
 # Sample dataset paths (real .nc files checked into git lfs)
-SAMPLE_NAMES = ["cmod_low_1", "cmod_low_2", "cmod_high", "cmod_recent"]
-SAMPLE_PATHS = {name: Path(PACKAGE_ROOT) / "datasets" / "sample" / f"{name}.nc" for name in SAMPLE_NAMES}
-
-
-@pytest.fixture()
-def sample_dataset_config(monkeypatch):
-    """Replace the module-level dataset_config singleton with one pointing
-    at the checked-in sample .nc files so tests never need live env vars."""
-    sorted_names = sorted(SAMPLE_PATHS)
-    cfg = DatasetConfig(
-        dataset_paths={k: str(v) for k, v in SAMPLE_PATHS.items()},
-        ds_source_to_idx={name: i for i, name in enumerate(sorted_names)},
-        target_device="cmod_high",
-    )
-    monkeypatch.setattr(organize_data, "dataset_config", cfg)
-    return cfg
+SAMPLE_NAMES = ["cmod-low1", "cmod-low2", "cmod-high", "cmod-recent"]
+SAMPLE_FILES = ["cmod_low_1.nc", "cmod_low_2.nc", "cmod_high.nc", "cmod_recent.nc"]
+SAMPLE_PATHS = {
+    name: Path(PACKAGE_ROOT) / "datasets" / "sample" / f"{file}.nc" for name, file in zip(SAMPLE_NAMES, SAMPLE_FILES, strict=True)
+}
 
 
 class TestGetDs:
     @pytest.mark.parametrize("source_ds", SAMPLE_NAMES)
     @pytest.mark.parametrize("study_type", ["profile_transfer", "power_balance_transfer"])
-    def test_get_ds_returns_dataset_and_dims(self, sample_dataset_config, source_ds, study_type):
-        ds, episode_dim = get_ds(source_ds, study_type, debug=True)
+    def test_get_ds_returns_dataset_and_dims(self, source_ds, study_type):
+        ds, episode_dim = get_ds(source_ds, study_type)
         assert ds is not None
         assert episode_dim == EPISODE_DIM
         assert TIME_COORD in ds.coords
         assert TIME_DIM in ds.dims
 
     @pytest.mark.parametrize("study_type", ["profile_transfer", "power_balance_transfer"])
-    def test_get_ds_unknown_source_raises(self, sample_dataset_config, study_type):
+    def test_get_ds_unknown_source_raises(self, study_type):
         with pytest.raises(ValueError, match="Unknown source dataset"):
             get_ds("nonexistent_device", study_type, debug=True)
 

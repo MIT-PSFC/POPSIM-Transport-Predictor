@@ -3,7 +3,16 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
-from transport_study.config import StudyConfig, config, load_config
+from transport_study.config import StudyConfig, _ConfigProxy, config, load_config
+
+
+@pytest.fixture(autouse=True)
+def reset_config():
+    _ConfigProxy._cfg = None
+    _ConfigProxy.initialized = False
+    yield
+    _ConfigProxy._cfg = None
+    _ConfigProxy.initialized = False
 
 
 def test_config_load():

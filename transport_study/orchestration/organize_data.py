@@ -1,5 +1,3 @@
-import dataclasses
-import json
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -35,8 +33,8 @@ class TrainingData:
         return "_".join(sorted(self.sources))
 
     def __post_init__(self):
-        paths_from_env = set(dataset_config.dataset_paths.keys())
-        if paths_from_env:  # Skip validation if dataset_config not yet loaded (e.g. tests)
+        paths_from_env = set(config.dataset_paths.keys())
+        if paths_from_env:  # Skip validation if config not yet loaded (e.g. tests)
             unknown = set(self.sources) - paths_from_env
             if unknown:
                 raise ValueError(f"Unknown dataset sources: {unknown}. Known: {paths_from_env}")
@@ -49,48 +47,7 @@ class TrainingData:
     @property
     def source_idxs(self) -> frozenset:
         """Integer indices for all sources in this TrainingData, looked up from dataset_config."""
-        return frozenset(dataset_config.ds_source_to_idx[s] for s in self.sources)
-
-
-@dataclass
-class DatasetConfig:
-    """Locks in the dataset-to-index mapping for a study.
-
-    Saved to the study working directory on first run and checked on subsequent
-    runs to detect env var changes that would shift model checkpoint indices.
-    """
-
-    dataset_paths: dict  # name -> path string
-    ds_source_to_idx: dict  # name -> integer index (sorted for stability)
-    target_device: str | None
-
-    @classmethod
-    def from_env(cls) -> "DatasetConfig":
-        paths = {k: str(v) for k, v in config.dataset_paths.items()}
-        idx = {name: i for i, name in enumerate(sorted(paths))}
-        return cls(
-            dataset_paths=paths,
-            ds_source_to_idx=idx,
-            target_device=config.target_device,
-        )
-
-    def save(self, path: str):
-        with open(path, "w") as f:
-            json.dump(dataclasses.asdict(self), f, indent=2)
-
-    @classmethod
-    def load(cls, path: str) -> "DatasetConfig":
-        with open(path) as f:
-            return cls(**json.load(f))
-
-    @property
-    def idx_to_ds_source(self) -> dict:
-        return {v: k for k, v in self.ds_source_to_idx.items()}
-
-
-# Module-level singleton built from env vars at import time.
-# Imported by study.py (for save/check) and TRBs (for index lookup).
-dataset_config = DatasetConfig.from_env()
+        return frozenset(config.ds_source_to_idx[s] for s in self.sources)
 
 
 REQUIRED_SIGNALS_POWER_BALANCE = [
@@ -165,7 +122,6 @@ def concat_with_nan_padding(
 def get_ds(
     source_ds: str,
     study_type: str,
-    debug: bool | None = config.debug,
 ) -> tuple[xr.Dataset, str]:
     """Open the dataset, and do some light processing to get it ready for training.
 
@@ -177,16 +133,16 @@ def get_ds(
     Returns:
         tuple[xr.Dataset, str]: The processed dataset and the dimension along which to group the data
     """
-    if source_ds not in dataset_config.dataset_paths:
-        raise ValueError(f"Unknown source dataset: {source_ds!r}. Available: {set(dataset_config.dataset_paths)}")
-    ds_path = Path(dataset_config.dataset_paths[source_ds])
+    if source_ds not in config.dataset_paths:
+        raise ValueError(f"Unknown source dataset: {source_ds!r}. Available: {set(config.dataset_paths)}")
+    ds_path = Path(config.dataset_paths[source_ds])
 
     ds = xr.open_dataset(ds_path).astype(jax.numpy.float64 if jax.config.jax_enable_x64 else jax.numpy.float32)
 
     if EPISODE_DIM not in ds.dims:
         raise ValueError(f"Expected dataset to have {EPISODE_DIM} dimension, but it was not found. Found dimensions: {ds.dims}")
 
-    if debug:
+    if config.debug:
         ds = ds.isel({EPISODE_DIM: slice(0, 10)})  # Limit to 10 shots
     else:
         # Sort dataset by shot count, get the X most recent as set by config
@@ -585,7 +541,6 @@ def normalize_domain(  # noqa: PLR0915
 def get_train_val_datasets(
     training_data: "TrainingData",
     study_type: str = "profile_transfer",
-    debug: bool | None = config.debug,
 ):
     """
     Split dataset into training and validation sets based on the specified training data case.
@@ -598,7 +553,7 @@ def get_train_val_datasets(
     episode_coord = None
 
     for source in training_data.sources:
-        ds, episode_coord = get_ds(source, study_type, debug=debug)
+        ds, episode_coord = get_ds(source, study_type, debug=config.debug)
         ds = add_performance(ds, episode_coord)
         train_src, val_src = split_dataset_by_fracs(
             ds,
@@ -607,7 +562,7 @@ def get_train_val_datasets(
             seed=42,
             sortby="performance",
         )
-        src_idx = dataset_config.ds_source_to_idx[source]
+        src_idx = config.ds_source_to_idx[source]
         train_src["ds_source_idx"] = (
             episode_coord,
             np.full(train_src.sizes[episode_coord], src_idx),
@@ -640,7 +595,7 @@ def get_train_test_datasets(
     num_hp_shots: int,
     hp_test_set_size: int,
     study_type: str = "profile_transfer",
-    debug: bool | None = config.debug,
+    debug: bool | None = None,
 ):
     """
     Split dataset into training and test sets for the target learning case.
@@ -656,16 +611,16 @@ def get_train_test_datasets(
     We treat the test set as a validation set for checkpoint selection, which is slightly optimistic
     but consistent across all models so comparisons are fair.
     """
-    target = dataset_config.target_device
+    target = config.target_device
     if target is None:
-        raise ValueError("PTPS_DS_TARGET must be set for transfer learning")
+        raise ValueError("config.target_device must be set before transfer learning")
 
     # Load the target device dataset and split into train/test
     ds_hp, episode_coord = get_ds(target, study_type=study_type, debug=debug)
     ds_hp = add_performance(ds_hp, episode_coord)
     ds_hp["ds_source_idx"] = (
         episode_coord,
-        np.full(ds_hp.sizes[episode_coord], dataset_config.ds_source_to_idx[target]),
+        np.full(ds_hp.sizes[episode_coord], config.ds_source_to_idx[target]),
     )
     sorted_shots = np.argsort(ds_hp["performance"].values)
 
@@ -673,7 +628,7 @@ def get_train_test_datasets(
     test_ds = ds_hp.isel({episode_coord: test_shot_pool})
 
     if num_hp_shots == -1:
-        # All available target shots in training and testing (upper-bound reference)
+        # All available target shots in training and testing (upper-bound reference, CHEATING!)
         train_ds_hp = ds_hp.isel({episode_coord: sorted_shots})
     else:
         train_shot_pool = sorted_shots[:num_hp_shots]
@@ -690,7 +645,7 @@ def get_train_test_datasets(
     # For 'transfer' and exnihilo: strip historic data, train only on target device shots
     if domain_adaptation == "transfer" or training_data.exnihilo:
         train_ds = train_ds.where(
-            train_ds["ds_source_idx"] == dataset_config.ds_source_to_idx[target],
+            train_ds["ds_source_idx"] == config.ds_source_to_idx[target],
             drop=True,
         )
 

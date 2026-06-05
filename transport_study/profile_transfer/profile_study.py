@@ -12,7 +12,7 @@ import netCDF4  # noqa: F401
 import xarray as xr
 from loguru import logger
 from popsim.ml import TrainConfig
-from pydantic import Field, field_validator
+from pydantic import Field, field_validator, model_validator
 
 from transport_study import PACKAGE_ROOT
 from transport_study.config import StudyConfig, config, load_config
@@ -23,13 +23,12 @@ from transport_study.orchestration.wandb_utils import (
 )
 
 
-def _parse_training_data(s: str) -> TrainingData:
+def _parse_training_data(s: str, dataset_paths: dict, target_device: str | None) -> TrainingData:
     """Convert a string like 'cmod_tcv' or 'exnihilo' to a TrainingData object."""
     if s == "exnihilo":
-        target = dataset_config.target_device
-        non_target = frozenset(dataset_config.dataset_paths.keys()) - ({target} if target else set())
-        return TrainingData(sources=non_target, exnihilo=True)
-    return TrainingData(sources=frozenset(s.split("_")))
+        non_target = frozenset(dataset_paths.keys()) - ({target_device} if target_device else set())
+        return TrainingData(sources_unsorted=non_target, exnihilo=True)
+    return TrainingData(sources_unsorted=frozenset(s.split("_")))
 
 
 class ProfileStudy(Study):
@@ -79,10 +78,17 @@ class ProfileStudy(Study):
                     raise ValueError(f"Invalid domain adaptation: {da}. Must be one of {valid}.")
             return v
 
-        @field_validator("training_datasets", mode="before")
+        @model_validator(mode="before")
         @classmethod
-        def _coerce_training_datasets(cls, v) -> tuple[TrainingData, ...]:
-            return tuple(_parse_training_data(s) if isinstance(s, str) else s for s in v)
+        def _coerce_training_datasets(cls, data) -> dict:
+            if "training_datasets" not in data:
+                return data
+            dataset_paths = dict(data.get("dataset_paths", {}))
+            target_device = data.get("target_device")
+            data["training_datasets"] = tuple(
+                _parse_training_data(s, dataset_paths, target_device) if isinstance(s, str) else s for s in data["training_datasets"]
+            )
+            return data
 
         @classmethod
         def from_toml(cls, path: Path) -> ProfileStudy.Config:
@@ -163,10 +169,10 @@ class ProfileStudy(Study):
         def is_hyperparam_case(self) -> bool:
             if (
                 self.training_data == ProfileStudy._hyperparam_training_data()
-                and self.data_normalization == ProfileStudy.HYPERPARAM_DATA_NORMALIZATION
-                and self.domain_adaptation == ProfileStudy.HYPERPARAM_DOMAIN_ADAPTATION
-                and self.freeze_shapes == ProfileStudy.HYPERPARAM_FREEZE_SHAPES
-                and self.num_hp_shots == ProfileStudy.HYPERPARAM_NUM_HP_SHOTS
+                and self.data_normalization == config.hyperparam_data_normalization
+                and self.domain_adaptation == config.hyperparam_domain_adaptation
+                and self.freeze_shapes == config.hyperparam_freeze_shapes
+                and self.num_hp_shots == config.hyperparam_num_hp_shots
             ):
                 return True
             else:
@@ -207,7 +213,7 @@ class ProfileStudy(Study):
             num_hp_shots: int,
         ):
             if isinstance(training_data, str):
-                training_data = _parse_training_data(training_data)
+                training_data = _parse_training_data(training_data, dict(config.dataset_paths), config.target_device)
             self.model_type = model_type
             self.training_data = training_data
             self.data_normalization = data_normalization
@@ -223,7 +229,7 @@ class ProfileStudy(Study):
             ]:
                 raise ValueError(f"Unknown model type: {model_type}")
             if domain_adaptation is None:
-                if training_data != "exnihilo" and num_hp_shots != -1:
+                if not training_data.exnihilo and num_hp_shots != -1:
                     raise ValueError(
                         "If domain_adaptation is None and training data is not 'exnihilo', num_hp_shots must be -1 since this means we're training and testing on the same dataset and no high-performance data is being used"
                     )
@@ -236,10 +242,10 @@ class ProfileStudy(Study):
                     ProfileStudy.Case(
                         model_type=model_type,
                         training_data=ProfileStudy._hyperparam_training_data(),
-                        data_normalization=ProfileStudy.HYPERPARAM_DATA_NORMALIZATION,
-                        domain_adaptation=ProfileStudy.HYPERPARAM_DOMAIN_ADAPTATION,
-                        freeze_shapes=ProfileStudy.HYPERPARAM_FREEZE_SHAPES,
-                        num_hp_shots=ProfileStudy.HYPERPARAM_NUM_HP_SHOTS,
+                        data_normalization=config.hyperparam_data_normalization,
+                        domain_adaptation=config.hyperparam_domain_adaptation,
+                        freeze_shapes=config.hyperparam_freeze_shapes,
+                        num_hp_shots=config.hyperparam_num_hp_shots,
                     )
                 ]
 
@@ -372,7 +378,7 @@ class ProfileStudy(Study):
         """All configured non-target source devices - the canonical hyperparam case."""
         target = dataset_config.target_device
         sources = frozenset(dataset_config.dataset_paths.keys()) - ({target} if target else set())
-        return TrainingData(sources=sources)
+        return TrainingData(sources_unsorted=sources)
 
     #############
     # EXECUTION #

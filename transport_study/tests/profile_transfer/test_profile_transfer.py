@@ -7,6 +7,7 @@ from transport_study.profile_transfer.profile_study import ProfileStudy, run_stu
 
 
 def test_study_cmod_to_cmod():
+    print("beans")
     cfg = ProfileStudy.Config(
         study_name="test_study_cmod_to_cmod",
         working_dir_base=PACKAGE_ROOT / "tests" / "profile_transfer" / "working_dir_base",

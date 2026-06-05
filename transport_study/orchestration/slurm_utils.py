@@ -11,8 +11,10 @@ from popsim.ml import TrainConfig
 from transport_study.config import config
 
 
-def count_running_jobs(job_name: str, partition: str = config.partition) -> int:
+def count_running_jobs(job_name: str, partition: str | None = None) -> int:
     """Run squeue to list running jobs on the partition with the specific name"""
+    if partition is None:
+        partition = config.partition
     result = subprocess.run(
         [
             "squeue",
@@ -34,8 +36,12 @@ def count_running_jobs(job_name: str, partition: str = config.partition) -> int:
     return len(result.stdout.strip().split("\n")) if result.stdout.strip() else 0
 
 
-def count_idle_gpus(partition: str = config.partition, buffer_gpus: int = config.buffer_gpus) -> int:
+def count_idle_gpus(partition: str | None = None, buffer_gpus: int | None = None) -> int:
     """Count the number of idle GPUs on this partition."""
+    if partition is None:
+        partition = config.partition
+    if buffer_gpus is None:
+        buffer_gpus = config.buffer_gpus
     result = subprocess.run(
         ["sinfo", "-p", partition, "-N", "--Format=gres,gresused", "--noheader"],
         check=False,
@@ -62,7 +68,7 @@ def count_idle_gpus(partition: str = config.partition, buffer_gpus: int = config
     return max(avail - buffer_gpus, 0)  # Don't report negative available GPUs, just 0
 
 
-def resources_available(partition: str = config.partition, buffer_gpus: int = config.buffer_gpus) -> bool:
+def resources_available(partition: str | None = None, buffer_gpus: int | None = None) -> bool:
     idle_gpus = count_idle_gpus(partition, buffer_gpus)
     return idle_gpus > 0
 
@@ -72,7 +78,7 @@ def launch_train_parallel(
     job_name: str,
     result_path: Path | str,
     log_dir: Path | str,
-    partition: str = config.partition,
+    partition: str | None = None,
 ) -> None:
     """Submit a SLURM job that runs training serially and saves results to result_path.
 
@@ -83,6 +89,8 @@ def launch_train_parallel(
         log_dir: Directory for SLURM stdout/stderr logs.
         partition: The SLURM partition to submit to.
     """
+    if partition is None:
+        partition = config.partition
     # All temp files must live on the shared filesystem (not /tmp which is
     # node-local), so that compute nodes can read them.
     log_dir = Path(log_dir)
@@ -159,7 +167,7 @@ def launch_agent_parallel(
     kwargs_agent: dict,
     job_name: str,
     log_dir: Path | str,
-    partition: str = config.partition,
+    partition: str | None = None,
 ) -> None:
     """Submit a SLURM job that launches a W&B agent for an existing sweep.
 
@@ -171,6 +179,8 @@ def launch_agent_parallel(
         log_dir: Directory for SLURM stdout/stderr logs.
         partition: The SLURM partition to submit to.
     """
+    if partition is None:
+        partition = config.partition
     log_dir = Path(log_dir)
     log_dir.mkdir(parents=True, exist_ok=True)
 
