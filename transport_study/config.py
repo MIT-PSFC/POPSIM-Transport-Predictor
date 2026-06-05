@@ -3,10 +3,12 @@ Load and parse configuration files for the project.
 This is where we set global variables from env vars or config files
 """
 
+import tomllib
 from pathlib import Path
+from types import MappingProxyType
 
 from dynaconf import Dynaconf
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic import BaseModel, ConfigDict, model_validator
 
 from transport_study import PACKAGE_ROOT
 
@@ -17,58 +19,78 @@ TRAIN_VAL_TEST_SPLIT = (0.64, 0.16, 0.2)
 
 
 # Main config for environment variables
-class StudyConfig(BaseSettings):
-    """Configuration for dataset paths."""
-
+class StudyConfig(BaseModel):
     study_name: str = "transport_study"
-
-    # Debug does everything but with reduced scope (less data, fewer epochs, etc.)
     debug: bool = True
-    # Dry run skips training and evaluation and just runs the orchestration logic to make sure everything is set up correctly
     dry_run: bool = False
     hp_test_set_size: int = 65
     max_ds_size: int = 1000
-
     partition: str | None = None
     buffer_gpus: int = 12
     hyperparam_sweeps: int = 1000
     max_epochs: int = 1000
     epochs_per_val: int = 20
-    patience: int = 4  # epochs_per_val * patience epochs without improvement, stop
+    patience: int = 4  # epochs_per_val * patience = max epochs without improvement before stopping
     wandb_entity: str | None = None
+    scratch_dir: Path | None = None
+    dataset_paths: dict[str, Path] = {}
+    target_device: str | None = None
 
-    scratch_dir: Path | None = None  # Used for predict-first temp files
-    ds_target: str | None = None  # PTPS_DS_TARGET=DEVICE - which device is the HP target
+    # make everything in the config completely immutable, including the nested dataset_paths dict
+    model_config = ConfigDict(frozen=True)
 
-    model_config = SettingsConfigDict(
-        env_prefix="PTPS_",  # Datasets: PTPS_DS_DEVICE1=/path1.nc, PTPS_DS_DEVICE2=/path2.nc, etc.
-        env_file=".env",
-        env_file_encoding="utf-8",
-        extra="allow",  # Captures all PTPS_DS_* vars dynamically
-    )
+    @model_validator(mode="after")
+    def _freeze_paths(self):
+        object.__setattr__(self, "dataset_paths", MappingProxyType(self.dataset_paths))
+        return self
 
-    @property
-    def dataset_paths(self) -> dict[str, Path]:
-        """All PTPS_DS_* vars except PTPS_DS_TARGET, keyed by lowercased device name."""
-        return {k.removeprefix("ds_"): Path(v) for k, v in self.model_extra.items() if k.startswith("ds_")}
+    @classmethod
+    def from_toml(cls, path: Path) -> "StudyConfig":
+        with open(path, "rb") as f:
+            data = tomllib.load(f)
+        datasets = data.pop("datasets", {})
+        target = datasets.pop("target", None)
+        return cls(
+            **data,
+            dataset_paths={k: Path(v) for k, v in datasets.items()},
+            target_device=target,
+        )
 
-    @property
-    def target_device(self) -> str | None:
-        if self.ds_target is None:
-            return None
-        return self.ds_target.lower()
+
+class _ConfigProxy:
+    """Class that enables delayed instantiation of a global StudyConfig,
+    so we can load it from a file at runtime instead of having it be hardcoded at import time.
+
+    Also ensures the global config can only be created once, to prevent accidental bugs from mutable global state.
+    """
+
+    _cfg: "StudyConfig | None" = None
+    initialized = False
+
+    # File-based device configs - always available regardless of study config
+    cmod = Dynaconf(settings_files=[Path(PACKAGE_ROOT) / "datasets/cmod/config.toml"])
+    d3d = Dynaconf(settings_files=[Path(PACKAGE_ROOT) / "datasets/d3d/config.toml"])
+    mast = Dynaconf(settings_files=[Path(PACKAGE_ROOT) / "datasets/mast/config.toml"])
+    tcv = Dynaconf(settings_files=[Path(PACKAGE_ROOT) / "datasets/tcv/config.toml"])
+
+    def __setattr__(self, name, value):
+        raise AttributeError("Config is immutable. Use load_config() to replace it.")
+
+    def __getattr__(self, name: str):
+        if _ConfigProxy._cfg is None:
+            raise RuntimeError(f"Config not loaded. Call load_config() before accessing config.{name}")
+        return getattr(_ConfigProxy._cfg, name)
 
 
-config = StudyConfig()
+config = _ConfigProxy()
 
-if config.debug:
-    config.max_epochs = 2
-    config.epochs_per_val = 1
-    config.hyperparam_sweeps = 2
-    config.hp_test_set_size = 2
 
-# Device-specific configs loaded separately to avoid namespace collisions
-config.cmod = Dynaconf(settings_files=[Path(PACKAGE_ROOT) / "datasets" / "cmod" / "config.toml"])
-config.d3d = Dynaconf(settings_files=[Path(PACKAGE_ROOT) / "datasets" / "d3d" / "config.toml"])
-config.mast = Dynaconf(settings_files=[Path(PACKAGE_ROOT) / "datasets" / "mast" / "config.toml"])
-config.tcv = Dynaconf(settings_files=[Path(PACKAGE_ROOT) / "datasets" / "tcv" / "config.toml"])
+def load_config(cfg: "StudyConfig | Path") -> "StudyConfig":
+    """Load study config from a StudyConfig object or a path to a TOML file."""
+    if _ConfigProxy.initialized:
+        raise RuntimeError("Config already loaded. Multiple calls to load_config() are not allowed.")
+    _ConfigProxy.initialized = True
+    if isinstance(cfg, Path):
+        cfg = StudyConfig.from_toml(cfg)
+    _ConfigProxy._cfg = cfg
+    return cfg
