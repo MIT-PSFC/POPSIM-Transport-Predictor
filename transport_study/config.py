@@ -20,21 +20,27 @@ TRAIN_VAL_TEST_SPLIT = (0.64, 0.16, 0.2)
 
 # Main config for environment variables
 class StudyConfig(BaseModel):
-    study_name: str = "transport_study"
+    # Shared between all studies
+    study_name: str
+    dataset_paths: dict[str, Path] = {}
+    target_device: str | None = None
+
+    # Debugging and dev stuff
     debug: bool = True
     dry_run: bool = False
-    hp_test_set_size: int = 65
     max_ds_size: int = 1000
-    partition: str | None = None
-    buffer_gpus: int = 12
     hyperparam_sweeps: int = 1000
     max_epochs: int = 1000
     epochs_per_val: int = 20
     patience: int = 4  # epochs_per_val * patience = max epochs without improvement before stopping
+
+    # Environment-specific orchestration settings
+    partition: str | None = None
+    buffer_gpus: int = 12
     wandb_entity: str | None = None
-    scratch_dir: Path | None = None
-    dataset_paths: dict[str, Path] = {}
-    target_device: str | None = None
+    scratch_dir: Path | None = (
+        None  # TODO(ZanderKeith): Only used for intermediate results from trajectory optimization, can be put in that study config instead
+    )
 
     # make everything in the config completely immutable, including the nested dataset_paths dict
     model_config = ConfigDict(frozen=True)
@@ -74,10 +80,12 @@ class _ConfigProxy:
     tcv = Dynaconf(settings_files=[Path(PACKAGE_ROOT) / "datasets/tcv/config.toml"])
 
     def __setattr__(self, name, value):
-        raise AttributeError("Config is immutable. Use load_config() to replace it.")
+        raise AttributeError("Config is immutable after being set. Multiple calls to load_config() are not allowed.")
 
     def __getattr__(self, name: str):
         if _ConfigProxy._cfg is None:
+            if name == "initialized":
+                return False
             raise RuntimeError(f"Config not loaded. Call load_config() before accessing config.{name}")
         return getattr(_ConfigProxy._cfg, name)
 

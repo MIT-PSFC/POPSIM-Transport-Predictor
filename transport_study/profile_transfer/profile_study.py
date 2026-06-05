@@ -1,5 +1,8 @@
+from __future__ import annotations
+
 import shutil
 import time
+import tomllib
 from dataclasses import dataclass
 from itertools import product
 from pathlib import Path
@@ -9,9 +12,10 @@ import netCDF4  # noqa: F401
 import xarray as xr
 from loguru import logger
 from popsim.ml import TrainConfig
+from pydantic import Field, field_validator
 
 from transport_study import PACKAGE_ROOT
-from transport_study.config import config
+from transport_study.config import StudyConfig, config, load_config
 from transport_study.orchestration.organize_data import TrainingData, dataset_config
 from transport_study.orchestration.study import Study
 from transport_study.orchestration.wandb_utils import (
@@ -29,21 +33,95 @@ def _parse_training_data(s: str) -> TrainingData:
 
 
 class ProfileStudy(Study):
-    HYPERPARAM_DATA_NORMALIZATION = "physics"
-    HYPERPARAM_DOMAIN_ADAPTATION = None
-    HYPERPARAM_FREEZE_SHAPES = True
-    HYPERPARAM_NUM_HP_SHOTS = -1
-
-    @classmethod
-    def _hyperparam_training_data(cls) -> TrainingData:
-        """All configured non-target source devices - the canonical hyperparam case."""
-        target = dataset_config.target_device
-        sources = frozenset(dataset_config.dataset_paths.keys()) - ({target} if target else set())
-        return TrainingData(sources=sources)
-
     ##################
     # INITIALIZATION #
     ##################
+    class Config(StudyConfig):
+        # Organization for datasets and wandb projects
+        working_dir_base: Path = PACKAGE_ROOT / "popsim_studies" / "working_dir"
+        # The different cases being compared in this study
+        model_types: tuple[str, ...] = Field(default_factory=lambda: ("shape_init_pca", "shape_init_kmeans", "unstructured_nn"))
+        training_datasets: tuple[TrainingData, ...]
+        data_normalization_methods: tuple[str, ...] = Field(default_factory=lambda: ("physics",))
+        domain_adaptation_methods: tuple[str | None, ...] = Field(default_factory=lambda: (None, "mixing", "transfer"))
+        freeze_shapes_options: tuple[bool, ...] = Field(default_factory=lambda: (True,))
+        num_hp_shots_options: tuple[int, ...] = Field(default_factory=lambda: (0, 1, 10, -1))
+        hp_test_set_size: int
+        # configurations for the hyperparameter tuning case
+        hyperparam_data_normalization: str = "physics"
+        hyperparam_domain_adaptation: str | None = None
+        hyperparam_freeze_shapes: bool = True
+        hyperparam_num_hp_shots: int = -1
+
+        @field_validator("model_types")
+        @classmethod
+        def _validate_model_types(cls, v: tuple[str, ...]) -> tuple[str, ...]:
+            valid = {"shape_init_pca", "shape_init_kmeans", "unstructured_nn"}
+            for mt in v:
+                if mt not in valid:
+                    raise ValueError(f"Invalid model type: {mt}. Must be one of {sorted(valid)}.")
+            return v
+
+        @field_validator("data_normalization_methods")
+        @classmethod
+        def _validate_data_normalization(cls, v: tuple[str, ...]) -> tuple[str, ...]:
+            for dn in v:
+                if dn not in ["physics"]:
+                    raise ValueError(f"Invalid data normalization: {dn}. Only 'physics' is implemented for profile transfer.")
+            return v
+
+        @field_validator("domain_adaptation_methods")
+        @classmethod
+        def _validate_domain_adaptation(cls, v: tuple[str | None, ...]) -> tuple[str | None, ...]:
+            valid = {None, "mixing", "transfer"}
+            for da in v:
+                if da not in valid:
+                    raise ValueError(f"Invalid domain adaptation: {da}. Must be one of {valid}.")
+            return v
+
+        @field_validator("training_datasets", mode="before")
+        @classmethod
+        def _coerce_training_datasets(cls, v) -> tuple[TrainingData, ...]:
+            return tuple(_parse_training_data(s) if isinstance(s, str) else s for s in v)
+
+        @classmethod
+        def from_toml(cls, path: Path) -> ProfileStudy.Config:
+            with open(path, "rb") as f:
+                data = tomllib.load(f)
+            datasets = data.pop("datasets", {})
+            target = datasets.pop("target", None)
+            study_cases = data.pop("study_cases", {})
+            return cls(
+                **data,
+                **study_cases,
+                dataset_paths={k: Path(v) for k, v in datasets.items()},
+                target_device=target,
+            )
+
+    def __init__(
+        self,
+        cfg: str | Path | ProfileStudy.Config,
+    ):
+        if not config.initialized:
+            load_config(cfg)
+
+        cases = self.make_cases(
+            config.model_types,
+            config.training_datasets,
+            config.data_normalization_methods,
+            config.domain_adaptation_methods,
+            config.freeze_shapes_options,
+            config.num_hp_shots_options,
+        )
+        super().__init__(config.study_name, config.working_dir_base, cases)
+
+        logger.info(f"Model types: {config.model_types}")
+        logger.info(f"Training datasets: {config.training_datasets}")
+        logger.info(f"Data normalization methods: {config.data_normalization_methods}")
+        logger.info(f"Domain adaptation methods: {config.domain_adaptation_methods}")
+        logger.info(f"Freeze shapes options: {config.freeze_shapes_options}")
+        logger.info(f"Number of high-performance shots options: {config.num_hp_shots_options}")
+
     @dataclass
     class Case(Study.Case):
         """
@@ -113,10 +191,10 @@ class ProfileStudy(Study):
                 return ProfileStudy.Case(
                     model_type=self.model_type,
                     training_data=ProfileStudy._hyperparam_training_data(),
-                    data_normalization=ProfileStudy.HYPERPARAM_DATA_NORMALIZATION,
-                    domain_adaptation=ProfileStudy.HYPERPARAM_DOMAIN_ADAPTATION,
-                    freeze_shapes=ProfileStudy.HYPERPARAM_FREEZE_SHAPES,
-                    num_hp_shots=ProfileStudy.HYPERPARAM_NUM_HP_SHOTS,
+                    data_normalization=config.hyperparam_data_normalization,
+                    domain_adaptation=config.hyperparam_domain_adaptation,
+                    freeze_shapes=config.hyperparam_freeze_shapes,
+                    num_hp_shots=config.hyperparam_num_hp_shots,
                 )
 
         def __init__(
@@ -289,33 +367,12 @@ class ProfileStudy(Study):
 
         return possible_cases
 
-    def __init__(
-        self,
-        name: str,
-        working_dir_base: Path | str,
-        model_types: list[str],
-        training_datasets: list[TrainingData],
-        data_normalization_methods: list[str],
-        domain_adaptation_methods: list[str],
-        freeze_shapes_options: list[bool],
-        num_hp_shots_options: list[int],
-    ):
-        cases = self.make_cases(
-            model_types,
-            training_datasets,
-            data_normalization_methods,
-            domain_adaptation_methods,
-            freeze_shapes_options,
-            num_hp_shots_options,
-        )
-        super().__init__(name, working_dir_base, cases)
-
-        logger.info(f"Model types: {model_types}")
-        logger.info(f"Training datasets: {training_datasets}")
-        logger.info(f"Data normalization methods: {data_normalization_methods}")
-        logger.info(f"Domain adaptation methods: {domain_adaptation_methods}")
-        logger.info(f"Freeze shapes options: {freeze_shapes_options}")
-        logger.info(f"Number of high-performance shots options: {num_hp_shots_options}")
+    @classmethod
+    def _hyperparam_training_data(cls) -> TrainingData:
+        """All configured non-target source devices - the canonical hyperparam case."""
+        target = dataset_config.target_device
+        sources = frozenset(dataset_config.dataset_paths.keys()) - ({target} if target else set())
+        return TrainingData(sources=sources)
 
     #############
     # EXECUTION #
@@ -632,15 +689,8 @@ class ProfileStudy(Study):
         return ds_merged
 
 
-def run_study(  # noqa: PLR0915
-    project_name: str,
-    working_dir_base: Path | str | None,
-    model_types: list[str] | None = None,
-    training_datasets: list[str] | None = None,
-    data_normalization_methods: list[str] | None = None,
-    domain_adaptation_methods: list[str] | None = None,
-    freeze_shapes_options: list[bool] | None = None,
-    num_hp_shots_options: list[int] | None = None,
+def run_study(
+    config: ProfileStudy.Config | str | Path,
     enable_parallelism: bool | None = False,
     skip_tuning: bool | None = True,
     skip_visualization: bool | None = False,
@@ -663,12 +713,6 @@ def run_study(  # noqa: PLR0915
 
     Parameters
     ----------
-    project_name : str | None
-        Name of the project. Used to separate different runs within the working and figure directories.
-    working_dir_base : str | None
-        Base directory for working data. Trained models and intermediate data files will be placed in `{working_dir_base}/{project_name}`.
-    figure_dir_base : str | None
-        Base directory for figures. Figures will be placed in `{figure_dir_base}/{project_name}`.
     enable_parallelism : bool | None
         If false, runs the entire study sequentially in one process.
         If true, submits independent training steps with SLURM up to configurable resource limits.
@@ -688,141 +732,11 @@ def run_study(  # noqa: PLR0915
         If True, delete any existing figures in the figure directory before running.
     """
 
-    def _validate_args(
-        model_types,
-        training_datasets,
-        data_normalization_methods,
-        domain_adaptation_methods,
-        freeze_shapes_options,
-        num_hp_shots_options,
-    ):
-        def _assign_args(
-            model_types,
-            training_datasets,
-            data_normalization_methods,
-            domain_adaptation_methods,
-            freeze_shapes_options,
-            num_hp_shots_options,
-        ):
-            if model_types is None:
-                model_types = ["shape_init_pca", "shape_init_kmeans", "unstructured_nn"]
-            if training_datasets is None:
-                training_datasets = [_parse_training_data(s) for s in ["cmod", "tcv", "cmod_tcv", "exnihilo"]]
-            else:
-                training_datasets = [_parse_training_data(s) if isinstance(s, str) else s for s in training_datasets]
-            if data_normalization_methods is None:
-                data_normalization_methods = ["physics"]
-            if domain_adaptation_methods is None:
-                domain_adaptation_methods = [None, "mixing", "transfer"]
-            if freeze_shapes_options is None:
-                freeze_shapes_options = [True, False]
-            if num_hp_shots_options is None:
-                num_hp_shots_options = [0, 1, 3, 10, 32, -1]
-
-            return (
-                model_types,
-                training_datasets,
-                data_normalization_methods,
-                domain_adaptation_methods,
-                freeze_shapes_options,
-                num_hp_shots_options,
-            )
-
-        (
-            model_types,
-            training_datasets,
-            data_normalization_methods,
-            domain_adaptation_methods,
-            freeze_shapes_options,
-            num_hp_shots_options,
-        ) = _assign_args(
-            model_types,
-            training_datasets,
-            data_normalization_methods,
-            domain_adaptation_methods,
-            freeze_shapes_options,
-            num_hp_shots_options,
-        )
-
-        def _check_args(
-            model_types,
-            training_datasets,
-            data_normalization_methods,
-            domain_adaptation_methods,
-        ):
-            for model_type in model_types:
-                if model_type not in [
-                    "shape_init_pca",
-                    "shape_init_kmeans",
-                    "unstructured_nn",
-                ]:
-                    raise ValueError(
-                        f"Invalid model type: {model_type}. Must be one of 'shape_init_pca', 'shape_init_kmeans', or 'unstructured_nn'."
-                    )
-
-            for data_normalization in data_normalization_methods:
-                if data_normalization not in ["physics"]:
-                    raise ValueError(
-                        f"Invalid data normalization method: {data_normalization}. Only 'physics' is implemented for profile transfer."
-                    )
-
-            for domain_adaptation in domain_adaptation_methods:
-                if domain_adaptation not in [None, "mixing", "transfer"]:
-                    raise ValueError(
-                        f"Invalid domain adaptation method: {domain_adaptation}. Must be one of None, 'mixing', or 'transfer'."
-                    )
-
-        _check_args(
-            model_types,
-            training_datasets,
-            data_normalization_methods,
-            domain_adaptation_methods,
-        )
-
-        return (
-            model_types,
-            training_datasets,
-            data_normalization_methods,
-            domain_adaptation_methods,
-            freeze_shapes_options,
-            num_hp_shots_options,
-        )
-
-    (
-        model_types,
-        training_datasets,
-        data_normalization_methods,
-        domain_adaptation_methods,
-        freeze_shapes_options,
-        num_hp_shots_options,
-    ) = _validate_args(
-        model_types,
-        training_datasets,
-        data_normalization_methods,
-        domain_adaptation_methods,
-        freeze_shapes_options,
-        num_hp_shots_options,
-    )
-
     ###########################################
     # Initialize study and Set up directories #
     ###########################################
-    if working_dir_base is None:
-        working_dir_base = Path(PACKAGE_ROOT) / "popsim_studies" / "working_dir"
 
-    if config.debug:
-        project_name = f"{project_name}_debug"
-
-    study = ProfileStudy(
-        name=project_name,
-        working_dir_base=working_dir_base,
-        model_types=model_types,
-        training_datasets=training_datasets,
-        data_normalization_methods=data_normalization_methods,
-        domain_adaptation_methods=domain_adaptation_methods,
-        freeze_shapes_options=freeze_shapes_options,
-        num_hp_shots_options=num_hp_shots_options,
-    )
+    study = ProfileStudy(config)
 
     def _setup_directories(study: ProfileStudy):
         logger.info("SETTING UP DIRECTORIES")

@@ -7,7 +7,7 @@ from transport_study.modules.profile_predictor.module import ProfilePredictor
 from transport_study.modules.profile_predictor.trb import (
     ProfilePredictorTRB,
 )
-from transport_study.profile_transfer.run_study import ProfileStudy
+from transport_study.profile_transfer.profile_study import ProfileStudy
 
 
 def checkpoint_to_profile_case(checkpoint_dir: Path | str) -> ProfileStudy.Case:
