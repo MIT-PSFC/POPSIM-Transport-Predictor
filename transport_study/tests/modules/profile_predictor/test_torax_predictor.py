@@ -180,9 +180,7 @@ def test_stage2_training(small_model):
 
     # Random (inputs, fitted_params) pairs in the raw NN output space
     nn_inputs_batch = jnp.array(rng.normal(0.0, 0.5, (n_samples, 9)).astype(np.float32))
-    fitted_params = jnp.array(
-        rng.normal(0.0, 0.3, (n_samples, _NN_OUT_SIZE)).astype(np.float32)
-    )
+    fitted_params = jnp.array(rng.normal(0.0, 0.3, (n_samples, _NN_OUT_SIZE)).astype(np.float32))
 
     @eqx.filter_jit
     def loss_and_grad(nn_module):
@@ -220,9 +218,7 @@ def test_stage2_training(small_model):
     # NN weights should have changed
     leaves_before = jnp.concatenate([x.ravel() for x in jax.tree.leaves(nn_before)])
     leaves_after = jnp.concatenate([x.ravel() for x in jax.tree.leaves(nn)])
-    assert not jnp.allclose(leaves_before, leaves_after), (
-        "NN weights did not change after training"
-    )
+    assert not jnp.allclose(leaves_before, leaves_after), "NN weights did not change after training"
 
 
 if __name__ == "__main__":

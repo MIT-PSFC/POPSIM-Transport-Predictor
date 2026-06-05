@@ -34,7 +34,7 @@ class StudyConfig(BaseSettings):
     hyperparam_sweeps: int = 1000
     max_epochs: int = 1000
     epochs_per_val: int = 20
-    patience: int = 4  # 80 epochs without improvement, stop
+    patience: int = 4  # epochs_per_val * patience epochs without improvement, stop
     wandb_entity: str | None = None
 
     scratch_dir: Path | None = None  # Used for predict-first temp files

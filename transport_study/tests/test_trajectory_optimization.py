@@ -18,13 +18,6 @@ from transport_study.modules.profile_trajectory.module import (
 from transport_study.modules.profile_trajectory.trb import (
     ProfileTrajectoryOptimizerTRB,
 )
-from transport_study.trajectory_optimization.optimize import (
-    TrajectoryOptimizer,
-)
-from transport_study.trajectory_optimization.plotting import (
-    profile_comparison,
-    trajectory_performance_comparison,
-)
 from transport_study.trajectory_optimization.setup_data import (
     IP_RAMP_SHOTS,
     make_augmented_dataset,

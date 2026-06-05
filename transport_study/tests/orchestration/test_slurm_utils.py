@@ -1,7 +1,14 @@
+import shutil
+
+import pytest
+
 from transport_study.orchestration.slurm_utils import (
     count_idle_gpus,
     resources_available,
 )
+
+if shutil.which("squeue") is None:
+    pytest.skip("slurm not available, skipping slurm utils tests", allow_module_level=True)
 
 
 def test_count_idle_gpus():
