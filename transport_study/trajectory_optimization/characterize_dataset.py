@@ -1,3 +1,5 @@
+from pathlib import Path
+
 import fire
 import numpy as np
 from loguru import logger
@@ -15,7 +17,7 @@ from transport_study.trajectory_optimization.setup_data import (
 
 
 def get_trajectory_input_ranges(
-    ds_path: str,
+    ds_path: Path | str,
     inputs: list[str],
     shots_times: dict[int, dict[str, float]] = IP_RAMP_SHOTS,
 ) -> dict[str, dict[str, float]]:
@@ -58,7 +60,7 @@ def get_trajectory_input_ranges(
 
 
 def get_controllable_input_errors(
-    ds_path: str,
+    ds_path: Path | str,
     inputs: list[tuple[str, str]],
     shots_times: dict[int, dict[str, float]] = FEEDBACK_CONTROL_SHOTS,
 ) -> dict[str, float]:
@@ -90,13 +92,9 @@ def get_controllable_input_errors(
     input_errors = {}
     for input_prog, input_meas in inputs:
         if input_prog not in ds_trajectory or input_meas not in ds_trajectory:
-            raise ValueError(
-                f"Input variables {input_prog} and/or {input_meas} not found in dataset"
-            )
+            raise ValueError(f"Input variables {input_prog} and/or {input_meas} not found in dataset")
 
-        absolute_error = np.abs(
-            ds_trajectory[input_prog].values - ds_trajectory[input_meas].values
-        )
+        absolute_error = np.abs(ds_trajectory[input_prog].values - ds_trajectory[input_meas].values)
         absolute_error = absolute_error[~np.isnan(absolute_error)]
         error_stat = float(absolute_error.std())
         input_errors[input_prog] = error_stat
@@ -105,13 +103,15 @@ def get_controllable_input_errors(
 
 
 def characterize_dataset(
-    ds_path: str = config.dataset_paths.get(config.target_device),
+    ds_path: Path | str | None = None,
 ) -> None:
     """Load the dataset and print out some basic statistics to help scope the optimization problem.
 
     Args:
         ds_path (str): Path to the dataset.
     """
+    if ds_path is None:
+        ds_path = config.dataset_paths.get(config.target_device)
 
     try:
         input_ranges = get_trajectory_input_ranges(
@@ -133,9 +133,7 @@ def characterize_dataset(
         )
 
         for input_var, stats in input_ranges.items():
-            logger.info(
-                f"Input variable {input_var} has the following statistics during the trajectory portion of the shots:"
-            )
+            logger.info(f"Input variable {input_var} has the following statistics during the trajectory portion of the shots:")
             for stat_name, stat_value in stats.items():
                 logger.info(f"    {stat_name}: {stat_value:.5f}")
     except Exception as e:
@@ -158,9 +156,7 @@ def characterize_dataset(
         shots_times=FEEDBACK_CONTROL_SHOTS,
     )
 
-    logger.opt(colors=True).info(
-        "<bold><cyan>Controllable input parameter errors:</cyan></bold>"
-    )
+    logger.opt(colors=True).info("<bold><cyan>Controllable input parameter errors:</cyan></bold>")
     for input_var, error in controllable_input_ranges.items():
         logger.info(f"{input_var}:\t{error:.5f}")
 

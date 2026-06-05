@@ -11,7 +11,7 @@ Usage:
         --profile_predictor_checkpoint_dir /path/to/checkpoint
 """
 
-import os
+from pathlib import Path
 
 import fire
 import jax
@@ -113,8 +113,8 @@ def _overwrite_prog_with_measured(ds: xr.Dataset, shot: int) -> xr.Dataset:
 
 def run_postshot_prediction(
     shot: int,
-    profile_predictor_checkpoint_dir: str,
-    scratch_dir: str | None = config.scratch_dir,
+    profile_predictor_checkpoint_dir: Path | str,
+    scratch_dir: Path | str | None = config.scratch_dir,
 ):
     """Evaluate the profile predictor over an ensemble of perturbed *measured* trajectories.
 
@@ -129,18 +129,14 @@ def run_postshot_prediction(
         profile_predictor_checkpoint_dir: Checkpoint directory for the profile predictor.
         scratch_dir: Scratch directory for output files.
     """
-    working_dir = os.path.join(scratch_dir, "predict_first")
-    shot_data_dir = os.path.join(working_dir, "raw_data")
-    result_dir = os.path.join(
-        working_dir,
-        f"after_shot_{shot}",
-        os.path.basename(profile_predictor_checkpoint_dir),
-    )
-    os.makedirs(shot_data_dir, exist_ok=True)
-    os.makedirs(result_dir, exist_ok=True)
+    working_dir = Path(scratch_dir) / "predict_first"
+    shot_data_dir = working_dir / "raw_data"
+    result_dir = working_dir / f"after_shot_{shot}" / Path(profile_predictor_checkpoint_dir).name
+    shot_data_dir.mkdir(parents=True, exist_ok=True)
+    result_dir.mkdir(parents=True, exist_ok=True)
 
     # Load (or fetch) shot data
-    ds_path = os.path.join(shot_data_dir, f"{shot}.nc")
+    ds_path = shot_data_dir / f"{shot}.nc"
     ds = get_traj_shot_data(shot, ds_path)
 
     # Build programmed-trajectory variables first (gapin_prog needs B0_prog to exist)
@@ -230,7 +226,7 @@ def run_postshot_prediction(
     if "time" in ds_aug:
         ds_pred["time"] = ds_aug["time"]
 
-    pred_path = os.path.join(result_dir, "predicted_profiles.nc")
+    pred_path = result_dir / "predicted_profiles.nc"
     ds_pred.to_netcdf(pred_path)
     logger.info(f"Saved predicted profiles to {pred_path}")
 

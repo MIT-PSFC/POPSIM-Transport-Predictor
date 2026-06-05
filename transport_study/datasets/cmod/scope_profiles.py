@@ -1,17 +1,16 @@
-import glob
-import os
+from pathlib import Path
 
 import fire
 import matplotlib.pyplot as plt
 import xarray as xr
 
 
-def scope_shot(thomson_dir: str, profile_dir: str, figure_dir: str, shot: int):
+def scope_shot(thomson_dir: Path | str, profile_dir: Path | str, figure_dir: Path | str, shot: int):
     """Make a plot for a single shot comparing Thomson and profile data."""
-    os.makedirs(figure_dir, exist_ok=True)
+    Path(figure_dir).mkdir(parents=True, exist_ok=True)
 
-    ds_thomson = xr.open_dataset(os.path.join(thomson_dir, f"{shot}.nc"))
-    ds_profile = xr.open_dataset(os.path.join(profile_dir, f"{shot}.nc"))
+    ds_thomson = xr.open_dataset(Path(thomson_dir) / f"{shot}.nc")
+    ds_profile = xr.open_dataset(Path(profile_dir) / f"{shot}.nc")
     # Remove the shot dimension since we're only looking at one shot
     ds_thomson = ds_thomson.isel(shot=0).drop_vars("shot")
     ds_profile = ds_profile.isel(shot=0).drop_vars("shot")
@@ -106,38 +105,38 @@ def scope_shot(thomson_dir: str, profile_dir: str, figure_dir: str, shot: int):
         fig.suptitle(f"C-Mod Shot {shot} Time {ds_thomson_time['time'].values:.3f} s")
         fig.tight_layout(rect=[0, 0.03, 1, 0.95])
 
-        fig.savefig(os.path.join(figure_dir, f"time_{t_idx:03d}.png"))
+        fig.savefig(Path(figure_dir) / f"time_{t_idx:03d}.png")
         plt.close(fig)
 
 
-def scope_all_shots_freestyle(profile_dir: str):
+def scope_all_shots_freestyle(profile_dir: Path | str):
     """Plot all shots in the dataset."""
 
     thomson_dir = "/usr/local/mfe/ml_data_dump/POPSIM/old_studies/transport_predictor/cmod_100/cmod_thomson_raw"
-    figure_dir = os.path.join(profile_dir, "profile_scopes")
-    os.makedirs(figure_dir, exist_ok=True)
+    figure_dir = Path(profile_dir) / "profile_scopes"
+    figure_dir.mkdir(parents=True, exist_ok=True)
 
-    fitted_shot_data_files = glob.glob(os.path.join(profile_dir, "*.nc"))
-    fitted_shots = [int(os.path.basename(f).split("/")[-1].split(".")[0]) for f in fitted_shot_data_files]
+    fitted_shot_data_files = list(Path(profile_dir).glob("*.nc"))
+    fitted_shots = [int(f.stem) for f in fitted_shot_data_files]
 
     for shot in fitted_shots:
-        shot_dir = os.path.join(figure_dir, str(shot))
+        shot_dir = figure_dir / str(shot)
         scope_shot(thomson_dir, profile_dir, shot_dir, shot)
 
 
-def scope_all_shots(save_dir: str):
+def scope_all_shots(save_dir: Path | str):
     """Plot all shots in the dataset."""
 
-    thomson_dir = os.path.join(save_dir, "cmod_thomson_raw")
-    profile_dir = os.path.join(save_dir, "cmod_profiles_raw")
-    figure_dir = os.path.join(save_dir, "cmod_scope_profiles")
-    os.makedirs(figure_dir, exist_ok=True)
+    thomson_dir = Path(save_dir) / "cmod_thomson_raw"
+    profile_dir = Path(save_dir) / "cmod_profiles_raw"
+    figure_dir = Path(save_dir) / "cmod_scope_profiles"
+    figure_dir.mkdir(parents=True, exist_ok=True)
 
-    fitted_shot_data_files = glob.glob(os.path.join(profile_dir, "*.nc"))
-    fitted_shots = [int(os.path.basename(f).split("/")[-1].split(".")[0]) for f in fitted_shot_data_files]
+    fitted_shot_data_files = list(Path(profile_dir).glob("*.nc"))
+    fitted_shots = [int(f.stem) for f in fitted_shot_data_files]
 
     for shot in fitted_shots:
-        shot_dir = os.path.join(figure_dir, str(shot))
+        shot_dir = figure_dir / str(shot)
         scope_shot(thomson_dir, profile_dir, shot_dir, shot)
 
 

@@ -1,4 +1,4 @@
-import os
+from pathlib import Path
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -16,7 +16,7 @@ LEGEND_FONTSIZE = 18
 
 def ds_power_balance_time_plot(  # noqa: PLR0915
     ds: str | xr.Dataset,
-    fig_dir: str,
+    fig_dir: Path | str,
     num_shots: int | None = 9999,
     title: str = "Dataset Time Traces",
 ):
@@ -28,7 +28,7 @@ def ds_power_balance_time_plot(  # noqa: PLR0915
         else:
             ds = xr.open_dataset(ds_path)
 
-    os.makedirs(fig_dir, exist_ok=True)
+    Path(fig_dir).mkdir(parents=True, exist_ok=True)
 
     # Compute global y-limits across all shots for consistent axes
     ylim_ip = (0, float(np.nanmax(np.abs(ds["Ip_MA"].values))) * 1.1)
@@ -217,7 +217,7 @@ def ds_power_balance_time_plot(  # noqa: PLR0915
 
 def ds_profile_time_plot(  # noqa: PLR0915
     ds: str | xr.Dataset,
-    fig_dir: str,
+    fig_dir: Path | str,
     num_shots: int | None = 9999,
     title: str = "Profile dataset Time Traces",
 ):
@@ -229,7 +229,7 @@ def ds_profile_time_plot(  # noqa: PLR0915
         else:
             ds = xr.open_dataset(ds_path)
 
-    os.makedirs(fig_dir, exist_ok=True)
+    Path(fig_dir).mkdir(parents=True, exist_ok=True)
 
     # Compute global y-limits across all shots for consistent axes
     ylim_ip = (0, float(np.nanmax(np.abs(ds["Ip_MA"].values))) * 1.1)
@@ -380,7 +380,7 @@ def ds_profile_time_plot(  # noqa: PLR0915
 
 def ds_profile_plot(
     ds: str | xr.Dataset,
-    fig_dir: str,
+    fig_dir: Path | str,
     num_shots: int | None = 9999,
     title: str = "Dataset Time Traces",
 ):
@@ -392,7 +392,7 @@ def ds_profile_plot(
         else:
             ds = xr.open_dataset(ds_path)
 
-    os.makedirs(fig_dir, exist_ok=True)
+    Path(fig_dir).mkdir(parents=True, exist_ok=True)
 
     for shot in ds["shot"].data[:num_shots]:
         shot_ds = ds.sel(shot=shot)
@@ -486,13 +486,13 @@ def ds_profile_plot(
                 spine.set_color(TEXT_COLOR)
 
         fig.tight_layout()
-        fig.savefig(os.path.join(fig_dir, f"{shot}_profiles.png"), dpi=150)
+        fig.savefig(Path(fig_dir) / f"{shot}_profiles.png", dpi=150)
         plt.close(fig)
 
 
 def compare_powers(
-    ds_path: str,
-    fig_dir: str,
+    ds_path: Path | str,
+    fig_dir: Path | str,
     title: str = "Power Signal Comparison",
     num_shots: int | None = 9999,
 ):
@@ -502,7 +502,7 @@ def compare_powers(
     else:
         ds = xr.open_dataset(ds_path)
 
-    os.makedirs(fig_dir, exist_ok=True)
+    Path(fig_dir).mkdir(parents=True, exist_ok=True)
 
     # Find all power signals and their corresponding _alt versions
     power_signals = [

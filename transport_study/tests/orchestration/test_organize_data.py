@@ -1,4 +1,4 @@
-import os
+from pathlib import Path
 
 import pytest
 
@@ -15,10 +15,7 @@ from transport_study.orchestration.organize_data import (
 
 # Sample dataset paths (real .nc files checked into git lfs)
 SAMPLE_NAMES = ["cmod_low_1", "cmod_low_2", "cmod_high", "cmod_recent"]
-SAMPLE_PATHS = {
-    name: os.path.join(PACKAGE_ROOT, "datasets", "sample", f"{name}.nc")
-    for name in SAMPLE_NAMES
-}
+SAMPLE_PATHS = {name: Path(PACKAGE_ROOT) / "datasets" / "sample" / f"{name}.nc" for name in SAMPLE_NAMES}
 
 
 @pytest.fixture()
@@ -37,21 +34,15 @@ def sample_dataset_config(monkeypatch):
 
 class TestGetDs:
     @pytest.mark.parametrize("source_ds", SAMPLE_NAMES)
-    @pytest.mark.parametrize(
-        "study_type", ["profile_transfer", "power_balance_transfer"]
-    )
-    def test_get_ds_returns_dataset_and_dims(
-        self, sample_dataset_config, source_ds, study_type
-    ):
+    @pytest.mark.parametrize("study_type", ["profile_transfer", "power_balance_transfer"])
+    def test_get_ds_returns_dataset_and_dims(self, sample_dataset_config, source_ds, study_type):
         ds, episode_dim = get_ds(source_ds, study_type, debug=True)
         assert ds is not None
         assert episode_dim == EPISODE_DIM
         assert TIME_COORD in ds.coords
         assert TIME_DIM in ds.dims
 
-    @pytest.mark.parametrize(
-        "study_type", ["profile_transfer", "power_balance_transfer"]
-    )
+    @pytest.mark.parametrize("study_type", ["profile_transfer", "power_balance_transfer"])
     def test_get_ds_unknown_source_raises(self, sample_dataset_config, study_type):
         with pytest.raises(ValueError, match="Unknown source dataset"):
             get_ds("nonexistent_device", study_type, debug=True)
@@ -72,9 +63,7 @@ class TestGetDs:
 
 
 class TestAddPerformance:
-    @pytest.mark.parametrize(
-        "study_type", ["profile_transfer", "power_balance_transfer"]
-    )
+    @pytest.mark.parametrize("study_type", ["profile_transfer", "power_balance_transfer"])
     def test_add_performance_adds_variables(self, sample_dataset_config, study_type):
         ds, episode_coord = get_ds("cmod_low_1", study_type, debug=True)
         result = add_performance(ds, episode_coord)
@@ -112,18 +101,13 @@ class TestTrainingData:
         td_2 = TrainingData(sources_unsorted=frozenset({"cmod_high", "cmod_low_1"}))
         for i in range(len(td_1.sources)):
             assert td_1.sources[i] == td_2.sources[i]
-            assert (
-                sample_dataset_config.ds_source_to_idx[td_1.sources[i]]
-                == sample_dataset_config.ds_source_to_idx[td_2.sources[i]]
-            )
+            assert sample_dataset_config.ds_source_to_idx[td_1.sources[i]] == sample_dataset_config.ds_source_to_idx[td_2.sources[i]]
 
 
 class TestGetTrainValDatasets:
     def test_get_train_val_datasets_returns_split(self, sample_dataset_config):
         td = TrainingData(sources_unsorted=frozenset({"cmod_low_1", "cmod_low_2"}))
-        train_ds, val_ds = get_train_val_datasets(
-            td, study_type="power_balance_transfer", debug=True
-        )
+        train_ds, val_ds = get_train_val_datasets(td, study_type="power_balance_transfer", debug=True)
         assert train_ds.sizes["shot"] > 0
         assert val_ds.sizes["shot"] > 0
         # Assert that train and val sets are disjoint
@@ -132,9 +116,7 @@ class TestGetTrainValDatasets:
         assert train_shots.isdisjoint(val_shots)
         # Assert validation shots have higher performance metric within the same source dataset
         for source_idx in train_ds["ds_source_idx"].values:
-            train_subset = train_ds.where(
-                train_ds["ds_source_idx"] == source_idx, drop=True
-            )
+            train_subset = train_ds.where(train_ds["ds_source_idx"] == source_idx, drop=True)
             val_subset = val_ds.where(val_ds["ds_source_idx"] == source_idx, drop=True)
             train_perf_max = train_subset["performance"].values.max()
             val_perf_min = val_subset["performance"].values.min()
@@ -168,15 +150,11 @@ class TestGetTrainTestDatasets:
         assert train_shots.isdisjoint(test_shots)
 
         # Assert that only target device shots are in the test set
-        test_ds_idx = sample_dataset_config.ds_source_to_idx[
-            sample_dataset_config.target_device
-        ]
+        test_ds_idx = sample_dataset_config.ds_source_to_idx[sample_dataset_config.target_device]
         assert all(s == test_ds_idx for s in test_ds["ds_source_idx"].values)
 
         # Only need to check performance separation for the target device
-        train_subset = train_ds.where(
-            train_ds["ds_source_idx"] == test_ds_idx, drop=True
-        )
+        train_subset = train_ds.where(train_ds["ds_source_idx"] == test_ds_idx, drop=True)
         test_subset = test_ds.where(test_ds["ds_source_idx"] == test_ds_idx, drop=True)
         train_perf_max = train_subset["performance"].values.max()
         test_perf_min = test_subset["performance"].values.min()
@@ -190,9 +168,7 @@ class TestGetTrainTestDatasets:
         )
         organize_data.dataset_config = cfg
         td = TrainingData(sources_unsorted=frozenset({"cmod_low_1", "cmod_low_2"}))
-        with pytest.raises(
-            ValueError, match="PTPS_DS_TARGET must be set for transfer learning"
-        ):
+        with pytest.raises(ValueError, match="PTPS_DS_TARGET must be set for transfer learning"):
             get_train_test_datasets(
                 td,
                 domain_adaptation="mixing",

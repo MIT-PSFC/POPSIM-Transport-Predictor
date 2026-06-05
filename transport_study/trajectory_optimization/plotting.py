@@ -1,4 +1,4 @@
-import os
+from pathlib import Path
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -15,7 +15,7 @@ LEGEND_FONTSIZE = 18
 
 
 def profile_comparison(  # noqa: PLR0912
-    profile_dir: str,
+    profile_dir: Path | str,
     ds_targ: xr.Dataset,
     ds_pred_list: list[xr.Dataset] | None = None,
     ds_pred_labels: list[str] | None = None,
@@ -29,8 +29,8 @@ def profile_comparison(  # noqa: PLR0912
         ds_pred_labels: Labels for each predicted dataset
     """
 
-    if not os.path.exists(profile_dir):
-        os.makedirs(profile_dir)
+    profile_dir = Path(profile_dir)
+    profile_dir.mkdir(parents=True, exist_ok=True)
 
     # Set default labels if not provided
     if ds_pred_list is not None and ds_pred_labels is None:
@@ -62,9 +62,8 @@ def profile_comparison(  # noqa: PLR0912
                     # Shot not found in prediction dataset or other error
                     shot_ds_pred_list.append(None)
 
-        shot_dir = os.path.join(profile_dir, str(shot))
-        if not os.path.exists(shot_dir):
-            os.makedirs(shot_dir)
+        shot_dir = profile_dir / str(shot)
+        shot_dir.mkdir(parents=True, exist_ok=True)
 
         # Get psi coordinates
         psi = shot_ds_targ["psi"].values
@@ -172,22 +171,22 @@ def profile_comparison(  # noqa: PLR0912
                     pass
 
             fig.tight_layout()
-            fig.savefig(os.path.join(shot_dir, f"t{time:.3f}.png"))
+            fig.savefig(shot_dir / f"t{time:.3f}.png")
             plt.close(fig)
 
 
 def trajectory_performance_comparison(
     ds_perf_list: list[xr.DataArray],
     ds_perf_labels: list[str],
-    save_dir: str,
+    save_dir: Path | str,
     title: str,
 ):
     """Compare performance of different trajectories on the same plot, in a both per-shot and per-timeslice manner.
     Expects each DataArray in ds_perf_list to have dimensions (sample, time_idx) and coords (shot, time, shot_alt), where sample is the dimension corresponding to different trajectories for the same shot and time (e.g. from different permutations or from the optimization trajectory). The "time" coordinate should be the actual time value in seconds, which will be used for the x-axis in the timeslice performance plot.
     """
 
-    if not os.path.exists(save_dir):
-        os.makedirs(save_dir)
+    save_dir = Path(save_dir)
+    save_dir.mkdir(parents=True, exist_ok=True)
 
     timeslice_performance_list = []
     shot_performance_list = []
@@ -225,7 +224,7 @@ def trajectory_performance_comparison(
             flier.set(marker="o", markeredgecolor="white", markersize=4)
 
         fig.tight_layout()
-        fig.savefig(os.path.join(save_dir, f"performance_comparison_{perf_label.lower()}.png"))
+        fig.savefig(save_dir / f"performance_comparison_{perf_label.lower()}.png")
         plt.close(fig)
 
 
@@ -233,7 +232,7 @@ def trajectory_shapes_comparison(  # noqa: PLR0915
     trajectory_shapes: list[dict],
     trajectory_labels: list[str],
     orig_traj: xr.Dataset,
-    save_dir: str,
+    save_dir: Path | str,
     input_ranges: dict[str, tuple[float, float]] | None = None,
 ):
     """For each trajectory shape variable, plot in a 3-column layout:
@@ -251,8 +250,8 @@ def trajectory_shapes_comparison(  # noqa: PLR0915
 
     """
 
-    if not os.path.exists(save_dir):
-        os.makedirs(save_dir)
+    save_dir = Path(save_dir)
+    save_dir.mkdir(parents=True, exist_ok=True)
 
     trajectory_vars = [var for var in trajectory_shapes[0].keys() if var != "shape_times"]
     n_vars = len(trajectory_vars)
@@ -424,7 +423,7 @@ def trajectory_shapes_comparison(  # noqa: PLR0915
 
     fig.tight_layout()
     fig.savefig(
-        os.path.join(save_dir, "trajectory_shapes_comparison.png"),
+        save_dir / "trajectory_shapes_comparison.png",
         bbox_inches="tight",
     )
     plt.close(fig)

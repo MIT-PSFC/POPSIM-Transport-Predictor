@@ -1,3 +1,5 @@
+from pathlib import Path
+
 import jax
 import numpy as np
 import xarray as xr
@@ -53,9 +55,7 @@ def correct_B0_prog(ds: xr.Dataset) -> xr.Dataset:
     This means we avoid having to deal with weird edge cases in the dataset where the programmed B0 is completely wrong,
     and we can still capture the typical noise in the B0 signal that the predictor will have to deal with
     """
-    smoothed_B0 = (
-        ds["B0"].rolling(time_idx=100, center=False, min_periods=1).mean(skipna=True)
-    )
+    smoothed_B0 = ds["B0"].rolling(time_idx=100, center=False, min_periods=1).mean(skipna=True)
     ds = ds.assign(B0_prog=smoothed_B0)
     return ds
 
@@ -69,9 +69,7 @@ def add_gapin_prog(ds: xr.Dataset) -> xr.Dataset:
     so that we can still capture typical noise in the gapin signal that the predictor will have to deal with
     """
 
-    smoothed_gapin = (
-        ds["gapin"].rolling(time_idx=100, center=False, min_periods=1).mean(skipna=True)
-    )
+    smoothed_gapin = ds["gapin"].rolling(time_idx=100, center=False, min_periods=1).mean(skipna=True)
     # Fill leading/trailing NaNs (e.g. before EFIT is valid) by propagating nearest valid value
     smoothed_gapin = smoothed_gapin.bfill("time_idx").ffill("time_idx")
     ds = ds.assign(gapin_prog=smoothed_gapin)
@@ -79,7 +77,7 @@ def add_gapin_prog(ds: xr.Dataset) -> xr.Dataset:
 
 
 def get_ds(
-    ds_path: str,
+    ds_path: Path | str,
     selected_shots: list[dict[str, float]] = FEEDBACK_CONTROL_SHOTS,
     fresh_profiles: bool = False,
     debug: bool | None = False,
@@ -102,9 +100,7 @@ def get_ds(
     else:
         ds = xr.open_dataset(ds_path).astype(jax.numpy.float32)
 
-    ds = ds.sel(
-        shot=list(selected_shots.keys())
-    )  # Limit to specifically these feedback control shots
+    ds = ds.sel(shot=list(selected_shots.keys()))  # Limit to specifically these feedback control shots
     # Also limit to within the time window of interest
     max_time = max(times["end"] for times in selected_shots.values())
     min_time = min(times["start"] for times in selected_shots.values())

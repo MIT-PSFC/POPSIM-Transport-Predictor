@@ -1,6 +1,6 @@
 """Makes the 'raw' CMOD dataset on mfews, to be processed later by POPSIM"""
 
-import os
+from pathlib import Path
 
 import netCDF4  # noqa: F401
 import numpy as np
@@ -24,7 +24,7 @@ from transport_study.datasets.cmod.gp_fit import fit_gp_hyperparameters, gp_prof
 from transport_study.datasets.dispy_utils import summary
 from transport_study.datasets.workflow import DataWorkflow
 
-DEFAULT_SHOTLIST_FILE = os.path.join(PACKAGE_ROOT, "datasets", "cmod", "cmod_shotlist")
+DEFAULT_SHOTLIST_FILE = PACKAGE_ROOT / "datasets" / "cmod" / "cmod_shotlist"
 
 
 class CModDataWorkflow(DataWorkflow):
@@ -40,8 +40,8 @@ class CModDataWorkflow(DataWorkflow):
     def __init__(
         self,
         ds_name: str,
-        shotlist_file: str | None,
-        data_assembly_dir: str,
+        shotlist_file: Path | str | None,
+        data_assembly_dir: Path | str,
         max_num_shots: int | None = None,
         gp_fit_psi: np.ndarray | None = None,
         skip_profiles: bool = False,
@@ -193,12 +193,8 @@ class CModDataWorkflow(DataWorkflow):
             ne_err = np.full((len(times), len(self.gp_fit_psi)), np.nan)
 
             for variable in ["te", "ne"]:
-                data_y = ds_shot[
-                    f"ts_channel_{variable}"
-                ].values.T  # shape (time, channel)
-                err_y = ds_shot[
-                    f"ts_channel_{variable}_error"
-                ].values.T  # shape (time, channel)
+                data_y = ds_shot[f"ts_channel_{variable}"].values.T  # shape (time, channel)
+                err_y = ds_shot[f"ts_channel_{variable}_error"].values.T  # shape (time, channel)
 
                 if variable == "ne":
                     data_y = data_y * 1e-20  # Convert to [1e20 m^-3]
@@ -243,9 +239,7 @@ class CModDataWorkflow(DataWorkflow):
                         ne_err[i_time, :] = std_y_star
 
                     if i_time % 10 == 0:
-                        logger.verbose(
-                            f"Completed {i_time}/{len(times)} fits for {variable}"
-                        )
+                        logger.verbose(f"Completed {i_time}/{len(times)} fits for {variable}")
 
                     if config.debug and i_time > 20:
                         break
@@ -311,13 +305,11 @@ class CModDataWorkflow(DataWorkflow):
         processed_shots = 0
         for shot in self.shotlist:
             if self.max_num_shots is not None and processed_shots >= self.max_num_shots:
-                logger.info(
-                    f"Reached maximum number of shots to process: {self.max_num_shots}"
-                )
+                logger.info(f"Reached maximum number of shots to process: {self.max_num_shots}")
                 break
 
-            ds_path = os.path.join(self.raw_data_dir, f"{shot}.nc")
-            if os.path.exists(ds_path):
+            ds_path = self.raw_data_dir / f"{shot}.nc"
+            if ds_path.exists():
                 logger.info(f"Raw dataset for shot {shot} already exists at {ds_path}")
                 processed_shots += 1
                 continue
@@ -331,9 +323,7 @@ class CModDataWorkflow(DataWorkflow):
 
             if self.skip_profiles:
                 # Skip profile fitting, use zeros instead
-                logger.info(
-                    f"Skipping profile fitting for shot {shot} (skip_profiles=True)"
-                )
+                logger.info(f"Skipping profile fitting for shot {shot} (skip_profiles=True)")
                 max_time = ds_efit["time"].max().item()
                 timebase = make_uniform_1khz_timebase(max_time)
 
@@ -371,9 +361,7 @@ class CModDataWorkflow(DataWorkflow):
                 # Get Thomson data
                 ds_thomson = self._get_thomson_dataset(shot)
                 if ds_thomson is None:
-                    logger.warning(
-                        f"Skipping shot {shot} since no Thomson data was retrieved"
-                    )
+                    logger.warning(f"Skipping shot {shot} since no Thomson data was retrieved")
                     continue
 
                 # Fit Thomson profiles
@@ -389,13 +377,9 @@ class CModDataWorkflow(DataWorkflow):
 
                 ds_thomson = ds_thomson.reindex(time=timebase, method="ffill")
                 ds_profiles = ds_profiles.reindex(time=timebase, method="ffill")
-                ds_efit = ds_efit.interp(
-                    time=timebase, method="nearest"
-                )  # EFIT is already at high time resolution
+                ds_efit = ds_efit.interp(time=timebase, method="nearest")  # EFIT is already at high time resolution
 
-                ds_assembly = xr.merge(
-                    [ds_thomson, ds_profiles, ds_efit], compat="override"
-                )
+                ds_assembly = xr.merge([ds_thomson, ds_profiles, ds_efit], compat="override")
 
             ds_standardized = self.standardize_signal_names(ds_assembly)
             if ds_standardized is None:
@@ -444,9 +428,7 @@ class CModDataWorkflow(DataWorkflow):
         # Ip_MA
         # B0
         ds["betan"] = ds["beta_n"]
-        ds["ne20_edge"] = ds["ne20_psi"].sel(
-            psi=0.9
-        )  # C-Mod doesn't have edge interferometry, get the density from psi=0.9
+        ds["ne20_edge"] = ds["ne20_psi"].sel(psi=0.9)  # C-Mod doesn't have edge interferometry, get the density from psi=0.9
         # R0
         # kappa
         # a_minor
@@ -481,9 +463,7 @@ class CModDataWorkflow(DataWorkflow):
         # If any *important* signal is all NaN, return None to skip this shot
         for signal in ["Te_keV_psi", "ne20_psi", "Ip_MA"]:
             if ds[signal].isnull().all():
-                logger.warning(
-                    f"Signal {signal} is all NaN for shot {ds['shot'].item()}, skipping shot."
-                )
+                logger.warning(f"Signal {signal} is all NaN for shot {ds['shot'].item()}, skipping shot.")
                 return None
 
         # Make episode dimension, time dimension, and time coordinate names consistent
@@ -512,12 +492,10 @@ class CModDataWorkflow(DataWorkflow):
 
         # Cull obviously bad fits, such as when the point at psi = 0 is super low (1160503009 0.83)
         # Or when any profile value at psi < 1.0 is negative
-        negative_profile_mask = (ds["ne20_psi"].where(ds["psi"] < 1.0) < 0).any(
-            dim="psi"
-        ) | (ds["Te_keV_psi"].where(ds["psi"] < 1.0) < 0).any(dim="psi")
-        low_value_mask = (ds["Te_keV_psi"].sel(psi=0) < 1.0) | (
-            ds["ne20_psi"].sel(psi=0) < 0.3
-        )
+        negative_profile_mask = (ds["ne20_psi"].where(ds["psi"] < 1.0) < 0).any(dim="psi") | (
+            ds["Te_keV_psi"].where(ds["psi"] < 1.0) < 0
+        ).any(dim="psi")
+        low_value_mask = (ds["Te_keV_psi"].sel(psi=0) < 1.0) | (ds["ne20_psi"].sel(psi=0) < 0.3)
         valid_profile_mask = ~(negative_profile_mask | low_value_mask)
         if valid_profile_mask.sum() == 0:
             logger.warning(f"All profiles are invalid for shot {ds['shot'].item()}")

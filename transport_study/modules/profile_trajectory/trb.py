@@ -1,5 +1,5 @@
-import os
 from collections.abc import Callable
+from pathlib import Path
 from typing import Any
 
 import jax
@@ -40,11 +40,9 @@ class ProfileTrajectoryOptimizerTRB(TrainRunBuilder):
         while trajectory optimization gets two identical time-dependent dataloaders with a lot of augmented traces
         """
         if dataloader_config.get("module") == "profile_trajectory":
-            ds_ref_dir = os.path.join(
-                dataloader_config["scratch_dir"], "predict_first", "raw_data"
-            )
+            ds_ref_dir = Path(dataloader_config["scratch_dir"]) / "predict_first" / "raw_data"
             ds_ref, _ = get_ds(
-                os.path.join(ds_ref_dir, f"{dataloader_config['ref_shot']}.nc"),
+                ds_ref_dir / f"{dataloader_config['ref_shot']}.nc",
                 selected_shots={
                     # TODO(ZanderKeith) make this not hardcoded
                     dataloader_config["ref_shot"]: {
@@ -78,9 +76,7 @@ class ProfileTrajectoryOptimizerTRB(TrainRunBuilder):
             )
             ds = ds_aug
         else:
-            raise ValueError(
-                f"Called with a module that isn't a profile trajectory optimizer: {dataloader_config.get('module')}"
-            )
+            raise ValueError(f"Called with a module that isn't a profile trajectory optimizer: {dataloader_config.get('module')}")
 
         return ds, train_dl, val_dl, val_dl
 
@@ -95,9 +91,7 @@ class ProfileTrajectoryOptimizerTRB(TrainRunBuilder):
             derived_shape_ranges=model_init_config.get("derived_shape_ranges", {}),
         )
 
-        profile_predictor = restore_profile_predictor(
-            load_dict(submodule_configs["profile_predictor"])
-        )
+        profile_predictor = restore_profile_predictor(load_dict(submodule_configs["profile_predictor"]))
 
         # Seed all trajectory variables from the programmed waveforms of sample 0.
         # Use nearest-index lookup since the time coordinate is 2D after make_augmented_dataset.
@@ -105,18 +99,11 @@ class ProfileTrajectoryOptimizerTRB(TrainRunBuilder):
         sample_dim = meta.sample_dim
         time_dim = meta.time_dep_metadata.time_dim
         ds_first = train_dl.ds.isel({sample_dim: 0})
-        time_arr = (
-            ds_first["time"].values if "time" in ds_first else ds_first[time_dim].values
-        )
+        time_arr = ds_first["time"].values if "time" in ds_first else ds_first[time_dim].values
 
         def _at_traj_times(sig_name: str) -> jnp.ndarray:
             arr = ds_first[sig_name].values
-            return jnp.array(
-                [
-                    arr[int(np.argmin(np.abs(time_arr - float(t))))]
-                    for t in config.traj_times
-                ]
-            )
+            return jnp.array([arr[int(np.argmin(np.abs(time_arr - float(t))))] for t in config.traj_times])
 
         trajectory = {
             "R0": _at_traj_times("R0_prog"),
@@ -142,9 +129,7 @@ class ProfileTrajectoryOptimizerTRB(TrainRunBuilder):
         )
 
         if model_init_config.get("restore_main_module", False):
-            manager = create_default_checkpoint_manager(
-                model_init_config["checkpoint_dir"]
-            )
+            manager = create_default_checkpoint_manager(model_init_config["checkpoint_dir"])
             env = restore_model(manager, env)
 
         return env
@@ -189,9 +174,7 @@ class ProfileTrajectoryOptimizerTRB(TrainRunBuilder):
             # calc_effective_collisionality expects ne in [1e19 m^-3]
             ne_avg_1e19 = jnp.mean(ne20_psi) * 10.0
             Te_avg_keV = jnp.mean(Te_keV_psi)
-            nu_star = calc_effective_collisionality(
-                ne_avg_1e19, Te_avg_keV, pred.R0, Z_EFF
-            )
+            nu_star = calc_effective_collisionality(ne_avg_1e19, Te_avg_keV, pred.R0, Z_EFF)
             nu_loss = (
                 jax.nn.relu(nu_star - 0.3)  # D0 -> D1 boundary
                 + jax.nn.relu(nu_star - 0.6)  # D1 -> D2 boundary
@@ -241,8 +224,6 @@ class ProfileTrajectoryOptimizerTRB(TrainRunBuilder):
         )
         opt = optax.chain(
             optax.clip_by_global_norm(optimizer_config.get("max_grad_norm", 1.0)),
-            optax.adamw(
-                learning_rate=schedule, weight_decay=optimizer_config["weight_decay"]
-            ),
+            optax.adamw(learning_rate=schedule, weight_decay=optimizer_config["weight_decay"]),
         )
         return opt

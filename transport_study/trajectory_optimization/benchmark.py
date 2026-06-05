@@ -11,7 +11,7 @@ Plots to make:
 - Also comparison of optimized trajectory performance vs number of shape times
 """
 
-import os
+from pathlib import Path
 
 import fire
 import numpy as np
@@ -42,7 +42,7 @@ from transport_study.trajectory_optimization.setup_data import (
     make_augmented_dataset,
 )
 
-SAVE_DIR = os.path.join(PACKAGE_ROOT, "../scratch", "trajectory_optimization_benchmark")
+SAVE_DIR = Path(PACKAGE_ROOT) / "../scratch" / "trajectory_optimization_benchmark"
 MAX_NUM_SHAPE_TIMES = 5
 SHAPE_TIME_MIN = 2.0
 SHAPE_TIME_MAX = 5.5
@@ -52,19 +52,21 @@ SHAPE_TIME_MAX = 5.5
 # Comparing different implementations of the profile predictor #
 ################################################################
 def run_profile_predictor_evaluation(
-    ds_path: str | None = config.dataset_paths.get(config.target_device),
-    save_dir: str | None = SAVE_DIR,
+    ds_path: str | Path | None = None,
+    save_dir: Path | str | None = SAVE_DIR,
     clean: bool | None = False,
     debug: bool | None = False,
 ):
+    if ds_path is None:
+        ds_path = config.dataset_paths.get(config.target_device)
     model_types = ["direct_points"]
     for model_type in model_types:
         # Generate the evaluation data for each model type if it doesn't already exist
-        eval_ds_path = os.path.join(save_dir, model_type, "eval_data.nc")
-        if not os.path.exists(eval_ds_path) or clean:
+        eval_ds_path = Path(save_dir) / model_type / "eval_data.nc"
+        if not eval_ds_path.exists() or clean:
             logger.info(f"No evaluation data found for model type {model_type}")
-            checkpoint_dir = os.path.join(save_dir, model_type, "checkpoints")
-            if not os.path.exists(checkpoint_dir) or clean:
+            checkpoint_dir = Path(save_dir) / model_type / "checkpoints"
+            if not checkpoint_dir.exists() or clean:
                 logger.info(f"No checkpoints found for model type {model_type}, training model...")
                 trainer, test_dl, _test_results = train_profile_predictor(ds_path, model_type, checkpoint_dir, debug=debug, clean=clean)
             else:
@@ -94,7 +96,7 @@ def run_profile_predictor_evaluation(
     ds_pred_list = []
     ds_pred_labels = []
     for model_type in model_types:
-        eval_ds_path = os.path.join(save_dir, model_type, "eval_data.nc")
+        eval_ds_path = Path(save_dir) / model_type / "eval_data.nc"
         eval_ds = xr.open_dataset(eval_ds_path)
         ds_pred_list.append(eval_ds)
         ds_pred_labels.append(model_type)
@@ -103,7 +105,7 @@ def run_profile_predictor_evaluation(
         0
     ]  # They should both have the same target dataset since they use the same test dataloader, so just take the first one.
     profile_comparison(
-        profile_dir=os.path.join(save_dir, "profile_comparison"),
+        profile_dir=Path(save_dir) / "profile_comparison",
         ds_targ=ds_targ,
         ds_pred_list=ds_pred_list,
         ds_pred_labels=ds_pred_labels,
@@ -130,8 +132,8 @@ def eval_profile_predictor(transport_predictor_config: TrainConfig):
 
 
 def plot_profiles(
-    ds_path: str,
-    fig_dir: str,
+    ds_path: Path | str,
+    fig_dir: Path | str,
 ):
     ds, _episode_coord = get_ds(
         ds_path,
@@ -151,8 +153,8 @@ def plot_profiles(
 # Comparing optimized trajectory performance #
 ##############################################
 def run_trajectory_evaluation(
-    ds_path: str | None = config.dataset_paths.get(config.target_device),
-    save_dir: str | None = SAVE_DIR,
+    ds_path: str | Path | None = None,
+    save_dir: Path | str | None = SAVE_DIR,
     model_type: str | None = "direct_points",
     max_num_shape_times: int | None = MAX_NUM_SHAPE_TIMES,
     shape_time_min: float | None = SHAPE_TIME_MIN,
@@ -160,13 +162,16 @@ def run_trajectory_evaluation(
     clean: bool | None = False,
     debug: bool | None = False,
 ):
+    if ds_path is None:
+        ds_path = config.dataset_paths.get(config.target_device)
+
     num_shape_times_list = list(range(1, max_num_shape_times + 1, 2))  # [1, 3, 5, ..., max_num_shape_times]
     for num_shape_times in num_shape_times_list:
-        case_dir = os.path.join(save_dir, "trajectory_evaluation", model_type, f"n_{num_shape_times}")
-        eval_ds_path = os.path.join(case_dir, "eval_data.nc")
-        if not os.path.exists(eval_ds_path) or clean:
+        case_dir = Path(save_dir) / "trajectory_evaluation" / model_type / f"n_{num_shape_times}"
+        eval_ds_path = case_dir / "eval_data.nc"
+        if not eval_ds_path.exists() or clean:
             logger.info(f"No evaluation data found for num_shape_times={num_shape_times}")
-            checkpoint_dir = os.path.join(case_dir, "checkpoints")
+            checkpoint_dir = case_dir / "checkpoints"
             shape_times = np.linspace(shape_time_min, shape_time_max, num_shape_times).tolist()
             shape_times = [round(t, 1) for t in shape_times]  # Round to nearest 10th
             optimization_config = setup_optimization_config(
@@ -176,9 +181,9 @@ def run_trajectory_evaluation(
                 checkpoint_dir=checkpoint_dir,
                 shape_times=shape_times,
             )
-            profile_predictor_checkpoint_dir = os.path.join(save_dir, model_type, "checkpoints")
+            profile_predictor_checkpoint_dir = Path(save_dir) / model_type / "checkpoints"
             # Only need to train the profile predictor once for the first one since it's the same for all the different trajectory optimizations
-            if (not os.path.exists(profile_predictor_checkpoint_dir) or clean) and (num_shape_times == num_shape_times_list[0]):
+            if (not profile_predictor_checkpoint_dir.exists() or clean) and (num_shape_times == num_shape_times_list[0]):
                 logger.info("No checkpoints found for profile predictor, running profile predictor training...")
                 train_profile_predictor(
                     ds_path,
@@ -188,7 +193,7 @@ def run_trajectory_evaluation(
                     clean=True,
                 )
             optimization_config.model_init_config["submodules"]["profile_predictor"]["checkpoint_dir"] = profile_predictor_checkpoint_dir
-            if not os.path.exists(checkpoint_dir) or clean:
+            if not checkpoint_dir.exists() or clean:
                 logger.info(f"No checkpoints found for num_shape_times={num_shape_times}, running optimization...")
                 optimization_trainer, _, aug_dl, _, _test_results = launch_train(optimization_config.model_dump(), use_wandb=False)
             else:
@@ -228,8 +233,8 @@ def run_trajectory_evaluation(
     ds_perf_list = []
     ds_perf_labels = []
     for i, num_shape_times in enumerate(num_shape_times_list):
-        case_dir = os.path.join(save_dir, "trajectory_evaluation", model_type, f"n_{num_shape_times}")
-        eval_ds_path = os.path.join(case_dir, "eval_data.nc")
+        case_dir = Path(save_dir) / "trajectory_evaluation" / model_type / f"n_{num_shape_times}"
+        eval_ds_path = case_dir / "eval_data.nc"
         eval_ds = xr.open_dataset(eval_ds_path)
 
         if i == 0:
@@ -262,14 +267,14 @@ def run_trajectory_evaluation(
     trajectory_performance_comparison(
         ds_perf_list=ds_perf_list,
         ds_perf_labels=ds_perf_labels,
-        save_dir=os.path.join(save_dir, "trajectory_evaluation", model_type, "performance_comparison"),
+        save_dir=Path(save_dir) / "trajectory_evaluation" / model_type / "performance_comparison",
         title=f"Trajectory Performance Comparison for {model_type} Profile Predictor",
     )
 
 
 def plot_trajectory_shapes(
-    ds_path: str | None = config.dataset_paths.get(config.target_device),
-    save_dir: str | None = SAVE_DIR,
+    ds_path: str | Path | None = None,
+    save_dir: Path | str | None = SAVE_DIR,
     model_type: str | None = "direct_points",
     max_num_shape_times: int | None = MAX_NUM_SHAPE_TIMES,
     shape_time_min: float | None = SHAPE_TIME_MIN,
@@ -278,14 +283,17 @@ def plot_trajectory_shapes(
 ):
     """Plot trajectory shapes over time"""
 
+    if ds_path is None:
+        ds_path = config.dataset_paths.get(config.target_device)
+
     trajectory_shapes = []
     trajectory_labels = []
     num_shape_times_list = list(range(1, max_num_shape_times + 1, 2))  # [1, 3, 5, ..., max_num_shape_times]
     if debug:
         num_shape_times_list = [max_num_shape_times]  # Just plot the max one for debugging
     for num_shape_times in num_shape_times_list:
-        case_dir = os.path.join(save_dir, "trajectory_evaluation", model_type, f"n_{num_shape_times}")
-        checkpoint_dir = os.path.join(case_dir, "checkpoints")
+        case_dir = Path(save_dir) / "trajectory_evaluation" / model_type / f"n_{num_shape_times}"
+        checkpoint_dir = case_dir / "checkpoints"
         shape_times = np.linspace(shape_time_min, shape_time_max, num_shape_times).tolist()
         shape_times = [round(t, 1) for t in shape_times]  # Round to nearest 10th
         optimization_config = setup_optimization_config(
@@ -294,9 +302,9 @@ def plot_trajectory_shapes(
             checkpoint_dir=checkpoint_dir,
             shape_times=shape_times,
         )
-        profile_predictor_checkpoint_dir = os.path.join(save_dir, model_type, "checkpoints")
+        profile_predictor_checkpoint_dir = Path(save_dir) / model_type / "checkpoints"
         optimization_config.model_init_config["submodules"]["profile_predictor"]["checkpoint_dir"] = profile_predictor_checkpoint_dir
-        if not os.path.exists(checkpoint_dir):
+        if not checkpoint_dir.exists():
             logger.warning(f"No checkpoints found for num_shape_times={num_shape_times}, skipping shape plotting...")
             continue
 
@@ -334,7 +342,7 @@ def plot_trajectory_shapes(
         trajectory_shapes,
         trajectory_labels,
         orig_traj=ds_aug,
-        save_dir=os.path.join(save_dir, "trajectory_evaluation", model_type, "shape_comparison"),
+        save_dir=Path(save_dir) / "trajectory_evaluation" / model_type / "shape_comparison",
         input_ranges=optimization_config.model_init_config["input_ranges"],
     )
 

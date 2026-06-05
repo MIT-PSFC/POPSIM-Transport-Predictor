@@ -1,4 +1,4 @@
-import os
+from pathlib import Path
 
 import chex
 import numpy as np
@@ -109,12 +109,12 @@ def test_optimization_training():
     1. Confirm we aren't accidentally modifying our world model during optimization
     2. Confirm the optimization actually modifies the trajectory parameters
     """
-    save_dir = os.path.join(PACKAGE_ROOT, "tests", "test_trajectory_optimization")
-    case_dir = os.path.join(save_dir, "predictor_unchanged")
+    save_dir = Path(PACKAGE_ROOT) / "tests" / "test_trajectory_optimization"
+    case_dir = save_dir / "predictor_unchanged"
     ds_path = config.d3d_dataset_path
     model_type = "direct_points"
 
-    checkpoint_dir = os.path.join(case_dir, "checkpoints")
+    checkpoint_dir = case_dir / "checkpoints"
     shape_times = np.linspace(2.0, 5.0, 4).tolist()
     shape_times = [round(t, 1) for t in shape_times]  # Round to nearest 10th
     optimization_config = setup_optimization_config(
@@ -124,10 +124,8 @@ def test_optimization_training():
         checkpoint_dir=checkpoint_dir,
         shape_times=shape_times,
     )
-    optimization_config.model_init_config["submodules"]["profile_predictor"]["checkpoint_dir"] = os.path.join(
-        save_dir, model_type, "checkpoints"
-    )
-    profile_predictor_checkpoint_dir = os.path.join(save_dir, model_type, "checkpoints")
+    optimization_config.model_init_config["submodules"]["profile_predictor"]["checkpoint_dir"] = save_dir / model_type / "checkpoints"
+    profile_predictor_checkpoint_dir = save_dir / model_type / "checkpoints"
 
     predictor_trainer, _, _ = train_profile_predictor(
         ds_path,

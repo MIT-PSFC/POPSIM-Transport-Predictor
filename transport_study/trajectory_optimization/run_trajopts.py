@@ -1,4 +1,4 @@
-import os
+from pathlib import Path
 
 import fire
 import jax
@@ -53,7 +53,7 @@ PROFILE_MODULES = [
 ]
 
 
-def _profile_module_to_checkpoint_dir(profile_module: str, profopt_models_dir: str) -> str:
+def _profile_module_to_checkpoint_dir(profile_module: str, profopt_models_dir: Path | str) -> Path:
     """Convert a dot-separated profile module string into the ProfileStudy checkpoint directory.
 
     Input format:  model_type.training_data.data_normalization.domain_adaptation.freeze_shapes.num_hp_shots
@@ -73,13 +73,13 @@ def _profile_module_to_checkpoint_dir(profile_module: str, profopt_models_dir: s
     else:
         case_str = f"case.{model_type}.td_{training_data}.freeze_{freeze_shapes}"
 
-    return os.path.join(profopt_models_dir, case_str)
+    return Path(profopt_models_dir) / case_str
 
 
 def _compute_loss_metrics(
     ds_ref: xr.Dataset,
     profile_predictor,
-    optimized_trajectory_dir: str | None,
+    optimized_trajectory_dir: Path | str | None,
 ) -> dict[str, float]:
     """Run profile predictor on the augmented reference trajectory and return mean loss components.
 
@@ -93,7 +93,7 @@ def _compute_loss_metrics(
 
     # Step 0: Overwrite programmed signals with optimized trajectory if provided
     if optimized_trajectory_dir is not None:
-        traj_path = os.path.join(optimized_trajectory_dir, "optimized_trajectory.nc")
+        traj_path = Path(optimized_trajectory_dir) / "optimized_trajectory.nc"
         ds_traj = xr.open_dataset(traj_path)
         traj_signal_map = {
             "iptipp": ("Ip_MA_prog", 1e-6),  # A → MA
@@ -240,10 +240,10 @@ def _compute_loss_metrics(
 
 
 def run_trajopts(
-    working_dir_base: str,
-    profopt_models_dir: str,
+    working_dir_base: Path | str,
+    profopt_models_dir: Path | str,
 ):
-    working_dir_base = os.path.join(working_dir_base, f"trajopt_{config.ref_shot}")
+    working_dir_base = Path(working_dir_base) / f"trajopt_{config.ref_shot}"
     for profile_module in PROFILE_MODULES:
         run_trajectory_optimization(
             trajopt_name=profile_module,
@@ -256,8 +256,8 @@ def run_trajopts(
 
 
 def compare_trajopts(
-    working_dir_base: str,
-    profopt_models_dir: str,
+    working_dir_base: Path | str,
+    profopt_models_dir: Path | str,
 ):
     """For each profile module and each optimized trajectory case, compute the mean loss
     and its components, then plot vs num_traj_times.
@@ -266,9 +266,9 @@ def compare_trajopts(
     All comparisons are made on the same augmented dataset (100 perturbed trajectories
     around the reference shot) to ensure a fair comparison.
     """
-    working_dir_base = os.path.join(working_dir_base, f"trajopt_{config.ref_shot}")
-    shot_data_dir = os.path.join(config.scratch_dir, "predict_first", "raw_data")
-    ds_ref_path = os.path.join(shot_data_dir, f"{config.ref_shot}.nc")
+    working_dir_base = Path(working_dir_base) / f"trajopt_{config.ref_shot}"
+    shot_data_dir = Path(config.scratch_dir) / "predict_first" / "raw_data"
+    ds_ref_path = shot_data_dir / f"{config.ref_shot}.nc"
     # Ensure the data file exists (fetches if needed), then load with the same
     # windowing/resampling used by output_optimized_trajectory so that the
     # saved trajectory waveforms (126 pts) match ds_ref's time dimension.
@@ -307,11 +307,11 @@ def compare_trajopts(
         module_metrics[(0, False)] = module_metrics[(0, True)]  # same baseline for both od flags
 
         for case in trajopt.cases:
-            if not os.path.exists(trajopt.output_path(case)):
+            if not trajopt.output_path(case).exists():
                 logger.warning(f"  Skipping {case} — output not found")
                 continue
             logger.info(f"  {case}")
-            output_dir = os.path.dirname(trajopt.output_path(case))
+            output_dir = trajopt.output_path(case).parent
             module_metrics[(case.num_traj_times, case.optimize_density)] = _compute_loss_metrics(ds_ref, profile_predictor, output_dir)
 
         all_metrics[profile_module] = module_metrics
@@ -319,7 +319,7 @@ def compare_trajopts(
     _plot_comparison(all_metrics, working_dir_base)
 
 
-def _plot_comparison(all_metrics: dict, plot_dir: str):
+def _plot_comparison(all_metrics: dict, plot_dir: Path | str):
     from matplotlib import gridspec
     from matplotlib.lines import Line2D
 
@@ -425,8 +425,9 @@ def _plot_comparison(all_metrics: dict, plot_dir: str):
     )
     fig.tight_layout()
 
-    out_path = os.path.join(plot_dir, "comparison.png")
-    os.makedirs(plot_dir, exist_ok=True)
+    plot_dir = Path(plot_dir)
+    out_path = plot_dir / "comparison.png"
+    plot_dir.mkdir(parents=True, exist_ok=True)
     plt.savefig(out_path, dpi=150, facecolor=fig.get_facecolor())
     plt.close(fig)
     logger.info(f"Saved comparison plot to {out_path}")

@@ -11,8 +11,8 @@ The resulting spreadsheet has two sheets:
     Full Waveform — all time steps, including derived shape quantities
 """
 
-import os
 import sys
+from pathlib import Path
 
 import fire
 import numpy as np
@@ -160,7 +160,7 @@ def _autofit_columns(ws):
         ws.column_dimensions[col[0].column_letter].width = min(max_len + 2, 32)
 
 
-def trajopt_to_excel(output_dir: str, out: str | None = None):
+def trajopt_to_excel(output_dir: Path | str, out: Path | str | None = None):
     """Convert a trajectory optimization output directory to an Excel file.
 
     Args:
@@ -168,20 +168,20 @@ def trajopt_to_excel(output_dir: str, out: str | None = None):
                     optimized_trajectory.nc.
         out: Output .xlsx path. Defaults to <output_dir>/optimized_trajectory.xlsx.
     """
-    traj_path = os.path.join(output_dir, "optimized_trajectory.nc")
-    if not os.path.exists(traj_path):
+    traj_path = Path(output_dir) / "optimized_trajectory.nc"
+    if not traj_path.exists():
         print(f"ERROR: {traj_path} not found", file=sys.stderr)
         sys.exit(1)
 
     ds = xr.open_dataset(traj_path)
 
     if out is None:
-        out = os.path.join(output_dir, "optimized_trajectory.xlsx")
+        out = Path(output_dir) / "optimized_trajectory.xlsx"
 
     df_wp = _build_waypoints_df(ds)
     df_full = _build_full_df(ds)
 
-    case_name = ds.attrs.get("case", os.path.basename(output_dir))
+    case_name = ds.attrs.get("case", Path(output_dir).name)
     ref_shot_desc = ds.attrs.get("description", "")
 
     with pd.ExcelWriter(out, engine="openpyxl") as writer:

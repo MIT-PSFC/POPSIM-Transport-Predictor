@@ -1,8 +1,8 @@
 import getpass
-import os
 import shutil
 import time
 from datetime import datetime
+from pathlib import Path
 
 import fire
 from chex import dataclass
@@ -74,8 +74,8 @@ class TrajectoryOptimization:
     def __init__(
         self,
         name: str,
-        working_dir_base: str,
-        profile_module_checkpoint_dir: str,
+        working_dir_base: Path | str,
+        profile_module_checkpoint_dir: Path | str,
         traj_times: list[float],
         max_num_traj_times: int,
     ):
@@ -87,28 +87,24 @@ class TrajectoryOptimization:
         self.traj_times = traj_times
         self.max_num_traj_times = max_num_traj_times
 
-        self.working_dir = os.path.join(working_dir_base, name)
-        os.makedirs(self.working_dir, exist_ok=True)
+        self.working_dir = Path(working_dir_base) / name
+        self.working_dir.mkdir(parents=True, exist_ok=True)
         self.predictor_case = checkpoint_to_profile_case(profile_module_checkpoint_dir)
         self.cases = self._make_cases()
 
     ###########################
     # Directories and Pathing #
     ###########################
-    def checkpoint_dir(self, case: Case) -> str:
-        return os.path.join(
-            self.working_dir,
-            "checkpoints",
-            str(case),
-        )
+    def checkpoint_dir(self, case: Case) -> Path:
+        return self.working_dir / "checkpoints" / str(case)
 
-    def result_path(self, case: Case) -> str:
+    def result_path(self, case: Case) -> Path:
         """Path to the predicted profiles dataset (test eval results)."""
-        return os.path.join(self.working_dir, "outputs", str(case), "predicted_profiles.nc")
+        return self.working_dir / "outputs" / str(case) / "predicted_profiles.nc"
 
-    def output_path(self, case: Case) -> str:
+    def output_path(self, case: Case) -> Path:
         """Path to the done-marker output dataset for a case. Analogous to result_path in ProfileStudy."""
-        return os.path.join(self.working_dir, "outputs", str(case), "optimized_trajectory.nc")
+        return self.working_dir / "outputs" / str(case) / "optimized_trajectory.nc"
 
     def train_job_name(self, case: Case) -> str:
         return f"trajopt_{case}"
@@ -200,7 +196,7 @@ class TrajectoryOptimization:
             ds = test_results.get("test/predicted_profiles")
             if ds is not None:
                 result_path = self.result_path(case)
-                os.makedirs(os.path.dirname(result_path), exist_ok=True)
+                result_path.parent.mkdir(parents=True, exist_ok=True)
                 ds.to_netcdf(result_path)
 
     #######################################################################
@@ -260,9 +256,9 @@ class TrajectoryOptimization:
             ProfileTrajectoryOptimizerTRB,
         )
 
-        ds_ref_dir = os.path.join(config.scratch_dir, "predict_first", "raw_data")
+        ds_ref_dir = Path(config.scratch_dir) / "predict_first" / "raw_data"
         ds_ref, _ = get_ds(
-            os.path.join(ds_ref_dir, f"{config.ref_shot}.nc"),
+            ds_ref_dir / f"{config.ref_shot}.nc",
             selected_shots={
                 # TODO(ZanderKeith) make this not hardcoded
                 config.ref_shot: {
@@ -284,7 +280,7 @@ class TrajectoryOptimization:
             # Replicate the traj_times selection logic from setup_optimization_config
             traj_times = np.array(self.traj_times[: case.num_traj_times])
 
-            if os.path.exists(checkpoint_dir):
+            if checkpoint_dir.exists():
                 trajopt_config = self.setup_optimization_config(case)
                 _, train_dl, _, _ = ProfileTrajectoryOptimizerTRB.get_dataloaders(trajopt_config.dataloader_config)
                 env = ProfileTrajectoryOptimizerTRB.model_init(train_dl, trajopt_config.model_init_config)
@@ -391,17 +387,17 @@ class TrajectoryOptimization:
             },
         )
 
-        output_dir = os.path.join(self.working_dir, "outputs", str(case))
-        os.makedirs(output_dir, exist_ok=True)
+        output_dir = self.working_dir / "outputs" / str(case)
+        output_dir.mkdir(parents=True, exist_ok=True)
 
-        ds_traj_path = os.path.join(output_dir, "optimized_trajectory.nc")
+        ds_traj_path = output_dir / "optimized_trajectory.nc"
         ds_traj.to_netcdf(ds_traj_path)
         logger.info(f"Saved optimized trajectory dataset to {ds_traj_path}")
 
         ###########################################################################
         # Human-readable instruction file for DIII-D physics operator            #
         ###########################################################################
-        instruction_path = os.path.join(output_dir, "instructions.txt")
+        instruction_path = output_dir / "instructions.txt"
         with open(instruction_path, "w") as f:
             f.write("TRAJECTORY OPTIMIZATION PHYSICS OPERATOR INSTRUCTIONS\n")
             f.write(f"Reproducing shot {config.ref_shot}\n\n")
@@ -796,7 +792,7 @@ class TrajectoryOptimization:
         )
 
         fig.tight_layout(rect=[0, 0, 1, 0.97])
-        plot_path = os.path.join(output_dir, "trajectory_comparison.png")
+        plot_path = output_dir / "trajectory_comparison.png"
         fig.savefig(plot_path, dpi=150, facecolor=fig.get_facecolor())
         plt.close(fig)
         logger.info(f"Saved trajectory comparison plot to {plot_path}")
@@ -809,8 +805,8 @@ class TrajectoryOptimization:
 
 def run_trajectory_optimization(
     trajopt_name: str,
-    working_dir_base: str,
-    profile_module_checkpoint_dir: str,
+    working_dir_base: Path | str,
+    profile_module_checkpoint_dir: Path | str,
     traj_times: list[float] | None = TRAJ_TIMES,
     max_num_traj_times: int | None = 1,
     clean: bool | None = False,
@@ -846,14 +842,14 @@ def run_trajectory_optimization(
             )
         for case in trajopt.cases:
             shutil.rmtree(trajopt.checkpoint_dir(case), ignore_errors=True)
-            shutil.rmtree(os.path.dirname(trajopt.output_path(case)), ignore_errors=True)
+            shutil.rmtree(trajopt.output_path(case).parent, ignore_errors=True)
 
-    unfinished_cases = [case for case in trajopt.cases if not os.path.exists(trajopt.output_path(case))]
+    unfinished_cases = [case for case in trajopt.cases if not trajopt.output_path(case).exists()]
 
     while len(unfinished_cases) > 0:
         logger.opt(colors=True).info(f"<bold><green>{len(unfinished_cases)} cases remaining</green></bold>")
         for case in unfinished_cases:
-            if os.path.exists(trajopt.output_path(case)):
+            if trajopt.output_path(case).exists():
                 continue
             if enable_parallelism:
                 running = count_running_jobs(trajopt.train_job_name(case), config.partition)
@@ -865,12 +861,12 @@ def run_trajectory_optimization(
                     continue
                 launch_trajopt_case_parallel(trajopt, case)
             else:
-                if not os.path.exists(trajopt.checkpoint_dir(case)):
+                if not trajopt.checkpoint_dir(case).exists():
                     trajopt.run_case(case)
-                if not os.path.exists(trajopt.output_path(case)):
+                if not trajopt.output_path(case).exists():
                     trajopt.output_optimized_trajectory(case)
 
-        unfinished_cases = [case for case in unfinished_cases if not os.path.exists(trajopt.output_path(case))]
+        unfinished_cases = [case for case in unfinished_cases if not trajopt.output_path(case).exists()]
         if len(unfinished_cases) > 0:
             time.sleep(8)
 

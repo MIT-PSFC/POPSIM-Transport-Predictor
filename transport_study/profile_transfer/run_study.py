@@ -1,8 +1,8 @@
-import os
 import shutil
 import time
 from dataclasses import dataclass
 from itertools import product
+from pathlib import Path
 
 import fire
 import netCDF4  # noqa: F401
@@ -23,9 +23,7 @@ def _parse_training_data(s: str) -> TrainingData:
     """Convert a string like 'cmod_tcv' or 'exnihilo' to a TrainingData object."""
     if s == "exnihilo":
         target = dataset_config.target_device
-        non_target = frozenset(dataset_config.dataset_paths.keys()) - (
-            {target} if target else set()
-        )
+        non_target = frozenset(dataset_config.dataset_paths.keys()) - ({target} if target else set())
         return TrainingData(sources=non_target, exnihilo=True)
     return TrainingData(sources=frozenset(s.split("_")))
 
@@ -40,9 +38,7 @@ class ProfileStudy(Study):
     def _hyperparam_training_data(cls) -> TrainingData:
         """All configured non-target source devices - the canonical hyperparam case."""
         target = dataset_config.target_device
-        sources = frozenset(dataset_config.dataset_paths.keys()) - (
-            {target} if target else set()
-        )
+        sources = frozenset(dataset_config.dataset_paths.keys()) - ({target} if target else set())
         return TrainingData(sources=sources)
 
     ##################
@@ -89,8 +85,7 @@ class ProfileStudy(Study):
         def is_hyperparam_case(self) -> bool:
             if (
                 self.training_data == ProfileStudy._hyperparam_training_data()
-                and self.data_normalization
-                == ProfileStudy.HYPERPARAM_DATA_NORMALIZATION
+                and self.data_normalization == ProfileStudy.HYPERPARAM_DATA_NORMALIZATION
                 and self.domain_adaptation == ProfileStudy.HYPERPARAM_DOMAIN_ADAPTATION
                 and self.freeze_shapes == ProfileStudy.HYPERPARAM_FREEZE_SHAPES
                 and self.num_hp_shots == ProfileStudy.HYPERPARAM_NUM_HP_SHOTS
@@ -102,9 +97,7 @@ class ProfileStudy(Study):
         def is_impossible(self) -> bool:
             """Some cases don't make sense to run. Mark those cases as impossible and raise an error if we try to run them."""
             # Can't do transfer learning or training from nothing with 0 target shots.
-            if (
-                self.domain_adaptation == "transfer" or self.training_data.exnihilo
-            ) and self.num_hp_shots == 0:
+            if (self.domain_adaptation == "transfer" or self.training_data.exnihilo) and self.num_hp_shots == 0:
                 return True
 
             # exnihilo means training from nothing - no source domain to adapt from
@@ -292,16 +285,14 @@ class ProfileStudy(Study):
             _unwrap_prereqs(case)
 
         unique_cases = list(set(unwrapped_cases))  # Remove duplicates
-        possible_cases = [
-            case for case in unique_cases if not case.is_impossible()
-        ]  # Remove impossible cases
+        possible_cases = [case for case in unique_cases if not case.is_impossible()]  # Remove impossible cases
 
         return possible_cases
 
     def __init__(
         self,
         name: str,
-        working_dir_base: str,
+        working_dir_base: Path | str,
         model_types: list[str],
         training_datasets: list[TrainingData],
         data_normalization_methods: list[str],
@@ -350,9 +341,7 @@ class ProfileStudy(Study):
                 "aB0",
             ]
         else:
-            raise ValueError(
-                f"Profile study only uses physics normalization, but got {case.data_normalization}"
-            )
+            raise ValueError(f"Profile study only uses physics normalization, but got {case.data_normalization}")
 
         return input_vars
 
@@ -511,11 +500,9 @@ class ProfileStudy(Study):
             )
 
         tuned_config_path = self.tuned_config_path(case)
-        if os.path.exists(tuned_config_path):
+        if tuned_config_path.exists():
             tuned_config = TrainConfig.load(tuned_config_path)
-            logger.info(
-                f"Found tuned hyperparameter config for case {case}, using hyperparameters from that config"
-            )
+            logger.info(f"Found tuned hyperparameter config for case {case}, using hyperparameters from that config")
             # Restore hyperparameters from the tuned config, but keep the rest of the settings the same
 
             # Hyperparameters swept for all modules
@@ -541,9 +528,7 @@ class ProfileStudy(Study):
                         "model_init_config": {
                             **train_config.model_init_config,
                             "n_shapes": tuned_config.model_init_config["n_shapes"],
-                            "softmax_temp": tuned_config.model_init_config[
-                                "softmax_temp"
-                            ],
+                            "softmax_temp": tuned_config.model_init_config["softmax_temp"],
                         }
                     }
                 )
@@ -590,7 +575,7 @@ class ProfileStudy(Study):
         results = []
         for case in self.cases:
             result_path = self.result_path(case)
-            if not os.path.exists(result_path):
+            if not result_path.exists():
                 continue
 
             ds = xr.load_dataset(result_path)
@@ -605,23 +590,15 @@ class ProfileStudy(Study):
                     "err_abs_shot_mean": err_abs_shot.mean(),
                     "err_abs_shot_std": err_abs_shot.std(),
                     "err_abs_shot_med": err_abs_shot.median(),
-                    "err_abs_shot_p25": err_abs_shot.quantile(0.25).drop_vars(
-                        "quantile"
-                    ),
-                    "err_abs_shot_p75": err_abs_shot.quantile(0.75).drop_vars(
-                        "quantile"
-                    ),
+                    "err_abs_shot_p25": err_abs_shot.quantile(0.25).drop_vars("quantile"),
+                    "err_abs_shot_p75": err_abs_shot.quantile(0.75).drop_vars("quantile"),
                     "err_abs_shot_min": err_abs_shot.min(),
                     "err_abs_shot_max": err_abs_shot.max(),
                     "err_rel_shot_mean": err_rel_shot.mean(),
                     "err_rel_shot_std": err_rel_shot.std(),
                     "err_rel_shot_med": err_rel_shot.median(),
-                    "err_rel_shot_p25": err_rel_shot.quantile(0.25).drop_vars(
-                        "quantile"
-                    ),
-                    "err_rel_shot_p75": err_rel_shot.quantile(0.75).drop_vars(
-                        "quantile"
-                    ),
+                    "err_rel_shot_p25": err_rel_shot.quantile(0.25).drop_vars("quantile"),
+                    "err_rel_shot_p75": err_rel_shot.quantile(0.75).drop_vars("quantile"),
                     "err_rel_shot_min": err_rel_shot.min(),
                     "err_rel_shot_max": err_rel_shot.max(),
                     "err_abs_ts_mean": err_abs_ts.mean(),
@@ -657,7 +634,7 @@ class ProfileStudy(Study):
 
 def run_study(  # noqa: PLR0915
     project_name: str,
-    working_dir_base: str | None,
+    working_dir_base: Path | str | None,
     model_types: list[str] | None = None,
     training_datasets: list[str] | None = None,
     data_normalization_methods: list[str] | None = None,
@@ -730,15 +707,9 @@ def run_study(  # noqa: PLR0915
             if model_types is None:
                 model_types = ["shape_init_pca", "shape_init_kmeans", "unstructured_nn"]
             if training_datasets is None:
-                training_datasets = [
-                    _parse_training_data(s)
-                    for s in ["cmod", "tcv", "cmod_tcv", "exnihilo"]
-                ]
+                training_datasets = [_parse_training_data(s) for s in ["cmod", "tcv", "cmod_tcv", "exnihilo"]]
             else:
-                training_datasets = [
-                    _parse_training_data(s) if isinstance(s, str) else s
-                    for s in training_datasets
-                ]
+                training_datasets = [_parse_training_data(s) if isinstance(s, str) else s for s in training_datasets]
             if data_normalization_methods is None:
                 data_normalization_methods = ["physics"]
             if domain_adaptation_methods is None:
@@ -837,7 +808,7 @@ def run_study(  # noqa: PLR0915
     # Initialize study and Set up directories #
     ###########################################
     if working_dir_base is None:
-        working_dir_base = os.path.join(PACKAGE_ROOT, "popsim_studies", "working_dir")
+        working_dir_base = Path(PACKAGE_ROOT) / "popsim_studies" / "working_dir"
 
     if config.debug:
         project_name = f"{project_name}_debug"
@@ -863,9 +834,7 @@ def run_study(  # noqa: PLR0915
         logger.info(f"Clean results: {clean_results}")
         logger.info(f"Clean figures: {clean_figures}")
 
-        if (
-            clean_sweeps or clean_models or clean_results or clean_figures
-        ) and enable_parallelism:
+        if (clean_sweeps or clean_models or clean_results or clean_figures) and enable_parallelism:
             raise ValueError(
                 "Cannot clean models, results, or figures when parallelism is enabled, as this would interfere with jobs currently running or queued."
             )
@@ -876,22 +845,18 @@ def run_study(  # noqa: PLR0915
             )
 
         if clean_sweeps:
-            project_names = {
-                study.wandb_project_name(case)
-                for case in study.cases
-                if case.is_hyperparam_case()
-            }
+            project_names = {study.wandb_project_name(case) for case in study.cases if case.is_hyperparam_case()}
             run_clean_sweeps(project_names)
         if clean_models:
             shutil.rmtree(study.model_dir, ignore_errors=True)
-            shutil.rmtree(os.path.join(study.working_dir, "wandb"), ignore_errors=True)
+            shutil.rmtree(study.working_dir / "wandb", ignore_errors=True)
         if clean_results:
             shutil.rmtree(study.result_dir, ignore_errors=True)
         if clean_figures:
             shutil.rmtree(study.figure_dir, ignore_errors=True)
 
         for directory in [study.model_dir, study.result_dir, study.figure_dir]:
-            os.makedirs(directory, exist_ok=True)
+            directory.mkdir(parents=True, exist_ok=True)
 
     _setup_directories(study)
 
@@ -899,11 +864,11 @@ def run_study(  # noqa: PLR0915
         logger.info("Moving data to cluster scratch for faster training")
         for ds_path in config.dataset_paths.values():
             if ds_path:
-                _, file_name = os.path.split(ds_path)
-                scratch_dir = os.path.join(config.scratch_dir, study.name)
-                os.makedirs(scratch_dir, exist_ok=True)
-                scratch_path = os.path.join(scratch_dir, file_name)
-                if not os.path.exists(scratch_path):
+                file_name = Path(ds_path).name
+                scratch_dir = Path(config.scratch_dir) / study.name
+                scratch_dir.mkdir(parents=True, exist_ok=True)
+                scratch_path = scratch_dir / file_name
+                if not scratch_path.exists():
                     ds = xr.open_dataset(ds_path)
                     # For training, only need fresh profiles
                     ds = ds.where(ds.fresh_profiles == 1, drop=True)
@@ -917,14 +882,12 @@ def run_study(  # noqa: PLR0915
     # Data Visualization #
     ######################
     if not skip_visualization:
-        logger.opt(colors=True).info(
-            "<bold><magenta>DATA VISUALIZATION</magenta></bold>"
-        )
+        logger.opt(colors=True).info("<bold><magenta>DATA VISUALIZATION</magenta></bold>")
 
     ########################
     # Launch Orchestration #
     ########################
-    if os.path.exists(study.collected_results_path()):
+    if study.collected_results_path().exists():
         logger.info(
             f"Collected results file found at\n{study.collected_results_path()}\nSkipping orchestration and going straight to analysis and visualization"
         )
@@ -932,18 +895,11 @@ def run_study(  # noqa: PLR0915
         logger.opt(colors=True).info("<bold><magenta>ORCHESTRATION</magenta></bold>")
 
         # Unfinished cases are those we have data to run but haven't gotten results for yet
-        unfinished_cases = [
-            case
-            for case in study.cases
-            if not os.path.exists(study.result_path(case))
-            and study.check_data_requirements(case)
-        ]
+        unfinished_cases = [case for case in study.cases if not study.result_path(case).exists() and study.check_data_requirements(case)]
         while len(unfinished_cases) > 0:
-            logger.opt(colors=True).info(
-                f"<<bold><green>{len(unfinished_cases)} cases remain</green></bold>>"
-            )
+            logger.opt(colors=True).info(f"<<bold><green>{len(unfinished_cases)} cases remain</green></bold>>")
             for case in unfinished_cases:
-                if not os.path.exists(study.result_path(case)):
+                if not study.result_path(case).exists():
                     study.run_case(
                         case,
                         skip_tuning=skip_tuning,
@@ -951,11 +907,7 @@ def run_study(  # noqa: PLR0915
                     )
 
             # Check which cases are still unfinished
-            unfinished_cases = [
-                case
-                for case in unfinished_cases
-                if not os.path.exists(study.result_path(case))
-            ]
+            unfinished_cases = [case for case in unfinished_cases if not study.result_path(case).exists()]
             # Sleep for a bit before checking again to avoid spamming slurm
             time.sleep(8)
 

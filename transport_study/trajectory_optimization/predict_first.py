@@ -1,6 +1,7 @@
 import io
 import os
 import sys
+from pathlib import Path
 
 import fire
 import jax
@@ -50,9 +51,9 @@ BRIGHT_COLORS = [
 def run_preshot_prediction(  # noqa: PLR0915
     ref_shot: int,
     targ_shot: int | None,
-    profile_predictor_checkpoint_dir: str,
-    optimized_trajectory_checkpoint_dir: str | None = None,
-    scratch_dir: str | None = config.scratch_dir,
+    profile_predictor_checkpoint_dir: Path | str,
+    optimized_trajectory_checkpoint_dir: Path | str | None = None,
+    scratch_dir: Path | str | None = config.scratch_dir,
 ):
     """Run selected profile predictor to get distribution of profiles over time
 
@@ -69,39 +70,34 @@ def run_preshot_prediction(  # noqa: PLR0915
             The shot to use as the reference trajectory to perturb around
         targ_shot: int
             The shot that we are predicting for (should be programmed with the anticipated optimized trajectory)
-        profile_predictor_checkpoint_dir: str
+        profile_predictor_checkpoint_dir: Path | str
             The checkpoint directory to restore the profile predictor from
-        optimized_trajectory_checkpoint_dir: str | None
+        optimized_trajectory_checkpoint_dir: Path | str | None
             If not None, the checkpoint directory to restore the optimized trajectory from. If None, uses the programmed trajectory from the dataset as-is.
-        scratch_dir: str | None
+        scratch_dir: Path | str | None
             The directory to use for temporary files during prediction. If None, uses the value from config.scratch_dir.
     """
 
     def _setup_directories(scratch_dir):
-        working_dir = os.path.join(scratch_dir, "predict_first")
-        shot_data_dir = os.path.join(working_dir, "raw_data")
-        result_dir = os.path.join(
-            working_dir,
-            f"ref_{ref_shot}",
-            f"targ_{targ_shot}",
-            f"{os.path.basename(profile_predictor_checkpoint_dir)}",
-        )
-        os.makedirs(shot_data_dir, exist_ok=True)
-        os.makedirs(result_dir, exist_ok=True)
+        working_dir = Path(scratch_dir) / "predict_first"
+        shot_data_dir = working_dir / "raw_data"
+        result_dir = working_dir / f"ref_{ref_shot}" / f"targ_{targ_shot}" / Path(profile_predictor_checkpoint_dir).name
+        shot_data_dir.mkdir(parents=True, exist_ok=True)
+        result_dir.mkdir(parents=True, exist_ok=True)
         return working_dir, shot_data_dir, result_dir
 
     _working_dir, shot_data_dir, result_dir = _setup_directories(scratch_dir)
 
     # Get trajectories and profiles if they are not already saved in the shot_data_dir
     if targ_shot is not None:
-        ds_target_path = os.path.join(shot_data_dir, f"{targ_shot}.nc")
+        ds_target_path = shot_data_dir / f"{targ_shot}.nc"
         ds_targ = get_traj_shot_data(targ_shot, ds_target_path)
-    ds_ref_path = os.path.join(shot_data_dir, f"{ref_shot}.nc")
+    ds_ref_path = shot_data_dir / f"{ref_shot}.nc"
     ds_ref = get_traj_shot_data(ref_shot, ds_ref_path)
 
     # Step 0: Overwrite programmed trajectory if an optimized trajectory is provided
     if optimized_trajectory_checkpoint_dir is not None:
-        traj_path = os.path.join(optimized_trajectory_checkpoint_dir, "optimized_trajectory.nc")
+        traj_path = Path(optimized_trajectory_checkpoint_dir) / "optimized_trajectory.nc"
         logger.info(f"Loading optimized trajectory from {traj_path}")
         ds_traj = xr.open_dataset(traj_path)
         # Map PCS signal names → dataset variable names and unit scale factors
@@ -225,7 +221,7 @@ def run_preshot_prediction(  # noqa: PLR0915
     if "time" in ds_aug:
         ds_pred["time"] = ds_aug["time"]
 
-    pred_path = os.path.join(result_dir, "predicted_profiles.nc")
+    pred_path = Path(result_dir) / "predicted_profiles.nc"
     ds_pred.to_netcdf(pred_path)
     logger.info(f"Saved predicted profiles to {pred_path}")
 
@@ -244,14 +240,14 @@ def _plot_predictor_inputs(
     kappa: np.ndarray,
     delta_top: np.ndarray,
     delta_bot: np.ndarray,
-    output_dir: str,
+    output_dir: Path | str,
 ):
     """Plot mean ± 1 std of all 9 profile-predictor input signals across augmented perturbations.
 
     Saves one figure per base shot: a 3x3 grid showing each input signal over time.
     """
-    plot_dir = os.path.join(output_dir, "plots")
-    os.makedirs(plot_dir, exist_ok=True)
+    plot_dir = Path(output_dir) / "plots"
+    plot_dir.mkdir(parents=True, exist_ok=True)
 
     shot_alt_vals = ds_aug["shot_alt"].values
     base_shots = list(dict.fromkeys(str(sa).split("_")[0] for sa in shot_alt_vals))
@@ -331,22 +327,22 @@ def _plot_predictor_inputs(
 
         fig.tight_layout()
         fig.savefig(
-            os.path.join(plot_dir, f"shot_{base_shot}_predictor_inputs.png"),
+            plot_dir / f"shot_{base_shot}_predictor_inputs.png",
             dpi=150,
             facecolor=fig.get_facecolor(),
         )
         plt.close(fig)
 
 
-def _plot_preshot_predictions(ds_pred: xr.Dataset, output_dir: str):
+def _plot_preshot_predictions(ds_pred: xr.Dataset, output_dir: Path | str):
     """Plot predicted profiles with mean ± 1 std across perturbations.
 
     For each base shot, produces:
     - Time traces of ne and te at select psi values (mean ± std shading)
     - Profile snapshots at select times (mean ± std shading)
     """
-    plot_dir = os.path.join(output_dir, "plots")
-    os.makedirs(plot_dir, exist_ok=True)
+    plot_dir = Path(output_dir) / "plots"
+    plot_dir.mkdir(parents=True, exist_ok=True)
 
     shot_alt_vals = ds_pred["shot_alt"].values
     base_shots = list(dict.fromkeys(str(sa).split("_")[0] for sa in shot_alt_vals))
@@ -415,7 +411,7 @@ def _plot_preshot_predictions(ds_pred: xr.Dataset, output_dir: str):
         axes[-1].set_xlabel("Time [s]", fontsize=LABEL_FONTSIZE, color=TEXT_COLOR)
         fig.tight_layout()
         fig.savefig(
-            os.path.join(plot_dir, f"shot_{base_shot}_time_traces.png"),
+            plot_dir / f"shot_{base_shot}_time_traces.png",
             dpi=150,
             facecolor=fig.get_facecolor(),
         )
@@ -469,7 +465,7 @@ def _plot_preshot_predictions(ds_pred: xr.Dataset, output_dir: str):
 
             fig2.tight_layout()
             fig2.savefig(
-                os.path.join(plot_dir, f"shot_{base_shot}_profile_snapshots.png"),
+                plot_dir / f"shot_{base_shot}_profile_snapshots.png",
                 dpi=150,
                 facecolor=fig2.get_facecolor(),
             )
@@ -496,7 +492,7 @@ def _plot_trajectory_comparison(
     ds_targ: xr.Dataset,
     ref_shot: int,
     targ_shot: int,
-    result_dir: str,
+    result_dir: Path | str,
 ):
     """Compare all 9 predictor inputs across ref (programmed), target (programmed), target (measured).
 
@@ -509,8 +505,8 @@ def _plot_trajectory_comparison(
     from programmed shape variables for the "programmed" traces and read directly from the
     measured dataset variables for the "measured" trace.
     """
-    plot_dir = os.path.join(result_dir, "plots")
-    os.makedirs(plot_dir, exist_ok=True)
+    plot_dir = Path(result_dir) / "plots"
+    plot_dir.mkdir(parents=True, exist_ok=True)
 
     def _derive_shape(ds_sel: xr.Dataset):
         """Return (a_minor, kappa, delta_top, delta_bot) arrays from programmed shape vars."""
@@ -625,7 +621,7 @@ def _plot_trajectory_comparison(
 
     fig.tight_layout()
     fig.savefig(
-        os.path.join(plot_dir, f"shot_{targ_shot}_trajectory_comparison.png"),
+        plot_dir / f"shot_{targ_shot}_trajectory_comparison.png",
         dpi=150,
         facecolor=fig.get_facecolor(),
     )
@@ -637,7 +633,7 @@ def _plot_prediction_vs_measured(
     ds_pred: xr.Dataset,
     ds_targ: xr.Dataset,
     targ_shot: int,
-    result_dir: str,
+    result_dir: Path | str,
 ):
     """Compare predicted profile range (min/max band) vs measured profiles in target shot over time.
 
@@ -646,8 +642,8 @@ def _plot_prediction_vs_measured(
     """
     from matplotlib.patches import Patch
 
-    plot_dir = os.path.join(result_dir, "plots")
-    os.makedirs(plot_dir, exist_ok=True)
+    plot_dir = Path(result_dir) / "plots"
+    plot_dir.mkdir(parents=True, exist_ok=True)
 
     # Predicted time axis (take first shot_alt row; all share the same timebase)
     if "time" in ds_pred:
@@ -732,7 +728,7 @@ def _plot_prediction_vs_measured(
     axes[-1].set_xlabel("Time [s]", fontsize=LABEL_FONTSIZE, color=TEXT_COLOR)
     fig.tight_layout()
     fig.savefig(
-        os.path.join(plot_dir, f"shot_{targ_shot}_prediction_vs_measured.png"),
+        plot_dir / f"shot_{targ_shot}_prediction_vs_measured.png",
         dpi=150,
         facecolor=fig.get_facecolor(),
     )
@@ -744,7 +740,7 @@ def _make_profile_gif(  # noqa: PLR0915
     ds_pred: xr.Dataset,
     ds_targ: xr.Dataset,
     targ_shot: int,
-    result_dir: str,
+    result_dir: Path | str,
 ):
     """GIF of predicted profile range vs measured profile at each fresh ZIPFIT timestep.
 
@@ -753,8 +749,8 @@ def _make_profile_gif(  # noqa: PLR0915
     """
     from PIL import Image
 
-    gif_dir = os.path.join(result_dir, "gifs")
-    os.makedirs(gif_dir, exist_ok=True)
+    gif_dir = Path(result_dir) / "gifs"
+    gif_dir.mkdir(parents=True, exist_ok=True)
 
     # Prediction time axis
     if "time" in ds_pred:
@@ -794,7 +790,7 @@ def _make_profile_gif(  # noqa: PLR0915
     ida_ne: np.ndarray | None = None
     ida_te: np.ndarray | None = None
     _hp_path = config.dataset_paths.get(config.target_device)
-    if _hp_path is not None and os.path.exists(str(_hp_path)):
+    if _hp_path is not None and Path(_hp_path).exists():
         try:
             ds_hp = xr.open_dataset(_hp_path)
             if targ_shot in ds_hp["shot"].values:
@@ -923,7 +919,7 @@ def _make_profile_gif(  # noqa: PLR0915
         frames.append(Image.open(buf).copy())
         buf.close()
 
-    gif_path = os.path.join(gif_dir, f"shot_{targ_shot}_profiles.gif")
+    gif_path = gif_dir / f"shot_{targ_shot}_profiles.gif"
     frames[0].save(
         gif_path,
         save_all=True,
@@ -934,13 +930,14 @@ def _make_profile_gif(  # noqa: PLR0915
     logger.info(f"Saved profile GIF to {gif_path}")
 
 
-def get_traj_shot_data(shot: int, ds_path: str) -> xr.Dataset:
-    raw_data_dir = os.path.dirname(ds_path)
-    working_dir = os.path.dirname(raw_data_dir)
-    script_path = os.path.join(os.path.dirname(PACKAGE_ROOT), f"fetch_{shot}.py")
-    shotlist_path = os.path.join(raw_data_dir, f"{shot}_shotlist.txt")
+def get_traj_shot_data(shot: int, ds_path) -> xr.Dataset:
+    ds_path = Path(ds_path)
+    raw_data_dir = ds_path.parent
+    working_dir = raw_data_dir.parent
+    script_path = Path(PACKAGE_ROOT).parent / f"fetch_{shot}.py"
+    shotlist_path = raw_data_dir / f"{shot}_shotlist.txt"
 
-    if not os.path.exists(ds_path):
+    if not ds_path.exists():
         with open(shotlist_path, "w") as f:
             f.write(f"{shot}\n")
 
@@ -973,7 +970,7 @@ print("Done. Re-run predict_first.py.")
         sys.exit()
 
     for tmp in (script_path, shotlist_path):
-        if os.path.exists(tmp):
+        if tmp.exists():
             os.remove(tmp)
             logger.debug(f"Cleaned up temporary file {tmp}")
 

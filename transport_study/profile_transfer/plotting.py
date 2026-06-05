@@ -1,4 +1,4 @@
-import os
+from pathlib import Path
 
 import matplotlib.pyplot as plt
 import netCDF4  # noqa: F401
@@ -8,7 +8,7 @@ from matplotlib import cm
 
 result_data = "/home/zkeith/orcd/scratch/popsim_studies/profopt/working_dir/profopt_sweep/results/case.unstructured_nn.td_exnihilo.freeze_True.hp_-1/result_data.nc"
 plot_dir = "/orcd/home/002/zkeith/proj/popsim_dirs/POPSIM-Transport-Predictor/scratch/fastplots"
-os.makedirs(plot_dir, exist_ok=True)
+Path(plot_dir).mkdir(parents=True, exist_ok=True)
 
 BACKGROUND_COLOR = "#2F2F2F"
 FACE_COLOR = "#1A1A1A"
@@ -51,9 +51,7 @@ for shot in ds.shot.values:
             pred_psi = pred.sel(psi_n=psi, method="nearest").values[valid][sort_order]
             targ_psi = targ.sel(psi_n=psi, method="nearest").values[valid][sort_order]
             t_sorted = time[valid][sort_order]
-            ax.plot(
-                t_sorted, pred_psi, color=color, linewidth=1.5, label=f"psi={psi:.1f}"
-            )
+            ax.plot(t_sorted, pred_psi, color=color, linewidth=1.5, label=f"psi={psi:.1f}")
             ax.plot(
                 t_sorted,
                 targ_psi,

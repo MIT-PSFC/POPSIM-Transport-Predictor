@@ -1,5 +1,5 @@
-import os
 import shutil
+from pathlib import Path
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -221,14 +221,14 @@ def transfer_ds():  # noqa: PLR0915
     ds.to_netcdf(DS_PATH_TCV)
 
 
-def ds_time_plot(fig_dir: str, num_shots: int = 2):
+def ds_time_plot(fig_dir: Path | str, num_shots: int = 2):
     """Plot time traces of signals from the dataset"""
     ds = xr.open_dataset(DS_PATH_TCV)
 
     # Remove existing directory if present
-    if os.path.exists(fig_dir):
+    if Path(fig_dir).exists():
         shutil.rmtree(fig_dir)
-    os.makedirs(fig_dir)
+    Path(fig_dir).mkdir(parents=True)
 
     # Compute global y-limits across all shots for consistent axes
     ylim_ip = (0, float(np.nanmax(np.abs(ds["Ip_MA"].values))) * 1.1)
@@ -345,12 +345,12 @@ def ds_time_plot(fig_dir: str, num_shots: int = 2):
         plt.close(fig)
 
 
-def ds_profile_plot(profile_dir: str, num_shots: int = 2):
+def ds_profile_plot(profile_dir: Path | str, num_shots: int = 2):
     """Plot individual profile signals from the dataset"""
     ds = xr.open_dataset(DS_PATH_TCV)
 
-    if not os.path.exists(profile_dir):
-        os.makedirs(profile_dir)
+    if not Path(profile_dir).exists():
+        Path(profile_dir).mkdir(parents=True)
 
     # Compute global y-limits across all shots for consistent axes
     ylim_ne = (0, float(np.nanmax(ds["ne20_rho"].values)) * 1.1)
@@ -358,9 +358,9 @@ def ds_profile_plot(profile_dir: str, num_shots: int = 2):
 
     for shot in ds["shot"].data[:num_shots]:
         shot_ds = ds.sel(shot=shot)
-        shot_dir = os.path.join(profile_dir, str(shot))
-        if not os.path.exists(shot_dir):
-            os.makedirs(shot_dir)
+        shot_dir = Path(profile_dir) / str(shot)
+        if not shot_dir.exists():
+            shot_dir.mkdir(parents=True)
 
         # Get rho coordinates
         rho = shot_ds["rho"].values
@@ -436,11 +436,11 @@ def ds_profile_plot(profile_dir: str, num_shots: int = 2):
                     pass
 
             fig.tight_layout()
-            fig.savefig(os.path.join(shot_dir, f"t{time:.3f}.png"))
+            fig.savefig(shot_dir / f"t{time:.3f}.png")
             plt.close(fig)
 
 
-def ds_profile_time_plot(fig_dir: str, num_shots: int = 2):
+def ds_profile_time_plot(fig_dir: Path | str, num_shots: int = 2):
     """Plot 2D heatmaps of density and temperature profiles over time.
 
     X-axis: rho (radial coordinate)
@@ -451,9 +451,9 @@ def ds_profile_time_plot(fig_dir: str, num_shots: int = 2):
     ds = xr.open_dataset(DS_PATH_TCV)
 
     # Remove existing directory if present
-    if os.path.exists(fig_dir):
+    if Path(fig_dir).exists():
         shutil.rmtree(fig_dir)
-    os.makedirs(fig_dir)
+    Path(fig_dir).mkdir(parents=True)
 
     for shot in ds["shot"].data[:num_shots]:
         shot_ds = ds.sel(shot=shot)
@@ -547,13 +547,13 @@ def ds_profile_time_plot(fig_dir: str, num_shots: int = 2):
                 spine.set_color(TEXT_COLOR)
 
         fig.tight_layout()
-        fig.savefig(os.path.join(fig_dir, f"{shot}.png"), dpi=150)
+        fig.savefig(Path(fig_dir) / f"{shot}.png", dpi=150)
         plt.close(fig)
 
 
 if __name__ == "__main__":
     scope_dir = "scratch/scoping"
     num_shots = 999
-    ds_time_plot(os.path.join(scope_dir, "time_plots"), num_shots=num_shots)
-    ds_profile_plot(os.path.join(scope_dir, "profile_plots"), num_shots=num_shots)
-    ds_profile_time_plot(os.path.join(scope_dir, "profile_heatmaps"), num_shots=num_shots)
+    ds_time_plot(Path(scope_dir) / "time_plots", num_shots=num_shots)
+    ds_profile_plot(Path(scope_dir) / "profile_plots", num_shots=num_shots)
+    ds_profile_time_plot(Path(scope_dir) / "profile_heatmaps", num_shots=num_shots)

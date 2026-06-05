@@ -1,6 +1,6 @@
 """Makes the 'raw' DIII-D dataset on omega, to be processed later by POPSIM"""
 
-import os
+from pathlib import Path
 
 import netCDF4  # noqa: F401
 import numpy as np
@@ -26,9 +26,7 @@ from transport_study.datasets.d3d.utils import (
 from transport_study.datasets.dispy_utils import summary
 from transport_study.datasets.workflow import DataWorkflow
 
-INNER_WALL = (
-    1.05  # Location of the inner wall, used to calculate minor radius from gapin and R0
-)
+INNER_WALL = 1.05  # Location of the inner wall, used to calculate minor radius from gapin and R0
 
 
 class D3DDataWorkflow(DataWorkflow):
@@ -113,8 +111,8 @@ class D3DDataWorkflow(DataWorkflow):
     def __init__(
         self,
         ds_name: str,
-        shotlist_file: str | None,
-        data_assembly_dir: str,
+        shotlist_file: Path | str | None,
+        data_assembly_dir: Path | str,
         max_num_shots: int | None = None,
         use_ida: bool = True,
     ):
@@ -201,9 +199,7 @@ class D3DDataWorkflow(DataWorkflow):
         keep_idx = np.sort((n_time - 1) - reversed_unique_idx)
         if keep_idx.size != n_time:
             n_removed = n_time - keep_idx.size
-            logger.warning(
-                f"Shot {shot}: removed {n_removed} duplicate time values from {source}."
-            )
+            logger.warning(f"Shot {shot}: removed {n_removed} duplicate time values from {source}.")
             ds = ds.isel(time=keep_idx)
 
         return ds
@@ -307,9 +303,9 @@ class D3DDataWorkflow(DataWorkflow):
 
         # OTHER
         betapf = MdsSignal(r"\betapf", "pedestal", location="remote://atlas.gat.com")
-        ne_line_avg = MdsSignal(
-            r"\denv3", "bci", location="remote://atlas.gat.com"
-        ).set_callback(_cm3_to_m3)  # Line average electron density at the edge [m^-3]
+        ne_line_avg = MdsSignal(r"\denv3", "bci", location="remote://atlas.gat.com").set_callback(
+            _cm3_to_m3
+        )  # Line average electron density at the edge [m^-3]
 
         sigs_dict = {
             "ip": ip,
@@ -346,20 +342,13 @@ class D3DDataWorkflow(DataWorkflow):
                 if len(first_valid_idx) > 0:
                     first_valid_idx = first_valid_idx[0]
                     sig_data[:first_valid_idx] = np.nan
-                    ds_tok[sig] = xr.DataArray(
-                        sig_data, coords={"time": ds_tok["times"].values}, dims=["time"]
-                    )
+                    ds_tok[sig] = xr.DataArray(sig_data, coords={"time": ds_tok["times"].values}, dims=["time"])
 
         # Match disruption-py output
         ds = xr.Dataset(
-            data_vars={
-                var: (["shot", "time"], ds_tok[var].expand_dims("shot").values)
-                for var in ds_tok.data_vars
-            },
+            data_vars={var: (["shot", "time"], ds_tok[var].expand_dims("shot").values) for var in ds_tok.data_vars},
             coords={
-                "shot": np.atleast_1d(
-                    shot
-                ),  # Problem with xarray https://github.com/pydata/xarray/issues/1709
+                "shot": np.atleast_1d(shot),  # Problem with xarray https://github.com/pydata/xarray/issues/1709
                 "time": ds_tok["times"].values / 1e3,
             },
         )
@@ -371,14 +360,10 @@ class D3DDataWorkflow(DataWorkflow):
 
         for sig in sigs_dict.keys():
             if sig not in ds.data_vars:
-                logger.warning(
-                    f"Signal {sig} not found in TokSearch results for shot {shot}. Filling with NaNs."
-                )
+                logger.warning(f"Signal {sig} not found in TokSearch results for shot {shot}. Filling with NaNs.")
                 ds[sig] = (
                     ["shot", "time"],
-                    np.full_like(ds["time"].values, np.nan, dtype=np.float32).reshape(
-                        1, -1
-                    ),
+                    np.full_like(ds["time"].values, np.nan, dtype=np.float32).reshape(1, -1),
                 )
 
         return ds
@@ -419,9 +404,7 @@ class D3DDataWorkflow(DataWorkflow):
         # Resample to 1 kHz by taking the mean over previous 1ms window
         timeline = make_uniform_1khz_timebase(max_time_ms / 1e3)
         n_times = len(timeline)
-        times_array = (
-            ds["times"].values / 1e3
-        )  # Convert to seconds to match timeline units
+        times_array = ds["times"].values / 1e3  # Convert to seconds to match timeline units
 
         # Pre-allocate result arrays for better performance
         resampled_data = {}
@@ -476,17 +459,15 @@ class D3DDataWorkflow(DataWorkflow):
         efit_result = efit_result.set_index(idx=["shot", "time"]).unstack("idx")
 
         disruption_efit_path = f"/fusion/projects/disruption_warning/data/popsim/popsim_studies/profopt/archive/{shot}.tgz"
-        if os.path.exists(disruption_efit_path):
+        if Path(disruption_efit_path).exists():
             fast_efit_result = disruption_efit(disruption_efit_path, shot)
-            fig_dir = os.path.join(
-                self.data_assembly_dir, self.ds_name, "raw_data", "debug_figs", "efits"
-            )
-            os.makedirs(fig_dir, exist_ok=True)
+            fig_dir = Path(self.data_assembly_dir) / self.ds_name / "raw_data" / "debug_figs" / "efits"
+            fig_dir.mkdir(parents=True, exist_ok=True)
             compare_efits(
                 fast_efit_result,
                 efit_result,
                 shot,
-                fig_path=os.path.join(fig_dir, f"{shot}.png"),
+                fig_path=fig_dir / f"{shot}.png",
             )
 
             slow_efit_result = efit_result
@@ -525,9 +506,7 @@ class D3DDataWorkflow(DataWorkflow):
         efit_max_ms = int(efit_result["time"].max().item() * 1e3)
         toksearch_result = self._toksearch_signals(
             shot,
-            max_time_ms=max(
-                efit_max_ms, 8000
-            ),  # extend to cover full programmed waveforms
+            max_time_ms=max(efit_max_ms, 8000),  # extend to cover full programmed waveforms
         )
         toksearch_result = self._ensure_unique_time(toksearch_result, shot, "toksearch")
 
@@ -582,9 +561,7 @@ class D3DDataWorkflow(DataWorkflow):
         )
 
         ds["Te_psi"] = ds["Te_psi"] * 1e3  # Convert keV to eV to match IDA units
-        ds["ne_psi"] = (
-            ds["ne_psi"] * 1e19
-        )  # Convert 10^19 m^-3 to m^-3 to match IDA units
+        ds["ne_psi"] = ds["ne_psi"] * 1e19  # Convert 10^19 m^-3 to m^-3 to match IDA units
 
         # ZIPFIT output uses idx as the sample dimension with time as an idx coordinate.
         # Swap to a true time dimension, then add shot as an explicit dimension.
@@ -612,7 +589,7 @@ class D3DDataWorkflow(DataWorkflow):
             Dataset with electron density and temperature profiles, or None if file not found
         """
         ida_path = f"/fusion/projects/results/ida-results/HBP_database/IDA_{shot}_.cdf"
-        if not os.path.exists(ida_path):
+        if not Path(ida_path).exists():
             logger.warning(f"IDA profile file for shot {shot} not found at {ida_path}")
             return None
         ds = xr.open_dataset(ida_path)
@@ -643,36 +620,25 @@ class D3DDataWorkflow(DataWorkflow):
         processed_shots = 0
         for shot in self.shotlist:
             try:
-                if (
-                    self.max_num_shots is not None
-                    and processed_shots >= self.max_num_shots
-                ):
-                    logger.info(
-                        f"Reached maximum number of shots to process: {self.max_num_shots}"
-                    )
+                if self.max_num_shots is not None and processed_shots >= self.max_num_shots:
+                    logger.info(f"Reached maximum number of shots to process: {self.max_num_shots}")
                     break
 
-                ds_path = os.path.join(self.raw_data_dir, f"{shot}.nc")
-                if os.path.exists(ds_path):
-                    logger.info(
-                        f"Raw dataset for shot {shot} already exists at {ds_path}"
-                    )
+                ds_path = Path(self.raw_data_dir) / f"{shot}.nc"
+                if ds_path.exists():
+                    logger.info(f"Raw dataset for shot {shot} already exists at {ds_path}")
                     processed_shots += 1
                     continue
 
                 if self.use_ida:
                     ds_profile = self._get_profile_dataset_ida(shot)
                     if ds_profile is None:
-                        logger.info(
-                            f"Skipping shot {shot} since IDA profiles are not available"
-                        )
+                        logger.info(f"Skipping shot {shot} since IDA profiles are not available")
                         continue
                 else:
                     ds_profile = self._get_profile_dataset_zipfit(shot)
                     if ds_profile is None:
-                        logger.info(
-                            f"Skipping shot {shot} since ZIPFITs are not available"
-                        )
+                        logger.info(f"Skipping shot {shot} since ZIPFITs are not available")
 
                 ds_0d = self._get_0D_dataset(shot)
                 ds_profile = self._ensure_unique_time(ds_profile, shot, "profile")
@@ -686,9 +652,7 @@ class D3DDataWorkflow(DataWorkflow):
                 timebase = make_uniform_1khz_timebase(max_time)
 
                 ds_profile = ds_profile.reindex(time=timebase, method="ffill")
-                ds_0d = ds_0d.reindex(
-                    time=timebase, method="ffill"
-                )  # Hold last value to avoid nearest-neighbor jumps at startup
+                ds_0d = ds_0d.reindex(time=timebase, method="ffill")  # Hold last value to avoid nearest-neighbor jumps at startup
                 ds_assembly = xr.merge([ds_profile, ds_0d], compat="no_conflicts")
 
                 ds_standardized = self.standardize_signal_names(ds_assembly)
@@ -722,14 +686,12 @@ class D3DDataWorkflow(DataWorkflow):
             Standardized dataset, or None if critical signals are missing
         """
 
-        fig_dir = os.path.join(
-            self.data_assembly_dir, self.ds_name, "raw_data", "debug_figs", "densities"
-        )
-        os.makedirs(fig_dir, exist_ok=True)
+        fig_dir = Path(self.data_assembly_dir) / self.ds_name / "raw_data" / "debug_figs" / "densities"
+        fig_dir.mkdir(parents=True, exist_ok=True)
         compare_densities(
             ds,
             ds.shot.item(),
-            fig_path=os.path.join(fig_dir, f"{ds.shot.item()}.png"),
+            fig_path=fig_dir / f"{ds.shot.item()}.png",
         )
 
         # POWER BALANCE TRAINING
@@ -823,9 +785,7 @@ class D3DDataWorkflow(DataWorkflow):
         # If any *important* signal is all NaN, return None to skip this shot
         for signal in ["Te_keV_psi", "ne20_psi", "Ip_MA", "ne20_edge"]:
             if ds[signal].isnull().all():
-                logger.warning(
-                    f"Signal {signal} is all NaN for shot {ds['shot'].item()}, skipping shot."
-                )
+                logger.warning(f"Signal {signal} is all NaN for shot {ds['shot'].item()}, skipping shot.")
                 return None
 
         # Make episode dimension, time dimension, and time coordinate names consistent
@@ -860,20 +820,14 @@ class D3DDataWorkflow(DataWorkflow):
         """
 
         # If alternative radiated power exists, use that (significantly less noisy)
-        if (
-            "P_rad_MW_alt" in ds
-            and not ds["P_rad_MW_alt"].isnull().all()
-            and not (ds["P_rad_MW_alt"] == 0).all()
-        ):
+        if "P_rad_MW_alt" in ds and not ds["P_rad_MW_alt"].isnull().all() and not (ds["P_rad_MW_alt"] == 0).all():
             ds["P_rad_MW"] = ds["P_rad_MW_alt"]
 
         # Wtot_MJ is close enough to Wmhd_MJ while being less available
         # Have the Wtot_MJ signal take the Wmhd_MJ values when Wtot_MJ is missing or zero
         if "Wtot_MJ" in ds and "Wmhd_MJ" in ds:
             wtot_missing_or_zero = ds["Wtot_MJ"].isnull() | (ds["Wtot_MJ"] == 0)
-            ds["Wtot_MJ"] = ds["Wtot_MJ"].where(
-                ~wtot_missing_or_zero, other=ds["Wmhd_MJ"]
-            )
+            ds["Wtot_MJ"] = ds["Wtot_MJ"].where(~wtot_missing_or_zero, other=ds["Wmhd_MJ"])
 
         # Similarly, we sometimes need to fill in betan (from pedestal) with betan from some other source
         # Our order of preference is as follows:

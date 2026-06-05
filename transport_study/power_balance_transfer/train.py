@@ -8,6 +8,8 @@ so that the TrainRunBuilder can construct the appropriate datasets using
 get_train_val_datasets and get_train_test_datasets_transfer from the organize_data module.
 """
 
+from pathlib import Path
+
 import numpy as np
 from popsim.ml import TrainConfig
 
@@ -18,9 +20,7 @@ def make_sweep_config(case: Study.Case) -> dict:
     """Make the wandb sweep config for a given case in this study."""
 
 
-def make_train_config(
-    study: Study, case: Study.Case, checkpoint_dir: str
-) -> TrainConfig:
+def make_train_config(study: Study, case: Study.Case, checkpoint_dir: Path | str) -> TrainConfig:
     """Make the base TrainConfig for a given case in this study"""
     # TODO(ZanderKeith): This needs a lot more thought put into it, just replacing with NaNs for the time being
     loss_config_base = {

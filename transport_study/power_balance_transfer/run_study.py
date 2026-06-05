@@ -1,8 +1,8 @@
-import os
 import shutil
 import time
 from dataclasses import dataclass
 from itertools import product
+from pathlib import Path
 
 import fire
 import netCDF4  # noqa: F401
@@ -312,7 +312,7 @@ class PowerBalanceStudy(Study):
     def __init__(
         self,
         name: str,
-        working_dir_base: str,
+        working_dir_base: Path | str,
         model_types: list[str],
         training_datasets: list[TrainingData],
         data_normalization_methods: list[str],
@@ -680,7 +680,7 @@ class PowerBalanceStudy(Study):
             )
 
         tuned_config_path = self.tuned_config_path(case)
-        if os.path.exists(tuned_config_path):
+        if tuned_config_path.exists():
             tuned_config = TrainConfig.load(tuned_config_path)
             # Restore hyperparameters from the tuned config, but keep the rest of the settings the same
 
@@ -720,12 +720,8 @@ class PowerBalanceStudy(Study):
 
         if not sweep_id:
             logger.info(f"No existing sweep found for case {case}, creating a new sweep")
-            sweep_config_path = os.path.join(
-                PACKAGE_ROOT,
-                "transport_study",
-                "power_balance_transfer",
-                "sweep_configs",
-                f"{case.model_type}.yaml",
+            sweep_config_path = (
+                Path(PACKAGE_ROOT) / "transport_study" / "power_balance_transfer" / "sweep_configs" / f"{case.model_type}.yaml"
             )
             launch_sweep(train_config, sweep_config_path)
         else:
@@ -749,13 +745,13 @@ class PowerBalanceStudy(Study):
                 train_config,
                 train_job_name,
                 result_path,
-                os.path.join(self.result_dir, "logs"),
+                self.result_dir / "logs",
             )
         else:
             logger.info("Launching training serially")
             _, _, _, _, result_dict = launch_train(train_config)
             ds = result_dict["test/study_results"]
-            os.makedirs(os.path.dirname(result_path), exist_ok=True)
+            result_path.parent.mkdir(parents=True, exist_ok=True)
             ds.to_netcdf(result_path)
 
     ##############
@@ -787,7 +783,7 @@ class PowerBalanceStudy(Study):
         results = []
         for case in self.cases:
             result_path = self.result_path(case)
-            if not os.path.exists(result_path):
+            if not result_path.exists():
                 continue
 
             ds = xr.load_dataset(result_path)
@@ -846,7 +842,7 @@ class PowerBalanceStudy(Study):
 
 def run_study(
     project_name: str,
-    working_dir_base: str | None,
+    working_dir_base: Path | str | None,
     model_types: list[str] | None = None,
     training_datasets: list[str] | None = None,
     data_normalization_methods: list[str] | None = None,
@@ -1025,7 +1021,7 @@ def run_study(
     # Initialize study and Set up directories #
     ###########################################
     if working_dir_base is None:
-        working_dir_base = os.path.join(PACKAGE_ROOT, "popsim_studies", "working_dir")
+        working_dir_base = Path(PACKAGE_ROOT) / "popsim_studies" / "working_dir"
 
     study = PowerBalanceStudy(
         name=project_name,
@@ -1070,7 +1066,7 @@ def run_study(
             shutil.rmtree(study.figure_dir, ignore_errors=True)
 
         for directory in [study.model_dir, study.result_dir, study.figure_dir]:
-            os.makedirs(directory, exist_ok=True)
+            directory.mkdir(parents=True, exist_ok=True)
 
     _setup_directories(study)
 
@@ -1085,7 +1081,7 @@ def run_study(
     ########################
     # Launch Orchestration #
     ########################
-    if os.path.exists(study.collected_results_path()):
+    if study.collected_results_path().exists():
         logger.info(
             f"Collected results file found at\n{study.collected_results_path()}\nSkipping orchestration and going straight to analysis and visualization"
         )
@@ -1093,14 +1089,12 @@ def run_study(
         logger.opt(colors=True).info("<bold><magenta>ORCHESTRATION</magenta></bold>")
 
         # Unfinished cases are those we have data to run but haven't gotten results for yet
-        unfinished_cases = [
-            case for case in study.cases if not os.path.exists(study.result_path(case)) and study.check_data_requirements(case)
-        ]
+        unfinished_cases = [case for case in study.cases if not study.result_path(case).exists() and study.check_data_requirements(case)]
         while len(unfinished_cases) > 0:
             logger.opt(colors=True).info(f"<<bold><green>{len(unfinished_cases)} cases remain</green></bold>>")
             for case in unfinished_cases:
                 # TODO(ZanderKeith): Duplicates are happening somehow, but going fast
-                if not os.path.exists(study.result_path(case)):
+                if not study.result_path(case).exists():
                     study.run_case(
                         case,
                         skip_tuning=skip_tuning,
@@ -1108,7 +1102,7 @@ def run_study(
                     )
 
             # Check which cases are still unfinished
-            unfinished_cases = [case for case in unfinished_cases if not os.path.exists(study.result_path(case))]
+            unfinished_cases = [case for case in unfinished_cases if not study.result_path(case).exists()]
             # Sleep for a bit before checking again to avoid spamming slurm
             time.sleep(8)
 

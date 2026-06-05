@@ -1,4 +1,3 @@
-import os
 from pathlib import Path
 
 import matplotlib.pyplot as plt
@@ -46,7 +45,7 @@ DATASET_SHAPES = {
 
 
 def performance_extrapolation_plot(
-    save_path: str,
+    save_path: Path | str,
     ds_list: list[xr.Dataset],
     ds_type_list: list[str],
     x_var: str = "Ip_MA",
@@ -163,7 +162,7 @@ def domain_plot(
     ds: xr.Dataset,
     var_groups: list[list[str]],
     title: str,
-    save_path: str,
+    save_path: Path | str,
 ):
     """Make a 2x2 grid of scatter plots showing the domain of each dataset in different variable spaces, colored by data source."""
 
@@ -344,7 +343,7 @@ class DataVisualization:
 
     @staticmethod
     def performance_extrapolation(
-        figure_dir: str,
+        figure_dir: Path | str,
     ):
         """
         Performance is ip**2 + Wtot_MJ**2
@@ -359,12 +358,12 @@ class DataVisualization:
         7. Put DIII-D high-performance shots in context of all training data
         """
 
-        save_dir = os.path.join(figure_dir, "data_visualization", "performance_extrapolation")
+        save_dir = Path(figure_dir) / "data_visualization" / "performance_extrapolation"
 
         # C-Mod
         if dataset_config.dataset_paths.get("cmod"):
-            fig_path = os.path.join(save_dir, "cmod_performance_extrapolation.png")
-            if not os.path.exists(fig_path):
+            fig_path = save_dir / "cmod_performance_extrapolation.png"
+            if not fig_path.exists():
                 train_ds, val_ds = get_train_val_datasets(
                     training_data=_td("cmod"),
                     data_normalization="raw",
@@ -381,8 +380,8 @@ class DataVisualization:
 
         # TCV
         if dataset_config.dataset_paths.get("tcv"):
-            fig_path = os.path.join(save_dir, "tcv_performance_extrapolation.png")
-            if not os.path.exists(fig_path):
+            fig_path = save_dir / "tcv_performance_extrapolation.png"
+            if not fig_path.exists():
                 train_ds, val_ds = get_train_val_datasets(
                     training_data=_td("tcv"),
                     data_normalization="raw",
@@ -399,8 +398,8 @@ class DataVisualization:
 
         # C-Mod + TCV
         if dataset_config.dataset_paths.get("tcv") and dataset_config.dataset_paths.get("cmod"):
-            fig_path = os.path.join(save_dir, "cmod_tcv_performance_extrapolation.png")
-            if not os.path.exists(fig_path):
+            fig_path = save_dir / "cmod_tcv_performance_extrapolation.png"
+            if not fig_path.exists():
                 train_ds, val_ds = get_train_val_datasets(
                     training_data=_td("cmod_tcv"),
                     data_normalization="raw",
@@ -417,8 +416,8 @@ class DataVisualization:
 
         # DIII-D low-performance
         if dataset_config.dataset_paths.get("d3d_lp"):
-            fig_path = os.path.join(save_dir, "d3d_lp_performance_extrapolation.png")
-            if not os.path.exists(fig_path):
+            fig_path = save_dir / "d3d_lp_performance_extrapolation.png"
+            if not fig_path.exists():
                 train_ds, val_ds = get_train_val_datasets(
                     training_data=_td("d3d_lp"),
                     data_normalization="raw",
@@ -439,8 +438,8 @@ class DataVisualization:
             and dataset_config.dataset_paths.get("tcv")
             and dataset_config.dataset_paths.get("d3d_lp")
         ):
-            fig_path = os.path.join(save_dir, "cmod_tcv_d3d_lp_performance_extrapolation.png")
-            if not os.path.exists(fig_path):
+            fig_path = save_dir / "cmod_tcv_d3d_lp_performance_extrapolation.png"
+            if not fig_path.exists():
                 train_ds, val_ds = get_train_val_datasets(
                     training_data=_td("cmod_tcv_d3d_lp"),
                     data_normalization="raw",
@@ -459,8 +458,8 @@ class DataVisualization:
 
         # DIII-D performance overlap
         if dataset_config.dataset_paths.get(dataset_config.target_device) and dataset_config.dataset_paths.get("d3d_lp"):
-            fig_path = os.path.join(save_dir, "d3d_performance_overlap.png")
-            if not os.path.exists(fig_path):
+            fig_path = save_dir / "d3d_performance_overlap.png"
+            if not fig_path.exists():
                 train_ds, test_ds = get_train_test_datasets(
                     training_data=_td("d3d_lp"),
                     num_hp_shots=33,
@@ -506,8 +505,8 @@ class DataVisualization:
 
         for context_info in context_dict.values():
             if context_info["condition"] and dataset_config.dataset_paths.get(dataset_config.target_device):
-                fig_path = os.path.join(save_dir, context_info["fig_name"])
-                if not os.path.exists(fig_path):
+                fig_path = save_dir / context_info["fig_name"]
+                if not fig_path.exists():
                     train_ds, test_ds = get_train_test_datasets(
                         training_data=context_info["training_data"],
                         data_normalization="raw",
@@ -525,7 +524,7 @@ class DataVisualization:
 
     @staticmethod
     def domain_overlap(
-        figure_dir: str,
+        figure_dir: Path | str,
     ):
         """
         Compare different data preparation cases to how the parameter space overlaps.
@@ -581,11 +580,7 @@ class DataVisualization:
             else:
                 ds, _ = get_train_val_datasets(training_data=training_data, data_normalization=method)
 
-            fig_path = os.path.join(
-                figure_dir,
-                "domain_overlap",
-                f"{training_data}_domain_overlap_{method}.png",
-            )
+            fig_path = Path(figure_dir) / "domain_overlap" / f"{training_data}_domain_overlap_{method}.png"
             domain_plot(
                 ds=ds,
                 var_groups=var_groups,

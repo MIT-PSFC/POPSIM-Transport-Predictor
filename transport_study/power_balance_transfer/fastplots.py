@@ -1,4 +1,4 @@
-import os
+from pathlib import Path
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -68,7 +68,7 @@ def important_plots(ds: xr.Dataset):
     """
 
     fig_dir = "fastplots/important_plots"
-    os.makedirs(fig_dir, exist_ok=True)
+    Path(fig_dir).mkdir(parents=True, exist_ok=True)
 
     for data_normalization in ["raw", "z_score", "physics", "coral"]:
         for freeze_submodules in [False, True]:
@@ -87,9 +87,7 @@ def important_plots(ds: xr.Dataset):
                 hp_shot_to_idx = {v: i for i, v in enumerate(hp_shots)}
 
                 for model_type, color in MODEL_COLORS.items():
-                    model_data = case_data.isel(
-                        case_idx=(case_data.model_type == model_type)
-                    )
+                    model_data = case_data.isel(case_idx=(case_data.model_type == model_type))
 
                     # Sort by num_hp_shots so lines are drawn left-to-right
                     order = np.argsort(model_data.num_hp_shots.values)
@@ -117,14 +115,10 @@ def important_plots(ds: xr.Dataset):
                     )
 
                 ax.set_xticks(range(len(hp_shots)))
-                ax.set_xticklabels(
-                    [str(s) for s in hp_shots], color=TEXT_COLOR, fontsize=TICK_FONTSIZE
-                )
+                ax.set_xticklabels([str(s) for s in hp_shots], color=TEXT_COLOR, fontsize=TICK_FONTSIZE)
                 ax.tick_params(colors=TEXT_COLOR, labelsize=TICK_FONTSIZE)
 
-                ax.set_xlabel(
-                    "HP Shots Included", color=TEXT_COLOR, fontsize=LABEL_FONTSIZE
-                )
+                ax.set_xlabel("HP Shots Included", color=TEXT_COLOR, fontsize=LABEL_FONTSIZE)
                 ax.set_ylabel(
                     "Mean integrated absolute error [MJ s]",
                     color=TEXT_COLOR,
@@ -166,7 +160,7 @@ def data_normalization_comparison(ds: xr.Dataset):
         ds: Full results dataset loaded from collected_results.nc.
     """
     fig_dir = "fastplots/data_normalization"
-    os.makedirs(fig_dir, exist_ok=True)
+    Path(fig_dir).mkdir(parents=True, exist_ok=True)
 
     for model_type in ["sciml", "unstructured_nn"]:
         for freeze_submodules in [False, True]:
@@ -186,9 +180,7 @@ def data_normalization_comparison(ds: xr.Dataset):
                 hp_shot_to_idx = {v: i for i, v in enumerate(hp_shots)}
 
                 for data_normalization, color in NORM_COLORS.items():
-                    norm_data = case_data.isel(
-                        case_idx=(case_data.data_normalization == data_normalization)
-                    )
+                    norm_data = case_data.isel(case_idx=(case_data.data_normalization == data_normalization))
                     if norm_data.sizes["case_idx"] == 0:
                         continue
 
@@ -216,14 +208,10 @@ def data_normalization_comparison(ds: xr.Dataset):
                     )
 
                 ax.set_xticks(range(len(hp_shots)))
-                ax.set_xticklabels(
-                    [str(s) for s in hp_shots], color=TEXT_COLOR, fontsize=TICK_FONTSIZE
-                )
+                ax.set_xticklabels([str(s) for s in hp_shots], color=TEXT_COLOR, fontsize=TICK_FONTSIZE)
                 ax.tick_params(colors=TEXT_COLOR, labelsize=TICK_FONTSIZE)
 
-                ax.set_xlabel(
-                    "HP Shots Included", color=TEXT_COLOR, fontsize=LABEL_FONTSIZE
-                )
+                ax.set_xlabel("HP Shots Included", color=TEXT_COLOR, fontsize=LABEL_FONTSIZE)
                 ax.set_ylabel(
                     "Mean integrated absolute error [MJ s]",
                     color=TEXT_COLOR,
@@ -267,7 +255,7 @@ def domain_adaptation_comparison(ds: xr.Dataset):
         ds: Full results dataset loaded from collected_results.nc.
     """
     fig_dir = "fastplots/domain_adaptation"
-    os.makedirs(fig_dir, exist_ok=True)
+    Path(fig_dir).mkdir(parents=True, exist_ok=True)
 
     for model_type in ["sciml", "unstructured_nn"]:
         for freeze_submodules in [False, True]:
@@ -288,9 +276,7 @@ def domain_adaptation_comparison(ds: xr.Dataset):
                 hp_shot_to_idx = {v: i for i, v in enumerate(hp_shots)}
 
                 for domain_adaptation, color in DA_COLORS.items():
-                    da_data = case_data.isel(
-                        case_idx=(case_data.domain_adaptation == domain_adaptation)
-                    )
+                    da_data = case_data.isel(case_idx=(case_data.domain_adaptation == domain_adaptation))
                     if da_data.sizes["case_idx"] == 0:
                         continue
 
@@ -318,14 +304,10 @@ def domain_adaptation_comparison(ds: xr.Dataset):
                     )
 
                 ax.set_xticks(range(len(hp_shots)))
-                ax.set_xticklabels(
-                    [str(s) for s in hp_shots], color=TEXT_COLOR, fontsize=TICK_FONTSIZE
-                )
+                ax.set_xticklabels([str(s) for s in hp_shots], color=TEXT_COLOR, fontsize=TICK_FONTSIZE)
                 ax.tick_params(colors=TEXT_COLOR, labelsize=TICK_FONTSIZE)
 
-                ax.set_xlabel(
-                    "HP Shots Included", color=TEXT_COLOR, fontsize=LABEL_FONTSIZE
-                )
+                ax.set_xlabel("HP Shots Included", color=TEXT_COLOR, fontsize=LABEL_FONTSIZE)
                 ax.set_ylabel(
                     "Mean integrated absolute error [MJ s]",
                     color=TEXT_COLOR,
@@ -370,7 +352,7 @@ def submodule_freezing_comparison(ds: xr.Dataset):
 
     """
     fig_dir = "fastplots/submodule_freezing"
-    os.makedirs(fig_dir, exist_ok=True)
+    Path(fig_dir).mkdir(parents=True, exist_ok=True)
 
     # Filter out sentinel hp_shots=-1
     ds_filtered = ds.isel(case_idx=(ds.num_hp_shots >= 0))
@@ -440,8 +422,7 @@ def submodule_freezing_comparison(ds: xr.Dataset):
                 diff = np.array(
                     [
                         frozen_sorted[s] - unfrozen_sorted[s]
-                        if frozen_sorted[s] < DIVERGED_THRESHOLD
-                        and unfrozen_sorted[s] < DIVERGED_THRESHOLD
+                        if frozen_sorted[s] < DIVERGED_THRESHOLD and unfrozen_sorted[s] < DIVERGED_THRESHOLD
                         else np.nan
                         for s in shared_shots
                     ]
@@ -466,9 +447,7 @@ def submodule_freezing_comparison(ds: xr.Dataset):
         ax.axhline(0, color=TEXT_COLOR, linewidth=0.8, linestyle=":")
 
         ax.set_xticks(range(len(hp_shots_all)))
-        ax.set_xticklabels(
-            [str(s) for s in hp_shots_all], color=TEXT_COLOR, fontsize=TICK_FONTSIZE
-        )
+        ax.set_xticklabels([str(s) for s in hp_shots_all], color=TEXT_COLOR, fontsize=TICK_FONTSIZE)
         ax.tick_params(colors=TEXT_COLOR, labelsize=TICK_FONTSIZE)
         ax.set_xlim(left=0)
 

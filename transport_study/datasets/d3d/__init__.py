@@ -1,4 +1,4 @@
-import os
+from pathlib import Path
 
 from transport_study import PACKAGE_ROOT
 
@@ -15,7 +15,7 @@ HP_SHOTLIST_FILES = [
 ]
 sd = {}
 for i, shotlist_file in enumerate(HP_SHOTLIST_FILES):
-    with open(os.path.join(PACKAGE_ROOT, "datasets", "d3d", shotlist_file)) as f:
+    with open(Path(PACKAGE_ROOT) / "datasets" / "d3d" / shotlist_file) as f:
         lines = f.readlines()
         shot_numbers = [int(line.strip()) for line in lines if line.strip().isdigit()]
     sd[i] = shot_numbers

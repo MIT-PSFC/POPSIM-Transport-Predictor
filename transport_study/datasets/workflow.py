@@ -1,5 +1,5 @@
-import os
 from abc import abstractmethod
+from pathlib import Path
 
 import numpy as np
 import xarray as xr
@@ -25,8 +25,8 @@ class DataWorkflow:
     def __init__(
         self,
         ds_name: str,
-        shotlist_file: str | None,
-        data_assembly_dir: str,
+        shotlist_file: Path | str | None,
+        data_assembly_dir: Path | str,
         max_num_shots: int | None = None,
     ):
         """
@@ -34,39 +34,33 @@ class DataWorkflow:
         ----------
         ds_name : str
             Name of the dataset ('d3d', 'tcv', 'cmod')
-        shotlist_file : str | None
+        shotlist_file : Path | str | None
             Path to file containing list of shots to process. If None, will call
             _get_shotlist_from_source() to retrieve shotlist from device-specific source.
-        data_assembly_dir : str
+        data_assembly_dir : Path | str
             Directory where data files are stored and final dataset will be saved
         max_num_shots : int | None
             Maximum number of shots to process (for testing). If None, process all shots.
         """
 
         self.ds_name = ds_name
-        self.data_assembly_dir = data_assembly_dir
-        self.raw_data_dir = os.path.join(data_assembly_dir, ds_name, "raw_data")
+        self.data_assembly_dir = Path(data_assembly_dir)
+        self.raw_data_dir = self.data_assembly_dir / ds_name / "raw_data"
         if max_num_shots is None:
-            self.final_ds_dir = os.path.join(data_assembly_dir, ds_name, "dataset_full")
+            self.final_ds_dir = self.data_assembly_dir / ds_name / "dataset_full"
         else:
-            self.final_ds_dir = os.path.join(
-                data_assembly_dir, ds_name, f"dataset_{max_num_shots}"
-            )
+            self.final_ds_dir = self.data_assembly_dir / ds_name / f"dataset_{max_num_shots}"
 
         self.max_num_shots = max_num_shots
 
         if shotlist_file is None:
-            logger.info(
-                "No shotlist file provided, retrieving shotlist from device-specific source"
-            )
+            logger.info("No shotlist file provided, retrieving shotlist from device-specific source")
             self.shotlist = self._get_shotlist_from_source()
             logger.info(f"Retrieved {len(self.shotlist)} shots from source")
         else:
             with open(shotlist_file) as f:
                 lines = f.readlines()
-                self.shotlist = [
-                    int(line.strip()) for line in lines if line.strip().isdigit()
-                ]
+                self.shotlist = [int(line.strip()) for line in lines if line.strip().isdigit()]
             logger.info(f"Loaded {len(self.shotlist)} shots from {shotlist_file}")
 
     @abstractmethod
@@ -115,9 +109,7 @@ class DataWorkflow:
             try:
                 max_shot_idx = np.nanargmax(max_per_shot.values)
             except ValueError:
-                logger.warning(
-                    f"Variable {var} has no valid values, skipping stats logging"
-                )
+                logger.warning(f"Variable {var} has no valid values, skipping stats logging")
                 continue
             max_shot = ds["shot"].values[max_shot_idx]
             max_val = max_per_shot.values[max_shot_idx]
@@ -144,20 +136,14 @@ class DataWorkflow:
         from popsim.data.dataset_utils import build_tensorized_dataset
 
         if not int(np.version.version.split(".")[0]) >= 2:
-            raise RuntimeError(
-                "Numpy version must be greater than 2 to run data processing workflow on all devices."
-            )
+            raise RuntimeError("Numpy version must be greater than 2 to run data processing workflow on all devices.")
 
-        zarr_path = os.path.join(self.final_ds_dir, "ds.zarr")
-        if os.path.exists(zarr_path):
+        zarr_path = self.final_ds_dir / "ds.zarr"
+        if zarr_path.exists():
             print(f"Dataset already exists at {zarr_path}, skipping processing.")
             return
 
-        identifiers = [
-            int(fname.split(".")[0])
-            for fname in os.listdir(self.raw_data_dir)
-            if fname.endswith(".nc")
-        ]
+        identifiers = [int(p.stem) for p in self.raw_data_dir.glob("*.nc")]
         if self.max_num_shots:
             identifiers = identifiers[: self.max_num_shots]
 
@@ -183,7 +169,7 @@ class DataWorkflow:
         try:
             ds_profile_time_plot(
                 zarr_path,
-                os.path.join(self.final_ds_dir, "time_traces"),
+                self.final_ds_dir / "time_traces",
                 title=f"{self.ds_name.upper()} Dataset Time Traces",
             )
         except Exception as e:
@@ -191,7 +177,7 @@ class DataWorkflow:
         try:
             ds_profile_plot(
                 zarr_path,
-                os.path.join(self.final_ds_dir, "profile_traces"),
+                self.final_ds_dir / "profile_traces",
                 title=f"{self.ds_name.upper()} Dataset Profile Traces",
             )
         except Exception as e:
@@ -207,21 +193,13 @@ class DataWorkflow:
         # Apply full-timeslice filters
         for var, valid_range in self.filter_config.items():
             if var in shot_ds:
-                var_mask = (
-                    shot_ds[var].notnull()
-                    & (shot_ds[var] >= valid_range["min"])
-                    & (shot_ds[var] <= valid_range["max"])
-                )
+                var_mask = shot_ds[var].notnull() & (shot_ds[var] >= valid_range["min"]) & (shot_ds[var] <= valid_range["max"])
                 valid_mask = valid_mask & var_mask
             else:
-                logger.debug(
-                    f"Variable {var} specified in filter_config not found in dataset for shot {shot_ds.shot.values[0]}"
-                )
+                logger.debug(f"Variable {var} specified in filter_config not found in dataset for shot {shot_ds.shot.values[0]}")
 
         if valid_mask.sum() == 0:
-            logger.warning(
-                f"Excluding shot {shot_ds.shot.values[0]} because all data points are invalid after filtering"
-            )
+            logger.warning(f"Excluding shot {shot_ds.shot.values[0]} because all data points are invalid after filtering")
             return None
 
         # Apply individual filters that set out-of-range values to NaN, but don't drop the entire timeslice.
@@ -229,9 +207,7 @@ class DataWorkflow:
             for var, valid_range in self.individual_filter_config.items():
                 if var in shot_ds:
                     shot_ds[var] = shot_ds[var].where(
-                        (shot_ds[var].notnull())
-                        & (shot_ds[var] >= valid_range["min"])
-                        & (shot_ds[var] <= valid_range["max"]),
+                        (shot_ds[var].notnull()) & (shot_ds[var] >= valid_range["min"]) & (shot_ds[var] <= valid_range["max"]),
                         other=np.nan,
                     )
                 else:
@@ -243,32 +219,24 @@ class DataWorkflow:
         return shot_ds
 
     def _debug_plots(self, shot_ds: xr.Dataset):
-        debug_fig_dir = os.path.join(self.final_ds_dir, "debug_plots")
-        os.makedirs(debug_fig_dir, exist_ok=True)
-        ds_profile_time_plot(
-            shot_ds, debug_fig_dir, title=f"Debug: {shot_ds.shot.values[0]}"
-        )
-        ds_profile_plot(
-            shot_ds, debug_fig_dir, title=f"Debug: {shot_ds.shot.values[0]}"
-        )
+        debug_fig_dir = self.final_ds_dir / "debug_plots"
+        debug_fig_dir.mkdir(parents=True, exist_ok=True)
+        ds_profile_time_plot(shot_ds, debug_fig_dir, title=f"Debug: {shot_ds.shot.values[0]}")
+        ds_profile_plot(shot_ds, debug_fig_dir, title=f"Debug: {shot_ds.shot.values[0]}")
 
     def process_fn(self, shot_id: int) -> xr.Dataset:
-        raw_ds_path = os.path.join(self.raw_data_dir, f"{shot_id}.nc")
+        raw_ds_path = self.raw_data_dir / f"{shot_id}.nc"
         shot_ds = xr.open_dataset(raw_ds_path)
 
         # Processing that is specific to the device, implemented in the subclass
         shot_ds = self.device_specific_processing(shot_ds)
         if shot_ds is None:
-            logger.warning(
-                f"Skipping shot {shot_id} due to device-specific processing failure"
-            )
+            logger.warning(f"Skipping shot {shot_id} due to device-specific processing failure")
             return None
 
         # Processing that is common across devices
         # Ensure powers are non-negative
-        power_signals = [
-            sig for sig in shot_ds.data_vars if "P_" in sig and sig.endswith("_MW")
-        ]
+        power_signals = [sig for sig in shot_ds.data_vars if "P_" in sig and sig.endswith("_MW")]
         for sig in power_signals:
             shot_ds[sig] = shot_ds[sig].clip(min=0)
 
@@ -293,24 +261,16 @@ class DataWorkflow:
         # Culling that is specific to the device, implemented in the subclass.
         # This is applied after the device-specific processing and the general processing steps, so that it can take into account any corrections or fixes that were made to the data in those steps.
         if self.device_specific_culling(shot_ds):
-            logger.warning(
-                f"Excluding shot {shot_id} based on device-specific culling criteria"
-            )
+            logger.warning(f"Excluding shot {shot_id} based on device-specific culling criteria")
             self._debug_plots(debug_ds)
             return None
 
         # Culling that is common across devices
         # If shot is too short (less than 500 ms) after processing, exclude it
         cleaned_ds = shot_ds.dropna("time_idx", how="all")
-        valid_time_duration = (
-            0
-            if cleaned_ds.time.size == 0
-            else float(cleaned_ds.time.max() - cleaned_ds.time.min())
-        )
+        valid_time_duration = 0 if cleaned_ds.time.size == 0 else float(cleaned_ds.time.max() - cleaned_ds.time.min())
         if valid_time_duration < 0.5:
-            logger.warning(
-                f"Excluding shot {shot_id} because duration after processing is only {valid_time_duration:.2f} seconds"
-            )
+            logger.warning(f"Excluding shot {shot_id} because duration after processing is only {valid_time_duration:.2f} seconds")
             self._debug_plots(debug_ds)
             return None
 

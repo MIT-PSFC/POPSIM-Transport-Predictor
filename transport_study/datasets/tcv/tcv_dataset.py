@@ -2,7 +2,7 @@
 
 import gc
 import glob
-import os
+from pathlib import Path
 
 import netCDF4  # noqa: F401
 import numpy as np
@@ -14,7 +14,7 @@ from transport_study.config import config
 from transport_study.datasets import make_uniform_1khz_timebase
 from transport_study.datasets.workflow import DataWorkflow
 
-DEFAULT_SHOTLIST_FILE = os.path.join(PACKAGE_ROOT, "datasets", "tcv", "tcv_shotlist")
+DEFAULT_SHOTLIST_FILE = Path(PACKAGE_ROOT) / "datasets" / "tcv" / "tcv_shotlist"
 
 TCV_0D_SIGNALS = [
     # Required by the transport predictor module
@@ -55,9 +55,9 @@ class TCVDataWorkflow(DataWorkflow):
     def __init__(
         self,
         ds_name: str,
-        shotlist_file: str | None,
-        data_assembly_dir: str,
-        source_dataset_path: str | None = None,
+        shotlist_file: Path | str | None,
+        data_assembly_dir: Path | str,
+        source_dataset_path: Path | str | None = None,
         max_num_shots: int | None = None,
     ):
         """Initialize the TCV data workflow.
@@ -118,23 +118,19 @@ class TCVDataWorkflow(DataWorkflow):
         logger.info(f"Loading shotlist from TCV source directory {self.source_dir}")
 
         # List all .nc files in the directory
-        files = glob.glob(os.path.join(self.source_dir, "TCVno*.nc"))
+        files = glob.glob(Path(self.source_dir) / "TCVno*.nc")
 
         # Extract shot numbers from filenames (TCVno{shot}.nc)
         shotlist = []
         for file in files:
-            basename = os.path.basename(file)
+            basename = Path(file).name
             if basename.startswith("TCVno") and basename.endswith(".nc"):
-                shot_str = basename[
-                    5:-3
-                ]  # Extract the number between "TCVno" and ".nc"
+                shot_str = basename[5:-3]  # Extract the number between "TCVno" and ".nc"
                 try:
                     shot = int(shot_str)
                     shotlist.append(shot)
                 except ValueError:
-                    logger.warning(
-                        f"Could not extract shot number from filename: {basename}"
-                    )
+                    logger.warning(f"Could not extract shot number from filename: {basename}")
 
         shotlist.sort()
         logger.info(f"Found {len(shotlist)} shots in source directory")
@@ -153,8 +149,8 @@ class TCVDataWorkflow(DataWorkflow):
         xr.Dataset | None
             Dataset for the shot, or None if file not found or cannot be loaded
         """
-        shot_file = os.path.join(self.source_dir, f"TCVno{shot}.nc")
-        if not os.path.exists(shot_file):
+        shot_file = Path(self.source_dir) / f"TCVno{shot}.nc"
+        if not shot_file.exists():
             logger.warning(f"Shot file not found: {shot_file}")
             return None
 
@@ -176,13 +172,11 @@ class TCVDataWorkflow(DataWorkflow):
         processed_shots = 0
         for shot in self.shotlist:
             if self.max_num_shots is not None and processed_shots >= self.max_num_shots:
-                logger.info(
-                    f"Reached maximum number of shots to process: {self.max_num_shots}"
-                )
+                logger.info(f"Reached maximum number of shots to process: {self.max_num_shots}")
                 break
 
-            ds_path = os.path.join(self.raw_data_dir, f"{shot}.nc")
-            if os.path.exists(ds_path):
+            ds_path = Path(self.raw_data_dir) / f"{shot}.nc"
+            if ds_path.exists():
                 logger.info(f"Raw dataset for shot {shot} already exists at {ds_path}")
                 processed_shots += 1
                 continue
@@ -240,9 +234,7 @@ class TCVDataWorkflow(DataWorkflow):
 
         logger.info("Finished making raw data files.")
 
-    def _create_uniform_timebase_dataset(
-        self, ds: xr.Dataset, timebase: np.ndarray
-    ) -> xr.Dataset:
+    def _create_uniform_timebase_dataset(self, ds: xr.Dataset, timebase: np.ndarray) -> xr.Dataset:
         """Interpolate all signals from a raw TCV dataset onto a uniform 1 kHz timebase.
 
         Each signal in the raw TCV dataset has its own time coordinate (e.g., time_I_P for I_P).
@@ -271,9 +263,7 @@ class TCVDataWorkflow(DataWorkflow):
                     signal_data = ds[signal].values
                     signal_time = ds[f"time_{signal}"].values
 
-                    interp_data = np.interp(
-                        timebase, signal_time, signal_data, left=np.nan, right=np.nan
-                    )
+                    interp_data = np.interp(timebase, signal_time, signal_data, left=np.nan, right=np.nan)
 
                     interp_da = xr.DataArray(
                         interp_data,
@@ -290,15 +280,9 @@ class TCVDataWorkflow(DataWorkflow):
         # Handle profile data (Ne_rho, Te_rho)
         # Use rectilinear interpolation (forward-fill) for slow diagnostic signals
         for signal in ["Ne_rho", "Te_rho"]:
-            if (
-                signal in ds
-                and f"t_{signal}" in ds.coords
-                and f"x_{signal}" in ds.coords
-            ):
+            if signal in ds and f"t_{signal}" in ds.coords and f"x_{signal}" in ds.coords:
                 try:
-                    profile_data = ds[
-                        signal
-                    ].values  # Shape: (time_profile, rho_profile)
+                    profile_data = ds[signal].values  # Shape: (time_profile, rho_profile)
                     profile_time = ds[f"t_{signal}"].values
                     profile_rho = ds[f"x_{signal}"].values
 
@@ -391,9 +375,7 @@ class TCVDataWorkflow(DataWorkflow):
             if original_name not in ds:
                 ds[new_name] = xr.where(ds["Ip_MA"].notnull(), 0.0, np.nan)
             else:
-                ds[new_name] = xr.where(
-                    ds["Ip_MA"].notnull(), ds[original_name].fillna(0.0), np.nan
-                )
+                ds[new_name] = xr.where(ds["Ip_MA"].notnull(), ds[original_name].fillna(0.0), np.nan)
                 # Only keep variables of interest
         kept_vars = {
             # POWER BALANCE TRAINING
@@ -496,13 +478,7 @@ class TCVDataWorkflow(DataWorkflow):
 
         ne_line_avg = ds["ne20_line_avg"].mean().item()
         ne_edge_avg = ds["ne20_edge"].mean().item()
-        if (
-            ne_edge_avg > (2 * ne_line_avg)
-            or ds["ne20_line_avg"].isnull().all()
-            or ds["ne20_edge"].isnull().all()
-        ):
-            logger.info(
-                f"Culling shot {ds.shot.values[0]} due to edge density being significantly higher than line-avg density"
-            )
+        if ne_edge_avg > (2 * ne_line_avg) or ds["ne20_line_avg"].isnull().all() or ds["ne20_edge"].isnull().all():
+            logger.info(f"Culling shot {ds.shot.values[0]} due to edge density being significantly higher than line-avg density")
 
         return False

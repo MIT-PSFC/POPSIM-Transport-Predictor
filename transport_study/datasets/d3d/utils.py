@@ -1,9 +1,8 @@
-import glob
 import io
-import os
 import tarfile
 import tempfile
 import warnings
+from pathlib import Path
 
 import matplotlib.pyplot as plt
 import netCDF4  # noqa: F401
@@ -28,9 +27,7 @@ warnings.filterwarnings(
 )
 
 
-DEFAULT_SHOTLIST_FILE = os.path.join(
-    PACKAGE_ROOT, "datasets", "d3d", "HBP_shotlist_2024"
-)
+DEFAULT_SHOTLIST_FILE = Path(PACKAGE_ROOT) / "datasets" / "d3d" / "HBP_shotlist_2024"
 
 
 class Uniform1kHzTimeSetting(TimeSetting):
@@ -50,9 +47,7 @@ class Uniform1kHzTimeSetting(TimeSetting):
         np.ndarray
             Array of times in the timebase.
         """
-        (efit_time,) = params.mds_conn.get_dims(
-            r"\efit_aeqdsk:ali", tree_name="_efit_tree"
-        )
+        (efit_time,) = params.mds_conn.get_dims(r"\efit_aeqdsk:ali", tree_name="_efit_tree")
         # If timebase is much slower than 1 kHz, log a warning
         typical_delta = np.median(np.diff(efit_time))
         if typical_delta > 2:
@@ -87,9 +82,7 @@ class Uniform1MHzTimeSetting(TimeSetting):
         np.ndarray
             Array of times in the timebase.
         """
-        (efit_time,) = params.mds_conn.get_dims(
-            r"\efit_aeqdsk:ali", tree_name="_efit_tree"
-        )
+        (efit_time,) = params.mds_conn.get_dims(r"\efit_aeqdsk:ali", tree_name="_efit_tree")
 
         max_time = np.max(efit_time)
         if params.tokamak == Tokamak.CMOD:
@@ -150,7 +143,7 @@ def _clean_aeqdsk_file(f):
     return string_io
 
 
-def disruption_efit(efit_tgz_path: str, shot: int) -> xr.Dataset:
+def disruption_efit(efit_tgz_path: Path | str, shot: int) -> xr.Dataset:
     """Directly parse the saved 1 kHz EFIT results into an xarray dataset for a shot
 
     We re-computed EFIT01 at 1 kHz, but the DIII-D data curators did not allow us to have a dedicated tree in MDSPlus,
@@ -159,13 +152,13 @@ def disruption_efit(efit_tgz_path: str, shot: int) -> xr.Dataset:
     So here I'm just going to where we have the results saved and parse the data directly into Xarray
     """
 
-    if not os.path.exists(efit_tgz_path):
+    if not Path(efit_tgz_path).exists():
         logger.warning(f"EFIT tgz file for shot {shot} not found at {efit_tgz_path}")
         return None
 
-    archive_dir = os.path.dirname(efit_tgz_path)
-    efit_nc_path = os.path.join(archive_dir, f"{shot}.nc")
-    if os.path.exists(efit_nc_path):
+    archive_dir = Path(efit_tgz_path).parent
+    efit_nc_path = archive_dir / f"{shot}.nc"
+    if efit_nc_path.exists():
         logger.info(
             f"Found pre-extracted EFIT netCDF file for shot {shot} at {efit_nc_path}, loading from it instead of re-extracting from tgz"
         )
@@ -173,29 +166,22 @@ def disruption_efit(efit_tgz_path: str, shot: int) -> xr.Dataset:
         # Make sure all the data vars have ("shot", "time") as their dimensions
         for var in ds.data_vars:
             if set(ds[var].dims) != {"shot", "time"}:
-                ds[var] = (
-                    ds[var].expand_dims({"shot": [shot]}).transpose("shot", "time")
-                )
+                ds[var] = ds[var].expand_dims({"shot": [shot]}).transpose("shot", "time")
         return ds
-
-    start_dir = os.getcwd()
 
     with tempfile.TemporaryDirectory() as tmpdir:
         with tarfile.open(efit_tgz_path, "r:gz") as tar:
             tar.extractall(path=tmpdir)
-        os.chdir(os.path.join(tmpdir, "efit"))
-        a_files = glob.glob("a*")  # Mainly 0D scalars
-        g_files = glob.glob("g*")  # Grids and boundaries
+        efit_dir = Path(tmpdir) / "efit"
+        a_files = sorted(p.name for p in efit_dir.glob("a*"))  # Mainly 0D scalars
+        g_files = sorted(p.name for p in efit_dir.glob("g*"))  # Grids and boundaries
 
-        # Ensure they're sorted from low to high
-        for files in [g_files, a_files]:
-            files.sort()
         if len(a_files) != len(g_files):
             raise ValueError("Inconstent number of EFIT files!")
 
         datasets = []
-        for _i, a_file in enumerate(a_files):  # Limit to first 100 files
-            with open(a_file) as f:
+        for _i, a_file in enumerate(a_files):
+            with open(efit_dir / a_file) as f:
                 cleaned_f = _clean_aeqdsk_file(f)
                 a_data = aeqdsk.read(cleaned_f)
 
@@ -237,16 +223,13 @@ def disruption_efit(efit_tgz_path: str, shot: int) -> xr.Dataset:
 
         final_dataset = xr.concat(datasets, dim="time")
 
-    os.chdir(start_dir)
     # Add shot dimension
-    final_dataset = final_dataset.expand_dims({"shot": [shot]}).transpose(
-        "shot", "time"
-    )
+    final_dataset = final_dataset.expand_dims({"shot": [shot]}).transpose("shot", "time")
     final_dataset.to_netcdf(efit_nc_path)
     return final_dataset
 
 
-def compare_efits(ds_fast: xr.Dataset, ds_slow: xr.Dataset, shot: int, fig_path: str):
+def compare_efits(ds_fast: xr.Dataset, ds_slow: xr.Dataset, shot: int, fig_path: Path | str):
     num_data_vars = len(ds_fast.data_vars)
 
     ds_fast_shot = ds_fast.sel(shot=shot)
@@ -278,7 +261,7 @@ def compare_efits(ds_fast: xr.Dataset, ds_slow: xr.Dataset, shot: int, fig_path:
     plt.close(fig)
 
 
-def compare_densities(ds: xr.Dataset, shot: int, fig_path: str):
+def compare_densities(ds: xr.Dataset, shot: int, fig_path: Path | str):
     ds = ds.isel(shot=0)
     dssneped = ds["dssneped"].data / 10
     ne_line_avg = ds["ne_line_avg"].data / 2e20

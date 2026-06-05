@@ -1,8 +1,8 @@
-import os
 import re
 import subprocess
 import sys
 import tempfile
+from pathlib import Path
 
 import yaml
 from loguru import logger
@@ -34,9 +34,7 @@ def count_running_jobs(job_name: str, partition: str = config.partition) -> int:
     return len(result.stdout.strip().split("\n")) if result.stdout.strip() else 0
 
 
-def count_idle_gpus(
-    partition: str = config.partition, buffer_gpus: int = config.buffer_gpus
-) -> int:
+def count_idle_gpus(partition: str = config.partition, buffer_gpus: int = config.buffer_gpus) -> int:
     """Count the number of idle GPUs on this partition."""
     result = subprocess.run(
         ["sinfo", "-p", partition, "-N", "--Format=gres,gresused", "--noheader"],
@@ -64,9 +62,7 @@ def count_idle_gpus(
     return max(avail - buffer_gpus, 0)  # Don't report negative available GPUs, just 0
 
 
-def resources_available(
-    partition: str = config.partition, buffer_gpus: int = config.buffer_gpus
-) -> bool:
+def resources_available(partition: str = config.partition, buffer_gpus: int = config.buffer_gpus) -> bool:
     idle_gpus = count_idle_gpus(partition, buffer_gpus)
     return idle_gpus > 0
 
@@ -74,8 +70,8 @@ def resources_available(
 def launch_train_parallel(
     train_config: TrainConfig,
     job_name: str,
-    result_path: str,
-    log_dir: str,
+    result_path: Path | str,
+    log_dir: Path | str,
     partition: str = config.partition,
 ) -> None:
     """Submit a SLURM job that runs training serially and saves results to result_path.
@@ -89,7 +85,8 @@ def launch_train_parallel(
     """
     # All temp files must live on the shared filesystem (not /tmp which is
     # node-local), so that compute nodes can read them.
-    os.makedirs(log_dir, exist_ok=True)
+    log_dir = Path(log_dir)
+    log_dir.mkdir(parents=True, exist_ok=True)
 
     # Serialize the train config so the job can reconstruct it
     with tempfile.NamedTemporaryFile(
@@ -104,8 +101,8 @@ def launch_train_parallel(
 
     # Write the serial training logic as a small Python script
     py_script = f"""\
-import os
 import yaml
+from pathlib import Path
 from popsim.ml import TrainConfig
 from popsim.ml.launch import launch_train
 
@@ -114,17 +111,15 @@ with open({config_path!r}) as f:
 
 _, _, _, _, result_dict = launch_train(train_config)
 ds = result_dict["test/study_results"]
-os.makedirs(os.path.dirname({result_path!r}) or ".", exist_ok=True)
-ds.to_netcdf({result_path!r})
-os.remove({config_path!r})
+Path({str(result_path)!r}).parent.mkdir(parents=True, exist_ok=True)
+ds.to_netcdf({str(result_path)!r})
+Path({str(config_path)!r}).unlink()
 """
 
-    with tempfile.NamedTemporaryFile(
-        mode="w", suffix=".py", delete=False, prefix=f"{job_name}_script_", dir=log_dir
-    ) as f:
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False, prefix=f"{job_name}_script_", dir=log_dir) as f:
         f.write(py_script)
         script_path = f.name
-    log_path = os.path.join(log_dir, f"{job_name}.log")
+    log_path = log_dir / f"{job_name}.log"
 
     sbatch_script = f"""\
 #!/bin/bash
@@ -163,7 +158,7 @@ def launch_agent_parallel(
     sweep_id: str,
     kwargs_agent: dict,
     job_name: str,
-    log_dir: str,
+    log_dir: Path | str,
     partition: str = config.partition,
 ) -> None:
     """Submit a SLURM job that launches a W&B agent for an existing sweep.
@@ -176,19 +171,20 @@ def launch_agent_parallel(
         log_dir: Directory for SLURM stdout/stderr logs.
         partition: The SLURM partition to submit to.
     """
-    os.makedirs(log_dir, exist_ok=True)
+    log_dir = Path(log_dir)
+    log_dir.mkdir(parents=True, exist_ok=True)
 
     run_dir = tempfile.mkdtemp(prefix=f"{job_name}_", dir=log_dir)
-    config_path = os.path.join(run_dir, "config.yaml")
-    script_path = os.path.join(run_dir, "run_agent.py")
-    log_path = os.path.join(run_dir, "slurm.log")
+    config_path = Path(run_dir) / "config.yaml"
+    script_path = Path(run_dir) / "run_agent.py"
+    log_path = Path(run_dir) / "slurm.log"
 
     with open(config_path, "w") as f:
         yaml.dump(train_config.model_dump(), f, indent=4)
 
     py_script = f"""\
-import os
 import yaml
+from pathlib import Path
 from popsim.ml import TrainConfig
 from popsim.ml.launch import launch_agent
 
@@ -200,7 +196,7 @@ launch_agent(
     {sweep_id!r},
     kwargs_agent={kwargs_agent!r},
 )
-os.remove({config_path!r})
+Path({config_path!r}).unlink()
 """
 
     with open(script_path, "w") as f:
@@ -240,12 +236,12 @@ def launch_trajopt_case_parallel(
     case,
 ) -> None:
     """Submit a SLURM job that trains and generates output for a single trajectory optimization case."""
-    log_dir = os.path.join(trajopt.working_dir, "logs")
-    os.makedirs(log_dir, exist_ok=True)
+    log_dir = trajopt.working_dir / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
 
     init_kwargs = {
         "name": trajopt.name,
-        "working_dir_base": os.path.dirname(trajopt.working_dir),
+        "working_dir_base": trajopt.working_dir.parent,
         "profile_module_checkpoint_dir": trajopt.profile_module_checkpoint_dir,
         "traj_times": trajopt.traj_times,
         "max_num_traj_times": trajopt.max_num_traj_times,
@@ -253,25 +249,22 @@ def launch_trajopt_case_parallel(
     case_str = str(case)
 
     py_script = f"""\
-import os
 from transport_study.trajectory_optimization.optimize import TrajectoryOptimization
 
 trajopt = TrajectoryOptimization(**{init_kwargs!r})
 case = next(c for c in trajopt.cases if str(c) == {case_str!r})
 
-if not os.path.exists(trajopt.checkpoint_dir(case)):
+if not trajopt.checkpoint_dir(case).exists():
     trajopt.run_case(case)
 
-if not os.path.exists(trajopt.output_path(case)):
+if not trajopt.output_path(case).exists():
     trajopt.output_optimized_trajectory(case)
 """
 
     job_name = trajopt.train_job_name(case)
-    log_path = os.path.join(log_dir, f"{job_name}.log")
+    log_path = log_dir / f"{job_name}.log"
 
-    with tempfile.NamedTemporaryFile(
-        mode="w", suffix=".py", delete=False, prefix=f"{job_name}_", dir=log_dir
-    ) as f:
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False, prefix=f"{job_name}_", dir=log_dir) as f:
         f.write(py_script)
         script_path = f.name
 
@@ -292,9 +285,7 @@ export WANDB_MODE=offline
 rm -f {script_path}
 """
 
-    result = subprocess.run(
-        ["sbatch"], input=sbatch_script, check=False, capture_output=True, text=True
-    )
+    result = subprocess.run(["sbatch"], input=sbatch_script, check=False, capture_output=True, text=True)
     if result.returncode != 0:
         logger.error(f"sbatch failed for {job_name}: {result.stderr}")
     else:
