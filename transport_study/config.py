@@ -63,6 +63,11 @@ class StudyConfig(BaseModel):
             target_device=target,
         )
 
+    @property
+    def ds_source_to_idx(self) -> dict[str, int]:
+        """Stable integer index per device, sorted alphabetically for reproducibility."""
+        return {k: i for i, k in enumerate(sorted(self.dataset_paths.keys()))}
+
     def is_compatible(self, cfg: "StudyConfig") -> bool:
         """Check if two configs are compatible for running the same study (e.g. dataset paths and target device must match)."""
         return self.dataset_paths == cfg.dataset_paths and self.target_device == cfg.target_device

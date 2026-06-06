@@ -17,7 +17,7 @@ from popsim.ml.launch import (
 
 from transport_study import PACKAGE_ROOT
 from transport_study.config import config
-from transport_study.orchestration.organize_data import TrainingData, dataset_config
+from transport_study.orchestration.organize_data import TrainingData
 from transport_study.orchestration.slurm_utils import (
     launch_train_parallel,
 )
@@ -31,10 +31,10 @@ from transport_study.orchestration.wandb_utils import (
 def _parse_training_data(s: str) -> TrainingData:
     """Convert a string like 'cmod_tcv' or 'exnihilo' to a TrainingData object."""
     if s == "exnihilo":
-        target = dataset_config.target_device
-        non_target = frozenset(dataset_config.dataset_paths.keys()) - ({target} if target else set())
-        return TrainingData(sources=non_target, exnihilo=True)
-    return TrainingData(sources=frozenset(s.split("_")))
+        target = config.target_device
+        non_target = set(config.dataset_paths.keys()) - ({target} if target else set())
+        return TrainingData(sources_unsorted=non_target, exnihilo=True)
+    return TrainingData(sources_unsorted=s.split("_"))
 
 
 from transport_study.power_balance_transfer.data_visualization import DataVisualization
@@ -49,9 +49,9 @@ class PowerBalanceStudy(Study):
     @classmethod
     def _hyperparam_training_data(cls) -> TrainingData:
         """All configured non-target source devices - the canonical hyperparam case."""
-        target = dataset_config.target_device
-        sources = frozenset(dataset_config.dataset_paths.keys()) - ({target} if target else set())
-        return TrainingData(sources=sources)
+        target = config.target_device
+        sources = set(config.dataset_paths.keys() - ({target} if target else set()))
+        return TrainingData(sources_unsorted=sources)
 
     ##################
     # INITIALIZATION #

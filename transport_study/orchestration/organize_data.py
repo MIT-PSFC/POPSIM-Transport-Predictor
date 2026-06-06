@@ -19,13 +19,16 @@ from transport_study.config import TRAIN_VAL_SPLIT, config
 class TrainingData:
     """Specifies which source devices to use for training.
 
-    sources: frozenset of device keys
+    sources: tuple of device keys
     exnihilo: if True, load sources for normalization only - strip them from the
               actual training set, leaving only target device shots.
     """
 
-    sources_unsorted: frozenset  # Not necessarily sorted
+    sources_unsorted: list[str]
     exnihilo: bool = False
+
+    def __hash__(self):
+        return hash((tuple(self.sources), self.exnihilo))
 
     def __str__(self) -> str:
         if self.exnihilo:
@@ -38,9 +41,9 @@ class TrainingData:
         return sorted(self.sources_unsorted)
 
     @property
-    def source_idxs(self) -> frozenset:
+    def source_idxs(self) -> list:
         """Integer indices for all sources in this TrainingData, looked up from global config."""
-        return frozenset(config.ds_source_to_idx[s] for s in self.sources)
+        return [config.ds_source_to_idx[s] for s in self.sources]
 
 
 REQUIRED_SIGNALS_POWER_BALANCE = [
@@ -546,7 +549,7 @@ def get_train_val_datasets(
     episode_coord = None
 
     for source in training_data.sources:
-        ds, episode_coord = get_ds(source, study_type, debug=config.debug)
+        ds, episode_coord = get_ds(source, study_type)
         ds = add_performance(ds, episode_coord)
         train_src, val_src = split_dataset_by_fracs(
             ds,
@@ -564,6 +567,8 @@ def get_train_val_datasets(
             episode_coord,
             np.full(val_src.sizes[episode_coord], src_idx),
         )
+        train_src = train_src.assign_coords(ds_source=source)
+        val_src = val_src.assign_coords(ds_source=source)
         ds_sources[source] = (train_src, val_src)
 
     if not ds_sources:
@@ -579,6 +584,7 @@ def get_train_val_datasets(
     logger.debug("Historic Training dataset size: {}", train_ds.sizes[episode_coord])
     logger.debug("Historic Validation dataset size: {}", val_ds.sizes[episode_coord])
 
+    train_ds, val_ds = normalize_domain(train_ds, val_ds, method="physics")
     return train_ds, val_ds
 
 
@@ -609,12 +615,14 @@ def get_train_test_datasets(
         raise ValueError("config.target_device must be set before transfer learning")
 
     # Load the target device dataset and split into train/test
-    ds_hp, episode_coord = get_ds(target, study_type=study_type, debug=debug)
+    ds_hp, episode_coord = get_ds(target, study_type=study_type)
     ds_hp = add_performance(ds_hp, episode_coord)
+    ds_hp, _ = normalize_domain(ds_hp, method="physics")
     ds_hp["ds_source_idx"] = (
         episode_coord,
         np.full(ds_hp.sizes[episode_coord], config.ds_source_to_idx[target]),
     )
+    ds_hp = ds_hp.assign_coords(ds_source=target)
     sorted_shots = np.argsort(ds_hp["performance"].values)
 
     test_shot_pool = sorted_shots[-hp_test_set_size:]
@@ -629,7 +637,7 @@ def get_train_test_datasets(
 
     # Load historic source data for training (and for exnihilo: normalization only)
     # exnihilo.sources contains all non-target devices, so we can pass training_data directly
-    train_ds_hist, val_ds_hist = get_train_val_datasets(training_data, study_type=study_type, debug=debug)
+    train_ds_hist, val_ds_hist = get_train_val_datasets(training_data, study_type=study_type)
     train_ds = concat_with_nan_padding(
         [train_ds_hist, val_ds_hist, train_ds_hp],
         concat_dim=episode_coord,

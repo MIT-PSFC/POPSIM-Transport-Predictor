@@ -13,6 +13,7 @@ from popsim.ml.dataloading import make_dataloaders
 from popsim.ml.eval import EvalData, EvaluationSuite, batched_model_eval_and_loss
 
 from transport_study import EPISODE_DIM, TIME_COORD, TIME_DIM
+from transport_study.config import config
 from transport_study.modules.profile_predictor.module import (
     ProfilePredictorShapeInit,
     ProfilePredictorUnstructuredNN,
@@ -21,7 +22,6 @@ from transport_study.modules.profile_predictor.module import (
     pca_initial_guess,
 )
 from transport_study.orchestration.organize_data import (
-    dataset_config,
     get_train_test_datasets,
     get_train_val_datasets,
 )
@@ -54,14 +54,11 @@ class ProfilePredictorTRB(TrainRunBuilder):
             if not training_data.exnihilo:
                 ds_train, ds_val = get_train_val_datasets(
                     training_data=training_data,
-                    data_normalization=dataloader_config["data_normalization"],
                     study_type="profile_transfer",
-                    debug=dataloader_config.get("debug", False),
                 )
             else:
                 ds_train, ds_val = get_train_test_datasets(
                     training_data=training_data,
-                    data_normalization=dataloader_config["data_normalization"],
                     domain_adaptation=None,
                     num_hp_shots=dataloader_config["num_hp_shots"],
                     hp_test_set_size=dataloader_config.get("hp_test_set_size", None),
@@ -69,7 +66,7 @@ class ProfilePredictorTRB(TrainRunBuilder):
                     debug=dataloader_config.get("debug", False),
                 )
                 # Double check there's no source (non-target) data anywhere in here
-                non_target = set(dataset_config.dataset_paths.keys()) - {dataset_config.target_device}
+                non_target = set(config.dataset_paths.keys()) - {config.target_device}
                 if any((ds_train["ds_source"] == src).any() for src in non_target):
                     raise ValueError(
                         "Historic data found in training set for exnihilo training_data option. Please check the dataset construction logic."
@@ -78,7 +75,6 @@ class ProfilePredictorTRB(TrainRunBuilder):
             logger.info(f"Using transfer learning dataloader with domain adaptation {dataloader_config['domain_adaptation']}")
             ds_train, ds_val = get_train_test_datasets(
                 training_data=training_data,
-                data_normalization=dataloader_config["data_normalization"],
                 domain_adaptation=dataloader_config["domain_adaptation"],
                 num_hp_shots=dataloader_config["num_hp_shots"],
                 hp_test_set_size=dataloader_config.get("hp_test_set_size", None),
@@ -172,7 +168,7 @@ class ProfilePredictorTRB(TrainRunBuilder):
     @staticmethod
     def get_loss_fn(loss_config: dict) -> Callable[[Any, Any], jnp.ndarray]:
         if "device_weights" not in loss_config:
-            device_weights = dict.fromkeys(dataset_config.dataset_paths, 1.0)
+            device_weights = dict.fromkeys(config.dataset_paths, 1.0)
         else:
             device_weights = loss_config["device_weights"]
 
@@ -193,7 +189,7 @@ class ProfilePredictorTRB(TrainRunBuilder):
             sample_weights = jnp.ones(ds_source_idx.shape, dtype=ne_huber.dtype)
             for device, weight in device_weights.items():
                 sample_weights = jnp.where(
-                    ds_source_idx == dataset_config.ds_source_to_idx[device],
+                    ds_source_idx == config.ds_source_to_idx[device],
                     weight,
                     sample_weights,
                 )

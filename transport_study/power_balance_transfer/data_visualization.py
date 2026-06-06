@@ -18,7 +18,7 @@ from transport_study.orchestration.organize_data import (
 
 def _td(s: str) -> TrainingData:
     """Parse string like 'cmod_tcv' into TrainingData."""
-    return TrainingData(sources=frozenset(s.split("_")))
+    return TrainingData(sources_unsorted=s.split("_"))
 
 
 BACKGROUND_COLOR = "#2F2F2F"

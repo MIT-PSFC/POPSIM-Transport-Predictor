@@ -31,9 +31,9 @@ HYPERPARAM_TARGET_SHOTS = 0
 def _parse_training_data(s: str, dataset_paths: dict, target_device: str | None) -> TrainingData:
     """Convert a string like 'cmod_tcv' or 'exnihilo' to a TrainingData object."""
     if s == "exnihilo":
-        non_target = frozenset(dataset_paths.keys()) - ({target_device} if target_device else set())
+        non_target = set(dataset_paths.keys()) - ({target_device} if target_device else set())
         return TrainingData(sources_unsorted=non_target, exnihilo=True)
-    return TrainingData(sources_unsorted=frozenset(s.split("_")))
+    return TrainingData(sources_unsorted=s.split("_"))
 
 
 class ProfileStudy(Study):
@@ -436,7 +436,7 @@ class ProfileStudy(Study):
     def _hyperparam_training_data(cls) -> TrainingData:
         """All configured non-target source devices - the canonical hyperparam case."""
         target = config.target_device
-        sources = frozenset(config.dataset_paths.keys()) - ({target} if target else set())
+        sources = sorted(set(config.dataset_paths.keys()) - ({target} if target else set()))
         return TrainingData(sources_unsorted=sources)
 
     #############
