@@ -45,13 +45,20 @@ class ProfileStudy(Study):
         data_normalization_methods: tuple[str, ...] = Field(default_factory=lambda: ("physics",))
         domain_adaptation_methods: tuple[str | None, ...] = Field(default_factory=lambda: (None, "mixing", "transfer"))
         freeze_shapes_options: tuple[bool, ...] = Field(default_factory=lambda: (True,))
-        num_hp_shots_options: tuple[int, ...] = Field(default_factory=lambda: (0, 1, 10, -1))
+        num_target_shots_options: tuple[int, ...] = Field(default_factory=lambda: (0, 1, 10, -1))
         target_test_set_size: int
         # configurations for the hyperparameter tuning case
         hyperparam_data_normalization: str = "physics"
         hyperparam_domain_adaptation: str | None = None
         hyperparam_freeze_shapes: bool = True
         hyperparam_num_target_test_shots: int = -1
+        # Misc configurations
+        dataset_sizes: dict[str, int] = Field(
+            default_factory=dict
+        )  # Optional dict of dataset sizes to use for weighting during domain adaptation, only used if domain_adaptation includes "mixing"
+        dataset_weights: dict[str, float] = Field(
+            default_factory=dict
+        )  # Optional dict of dataset weights to use during domain adaptation, only used if domain_adaptation includes "mixing". If not provided, will be calculated based on dataset_sizes so the target device is weighted as 50% of the total contribution and the other devices are weighted proportionally to their size.
 
         @field_validator("model_types")
         @classmethod
@@ -167,7 +174,7 @@ class ProfileStudy(Study):
             config.data_normalization_methods,
             config.domain_adaptation_methods,
             config.freeze_shapes_options,
-            config.num_hp_shots_options,
+            config.num_target_shots_options,
         )
         super().__init__(config.study_name, config.working_dir_base, cases)
 
@@ -176,7 +183,7 @@ class ProfileStudy(Study):
         logger.info(f"Data normalization methods: {config.data_normalization_methods}")
         logger.info(f"Domain adaptation methods: {config.domain_adaptation_methods}")
         logger.info(f"Freeze shapes options: {config.freeze_shapes_options}")
-        logger.info(f"Number of high-performance shots options: {config.num_hp_shots_options}")
+        logger.info(f"Number of target shots included in training options: {config.num_target_shots_options}")
 
     @dataclass
     class Case(Study.Case):
@@ -203,7 +210,7 @@ class ProfileStudy(Study):
         freeze_shapes:
         - some profile predictors first use PCA to identify dominant shapes. these shapes may be frozen or modified during module training
 
-        num_hp_shots: The number of high-performance shots included in the training data, or -1 to include all high-performance shots (including all shots in training is cheating, but again answers the question of what is the best possible performance).
+        num_target_shots: The number of shots included in the training data from the target dataset, or -1 to include all shots (including all shots in training is cheating, but again answers the question of what is the best possible performance).
         """
 
         model_type: str
@@ -211,7 +218,7 @@ class ProfileStudy(Study):
         data_normalization: str  # raw, physics, z_score, coral
         domain_adaptation: str  # none, mixing, transfer
         freeze_shapes: bool
-        num_hp_shots: int  # Number of target shots included in training, or -1 for all (should be -1 if domain_adaptation is None)
+        num_target_shots: int  # Number of target shots included in training, or -1 for all (should be -1 if domain_adaptation is None)
         prereqs: (
             list[Study.Case] | None
         )  # If not None, this case depends on the results of another case, and should only be run after that case has been run
@@ -222,7 +229,7 @@ class ProfileStudy(Study):
                 and self.data_normalization == config.hyperparam_data_normalization
                 and self.domain_adaptation == config.hyperparam_domain_adaptation
                 and self.freeze_shapes == config.hyperparam_freeze_shapes
-                and self.num_hp_shots == config.hyperparam_num_hp_shots
+                and self.num_target_shots == config.hyperparam_num_target_shots
             ):
                 return True
             else:
@@ -231,7 +238,7 @@ class ProfileStudy(Study):
         def is_impossible(self) -> bool:
             """Some cases don't make sense to run. Mark those cases as impossible and raise an error if we try to run them."""
             # Can't do transfer learning or training from nothing with 0 target shots.
-            if (self.domain_adaptation == "transfer" or self.training_data.exnihilo) and self.num_hp_shots == 0:
+            if (self.domain_adaptation == "transfer" or self.training_data.exnihilo) and self.num_target_shots == 0:
                 return True
 
             # exnihilo means training from nothing - no source domain to adapt from
@@ -250,7 +257,7 @@ class ProfileStudy(Study):
                     data_normalization=config.hyperparam_data_normalization,
                     domain_adaptation=config.hyperparam_domain_adaptation,
                     freeze_shapes=config.hyperparam_freeze_shapes,
-                    num_hp_shots=config.hyperparam_num_hp_shots,
+                    num_target_shots=config.hyperparam_num_target_shots,
                 )
 
         def __init__(
@@ -260,7 +267,7 @@ class ProfileStudy(Study):
             data_normalization: str,
             domain_adaptation: str,
             freeze_shapes: bool,
-            num_hp_shots: int,
+            num_target_shots: int,
         ):
             if isinstance(training_data, str):
                 training_data = _parse_training_data(training_data, dict(config.dataset_paths), config.target_device)
@@ -269,7 +276,7 @@ class ProfileStudy(Study):
             self.data_normalization = data_normalization
             self.domain_adaptation = domain_adaptation
             self.freeze_shapes = freeze_shapes
-            self.num_hp_shots = num_hp_shots
+            self.num_target_shots = num_target_shots
 
             # Recursively add prereqs based on the logic of which cases depend on which other cases
             if model_type not in [
@@ -279,9 +286,9 @@ class ProfileStudy(Study):
             ]:
                 raise ValueError(f"Unknown model type: {model_type}")
             if domain_adaptation is None:
-                if not training_data.exnihilo and num_hp_shots != -1:
+                if not training_data.exnihilo and num_target_shots != -1:
                     raise ValueError(
-                        "If domain_adaptation is None and training data is not 'exnihilo', num_hp_shots must be -1 since this means we're training and testing on the same dataset and no high-performance data is being used"
+                        "If domain_adaptation is None and training data is not 'exnihilo', num_target_shots must be -1 since this means we're training and testing on the same dataset and no high-performance data is being used"
                     )
 
             prereqs = []
@@ -295,7 +302,7 @@ class ProfileStudy(Study):
                         data_normalization=config.hyperparam_data_normalization,
                         domain_adaptation=config.hyperparam_domain_adaptation,
                         freeze_shapes=config.hyperparam_freeze_shapes,
-                        num_hp_shots=config.hyperparam_num_hp_shots,
+                        num_target_shots=config.hyperparam_num_target_shots,
                     )
                 ]
 
@@ -311,7 +318,7 @@ class ProfileStudy(Study):
                         data_normalization=data_normalization,
                         domain_adaptation=None,
                         freeze_shapes=freeze_shapes,
-                        num_hp_shots=-1,
+                        num_target_shots=-1,
                     )
                 ]
 
@@ -322,9 +329,9 @@ class ProfileStudy(Study):
 
         def __str__(self):
             if self.domain_adaptation:
-                return f"case.{self.model_type}.td_{self.training_data}.da_{self.domain_adaptation}.freeze_{self.freeze_shapes}.hp_{self.num_hp_shots}"
+                return f"case.{self.model_type}.td_{self.training_data}.da_{self.domain_adaptation}.freeze_{self.freeze_shapes}.targ_{self.num_target_shots}"
             elif self.training_data.exnihilo:
-                return f"case.{self.model_type}.td_{self.training_data}.freeze_{self.freeze_shapes}.hp_{self.num_hp_shots}"
+                return f"case.{self.model_type}.td_{self.training_data}.freeze_{self.freeze_shapes}.targ_{self.num_target_shots}"
             else:
                 return f"case.{self.model_type}.td_{self.training_data}.freeze_{self.freeze_shapes}"
 
@@ -337,7 +344,7 @@ class ProfileStudy(Study):
                         self.data_normalization,
                         self.domain_adaptation,
                         self.freeze_shapes,
-                        self.num_hp_shots,
+                        self.num_target_shots,
                     )
                 )
             elif self.training_data.exnihilo:
@@ -347,7 +354,7 @@ class ProfileStudy(Study):
                         self.training_data,
                         self.data_normalization,
                         self.freeze_shapes,
-                        self.num_hp_shots,
+                        self.num_target_shots,
                     )
                 )
             else:
@@ -368,7 +375,7 @@ class ProfileStudy(Study):
         data_normalization_methods,
         domain_adaptation_methods,
         freeze_shapes_options,
-        num_hp_shots_options,
+        num_target_shots_options,
     ):
         cases = []
         # Make every case we're interested in for this study
@@ -378,20 +385,20 @@ class ProfileStudy(Study):
             data_normalization,
             domain_adaptation,
             freeze_shapes,
-            num_hp_shots,
+            num_target_shots,
         ) in product(
             model_types,
             training_datasets,
             data_normalization_methods,
             domain_adaptation_methods,
             freeze_shapes_options,
-            num_hp_shots_options,
+            num_target_shots_options,
         ):
             if domain_adaptation is None:
                 if training_dataset.exnihilo:
-                    if num_hp_shots == 0:
+                    if num_target_shots == 0:
                         continue  # Can't train from nothing with 0 target shots
-                elif num_hp_shots != -1:
+                elif num_target_shots != -1:
                     continue  # Invalid case, skip
             if model_type == "unstructured_nn" and not freeze_shapes:
                 continue  # No shapes to freeze, just do one of the two
@@ -402,7 +409,7 @@ class ProfileStudy(Study):
                 data_normalization=data_normalization,
                 domain_adaptation=domain_adaptation,
                 freeze_shapes=freeze_shapes,
-                num_hp_shots=num_hp_shots,
+                num_target_shots=num_target_shots,
             )
 
             cases.append(case)
@@ -467,8 +474,8 @@ class ProfileStudy(Study):
             "training_data": case.training_data,
             "data_normalization": case.data_normalization,
             "domain_adaptation": case.domain_adaptation,
-            "num_hp_shots": case.num_hp_shots,
-            "hp_test_set_size": config.hp_test_set_size,
+            "num_target_shots": case.num_target_shots,
+            "target_test_set_size": config.target_test_set_size,
             "prng_seed": 42,
             "debug": config.debug,
             # Hyperparameters
@@ -492,22 +499,22 @@ class ProfileStudy(Study):
         }
         if case.domain_adaptation == "mixing":
             # Special logic for loss weighting when doing mixing domain adaptation
-            # Assuming ~1000 shots of historic data for C-Mod and TCV and DIII-D low-performance, and num_hp_shots of DIII-D high-performance
+            # Assuming ~1000 shots of historic data for C-Mod and TCV and DIII-D low-performance, and num_target_shots of DIII-D high-performance
             # we want the high-performance data to be consistently heavily weighted
             # Weights are chosen so that each device's effective contribution F_x = W_x * N_x
-            # (where N_x is the shot count) sums to 200, with d3d_hp carrying ~50% of that total.
+            # (where N_x is the shot count) sums to 200, with target carrying ~50% of that total.
             # So the C-Mod and TCV data each make up 40 out of 200,
             # the DIII-D low-performance data makes up 60 out of 200,
             # and the DIII-D high-performance data makes up 100 out of 200
             W_c = 20 / 1000
             W_t = 20 / 1000
             W_dlp = 60 / 1000
-            if case.num_hp_shots in [-1, 0]:
+            if case.num_target_shots in [-1, 0]:
                 # If -1, all 97 high-performance shots in the DIII-D dataset
                 # If 0, weights aren't being used anyway
                 N_dhp = 97
             else:
-                N_dhp = case.num_hp_shots
+                N_dhp = case.num_target_shots
             W_dhp = 100 / N_dhp
             # Multiply all by 100 to get back to a value ~1
             dataloader_config_base["device_weights"] = {
@@ -599,7 +606,7 @@ class ProfileStudy(Study):
                 data_normalization=case.data_normalization,
                 domain_adaptation=None,
                 freeze_shapes=case.freeze_shapes,
-                num_hp_shots=-1,
+                num_target_shots=-1,
             )
             transfer_case_model_dir = self.trained_model_dir(transfer_case)
 
@@ -675,7 +682,7 @@ class ProfileStudy(Study):
         - data_normalization(case_idx)
         - domain_adaptation(case_idx)
         - freeze_shapes(case_idx)
-        - num_hp_shots(case_idx)
+        - num_target_shots(case_idx)
         Data variables: (E is either relative 'rel' or absolute 'abs', and D is dimension either 'shot' or per-timeslice 'ts')
         - error_E_D_mean(case_idx)
         - error_E_D_std(case_idx)
@@ -736,7 +743,7 @@ class ProfileStudy(Study):
                     "data_normalization": case.data_normalization,
                     "domain_adaptation": case.domain_adaptation,
                     "freeze_shapes": case.freeze_shapes,
-                    "num_hp_shots": case.num_hp_shots,
+                    "num_target_shots": case.num_target_shots,
                 }
             )
             results.append(result)

@@ -182,7 +182,7 @@ def test_study_cmod_to_cmod():
         ],
         domain_adaptation_methods=[None, "mixing", "transfer"],
         num_hp_shots_options=[0, 1, -1],
-        hp_test_set_size=60,
+        target_test_set_size=60,
     )
 
     study = ProfileStudy(cfg)
