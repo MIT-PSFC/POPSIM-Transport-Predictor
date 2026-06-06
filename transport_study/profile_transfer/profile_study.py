@@ -442,30 +442,6 @@ class ProfileStudy(Study):
     #############
     # EXECUTION #
     #############
-    def _input_vars(self, case: Case) -> list[str]:
-        input_vars_base = [
-            "Ip_MA",
-            "B0",
-            "betan",
-            "ne20_edge",
-            "R0",
-            "a_minor",
-            "kappa",
-            "delta_top",
-            "delta_bot",
-        ]
-        if case.data_normalization == "physics":
-            input_vars = [
-                *input_vars_base,
-                "epsilon",
-                "q_star",
-                "f_G",
-                "aB0",
-            ]
-        else:
-            raise ValueError(f"Profile study only uses physics normalization, but got {case.data_normalization}")
-
-        return input_vars
 
     def make_train_config(self, case: Case) -> TrainConfig:
         """Make the TrainConfig for a given case
@@ -504,7 +480,7 @@ class ProfileStudy(Study):
             # Weights are chosen so that each device's effective contribution F_x = W_x * N_x
             # (where N_x is the shot count)
             # Typically, the target device is weighted most heavily
-            if config.dataset_sizes is None:
+            if not config.dataset_sizes:
                 logger.warning(
                     "Dataset sizes not provided in config, reading from disk. This will be slow, consider adding dataset sizes to the config."
                 )
@@ -516,7 +492,7 @@ class ProfileStudy(Study):
             else:
                 dataset_sizes = config.dataset_sizes
 
-            if config.dataset_fractions is None:
+            if not config.dataset_fractions:
                 logger.info(
                     "Dataset fractions not provided in config. Using 50% for target and dividing remaining 50% evenly among sources."
                 )
@@ -562,7 +538,17 @@ class ProfileStudy(Study):
                     # When doing hyperparameter tuning, this gets overwritten by the wandb agent
                     checkpoint_dir=str(self.trained_model_dir(case)),
                     dataloader_config={
-                        "input_vars": self._input_vars(case),
+                        "input_vars": [
+                            "Ip_MA",
+                            "B0",
+                            "betan",
+                            "ne20_edge",
+                            "R0",
+                            "a_minor",
+                            "kappa",
+                            "delta_top",
+                            "delta_bot",
+                        ],
                         "extra_vars": ["Te_shape", "ne_shape"],
                         **dataloader_config_base,
                     },
@@ -595,7 +581,17 @@ class ProfileStudy(Study):
                     # When doing hyperparameter tuning, this gets overwritten by the wandb agent
                     checkpoint_dir=str(self.trained_model_dir(case)),
                     dataloader_config={
-                        "input_vars": self._input_vars(case),
+                        "input_vars": [
+                            "Ip_MA",
+                            "B0",
+                            "betan",
+                            "ne20_edge",
+                            "R0",
+                            "a_minor",
+                            "kappa",
+                            "delta_top",
+                            "delta_bot",
+                        ],
                         **dataloader_config_base,
                     },
                     model_init_config={

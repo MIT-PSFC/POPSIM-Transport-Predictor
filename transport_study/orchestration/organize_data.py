@@ -584,7 +584,6 @@ def get_train_val_datasets(
     logger.debug("Historic Training dataset size: {}", train_ds.sizes[episode_coord])
     logger.debug("Historic Validation dataset size: {}", val_ds.sizes[episode_coord])
 
-    train_ds, val_ds = normalize_domain(train_ds, val_ds, method="physics")
     return train_ds, val_ds
 
 
