@@ -222,6 +222,9 @@ def test_study_cmod_to_cmod_no_tuning():
             if not study.result_path(case).exists():
                 study.run_case(case, skip_tuning=True, enable_parallelism=False)
 
+    ds_final = study.collect_results()
+    ds_final.to_netcdf(study.collected_results_path())
+
 
 def test_study_cmod_to_cmod_with_tuning():
     working_dir_base = PACKAGE_ROOT / "tests" / "profile_transfer" / "working_dir_base"

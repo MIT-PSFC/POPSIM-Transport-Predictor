@@ -694,6 +694,11 @@ class ProfileStudy(Study):
     def collect_results(self):
         """Collect results from all cases and combine them into a single xarray dataset for analysis and visualization.
 
+        TODO(ZanderKeith): Cristina really wants more fine-grained statistics for specific situations
+        - rampup vs flattop vs rampdown
+        - H mode vs L mode
+        - disruptive vs non-disruptive shots
+
         Dims: case_idx, shot_idx
         Coords:
         - shot(case_idx, shot_idx)
