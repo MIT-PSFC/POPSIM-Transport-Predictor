@@ -216,8 +216,12 @@ def test_study_cmod_to_cmod():
     )
 
     study = ProfileStudy(cfg)
-    logger.critical("Running test_study_cmod_to_cmod...")
-    pass
+
+    # Ensure each case can be run
+    while len(study.get_unfinished_cases()) > 0:
+        for case in study.get_unfinished_cases():
+            if not study.result_path(case).exists():
+                study.run_case(case)
 
 
 if __name__ == "__main__":

@@ -103,18 +103,23 @@ class Study:
             "mixing",
             "transfer",
         ):
-            target = self.dataset_config.target_device
-            if target is None:
-                logger.warning(f"Case {case} requires a target device but PTPS_DS_TARGET is not set. Skipping.")
-                return False
-            required.add(target)
+            required.add(config.target_device)
 
-        missing = [ds for ds in required if ds not in self.dataset_config.dataset_paths]
+        missing = [ds for ds in required if ds not in config.dataset_paths]
         if missing:
             logger.warning(f"Case {case} is missing required datasets: {missing}. Skipping this case.")
             return False
 
         return True
+
+    def get_unfinished_cases(self) -> list[Case]:
+        unfinished = []
+        for case in self.cases:
+            if not self.result_path(case).exists():
+                if not self.check_data_requirements(case):
+                    logger.debug(f"Case {case} is missing required data, skipping.")
+                unfinished.append(case)
+        return unfinished
 
     def run_case(
         self,

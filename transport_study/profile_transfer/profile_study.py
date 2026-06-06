@@ -522,7 +522,9 @@ class ProfileStudy(Study):
                 dataset_fractions = {}
                 num_sources = len(config.dataset_paths) - 1
                 dataset_fractions[config.target_device] = 0.5
-                dataset_fractions = {device: 0.5 / num_sources for device in config.dataset_paths if device != config.target_device}
+                for device in config.dataset_paths:
+                    if device != config.target_device:
+                        dataset_fractions[device] = 0.5 / num_sources
             else:
                 dataset_fractions = config.dataset_fractions
 
