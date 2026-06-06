@@ -60,10 +60,9 @@ class ProfilePredictorTRB(TrainRunBuilder):
                 ds_train, ds_val = get_train_test_datasets(
                     training_data=training_data,
                     domain_adaptation=None,
-                    num_hp_shots=dataloader_config["num_hp_shots"],
-                    hp_test_set_size=dataloader_config.get("hp_test_set_size", None),
+                    num_target_shots=dataloader_config["num_target_shots"],
+                    target_test_set_size=dataloader_config.get("target_test_set_size", None),
                     study_type="profile_transfer",
-                    debug=dataloader_config.get("debug", False),
                 )
                 # Double check there's no source (non-target) data anywhere in here
                 non_target = set(config.dataset_paths.keys()) - {config.target_device}
@@ -76,10 +75,9 @@ class ProfilePredictorTRB(TrainRunBuilder):
             ds_train, ds_val = get_train_test_datasets(
                 training_data=training_data,
                 domain_adaptation=dataloader_config["domain_adaptation"],
-                num_hp_shots=dataloader_config["num_hp_shots"],
-                hp_test_set_size=dataloader_config.get("hp_test_set_size", None),
+                num_target_shots=dataloader_config["num_target_shots"],
+                target_test_set_size=dataloader_config.get("target_test_set_size", None),
                 study_type="profile_transfer",
-                debug=dataloader_config.get("debug", False),
             )
 
         # Drop time_idx as a shared coordinate — it has duplicate values across shots and

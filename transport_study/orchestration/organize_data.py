@@ -590,20 +590,19 @@ def get_train_val_datasets(
 def get_train_test_datasets(
     training_data: "TrainingData",
     domain_adaptation: str,
-    num_hp_shots: int,
-    hp_test_set_size: int,
+    num_target_shots: int,
+    target_test_set_size: int,
     study_type: str = "profile_transfer",
-    debug: bool | None = None,
 ):
     """
     Split dataset into training and test sets for the target learning case.
     If domain adaptation is 'mixing', makes a combined training set of historic data and target
     device shots. If domain adaptation is 'transfer' or training_data.exnihilo is True, removes
     all historic data from the training set, leaving only the target device shots.
-    The number of target shots included in training is specified by `num_hp_shots`.
+    The number of target shots included in training is specified by `num_target_shots`.
 
     The test set is always the same set of target device shots.
-    The training set is the historic data from training_data.sources plus num_hp_shots target shots.
+    The training set is the historic data from training_data.sources plus num_target_shots target shots.
 
     There is no validation set here since hyperparameters are not tuned on transfer learning data.
     We treat the test set as a validation set for checkpoint selection, which is slightly optimistic
@@ -614,25 +613,25 @@ def get_train_test_datasets(
         raise ValueError("config.target_device must be set before transfer learning")
 
     # Load the target device dataset and split into train/test
-    ds_hp, episode_coord = get_ds(target, study_type=study_type)
-    ds_hp = add_performance(ds_hp, episode_coord)
-    ds_hp, _ = normalize_domain(ds_hp, method="physics")
-    ds_hp["ds_source_idx"] = (
+    ds_target, episode_coord = get_ds(target, study_type=study_type)
+    ds_target = add_performance(ds_target, episode_coord)
+    ds_target, _ = normalize_domain(ds_target, method="physics")
+    ds_target["ds_source_idx"] = (
         episode_coord,
-        np.full(ds_hp.sizes[episode_coord], config.ds_source_to_idx[target]),
+        np.full(ds_target.sizes[episode_coord], config.ds_source_to_idx[target]),
     )
-    ds_hp = ds_hp.assign_coords(ds_source=target)
-    sorted_shots = np.argsort(ds_hp["performance"].values)
+    ds_target = ds_target.assign_coords(ds_source=target)
+    sorted_shots = np.argsort(ds_target["performance"].values)
 
-    test_shot_pool = sorted_shots[-hp_test_set_size:]
-    test_ds = ds_hp.isel({episode_coord: test_shot_pool})
+    test_shot_pool = sorted_shots[-target_test_set_size:]
+    test_ds = ds_target.isel({episode_coord: test_shot_pool})
 
-    if num_hp_shots == -1:
+    if num_target_shots == -1:
         # All available target shots in training and testing (upper-bound reference, CHEATING!)
-        train_ds_hp = ds_hp.isel({episode_coord: sorted_shots})
+        train_ds_hp = ds_target.isel({episode_coord: sorted_shots})
     else:
-        train_shot_pool = sorted_shots[:num_hp_shots]
-        train_ds_hp = ds_hp.isel({episode_coord: train_shot_pool})
+        train_shot_pool = sorted_shots[:num_target_shots]
+        train_ds_hp = ds_target.isel({episode_coord: train_shot_pool})
 
     # Load historic source data for training (and for exnihilo: normalization only)
     # exnihilo.sources contains all non-target devices, so we can pass training_data directly

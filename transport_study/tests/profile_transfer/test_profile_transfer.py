@@ -187,8 +187,6 @@ def test_config_save_load_with_dataset_weights():
 
 def test_study_cmod_to_cmod_no_tuning():
     working_dir_base = PACKAGE_ROOT / "tests" / "profile_transfer" / "working_dir_base"
-    if working_dir_base.exists():
-        shutil.rmtree(working_dir_base)
 
     cfg = ProfileStudy.Config(
         study_name="test_study_cmod_to_cmod",
@@ -210,6 +208,7 @@ def test_study_cmod_to_cmod_no_tuning():
             "exnihilo",
             "cmod-low",
         ],
+        dataset_sizes={"cmod-low": 100, "cmod-high": 100},
         domain_adaptation_methods=[None, "mixing", "transfer"],
         num_hp_shots_options=[0, 1, -1],
         target_test_set_size=60,
