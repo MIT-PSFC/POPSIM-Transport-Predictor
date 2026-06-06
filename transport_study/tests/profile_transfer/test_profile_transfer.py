@@ -185,7 +185,7 @@ def test_config_save_load_with_dataset_weights():
         assert cfg == loaded_cfg
 
 
-def test_study_cmod_to_cmod():
+def test_study_cmod_to_cmod_no_tuning():
     working_dir_base = PACKAGE_ROOT / "tests" / "profile_transfer" / "working_dir_base"
     if working_dir_base.exists():
         shutil.rmtree(working_dir_base)
@@ -221,12 +221,43 @@ def test_study_cmod_to_cmod():
     while len(study.get_unfinished_cases()) > 0:
         for case in study.get_unfinished_cases():
             if not study.result_path(case).exists():
-                study.run_case(case)
+                study.run_case(case, skip_tuning=True, enable_parallelism=False)
 
 
-if __name__ == "__main__":
-    fire.Fire(
-        {
-            "test_study_cmod_to_cmod": test_study_cmod_to_cmod,
-        }
+def test_study_cmod_to_cmod_with_tuning():
+    working_dir_base = PACKAGE_ROOT / "tests" / "profile_transfer" / "working_dir_base"
+    if working_dir_base.exists():
+        shutil.rmtree(working_dir_base)
+
+    cfg = ProfileStudy.Config(
+        study_name="test_study_cmod_to_cmod",
+        working_dir_base=working_dir_base,
+        dataset_paths={
+            "cmod-low": PACKAGE_ROOT / "datasets" / "sample" / "cmod_low_1.nc",
+            "cmod-high": PACKAGE_ROOT / "datasets" / "sample" / "cmod_high.nc",
+        },
+        target_device="cmod-high",
+        debug=True,
+        dry_run=False,
+        max_ds_size=20,
+        hyperparam_sweeps=2,
+        max_epochs=2,
+        epochs_per_val=1,
+        patience=2,
+        model_types=["unstructured_nn"],
+        training_datasets=[
+            "exnihilo",
+            "cmod-low",
+        ],
+        domain_adaptation_methods=[None, "mixing", "transfer"],
+        num_hp_shots_options=[0, -1],
+        target_test_set_size=60,
     )
+
+    study = ProfileStudy(cfg)
+
+    # Ensure each case can be run
+    while len(study.get_unfinished_cases()) > 0:
+        for case in study.get_unfinished_cases():
+            if not study.result_path(case).exists():
+                study.run_case(case, skip_tuning=False, enable_parallelism=False)

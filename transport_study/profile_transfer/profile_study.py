@@ -323,6 +323,7 @@ class ProfileStudy(Study):
                     )
                 ]
 
+            prereqs = list(dict.fromkeys(prereqs))
             if len(prereqs) > 0:
                 self.prereqs = prereqs
             else:
@@ -330,7 +331,7 @@ class ProfileStudy(Study):
 
         def __str__(self):
             if self.domain_adaptation:
-                return f"case.{self.model_type}.td_{self.training_data}.da_{self.domain_adaptation}.freeze_{self.freeze_shapes}.targ_{self.num_target_shots}"
+                return f"case.{self.model_type}.td_{self.training_data}.freeze_{self.freeze_shapes}.targ_{self.num_target_shots}.da_{self.domain_adaptation}"
             elif self.training_data.exnihilo:
                 return f"case.{self.model_type}.td_{self.training_data}.freeze_{self.freeze_shapes}.targ_{self.num_target_shots}"
             else:
@@ -496,7 +497,7 @@ class ProfileStudy(Study):
             "loss_config": loss_config_base,
         }
         test_eval_suite_config_base = {
-            "result_path": self.result_path(case),
+            "result_path": str(self.result_path(case)),
         }
         if case.domain_adaptation == "mixing":
             # Special logic for loss weighting when doing mixing domain adaptation
@@ -558,9 +559,8 @@ class ProfileStudy(Study):
                     max_epochs=config.max_epochs,
                     epochs_per_val=config.epochs_per_val,
                     patience=config.patience,
-                    checkpoint_dir=self.trained_model_dir(
-                        case
-                    ),  # When doing hyperparameter tuning, this gets overwritten by the wandb agent
+                    # When doing hyperparameter tuning, this gets overwritten by the wandb agent
+                    checkpoint_dir=str(self.trained_model_dir(case)),
                     dataloader_config={
                         "input_vars": self._input_vars(case),
                         "extra_vars": ["Te_shape", "ne_shape"],
@@ -592,9 +592,8 @@ class ProfileStudy(Study):
                     max_epochs=config.max_epochs,
                     epochs_per_val=config.epochs_per_val,
                     patience=config.patience,
-                    checkpoint_dir=self.trained_model_dir(
-                        case
-                    ),  # When doing hyperparameter tuning, this gets overwritten by the wandb agent
+                    # When doing hyperparameter tuning, this gets overwritten by the wandb agent
+                    checkpoint_dir=str(self.trained_model_dir(case)),
                     dataloader_config={
                         "input_vars": self._input_vars(case),
                         **dataloader_config_base,
@@ -647,7 +646,7 @@ class ProfileStudy(Study):
 
         tuned_config_path = self.tuned_config_path(case)
         if tuned_config_path.exists():
-            tuned_config = TrainConfig.load(tuned_config_path)
+            tuned_config = TrainConfig.load(str(tuned_config_path))
             logger.info(f"Found tuned hyperparameter config for case {case}, using hyperparameters from that config")
             # Restore hyperparameters from the tuned config, but keep the rest of the settings the same
 

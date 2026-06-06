@@ -151,6 +151,7 @@ class Study:
         if case.is_hyperparam_case() and not self._ensure_hyperparams_ready(case, skip_tuning, enable_parallelism):
             return
         if not self._no_blocking_jobs(case, enable_parallelism):
+            logger.debug("Blocking jobs still running, waiting before trying again...")
             return
         self.launch_train(case, enable_parallelism=enable_parallelism)
 
