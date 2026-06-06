@@ -1,8 +1,10 @@
+import shutil
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
 import fire
 import pytest
+from loguru import logger
 
 from transport_study import PACKAGE_ROOT
 from transport_study.config import StudyConfig, load_config
@@ -184,9 +186,13 @@ def test_config_save_load_with_dataset_weights():
 
 
 def test_study_cmod_to_cmod():
+    working_dir_base = PACKAGE_ROOT / "tests" / "profile_transfer" / "working_dir_base"
+    if working_dir_base.exists():
+        shutil.rmtree(working_dir_base)
+
     cfg = ProfileStudy.Config(
         study_name="test_study_cmod_to_cmod",
-        working_dir_base=PACKAGE_ROOT / "tests" / "profile_transfer" / "working_dir_base",
+        working_dir_base=working_dir_base,
         dataset_paths={
             "cmod-low": PACKAGE_ROOT / "datasets" / "sample" / "cmod_low_1.nc",
             "cmod-high": PACKAGE_ROOT / "datasets" / "sample" / "cmod_high.nc",
@@ -210,6 +216,8 @@ def test_study_cmod_to_cmod():
     )
 
     study = ProfileStudy(cfg)
+    logger.critical("Running test_study_cmod_to_cmod...")
+    pass
 
 
 if __name__ == "__main__":

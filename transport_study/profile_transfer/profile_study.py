@@ -23,6 +23,10 @@ from transport_study.orchestration.wandb_utils import (
     run_clean_sweeps,
 )
 
+# When domain adaptation is None, we aren't using any target data during training anyway so this is unused
+# During domain adaptation, we aren't doing hyperparameter tuning
+HYPERPARAM_TARGET_SHOTS = 0
+
 
 def _parse_training_data(s: str, dataset_paths: dict, target_device: str | None) -> TrainingData:
     """Convert a string like 'cmod_tcv' or 'exnihilo' to a TrainingData object."""
@@ -51,7 +55,7 @@ class ProfileStudy(Study):
         hyperparam_data_normalization: str = "physics"
         hyperparam_domain_adaptation: str | None = None
         hyperparam_freeze_shapes: bool = True
-        hyperparam_num_target_test_shots: int = -1
+        hyperparam_num_target_shots: int = HYPERPARAM_TARGET_SHOTS
         # Misc configurations
         dataset_sizes: dict[str, int] = Field(
             default_factory=dict
@@ -131,7 +135,7 @@ class ProfileStudy(Study):
                 and self.hyperparam_data_normalization == cfg.hyperparam_data_normalization
                 and self.hyperparam_domain_adaptation == cfg.hyperparam_domain_adaptation
                 and self.hyperparam_freeze_shapes == cfg.hyperparam_freeze_shapes
-                and self.hyperparam_num_target_test_shots == cfg.hyperparam_num_target_test_shots
+                and self.hyperparam_num_target_shots == cfg.hyperparam_num_target_shots
                 and self.dataset_sizes == cfg.dataset_sizes
                 and self.dataset_fractions == cfg.dataset_fractions
             )
@@ -215,7 +219,7 @@ class ProfileStudy(Study):
         data_normalization: str  # raw, physics, z_score, coral
         domain_adaptation: str  # none, mixing, transfer
         freeze_shapes: bool
-        num_target_shots: int  # Number of target shots included in training, or -1 for all (should be -1 if domain_adaptation is None)
+        num_target_shots: int  # Number of target shots included in training, or -1 for all (should be HYPERPARAM_TARGET_SHOTS if domain_adaptation is None)
         prereqs: (
             list[Study.Case] | None
         )  # If not None, this case depends on the results of another case, and should only be run after that case has been run
@@ -283,9 +287,9 @@ class ProfileStudy(Study):
             ]:
                 raise ValueError(f"Unknown model type: {model_type}")
             if domain_adaptation is None:
-                if not training_data.exnihilo and num_target_shots != -1:
+                if not training_data.exnihilo and num_target_shots != HYPERPARAM_TARGET_SHOTS:
                     raise ValueError(
-                        "If domain_adaptation is None and training data is not 'exnihilo', num_target_shots must be -1 since this means we're training and testing on the same dataset and no high-performance data is being used"
+                        "If domain_adaptation is None and training data is not 'exnihilo', num_target_shots must be HYPERPARAM_TARGET_SHOTS since this means we're training and testing on the same dataset"
                     )
 
             prereqs = []
@@ -315,7 +319,7 @@ class ProfileStudy(Study):
                         data_normalization=data_normalization,
                         domain_adaptation=None,
                         freeze_shapes=freeze_shapes,
-                        num_target_shots=-1,
+                        num_target_shots=HYPERPARAM_TARGET_SHOTS,
                     )
                 ]
 
@@ -395,7 +399,7 @@ class ProfileStudy(Study):
                 if training_dataset.exnihilo:
                     if num_target_shots == 0:
                         continue  # Can't train from nothing with 0 target shots
-                elif num_target_shots != -1:
+                elif num_target_shots != HYPERPARAM_TARGET_SHOTS:
                     continue  # Invalid case, skip
             if model_type == "unstructured_nn" and not freeze_shapes:
                 continue  # No shapes to freeze, just do one of the two
@@ -626,7 +630,7 @@ class ProfileStudy(Study):
                 data_normalization=case.data_normalization,
                 domain_adaptation=None,
                 freeze_shapes=case.freeze_shapes,
-                num_target_shots=-1,
+                num_target_shots=HYPERPARAM_TARGET_SHOTS,
             )
             transfer_case_model_dir = self.trained_model_dir(transfer_case)
 

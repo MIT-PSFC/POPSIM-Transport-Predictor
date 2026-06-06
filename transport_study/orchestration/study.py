@@ -328,7 +328,7 @@ class Study:
         config_path = self.working_dir / CONFIG_LOCK_FILENAME
         if config_path.exists():
             saved = config.from_toml(config_path)
-            if saved != config:
+            if not config.is_compatible(saved):
                 raise RuntimeError(
                     f"Dataset config changed since study was created.\n"
                     f"Saved:   {saved}\n"
@@ -345,7 +345,7 @@ class Study:
         logger.info(f"Study name: {name}")
         logger.info(f"Working directory base: {working_dir_base}")
         logger.info(f"Total number of cases: {len(cases)}")
-        logger.info(f"High-performance test set size: {config.hp_test_set_size}")
+        logger.info(f"Target test set size: {config.target_test_set_size}")
         logger.info(f"Dataset paths: {config.dataset_paths}")
         logger.info(f"Target device: {config.target_device}")
 
