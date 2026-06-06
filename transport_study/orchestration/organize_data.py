@@ -535,7 +535,7 @@ def normalize_domain(  # noqa: PLR0915
 
 
 def get_train_val_datasets(
-    training_data: "TrainingData",
+    training_data: TrainingData,
     study_type: str = "profile_transfer",
 ):
     """

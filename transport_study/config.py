@@ -3,13 +3,14 @@ Load and parse configuration files for the project.
 This is where we set global variables from env vars or config files
 """
 
+import os
 import tomllib
 from pathlib import Path
 from types import MappingProxyType
 
 import toml
 from dynaconf import Dynaconf
-from pydantic import BaseModel, ConfigDict, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from transport_study import PACKAGE_ROOT
 
@@ -38,7 +39,7 @@ class StudyConfig(BaseModel):
     # Environment-specific orchestration settings
     partition: str | None = None
     buffer_gpus: int = 12
-    wandb_entity: str | None = None
+    wandb_entity: str | None = Field(default_factory=lambda: os.environ.get("PTPS_WANDB_ENTITY"))
     scratch_dir: Path | None = (
         None  # TODO(ZanderKeith): Only used for intermediate results from trajectory optimization, can be put in that study config instead
     )

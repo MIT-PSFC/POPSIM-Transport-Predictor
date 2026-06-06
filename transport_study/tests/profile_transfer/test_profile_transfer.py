@@ -186,7 +186,9 @@ def test_config_save_load_with_dataset_weights():
 
 
 def test_study_cmod_to_cmod_no_tuning():
-    working_dir_base = PACKAGE_ROOT / "tests" / "profile_transfer" / "working_dir_base"
+    working_dir_base = PACKAGE_ROOT / "tests" / "profile_transfer" / "cmod_to_cmod_no_tuning"
+    if working_dir_base.exists():
+        shutil.rmtree(working_dir_base)
 
     cfg = ProfileStudy.Config(
         study_name="test_study_cmod_to_cmod",
@@ -227,7 +229,7 @@ def test_study_cmod_to_cmod_no_tuning():
 
 
 def test_study_cmod_to_cmod_with_tuning():
-    working_dir_base = PACKAGE_ROOT / "tests" / "profile_transfer" / "working_dir_base"
+    working_dir_base = PACKAGE_ROOT / "tests" / "profile_transfer" / "cmod_to_cmod_with_tuning"
     if working_dir_base.exists():
         shutil.rmtree(working_dir_base)
 

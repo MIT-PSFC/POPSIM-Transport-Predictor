@@ -1,30 +1,31 @@
 import subprocess
 from typing import Any
 
-import wandb
 from loguru import logger
 from popsim.ml import TrainConfig
 
+import wandb
+from transport_study.config import config
 
-def get_project(project: str, entity: str | None = None):
+
+def get_project(project: str):
     api = wandb.Api()
 
-    if entity is None:
-        logger.critical("WANDB_ENTITY is not set, cannot check if project exists.")
-        return False
+    if config.wandb_entity is None:
+        raise ValueError("WANDB_ENTITY is not set, cannot check if project exists.")
 
     try:
-        project_obj = api.project(project, entity=entity)
+        project_obj = api.project(project, entity=config.wandb_entity)
         len(project_obj.sweeps())  # Try to access sweeps to confirm project exists
         return project_obj
-    except Exception:
+    except ValueError:
         return None
 
 
-def get_completed_runs(project: str, entity: str | None = None) -> list[Any]:
+def get_completed_runs(project: str) -> list[Any]:
     api = wandb.Api()
 
-    project_obj = get_project(project, entity)
+    project_obj = get_project(project)
     if project_obj is None:
         logger.warning(f"No wandb project found for {project}, assuming no completed runs.")
         return []
@@ -38,7 +39,7 @@ def get_completed_runs(project: str, entity: str | None = None) -> list[Any]:
                 completed_runs.append(run)
             elif run_state in ["crashed", "failed"]:
                 run.delete()  # Clean up failed runs since they won't be useful and just take up space
-    except Exception as e:
+    except ValueError as e:
         logger.warning(f"No wandb runs found for {project}, assuming no completed runs.")
         logger.debug(e)
         completed_runs = []
@@ -60,8 +61,8 @@ def get_best_train_config(project: str) -> TrainConfig | None:
     return train_config
 
 
-def get_sweep_id(project: str, entity: str | None = None) -> str | None:
-    project_obj = get_project(project, entity)
+def get_sweep_id(project: str) -> str | None:
+    project_obj = get_project(project)
     if project_obj is None:
         logger.warning(f"No wandb project found for {project}, assuming no sweeps.")
         return None
@@ -85,7 +86,7 @@ def get_sweep_id(project: str, entity: str | None = None) -> str | None:
         return None
 
 
-def run_clean_sweeps(projects: list[str], entity: str | None = None):
+def run_clean_sweeps(projects: list[str]):
     def _delete_sweep(sweep):
         sweep_str = f"{sweep.entity}/{sweep.project}/{sweep.id}"
         result = subprocess.run(
@@ -103,7 +104,7 @@ def run_clean_sweeps(projects: list[str], entity: str | None = None):
 
     for project in projects:
         try:
-            project_obj = get_project(project, entity)
+            project_obj = get_project(project)
             if project_obj is None:
                 logger.warning(f"No wandb project found for {project}, skipping sweep cleanup.")
                 continue

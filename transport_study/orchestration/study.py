@@ -3,7 +3,6 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
-import wandb
 import yaml
 from loguru import logger
 from popsim.ml import DataLoader, TrainConfig, Trainer
@@ -14,6 +13,7 @@ from popsim.ml.launch import (
 )
 from popsim.ml.train_config import load_dict
 
+import wandb
 from transport_study import PACKAGE_ROOT
 from transport_study.config import config
 from transport_study.orchestration.slurm_utils import (
@@ -167,7 +167,7 @@ class Study:
             return True
         completed_runs = get_completed_runs(self.wandb_project_name(case))
         if len(completed_runs) < config.hyperparam_sweeps:
-            logger.info(f"Hyperparameter sweeps incomplete, {len(completed_runs)}/{config.hyperparam_sweeps} runs")
+            logger.info(f"Hyperparameter sweeps incomplete\n{len(completed_runs)}/{config.hyperparam_sweeps} runs")
             self.launch_sweep(case, enable_parallelism=enable_parallelism)
             return False
         return self._finalize_sweep(case, enable_parallelism, completed_runs)
@@ -230,7 +230,7 @@ class Study:
         if not sweep_id:
             logger.info(f"No existing sweep found for case {case}, creating a new sweep")
             sweep_config_path = Path(PACKAGE_ROOT) / "profile_transfer" / "sweep_configs" / f"{case.model_type}.yaml"
-            sweep_config = load_dict(sweep_config_path)
+            sweep_config = load_dict(str(sweep_config_path))
             sweep_id = wandb.sweep(sweep_config, project=wandb_project_name)
 
         if enable_parallelism:

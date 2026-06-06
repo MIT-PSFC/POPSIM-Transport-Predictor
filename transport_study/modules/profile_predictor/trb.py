@@ -22,6 +22,7 @@ from transport_study.modules.profile_predictor.module import (
     pca_initial_guess,
 )
 from transport_study.orchestration.organize_data import (
+    TrainingData,
     get_train_test_datasets,
     get_train_val_datasets,
 )
@@ -49,6 +50,10 @@ class ProfilePredictorTRB(TrainRunBuilder):
         """
 
         training_data = dataloader_config["training_data"]
+
+        if isinstance(training_data, dict):  # when the config is passed from WandB, it's a dict
+            training_data = TrainingData(**training_data)
+
         if dataloader_config["domain_adaptation"] is None:
             logger.info("Using standard learning dataloader")
             if not training_data.exnihilo:
