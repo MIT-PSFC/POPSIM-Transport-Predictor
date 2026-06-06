@@ -9,6 +9,7 @@ from pathlib import Path
 
 import fire
 import netCDF4  # noqa: F401
+import toml
 import xarray as xr
 from loguru import logger
 from popsim.ml import TrainConfig
@@ -16,7 +17,7 @@ from pydantic import Field, field_validator, model_validator
 
 from transport_study import PACKAGE_ROOT
 from transport_study.config import StudyConfig, config, load_config
-from transport_study.orchestration.organize_data import TrainingData, dataset_config
+from transport_study.orchestration.organize_data import TrainingData
 from transport_study.orchestration.study import Study
 from transport_study.orchestration.wandb_utils import (
     run_clean_sweeps,
@@ -45,12 +46,12 @@ class ProfileStudy(Study):
         domain_adaptation_methods: tuple[str | None, ...] = Field(default_factory=lambda: (None, "mixing", "transfer"))
         freeze_shapes_options: tuple[bool, ...] = Field(default_factory=lambda: (True,))
         num_hp_shots_options: tuple[int, ...] = Field(default_factory=lambda: (0, 1, 10, -1))
-        hp_test_set_size: int
+        target_test_set_size: int
         # configurations for the hyperparameter tuning case
         hyperparam_data_normalization: str = "physics"
         hyperparam_domain_adaptation: str | None = None
         hyperparam_freeze_shapes: bool = True
-        hyperparam_num_hp_shots: int = -1
+        hyperparam_num_target_test_shots: int = -1
 
         @field_validator("model_types")
         @classmethod
@@ -73,10 +74,11 @@ class ProfileStudy(Study):
         @classmethod
         def _validate_domain_adaptation(cls, v: tuple[str | None, ...]) -> tuple[str | None, ...]:
             valid = {None, "mixing", "transfer"}
-            for da in v:
+            converted = tuple(None if da == "none" else da for da in v)
+            for da in converted:
                 if da not in valid:
                     raise ValueError(f"Invalid domain adaptation: {da}. Must be one of {valid}.")
-            return v
+            return converted
 
         @model_validator(mode="before")
         @classmethod
@@ -103,6 +105,54 @@ class ProfileStudy(Study):
                 dataset_paths={k: Path(v) for k, v in datasets.items()},
                 target_device=target,
             )
+
+        def is_compatible(self, cfg: ProfileStudy.Config) -> bool:
+            """Check if two configs are compatible for running the same study
+            For the ProfileStudy, that means the following:
+            1: study name must match (used in WandB sweeps, etc.)
+            2: dataset paths must be identical
+            3: target device must be the same
+            4: target test set size must be the same
+            5: hyperparameter tuning configs must match
+            """
+            if self.study_name != cfg.study_name:
+                return False
+            if self.dataset_paths != cfg.dataset_paths:
+                return False
+            if self.target_device != cfg.target_device:
+                return False
+            if self.target_test_set_size != cfg.target_test_set_size:
+                return False
+            if (
+                self.hyperparam_data_normalization != cfg.hyperparam_data_normalization
+                or self.hyperparam_domain_adaptation != cfg.hyperparam_domain_adaptation
+                or self.hyperparam_freeze_shapes != cfg.hyperparam_freeze_shapes
+                or self.hyperparam_num_target_test_shots != cfg.hyperparam_num_target_test_shots
+            ):
+                return False
+            return True
+
+        def save(self, path: Path):
+            raw = self.model_dump()
+            datasets = {k: str(v) for k, v in self.dataset_paths.items()}
+            if self.target_device is not None:
+                datasets["target"] = self.target_device
+            skip = {"dataset_paths", "target_device", "training_datasets", "domain_adaptation_methods"}
+            data = {}
+            for k, v in raw.items():
+                if k in skip:
+                    continue
+                if v is None:
+                    continue
+                if isinstance(v, Path):
+                    data[k] = str(v)
+                else:
+                    data[k] = v
+            data["training_datasets"] = [str(td) for td in self.training_datasets]
+            data["domain_adaptation_methods"] = [da if da is not None else "none" for da in self.domain_adaptation_methods]
+            data["datasets"] = datasets
+            with open(path, "w") as f:
+                toml.dump(data, f)
 
     def __init__(
         self,
@@ -376,8 +426,8 @@ class ProfileStudy(Study):
     @classmethod
     def _hyperparam_training_data(cls) -> TrainingData:
         """All configured non-target source devices - the canonical hyperparam case."""
-        target = dataset_config.target_device
-        sources = frozenset(dataset_config.dataset_paths.keys()) - ({target} if target else set())
+        target = config.target_device
+        sources = frozenset(config.dataset_paths.keys()) - ({target} if target else set())
         return TrainingData(sources_unsorted=sources)
 
     #############

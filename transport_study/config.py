@@ -7,6 +7,7 @@ import tomllib
 from pathlib import Path
 from types import MappingProxyType
 
+import toml
 from dynaconf import Dynaconf
 from pydantic import BaseModel, ConfigDict, model_validator
 
@@ -61,6 +62,29 @@ class StudyConfig(BaseModel):
             dataset_paths={k: Path(v) for k, v in datasets.items()},
             target_device=target,
         )
+
+    def is_compatible(self, cfg: "StudyConfig") -> bool:
+        """Check if two configs are compatible for running the same study (e.g. dataset paths and target device must match)."""
+        return self.dataset_paths == cfg.dataset_paths and self.target_device == cfg.target_device
+
+    def save(self, path: Path):
+        raw = self.model_dump()
+        datasets = {k: str(v) for k, v in self.dataset_paths.items()}
+        if self.target_device is not None:
+            datasets["target"] = self.target_device
+        data = {}
+        for k, v in raw.items():
+            if k in ("dataset_paths", "target_device"):
+                continue
+            if v is None:
+                continue
+            if isinstance(v, Path):
+                data[k] = str(v)
+            else:
+                data[k] = v
+        data["datasets"] = datasets
+        with open(path, "w") as f:
+            toml.dump(data, f)
 
 
 class _ConfigProxy:

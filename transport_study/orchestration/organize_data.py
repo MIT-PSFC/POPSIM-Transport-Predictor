@@ -19,7 +19,7 @@ from transport_study.config import TRAIN_VAL_SPLIT, config
 class TrainingData:
     """Specifies which source devices to use for training.
 
-    sources: frozenset of device keys (must be registered in DatasetConfig)
+    sources: frozenset of device keys
     exnihilo: if True, load sources for normalization only - strip them from the
               actual training set, leaving only target device shots.
     """
@@ -32,13 +32,6 @@ class TrainingData:
             return "exnihilo"
         return "_".join(sorted(self.sources))
 
-    def __post_init__(self):
-        paths_from_env = set(config.dataset_paths.keys())
-        if paths_from_env:  # Skip validation if config not yet loaded (e.g. tests)
-            unknown = set(self.sources) - paths_from_env
-            if unknown:
-                raise ValueError(f"Unknown dataset sources: {unknown}. Known: {paths_from_env}")
-
     @property
     def sources(self) -> list[str]:
         """Sources in deterministic order for stable concatenation and indexing."""
@@ -46,7 +39,7 @@ class TrainingData:
 
     @property
     def source_idxs(self) -> frozenset:
-        """Integer indices for all sources in this TrainingData, looked up from dataset_config."""
+        """Integer indices for all sources in this TrainingData, looked up from global config."""
         return frozenset(config.ds_source_to_idx[s] for s in self.sources)
 
 

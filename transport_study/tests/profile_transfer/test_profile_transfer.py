@@ -1,3 +1,6 @@
+from pathlib import Path
+from tempfile import TemporaryDirectory
+
 import fire
 import pytest
 
@@ -6,8 +9,157 @@ from transport_study.config import StudyConfig, load_config
 from transport_study.profile_transfer.profile_study import ProfileStudy, run_study
 
 
+def test_compatible_configs():
+    # Base config to compare against
+    cfg1 = ProfileStudy.Config(
+        # Super
+        study_name="test_study",
+        dataset_paths={
+            "cmod-low": "path/to/cmod_low.nc",
+            "cmod-high": "path/to/cmod_high.nc",
+        },
+        target_device="cmod-high",
+        # ProfileStudy
+        working_dir_base=PACKAGE_ROOT / "tests" / "profile_transfer" / "test_compatible_configs",
+        training_datasets=("exnihilo", "cmod-low"),
+        target_test_set_size=60,
+    )
+
+    # Config that should match
+    cfg2 = ProfileStudy.Config(
+        # Super
+        study_name="test_study",
+        dataset_paths={
+            "cmod-low": "path/to/cmod_low.nc",
+            "cmod-high": "path/to/cmod_high.nc",
+        },
+        target_device="cmod-high",
+        # ProfileStudy
+        working_dir_base=PACKAGE_ROOT / "tests" / "profile_transfer" / "test_compatible_configs",
+        training_datasets=("exnihilo", "cmod-low"),
+        target_test_set_size=60,
+    )
+    assert cfg1.is_compatible(cfg2)
+
+    # Config that differs in name
+    cfg3 = ProfileStudy.Config(
+        # Super
+        study_name="test_study_different_name",
+        dataset_paths={
+            "cmod-low": "path/to/cmod_low.nc",
+            "cmod-high": "path/to/cmod_high.nc",
+        },
+        target_device="cmod-high",
+        # ProfileStudy
+        working_dir_base=PACKAGE_ROOT / "tests" / "profile_transfer" / "test_compatible_configs",
+        training_datasets=("exnihilo", "cmod-low"),
+        target_test_set_size=60,
+    )
+    assert not cfg1.is_compatible(cfg3)
+
+    # Config that differs in dataset paths
+    cfg4 = ProfileStudy.Config(
+        # Super
+        study_name="test_study",
+        dataset_paths={
+            "cmod-low": "new/path/to/cmod_low.nc",
+            "cmod-high": "path/to/cmod_high.nc",
+        },
+        target_device="cmod-high",
+        # ProfileStudy
+        working_dir_base=PACKAGE_ROOT / "tests" / "profile_transfer" / "test_compatible_configs",
+        training_datasets=("exnihilo", "cmod-low"),
+        target_test_set_size=60,
+    )
+    assert not cfg1.is_compatible(cfg4)
+
+    # Config that differs in target device
+    cfg5 = ProfileStudy.Config(
+        # Super
+        study_name="test_study",
+        dataset_paths={
+            "cmod-low": "path/to/cmod_low.nc",
+            "cmod-high": "path/to/cmod_high.nc",
+        },
+        target_device="cmod-low",
+        # ProfileStudy
+        working_dir_base=PACKAGE_ROOT / "tests" / "profile_transfer" / "test_compatible_configs",
+        training_datasets=("exnihilo", "cmod-low"),
+        target_test_set_size=60,
+    )
+    assert not cfg1.is_compatible(cfg5)
+
+    # Config that differs in target test set size
+    cfg6 = ProfileStudy.Config(
+        # Super
+        study_name="test_study",
+        dataset_paths={
+            "cmod-low": "path/to/cmod_low.nc",
+            "cmod-high": "path/to/cmod_high.nc",
+        },
+        target_device="cmod-high",
+        # ProfileStudy
+        working_dir_base=PACKAGE_ROOT / "tests" / "profile_transfer" / "test_compatible_configs",
+        training_datasets=("exnihilo", "cmod-low"),
+        target_test_set_size=20,
+    )
+    assert not cfg1.is_compatible(cfg6)
+
+    # Config that differs in one of the hyperparameter tuning settings
+    cfg7 = ProfileStudy.Config(
+        # Super
+        study_name="test_study",
+        dataset_paths={
+            "cmod-low": "path/to/cmod_low.nc",
+            "cmod-high": "path/to/cmod_high.nc",
+        },
+        target_device="cmod-high",
+        # ProfileStudy
+        working_dir_base=PACKAGE_ROOT / "tests" / "profile_transfer" / "test_compatible_configs",
+        training_datasets=("exnihilo", "cmod-low"),
+        target_test_set_size=60,
+        hyperparam_freeze_shapes=False,
+    )
+    assert not cfg1.is_compatible(cfg7)
+
+    # Config that differs in training datasets, but that should be fine
+    cfg8 = ProfileStudy.Config(
+        # Super
+        study_name="test_study",
+        dataset_paths={
+            "cmod-low": "path/to/cmod_low.nc",
+            "cmod-high": "path/to/cmod_high.nc",
+        },
+        target_device="cmod-high",
+        # ProfileStudy
+        working_dir_base=PACKAGE_ROOT / "tests" / "profile_transfer" / "test_compatible_configs",
+        training_datasets=("exnihilo"),
+        target_test_set_size=60,
+    )
+    assert cfg1.is_compatible(cfg8)
+
+
+def test_config_save_load():
+    with TemporaryDirectory() as tmpdir:
+        cfg = ProfileStudy.Config(
+            study_name="test_study_save_load",
+            dataset_paths={
+                "cmod-low": "path/to/cmod_low.nc",
+                "cmod-high": "path/to/cmod_high.nc",
+            },
+            target_device="cmod-high",
+            working_dir_base=Path(tmpdir) / "working_dir_base",
+            training_datasets=("exnihilo", "cmod-low"),
+            target_test_set_size=60,
+        )
+        save_path = Path(tmpdir) / "config.toml"
+        cfg.save(save_path)
+
+        loaded_cfg = ProfileStudy.Config.from_toml(save_path)
+        assert cfg == loaded_cfg
+
+
 def test_study_cmod_to_cmod():
-    print("beans")
     cfg = ProfileStudy.Config(
         study_name="test_study_cmod_to_cmod",
         working_dir_base=PACKAGE_ROOT / "tests" / "profile_transfer" / "working_dir_base",

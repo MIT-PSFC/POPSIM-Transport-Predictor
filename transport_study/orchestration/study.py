@@ -16,7 +16,6 @@ from popsim.ml.train_config import load_dict
 
 from transport_study import PACKAGE_ROOT
 from transport_study.config import config
-from transport_study.orchestration.organize_data import DatasetConfig, dataset_config
 from transport_study.orchestration.slurm_utils import (
     count_idle_gpus,
     count_running_jobs,
@@ -30,7 +29,7 @@ from transport_study.orchestration.wandb_utils import (
     get_sweep_id,
 )
 
-DATASET_CONFIG_FILENAME = "dataset_config.json"
+CONFIG_LOCK_FILENAME = "config_lock.toml"
 
 
 class Study:
@@ -323,22 +322,21 @@ class Study:
 
         self.working_dir.mkdir(parents=True, exist_ok=True)
 
-        # Save DatasetConfig on first run; on subsequent runs check for changes.
-        # This locks in ds_source_to_idx so that checkpoint indices stay stable.
-        config_path = self.working_dir / DATASET_CONFIG_FILENAME
+        # Save config on first run, and on subsequent runs check for changes.
+        # This locks in the state so on subsequent runs if the dataset paths or
+        # target device changes, we'll get an error instead of silently wrong results
+        config_path = self.working_dir / CONFIG_LOCK_FILENAME
         if config_path.exists():
-            saved = DatasetConfig.load(config_path)
-            if saved != dataset_config:
+            saved = config.from_toml(config_path)
+            if saved != config:
                 raise RuntimeError(
                     f"Dataset config changed since study was created.\n"
                     f"Saved:   {saved}\n"
-                    f"Current: {dataset_config}\n"
+                    f"Current: {config}\n"
                     f"Delete {config_path} to reset (will invalidate existing results)."
                 )
         else:
-            dataset_config.save(config_path)
-
-        self.dataset_config = dataset_config
+            config.save(config_path)
 
         log_path = self.working_dir / "logs" / f"{os.getpid()}_run_study.log"
         logger.add(log_path)
@@ -348,8 +346,8 @@ class Study:
         logger.info(f"Working directory base: {working_dir_base}")
         logger.info(f"Total number of cases: {len(cases)}")
         logger.info(f"High-performance test set size: {config.hp_test_set_size}")
-        logger.info(f"Dataset paths: {dataset_config.dataset_paths}")
-        logger.info(f"Target device: {dataset_config.target_device}")
+        logger.info(f"Dataset paths: {config.dataset_paths}")
+        logger.info(f"Target device: {config.target_device}")
 
 
 def update_submodule_configs(main_config: dict, submodules: list[str]) -> TrainConfig:
