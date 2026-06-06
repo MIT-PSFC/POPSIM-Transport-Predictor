@@ -1,4 +1,5 @@
 import os
+import shutil
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -27,6 +28,7 @@ from transport_study.orchestration.wandb_utils import (
     get_best_train_config,
     get_completed_runs,
     get_sweep_id,
+    run_clean_sweeps,
 )
 
 CONFIG_LOCK_FILENAME = "config_lock.toml"
@@ -92,6 +94,49 @@ class Study:
             if not prereq_result_path.exists():
                 return False
         return True
+
+    def setup_directories(
+        self,
+        enable_parallelism: bool = False,
+        skip_tuning: bool = True,
+        skip_visualization: bool = False,
+        clean_sweeps: bool = False,
+        clean_models: bool = False,
+        clean_results: bool = False,
+        clean_figures: bool = True,
+    ):
+        logger.info("SETTING UP DIRECTORIES")
+        logger.info(f"Enable parallelism: {enable_parallelism}")
+        logger.info(f"Skip hyperparameter tuning: {skip_tuning}")
+        logger.info(f"Skip visualization: {skip_visualization}")
+        logger.info(f"Clean sweeps: {clean_sweeps}")
+        logger.info(f"Clean models: {clean_models}")
+        logger.info(f"Clean results: {clean_results}")
+        logger.info(f"Clean figures: {clean_figures}")
+
+        if (clean_sweeps or clean_models or clean_results or clean_figures) and enable_parallelism:
+            raise ValueError(
+                "Cannot clean models, results, or figures when parallelism is enabled, as this would interfere with jobs currently running or queued."
+            )
+
+        if (not skip_tuning) and (not enable_parallelism):
+            logger.critical(
+                "Hyperparameter tuning without parallelism enabled is probably gonna take a long time, are you sure you want to do this?"
+            )
+
+        if clean_sweeps:
+            project_names = {self.wandb_project_name(case) for case in self.cases if case.is_hyperparam_case()}
+            run_clean_sweeps(project_names)
+        if clean_models:
+            shutil.rmtree(self.model_dir, ignore_errors=True)
+            shutil.rmtree(self.working_dir / "wandb", ignore_errors=True)
+        if clean_results:
+            shutil.rmtree(self.result_dir, ignore_errors=True)
+        if clean_figures:
+            shutil.rmtree(self.figure_dir, ignore_errors=True)
+
+        for directory in [self.model_dir, self.result_dir, self.figure_dir]:
+            directory.mkdir(parents=True, exist_ok=True)
 
     #############
     # EXECUTION #

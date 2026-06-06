@@ -98,7 +98,7 @@ def run_clean_sweeps(projects: list[str]):
         return result
 
     def _delete_runs(project):
-        api = wandb.api()
+        api = wandb.Api()
         for run in api.runs(project):
             run.delete()
 
@@ -116,4 +116,4 @@ def run_clean_sweeps(projects: list[str]):
         except Exception as e:
             logger.warning(f"Error reading sweeps for project {project}, skipping sweep cleanup.")
             logger.debug(e)
-            return
+            continue

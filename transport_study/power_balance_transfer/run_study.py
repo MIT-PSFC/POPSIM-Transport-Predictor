@@ -1,4 +1,3 @@
-import shutil
 import time
 from dataclasses import dataclass
 from itertools import product
@@ -24,7 +23,6 @@ from transport_study.orchestration.slurm_utils import (
 from transport_study.orchestration.study import Study
 from transport_study.orchestration.wandb_utils import (
     get_sweep_id,
-    run_clean_sweeps,
 )
 
 
@@ -33,8 +31,8 @@ def _parse_training_data(s: str) -> TrainingData:
     if s == "exnihilo":
         target = config.target_device
         non_target = set(config.dataset_paths.keys()) - ({target} if target else set())
-        return TrainingData(sources_unsorted=non_target, exnihilo=True)
-    return TrainingData(sources_unsorted=s.split("_"))
+        return TrainingData(sources_unsorted=list(non_target), exnihilo=True)
+    return TrainingData(sources_unsorted=list(s.split("_")))
 
 
 from transport_study.power_balance_transfer.data_visualization import DataVisualization
@@ -51,7 +49,7 @@ class PowerBalanceStudy(Study):
         """All configured non-target source devices - the canonical hyperparam case."""
         target = config.target_device
         sources = set(config.dataset_paths.keys() - ({target} if target else set()))
-        return TrainingData(sources_unsorted=sources)
+        return TrainingData(sources_unsorted=list(sources))
 
     ##################
     # INITIALIZATION #
@@ -1035,40 +1033,12 @@ def run_study(
         hp_test_set_size=hp_test_set_size,
     )
 
-    def _setup_directories(study: PowerBalanceStudy):
-        logger.info("SETTING UP DIRECTORIES")
-        logger.info(f"Enable parallelism: {enable_parallelism}")
-        logger.info(f"Skip hyperparameter tuning: {skip_tuning}")
-        logger.info(f"Skip visualization: {skip_visualization}")
-        logger.info(f"Clean sweeps: {clean_sweeps}")
-        logger.info(f"Clean models: {clean_models}")
-        logger.info(f"Clean results: {clean_results}")
-        logger.info(f"Clean figures: {clean_figures}")
-
-        if (clean_sweeps or clean_models or clean_results or clean_figures) and enable_parallelism:
-            raise ValueError(
-                "Cannot clean models, results, or figures when parallelism is enabled, as this would interfere with jobs currently running or queued."
-            )
-
-        if (not skip_tuning) and (not enable_parallelism):
-            logger.critical(
-                "Hyperparameter tuning without parallelism enabled is probably gonna take a long time, are you sure you want to do this?"
-            )
-
-        if clean_sweeps:
-            project_names = {study.wandb_project_name(case) for case in study.cases}
-            run_clean_sweeps(project_names)
-        if clean_models:
-            shutil.rmtree(study.model_dir, ignore_errors=True)
-        if clean_results:
-            shutil.rmtree(study.result_dir, ignore_errors=True)
-        if clean_figures:
-            shutil.rmtree(study.figure_dir, ignore_errors=True)
-
-        for directory in [study.model_dir, study.result_dir, study.figure_dir]:
-            directory.mkdir(parents=True, exist_ok=True)
-
-    _setup_directories(study)
+    study.setup_directories(
+        clean_sweeps=clean_sweeps,
+        clean_models=clean_models,
+        clean_results=clean_results,
+        clean_figures=clean_figures,
+    )
 
     ######################
     # Data Visualization #

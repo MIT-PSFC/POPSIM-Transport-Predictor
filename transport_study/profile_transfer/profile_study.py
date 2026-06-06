@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import shutil
 import time
 import tomllib
 from dataclasses import dataclass
@@ -19,9 +18,6 @@ from transport_study import PACKAGE_ROOT
 from transport_study.config import StudyConfig, config, load_config
 from transport_study.orchestration.organize_data import TrainingData
 from transport_study.orchestration.study import Study
-from transport_study.orchestration.wandb_utils import (
-    run_clean_sweeps,
-)
 
 # When domain adaptation is None, we aren't using any target data during training anyway so this is unused
 # During domain adaptation, we aren't doing hyperparameter tuning
@@ -826,42 +822,12 @@ def run_study(
     ###########################################
 
     study = ProfileStudy(config)
-
-    def _setup_directories(study: ProfileStudy):
-        logger.info("SETTING UP DIRECTORIES")
-        logger.info(f"Enable parallelism: {enable_parallelism}")
-        logger.info(f"Skip hyperparameter tuning: {skip_tuning}")
-        logger.info(f"Skip visualization: {skip_visualization}")
-        logger.info(f"Clean sweeps: {clean_sweeps}")
-        logger.info(f"Clean models: {clean_models}")
-        logger.info(f"Clean results: {clean_results}")
-        logger.info(f"Clean figures: {clean_figures}")
-
-        if (clean_sweeps or clean_models or clean_results or clean_figures) and enable_parallelism:
-            raise ValueError(
-                "Cannot clean models, results, or figures when parallelism is enabled, as this would interfere with jobs currently running or queued."
-            )
-
-        if (not skip_tuning) and (not enable_parallelism):
-            logger.critical(
-                "Hyperparameter tuning without parallelism enabled is probably gonna take a long time, are you sure you want to do this?"
-            )
-
-        if clean_sweeps:
-            project_names = {study.wandb_project_name(case) for case in study.cases if case.is_hyperparam_case()}
-            run_clean_sweeps(project_names)
-        if clean_models:
-            shutil.rmtree(study.model_dir, ignore_errors=True)
-            shutil.rmtree(study.working_dir / "wandb", ignore_errors=True)
-        if clean_results:
-            shutil.rmtree(study.result_dir, ignore_errors=True)
-        if clean_figures:
-            shutil.rmtree(study.figure_dir, ignore_errors=True)
-
-        for directory in [study.model_dir, study.result_dir, study.figure_dir]:
-            directory.mkdir(parents=True, exist_ok=True)
-
-    _setup_directories(study)
+    study.setup_directories(
+        clean_sweeps=clean_sweeps,
+        clean_models=clean_models,
+        clean_results=clean_results,
+        clean_figures=clean_figures,
+    )
 
     def _move_data(study: Study):
         logger.info("Moving data to cluster scratch for faster training")

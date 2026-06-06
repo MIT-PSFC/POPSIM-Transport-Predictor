@@ -187,8 +187,6 @@ def test_config_save_load_with_dataset_weights():
 
 def test_study_cmod_to_cmod_no_tuning():
     working_dir_base = PACKAGE_ROOT / "tests" / "profile_transfer" / "cmod_to_cmod_no_tuning"
-    if working_dir_base.exists():
-        shutil.rmtree(working_dir_base)
 
     cfg = ProfileStudy.Config(
         study_name="test_study_cmod_to_cmod",
@@ -217,6 +215,15 @@ def test_study_cmod_to_cmod_no_tuning():
     )
 
     study = ProfileStudy(cfg)
+    study.setup_directories(
+        enable_parallelism=False,
+        skip_tuning=True,
+        skip_visualization=True,
+        clean_sweeps=True,
+        clean_models=True,
+        clean_results=True,
+        clean_figures=True,
+    )
 
     # Ensure each case can be run
     while len(study.get_unfinished_cases()) > 0:
@@ -230,8 +237,6 @@ def test_study_cmod_to_cmod_no_tuning():
 
 def test_study_cmod_to_cmod_with_tuning():
     working_dir_base = PACKAGE_ROOT / "tests" / "profile_transfer" / "cmod_to_cmod_with_tuning"
-    if working_dir_base.exists():
-        shutil.rmtree(working_dir_base)
 
     cfg = ProfileStudy.Config(
         study_name="test_study_cmod_to_cmod",
@@ -259,6 +264,15 @@ def test_study_cmod_to_cmod_with_tuning():
     )
 
     study = ProfileStudy(cfg)
+    study.setup_directories(
+        enable_parallelism=False,
+        skip_tuning=False,
+        skip_visualization=True,
+        clean_sweeps=True,
+        clean_models=True,
+        clean_results=True,
+        clean_figures=True,
+    )
 
     # Ensure each case can be run
     while len(study.get_unfinished_cases()) > 0:
