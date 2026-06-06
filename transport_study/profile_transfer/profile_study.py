@@ -56,9 +56,9 @@ class ProfileStudy(Study):
         dataset_sizes: dict[str, int] = Field(
             default_factory=dict
         )  # Optional dict of dataset sizes to use for weighting during domain adaptation, only used if domain_adaptation includes "mixing"
-        dataset_weights: dict[str, float] = Field(
+        dataset_fractions: dict[str, float] = Field(
             default_factory=dict
-        )  # Optional dict of dataset weights to use during domain adaptation, only used if domain_adaptation includes "mixing". If not provided, will be calculated based on dataset_sizes so the target device is weighted as 50% of the total contribution and the other devices are weighted proportionally to their size.
+        )  # Optional dict of dataset fractions to use during domain adaptation, only used if domain_adaptation includes "mixing".
 
         @field_validator("model_types")
         @classmethod
@@ -121,23 +121,20 @@ class ProfileStudy(Study):
             3: target device must be the same
             4: target test set size must be the same
             5: hyperparameter tuning configs must match
+            6: Dataset sizes and weights must match
             """
-            if self.study_name != cfg.study_name:
-                return False
-            if self.dataset_paths != cfg.dataset_paths:
-                return False
-            if self.target_device != cfg.target_device:
-                return False
-            if self.target_test_set_size != cfg.target_test_set_size:
-                return False
-            if (
-                self.hyperparam_data_normalization != cfg.hyperparam_data_normalization
-                or self.hyperparam_domain_adaptation != cfg.hyperparam_domain_adaptation
-                or self.hyperparam_freeze_shapes != cfg.hyperparam_freeze_shapes
-                or self.hyperparam_num_target_test_shots != cfg.hyperparam_num_target_test_shots
-            ):
-                return False
-            return True
+            return (
+                self.study_name == cfg.study_name
+                and self.dataset_paths == cfg.dataset_paths
+                and self.target_device == cfg.target_device
+                and self.target_test_set_size == cfg.target_test_set_size
+                and self.hyperparam_data_normalization == cfg.hyperparam_data_normalization
+                and self.hyperparam_domain_adaptation == cfg.hyperparam_domain_adaptation
+                and self.hyperparam_freeze_shapes == cfg.hyperparam_freeze_shapes
+                and self.hyperparam_num_target_test_shots == cfg.hyperparam_num_target_test_shots
+                and self.dataset_sizes == cfg.dataset_sizes
+                and self.dataset_fractions == cfg.dataset_fractions
+            )
 
         def save(self, path: Path):
             raw = self.model_dump()
@@ -499,30 +496,53 @@ class ProfileStudy(Study):
         }
         if case.domain_adaptation == "mixing":
             # Special logic for loss weighting when doing mixing domain adaptation
-            # Assuming ~1000 shots of historic data for C-Mod and TCV and DIII-D low-performance, and num_target_shots of DIII-D high-performance
-            # we want the high-performance data to be consistently heavily weighted
             # Weights are chosen so that each device's effective contribution F_x = W_x * N_x
-            # (where N_x is the shot count) sums to 200, with target carrying ~50% of that total.
-            # So the C-Mod and TCV data each make up 40 out of 200,
-            # the DIII-D low-performance data makes up 60 out of 200,
-            # and the DIII-D high-performance data makes up 100 out of 200
-            W_c = 20 / 1000
-            W_t = 20 / 1000
-            W_dlp = 60 / 1000
-            if case.num_target_shots in [-1, 0]:
-                # If -1, all 97 high-performance shots in the DIII-D dataset
-                # If 0, weights aren't being used anyway
-                N_dhp = 97
+            # (where N_x is the shot count)
+            # Typically, the target device is weighted most heavily
+            if config.dataset_sizes is None:
+                logger.warning(
+                    "Dataset sizes not provided in config, reading from disk. This will be slow, consider adding dataset sizes to the config."
+                )
+                dataset_sizes = {}
+                for device, path in config.dataset_paths.items():
+                    ds = xr.open_dataset(path)
+                    dataset_sizes[device] = len(ds.shot)
+                    ds.close()
             else:
-                N_dhp = case.num_target_shots
-            W_dhp = 100 / N_dhp
-            # Multiply all by 100 to get back to a value ~1
-            dataloader_config_base["device_weights"] = {
-                "cmod": W_c * 100,
-                "tcv": W_t * 100,
-                "d3d_lp": W_dlp * 100,
-                "d3d_hp": W_dhp * 100,
-            }
+                dataset_sizes = config.dataset_sizes
+
+            if config.dataset_fractions is None:
+                logger.info(
+                    "Dataset fractions not provided in config. Using 50% for target and dividing remaining 50% evenly among sources."
+                )
+                dataset_fractions = {}
+                num_sources = len(config.dataset_paths) - 1
+                dataset_fractions[config.target_device] = 0.5
+                dataset_fractions = {device: 0.5 / num_sources for device in config.dataset_paths if device != config.target_device}
+            else:
+                dataset_fractions = config.dataset_fractions
+
+            if case.num_target_shots in [-1, 0]:
+                # If -1, all target shots are being included
+                # If 0, weights aren't being used anyway
+                N_target = dataset_sizes[config.target_device]
+            else:
+                N_target = case.num_target_shots
+
+            avg_size = sum(dataset_sizes.values()) / len(dataset_sizes)
+            dataset_weights = {}
+            for device in config.dataset_paths.keys():
+                if device == config.target_device:
+                    N_x = N_target
+                else:
+                    N_x = dataset_sizes[device]
+                F_x = dataset_fractions[device]
+                W_x = F_x / N_x
+                # Dividing by number of shots can make the weight very small, problematic for loss function
+                # Multiply by avg_size so weights go back to around 1
+                dataset_weights[device] = W_x * avg_size
+
+            dataloader_config_base["dataset_weights"] = dataset_weights
 
         def _make_train_config_base(case: ProfileStudy.Case) -> TrainConfig:
             if case.model_type in ["shape_init_pca", "shape_init_kmeans"]:

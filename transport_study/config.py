@@ -24,7 +24,7 @@ class StudyConfig(BaseModel):
     # Shared between all studies
     study_name: str
     dataset_paths: dict[str, Path] = {}
-    target_device: str | None = None
+    target_device: str
 
     # Debugging and dev stuff
     debug: bool = True
