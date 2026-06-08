@@ -17,6 +17,7 @@ from scipy.interpolate import interp1d
 
 from transport_study import EPISODE_DIM, PACKAGE_ROOT, TIME_COORD, TIME_DIM
 from transport_study.datasets import make_uniform_1khz_timebase
+from transport_study.datasets.cmod.gp_fit import fit_gp_hyperparameters, gp_profile
 from transport_study.datasets.workflow import DataWorkflow
 
 DEFAULT_SHOTLIST_FILE = Path(PACKAGE_ROOT) / "datasets" / "mast" / "mast_shotlist"
@@ -165,11 +166,12 @@ class MASTDataWorkflow(DataWorkflow):
         self.level1_cfg = ds_cfg
 
         prof_cfg = self.config["profile_fitting"]
-        self.psi_n_grid = np.linspace(
+        self.gp_fit_psi = np.linspace(
             prof_cfg["psi_n_min"],
             prof_cfg["psi_n_max"],
             prof_cfg["num_psi_points"],
         )
+        self.min_ts_points = int(prof_cfg["min_ts_points"])
 
         super().__init__(
             ds_name,
@@ -279,34 +281,30 @@ class MASTDataWorkflow(DataWorkflow):
         return data
 
     # ------------------------------------------------------------------
-    def _get_profile_dataset(
+    def _get_thomson_raw(
         self,
         shot: int,
         params: PhysicsMethodParams,
         timebase: np.ndarray,
-    ) -> tuple[np.ndarray, np.ndarray] | None:
-        """Compute Te and ne profiles on the uniform psi_n grid.
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray] | None:
+        """Get raw Thomson channel data mapped to psi_n coordinates.
 
-        Returns (te_psi, ne_psi) each shaped (n_t, n_psi), or None on failure.
-        te_psi in keV, ne_psi in 1e20 m^-3.
+        Returns (te_eV, ne_m3, psi_n_ts) each shaped (n_t, n_channels), or None
+        on failure. Invalid channels at a given timestep are NaN.
         """
         try:
-            # Thomson scattering raw channel data via disruption_py
             ts_data = MastPhysicsMethods.get_ts_channels(params)
             te_da = ts_data["ts_te_eV"]  # (time, major_radius)
             ne_da = ts_data["ts_ne"]
             ts_time = te_da.coords["time"].values
             r_ts = te_da.coords["major_radius"].values
-            # Transpose to (major_radius, time) for per-timestep indexing
+            # Transpose to (n_ch, n_ts_time) for per-timestep indexing
             te_raw = te_da.values.T
             ne_raw = ne_da.values.T
         except Exception as e:
             logger.warning(f"Shot {shot}: failed to read Thomson data: {e}")
             return None
 
-        # 2D psi flux map and psi_axis/psi_boundary from level1 EFM zarr.
-        # The level2 zarr equilibrium group has only 0D/1D scalars; psirz is
-        # only available in the level1 EFM store.
         efm = _open_level1_efm(shot, self.level1_cfg)
         if efm is None:
             return None
@@ -314,7 +312,6 @@ class MASTDataWorkflow(DataWorkflow):
             psi_axis_arr = efm["psi_axis"].values
             psi_bry_arr = efm["psi_boundary"].values
             efm_time = efm.coords["time"].values
-            # psirz shape from level1 EFM: (time, profile_z, profile_r)
             psirz = efm["psirz"].values  # (T_eq, n_z, n_r)
             z_grid = efm.coords["profile_z"].values
             r_grid_eq = efm.coords["profile_r"].values
@@ -322,30 +319,26 @@ class MASTDataWorkflow(DataWorkflow):
             logger.warning(f"Shot {shot}: failed to read EFM psi data: {e}")
             return None
 
-        n_psi = len(self.psi_n_grid)
+        n_ch = len(r_ts)
         n_t = len(timebase)
-        te_out = np.full((n_t, n_psi), np.nan, dtype=np.float32)
-        ne_out = np.full((n_t, n_psi), np.nan, dtype=np.float32)
+        te_out = np.full((n_t, n_ch), np.nan, dtype=np.float32)
+        ne_out = np.full((n_t, n_ch), np.nan, dtype=np.float32)
+        psi_n_out = np.full((n_t, n_ch), np.nan, dtype=np.float32)
 
-        # Pre-compute psi_axis/psi_boundary at all timebase points
         psi_ax_all = interp1d(efm_time, psi_axis_arr, bounds_error=False, fill_value=np.nan)(timebase)
         psi_br_all = interp1d(efm_time, psi_bry_arr, bounds_error=False, fill_value=np.nan)(timebase)
-        # Nearest-neighbour EFM and TS time indices for each timebase point
         t_eq_indices = np.argmin(np.abs(efm_time[:, None] - timebase[None, :]), axis=0)
         t_ts_indices = np.argmin(np.abs(ts_time[:, None] - timebase[None, :]), axis=0)
 
-        for i, _t in enumerate(timebase):
+        for i in range(n_t):
             psi_ax = float(psi_ax_all[i])
             psi_br = float(psi_br_all[i])
             if not (np.isfinite(psi_ax) and np.isfinite(psi_br)):
                 continue
 
-            # psirz: (T_eq, n_z, n_r) - select nearest EFM timestep
             psi_2d = psirz[t_eq_indices[i], :, :]  # (n_z, n_r)
-
             psi_n_ts = _map_thomson_to_psi_n(r_ts, psi_2d, z_grid, r_grid_eq, psi_ax, psi_br)
 
-            # te_raw/ne_raw dims: (major_radius, time)
             te_at_t = te_raw[:, t_ts_indices[i]]
             ne_at_t = ne_raw[:, t_ts_indices[i]]
 
@@ -358,22 +351,73 @@ class MASTDataWorkflow(DataWorkflow):
                 & (te_at_t > 0)
                 & (ne_at_t > 0)
             )
-            if valid.sum() < 4:
-                continue
+            psi_n_out[i, valid] = psi_n_ts[valid]
+            te_out[i, valid] = te_at_t[valid]
+            ne_out[i, valid] = ne_at_t[valid]
 
-            psi_v = psi_n_ts[valid]
-            te_v = te_at_t[valid] / 1e3  # eV -> keV
-            ne_v = ne_at_t[valid] / 1e20  # m^-3 -> 1e20 m^-3
+        return te_out, ne_out, psi_n_out
 
-            sort_idx = np.argsort(psi_v)
-            psi_v = psi_v[sort_idx]
-            te_v = te_v[sort_idx]
-            ne_v = ne_v[sort_idx]
+    # ------------------------------------------------------------------
+    def _make_profile_dataset(
+        self,
+        te_eV: np.ndarray,
+        ne_m3: np.ndarray,
+        psi_n_ts: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """GP fit raw Thomson channel data onto self.gp_fit_psi grid.
 
-            te_out[i, :] = np.interp(self.psi_n_grid, psi_v, te_v, left=np.nan, right=np.nan)
-            ne_out[i, :] = np.interp(self.psi_n_grid, psi_v, ne_v, left=np.nan, right=np.nan)
+        Parameters
+        ----------
+        te_eV, ne_m3, psi_n_ts : (n_t, n_ch) - NaN where channel invalid.
 
-        return te_out, ne_out
+        Returns
+        -------
+        (Te_keV_psi, ne20_psi) each (n_t, n_psi) on self.gp_fit_psi.
+        """
+        n_t, _ = te_eV.shape
+        n_psi = len(self.gp_fit_psi)
+        Te_out = np.full((n_t, n_psi), np.nan, dtype=np.float32)
+        ne_out = np.full((n_t, n_psi), np.nan, dtype=np.float32)
+
+        te_keV = te_eV / 1e3
+        ne_20 = ne_m3 / 1e20
+
+        for data_y_all, out_arr in [(te_keV, Te_out), (ne_20, ne_out)]:
+            # Synthetic 10% fractional errors with a floor of 0.01 [keV or 1e20 m^-3]
+            err_y_all = np.where(np.isfinite(data_y_all), 0.1 * np.abs(data_y_all), np.nan)
+            err_y_all = np.where(err_y_all < 0.01, 0.01, err_y_all)
+
+            cached_hp = None
+            for i_seed in range(n_t):
+                n_valid = int(np.sum(np.isfinite(psi_n_ts[i_seed, :]) & np.isfinite(data_y_all[i_seed, :])))
+                if n_valid < self.min_ts_points:
+                    continue
+                cached_hp = fit_gp_hyperparameters(
+                    data_X=psi_n_ts[i_seed, :],
+                    data_y=data_y_all[i_seed, :],
+                    err_y=err_y_all[i_seed, :],
+                )
+                if cached_hp is not None:
+                    break
+
+            for i_time in range(n_t):
+                n_valid = int(np.sum(np.isfinite(psi_n_ts[i_time, :]) & np.isfinite(data_y_all[i_time, :])))
+                if n_valid < self.min_ts_points:
+                    continue
+                y_star, _, _, _ = gp_profile(
+                    data_X=psi_n_ts[i_time, :],
+                    data_y=data_y_all[i_time, :],
+                    err_y=err_y_all[i_time, :],
+                    X_star=self.gp_fit_psi,
+                    calc_gradient=False,
+                    hyperparams=cached_hp,
+                    optimize_hyperparams=cached_hp is None,
+                )
+                if y_star is None:
+                    continue
+                out_arr[i_time, :] = y_star
+
+        return Te_out, ne_out
 
     # ------------------------------------------------------------------
     def make_raw_data_files(self):
@@ -424,23 +468,30 @@ class MASTDataWorkflow(DataWorkflow):
             if raw_0d is None:
                 continue
 
-            profiles = self._get_profile_dataset(shot, params, timebase)
-            if profiles is None:
-                logger.warning(f"Shot {shot}: failed to compute Thomson profiles, skipping")
+            raw_ts = self._get_thomson_raw(shot, params, timebase)
+            if raw_ts is None:
+                logger.warning(f"Shot {shot}: failed to get raw Thomson data, skipping")
                 continue
-            te_psi, ne_psi = profiles
+            te_eV, ne_m3, psi_n_ts = raw_ts
 
+            Te_keV_psi, ne20_psi = self._make_profile_dataset(te_eV, ne_m3, psi_n_ts)
+
+            n_ch = te_eV.shape[1]
             data_vars = {}
             for name, vals in raw_0d.items():
                 data_vars[name] = ([TIME_DIM], vals.astype(np.float32))
 
-            data_vars["Te_keV_psi"] = ([TIME_DIM, "psi_n"], te_psi)
-            data_vars["ne20_psi"] = ([TIME_DIM, "psi_n"], ne_psi)
+            data_vars["ts_te_eV"] = ([TIME_DIM, "ts_channel"], te_eV)
+            data_vars["ts_ne"] = ([TIME_DIM, "ts_channel"], ne_m3)
+            data_vars["ts_psi_n"] = ([TIME_DIM, "ts_channel"], psi_n_ts)
+            data_vars["Te_keV_psi"] = ([TIME_DIM, "psi_n"], Te_keV_psi)
+            data_vars["ne20_psi"] = ([TIME_DIM, "psi_n"], ne20_psi)
 
             coords = {
                 TIME_DIM: np.arange(len(timebase)),
                 TIME_COORD: (TIME_DIM, timebase.astype(np.float32)),
-                "psi_n": self.psi_n_grid.astype(np.float32),
+                "psi_n": self.gp_fit_psi.astype(np.float32),
+                "ts_channel": np.arange(n_ch),
             }
 
             ds = xr.Dataset(data_vars, coords=coords)
@@ -504,6 +555,9 @@ class MASTDataWorkflow(DataWorkflow):
             "P_rad_MW",
             "Te_keV_psi",
             "ne20_psi",
+            "ts_te_eV",
+            "ts_ne",
+            "ts_psi_n",
             "betan",
             "ne20_edge",
             "delta_top",
@@ -539,13 +593,13 @@ class MASTDataWorkflow(DataWorkflow):
 
     # ------------------------------------------------------------------
     def device_specific_processing(self, ds: xr.Dataset) -> xr.Dataset:
-        """Clip unphysical values and fill ne20_edge from profile."""
+        """Clip unphysical GP-fitted profile values and fill ne20_edge from profile."""
         if "ne20_psi" in ds:
             ds["ne20_psi"] = ds["ne20_psi"].where(ds["ne20_psi"] > 0)
         if "Te_keV_psi" in ds:
             ds["Te_keV_psi"] = ds["Te_keV_psi"].where(ds["Te_keV_psi"] > 0)
 
-        if "ne20_edge" in ds and "ne20_psi" in ds:
+        if "ne20_edge" in ds and "ne20_psi" in ds and "psi_n" in ds["ne20_psi"].dims:
             ne_edge_from_profile = ds["ne20_psi"].sel(psi_n=0.9, method="nearest")
             ds["ne20_edge"] = ds["ne20_edge"].where(
                 ds["ne20_edge"].notnull() & (ds["ne20_edge"] > 0.001),

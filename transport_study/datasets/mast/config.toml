@@ -9,10 +9,12 @@ level1_path = "mast/level1/shots"
 level1_efm_group = "efm"
 
 [profile_fitting]
-# Uniform psi_n grid for profile interpolation
+# Output psi_n grid for GP-fitted profiles
 psi_n_min = 0.0
 psi_n_max = 1.0
 num_psi_points = 64
+# Minimum valid (psi_n, value) pairs required per timestep to run the GP fit
+min_ts_points = 10
 
 [shot_filters]
 # Minimum IP [A] for a valid MAST shot
