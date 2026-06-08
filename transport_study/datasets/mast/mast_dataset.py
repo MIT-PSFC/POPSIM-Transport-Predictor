@@ -392,10 +392,13 @@ class MASTDataWorkflow(DataWorkflow):
                 n_valid = int(np.sum(np.isfinite(psi_n_ts[i_seed, :]) & np.isfinite(data_y_all[i_seed, :])))
                 if n_valid < self.min_ts_points:
                     continue
+                seed_scale = float(np.nanmax(data_y_all[i_seed, :]))
+                if not np.isfinite(seed_scale) or seed_scale < 1e-6:
+                    continue
                 cached_hp = fit_gp_hyperparameters(
                     data_X=psi_n_ts[i_seed, :],
-                    data_y=data_y_all[i_seed, :],
-                    err_y=err_y_all[i_seed, :],
+                    data_y=data_y_all[i_seed, :] / seed_scale,
+                    err_y=err_y_all[i_seed, :] / seed_scale,
                 )
                 if cached_hp is not None:
                     break
@@ -404,10 +407,15 @@ class MASTDataWorkflow(DataWorkflow):
                 n_valid = int(np.sum(np.isfinite(psi_n_ts[i_time, :]) & np.isfinite(data_y_all[i_time, :])))
                 if n_valid < self.min_ts_points:
                     continue
+                # Normalize to O(1) before GP fit to prevent amplitude collapse
+                # when channels don't cover the full psi_n range.
+                scale = float(np.nanmax(data_y_all[i_time, :]))
+                if not np.isfinite(scale) or scale < 1e-6:
+                    continue
                 y_star, _, _, _ = gp_profile(
                     data_X=psi_n_ts[i_time, :],
-                    data_y=data_y_all[i_time, :],
-                    err_y=err_y_all[i_time, :],
+                    data_y=data_y_all[i_time, :] / scale,
+                    err_y=err_y_all[i_time, :] / scale,
                     X_star=self.gp_fit_psi,
                     calc_gradient=False,
                     hyperparams=cached_hp,
@@ -415,7 +423,7 @@ class MASTDataWorkflow(DataWorkflow):
                 )
                 if y_star is None:
                     continue
-                out_arr[i_time, :] = y_star
+                out_arr[i_time, :] = np.asarray(y_star).ravel() * scale
 
         return Te_out, ne_out
 
