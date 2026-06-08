@@ -9,10 +9,7 @@ from pathlib import Path
 from types import MappingProxyType
 
 import toml
-from dynaconf import Dynaconf
 from pydantic import BaseModel, ConfigDict, Field, model_validator
-
-from transport_study import PACKAGE_ROOT
 
 # 80/20 between train/val
 # 80/20 between train+val/test
@@ -102,12 +99,6 @@ class _ConfigProxy:
 
     _cfg: "StudyConfig | None" = None
     initialized = False
-
-    # File-based device configs - always available regardless of study config
-    cmod = Dynaconf(settings_files=[Path(PACKAGE_ROOT) / "datasets/cmod/config.toml"])
-    d3d = Dynaconf(settings_files=[Path(PACKAGE_ROOT) / "datasets/d3d/config.toml"])
-    mast = Dynaconf(settings_files=[Path(PACKAGE_ROOT) / "datasets/mast/config.toml"])
-    tcv = Dynaconf(settings_files=[Path(PACKAGE_ROOT) / "datasets/tcv/config.toml"])
 
     def __setattr__(self, name, value):
         raise AttributeError("Config is immutable after being set. Multiple calls to load_config() are not allowed.")

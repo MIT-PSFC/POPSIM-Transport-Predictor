@@ -1,0 +1,21 @@
+[data_sources]
+# MAST open-access Zarr stores hosted at STFC ECHO S3
+level2_endpoint = "https://s3.echo.stfc.ac.uk"
+level2_path = "mast/level2/shots"
+level2_ext = "zarr"
+
+level1_endpoint = "https://s3.echo.stfc.ac.uk"
+level1_path = "mast/level1/shots"
+level1_efm_group = "efm"
+
+[profile_fitting]
+# Uniform psi_n grid for profile interpolation
+psi_n_min = 0.0
+psi_n_max = 1.0
+num_psi_points = 64
+
+[shot_filters]
+# Minimum IP [A] for a valid MAST shot
+min_ip = 100000.0
+# Minimum shot duration [s] after IP > min_ip
+min_duration = 0.1

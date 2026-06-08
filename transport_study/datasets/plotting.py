@@ -606,9 +606,3 @@ def compare_powers(
         fig.tight_layout()
         fig.savefig(f"{fig_dir}/power_comparison_{shot}.png", dpi=150, bbox_inches="tight")
         plt.close(fig)
-
-
-if __name__ == "__main__":
-    ds_path = "/fusion/projects/disruption_warning/data/popsim/tpt_d3d_final/d3d_hp.zarr"
-    fig_dir = "/fusion/projects/disruption_warning/data/popsim/tpt_d3d_final/power_comparisons"
-    compare_powers(ds_path, fig_dir, title="DIII-D Power Signal Comparison")

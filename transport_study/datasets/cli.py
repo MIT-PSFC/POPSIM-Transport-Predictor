@@ -5,9 +5,9 @@ from pathlib import Path
 import fire
 from loguru import logger
 
-from transport_study.config import config
 from transport_study.datasets.cmod.cmod_dataset import CModDataWorkflow
 from transport_study.datasets.d3d.d3d_dataset import D3DDataWorkflow
+from transport_study.datasets.mast.mast_dataset import MASTDataWorkflow
 from transport_study.datasets.tcv.tcv_dataset import TCVDataWorkflow
 
 
@@ -24,7 +24,7 @@ class DatasetCLI:
         clean: bool | None = False,
         skip_profiles: bool | None = False,
     ):
-        data_assembly_dir = Path(data_assembly_dir) / config.study_name
+        data_assembly_dir = Path(data_assembly_dir)
         workflow = CModDataWorkflow(
             ds_name=ds_name,
             shotlist_file=shotlist_file,
@@ -45,13 +45,32 @@ class DatasetCLI:
         clean: bool | None = False,
         use_ida: bool | None = True,
     ):
-        data_assembly_dir = Path(data_assembly_dir) / config.study_name
+        data_assembly_dir = Path(data_assembly_dir)
         workflow = D3DDataWorkflow(
             ds_name=ds_name,
             shotlist_file=shotlist_file,
             data_assembly_dir=data_assembly_dir,
             max_num_shots=max_num_shots,
             use_ida=use_ida,
+        )
+
+        self._execute(workflow, mode, clean)
+
+    def mast(
+        self,
+        ds_name: str = "mast",
+        shotlist_file: Path | str | None = None,
+        data_assembly_dir: Path | str | None = None,
+        max_num_shots: int | None = None,
+        mode: str | None = "raw",
+        clean: bool | None = False,
+    ):
+        data_assembly_dir = Path(data_assembly_dir)
+        workflow = MASTDataWorkflow(
+            ds_name=ds_name,
+            shotlist_file=shotlist_file,
+            data_assembly_dir=data_assembly_dir,
+            max_num_shots=max_num_shots,
         )
 
         self._execute(workflow, mode, clean)
@@ -66,7 +85,7 @@ class DatasetCLI:
         mode: str | None = "raw",
         clean: bool | None = False,
     ):
-        data_assembly_dir = Path(data_assembly_dir) / config.study_name
+        data_assembly_dir = Path(data_assembly_dir)
         workflow = TCVDataWorkflow(
             ds_name=ds_name,
             shotlist_file=shotlist_file,

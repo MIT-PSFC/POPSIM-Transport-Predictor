@@ -8,6 +8,7 @@ dependencies = [
     "disruption-py",
     "popsim",
     "torax",
+    "gptools",
     "pre-commit>=4.3.0",
     "xarray",
     "netcdf4",
@@ -43,6 +44,7 @@ packages = ["transport_study"]
 
 [tool.uv.sources]
 disruption-py = { path = "./submodules/disruption-py", editable = true }
+gptools = { path = "./submodules/gptools", editable = true }
 popsim = { path = "./submodules/popsim-public", editable = true }
 torax = { path = "./submodules/torax", editable = true }
 
