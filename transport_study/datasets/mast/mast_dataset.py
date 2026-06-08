@@ -8,7 +8,6 @@ import s3fs
 import xarray as xr
 from disruption_py.core.physics_method.params import PhysicsMethodParams
 from disruption_py.inout.xr import XarrayDataConnection
-from disruption_py.machine.mast.efit import MastEfitMethods
 from disruption_py.machine.mast.physics import MastPhysicsMethods
 from disruption_py.machine.mast.util import MastUtilMethods
 from disruption_py.machine.tokamak import Tokamak
@@ -37,12 +36,39 @@ def _make_fs(endpoint_url: str) -> s3fs.S3FileSystem:
     return s3fs.S3FileSystem(anon=True, endpoint_url=endpoint_url)
 
 
+# Zarr variable paths (relative to shot store root) that must be present.
+_REQUIRED_ZARR_VARS = [
+    "equilibrium/vloop_dynamic",
+    "summary/line_average_n_e",
+    "summary/power_radiated",
+]
+
+
+def _check_required_signals(shot: int, cfg) -> bool:
+    """Return True if all required zarr variables exist in the level2 store.
+
+    Uses fs.ls() on each variable prefix rather than checking for a specific
+    metadata filename, so it works for both zarr v2 (.zarray) and v3 (zarr.json).
+    """
+    fs = _make_fs(cfg["level2_endpoint"])
+    base = f"{cfg['level2_path']}/{shot}.{cfg['level2_ext']}"
+    for var_path in _REQUIRED_ZARR_VARS:
+        try:
+            entries = fs.ls(f"{base}/{var_path}", detail=False)
+            if not entries:
+                raise FileNotFoundError
+        except Exception:
+            logger.warning(f"Shot {shot}: {var_path} not found in store, skipping")
+            return False
+    return True
+
+
 def _open_level2(shot: int, cfg) -> xr.DataTree | None:
     try:
         fs = _make_fs(cfg["level2_endpoint"])
         path = f"{cfg['level2_path']}/{shot}.{cfg['level2_ext']}"
         store = s3fs.S3Map(path, s3=fs)
-        return xr.open_datatree(store, engine="zarr", chunks=None)
+        return xr.open_datatree(store, engine="zarr", chunks=None, consolidated=True)
     except Exception as e:
         logger.warning(f"Failed to open level2 zarr for shot {shot}: {e}")
         return None
@@ -53,7 +79,7 @@ def _open_level1_efm(shot: int, cfg) -> xr.Dataset | None:
         fs = _make_fs(cfg["level1_endpoint"])
         path = f"{cfg['level1_path']}/{shot}.{cfg['level2_ext']}"
         store = s3fs.S3Map(path, s3=fs)
-        return xr.open_zarr(store, group=cfg["level1_efm_group"], chunks=None)
+        return xr.open_zarr(store, group=cfg["level1_efm_group"], chunks=None, consolidated=True)
     except Exception as e:
         logger.warning(f"Failed to open level1 EFM zarr for shot {shot}: {e}")
         return None
@@ -155,6 +181,7 @@ class MASTDataWorkflow(DataWorkflow):
         self.filter_config = {
             "Wtot_MJ": {"min": 0.0005, "max": 2.0},
             "ne20_line_avg": {"min": 0.01, "max": 6.0},
+            "betan": {"min": 0, "max": 10},
         }
         self.individual_filter_config = None
 
@@ -174,48 +201,79 @@ class MASTDataWorkflow(DataWorkflow):
 
     # ------------------------------------------------------------------
     def _get_0d_dataset(self, shot: int, params: PhysicsMethodParams) -> dict | None:
-        """Extract all required 0D signals via disruption_py.
+        """Extract all required 0D signals.
 
-        All returned arrays are already interpolated onto params.times.
-        Returns a dict mapping signal_name -> np.ndarray.
+        Two-phase:
+          1. Existence check via return_xarray=True - no S3 data reads, fast fail.
+          2. Fetch (.values) and interpolate only for shots that pass phase 1.
+        Returns a dict of arrays on params.times.
         """
+        conn = params.data_conn
+        n_t = len(params.times)
+
+        # --- Phase 1: check existence only (no .values / no S3 reads) ---
+        # vloop_dynamic included because get_ohmic_parameters requires it.
+        required_paths = [
+            "equilibrium/time",
+            "equilibrium/wmhd",
+            "equilibrium/bvac_rmag",
+            "equilibrium/elongation",
+            "equilibrium/minor_radius",
+            "equilibrium/magnetic_axis_r",
+            "equilibrium/beta_tor_normal",
+            "equilibrium/beta_pol",
+            "equilibrium/triangularity_upper",
+            "equilibrium/triangularity_lower",
+            "equilibrium/li",
+            "equilibrium/vloop_dynamic",
+            "summary/time",
+            "summary/ip",
+            "summary/line_average_n_e",
+            "summary/power_radiated",
+        ]
+        for path in required_paths:
+            try:
+                conn.get_data(path, return_xarray=True)
+            except Exception as e:
+                logger.warning(f"Shot {shot}: {path} missing ({e}), skipping")
+                return None
+
+        # --- Phase 2: fetch data (.values triggers S3 reads) and interpolate ---
+        times = params.times
+        eq_time = conn.get_data("equilibrium/time")
+        ip_time = conn.get_data("summary/time")
+
+        eq_map = {
+            "wmhd": "wmhd",
+            "bvac_rmag": "bvac_rmag",
+            "kappa": "elongation",
+            "a_minor": "minor_radius",
+            "rmagx": "magnetic_axis_r",
+            "beta_n": "beta_tor_normal",
+            "beta_p": "beta_pol",
+            "tritop": "triangularity_upper",
+            "tribot": "triangularity_lower",
+            "li": "li",
+        }
+        data = {}
+        for key, prop in eq_map.items():
+            data[key] = MastUtilMethods.interpolate_1d(eq_time, conn.get_data(f"equilibrium/{prop}"), times)
+
+        data["ip"] = MastUtilMethods.interpolate_1d(ip_time, conn.get_data("summary/ip"), times)
+        data["n_e"] = MastUtilMethods.interpolate_1d(ip_time, conn.get_data("summary/line_average_n_e"), times)
+        data["p_rad"] = MastUtilMethods.interpolate_1d(ip_time, conn.get_data("summary/power_radiated"), times)
+
         try:
-            # EFIT equilibrium parameters
-            efit = MastEfitMethods.get_efit_parameters(params)
-            data = {
-                "wmhd": efit["wmhd"],
-                "bvac_rmag": efit["bvac_rmag"],
-                "kappa": efit["kappa"],
-                "a_minor": efit["a_minor"],
-                "rmagx": efit["rmagx"],
-                "beta_n": efit["beta_n"],
-                "beta_p": efit["beta_p"],
-                "tritop": efit["tritop"],
-                "tribot": efit["tribot"],
-                "li": efit["li"],
-            }
+            data["p_nbi"] = MastUtilMethods.interpolate_1d(ip_time, conn.get_data("summary/power_nbi"), times)
+        except Exception as e:
+            logger.warning(f"Shot {shot}: summary/power_nbi missing ({e}), filling zeros")
+            data["p_nbi"] = np.zeros(n_t, dtype=np.float32)
 
-            # Heating power
-            power = MastPhysicsMethods.get_power(params)
-            data["p_nbi"] = power["p_nbi"]
-            data["p_rad"] = power["p_rad"]
-
-            # Ip and line-average density - read directly to avoid
-            # get_ip_parameters dependency on pulse_schedule/i_plasma
-            conn = params.data_conn
-            ip = conn.get_data("summary/ip")
-            ip_time = conn.get_data("summary/time")
-            data["ip"] = MastUtilMethods.interpolate_1d(ip_time, ip, params.times)
-
-            n_e = conn.get_data("summary/line_average_n_e")
-            data["n_e"] = MastUtilMethods.interpolate_1d(ip_time, n_e, params.times)
-
-            # Ohmic power via disruption_py (handles inductive correction)
+        try:
             ohm = MastPhysicsMethods.get_ohmic_parameters(params)
             data["p_oh"] = ohm["p_oh"]
-
         except Exception as e:
-            logger.warning(f"Shot {shot}: failed to extract 0D signals: {e}")
+            logger.warning(f"Shot {shot}: ohmic power calculation failed ({e}), skipping")
             return None
 
         return data
@@ -242,18 +300,13 @@ class MASTDataWorkflow(DataWorkflow):
             # Transpose to (major_radius, time) for per-timestep indexing
             te_raw = te_da.values.T
             ne_raw = ne_da.values.T
-
-            # 2D psi flux map from level2 equilibrium
-            psi_da = params.get_data("equilibrium/psi", return_xarray=True)
-            psi_3d = psi_da.values  # (z, major_radius, time)
-            z_grid = psi_da.coords["z"].values
-            r_grid_eq = psi_da.coords["major_radius"].values
-            eq_time = psi_da.coords["time"].values
-
         except Exception as e:
-            logger.warning(f"Shot {shot}: failed to read Thomson/equilibrium data: {e}")
+            logger.warning(f"Shot {shot}: failed to read Thomson data: {e}")
             return None
 
+        # 2D psi flux map and psi_axis/psi_boundary from level1 EFM zarr.
+        # The level2 zarr equilibrium group has only 0D/1D scalars; psirz is
+        # only available in the level1 EFM store.
         efm = _open_level1_efm(shot, self.level1_cfg)
         if efm is None:
             return None
@@ -261,8 +314,12 @@ class MASTDataWorkflow(DataWorkflow):
             psi_axis_arr = efm["psi_axis"].values
             psi_bry_arr = efm["psi_boundary"].values
             efm_time = efm.coords["time"].values
+            # psirz shape from level1 EFM: (time, profile_z, profile_r)
+            psirz = efm["psirz"].values  # (T_eq, n_z, n_r)
+            z_grid = efm.coords["profile_z"].values
+            r_grid_eq = efm.coords["profile_r"].values
         except Exception as e:
-            logger.warning(f"Shot {shot}: failed to read EFM psi_axis/psi_boundary: {e}")
+            logger.warning(f"Shot {shot}: failed to read EFM psi data: {e}")
             return None
 
         n_psi = len(self.psi_n_grid)
@@ -270,22 +327,27 @@ class MASTDataWorkflow(DataWorkflow):
         te_out = np.full((n_t, n_psi), np.nan, dtype=np.float32)
         ne_out = np.full((n_t, n_psi), np.nan, dtype=np.float32)
 
-        for i, t in enumerate(timebase):
-            psi_ax = float(interp1d(efm_time, psi_axis_arr, bounds_error=False, fill_value=np.nan)(t))
-            psi_br = float(interp1d(efm_time, psi_bry_arr, bounds_error=False, fill_value=np.nan)(t))
+        # Pre-compute psi_axis/psi_boundary at all timebase points
+        psi_ax_all = interp1d(efm_time, psi_axis_arr, bounds_error=False, fill_value=np.nan)(timebase)
+        psi_br_all = interp1d(efm_time, psi_bry_arr, bounds_error=False, fill_value=np.nan)(timebase)
+        # Nearest-neighbour EFM and TS time indices for each timebase point
+        t_eq_indices = np.argmin(np.abs(efm_time[:, None] - timebase[None, :]), axis=0)
+        t_ts_indices = np.argmin(np.abs(ts_time[:, None] - timebase[None, :]), axis=0)
+
+        for i, _t in enumerate(timebase):
+            psi_ax = float(psi_ax_all[i])
+            psi_br = float(psi_br_all[i])
             if not (np.isfinite(psi_ax) and np.isfinite(psi_br)):
                 continue
 
-            # psi_3d dims: (z, major_radius, time)
-            t_eq_idx = int(np.argmin(np.abs(eq_time - t)))
-            psi_2d = psi_3d[:, :, t_eq_idx]  # (n_z, n_r_eq)
+            # psirz: (T_eq, n_z, n_r) - select nearest EFM timestep
+            psi_2d = psirz[t_eq_indices[i], :, :]  # (n_z, n_r)
 
             psi_n_ts = _map_thomson_to_psi_n(r_ts, psi_2d, z_grid, r_grid_eq, psi_ax, psi_br)
 
             # te_raw/ne_raw dims: (major_radius, time)
-            t_ts_idx = int(np.argmin(np.abs(ts_time - t)))
-            te_at_t = te_raw[:, t_ts_idx]
-            ne_at_t = ne_raw[:, t_ts_idx]
+            te_at_t = te_raw[:, t_ts_indices[i]]
+            ne_at_t = ne_raw[:, t_ts_indices[i]]
 
             valid = (
                 np.isfinite(te_at_t)
@@ -328,6 +390,9 @@ class MASTDataWorkflow(DataWorkflow):
             if ds_path.exists():
                 logger.info(f"Raw dataset for shot {shot} already exists at {ds_path}")
                 processed_shots += 1
+                continue
+
+            if not _check_required_signals(shot, self.level2_cfg):
                 continue
 
             dt = _open_level2(shot, self.level2_cfg)
