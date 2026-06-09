@@ -73,25 +73,28 @@ class ProfilePredictorTorax(TimeIndepModule):
 
         # Get transport and source terms from neural networks
         nn_inputs = inputs.nn_inputs
-        chi_i, chi_e, D_e, V_e = self.nn_transport(nn_inputs)
+        nn_transport_out = self.nn_transport(nn_inputs)
+        chi_i = nn_transport_out[0:1]
+        chi_e = nn_transport_out[1:2]
+        D_e = nn_transport_out[2:3]
+        V_e = nn_transport_out[3:4]
         S_total = self.nn_sources(nn_inputs)
 
         # Assign input and NN-predicted transport/source terms to the step function
 
         # Profile conditions
         ip_update = torax_experimental.TimeVaryingScalarUpdate(
-            value=inputs.Ip * 1e6,
+            value=jnp.atleast_1d(inputs.Ip * 1e6),
         )
-        nbar_update = torax_experimental.TimeVaryingScalarUpdate(value=inputs.fGW)
-        # Transport
-        chi_i_update = torax_experimental.TimeVaryingScalarUpdate(value=chi_i)
-        chi_e_update = torax_experimental.TimeVaryingScalarUpdate(value=chi_e)
-        D_e_update = torax_experimental.TimeVaryingScalarUpdate(value=D_e)
-        V_e_update = torax_experimental.TimeVaryingScalarUpdate(value=V_e)
+        nbar_update = torax_experimental.TimeVaryingScalarUpdate(value=jnp.atleast_1d(inputs.fGW))
+        # Transport - uniform radial profiles: broadcast (1,) scalar to shape [1, 1]
+        _rho = jnp.array([1.0])
+        chi_i_update = torax_experimental.TimeVaryingArrayUpdate(value=jnp.broadcast_to(chi_i[:, jnp.newaxis], (1, 1)), rho_norm=_rho)
+        chi_e_update = torax_experimental.TimeVaryingArrayUpdate(value=jnp.broadcast_to(chi_e[:, jnp.newaxis], (1, 1)), rho_norm=_rho)
+        D_e_update = torax_experimental.TimeVaryingArrayUpdate(value=jnp.broadcast_to(D_e[:, jnp.newaxis], (1, 1)), rho_norm=_rho)
+        V_e_update = torax_experimental.TimeVaryingArrayUpdate(value=jnp.broadcast_to(V_e[:, jnp.newaxis], (1, 1)), rho_norm=_rho)
         # Sources
-        S_total_update = torax_experimental.TimeVaryingScalarUpdate(
-            value=S_total * 1e20  # Assuming S_total has shape (1,) and is in units of 1e20 particles/s
-        )
+        S_total_update = torax_experimental.TimeVaryingScalarUpdate(value=S_total * 1e20)
 
         new_provider = self.step_fn.runtime_params_provider.update_provider_from_mapping(
             {
