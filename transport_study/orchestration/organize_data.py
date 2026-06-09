@@ -67,7 +67,7 @@ REQUIRED_SIGNALS_PROFILE_TRANSFER = [
     "Ip_MA",
     "B0",
     "betan",
-    "ne20",
+    "ne20_edge",
     "R0",
     "a_minor",
     "kappa",

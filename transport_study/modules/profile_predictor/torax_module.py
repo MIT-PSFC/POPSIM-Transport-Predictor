@@ -8,6 +8,7 @@ from popsim.ml.rtd_mlp import Activation, RtdMLP
 from torax import ToraxConfig
 from torax import experimental as torax_experimental
 from torax._src.orchestration.step_function import SimulationStepFn
+from torax.experimental import geometry as geometry_experimental
 
 from transport_study.modules.profile_predictor.module import (
     Inputs,
@@ -61,7 +62,7 @@ class ProfilePredictorTorax(TimeIndepModule):
                 Ip=inputs["Ip_MA"].data,
                 B0=inputs["B0"].data,
                 betan=inputs["betan"].data,
-                ne20=inputs["ne20"].data,
+                ne20=inputs["ne20_edge"].data,  # TODO(ZanderKeith) replace this with ne20 line avg
                 R0=inputs["R0"].data,
                 a_minor=inputs["a_minor"].data,
                 kappa=inputs["kappa"].data,
@@ -82,16 +83,11 @@ class ProfilePredictorTorax(TimeIndepModule):
             value=inputs.Ip * 1e6,
         )
         nbar_update = torax_experimental.TimeVaryingScalarUpdate(value=inputs.fGW)
-        # Geometry (Might be handled differently?)
-        R_major_update = torax_experimental.TimeVaryingScalarUpdate(value=inputs.R0)
-        a_minor_update = torax_experimental.TimeVaryingScalarUpdate(value=inputs.a_minor)
-        B0_update = torax_experimental.TimeVaryingScalarUpdate(value=inputs.B0)
-        elongation_LCFS_update = torax_experimental.TimeVaryingScalarUpdate(value=inputs.kappa)
         # Transport
-        chi_i_update = torax_experimental.TimeVaryingArrayUpdate(value=jnp.array([chi_i]))
-        chi_e_update = torax_experimental.TimeVaryingArrayUpdate(value=jnp.array([chi_e]))
-        D_e_update = torax_experimental.TimeVaryingArrayUpdate(value=jnp.array([D_e]))
-        V_e_update = torax_experimental.TimeVaryingArrayUpdate(value=jnp.array([V_e]))
+        chi_i_update = torax_experimental.TimeVaryingScalarUpdate(value=chi_i)
+        chi_e_update = torax_experimental.TimeVaryingScalarUpdate(value=chi_e)
+        D_e_update = torax_experimental.TimeVaryingScalarUpdate(value=D_e)
+        V_e_update = torax_experimental.TimeVaryingScalarUpdate(value=V_e)
         # Sources
         S_total_update = torax_experimental.TimeVaryingScalarUpdate(
             value=S_total * 1e20  # Assuming S_total has shape (1,) and is in units of 1e20 particles/s
@@ -102,25 +98,33 @@ class ProfilePredictorTorax(TimeIndepModule):
                 # Profile conditions
                 "profile_conditions.Ip": ip_update,
                 "profile_conditions.nbar": nbar_update,
-                # Geometry
-                "geometry.R_major": R_major_update,
-                "geometry.a_minor": a_minor_update,
-                "geometry.B_0": B0_update,
-                "geometry.elongation_LCFS": elongation_LCFS_update,
                 # Transport
-                "transport.chi_i": chi_i_update,
-                "transport.chi_e": chi_e_update,
-                "transport.D_e": D_e_update,
-                "transport.V_e": V_e_update,
+                "transport_model.chi_i": chi_i_update,
+                "transport_model.chi_e": chi_e_update,
+                "transport_model.D_e": D_e_update,
+                "transport_model.V_e": V_e_update,
                 # Sources
                 "sources.gas_puff.S_total": S_total_update,
             }
         )
 
+        # Geometry is handled differently
+        geometry_config = geometry_experimental.Geometry.from_dict(
+            {
+                "geometry_type": "circular",
+                "R_major": inputs.R0,
+                "a_minor": inputs.a_minor,
+                "B_0": inputs.B0,
+                "elongation_LCFS": inputs.kappa,
+            }
+        )
+        geometry_provider = geometry_config.build_provider
+
         sim_states, _post_processed_outputs, final_i = torax_experimental.run_loop_jit(
             step_fn=self.step_fn,
             max_steps=10,
             runtime_params_overrides=new_provider,
+            geometry_provider=geometry_provider,
         )
 
         ne = sim_states.core_profiles.n_e.value[final_i]
