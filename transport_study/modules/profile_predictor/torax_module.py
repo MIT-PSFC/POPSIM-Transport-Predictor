@@ -3,6 +3,7 @@ import jax
 import jax.numpy as jnp
 import xarray as xr
 from jaxtyping import Array
+from popsim import TimeIndepModule
 from popsim.ml.rtd_mlp import Activation, RtdMLP
 from torax import ToraxConfig
 from torax import experimental as torax_experimental
@@ -11,11 +12,12 @@ from torax._src.orchestration.step_function import SimulationStepFn
 from transport_study.modules.profile_predictor.module import (
     Inputs,
     Outputs,
-    ProfilePredictor,
 )
 
 
-class ProfilePredictorTorax(ProfilePredictor):
+class ProfilePredictorTorax(TimeIndepModule):
+    psigrid: tuple = eqx.field(static=True)  # The psi grid on which the profiles are evaluated
+
     nn_transport: RtdMLP
     nn_sources: RtdMLP
 
@@ -26,14 +28,14 @@ class ProfilePredictorTorax(ProfilePredictor):
         nn_width: int,
         nn_depth: int,
         psigrid: tuple,
-        torax_config: ToraxConfig,
+        torax_config: ToraxConfig | dict,
         key: jax.random.PRNGKey,
     ):
         key, subkey_transport, subkey_sources = jax.random.split(key, 3)
         self.nn_transport = RtdMLP(
             in_size=9,
             out_size=4,  # chi_i, chi_e, D_e, V_e
-            width=nn_width,
+            width_size=nn_width,
             depth=nn_depth,
             activation=Activation.RELU,
             key=subkey_transport,
@@ -41,11 +43,14 @@ class ProfilePredictorTorax(ProfilePredictor):
         self.nn_sources = RtdMLP(
             in_size=9,
             out_size=1,  # S_total
-            width=nn_width,
+            width_size=nn_width,
             depth=nn_depth,
             activation=Activation.RELU,
             key=subkey_sources,
         )
+
+        if isinstance(torax_config, dict):
+            torax_config = ToraxConfig.from_dict(torax_config)
 
         self.step_fn = torax_experimental.make_step_fn(torax_config)
         self.psigrid = psigrid

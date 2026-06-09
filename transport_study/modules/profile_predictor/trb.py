@@ -173,7 +173,7 @@ class ProfilePredictorTRB(TrainRunBuilder):
                 key=jax.random.PRNGKey(model_init_config["prng_seed"]),
             )
         else:
-            raise ValueError(f"Invalid model type {model_init_config['model_type']}, must be either 'shape_init' or 'unstructured_nn'")
+            raise ValueError(f"Invalid model type {model_init_config['model_type']}")
 
         return module
 
@@ -248,12 +248,18 @@ class ProfilePredictorTRB(TrainRunBuilder):
             ids_of_nn_leaves = [id(x) for x in jax.tree.leaves(module.nn)]
             return [x for x in jax.tree.leaves(module) if id(x) in ids_of_nn_leaves]
 
+        def get_trainable_torax(module: ProfilePredictorTorax):
+            ids_of_nn_leaves = [id(x) for x in jax.tree.leaves((module.nn_transport, module.nn_sources))]
+            return [x for x in jax.tree.leaves(module) if id(x) in ids_of_nn_leaves]
+
         if model_init_config["model_type"] in ["shape_init_pca", "shape_init_kmeans"]:
             return get_trainable_shape_init
         elif model_init_config["model_type"] == "unstructured_nn":
             return get_trainable_nn
+        elif model_init_config["model_type"] == "torax":
+            return get_trainable_torax
         else:
-            raise ValueError(f"Invalid model type {model_init_config['model_type']}, must be either 'shape_init' or 'unstructured_nn'")
+            raise ValueError(f"Invalid model type {model_init_config['model_type']}")
 
     @staticmethod
     def get_val_eval_suite(suite_config) -> EvaluationSuite:
@@ -264,6 +270,9 @@ class ProfilePredictorTRB(TrainRunBuilder):
         This eval suite basically does the same thing but cuts the vec to be at most 100 long
         Can still see the distribution, but without all the data
         """
+        # If not specified, return None
+        if suite_config is None:
+            return None
 
         # Must be an exact copy of the loss_config used in training
         loss_config = suite_config["loss_config"]

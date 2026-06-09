@@ -16,7 +16,7 @@ PROFILE_PREDICTOR_SHAPE_INIT_CONFIG = {
             "Ip_MA",
             "B0",
             "betan",
-            "ne20_edge",
+            "ne20",
             "R0",
             "a_minor",
             "kappa",
@@ -63,7 +63,7 @@ PROFILE_PREDICTOR_TORAX_CONFIG = {
             "Ip_MA",
             "B0",
             "betan",
-            "ne20_edge",
+            "ne20",
             "R0",
             "a_minor",
             "kappa",
@@ -78,7 +78,7 @@ PROFILE_PREDICTOR_TORAX_CONFIG = {
         "nn_width": 16,
         "torax_config": {
             "profile_conditions": {
-                "Ip": None,  # Overridden by dataloader input
+                "Ip": 9999,  # Overridden by dataloader input
                 "T_i_right_bc": None,
                 "T_e_right_bc": None,
                 # Initial profiles that will then relax under influence of transport and sources.
@@ -86,7 +86,7 @@ PROFILE_PREDICTOR_TORAX_CONFIG = {
                 "T_e": {0: {0: 1.0, 1: 0.01}},
                 "n_e": {0: {0: 1e20, 1: 0.01e20}},
                 "normalize_n_e_to_nbar": True,
-                "nbar": None,  # Overridden by dataloader input
+                "nbar": 99,  # Overridden by dataloader input
                 "n_e_nbar_is_fGW": True,
                 "n_e_right_bc": None,
             },
@@ -104,26 +104,31 @@ PROFILE_PREDICTOR_TORAX_CONFIG = {
             },
             "geometry": {
                 "geometry_type": "circular",
-                "R_major": None,  # Overridden by dataloader input
-                "a_minor": None,  # Overridden by dataloader input
-                "B_0": None,  # Overridden by dataloader input
-                "elongation_LCFS": None,  # Overridden by dataloader input
+                "R_major": 9999,  # Overridden by dataloader input
+                "a_minor": 9999,  # Overridden by dataloader input
+                "B_0": 9999,  # Overridden by dataloader input
+                "elongation_LCFS": 9999,  # Overridden by dataloader input
             },
             "transport": {
                 "model_name": "constant",
-                "chi_i": None,  # Predicted by NN
-                "chi_e": None,  # Predicted by NN
-                "D_e": None,  # Predicted by NN
-                "V_e": None,  # Predicted by NN
+                "chi_i": 9999,  # Predicted by NN
+                "chi_e": 9999,  # Predicted by NN
+                "D_e": 9999,  # Predicted by NN
+                "V_e": 9999,  # Predicted by NN
             },
             "sources": {
                 "ei_exchange": {},
                 "bremsstrahlung": {},
                 "cyclotron_radiation": {},
                 "ohmic": {},
-                "gas_puff": {"S_total": None},  # Predicted by NN
+                "gas_puff": {"S_total": 9999},  # Predicted by NN
                 "generic_current": {},
             },
+            # A bunch of stuff that we aren't using but we must include so it doesn't complain
+            "solver": {},
+            "time_step_calculator": {},
+            "neoclassical": {},
+            "pedestal": {},
         },
         "prng_seed": 42,
     },
@@ -150,7 +155,7 @@ PROFILE_PREDICTOR_DIRECT_POINTS_CONFIG = {
             "Ip_MA",
             "B0",
             "betan",
-            "ne20_edge",
+            "ne20",
             "R0",
             "a_minor",
             "kappa",
