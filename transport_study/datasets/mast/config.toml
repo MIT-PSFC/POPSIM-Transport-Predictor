@@ -19,5 +19,5 @@ min_ts_points = 20
 [shot_filters]
 # Minimum IP [A] for a valid MAST shot
 min_ip = 100000.0
-# Minimum shot duration [s] after IP > min_ip
-min_duration = 0.1
+# Minimum shot duration [s] after filtering to valid signal ranges
+min_duration = 0.2

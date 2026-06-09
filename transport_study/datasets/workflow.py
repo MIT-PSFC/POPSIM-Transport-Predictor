@@ -28,6 +28,7 @@ class DataWorkflow:
         shotlist_file: Path | str | None,
         data_assembly_dir: Path | str,
         max_num_shots: int | None = None,
+        min_shot_duration: float = 0.5,
     ):
         """
         Parameters
@@ -41,6 +42,8 @@ class DataWorkflow:
             Directory where data files are stored and final dataset will be saved
         max_num_shots : int | None
             Maximum number of shots to process (for testing). If None, process all shots.
+        min_shot_duration : float
+            Minimum duration (in seconds) for a shot to be included in the dataset.
         """
 
         self.ds_name = ds_name
@@ -52,6 +55,7 @@ class DataWorkflow:
             self.final_ds_dir = self.data_assembly_dir / ds_name / f"dataset_{max_num_shots}"
 
         self.max_num_shots = max_num_shots
+        self.min_shot_duration = min_shot_duration
 
         if shotlist_file is None:
             logger.info("No shotlist file provided, retrieving shotlist from device-specific source")
@@ -153,7 +157,7 @@ class DataWorkflow:
         ds = build_tensorized_dataset(
             process_fn=self.process_fn,
             identifiers=identifiers,
-            zarr_path=zarr_path,
+            zarr_path=str(zarr_path),
             time_dim=TIME_DIM,
             episode_dim=EPISODE_DIM,
             extend_existing=False,
@@ -266,10 +270,10 @@ class DataWorkflow:
             return None
 
         # Culling that is common across devices
-        # If shot is too short (less than 500 ms) after processing, exclude it
+        # If shot is too short after processing, exclude it
         cleaned_ds = shot_ds.dropna("time_idx", how="all")
         valid_time_duration = 0 if cleaned_ds.time.size == 0 else float(cleaned_ds.time.max() - cleaned_ds.time.min())
-        if valid_time_duration < 0.5:
+        if valid_time_duration < self.min_shot_duration:
             logger.warning(f"Excluding shot {shot_id} because duration after processing is only {valid_time_duration:.2f} seconds")
             self._debug_plots(debug_ds)
             return None

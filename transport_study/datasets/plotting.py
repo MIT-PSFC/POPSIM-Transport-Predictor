@@ -21,8 +21,8 @@ def ds_power_balance_time_plot(  # noqa: PLR0915
     title: str = "Dataset Time Traces",
 ):
     """Plot time traces of signals from the dataset"""
-    if isinstance(ds, str):
-        ds_path = ds
+    if isinstance(ds, (str, Path)):
+        ds_path = str(ds)
         if ds_path.endswith(".zarr"):
             ds = xr.open_zarr(ds_path)
         else:
@@ -222,8 +222,8 @@ def ds_profile_time_plot(  # noqa: PLR0915
     title: str = "Profile dataset Time Traces",
 ):
     """Plot time traces of signals from the dataset"""
-    if isinstance(ds, str):
-        ds_path = ds
+    if isinstance(ds, (str, Path)):
+        ds_path = str(ds)
         if ds_path.endswith(".zarr"):
             ds = xr.open_zarr(ds_path)
         else:
@@ -385,8 +385,8 @@ def ds_profile_plot(
     title: str = "Dataset Time Traces",
 ):
     """Plot profile traces of signals from the dataset"""
-    if isinstance(ds, str):
-        ds_path = ds
+    if isinstance(ds, (str, Path)):
+        ds_path = str(ds)
         if ds_path.endswith(".zarr"):
             ds = xr.open_zarr(ds_path)
         else:

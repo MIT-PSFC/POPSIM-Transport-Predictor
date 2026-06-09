@@ -279,3 +279,54 @@ def test_study_cmod_to_cmod_with_tuning():
         for case in study.get_unfinished_cases():
             if not study.result_path(case).exists():
                 study.run_case(case, skip_tuning=False, enable_parallelism=False)
+
+
+def test_study_cmod_to_mast():
+    working_dir_base = PACKAGE_ROOT / "tests" / "profile_transfer" / "cmod_to_mast"
+
+    cfg = ProfileStudy.Config(
+        study_name="test_study_cmod_to_mast",
+        working_dir_base=working_dir_base,
+        dataset_paths={
+            "cmod-low": PACKAGE_ROOT / "datasets" / "sample" / "cmod_low_1.nc",
+            "cmod-high": PACKAGE_ROOT / "datasets" / "sample" / "cmod_high.nc",
+            "mast": PACKAGE_ROOT / ".." / "scratch" / "datasets" / "mast" / "dataset_200" / "ds.zarr",
+        },
+        target_device="mast",
+        debug=True,
+        dry_run=False,
+        max_ds_size=20,
+        hyperparam_sweeps=2,
+        max_epochs=2,
+        epochs_per_val=1,
+        patience=2,
+        model_types=["unstructured_nn"],
+        training_datasets=[
+            "exnihilo",
+            "cmod-low_cmod-high",
+        ],
+        dataset_sizes={"cmod-low": 100, "cmod-high": 100, "mast": 41},
+        domain_adaptation_methods=[None, "mixing", "transfer"],
+        num_hp_shots_options=[0, 1, -1],
+        target_test_set_size=20,
+    )
+
+    study = ProfileStudy(cfg)
+    study.setup_directories(
+        enable_parallelism=False,
+        skip_tuning=True,
+        skip_visualization=True,
+        clean_sweeps=True,
+        clean_models=True,
+        clean_results=True,
+        clean_figures=True,
+    )
+
+    # Ensure each case can be run
+    while len(study.get_unfinished_cases()) > 0:
+        for case in study.get_unfinished_cases():
+            if not study.result_path(case).exists():
+                study.run_case(case, skip_tuning=True, enable_parallelism=False)
+
+    ds_final = study.collect_results()
+    ds_final.to_netcdf(study.collected_results_path())

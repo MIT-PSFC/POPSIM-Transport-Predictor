@@ -178,6 +178,7 @@ class MASTDataWorkflow(DataWorkflow):
             shotlist_file,
             data_assembly_dir,
             max_num_shots=max_num_shots,
+            min_shot_duration=self.config["shot_filters"]["min_duration"],
         )
 
         self.filter_config = {
