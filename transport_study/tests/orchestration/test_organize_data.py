@@ -6,7 +6,6 @@ from transport_study import EPISODE_DIM, PACKAGE_ROOT, TIME_COORD, TIME_DIM
 from transport_study.config import _ConfigProxy
 from transport_study.orchestration import organize_data
 from transport_study.orchestration.organize_data import (
-    DatasetConfig,
     TrainingData,
     add_performance,
     get_ds,

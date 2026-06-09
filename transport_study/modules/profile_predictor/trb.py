@@ -21,6 +21,7 @@ from transport_study.modules.profile_predictor.module import (
     kmeans_initial_guess,
     pca_initial_guess,
 )
+from transport_study.modules.profile_predictor.torax_module import ProfilePredictorTorax
 from transport_study.orchestration.organize_data import (
     TrainingData,
     get_train_test_datasets,
@@ -54,7 +55,7 @@ class ProfilePredictorTRB(TrainRunBuilder):
         if isinstance(training_data, dict):  # when the config is passed from WandB, it's a dict
             training_data = TrainingData(**training_data)
 
-        if dataloader_config["domain_adaptation"] is None:
+        if dataloader_config.get("domain_adaptation") is None:
             logger.info("Using standard learning dataloader")
             if not training_data.exnihilo:
                 ds_train, ds_val = get_train_val_datasets(
@@ -161,6 +162,14 @@ class ProfilePredictorTRB(TrainRunBuilder):
                 nn_width=model_init_config["nn_width"],
                 nn_depth=model_init_config["nn_depth"],
                 psigrid=np.asarray(train_dl.ds["psi_n"]),
+                key=jax.random.PRNGKey(model_init_config["prng_seed"]),
+            )
+        elif model_init_config["model_type"] == "torax":
+            module = ProfilePredictorTorax(
+                nn_width=model_init_config["nn_width"],
+                nn_depth=model_init_config["nn_depth"],
+                psigrid=np.asarray(train_dl.ds["psi_n"]),
+                torax_config=model_init_config["torax_config"],
                 key=jax.random.PRNGKey(model_init_config["prng_seed"]),
             )
         else:

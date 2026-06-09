@@ -1,6 +1,3 @@
-"""Similar implementation as the original POPSIM version, but using specifically psi_n with a larger range to be more portable and capture
-more interesting profile behavior at the edge"""
-
 from enum import IntEnum
 
 import chex
@@ -107,9 +104,7 @@ class ProfileShape(TimeIndepModule):
         return cls(basis=basis, coeffs=coeffs, normalize=normalize)
 
     @classmethod
-    def make_points(
-        cls, points: Array, grid: Array, normalize: bool = True
-    ) -> "ProfileShape":
+    def make_points(cls, points: Array, grid: Array, normalize: bool = True) -> "ProfileShape":
         """Create a ProfileShape with points on the grid. To evaluate the profile shape on an arbitrary grid, we use interpolation.
 
         Args:
@@ -234,24 +229,12 @@ def kmeans_initial_guess(
 
     ne_kmeans = KMeans(n_clusters=n_shapes, random_state=seed).fit(ne_data.values)
 
-    te_shapes = [
-        ProfileShape.make_points(
-            points=te_kmeans.cluster_centers_[i], grid=te_data.psi_n.values
-        )
-        for i in range(n_shapes)
-    ]
-    ne_shapes = [
-        ProfileShape.make_points(
-            points=ne_kmeans.cluster_centers_[i], grid=ne_data.psi_n.values
-        )
-        for i in range(n_shapes)
-    ]
+    te_shapes = [ProfileShape.make_points(points=te_kmeans.cluster_centers_[i], grid=te_data.psi_n.values) for i in range(n_shapes)]
+    ne_shapes = [ProfileShape.make_points(points=ne_kmeans.cluster_centers_[i], grid=ne_data.psi_n.values) for i in range(n_shapes)]
     return te_shapes, ne_shapes
 
 
-def pca_initial_guess(
-    n_shapes: int, te_data: xr.DataArray, ne_data: xr.DataArray, sample_dim: str
-):
+def pca_initial_guess(n_shapes: int, te_data: xr.DataArray, ne_data: xr.DataArray, sample_dim: str):
     from xeofs.single import EOF
 
     te_eof = EOF(n_modes=n_shapes)
@@ -280,9 +263,7 @@ def pca_initial_guess(
 
 
 class ProfilePredictor(TimeIndepModule):
-    psigrid: tuple = eqx.field(
-        static=True
-    )  # The psi grid on which the profiles are evaluated
+    psigrid: tuple = eqx.field(static=True)  # The psi grid on which the profiles are evaluated
 
     nn: RtdMLP
 
@@ -357,17 +338,11 @@ class ProfilePredictorShapeInit(ProfilePredictor):
 
         # Compute the shapes.
         ne_shapes = jnp.stack(
-            [
-                w * shape(inputs.psi)
-                for shape, w in zip(self.ne_shapes, ne_coeffs, strict=True)
-            ],
+            [w * shape(inputs.psi) for shape, w in zip(self.ne_shapes, ne_coeffs, strict=True)],
             axis=0,
         )
         te_shapes = jnp.stack(
-            [
-                w * shape(inputs.psi)
-                for shape, w in zip(self.te_shapes, te_coeffs, strict=True)
-            ],
+            [w * shape(inputs.psi) for shape, w in zip(self.te_shapes, te_coeffs, strict=True)],
             axis=0,
         )
 
@@ -387,12 +362,8 @@ class ProfilePredictorShapeInit(ProfilePredictor):
             debug_info = None
 
         out = Outputs(
-            ne=xr.DataArray(
-                data=ne, dims=("psi_n",), coords={"psi_n": list(self.psigrid)}
-            ),
-            te=xr.DataArray(
-                data=te, dims=("psi_n",), coords={"psi_n": list(self.psigrid)}
-            ),
+            ne=xr.DataArray(data=ne, dims=("psi_n",), coords={"psi_n": list(self.psigrid)}),
+            te=xr.DataArray(data=te, dims=("psi_n",), coords={"psi_n": list(self.psigrid)}),
             debug_info=debug_info,
         )
 
@@ -413,16 +384,10 @@ class ProfilePredictorShapeInit(ProfilePredictor):
         psigrid_jax = jnp.array(psigrid)
         psigrid_tuple = tuple(psigrid.tolist())
         te_shapes = [
-            ProfileShape.make_points(
-                points=jnp.zeros_like(psigrid_jax), grid=psigrid_jax, normalize=False
-            )
-            for _ in range(n_shapes)
+            ProfileShape.make_points(points=jnp.zeros_like(psigrid_jax), grid=psigrid_jax, normalize=False) for _ in range(n_shapes)
         ]
         ne_shapes = [
-            ProfileShape.make_points(
-                points=jnp.zeros_like(psigrid_jax), grid=psigrid_jax, normalize=False
-            )
-            for _ in range(n_shapes)
+            ProfileShape.make_points(points=jnp.zeros_like(psigrid_jax), grid=psigrid_jax, normalize=False) for _ in range(n_shapes)
         ]
         return cls(
             te_shapes=te_shapes,
@@ -438,9 +403,7 @@ class ProfilePredictorShapeInit(ProfilePredictor):
 
 
 class ProfilePredictorUnstructuredNN(ProfilePredictor):
-    psi_points: tuple = eqx.field(
-        static=True
-    )  # Hashable points at which the NN predicts
+    psi_points: tuple = eqx.field(static=True)  # Hashable points at which the NN predicts
 
     def __init__(
         self,
@@ -450,12 +413,8 @@ class ProfilePredictorUnstructuredNN(ProfilePredictor):
         psigrid: tuple,
         key: jax.random.PRNGKey,
     ):
-        psigrid_tuple = (
-            tuple(psigrid.tolist()) if hasattr(psigrid, "tolist") else tuple(psigrid)
-        )
-        self.psi_points = tuple(
-            jnp.linspace(min(psigrid_tuple), max(psigrid_tuple), n_points).tolist()
-        )
+        psigrid_tuple = tuple(psigrid.tolist()) if hasattr(psigrid, "tolist") else tuple(psigrid)
+        self.psi_points = tuple(jnp.linspace(min(psigrid_tuple), max(psigrid_tuple), n_points).tolist())
 
         key, subkey = jax.random.split(key)
         self.nn = RtdMLP(
@@ -500,12 +459,8 @@ class ProfilePredictorUnstructuredNN(ProfilePredictor):
         te = jnp.interp(inputs.psi, psi_points, te_points) * te_correction
 
         out = Outputs(
-            ne=xr.DataArray(
-                data=ne, dims=("psi_n",), coords={"psi_n": list(self.psigrid)}
-            ),
-            te=xr.DataArray(
-                data=te, dims=("psi_n",), coords={"psi_n": list(self.psigrid)}
-            ),
+            ne=xr.DataArray(data=ne, dims=("psi_n",), coords={"psi_n": list(self.psigrid)}),
+            te=xr.DataArray(data=te, dims=("psi_n",), coords={"psi_n": list(self.psigrid)}),
             debug_info=None,
         )
 

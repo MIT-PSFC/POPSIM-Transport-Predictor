@@ -8,9 +8,9 @@ from loguru import logger
 from matplotlib import patches
 from scipy.spatial import ConvexHull
 
+from transport_study.config import config
 from transport_study.orchestration.organize_data import (
     TrainingData,
-    dataset_config,
     get_train_test_datasets,
     get_train_val_datasets,
 )
@@ -322,19 +322,15 @@ class DataVisualization:
     def _get_largest_dataset():
         # Determine the biggest dataset we can use so that we only need to make one plot
         # for the domain overlap visualization. Want to only do this once since it's expensive.
-        if (
-            dataset_config.dataset_paths.get("cmod")
-            and dataset_config.dataset_paths.get("tcv")
-            and dataset_config.dataset_paths.get("d3d_lp")
-        ):
+        if config.dataset_paths.get("cmod") and config.dataset_paths.get("tcv") and config.dataset_paths.get("d3d_lp"):
             training_data = _td("cmod_tcv_d3d_lp")
-        elif dataset_config.dataset_paths.get("cmod") and dataset_config.dataset_paths.get("tcv"):
+        elif config.dataset_paths.get("cmod") and config.dataset_paths.get("tcv"):
             training_data = _td("cmod_tcv")
-        elif dataset_config.dataset_paths.get("cmod"):
+        elif config.dataset_paths.get("cmod"):
             training_data = _td("cmod")
-        elif dataset_config.dataset_paths.get("tcv"):
+        elif config.dataset_paths.get("tcv"):
             training_data = _td("tcv")
-        elif dataset_config.dataset_paths.get("d3d_lp"):
+        elif config.dataset_paths.get("d3d_lp"):
             training_data = _td("d3d_lp")
         else:
             raise ValueError("No dataset paths provided in config, cannot determine largest dataset case for domain overlap plot.")
@@ -361,7 +357,7 @@ class DataVisualization:
         save_dir = Path(figure_dir) / "data_visualization" / "performance_extrapolation"
 
         # C-Mod
-        if dataset_config.dataset_paths.get("cmod"):
+        if config.dataset_paths.get("cmod"):
             fig_path = save_dir / "cmod_performance_extrapolation.png"
             if not fig_path.exists():
                 train_ds, val_ds = get_train_val_datasets(
@@ -379,7 +375,7 @@ class DataVisualization:
             logger.warning("C-Mod dataset path not provided, skipping C-Mod figures.")
 
         # TCV
-        if dataset_config.dataset_paths.get("tcv"):
+        if config.dataset_paths.get("tcv"):
             fig_path = save_dir / "tcv_performance_extrapolation.png"
             if not fig_path.exists():
                 train_ds, val_ds = get_train_val_datasets(
@@ -397,7 +393,7 @@ class DataVisualization:
             logger.warning("TCV dataset path not provided, skipping TCV figures.")
 
         # C-Mod + TCV
-        if dataset_config.dataset_paths.get("tcv") and dataset_config.dataset_paths.get("cmod"):
+        if config.dataset_paths.get("tcv") and config.dataset_paths.get("cmod"):
             fig_path = save_dir / "cmod_tcv_performance_extrapolation.png"
             if not fig_path.exists():
                 train_ds, val_ds = get_train_val_datasets(
@@ -415,7 +411,7 @@ class DataVisualization:
             logger.warning("TCV or C-Mod dataset path not provided, skipping combined C-Mod + TCV figures.")
 
         # DIII-D low-performance
-        if dataset_config.dataset_paths.get("d3d_lp"):
+        if config.dataset_paths.get("d3d_lp"):
             fig_path = save_dir / "d3d_lp_performance_extrapolation.png"
             if not fig_path.exists():
                 train_ds, val_ds = get_train_val_datasets(
@@ -433,11 +429,7 @@ class DataVisualization:
             logger.warning("DIII-D low-performance dataset path not provided, skipping DIII-D low-performance figures.")
 
         # C-Mod + TCV + DIII-D low-performance
-        if (
-            dataset_config.dataset_paths.get("cmod")
-            and dataset_config.dataset_paths.get("tcv")
-            and dataset_config.dataset_paths.get("d3d_lp")
-        ):
+        if config.dataset_paths.get("cmod") and config.dataset_paths.get("tcv") and config.dataset_paths.get("d3d_lp"):
             fig_path = save_dir / "cmod_tcv_d3d_lp_performance_extrapolation.png"
             if not fig_path.exists():
                 train_ds, val_ds = get_train_val_datasets(
@@ -457,7 +449,7 @@ class DataVisualization:
             )
 
         # DIII-D performance overlap
-        if dataset_config.dataset_paths.get(dataset_config.target_device) and dataset_config.dataset_paths.get("d3d_lp"):
+        if config.dataset_paths.get(config.target_device) and config.dataset_paths.get("d3d_lp"):
             fig_path = save_dir / "d3d_performance_overlap.png"
             if not fig_path.exists():
                 train_ds, test_ds = get_train_test_datasets(
@@ -476,35 +468,33 @@ class DataVisualization:
         context_dict = {
             "cmod": {
                 "training_data": _td("cmod"),
-                "condition": dataset_config.dataset_paths.get("cmod"),
+                "condition": config.dataset_paths.get("cmod"),
                 "fig_name": "d3d_hp_in_context_cmod_performance_extrapolation.png",
             },
             "tcv": {
                 "training_data": _td("tcv"),
-                "condition": dataset_config.dataset_paths.get("tcv"),
+                "condition": config.dataset_paths.get("tcv"),
                 "fig_name": "d3d_hp_in_context_tcv_performance_extrapolation.png",
             },
             "d3d_lp": {
                 "training_data": _td("d3d_lp"),
-                "condition": dataset_config.dataset_paths.get("d3d_lp"),
+                "condition": config.dataset_paths.get("d3d_lp"),
                 "fig_name": "d3d_hp_in_context_d3d_lp_performance_extrapolation.png",
             },
             "cmod_tcv": {
                 "training_data": _td("cmod_tcv"),
-                "condition": dataset_config.dataset_paths.get("cmod") and dataset_config.dataset_paths.get("tcv"),
+                "condition": config.dataset_paths.get("cmod") and config.dataset_paths.get("tcv"),
                 "fig_name": "d3d_hp_in_context_cmod_tcv_performance_extrapolation.png",
             },
             "cmod_tcv_d3d_lp": {
                 "training_data": _td("cmod_tcv_d3d_lp"),
-                "condition": dataset_config.dataset_paths.get("cmod")
-                and dataset_config.dataset_paths.get("tcv")
-                and dataset_config.dataset_paths.get("d3d_lp"),
+                "condition": config.dataset_paths.get("cmod") and config.dataset_paths.get("tcv") and config.dataset_paths.get("d3d_lp"),
                 "fig_name": "d3d_hp_in_context_cmod_tcv_d3d_lp_performance_extrapolation.png",
             },
         }
 
         for context_info in context_dict.values():
-            if context_info["condition"] and dataset_config.dataset_paths.get(dataset_config.target_device):
+            if context_info["condition"] and config.dataset_paths.get(config.target_device):
                 fig_path = save_dir / context_info["fig_name"]
                 if not fig_path.exists():
                     train_ds, test_ds = get_train_test_datasets(
@@ -569,7 +559,7 @@ class DataVisualization:
             else:
                 raise ValueError(f"Unknown normalization method '{method}' specified.")
 
-            if dataset_config.dataset_paths.get(dataset_config.target_device):
+            if config.dataset_paths.get(config.target_device):
                 ds, _ = get_train_test_datasets(
                     training_data=training_data,
                     data_normalization=method,

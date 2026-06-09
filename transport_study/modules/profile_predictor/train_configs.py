@@ -1,9 +1,6 @@
 from transport_study.modules.profile_predictor.module import (
     ShapeType,
 )
-from transport_study.modules.profile_predictor.torax_trb import (
-    ProfilePredictorToraxTRB,
-)
 from transport_study.modules.profile_predictor.trb import (
     ProfilePredictorTRB,
 )
@@ -57,9 +54,9 @@ PROFILE_PREDICTOR_SHAPE_INIT_CONFIG = {
 
 PROFILE_PREDICTOR_TORAX_CONFIG = {
     "project": "profile_predictor_torax",
-    "train_run_builder": ProfilePredictorToraxTRB,
-    "max_epochs": 100,
-    "epochs_per_val": 10,
+    "train_run_builder": ProfilePredictorTRB,
+    "max_epochs": 10,
+    "epochs_per_val": 2,
     "checkpoint_dir": None,
     "dataloader_config": {
         "input_vars": [
@@ -76,11 +73,58 @@ PROFILE_PREDICTOR_TORAX_CONFIG = {
         "target_vars": ["ne20_psi", "Te_keV_psi"],
     },
     "model_init_config": {
-        "nn_depth": 3,
-        "nn_width": 32,
-        "dt_steady": 5.0,
-        "n_rho": 25,
-        "t_edge_keV": 0.2,
+        "model_type": "torax",
+        "nn_depth": 2,
+        "nn_width": 16,
+        "torax_config": {
+            "profile_conditions": {
+                "Ip": None,  # Overridden by dataloader input
+                "T_i_right_bc": None,
+                "T_e_right_bc": None,
+                # Initial profiles that will then relax under influence of transport and sources.
+                "T_i": {0: {0: 1.0, 1: 0.01}},
+                "T_e": {0: {0: 1.0, 1: 0.01}},
+                "n_e": {0: {0: 1e20, 1: 0.01e20}},
+                "normalize_n_e_to_nbar": True,
+                "nbar": None,  # Overridden by dataloader input
+                "n_e_nbar_is_fGW": True,
+                "n_e_right_bc": None,
+            },
+            "numerics": {
+                "t_initial": 0.0,
+                "t_final": 0.1,  # Give it ~100 ms to relax, on order of energy confinement time
+                "evolve_ion_heat": True,
+                "evolve_electron_heat": True,
+                "evolve_current": True,
+                "evolve_density": True,
+            },
+            "plasma_composition": {
+                "main_ion": {"D": 1.0},  # Assuming DD and minor impurities
+                "Z_eff": 1.1,
+            },
+            "geometry": {
+                "geometry_type": "circular",
+                "R_major": None,  # Overridden by dataloader input
+                "a_minor": None,  # Overridden by dataloader input
+                "B_0": None,  # Overridden by dataloader input
+                "elongation_LCFS": None,  # Overridden by dataloader input
+            },
+            "transport": {
+                "model_name": "constant",
+                "chi_i": None,  # Predicted by NN
+                "chi_e": None,  # Predicted by NN
+                "D_e": None,  # Predicted by NN
+                "V_e": None,  # Predicted by NN
+            },
+            "sources": {
+                "ei_exchange": {},
+                "bremsstrahlung": {},
+                "cyclotron_radiation": {},
+                "ohmic": {},
+                "gas_puff": {"S_total": None},  # Predicted by NN
+                "generic_current": {},
+            },
+        },
         "prng_seed": 42,
     },
     "loss_config": {
