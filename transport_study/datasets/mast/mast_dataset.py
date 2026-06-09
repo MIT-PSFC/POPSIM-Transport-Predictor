@@ -428,7 +428,55 @@ class MASTDataWorkflow(DataWorkflow):
         return Te_out, ne_out
 
     # ------------------------------------------------------------------
-    def make_raw_data_files(self):
+    def _debug_plot_profiles(
+        self,
+        shot: int,
+        te_keV: np.ndarray,
+        ne_20: np.ndarray,
+        psi_n_ts: np.ndarray,
+        Te_out: np.ndarray,
+        ne_out: np.ndarray,
+        debug_plot_dir: Path | None = "/home/zkeith/proj/popsim_dirs/POPSIM-Transport-Predictor/scratch/datasets/mast/debug_plots",
+    ) -> None:
+        """Save a PDF of raw TS points vs GP fit for sampled timesteps."""
+        import matplotlib
+
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        from matplotlib.backends.backend_pdf import PdfPages
+
+        debug_plot_dir.mkdir(parents=True, exist_ok=True)
+        pdf_path = debug_plot_dir / f"{shot}_ts_gp_debug.pdf"
+
+        n_t = te_keV.shape[0]
+        step = max(1, n_t // 20)
+        t_indices = range(0, n_t, step)
+
+        with PdfPages(pdf_path) as pdf:
+            for i_time in t_indices:
+                fig, axes = plt.subplots(1, 2, figsize=(10, 4))
+                for ax, data_y, gp_y, label, unit in [
+                    (axes[0], te_keV[i_time, :], Te_out[i_time, :], "Te", "[keV]"),
+                    (axes[1], ne_20[i_time, :], ne_out[i_time, :], "ne", "[1e20 m^-3]"),
+                ]:
+                    psi_raw = psi_n_ts[i_time, :]
+                    valid = np.isfinite(psi_raw) & np.isfinite(data_y)
+                    ax.scatter(psi_raw[valid], data_y[valid], s=14, zorder=3, label="raw TS")
+                    gp_valid = np.isfinite(gp_y)
+                    if gp_valid.any():
+                        ax.plot(self.gp_fit_psi[gp_valid], gp_y[gp_valid], label="GP fit")
+                    ax.set_xlabel("psi_n")
+                    ax.set_ylabel(f"{label} {unit}")
+                    ax.set_title(f"shot {shot}  t_idx={i_time}  n_valid={valid.sum()}")
+                    ax.legend(fontsize=8)
+                fig.tight_layout()
+                pdf.savefig(fig)
+                plt.close(fig)
+
+        logger.info(f"Saved debug plot to {pdf_path}")
+
+    # ------------------------------------------------------------------
+    def make_raw_data_files(self, debug_plot_dir: Path | str | None = None):
         """Create one netCDF per shot in the raw_data directory."""
         self.raw_data_dir.mkdir(parents=True, exist_ok=True)
 
@@ -483,6 +531,18 @@ class MASTDataWorkflow(DataWorkflow):
             te_eV, ne_m3, psi_n_ts = raw_ts
 
             Te_keV_psi, ne20_psi = self._make_profile_dataset(te_eV, ne_m3, psi_n_ts)
+
+            debug_plot_dir = "/home/zkeith/proj/popsim_dirs/POPSIM-Transport-Predictor/scratch/datasets/mast/debug_plots"
+            if debug_plot_dir is not None:
+                self._debug_plot_profiles(
+                    shot,
+                    te_eV / 1e3,
+                    ne_m3 / 1e20,
+                    psi_n_ts,
+                    Te_keV_psi,
+                    ne20_psi,
+                    Path(debug_plot_dir),
+                )
 
             n_ch = te_eV.shape[1]
             data_vars = {}
