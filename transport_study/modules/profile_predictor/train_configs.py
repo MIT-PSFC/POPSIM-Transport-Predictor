@@ -94,7 +94,11 @@ PROFILE_PREDICTOR_TORAX_CONFIG = {
             "numerics": {
                 "t_initial": 0.0,
                 "t_final": 0.1,  # Give it ~100 ms to relax, on order of energy confinement time
-                "min_dt": 1e-3,  # 1ms dt would give ~100 steps
+                # Linear theta solver is implicit / unconditionally stable, so we
+                # can take large fixed steps to reach steady state cheaply. 10ms
+                # dt -> 10 steps to cover t_final, vs ~30-100 with chi-based dt.
+                "fixed_dt": 1e-2,
+                "min_dt": 1e-3,
                 "evolve_ion_heat": True,
                 "evolve_electron_heat": True,
                 "evolve_current": True,
@@ -128,7 +132,7 @@ PROFILE_PREDICTOR_TORAX_CONFIG = {
             },
             # A bunch of stuff that we aren't using but we must include so it doesn't complain
             "solver": {},
-            "time_step_calculator": {},
+            "time_step_calculator": {"calculator_type": "fixed"},
             "neoclassical": {},
             "pedestal": {},
         },

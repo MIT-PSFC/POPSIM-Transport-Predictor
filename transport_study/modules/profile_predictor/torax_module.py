@@ -199,8 +199,6 @@ def _run_loop_jit_with_geo(
             )
         return i + 1, current_state, post_processed
 
-    body = jax.checkpoint(body)
-
     _, output_state, post_processed = torax_jax_utils.while_loop_bounded(
         cond,
         body,
@@ -260,7 +258,12 @@ class ProfilePredictorTorax(TimeIndepModule):
         self._face_centers = tuple(static_geo.torax_mesh.face_centers.tolist())
         self._rho_hires_norm = tuple(np.array(static_geo.rho_hires_norm).tolist())
 
-        self.max_steps = 20
+        # With the fixed time-step calculator, steps to cover t_final are
+        # deterministic: ceil((t_final - t_initial) / fixed_dt). Add 1 for the
+        # clipped final step that lands exactly on t_final.
+        numerics = self.step_fn.runtime_params_provider.numerics
+        fixed_dt = float(numerics.fixed_dt.get_value(0.0))
+        self.max_steps = int(np.ceil((numerics.t_final - numerics.t_initial) / fixed_dt)) + 1
 
     def __call__(self, inputs: Inputs | xr.Dataset, debug: bool = False) -> Outputs:
         if isinstance(inputs, xr.Dataset):
@@ -279,12 +282,14 @@ class ProfilePredictorTorax(TimeIndepModule):
 
         # Get transport and source terms from neural networks, bounded to
         # physical ranges so the TORAX solver stays stable during training
-        # Approximate L-mode ranges:
-        #   chi_i: 0.1 - 5 m^2/s
-        #   chi_e: 0.1 - 10 m^2/s
-        #   D_e:   0.1 - 2 m^2/s   (nonzero floor prevents advection-only blowup)
+        # Approximate ranges taken from DIII-D study and TFTR
+        # https://iopscience-iop-org.libproxy.mit.edu/article/10.1088/0029-5515/38/4/301/pdf
+        # https://iopscience-iop-org.libproxy.mit.edu/article/10.1088/0029-5515/39/1/309/pdf
+        #   chi_i: 0.1 - 10 m^2/s
+        #   chi_e: 0.1 - 20 m^2/s
+        #   D_e:   0.1 - 3 m^2/s   (nonzero floor prevents advection-only blowup)
         #   V_e:   -5 - 5 m/s      (signed pinch)
-        #   S_total: 0 - 10 (x 1e21 below; nonzero is fine)
+        #   S_total: 0 - 10 (x 1e21 below)
         nn_inputs = inputs.nn_inputs
         nn_transport_out = self.nn_transport(nn_inputs)
         chi_i = 0.1 + 4.9 * jax.nn.sigmoid(nn_transport_out[0:1])
