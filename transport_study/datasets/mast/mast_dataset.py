@@ -1,5 +1,6 @@
 """Makes the raw MAST dataset from the STFC ECHO S3 open-access Zarr store."""
 
+import gc
 from pathlib import Path
 
 import netCDF4  # noqa: F401
@@ -23,6 +24,8 @@ from transport_study.datasets.workflow import DataWorkflow
 DEFAULT_SHOTLIST_FILE = Path(PACKAGE_ROOT) / "datasets" / "mast" / "mast_shotlist"
 
 config = Dynaconf(settings_files=[Path(PACKAGE_ROOT) / "datasets/mast/config.toml"])
+
+GC_INTERVAL = 40  # Every 40 shots force garbage collection
 
 
 def _ensure_verbose_level():
@@ -482,7 +485,11 @@ class MASTDataWorkflow(DataWorkflow):
         self.raw_data_dir.mkdir(parents=True, exist_ok=True)
 
         processed_shots = 0
-        for shot in self.shotlist:
+        for i, shot in enumerate(self.shotlist):
+            if i > 0 and i % GC_INTERVAL == 0:
+                logger.debug(f"Forcing garbage collection after {i} processed shots")
+                gc.collect()
+
             if self.max_num_shots is not None and processed_shots >= self.max_num_shots:
                 logger.info(f"Reached maximum shots: {self.max_num_shots}")
                 break
