@@ -183,6 +183,18 @@ def _run_loop_jit_with_geo(
             runtime_params_overrides=runtime_params_overrides,
             geo_overrides=geo_provider,
         )
+        cp = current_state.core_profiles
+        jax.debug.print(
+            "[scan i={i}] t={t} dt={dt} err={err} Te[min,max]=[{te_lo},{te_hi}] ne[min,max]=[{ne_lo},{ne_hi}]",
+            i=i,
+            t=current_state.t,
+            dt=current_state.dt,
+            err=current_state.solver_numeric_outputs.solver_error_state,
+            te_lo=cp.T_e.value.min(),
+            te_hi=cp.T_e.value.max(),
+            ne_lo=cp.n_e.value.min(),
+            ne_hi=cp.n_e.value.max(),
+        )
         return i + 1, current_state, post_processed
 
     body = jax.checkpoint(body)
@@ -271,6 +283,15 @@ class ProfilePredictorTorax(TimeIndepModule):
         D_e = jax.nn.softplus(nn_transport_out[2:3])
         V_e = nn_transport_out[3:4]
         S_total = jax.nn.softplus(self.nn_sources(nn_inputs))
+        jax.debug.print(
+            "[nn] chi_i={ci} chi_e={ce} D_e={d} V_e={v} S_total={s} nn_in={ni}",
+            ci=chi_i,
+            ce=chi_e,
+            d=D_e,
+            v=V_e,
+            s=S_total,
+            ni=nn_inputs,
+        )
 
         # Build runtime params override
         ip_update = torax_experimental.TimeVaryingScalarUpdate(
@@ -315,6 +336,14 @@ class ProfilePredictorTorax(TimeIndepModule):
             step_fn=self.step_fn,
             runtime_params_overrides=new_provider,
             geometry_overrides=geo_provider,
+        )
+        cp0 = initial_state.core_profiles
+        jax.debug.print(
+            "[init] Te[min,max]=[{te_lo},{te_hi}] ne[min,max]=[{ne_lo},{ne_hi}]",
+            te_lo=cp0.T_e.value.min(),
+            te_hi=cp0.T_e.value.max(),
+            ne_lo=cp0.n_e.value.min(),
+            ne_hi=cp0.n_e.value.max(),
         )
 
         state, _post = _run_loop_jit_with_geo(

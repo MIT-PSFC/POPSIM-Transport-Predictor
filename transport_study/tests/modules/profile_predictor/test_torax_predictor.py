@@ -32,6 +32,7 @@ def test_torax_predictor():
                 **train_config.dataloader_config,
                 "training_data": training_data,
                 "target_vars": ["Te_keV_psi", "ne20_psi", "ds_source_idx"],
+                "batch_size": 1,
             },
         }
     )
