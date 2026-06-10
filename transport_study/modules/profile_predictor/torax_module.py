@@ -1,5 +1,3 @@
-import dataclasses
-
 import equinox as eqx
 import jax
 import jax.numpy as jnp
@@ -10,7 +8,6 @@ from popsim import TimeIndepModule
 from popsim.ml.rtd_mlp import Activation, RtdMLP
 from torax import ToraxConfig
 from torax import experimental as torax_experimental
-from torax._src import constants as torax_constants
 from torax._src import jax_utils as torax_jax_utils
 from torax._src.geometry import geometry as torax_geometry
 from torax._src.geometry import geometry_provider as geometry_provider_lib
@@ -154,62 +151,47 @@ def _build_circular_geometry_jax(
     )
 
 
-def _differentiable_fixed_time_step(
+def _run_loop_jit_with_geo(
     step_fn: SimulationStepFn,
-    dt,
     input_state,
     previous_post_processed_outputs,
     runtime_params_overrides,
     geo_provider,
     max_steps: int,
 ):
-    """Reimplements SimulationStepFn.fixed_time_step using while_loop_bounded.
+    """Local copy of torax_experimental.run_loop_jit that also accepts geo_overrides.
 
-    Uses jax_utils.while_loop_bounded (lax.scan-based) so the loop is
-    reverse-mode differentiable, unlike jax.lax.while_loop.
-    max_steps must be a static int large enough that the simulation finishes.
+    Mirrors torax._src.orchestration.jit_run_loop.run_loop_jit (the recommended
+    fully-JITted simulation loop pattern from the TORAX docs) but:
+      - Accepts a geo_overrides argument so per-sample geometry can be passed
+        in without retracing the outer step_fn.
+      - Skips the per-step history buffers (we only need the final state).
+      - Wraps the body in jax.checkpoint so reverse-mode AD recomputes
+        per-step activations rather than storing all max_steps copies.
     """
-    remaining_dt = dt
 
-    adaptive = step_fn.runtime_params_provider.numerics.adaptive_dt
+    def cond(carry):
+        i, current_state, _ = carry
+        is_done = step_fn.is_done(current_state.t)
+        return jnp.logical_and(i < max_steps, jnp.logical_not(is_done))
 
-    def cond(args):
-        remaining_dt, prev_state, _ = args
-        if adaptive:
-            exit_min_dt = prev_state.solver_numeric_outputs.solver_error_state == 1
-        else:
-            exit_min_dt = False
-        return jnp.logical_and(remaining_dt > torax_constants.CONSTANTS.eps, ~exit_min_dt)
-
-    def body(args):
-        remaining_dt, prev_state, prev_post = args
-        output_state, post_processed = step_fn(
+    def body(carry):
+        i, prev_state, prev_post = carry
+        current_state, post_processed = step_fn(
             prev_state,
             prev_post,
-            max_dt=remaining_dt,
             runtime_params_overrides=runtime_params_overrides,
             geo_overrides=geo_provider,
         )
-        remaining_dt -= output_state.dt
-        return remaining_dt, output_state, post_processed
+        return i + 1, current_state, post_processed
 
-    # Checkpoint the body so reverse-mode AD recomputes per-step activations
-    # rather than storing them all; reduces memory from O(max_steps) to O(1)
-    # at the cost of an extra forward pass per step.
     body = jax.checkpoint(body)
 
-    remaining_dt, output_state, post_processed = torax_jax_utils.while_loop_bounded(
+    _, output_state, post_processed = torax_jax_utils.while_loop_bounded(
         cond,
         body,
-        (remaining_dt, input_state, previous_post_processed_outputs),
+        (0, input_state, previous_post_processed_outputs),
         max_steps,
-    )
-
-    elapsed_dt = dt - remaining_dt
-    output_state = dataclasses.replace(
-        output_state,
-        t=input_state.t + elapsed_dt,
-        dt=elapsed_dt,
     )
     return output_state, post_processed
 
@@ -264,7 +246,7 @@ class ProfilePredictorTorax(TimeIndepModule):
         self._face_centers = tuple(static_geo.torax_mesh.face_centers.tolist())
         self._rho_hires_norm = tuple(np.array(static_geo.rho_hires_norm).tolist())
 
-        self.max_steps = 10
+        self.max_steps = 20
 
     def __call__(self, inputs: Inputs | xr.Dataset, debug: bool = False) -> Outputs:
         if isinstance(inputs, xr.Dataset):
@@ -281,14 +263,14 @@ class ProfilePredictorTorax(TimeIndepModule):
                 psi=jnp.array(self.psigrid),
             )
 
-        # Get transport and source terms from neural networks
+        # Get transport and source terms from neural networks, with physical constraints
         nn_inputs = inputs.nn_inputs
         nn_transport_out = self.nn_transport(nn_inputs)
-        chi_i = nn_transport_out[0:1]
-        chi_e = nn_transport_out[1:2]
-        D_e = nn_transport_out[2:3]
+        chi_i = jax.nn.softplus(nn_transport_out[0:1])
+        chi_e = jax.nn.softplus(nn_transport_out[1:2])
+        D_e = jax.nn.softplus(nn_transport_out[2:3])
         V_e = nn_transport_out[3:4]
-        S_total = self.nn_sources(nn_inputs)
+        S_total = jax.nn.softplus(self.nn_sources(nn_inputs))
 
         # Build runtime params override
         ip_update = torax_experimental.TimeVaryingScalarUpdate(
@@ -335,10 +317,8 @@ class ProfilePredictorTorax(TimeIndepModule):
             geometry_overrides=geo_provider,
         )
 
-        t_final = jnp.array(self.step_fn.runtime_params_provider.numerics.t_final)
-        state, _post = _differentiable_fixed_time_step(
+        state, _post = _run_loop_jit_with_geo(
             step_fn=self.step_fn,
-            dt=t_final,
             input_state=initial_state,
             previous_post_processed_outputs=initial_post,
             runtime_params_overrides=new_provider,
