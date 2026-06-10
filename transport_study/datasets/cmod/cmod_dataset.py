@@ -449,6 +449,7 @@ class CModDataWorkflow(DataWorkflow):
             "B0",
             "betan",
             "ne20_edge",
+            "ne20_line_avg",
             "R0",
             "kappa",
             "a_minor",
