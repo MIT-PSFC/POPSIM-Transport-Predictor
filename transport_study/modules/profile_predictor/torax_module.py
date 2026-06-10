@@ -256,7 +256,9 @@ class ProfilePredictorTorax(TimeIndepModule):
             torax_config = ToraxConfig.from_dict(torax_config)
 
         self.step_fn = torax_experimental.make_step_fn(torax_config)
-        self.psigrid = psigrid
+        # Coerce to tuple: arrays in static fields break pytree metadata
+        # equality (ambiguous truth value) when two module instances coexist
+        self.psigrid = tuple(np.asarray(psigrid).tolist())
 
         static_geo = self.step_fn.geometry_provider(0.0)
         self._face_centers = tuple(static_geo.torax_mesh.face_centers.tolist())

@@ -9,6 +9,7 @@ import optax
 import xarray as xr
 from loguru import logger
 from popsim.ml import DataLoader, TrainRunBuilder
+from popsim.ml.checkpointing import create_default_checkpoint_manager, restore_model
 from popsim.ml.dataloading import make_dataloaders
 from popsim.ml.eval import EvalData, EvaluationSuite, batched_model_eval_and_loss
 
@@ -174,6 +175,11 @@ class ProfilePredictorTRB(TrainRunBuilder):
             )
         else:
             raise ValueError(f"Invalid model type {model_init_config['model_type']}")
+
+        if model_init_config.get("transfer_checkpoint", False):
+            transfer_manager = create_default_checkpoint_manager(model_init_config["transfer_checkpoint"])
+            module = restore_model(transfer_manager, module)
+            logger.debug(f"Restoring module from transfer learning pretrained checkpoint\n{model_init_config['transfer_checkpoint']}")
 
         return module
 
