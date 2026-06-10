@@ -186,7 +186,7 @@ def test_config_save_load_with_dataset_weights():
 
 
 def test_study_cmod_to_cmod_no_tuning():
-    working_dir_base = PACKAGE_ROOT / "tests" / "profile_transfer" / "cmod_to_cmod_no_tuning"
+    working_dir_base = PACKAGE_ROOT / "tests" / "test_outputs" / "profile_transfer" / "cmod_to_cmod_no_tuning"
 
     cfg = ProfileStudy.Config(
         study_name="test_study_cmod_to_cmod",
@@ -203,7 +203,7 @@ def test_study_cmod_to_cmod_no_tuning():
         max_epochs=2,
         epochs_per_val=1,
         patience=2,
-        model_types=["unstructured_nn"],
+        model_types=["torax"],
         training_datasets=[
             "exnihilo",
             "cmod-low",
@@ -236,7 +236,7 @@ def test_study_cmod_to_cmod_no_tuning():
 
 
 def test_study_cmod_to_cmod_with_tuning():
-    working_dir_base = PACKAGE_ROOT / "tests" / "profile_transfer" / "cmod_to_cmod_with_tuning"
+    working_dir_base = PACKAGE_ROOT / "tests" / "test_outputs" / "profile_transfer" / "cmod_to_cmod_with_tuning"
 
     cfg = ProfileStudy.Config(
         study_name="test_study_cmod_to_cmod",
@@ -282,7 +282,7 @@ def test_study_cmod_to_cmod_with_tuning():
 
 
 def test_study_cmod_to_mast():
-    working_dir_base = PACKAGE_ROOT / "tests" / "profile_transfer" / "cmod_to_mast"
+    working_dir_base = PACKAGE_ROOT / "tests" / "test_outputs" / "profile_transfer" / "cmod_to_mast"
 
     cfg = ProfileStudy.Config(
         study_name="test_study_cmod_to_mast",

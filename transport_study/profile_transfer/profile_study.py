@@ -16,6 +16,9 @@ from pydantic import Field, field_validator, model_validator
 
 from transport_study import PACKAGE_ROOT
 from transport_study.config import StudyConfig, config, load_config
+from transport_study.modules.profile_predictor.train_configs import (
+    PROFILE_PREDICTOR_TORAX_CONFIG,
+)
 from transport_study.orchestration.organize_data import TrainingData
 from transport_study.orchestration.study import Study
 
@@ -63,7 +66,7 @@ class ProfileStudy(Study):
         @field_validator("model_types")
         @classmethod
         def _validate_model_types(cls, v: tuple[str, ...]) -> tuple[str, ...]:
-            valid = {"shape_init_pca", "shape_init_kmeans", "unstructured_nn"}
+            valid = {"shape_init_pca", "shape_init_kmeans", "unstructured_nn", "torax"}
             for mt in v:
                 if mt not in valid:
                     raise ValueError(f"Invalid model type: {mt}. Must be one of {sorted(valid)}.")
@@ -280,6 +283,7 @@ class ProfileStudy(Study):
                 "shape_init_pca",
                 "shape_init_kmeans",
                 "unstructured_nn",
+                "torax",
             ]:
                 raise ValueError(f"Unknown model type: {model_type}")
             if domain_adaptation is None:
@@ -594,11 +598,49 @@ class ProfileStudy(Study):
                         "model_type": case.model_type,
                         "data_normalization": case.data_normalization,
                         "domain_adaptation": case.domain_adaptation,
-                        "freeze_shapes": case.freeze_shapes,
                         "n_points": 21,  # Number of points along the profile to predict for the unstructured NN
                         "nn_depth": 2,
                         "nn_width": 16,
                         "in_size": 9,  # Ip_MA, B0, betan, ne20_line_avg, R0, a_minor, kappa, delta_top, delta_bot
+                        "prng_seed": 42,
+                    },
+                    loss_config=loss_config_base,
+                    optimizer_config=optimizer_config_base,
+                    val_eval_suite_config=val_eval_suite_config_base,
+                    test_eval_suite_config=test_eval_suite_config_base,
+                )
+            elif case.model_type == "torax":
+                train_config_base = TrainConfig(
+                    project=self.wandb_project_name(case),
+                    train_run_builder="transport_study.modules.profile_predictor.trb.ProfilePredictorTRB",
+                    max_epochs=config.max_epochs,
+                    epochs_per_val=config.epochs_per_val,
+                    patience=config.patience,
+                    # When doing hyperparameter tuning, this gets overwritten by the wandb agent
+                    checkpoint_dir=str(self.trained_model_dir(case)),
+                    dataloader_config={
+                        "input_vars": [
+                            "Ip_MA",
+                            "B0",
+                            "betan",
+                            "ne20_line_avg",
+                            "R0",
+                            "a_minor",
+                            "kappa",
+                            "delta_top",
+                            "delta_bot",
+                        ],
+                        **dataloader_config_base,
+                    },
+                    model_init_config={
+                        "model_type": case.model_type,
+                        "data_normalization": case.data_normalization,
+                        "domain_adaptation": case.domain_adaptation,
+                        "freeze_shapes": case.freeze_shapes,
+                        "nn_depth": 2,
+                        "nn_width": 16,
+                        "in_size": 9,  # Ip_MA, B0, betan, ne20_line_avg, R0, a_minor, kappa, delta_top, delta_bot
+                        "torax_config": PROFILE_PREDICTOR_TORAX_CONFIG["model_init_config"]["torax_config"],
                         "prng_seed": 42,
                     },
                     loss_config=loss_config_base,

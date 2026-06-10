@@ -229,3 +229,4 @@ transport_study/tests/test_outputs/
 fetch_*
 _debug_runner.py
 working_dir_base
+wandb
