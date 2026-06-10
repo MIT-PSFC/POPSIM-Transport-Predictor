@@ -448,7 +448,6 @@ class CModDataWorkflow(DataWorkflow):
             "Ip_MA",
             "B0",
             "betan",
-            "ne20_edge",
             "ne20_line_avg",
             "R0",
             "kappa",
@@ -457,6 +456,7 @@ class CModDataWorkflow(DataWorkflow):
             "delta_bot",
             # OTHER
             "beta_p",  # EFIT
+            "ne20_edge",
         }
 
         ds = ds[list(kept_vars)]
