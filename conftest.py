@@ -5,7 +5,7 @@ from pathlib import Path
 from loguru import logger
 
 os.environ.setdefault("JAX_PLATFORMS", "cpu")
-os.environ.setdefault("JAX_DEBUG_NANS", "1")
+os.environ.setdefault("JAX_DEBUG_NANS", "0")
 os.environ.setdefault("MPLBACKEND", "Agg")
 
 PROJECT_ROOT = Path(__file__).resolve().parent

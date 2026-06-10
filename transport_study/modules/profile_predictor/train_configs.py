@@ -79,16 +79,17 @@ PROFILE_PREDICTOR_TORAX_CONFIG = {
         "torax_config": {
             "profile_conditions": {
                 "Ip": 9999,  # Overridden by dataloader input
-                "T_i_right_bc": None,
-                "T_e_right_bc": None,
-                # Initial profiles that will then relax under influence of transport and sources.
-                "T_i": {0: {0: 1.0, 1: 0.01}},
-                "T_e": {0: {0: 1.0, 1: 0.01}},
-                "n_e": {0: {0: 1e20, 1: 0.01e20}},
+                # Mild edge BCs to avoid huge initial gradient at LCFS (was crashing solver).
+                "T_i_right_bc": 0.2,  # [keV]
+                "T_e_right_bc": 0.2,  # [keV]
+                # Near-flat initial profiles; will relax up under ohmic heating / NN transport.
+                "T_i": {0: {0: 0.3, 1: 0.2}},
+                "T_e": {0: {0: 0.3, 1: 0.2}},
+                "n_e": {0: {0: 1e20, 1: 0.5e20}},
                 "normalize_n_e_to_nbar": True,
                 "nbar": 99,  # Overridden by dataloader input
                 "n_e_nbar_is_fGW": True,
-                "n_e_right_bc": None,
+                "n_e_right_bc": 0.5e20,
             },
             "numerics": {
                 "t_initial": 0.0,

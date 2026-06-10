@@ -158,6 +158,7 @@ def _run_loop_jit_with_geo(
     runtime_params_overrides,
     geo_provider,
     max_steps: int,
+    debug: bool = False,
 ):
     """Local copy of torax_experimental.run_loop_jit that also accepts geo_overrides.
 
@@ -184,17 +185,18 @@ def _run_loop_jit_with_geo(
             geo_overrides=geo_provider,
         )
         cp = current_state.core_profiles
-        jax.debug.print(
-            "[scan i={i}] t={t} dt={dt} err={err} Te[min,max]=[{te_lo},{te_hi}] ne[min,max]=[{ne_lo},{ne_hi}]",
-            i=i,
-            t=current_state.t,
-            dt=current_state.dt,
-            err=current_state.solver_numeric_outputs.solver_error_state,
-            te_lo=cp.T_e.value.min(),
-            te_hi=cp.T_e.value.max(),
-            ne_lo=cp.n_e.value.min(),
-            ne_hi=cp.n_e.value.max(),
-        )
+        if debug:
+            jax.debug.print(
+                "[scan i={i}] t={t} dt={dt} err={err} Te[min,max]=[{te_lo},{te_hi}] ne[min,max]=[{ne_lo},{ne_hi}]",
+                i=i,
+                t=current_state.t,
+                dt=current_state.dt,
+                err=current_state.solver_numeric_outputs.solver_error_state,
+                te_lo=cp.T_e.value.min(),
+                te_hi=cp.T_e.value.max(),
+                ne_lo=cp.n_e.value.min(),
+                ne_hi=cp.n_e.value.max(),
+            )
         return i + 1, current_state, post_processed
 
     body = jax.checkpoint(body)
@@ -275,23 +277,31 @@ class ProfilePredictorTorax(TimeIndepModule):
                 psi=jnp.array(self.psigrid),
             )
 
-        # Get transport and source terms from neural networks, with physical constraints
+        # Get transport and source terms from neural networks, bounded to
+        # physical ranges so the TORAX solver stays stable during training
+        # Approximate L-mode ranges:
+        #   chi_i: 0.1 - 5 m^2/s
+        #   chi_e: 0.1 - 10 m^2/s
+        #   D_e:   0.1 - 2 m^2/s   (nonzero floor prevents advection-only blowup)
+        #   V_e:   -5 - 5 m/s      (signed pinch)
+        #   S_total: 0 - 10 (x 1e21 below; nonzero is fine)
         nn_inputs = inputs.nn_inputs
         nn_transport_out = self.nn_transport(nn_inputs)
-        chi_i = jax.nn.softplus(nn_transport_out[0:1])
-        chi_e = jax.nn.softplus(nn_transport_out[1:2])
-        D_e = jax.nn.softplus(nn_transport_out[2:3])
-        V_e = nn_transport_out[3:4]
+        chi_i = 0.1 + 4.9 * jax.nn.sigmoid(nn_transport_out[0:1])
+        chi_e = 0.1 + 9.9 * jax.nn.sigmoid(nn_transport_out[1:2])
+        D_e = 0.1 + 1.9 * jax.nn.sigmoid(nn_transport_out[2:3])
+        V_e = 5.0 * jnp.tanh(nn_transport_out[3:4])
         S_total = jax.nn.softplus(self.nn_sources(nn_inputs))
-        jax.debug.print(
-            "[nn] chi_i={ci} chi_e={ce} D_e={d} V_e={v} S_total={s} nn_in={ni}",
-            ci=chi_i,
-            ce=chi_e,
-            d=D_e,
-            v=V_e,
-            s=S_total,
-            ni=nn_inputs,
-        )
+        if debug:
+            jax.debug.print(
+                "[nn] chi_i={ci} chi_e={ce} D_e={d} V_e={v} S_total={s} nn_in={ni}",
+                ci=chi_i,
+                ce=chi_e,
+                d=D_e,
+                v=V_e,
+                s=S_total,
+                ni=nn_inputs,
+            )
 
         # Build runtime params override
         ip_update = torax_experimental.TimeVaryingScalarUpdate(
@@ -303,7 +313,7 @@ class ProfilePredictorTorax(TimeIndepModule):
         chi_e_update = torax_experimental.TimeVaryingArrayUpdate(value=jnp.broadcast_to(chi_e[:, jnp.newaxis], (1, 1)), rho_norm=_rho)
         D_e_update = torax_experimental.TimeVaryingArrayUpdate(value=jnp.broadcast_to(D_e[:, jnp.newaxis], (1, 1)), rho_norm=_rho)
         V_e_update = torax_experimental.TimeVaryingArrayUpdate(value=jnp.broadcast_to(V_e[:, jnp.newaxis], (1, 1)), rho_norm=_rho)
-        S_total_update = torax_experimental.TimeVaryingScalarUpdate(value=S_total * 1e20)
+        S_total_update = torax_experimental.TimeVaryingScalarUpdate(value=S_total * 1e21)
 
         new_provider = self.step_fn.runtime_params_provider.update_provider_from_mapping(
             {
@@ -338,13 +348,14 @@ class ProfilePredictorTorax(TimeIndepModule):
             geometry_overrides=geo_provider,
         )
         cp0 = initial_state.core_profiles
-        jax.debug.print(
-            "[init] Te[min,max]=[{te_lo},{te_hi}] ne[min,max]=[{ne_lo},{ne_hi}]",
-            te_lo=cp0.T_e.value.min(),
-            te_hi=cp0.T_e.value.max(),
-            ne_lo=cp0.n_e.value.min(),
-            ne_hi=cp0.n_e.value.max(),
-        )
+        if debug:
+            jax.debug.print(
+                "[init] Te[min,max]=[{te_lo},{te_hi}] ne[min,max]=[{ne_lo},{ne_hi}]",
+                te_lo=cp0.T_e.value.min(),
+                te_hi=cp0.T_e.value.max(),
+                ne_lo=cp0.n_e.value.min(),
+                ne_hi=cp0.n_e.value.max(),
+            )
 
         state, _post = _run_loop_jit_with_geo(
             step_fn=self.step_fn,
@@ -353,6 +364,7 @@ class ProfilePredictorTorax(TimeIndepModule):
             runtime_params_overrides=new_provider,
             geo_provider=geo_provider,
             max_steps=self.max_steps,
+            debug=debug,
         )
 
         ne = state.core_profiles.n_e.value

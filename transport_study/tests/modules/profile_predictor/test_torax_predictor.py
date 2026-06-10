@@ -28,11 +28,13 @@ def test_torax_predictor():
     train_config = train_config.model_copy(
         update={
             "project": config.study_name,
+            "max_epochs": 4,
+            "epochs_per_val": 2,
             "dataloader_config": {
                 **train_config.dataloader_config,
                 "training_data": training_data,
                 "target_vars": ["Te_keV_psi", "ne20_psi", "ds_source_idx"],
-                "batch_size": 1,
+                "batch_size": None,
             },
         }
     )
