@@ -93,6 +93,7 @@ PROFILE_PREDICTOR_TORAX_CONFIG = {
             "numerics": {
                 "t_initial": 0.0,
                 "t_final": 0.1,  # Give it ~100 ms to relax, on order of energy confinement time
+                "min_dt": 1e-3,  # 1ms dt would give ~100 steps
                 "evolve_ion_heat": True,
                 "evolve_electron_heat": True,
                 "evolve_current": True,

@@ -1,3 +1,5 @@
+import dataclasses
+
 import equinox as eqx
 import jax
 import jax.numpy as jnp
@@ -8,6 +10,8 @@ from popsim import TimeIndepModule
 from popsim.ml.rtd_mlp import Activation, RtdMLP
 from torax import ToraxConfig
 from torax import experimental as torax_experimental
+from torax._src import constants as torax_constants
+from torax._src import jax_utils as torax_jax_utils
 from torax._src.geometry import geometry as torax_geometry
 from torax._src.geometry import geometry_provider as geometry_provider_lib
 from torax._src.orchestration.step_function import SimulationStepFn
@@ -150,6 +154,66 @@ def _build_circular_geometry_jax(
     )
 
 
+def _differentiable_fixed_time_step(
+    step_fn: SimulationStepFn,
+    dt,
+    input_state,
+    previous_post_processed_outputs,
+    runtime_params_overrides,
+    geo_provider,
+    max_steps: int,
+):
+    """Reimplements SimulationStepFn.fixed_time_step using while_loop_bounded.
+
+    Uses jax_utils.while_loop_bounded (lax.scan-based) so the loop is
+    reverse-mode differentiable, unlike jax.lax.while_loop.
+    max_steps must be a static int large enough that the simulation finishes.
+    """
+    remaining_dt = dt
+
+    adaptive = step_fn.runtime_params_provider.numerics.adaptive_dt
+
+    def cond(args):
+        remaining_dt, prev_state, _ = args
+        if adaptive:
+            exit_min_dt = prev_state.solver_numeric_outputs.solver_error_state == 1
+        else:
+            exit_min_dt = False
+        return jnp.logical_and(remaining_dt > torax_constants.CONSTANTS.eps, ~exit_min_dt)
+
+    def body(args):
+        remaining_dt, prev_state, prev_post = args
+        output_state, post_processed = step_fn(
+            prev_state,
+            prev_post,
+            max_dt=remaining_dt,
+            runtime_params_overrides=runtime_params_overrides,
+            geo_overrides=geo_provider,
+        )
+        remaining_dt -= output_state.dt
+        return remaining_dt, output_state, post_processed
+
+    # Checkpoint the body so reverse-mode AD recomputes per-step activations
+    # rather than storing them all; reduces memory from O(max_steps) to O(1)
+    # at the cost of an extra forward pass per step.
+    body = jax.checkpoint(body)
+
+    remaining_dt, output_state, post_processed = torax_jax_utils.while_loop_bounded(
+        cond,
+        body,
+        (remaining_dt, input_state, previous_post_processed_outputs),
+        max_steps,
+    )
+
+    elapsed_dt = dt - remaining_dt
+    output_state = dataclasses.replace(
+        output_state,
+        t=input_state.t + elapsed_dt,
+        dt=elapsed_dt,
+    )
+    return output_state, post_processed
+
+
 class ProfilePredictorTorax(TimeIndepModule):
     psigrid: tuple = eqx.field(static=True)
 
@@ -161,6 +225,8 @@ class ProfilePredictorTorax(TimeIndepModule):
     # Static mesh info for JAX-differentiable geometry construction
     _face_centers: tuple = eqx.field(static=True)
     _rho_hires_norm: tuple = eqx.field(static=True)
+    # Upper bound on sub-steps in fixed_time_step; enables scan-based (differentiable) loop
+    max_steps: int = eqx.field(static=True)
 
     def __init__(
         self,
@@ -197,6 +263,8 @@ class ProfilePredictorTorax(TimeIndepModule):
         static_geo = self.step_fn.geometry_provider(0.0)
         self._face_centers = tuple(static_geo.torax_mesh.face_centers.tolist())
         self._rho_hires_norm = tuple(np.array(static_geo.rho_hires_norm).tolist())
+
+        self.max_steps = 10
 
     def __call__(self, inputs: Inputs | xr.Dataset, debug: bool = False) -> Outputs:
         if isinstance(inputs, xr.Dataset):
@@ -268,12 +336,14 @@ class ProfilePredictorTorax(TimeIndepModule):
         )
 
         t_final = jnp.array(self.step_fn.runtime_params_provider.numerics.t_final)
-        state, _post = self.step_fn.fixed_time_step(
+        state, _post = _differentiable_fixed_time_step(
+            step_fn=self.step_fn,
             dt=t_final,
             input_state=initial_state,
             previous_post_processed_outputs=initial_post,
             runtime_params_overrides=new_provider,
-            geo_overrides=geo_provider,
+            geo_provider=geo_provider,
+            max_steps=self.max_steps,
         )
 
         ne = state.core_profiles.n_e.value
