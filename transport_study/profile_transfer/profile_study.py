@@ -538,7 +538,7 @@ class ProfileStudy(Study):
                             "Ip_MA",
                             "B0",
                             "betan",
-                            "ne20",
+                            "ne20_line_avg",
                             "R0",
                             "a_minor",
                             "kappa",
@@ -558,7 +558,7 @@ class ProfileStudy(Study):
                         "n_shapes": 3,
                         "nn_depth": 2,
                         "nn_width": 16,
-                        "in_size": 9,  # Ip_MA, B0, betan, ne20, R0, a_minor, kappa, delta_top, delta_bot
+                        "in_size": 9,  # Ip_MA, B0, betan, ne20_line_avg, R0, a_minor, kappa, delta_top, delta_bot
                         "softmax_temp": 1,
                         "prng_seed": 42,
                     },
@@ -581,7 +581,7 @@ class ProfileStudy(Study):
                             "Ip_MA",
                             "B0",
                             "betan",
-                            "ne20",
+                            "ne20_line_avg",
                             "R0",
                             "a_minor",
                             "kappa",
@@ -598,7 +598,7 @@ class ProfileStudy(Study):
                         "n_points": 21,  # Number of points along the profile to predict for the unstructured NN
                         "nn_depth": 2,
                         "nn_width": 16,
-                        "in_size": 9,  # Ip_MA, B0, betan, ne20, R0, a_minor, kappa, delta_top, delta_bot
+                        "in_size": 9,  # Ip_MA, B0, betan, ne20_line_avg, R0, a_minor, kappa, delta_top, delta_bot
                         "prng_seed": 42,
                     },
                     loss_config=loss_config_base,

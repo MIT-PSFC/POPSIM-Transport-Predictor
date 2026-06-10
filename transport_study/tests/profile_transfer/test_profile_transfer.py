@@ -242,8 +242,8 @@ def test_study_cmod_to_cmod_with_tuning():
         study_name="test_study_cmod_to_cmod",
         working_dir_base=working_dir_base,
         dataset_paths={
-            "cmod-low": PACKAGE_ROOT / "datasets" / "sample" / "cmod_low_1.nc",
-            "cmod-high": PACKAGE_ROOT / "datasets" / "sample" / "cmod_high.nc",
+            "cmod-low": PACKAGE_ROOT / "datasets" / "sample" / "cmod-low1.nc",
+            "cmod-high": PACKAGE_ROOT / "datasets" / "sample" / "cmod-high.nc",
         },
         target_device="cmod-high",
         debug=True,
@@ -288,8 +288,8 @@ def test_study_cmod_to_mast():
         study_name="test_study_cmod_to_mast",
         working_dir_base=working_dir_base,
         dataset_paths={
-            "cmod-low": PACKAGE_ROOT / "datasets" / "sample" / "cmod_low_1.nc",
-            "cmod-high": PACKAGE_ROOT / "datasets" / "sample" / "cmod_high.nc",
+            "cmod-low": PACKAGE_ROOT / "datasets" / "sample" / "cmod-low1.nc",
+            "cmod-high": PACKAGE_ROOT / "datasets" / "sample" / "cmod-high.nc",
             "mast": PACKAGE_ROOT / ".." / "scratch" / "datasets" / "mast" / "dataset_200" / "ds.zarr",
         },
         target_device="mast",

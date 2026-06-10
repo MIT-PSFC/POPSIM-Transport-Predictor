@@ -128,7 +128,7 @@ class Inputs:
     Ip: float  # Plasma current [MA]
     B0: float  # On-axis toroidal field [T]
     betan: float  # Normalized beta
-    ne20: float  # electron density [10^20 m^-3]
+    ne20_line_avg: float  # line-averaged electron density [10^20 m^-3]
     R0: float  # Geometric major radius [m]
     a_minor: float  # Minor radius [m]
     kappa: float  # Elongation
@@ -156,7 +156,7 @@ class Inputs:
     @property
     def fGW(self):
         greenwald_limit = self.Ip / (jnp.pi * self.a_minor**2)
-        return self.ne20 / greenwald_limit
+        return self.ne20_line_avg / greenwald_limit
 
     @property
     def aB0(self):
@@ -179,7 +179,7 @@ class Inputs:
         pressure_Pa = self.beta * self.B0**2 / (2 * mu_0)
         pressure_eV = pressure_Pa / eV
         pressure_keV20 = pressure_eV / 1e3 / 1e20
-        temp_keV = pressure_keV20 / self.ne20
+        temp_keV = pressure_keV20 / self.ne20_line_avg
         return temp_keV
 
     @property
@@ -310,7 +310,7 @@ class ProfilePredictorShapeInit(ProfilePredictor):
                 Ip=inputs["Ip_MA"].data,
                 B0=inputs["B0"].data,
                 betan=inputs["betan"].data,
-                ne20=inputs["ne20"].data,
+                ne20_line_avg=inputs["ne20_line_avg"].data,
                 R0=inputs["R0"].data,
                 a_minor=inputs["a_minor"].data,
                 kappa=inputs["kappa"].data,
@@ -347,7 +347,7 @@ class ProfilePredictorShapeInit(ProfilePredictor):
         )
 
         # Compute the ne profile.
-        ne = jnp.sum(ne_shapes, axis=0) * inputs.ne20
+        ne = jnp.sum(ne_shapes, axis=0) * inputs.ne20_line_avg
 
         # Compute the te profile using the learned correction.
         te = jnp.sum(te_shapes, axis=0) * inputs.te_approx * te_correction
@@ -434,7 +434,7 @@ class ProfilePredictorUnstructuredNN(ProfilePredictor):
                 Ip=inputs["Ip_MA"].data,
                 B0=inputs["B0"].data,
                 betan=inputs["betan"].data,
-                ne20=inputs["ne20"].data,
+                ne20_line_avg=inputs["ne20_line_avg"].data,
                 R0=inputs["R0"].data,
                 a_minor=inputs["a_minor"].data,
                 kappa=inputs["kappa"].data,
@@ -455,7 +455,7 @@ class ProfilePredictorUnstructuredNN(ProfilePredictor):
         te_correction = jnp.abs(outputs[-2])
 
         # Interpolate the predicted points to the psigrid
-        ne = jnp.interp(inputs.psi, psi_points, ne_points) * inputs.ne20 * ne_correction
+        ne = jnp.interp(inputs.psi, psi_points, ne_points) * inputs.ne20_line_avg * ne_correction
         te = jnp.interp(inputs.psi, psi_points, te_points) * te_correction
 
         out = Outputs(

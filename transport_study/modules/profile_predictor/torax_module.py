@@ -275,7 +275,7 @@ class ProfilePredictorTorax(TimeIndepModule):
                 Ip=inputs["Ip_MA"].data,
                 B0=inputs["B0"].data,
                 betan=inputs["betan"].data,
-                ne20=inputs["ne20_edge"].data,
+                ne20_line_avg=inputs["ne20_line_avg"].data,
                 R0=inputs["R0"].data,
                 a_minor=inputs["a_minor"].data,
                 kappa=inputs["kappa"].data,

@@ -40,5 +40,3 @@ def test_torax_predictor():
     )
 
     trainer, train_dl, val_dl, test_dl, _ = launch_train(train_config)
-
-    pass
