@@ -159,6 +159,7 @@ def _run_loop_jit_with_geo(
     geo_provider,
     max_steps: int,
     debug: bool = False,
+    wrap_body_in_checkpoint: bool = False,
 ):
     """Local copy of torax_experimental.run_loop_jit that also accepts geo_overrides.
 
@@ -167,7 +168,7 @@ def _run_loop_jit_with_geo(
       - Accepts a geo_overrides argument so per-sample geometry can be passed
         in without retracing the outer step_fn.
       - Skips the per-step history buffers (we only need the final state).
-      - Wraps the body in jax.checkpoint so reverse-mode AD recomputes
+      - Optionally wraps the body in jax.checkpoint so reverse-mode AD recomputes
         per-step activations rather than storing all max_steps copies.
     """
 
@@ -198,6 +199,9 @@ def _run_loop_jit_with_geo(
                 ne_hi=cp.n_e.value.max(),
             )
         return i + 1, current_state, post_processed
+
+    if wrap_body_in_checkpoint:
+        body = jax.checkpoint(body, prevent_cse=False)
 
     _, output_state, post_processed = torax_jax_utils.while_loop_bounded(
         cond,
