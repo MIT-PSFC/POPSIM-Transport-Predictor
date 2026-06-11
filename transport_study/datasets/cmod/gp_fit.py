@@ -4,9 +4,7 @@ import numpy as np
 
 def _build_gp() -> gptools.GaussianProcess:
     """Construct a GP instance with the standard prior/kernel settings."""
-    hp = gptools.UniformJointPrior([[0.0, 20.0]]) * gptools.GammaJointPriorAlt(
-        [1.0, 0.5, 0.0, 1.0], [0.3, 0.25, 0.1, 0.1]
-    )
+    hp = gptools.UniformJointPrior([[0.0, 20.0]]) * gptools.GammaJointPriorAlt([1.0, 0.5, 0.0, 1.0], [0.3, 0.25, 0.1, 0.1])
     k_gibbs = gptools.GibbsKernel1dTanh(hyperprior=hp)
     return gptools.GaussianProcess(k_gibbs)
 
@@ -38,9 +36,7 @@ def fit_gp_hyperparameters(
 
     # Boundary conditions, informed by Chilenski 2016
     val_bc = np.array([[1.1, 0, 0.01], [1.2, 0, 0.01], [1.3, 0, 0.01], [1.4, 0, 0.01]])
-    grad_bc = np.array(
-        [[0, 0, 0], [1.1, 0, 0.1], [1.2, 0, 0.1], [1.3, 0, 0.1], [1.4, 0, 0.1]]
-    )
+    grad_bc = np.array([[0, 0, 0], [1.1, 0, 0.1], [1.2, 0, 0.1], [1.3, 0, 0.1], [1.4, 0, 0.1]])
     gp.add_data(val_bc[:, 0], val_bc[:, 1], err_y=val_bc[:, 2], n=0)
     gp.add_data(grad_bc[:, 0], grad_bc[:, 1], err_y=grad_bc[:, 2], n=1)
 
@@ -71,18 +67,14 @@ def gp_profile(
 
     # Boundary conditions, informed by Chilenski 2016
     val_bc = np.array([[1.1, 0, 0.01], [1.2, 0, 0.01], [1.3, 0, 0.01], [1.4, 0, 0.01]])
-    grad_bc = np.array(
-        [[0, 0, 0], [1.1, 0, 0.1], [1.2, 0, 0.1], [1.3, 0, 0.1], [1.4, 0, 0.1]]
-    )
+    grad_bc = np.array([[0, 0, 0], [1.1, 0, 0.1], [1.2, 0, 0.1], [1.3, 0, 0.1], [1.4, 0, 0.1]])
     gp.add_data(val_bc[:, 0], val_bc[:, 1], err_y=val_bc[:, 2], n=0)
     gp.add_data(grad_bc[:, 0], grad_bc[:, 1], err_y=grad_bc[:, 2], n=1)
 
     if hyperparams is not None:
         gp.update_hyperparameters(np.asarray(hyperparams, dtype=float))
     elif optimize_hyperparams:
-        gp.optimize_hyperparameters(
-            verbose=False, random_starts=8, max_tries=4, num_proc=4
-        )
+        gp.optimize_hyperparameters(verbose=False, random_starts=8, max_tries=4, num_proc=4)
 
     y_star, std_y_star = gp.predict(X_star)
 

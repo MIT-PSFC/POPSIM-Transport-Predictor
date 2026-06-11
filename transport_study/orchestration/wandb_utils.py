@@ -1,10 +1,10 @@
 import subprocess
 from typing import Any
 
+import wandb
 from loguru import logger
 from popsim.ml import TrainConfig
 
-import wandb
 from transport_study.config import config
 
 

@@ -1,3 +1,6 @@
+import copy
+from typing import Any
+
 from transport_study.modules.profile_predictor.module import (
     ShapeType,
 )
@@ -52,7 +55,46 @@ PROFILE_PREDICTOR_SHAPE_INIT_CONFIG = {
     },
 }
 
-PROFILE_PREDICTOR_TORAX_CONFIG = {
+# Transport blocks for the three TORAX transport models the torax profile
+# predictor can be benchmarked with. Values are placeholders that must pass
+# pydantic validation; the NN-driven entries are overridden at call time.
+TORAX_TRANSPORT_BLOCKS = {
+    "constant": {
+        # Prescribed (flat) transport coefficients, all predicted by the NN.
+        "model_name": "constant",
+        "chi_i": 1.0,  # Predicted by NN
+        "chi_e": 1.0,  # Predicted by NN
+        "D_e": 1.0,  # Predicted by NN
+        "V_e": -0.33,  # Predicted by NN
+    },
+    "cgm": {
+        # Critical Gradient Model: TORAX computes the critical ion temperature
+        # gradient from the evolving state and geometry (known inputs); the NN
+        # predicts the dimensionless free parameters.
+        "model_name": "CGM",
+        "alpha": 2.0,  # Predicted by NN
+        "chi_stiff": 2.0,  # Predicted by NN
+        "chi_e_i_ratio": 2.0,  # Predicted by NN
+        "chi_D_ratio": 5.0,  # Predicted by NN
+        "VR_D_ratio": 0.0,  # Predicted by NN
+    },
+    "gyrobohm": {
+        # Bohm-GyroBohm model: TORAX computes the Bohm and GyroBohm chi terms
+        # from the evolving state and geometry; the NN predicts one multiplier
+        # per term (applied to both species) plus the particle transport
+        # weighting constants. The coeff prefactors stay at TORAX defaults.
+        "model_name": "bohm-gyrobohm",
+        "chi_e_bohm_multiplier": 1.0,  # Predicted by NN
+        "chi_i_bohm_multiplier": 1.0,  # Predicted by NN
+        "chi_e_gyrobohm_multiplier": 1.0,  # Predicted by NN
+        "chi_i_gyrobohm_multiplier": 1.0,  # Predicted by NN
+        "D_face_c1": 1.0,  # Predicted by NN
+        "D_face_c2": 0.3,  # Predicted by NN
+        "V_face_coeff": -0.1,  # Predicted by NN
+    },
+}
+
+_PROFILE_PREDICTOR_TORAX_CONFIG_BASE: dict[str, Any] = {
     "project": "profile_predictor_torax",
     "train_run_builder": ProfilePredictorTRB,
     "max_epochs": 10,
@@ -73,7 +115,7 @@ PROFILE_PREDICTOR_TORAX_CONFIG = {
         "target_vars": ["ne20_psi", "Te_keV_psi"],
     },
     "model_init_config": {
-        "model_type": "torax",
+        "model_type": "torax-cgm",  # Overridden per transport model by the builder below
         "nn_depth": 2,
         "nn_width": 16,
         "torax_config": {
@@ -119,18 +161,7 @@ PROFILE_PREDICTOR_TORAX_CONFIG = {
                 "B_0": 9999,  # Overridden by dataloader input
                 "elongation_LCFS": 9999,  # Overridden by dataloader input
             },
-            "transport": {
-                # Critical Gradient Model: TORAX computes the critical ion temperature
-                # gradient from the evolving state and geometry (known inputs); the NN
-                # predicts the dimensionless free parameters. Values here are
-                # placeholders that must pass validation.
-                "model_name": "CGM",
-                "alpha": 2.0,  # Predicted by NN
-                "chi_stiff": 2.0,  # Predicted by NN
-                "chi_e_i_ratio": 2.0,  # Predicted by NN
-                "chi_D_ratio": 5.0,  # Predicted by NN
-                "VR_D_ratio": 0.0,  # Predicted by NN
-            },
+            # "transport" block filled per transport model from TORAX_TRANSPORT_BLOCKS
             "sources": {
                 "ei_exchange": {},
                 "bremsstrahlung": {},
@@ -140,9 +171,10 @@ PROFILE_PREDICTOR_TORAX_CONFIG = {
                 "generic_current": {},
             },
             "solver": {
-                # CGM transport is stiff (chi jumps once the critical gradient is
-                # exceeded); the Pereverzev-Corrigan terms keep the linear theta
-                # solver stable at large fixed steps.
+                # Gradient-dependent transport (CGM is stiff, BgB chi depends on the
+                # evolving gradients); the Pereverzev-Corrigan terms keep the linear
+                # theta solver stable at large fixed steps. Harmless for the
+                # constant model.
                 "use_pereverzev": True,
                 "use_predictor_corrector": True,
             },
@@ -162,6 +194,26 @@ PROFILE_PREDICTOR_TORAX_CONFIG = {
         "lrf": 1e-4,
         "weight_decay": 1e-4,
     },
+}
+
+
+def make_profile_predictor_torax_config(transport_model: str) -> dict:
+    """Train config for the torax profile predictor with the given transport model.
+
+    transport_model is one of "constant", "cgm", "gyrobohm"; the corresponding
+    model_type is "torax-<transport_model>".
+    """
+    if transport_model not in TORAX_TRANSPORT_BLOCKS:
+        raise ValueError(f"Unknown transport model '{transport_model}', valid: {sorted(TORAX_TRANSPORT_BLOCKS)}")
+    cfg = copy.deepcopy(_PROFILE_PREDICTOR_TORAX_CONFIG_BASE)
+    cfg["project"] = f"profile_predictor_torax_{transport_model}"
+    cfg["model_init_config"]["model_type"] = f"torax-{transport_model}"
+    cfg["model_init_config"]["torax_config"]["transport"] = copy.deepcopy(TORAX_TRANSPORT_BLOCKS[transport_model])
+    return cfg
+
+
+PROFILE_PREDICTOR_TORAX_CONFIGS = {
+    transport_model: make_profile_predictor_torax_config(transport_model) for transport_model in TORAX_TRANSPORT_BLOCKS
 }
 
 PROFILE_PREDICTOR_DIRECT_POINTS_CONFIG = {

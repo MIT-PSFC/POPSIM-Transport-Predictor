@@ -17,7 +17,7 @@ from pydantic import Field, field_validator, model_validator
 from transport_study import PACKAGE_ROOT
 from transport_study.config import StudyConfig, config, load_config
 from transport_study.modules.profile_predictor.train_configs import (
-    PROFILE_PREDICTOR_TORAX_CONFIG,
+    PROFILE_PREDICTOR_TORAX_CONFIGS,
 )
 from transport_study.orchestration.organize_data import TrainingData
 from transport_study.orchestration.study import Study
@@ -66,7 +66,7 @@ class ProfileStudy(Study):
         @field_validator("model_types")
         @classmethod
         def _validate_model_types(cls, v: tuple[str, ...]) -> tuple[str, ...]:
-            valid = {"shape_init_pca", "shape_init_kmeans", "unstructured_nn", "torax"}
+            valid = {"shape_init_pca", "shape_init_kmeans", "unstructured_nn", "torax-constant", "torax-cgm", "torax-gyrobohm"}
             for mt in v:
                 if mt not in valid:
                     raise ValueError(f"Invalid model type: {mt}. Must be one of {sorted(valid)}.")
@@ -191,6 +191,8 @@ class ProfileStudy(Study):
         model_type: The type of profile_predictor model to use
         - shape_init: Use principal component analysis to determine dominant shapes
         - unstructured_nn: a single neural network directly predicts profiles at certain points
+        - torax-constant / torax-cgm / torax-gyrobohm: TORAX simulation with NN-predicted
+          parameters for the constant, critical gradient, or Bohm-GyroBohm transport model
 
         training_data: The dataset(s) used for training
         - cmod: C-Mod only
@@ -283,7 +285,9 @@ class ProfileStudy(Study):
                 "shape_init_pca",
                 "shape_init_kmeans",
                 "unstructured_nn",
-                "torax",
+                "torax-constant",
+                "torax-cgm",
+                "torax-gyrobohm",
             ]:
                 raise ValueError(f"Unknown model type: {model_type}")
             if domain_adaptation is None:
@@ -609,7 +613,8 @@ class ProfileStudy(Study):
                     val_eval_suite_config=val_eval_suite_config_base,
                     test_eval_suite_config=test_eval_suite_config_base,
                 )
-            elif case.model_type == "torax":
+            elif case.model_type.startswith("torax-"):
+                transport_model = case.model_type.removeprefix("torax-")
                 train_config_base = TrainConfig(
                     project=self.wandb_project_name(case),
                     train_run_builder="transport_study.modules.profile_predictor.trb.ProfilePredictorTRB",
@@ -640,7 +645,7 @@ class ProfileStudy(Study):
                         "nn_depth": 2,
                         "nn_width": 16,
                         "in_size": 9,  # Ip_MA, B0, betan, ne20_line_avg, R0, a_minor, kappa, delta_top, delta_bot
-                        "torax_config": PROFILE_PREDICTOR_TORAX_CONFIG["model_init_config"]["torax_config"],
+                        "torax_config": PROFILE_PREDICTOR_TORAX_CONFIGS[transport_model]["model_init_config"]["torax_config"],
                         "prng_seed": 42,
                     },
                     loss_config=loss_config_base,

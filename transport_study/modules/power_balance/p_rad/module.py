@@ -55,9 +55,7 @@ class RadiatedPower(TimeIndepModule):
             ],
         )
         nn_out = self.nn(arr)
-        bounded_out = soft_clip(
-            jnp.abs(inputs.ne20_real * nn_out), self.min_val, self.max_val, sharpness=8
-        ).squeeze()
+        bounded_out = soft_clip(jnp.abs(inputs.ne20_real * nn_out), self.min_val, self.max_val, sharpness=8).squeeze()
 
         output = RadiatedPower.Output(
             P_rad_MW_pred=bounded_out,
@@ -162,6 +160,4 @@ class RadiatedPower(TimeIndepModule):
             key=jax.random.PRNGKey(prng_seed),
         )
         input_format_fn = cls.get_input_format_fn(data_normalization)
-        return cls(
-            nn=nn, min_val=min_val, max_val=max_val, input_format_fn=input_format_fn
-        )
+        return cls(nn=nn, min_val=min_val, max_val=max_val, input_format_fn=input_format_fn)

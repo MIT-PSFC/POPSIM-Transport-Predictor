@@ -20,9 +20,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-_DS_PATH = Path(
-    "/fusion/projects/disruption_warning/data/popsim/popsim_studies/profopt/hbp_ida/raw_data/199056.nc"
-)
+_DS_PATH = Path("/fusion/projects/disruption_warning/data/popsim/popsim_studies/profopt/hbp_ida/raw_data/199056.nc")
 if not _DS_PATH.exists():
     pytest.skip("ds_path not found, skipping module", allow_module_level=True)
 
@@ -44,7 +42,6 @@ from transport_study import PACKAGE_ROOT
 from transport_study.datasets.d3d.d3d_dataset import D3DDataWorkflow
 from transport_study.datasets.d3d.utils import (
     DEFAULT_SHOTLIST_FILE,
-    Uniform1kHzTimeSetting,
 )
 
 
@@ -76,9 +73,7 @@ def test_trajopt_input_mapping():
 
     fig, axes = plt.subplots(4, 1, figsize=(10, 15))
     axes[0].plot(ds["time"], a_minor, label="a_minor")
-    axes[0].plot(
-        ds["time"], a_minor_reconst, label="a_minor_reconst", linestyle="dashed"
-    )
+    axes[0].plot(ds["time"], a_minor_reconst, label="a_minor_reconst", linestyle="dashed")
     axes[0].set_title("a_minor")
     axes[0].legend()
     axes[1].plot(ds["time"], kappa, label="kappa")
@@ -86,15 +81,11 @@ def test_trajopt_input_mapping():
     axes[1].set_title("kappa")
     axes[1].legend()
     axes[2].plot(ds["time"], delta_top, label="delta_top")
-    axes[2].plot(
-        ds["time"], delta_top_reconst, label="delta_top_reconst", linestyle="dashed"
-    )
+    axes[2].plot(ds["time"], delta_top_reconst, label="delta_top_reconst", linestyle="dashed")
     axes[2].set_title("delta_top")
     axes[2].legend()
     axes[3].plot(ds["time"], delta_bot, label="delta_bot")
-    axes[3].plot(
-        ds["time"], delta_bot_reconst, label="delta_bot_reconst", linestyle="dashed"
-    )
+    axes[3].plot(ds["time"], delta_bot_reconst, label="delta_bot_reconst", linestyle="dashed")
     axes[3].set_title("delta_bot")
     axes[3].legend()
     fig.tight_layout()
@@ -117,9 +108,7 @@ class TimeCheckSetting(TimeSetting):
         np.ndarray
             Array of times in the timebase.
         """
-        (efit_time,) = params.mds_conn.get_dims(
-            r"\efit_aeqdsk:ali", tree_name="_efit_tree"
-        )
+        (efit_time,) = params.mds_conn.get_dims(r"\efit_aeqdsk:ali", tree_name="_efit_tree")
         result_dir = PACKAGE_ROOT / "tests" / "test_outputs" / "d3d_1kHz_discrepancies"
         good_shots_dir = result_dir / "good_shots"
         bad_shots_dir = result_dir / "bad_shots"
@@ -134,9 +123,7 @@ class TimeCheckSetting(TimeSetting):
                 )
         else:
             with open(good_shots_dir / f"{params.shot_id}.txt", "w") as f:
-                f.write(
-                    f"EFIT timebase is good (typical delta: {typical_delta:.3f} ms)."
-                )
+                f.write(f"EFIT timebase is good (typical delta: {typical_delta:.3f} ms).")
 
         max_time = np.max(efit_time)
         if params.tokamak == Tokamak.CMOD:
@@ -149,16 +136,12 @@ class TimeCheckSetting(TimeSetting):
 
 
 def find_1kHz_discrepancies():
-    shotlist_file = (
-        PACKAGE_ROOT / "transport_study" / "datasets" / "d3d" / DEFAULT_SHOTLIST_FILE
-    )
+    shotlist_file = PACKAGE_ROOT / "transport_study" / "datasets" / "d3d" / DEFAULT_SHOTLIST_FILE
     shotlist_initial = np.loadtxt(shotlist_file, dtype=int)
 
     shotlist_ida = []
     for shot in shotlist_initial:
-        ida_path = Path(
-            f"/fusion/projects/results/ida-results/HBP_database/IDA_{shot}_.cdf"
-        )
+        ida_path = Path(f"/fusion/projects/results/ida-results/HBP_database/IDA_{shot}_.cdf")
         if ida_path.exists():
             shotlist_ida.append(shot)
 
@@ -196,20 +179,14 @@ def find_1kHz_discrepancies():
             f.write(f"{p.stem}\n")
             shotlist_bad.append(int(p.stem))
 
-    disruption_efit_dir = Path(
-        "/fusion/projects/disruption_warning/data/disruption-efit"
-    )
+    disruption_efit_dir = Path("/fusion/projects/disruption_warning/data/disruption-efit")
     for shot in shotlist_good:
         if not (disruption_efit_dir / f"{shot}.tgz").exists():
-            logger.warning(
-                f"Shot {shot} is in the good list but does not have a disruption efit file."
-            )
+            logger.warning(f"Shot {shot} is in the good list but does not have a disruption efit file.")
 
     for shot in shotlist_bad:
         if (disruption_efit_dir / f"{shot}.tgz").exists():
-            logger.warning(
-                f"Shot {shot} is in the bad list but has a disruption efit file."
-            )
+            logger.warning(f"Shot {shot} is in the bad list but has a disruption efit file.")
 
     with tempfile.TemporaryDirectory() as tmpdir:
         # Create the workflow and run it on a test shot
@@ -240,9 +217,7 @@ def find_1kHz_discrepancies():
     axs[0].set_title("gapin")
     axs[0].legend()
     axs[1].plot(ds_fast["time"], ds_fast["rsurf"], label="R0 (fast)")
-    axs[1].plot(
-        ds_slow_shot["time"], ds_slow_shot["R0"], label="R0 (slow)", linestyle="dashed"
-    )
+    axs[1].plot(ds_slow_shot["time"], ds_slow_shot["R0"], label="R0 (slow)", linestyle="dashed")
     axs[1].set_title("R0")
     axs[1].legend()
     axs[2].plot(ds_fast["time"], ds_fast["rxpt1"], label="rxpt1 (fast)")
@@ -264,13 +239,7 @@ def find_1kHz_discrepancies():
     axs[3].set_title("zxpt1")
     axs[3].legend()
     fig.tight_layout()
-    fig.savefig(
-        PACKAGE_ROOT
-        / "tests"
-        / "test_outputs"
-        / "d3d_1kHz_discrepancies"
-        / "input_mapping_comparison.png"
-    )
+    fig.savefig(PACKAGE_ROOT / "tests" / "test_outputs" / "d3d_1kHz_discrepancies" / "input_mapping_comparison.png")
     plt.close(fig)
 
 
@@ -282,9 +251,7 @@ def correct_betan_source():
     # 2. betan from fast EFIT
     # 3. betan from slow EFIT
     # 4. programmed betan
-    raw_path = Path(
-        "/fusion/projects/disruption_warning/data/popsim/popsim_studies/profopt/hbp_ida/raw_data/201927.nc"
-    )
+    raw_path = Path("/fusion/projects/disruption_warning/data/popsim/popsim_studies/profopt/hbp_ida/raw_data/201927.nc")
     ds_raw = xr.open_dataset(raw_path).isel(shot=0)
 
     betanf = ds_raw["betan"].values
@@ -298,9 +265,7 @@ def correct_betan_source():
     fig, ax = plt.subplots(figsize=(10, 5))
     ax.plot(ds_raw["time"], betanf, label="betanf (pedestal)")
     ax.plot(ds_raw["time"], beta_n, label="betan (EFIT)", linestyle="dashed")
-    ax.plot(
-        ds_raw["time"], betan_prog, label="betan_prog (programmed)", linestyle="dotted"
-    )
+    ax.plot(ds_raw["time"], betan_prog, label="betan_prog (programmed)", linestyle="dotted")
     ax.plot(ds_raw["time"], betat, label="betat (EFIT)", linestyle="dashdot")
     ax.plot(
         ds_raw["time"],
@@ -314,13 +279,7 @@ def correct_betan_source():
     ax.set_ylim(-0.01, 5)
     ax.legend()
     fig.tight_layout()
-    fig.savefig(
-        PACKAGE_ROOT
-        / "tests"
-        / "test_outputs"
-        / "d3d_1kHz_discrepancies"
-        / "betan_comparison.png"
-    )
+    fig.savefig(PACKAGE_ROOT / "tests" / "test_outputs" / "d3d_1kHz_discrepancies" / "betan_comparison.png")
     plt.close(fig)
 
 

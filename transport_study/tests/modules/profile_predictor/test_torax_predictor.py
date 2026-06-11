@@ -1,26 +1,27 @@
+import pytest
 from popsim.ml import TrainConfig
 from popsim.ml.launch import launch_train
 
 from transport_study import PACKAGE_ROOT
 from transport_study.config import StudyConfig, load_config
 from transport_study.modules.profile_predictor.train_configs import (
-    PROFILE_PREDICTOR_TORAX_CONFIG,
+    PROFILE_PREDICTOR_TORAX_CONFIGS,
 )
-from transport_study.modules.profile_predictor.trb import ProfilePredictorTRB
 
 
-def test_torax_predictor():
+@pytest.mark.parametrize("transport_model", ["constant", "cgm", "gyrobohm"])
+def test_torax_predictor(transport_model):
     config = StudyConfig(
-        study_name="test_torax_predictor",
+        study_name=f"test_torax_predictor_{transport_model}",
         dataset_paths={
-            "cmod-low": PACKAGE_ROOT / "datasets" / "sample" / "cmod_low_1.nc",
-            "cmod-high": PACKAGE_ROOT / "datasets" / "sample" / "cmod_high.nc",
+            "cmod-low": PACKAGE_ROOT / "datasets" / "sample" / "cmod-low1.nc",
+            "cmod-high": PACKAGE_ROOT / "datasets" / "sample" / "cmod-high.nc",
         },
         target_device="cmod-high",
     )
     load_config(config)
 
-    train_config = TrainConfig(**PROFILE_PREDICTOR_TORAX_CONFIG)
+    train_config = TrainConfig(**PROFILE_PREDICTOR_TORAX_CONFIGS[transport_model])
     training_data = {
         "sources_unsorted": ["cmod-low"],
         "exnihilo": False,
@@ -39,4 +40,4 @@ def test_torax_predictor():
         }
     )
 
-    trainer, train_dl, val_dl, test_dl, _ = launch_train(train_config)
+    _trainer, _train_dl, _val_dl, _test_dl, _ = launch_train(train_config)

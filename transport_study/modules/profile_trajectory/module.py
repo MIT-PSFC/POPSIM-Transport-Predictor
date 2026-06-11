@@ -78,14 +78,10 @@ class ProfileTrajectoryOptimizer(TimeDepModule):
 
     @chex.dataclass
     class Config:
-        traj_times: (
-            Array  # The times at which we specify the our desired trajectory [s]
-        )
+        traj_times: Array  # The times at which we specify the our desired trajectory [s]
         # I think that including these ranges should prevent the autodiff from finding a gradient that pushes it out of range
         # because if you put it into a softclip it kinda makes a wall that the input can't get nudged into
-        input_ranges: dict[
-            str, tuple[float, float]
-        ]  # The ranges for the input parameters during the trajectory
+        input_ranges: dict[str, tuple[float, float]]  # The ranges for the input parameters during the trajectory
         derived_shape_ranges: dict[
             str, tuple[float | None, float | None]
         ]  # Optional bounds on derived shape quantities: a_minor, kappa, delta_top, delta_bot
@@ -140,14 +136,7 @@ class ProfileTrajectoryOptimizer(TimeDepModule):
             "ne20_edge",
         ]:
             if input_name not in trajectory:
-                trajectory[input_name] = (
-                    jnp.ones(num_times)
-                    * (
-                        config.input_ranges[input_name][0]
-                        + config.input_ranges[input_name][1]
-                    )
-                    / 2
-                )
+                trajectory[input_name] = jnp.ones(num_times) * (config.input_ranges[input_name][0] + config.input_ranges[input_name][1]) / 2
 
         self.R0 = trajectory["R0"]
         self.gapin = trajectory["gapin"]
@@ -157,14 +146,10 @@ class ProfileTrajectoryOptimizer(TimeDepModule):
         self.zxpt2 = trajectory["zxpt2"]
         self.ne20_edge = trajectory["ne20_edge"]
 
-    def resolve_targets(
-        self, time: float, clip_sharpness: float = 10.0
-    ) -> dict[str, float]:
+    def resolve_targets(self, time: float, clip_sharpness: float = 10.0) -> dict[str, float]:
         """Output the target parameters at a given time"""
         idx = jnp.searchsorted(self.config.traj_times, time, side="right") - 1
-        idx = jnp.clip(
-            idx, 0, len(self.config.traj_times) - 1
-        )  # Ensure idx is within bounds
+        idx = jnp.clip(idx, 0, len(self.config.traj_times) - 1)  # Ensure idx is within bounds
 
         targ_dict = {
             "gapin": soft_clip(
@@ -257,13 +242,9 @@ class ProfileTrajectoryOptimizer(TimeDepModule):
         for name, (lo, hi) in self.config.derived_shape_ranges.items():
             val = derived_vals[name]
             if lo is not None:
-                shape_penalty = shape_penalty + jax.nn.softplus(
-                    _SHAPE_SHARPNESS * (lo - val)
-                )
+                shape_penalty = shape_penalty + jax.nn.softplus(_SHAPE_SHARPNESS * (lo - val))
             if hi is not None:
-                shape_penalty = shape_penalty + jax.nn.softplus(
-                    _SHAPE_SHARPNESS * (val - hi)
-                )
+                shape_penalty = shape_penalty + jax.nn.softplus(_SHAPE_SHARPNESS * (val - hi))
 
         # Create the output for this module
         output = ProfileTrajectoryOptimizer.Output(
@@ -305,9 +286,7 @@ class ProfileTrajectoryOptimizerEnv(ModuleTrainingEnv):
     optimize_density: bool = eqx.field(static=True, default=False)
 
     @staticmethod
-    def create_state(
-        observations: dict[str, ArrayLike], inputs: dict[str, ArrayLike]
-    ) -> ProfileTrajectoryOptimizer.State:
+    def create_state(observations: dict[str, ArrayLike], inputs: dict[str, ArrayLike]) -> ProfileTrajectoryOptimizer.State:
         return ProfileTrajectoryOptimizer.State()
 
     @staticmethod

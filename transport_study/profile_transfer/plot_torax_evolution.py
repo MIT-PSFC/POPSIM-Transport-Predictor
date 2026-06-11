@@ -8,8 +8,9 @@ Example:
     python -m transport_study.profile_transfer.plot_torax_evolution \
         --dataset transport_study/datasets/sample/cmod-low1.nc \
         --shot 1160824011 --timestep 800 \
+        --transport_model cgm \
         --checkpoint /path/to/trained/torax/checkpoint \
-        --chi_e_i_ratio 2.0 --S_total 1.0
+        --prescribed '{"chi_e_i_ratio": 2.0, "S_total": 1.0}'
 """
 
 from pathlib import Path
@@ -23,9 +24,12 @@ from loguru import logger
 from matplotlib import cm
 from popsim.ml.checkpointing import create_default_checkpoint_manager, restore_model
 
-from transport_study.modules.profile_predictor.torax_module import ProfilePredictorTorax
+from transport_study.modules.profile_predictor.torax_module import (
+    TRANSPORT_COEFFICIENT_NAMES,
+    ProfilePredictorTorax,
+)
 from transport_study.modules.profile_predictor.train_configs import (
-    PROFILE_PREDICTOR_TORAX_CONFIG,
+    PROFILE_PREDICTOR_TORAX_CONFIGS,
 )
 
 BACKGROUND_COLOR = "#2F2F2F"
@@ -80,14 +84,15 @@ def _load_timeslice(dataset: str | Path, shot: int, timestep: int) -> xr.Dataset
     return shot_ds.isel(time_idx=timestep)
 
 
-def _build_module(timeslice: xr.Dataset, checkpoint: str | Path | None) -> ProfilePredictorTorax:
-    model_cfg = PROFILE_PREDICTOR_TORAX_CONFIG["model_init_config"]
+def _build_module(timeslice: xr.Dataset, checkpoint: str | Path | None, transport_model: str) -> ProfilePredictorTorax:
+    model_cfg = PROFILE_PREDICTOR_TORAX_CONFIGS[transport_model]["model_init_config"]
     module = ProfilePredictorTorax(
         nn_width=model_cfg["nn_width"],
         nn_depth=model_cfg["nn_depth"],
         psigrid=tuple(timeslice["psi_n"].values.tolist()),
         torax_config=model_cfg["torax_config"],
         key=jax.random.PRNGKey(model_cfg["prng_seed"]),
+        transport_model=transport_model,
     )
     if checkpoint is not None:
         manager = create_default_checkpoint_manager(checkpoint)
@@ -110,15 +115,9 @@ def plot_torax_evolution(
     dataset: str,
     shot: int,
     timestep: int,
+    transport_model: str = "cgm",
     checkpoint: str | None = None,
-    chi_e_i_ratio: float | None = None,
-    chi_D_ratio: float | None = None,
-    VR_D_ratio: float | None = None,
-    alpha: float | None = None,
-    chi_stiff: float | None = None,
-    S_total: float | None = None,
-    n_e_right_bc: float | None = None,
-    T_e_right_bc: float | None = None,
+    prescribed: dict | None = None,
     output_dir: str | None = None,
 ):
     """Plot ne/Te profile evolution across the internal TORAX relaxation steps.
@@ -127,31 +126,26 @@ def plot_torax_evolution(
         dataset: Path to a NetCDF dataset with dims (shot, time_idx, psi_n).
         shot: Shot number to select.
         timestep: time_idx index of the timeslice to predict.
-        checkpoint: Optional checkpoint directory of a trained torax profile predictor.
-        chi_e_i_ratio: Optional prescribed CGM chi_i / chi_e ratio, bypasses NN output.
-        chi_D_ratio: Optional prescribed CGM chi_i / D_e ratio, bypasses NN output.
-        VR_D_ratio: Optional prescribed CGM R0 * V_e / D_e ratio, bypasses NN output.
-        alpha: Optional prescribed CGM chi power law exponent, bypasses NN output.
-        chi_stiff: Optional prescribed CGM stiffness parameter, bypasses NN output.
-        S_total: Optional prescribed gas puff particle source [1e21 /s], bypasses NN output.
-        n_e_right_bc: Optional prescribed edge density BC [1e20 m^-3], bypasses NN output.
-        T_e_right_bc: Optional prescribed edge temperature BC [keV], bypasses NN output.
+        transport_model: TORAX transport model: "constant", "cgm", or "gyrobohm".
+        checkpoint: Optional checkpoint directory of a trained torax profile predictor
+            (must have been trained with the same transport_model).
+        prescribed: Optional dict of coefficients bypassing the NN outputs.
+            Valid keys are the transport coefficients of the chosen model
+            (constant: chi_i, chi_e, D_e [m^2/s], V_e [m/s];
+            cgm: chi_e_i_ratio, chi_D_ratio, VR_D_ratio, alpha, chi_stiff;
+            gyrobohm: chi_bohm_multiplier, chi_gyrobohm_multiplier, D_face_c1,
+            D_face_c2, V_face_coeff)
+            plus S_total [1e21 /s], n_e_right_bc [1e20 m^-3], T_e_right_bc [keV].
+            From the CLI pass as a dict literal, e.g. --prescribed '{"S_total": 1.0}'.
         output_dir: Directory to save the figure in (default: current directory).
     """
+    if transport_model not in TRANSPORT_COEFFICIENT_NAMES:
+        raise ValueError(f"Unknown transport model '{transport_model}', valid: {sorted(TRANSPORT_COEFFICIENT_NAMES)}")
     timeslice = _load_timeslice(dataset, shot, timestep)
     time_s = float(timeslice["time"].values)
-    module = _build_module(timeslice, checkpoint)
+    module = _build_module(timeslice, checkpoint, transport_model)
 
-    prescribed = {
-        "chi_e_i_ratio": chi_e_i_ratio,
-        "chi_D_ratio": chi_D_ratio,
-        "VR_D_ratio": VR_D_ratio,
-        "alpha": alpha,
-        "chi_stiff": chi_stiff,
-        "S_total": S_total,
-        "n_e_right_bc": n_e_right_bc,
-        "T_e_right_bc": T_e_right_bc,
-    }
+    prescribed = prescribed or {}
     prescribed_names = {name for name, value in prescribed.items() if value is not None}
 
     steps, coeffs = module.evolve(timeslice, prescribed=prescribed)
@@ -168,10 +162,10 @@ def plot_torax_evolution(
         source = "prescribed" if name in prescribed_names else "NN"
         return f"{name}={coeffs[name]:.2f} ({source})"
 
-    coeff_line = ", ".join(_coeff_label(name) for name in ["chi_e_i_ratio", "chi_D_ratio", "VR_D_ratio", "alpha", "chi_stiff", "S_total"])
+    coeff_line = ", ".join(_coeff_label(name) for name in [*TRANSPORT_COEFFICIENT_NAMES[transport_model], "S_total"])
     bc_line = ", ".join(_coeff_label(name) for name in ["n_e_right_bc", "T_e_right_bc"])
     fig.suptitle(
-        f"TORAX profile relaxation - shot {shot} @ t={time_s:.3f}s (time_idx {timestep})\n{coeff_line}\n{bc_line}",
+        f"TORAX profile relaxation ({transport_model}) - shot {shot} @ t={time_s:.3f}s (time_idx {timestep})\n{coeff_line}\n{bc_line}",
         fontsize=TITLE_FONTSIZE - 4,
         color=TEXT_COLOR,
     )
@@ -205,7 +199,7 @@ def plot_torax_evolution(
 
     out_dir = Path(output_dir) if output_dir is not None else Path.cwd()
     out_dir.mkdir(parents=True, exist_ok=True)
-    plot_path = out_dir / f"torax_evolution_{Path(dataset).stem}_{shot}_ts{timestep}.png"
+    plot_path = out_dir / f"torax_evolution_{transport_model}_{Path(dataset).stem}_{shot}_ts{timestep}.png"
     fig.savefig(plot_path, dpi=150, facecolor=fig.get_facecolor(), bbox_inches="tight")
     plt.close(fig)
     logger.info(f"Saved plot to {plot_path}")

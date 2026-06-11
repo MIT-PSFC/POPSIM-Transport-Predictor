@@ -1,14 +1,8 @@
-import shutil
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
-import fire
-import pytest
-from loguru import logger
-
 from transport_study import PACKAGE_ROOT
-from transport_study.config import StudyConfig, load_config
-from transport_study.profile_transfer.profile_study import ProfileStudy, run_study
+from transport_study.profile_transfer.profile_study import ProfileStudy
 
 
 def test_compatible_configs():
@@ -203,7 +197,7 @@ def test_study_cmod_to_cmod_no_tuning():
         max_epochs=2,
         epochs_per_val=1,
         patience=2,
-        model_types=["shape_init_pca", "shape_init_kmeans", "unstructured_nn", "torax"],
+        model_types=["shape_init_pca", "shape_init_kmeans", "unstructured_nn", "torax-constant", "torax-cgm", "torax-gyrobohm"],
         training_datasets=[
             "exnihilo",
             "cmod-low",

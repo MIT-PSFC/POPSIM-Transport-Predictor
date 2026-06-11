@@ -3,7 +3,6 @@ import shutil
 from pathlib import Path
 
 import chex
-import numpy as np
 import pytest
 
 from transport_study import PACKAGE_ROOT
@@ -151,7 +150,7 @@ def test_power_balance_transfer_cases():
             print(f"{case}\n should have prereqs")
             for prereq in expected_prereqs:
                 print(f"{prereq}")
-            print(f"but has prereqs")
+            print("but has prereqs")
             for prereq in case.prereqs:
                 print(f"{prereq}")
             raise AssertionError

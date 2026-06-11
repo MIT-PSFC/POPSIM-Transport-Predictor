@@ -19,6 +19,21 @@ from transport_study.modules.profile_predictor.module import (
     Outputs,
 )
 
+# Per transport model: the coefficients predicted by the transport network,
+# in the order of the network outputs.
+TRANSPORT_COEFFICIENT_NAMES = {
+    "constant": ("chi_i", "chi_e", "D_e", "V_e"),
+    "cgm": ("chi_e_i_ratio", "chi_D_ratio", "VR_D_ratio", "alpha", "chi_stiff"),
+    "gyrobohm": ("chi_bohm_multiplier", "chi_gyrobohm_multiplier", "D_face_c1", "D_face_c2", "V_face_coeff"),
+}
+
+# TORAX transport.model_name expected in the torax_config for each transport model
+TORAX_TRANSPORT_MODEL_NAMES = {
+    "constant": "constant",
+    "cgm": "CGM",
+    "gyrobohm": "bohm-gyrobohm",
+}
+
 
 def _build_circular_geometry_jax(
     R_major: jax.Array,
@@ -214,6 +229,9 @@ def _run_loop_jit_with_geo(
 
 class ProfilePredictorTorax(TimeIndepModule):
     psigrid: tuple = eqx.field(static=True)
+    # Which TORAX transport model the transport network parameterizes:
+    # "constant", "cgm", or "gyrobohm"
+    transport_model: str = eqx.field(static=True)
 
     nn_transport: RtdMLP
     nn_sources: RtdMLP
@@ -234,11 +252,16 @@ class ProfilePredictorTorax(TimeIndepModule):
         psigrid: tuple,
         torax_config: ToraxConfig | dict,
         key: jax.random.PRNGKey,
+        transport_model: str = "cgm",
     ):
+        if transport_model not in TRANSPORT_COEFFICIENT_NAMES:
+            raise ValueError(f"Unknown transport model '{transport_model}', valid: {sorted(TRANSPORT_COEFFICIENT_NAMES)}")
+        self.transport_model = transport_model
+
         key, subkey_transport, subkey_sources, subkey_edge = jax.random.split(key, 4)
         self.nn_transport = RtdMLP(
             in_size=9,
-            out_size=5,  # chi_e_i_ratio, chi_D_ratio, VR_D_ratio, alpha, chi_stiff (CGM free parameters)
+            out_size=len(TRANSPORT_COEFFICIENT_NAMES[transport_model]),
             width_size=nn_width,
             depth=nn_depth,
             activation=Activation.RELU,
@@ -263,6 +286,13 @@ class ProfilePredictorTorax(TimeIndepModule):
 
         if isinstance(torax_config, dict):
             torax_config = ToraxConfig.from_dict(torax_config)
+
+        expected_model_name = TORAX_TRANSPORT_MODEL_NAMES[transport_model]
+        if torax_config.transport.model_name != expected_model_name:
+            raise ValueError(
+                f"transport_model '{transport_model}' requires torax_config transport.model_name "
+                f"'{expected_model_name}', got '{torax_config.transport.model_name}'"
+            )
 
         self.step_fn = torax_experimental.make_step_fn(torax_config)
         # Coerce to tuple: arrays in static fields break pytree metadata
@@ -296,25 +326,69 @@ class ProfilePredictorTorax(TimeIndepModule):
             )
         return inputs
 
+    def _transport_coefficients(self, nn_transport_out: jax.Array) -> dict:
+        """Bound the raw transport-network outputs to physical ranges for the configured model.
+
+        The bounds keep the TORAX solver stable during training for any network output.
+        Keys and order match TRANSPORT_COEFFICIENT_NAMES[self.transport_model].
+        """
+        if self.transport_model == "constant":
+            # Approximate ranges taken from DIII-D study and TFTR
+            # https://iopscience-iop-org.libproxy.mit.edu/article/10.1088/0029-5515/38/4/301/pdf
+            # https://iopscience-iop-org.libproxy.mit.edu/article/10.1088/0029-5515/39/1/309/pdf
+            #   chi_i: 0.1 - 5 m^2/s
+            #   chi_e: 0.1 - 10 m^2/s
+            #   D_e:   0.1 - 2 m^2/s   (nonzero floor prevents advection-only blowup)
+            #   V_e:   -5 - 5 m/s      (signed pinch)
+            return {
+                "chi_i": 0.1 + 4.9 * jax.nn.sigmoid(nn_transport_out[0:1]),
+                "chi_e": 0.1 + 9.9 * jax.nn.sigmoid(nn_transport_out[1:2]),
+                "D_e": 0.1 + 1.9 * jax.nn.sigmoid(nn_transport_out[2:3]),
+                "V_e": 5.0 * jnp.tanh(nn_transport_out[3:4]),
+            }
+        elif self.transport_model == "cgm":
+            # Free parameters of the Critical Gradient Model. The critical gradient
+            # itself is computed by TORAX from the evolving state and geometry
+            # (known inputs); only the dimensionless ratios are learned.
+            #   chi_e_i_ratio: 0.5 - 5   (chi_e = chi_i / ratio; ITG turbulence > 1)
+            #   chi_D_ratio:   1 - 20    (D_e = chi_i / ratio; must stay positive)
+            #   VR_D_ratio:    -5 - 5    (R0*V_e/D_e; negative peaks the density profile)
+            #   alpha:         1 - 3     (exponent of the chi power law, TORAX default 2)
+            #   chi_stiff:     0.5 - 5   (stiffness parameter, TORAX default 2)
+            return {
+                "chi_e_i_ratio": 0.5 + 4.5 * jax.nn.sigmoid(nn_transport_out[0:1]),
+                "chi_D_ratio": 1.0 + 19.0 * jax.nn.sigmoid(nn_transport_out[1:2]),
+                "VR_D_ratio": 5.0 * jnp.tanh(nn_transport_out[2:3]),
+                "alpha": 1.0 + 2.0 * jax.nn.sigmoid(nn_transport_out[3:4]),
+                "chi_stiff": 0.5 + 4.5 * jax.nn.sigmoid(nn_transport_out[4:5]),
+            }
+        else:  # gyrobohm
+            # Free parameters of the Bohm-GyroBohm model. The Bohm and GyroBohm
+            # chi terms are computed by TORAX from the evolving state and geometry;
+            # the NN learns one log-scale multiplier per term, applied to both
+            # species, since the model already fixes the ion/electron split
+            # (chi_i_B = 2 * chi_e_B, chi_i_gB = 0.5 * chi_e_gB). The coeff
+            # prefactors stay at the TORAX defaults (8e-5, 5e-6).
+            #   chi_bohm_multiplier and chi_gyrobohm_multiplier:
+            #     exp(-3) - exp(3), ~0.05 - 20, log-uniform around 1
+            #   D_face_c1: 0.1 - 5  (diffusivity weighting at the axis, TORAX default 1.0)
+            #   D_face_c2: 0.1 - 5  (diffusivity weighting at the edge, TORAX default 0.3)
+            #   V_face_coeff: -1 - 1 (convectivity / diffusivity ratio, TORAX default -0.1)
+            return {
+                "chi_bohm_multiplier": jnp.exp(3.0 * jnp.tanh(nn_transport_out[0:1])),
+                "chi_gyrobohm_multiplier": jnp.exp(3.0 * jnp.tanh(nn_transport_out[1:2])),
+                "D_face_c1": 0.1 + 4.9 * jax.nn.sigmoid(nn_transport_out[2:3]),
+                "D_face_c2": 0.1 + 4.9 * jax.nn.sigmoid(nn_transport_out[3:4]),
+                "V_face_coeff": jnp.tanh(nn_transport_out[4:5]),
+            }
+
     def _nn_coefficients(self, inputs: Inputs, debug: bool = False) -> dict:
-        # Get the free parameters of the Critical Gradient Model (CGM) and the
-        # particle source from neural networks, bounded to physical ranges so
-        # the TORAX solver stays stable during training. The critical gradient
-        # itself is computed by TORAX from the evolving state and geometry
-        # (known inputs); only the dimensionless ratios are learned.
-        #   chi_e_i_ratio: 0.5 - 5   (chi_e = chi_i / ratio; ITG turbulence > 1)
-        #   chi_D_ratio:   1 - 20    (D_e = chi_i / ratio; must stay positive)
-        #   VR_D_ratio:    -5 - 5    (R0*V_e/D_e; negative peaks the density profile)
-        #   alpha:         1 - 3     (exponent of the chi power law, TORAX default 2)
-        #   chi_stiff:     0.5 - 5   (stiffness parameter, TORAX default 2)
+        # Get the transport model free parameters and the particle source from
+        # neural networks, bounded to physical ranges so the TORAX solver stays
+        # stable during training.
         #   S_total: 0 - 10 (x 1e21 below)
         nn_inputs = inputs.nn_inputs
-        nn_transport_out = self.nn_transport(nn_inputs)
-        chi_e_i_ratio = 0.5 + 4.5 * jax.nn.sigmoid(nn_transport_out[0:1])
-        chi_D_ratio = 1.0 + 19.0 * jax.nn.sigmoid(nn_transport_out[1:2])
-        VR_D_ratio = 5.0 * jnp.tanh(nn_transport_out[2:3])
-        alpha = 1.0 + 2.0 * jax.nn.sigmoid(nn_transport_out[3:4])
-        chi_stiff = 0.5 + 4.5 * jax.nn.sigmoid(nn_transport_out[4:5])
+        coeffs = self._transport_coefficients(self.nn_transport(nn_inputs))
         S_total = jax.nn.softplus(self.nn_sources(nn_inputs))
 
         # Edge boundary conditions as NN-predicted fractions in (0, 1):
@@ -331,34 +405,62 @@ class ProfilePredictorTorax(TimeIndepModule):
         nn_edge_out = self.nn_edge(nn_inputs)
         ne_right_bc = jax.nn.sigmoid(nn_edge_out[0:1]) * inputs.ne20_line_avg
         te_right_bc = jax.nn.sigmoid(nn_edge_out[1:2] - 5.0) * inputs.te_approx
+
+        coeffs["S_total"] = S_total
+        coeffs["n_e_right_bc"] = ne_right_bc  # [1e20 m^-3]
+        coeffs["T_e_right_bc"] = te_right_bc  # [keV]
         if debug:
-            jax.debug.print(
-                "[nn] chi_e_i_ratio={cei} chi_D_ratio={cd} VR_D_ratio={vrd} alpha={a} chi_stiff={cs} S_total={s} nn_in={ni}",
-                cei=chi_e_i_ratio,
-                cd=chi_D_ratio,
-                vrd=VR_D_ratio,
-                a=alpha,
-                cs=chi_stiff,
-                s=S_total,
-                ni=nn_inputs,
-            )
-        return {
-            "chi_e_i_ratio": chi_e_i_ratio,
-            "chi_D_ratio": chi_D_ratio,
-            "VR_D_ratio": VR_D_ratio,
-            "alpha": alpha,
-            "chi_stiff": chi_stiff,
-            "S_total": S_total,
-            "n_e_right_bc": ne_right_bc,  # [1e20 m^-3]
-            "T_e_right_bc": te_right_bc,  # [keV]
-        }
+            fmt = " ".join(f"{name}={{{name}}}" for name in coeffs)
+            jax.debug.print("[nn] " + fmt + " nn_in={nn_in}", nn_in=nn_inputs, **coeffs)
+        return coeffs
+
+    def _transport_provider_mapping(self, coeffs: dict) -> dict:
+        """Runtime-params override entries for the configured transport model."""
+
+        def scalar(name: str) -> torax_experimental.TimeVaryingScalarUpdate:
+            return torax_experimental.TimeVaryingScalarUpdate(value=coeffs[name])
+
+        if self.transport_model == "constant":
+            # chi_i etc. are radial profiles (TimeVaryingArray) in the constant
+            # model: broadcast the NN scalar to a flat profile
+            rho = jnp.array([1.0])
+
+            def flat_profile(name: str) -> torax_experimental.TimeVaryingArrayUpdate:
+                return torax_experimental.TimeVaryingArrayUpdate(
+                    value=jnp.broadcast_to(coeffs[name][:, jnp.newaxis], (1, 1)),
+                    rho_norm=rho,
+                )
+
+            return {
+                "transport_model.chi_i": flat_profile("chi_i"),
+                "transport_model.chi_e": flat_profile("chi_e"),
+                "transport_model.D_e": flat_profile("D_e"),
+                "transport_model.V_e": flat_profile("V_e"),
+            }
+        elif self.transport_model == "cgm":
+            return {
+                "transport_model.chi_e_i_ratio": scalar("chi_e_i_ratio"),
+                "transport_model.chi_D_ratio": scalar("chi_D_ratio"),
+                "transport_model.VR_D_ratio": scalar("VR_D_ratio"),
+                # Plain float leaves in the provider: replaced with traced scalars
+                # directly rather than via TimeVaryingScalarUpdate
+                "transport_model.alpha": jnp.squeeze(coeffs["alpha"]),
+                "transport_model.chi_stiff": jnp.squeeze(coeffs["chi_stiff"]),
+            }
+        else:  # gyrobohm
+            # Same NN multiplier applied to both species: the BgB model already
+            # fixes chi_i_B = 2 * chi_e_B and chi_i_gB = 0.5 * chi_e_gB
+            return {
+                "transport_model.chi_e_bohm_multiplier": scalar("chi_bohm_multiplier"),
+                "transport_model.chi_i_bohm_multiplier": scalar("chi_bohm_multiplier"),
+                "transport_model.chi_e_gyrobohm_multiplier": scalar("chi_gyrobohm_multiplier"),
+                "transport_model.chi_i_gyrobohm_multiplier": scalar("chi_gyrobohm_multiplier"),
+                "transport_model.D_face_c1": scalar("D_face_c1"),
+                "transport_model.D_face_c2": scalar("D_face_c2"),
+                "transport_model.V_face_coeff": scalar("V_face_coeff"),
+            }
 
     def _build_provider_and_geo(self, inputs: Inputs, coeffs: dict):
-        chi_e_i_ratio = coeffs["chi_e_i_ratio"]
-        chi_D_ratio = coeffs["chi_D_ratio"]
-        VR_D_ratio = coeffs["VR_D_ratio"]
-        alpha = coeffs["alpha"]
-        chi_stiff = coeffs["chi_stiff"]
         S_total = coeffs["S_total"]
         ne_right_bc = coeffs["n_e_right_bc"]
         te_right_bc = coeffs["T_e_right_bc"]
@@ -368,9 +470,6 @@ class ProfilePredictorTorax(TimeIndepModule):
             value=jnp.atleast_1d(inputs.Ip * 1e6),
         )
         nbar_update = torax_experimental.TimeVaryingScalarUpdate(value=jnp.atleast_1d(inputs.fGW))
-        chi_e_i_ratio_update = torax_experimental.TimeVaryingScalarUpdate(value=chi_e_i_ratio)
-        chi_D_ratio_update = torax_experimental.TimeVaryingScalarUpdate(value=chi_D_ratio)
-        VR_D_ratio_update = torax_experimental.TimeVaryingScalarUpdate(value=VR_D_ratio)
         S_total_update = torax_experimental.TimeVaryingScalarUpdate(value=S_total * 1e21)
         ne_right_bc_update = torax_experimental.TimeVaryingScalarUpdate(value=ne_right_bc * 1e20)
         te_right_bc_update = torax_experimental.TimeVaryingScalarUpdate(value=te_right_bc)
@@ -386,26 +485,19 @@ class ProfilePredictorTorax(TimeIndepModule):
             rho_norm=jnp.array([0.0, 1.0]),
         )
 
-        new_provider = self.step_fn.runtime_params_provider.update_provider_from_mapping(
-            {
-                "profile_conditions.Ip": ip_update,
-                "profile_conditions.nbar": nbar_update,
-                "profile_conditions.n_e_right_bc": ne_right_bc_update,
-                # Assume the ion edge temperature matches the electron edge temperature
-                "profile_conditions.T_e_right_bc": te_right_bc_update,
-                "profile_conditions.T_i_right_bc": te_right_bc_update,
-                "profile_conditions.T_e": t_init_update,
-                "profile_conditions.T_i": t_init_update,
-                "transport_model.chi_e_i_ratio": chi_e_i_ratio_update,
-                "transport_model.chi_D_ratio": chi_D_ratio_update,
-                "transport_model.VR_D_ratio": VR_D_ratio_update,
-                # Plain float leaves in the provider: replaced with traced scalars
-                # directly rather than via TimeVaryingScalarUpdate
-                "transport_model.alpha": jnp.squeeze(alpha),
-                "transport_model.chi_stiff": jnp.squeeze(chi_stiff),
-                "sources.gas_puff.S_total": S_total_update,
-            }
-        )
+        mapping = {
+            "profile_conditions.Ip": ip_update,
+            "profile_conditions.nbar": nbar_update,
+            "profile_conditions.n_e_right_bc": ne_right_bc_update,
+            # Assume the ion edge temperature matches the electron edge temperature
+            "profile_conditions.T_e_right_bc": te_right_bc_update,
+            "profile_conditions.T_i_right_bc": te_right_bc_update,
+            "profile_conditions.T_e": t_init_update,
+            "profile_conditions.T_i": t_init_update,
+            "sources.gas_puff.S_total": S_total_update,
+        }
+        mapping.update(self._transport_provider_mapping(coeffs))
+        new_provider = self.step_fn.runtime_params_provider.update_provider_from_mapping(mapping)
 
         # Build JAX-differentiable geometry from per-sample inputs
         face_centers_np = np.array(self._face_centers)
@@ -474,13 +566,20 @@ class ProfilePredictorTorax(TimeIndepModule):
             geo_provider=geo_provider,
             max_steps=self.max_steps,
             debug=debug,
+            # The Bohm-GyroBohm chi depends on the evolving n_e/T_e gradients, so
+            # reverse-mode AD stores much larger per-step intermediates than the
+            # other models (47+ GiB at full batch -> GPU OOM). Recompute the loop
+            # body activations in the backward pass instead of storing them.
+            wrap_body_in_checkpoint=self.transport_model == "gyrobohm",
         )
 
-        ne = state.core_profiles.n_e.value
+        # n_e is in m^-3 inside TORAX; convert to 1e20 m^-3 to match the
+        # ne20_psi targets (and the other profile predictors)
+        ne = state.core_profiles.n_e.value / 1e20
         te = state.core_profiles.T_e.value
 
         # Interpolate onto psigrid in the true psi_n coordinate: TORAX evolves
-        # profiles on rho_norm (toroidal flux), so map the cell grid to
+        # profiles on rho_norm so map the cell grid to
         # normalized poloidal flux using the evolved psi profile.
         psi_n_cells = self._psi_n_cells(state.core_profiles)
         ne_interp = jnp.interp(inputs.psi, psi_n_cells, ne)
@@ -512,11 +611,13 @@ class ProfilePredictorTorax(TimeIndepModule):
 
         Args:
             inputs: Same as __call__ (Inputs or single-timeslice xr.Dataset).
-            prescribed: Optional dict overriding NN outputs. Keys from
-                {chi_e_i_ratio, chi_D_ratio, VR_D_ratio, alpha, chi_stiff, S_total,
-                n_e_right_bc, T_e_right_bc}; values are floats in the same units the NN
-                outputs use (the CGM parameters are dimensionless, S_total in 1e21
-                particles/s, n_e_right_bc in 1e20 m^-3, T_e_right_bc in keV).
+            prescribed: Optional dict overriding NN outputs. Valid keys are the
+                transport coefficients of the configured model
+                (TRANSPORT_COEFFICIENT_NAMES[self.transport_model]) plus
+                {S_total, n_e_right_bc, T_e_right_bc}; values are floats in the same
+                units the NN outputs use (S_total in 1e21 particles/s, n_e_right_bc
+                in 1e20 m^-3, T_e_right_bc in keV, chi/D/V in m^2/s or m/s for the
+                constant model, dimensionless otherwise).
                 Keys not given (or None) keep the NN prediction.
 
         Returns:
@@ -577,6 +678,7 @@ class ProfilePredictorTorax(TimeIndepModule):
         nn_width: int,
         nn_depth: int,
         prng_seed: int,
+        transport_model: str = "cgm",
     ):
         psigrid_tuple = tuple(psigrid.tolist())
         return cls(
@@ -585,4 +687,5 @@ class ProfilePredictorTorax(TimeIndepModule):
             psigrid=psigrid_tuple,
             torax_config=torax_config,
             key=jax.random.PRNGKey(prng_seed),
+            transport_model=transport_model,
         )

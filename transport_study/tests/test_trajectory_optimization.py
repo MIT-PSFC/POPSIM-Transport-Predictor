@@ -3,14 +3,11 @@ from pathlib import Path
 import chex
 import numpy as np
 import pytest
-from popsim.ml import TrainConfig, Trainer
+from popsim.ml import Trainer
 from popsim.ml.launch import launch_train
 
 from transport_study import PACKAGE_ROOT
 from transport_study.config import config
-from transport_study.modules.profile_predictor.trb import (
-    ProfilePredictorTRB,
-)
 from transport_study.modules.profile_trajectory.data import get_ds
 from transport_study.modules.profile_trajectory.module import (
     ProfileTrajectoryOptimizer,

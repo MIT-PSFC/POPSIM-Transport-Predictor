@@ -29,41 +29,27 @@ df["case"] = df[case_coords].astype(str).agg(".".join, axis=1)
 print("=" * 80)
 print("TOP 10 BY PER-TIMESLICE ERROR (err_rel_ts_mean)")
 print("=" * 80)
-print(
-    df.nsmallest(10, "err_rel_ts_mean")[
-        ["case", "err_rel_ts_mean", "err_rel_ts_std", "err_rel_ts_med"]
-    ].to_string(index=False)
-)
+print(df.nsmallest(10, "err_rel_ts_mean")[["case", "err_rel_ts_mean", "err_rel_ts_std", "err_rel_ts_med"]].to_string(index=False))
 
 print()
 print("=" * 80)
 print("TOP 10 BY PER-SHOT ERROR (err_rel_shot_mean)")
 print("=" * 80)
-print(
-    df.nsmallest(10, "err_rel_shot_mean")[
-        ["case", "err_rel_shot_mean", "err_rel_shot_std", "err_rel_shot_med"]
-    ].to_string(index=False)
-)
+print(df.nsmallest(10, "err_rel_shot_mean")[["case", "err_rel_shot_mean", "err_rel_shot_std", "err_rel_shot_med"]].to_string(index=False))
 
 df_hp = df[df["num_hp_shots"] != -1]
 print()
 print("=" * 80)
 print("TOP 10 BY PER-TIMESLICE ERROR (err_rel_ts_mean) — num_hp_shots != -1")
 print("=" * 80)
-print(
-    df_hp.nsmallest(10, "err_rel_ts_mean")[
-        ["case", "err_rel_ts_mean", "err_rel_ts_std", "err_rel_ts_med"]
-    ].to_string(index=False)
-)
+print(df_hp.nsmallest(10, "err_rel_ts_mean")[["case", "err_rel_ts_mean", "err_rel_ts_std", "err_rel_ts_med"]].to_string(index=False))
 
 print()
 print("=" * 80)
 print("TOP 10 BY PER-SHOT ERROR (err_rel_shot_mean) — num_hp_shots != -1")
 print("=" * 80)
 print(
-    df_hp.nsmallest(10, "err_rel_shot_mean")[
-        ["case", "err_rel_shot_mean", "err_rel_shot_std", "err_rel_shot_med"]
-    ].to_string(index=False)
+    df_hp.nsmallest(10, "err_rel_shot_mean")[["case", "err_rel_shot_mean", "err_rel_shot_std", "err_rel_shot_med"]].to_string(index=False)
 )
 
 # --- Bar charts ---
@@ -79,9 +65,7 @@ hp_color = {v: cmap(i) for i, v in enumerate(hp_values)}
 def bar_chart(ax, df_plot, metric, title):
     df_sorted = df_plot.sort_values(metric).reset_index(drop=True)
     colors = [hp_color[v] for v in df_sorted["num_hp_shots"]]
-    ax.bar(
-        range(len(df_sorted)), df_sorted[metric], color=colors, width=1.0, linewidth=0
-    )
+    ax.bar(range(len(df_sorted)), df_sorted[metric], color=colors, width=1.0, linewidth=0)
     ax.set_title(title, color=TEXT_COLOR)
     ax.set_ylabel(metric, color=TEXT_COLOR)
     ax.set_xticks([])

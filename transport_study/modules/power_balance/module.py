@@ -44,13 +44,9 @@ class BoundedNNPredictor(eqx.Module):
         P_aux_MW: float
 
     def __call__(self, inp: "Inputs") -> TauePredictorOutputs:
-        arr = jnp.array(
-            [inp.Ip_MA, inp.B0, inp.R0, inp.a_minor, inp.kappa, inp.ne20, inp.P_aux_MW]
-        )
+        arr = jnp.array([inp.Ip_MA, inp.B0, inp.R0, inp.a_minor, inp.kappa, inp.ne20, inp.P_aux_MW])
         nn_out = self.nn(arr)
-        bounded_out = soft_clip(
-            nn_out, self.min_val, self.max_val, sharpness=2
-        ).squeeze()
+        bounded_out = soft_clip(nn_out, self.min_val, self.max_val, sharpness=2).squeeze()
 
         output = TauePredictorOutputs(
             taue_pred=bounded_out,
@@ -105,17 +101,9 @@ class ScalingLawPredictor(eqx.Module):
         min_taue: float | None = None,
         max_taue: float | None = None,
     ):
-        self.scaling_lmode = (
-            scaling_lmode if scaling_lmode is not None else self.create_ipb98()
-        )
-        self.scaling_hmode = (
-            scaling_hmode if scaling_hmode is not None else self.create_ibp89()
-        )
-        self.scaling_lh_transition = (
-            scaling_lh_transition
-            if scaling_lh_transition is not None
-            else self.create_iter1996()
-        )
+        self.scaling_lmode = scaling_lmode if scaling_lmode is not None else self.create_ipb98()
+        self.scaling_hmode = scaling_hmode if scaling_hmode is not None else self.create_ibp89()
+        self.scaling_lh_transition = scaling_lh_transition if scaling_lh_transition is not None else self.create_iter1996()
         self.min_taue = MIN_TAUE if min_taue is None else min_taue
         self.max_taue = MAX_TAUE if max_taue is None else max_taue
 
@@ -278,9 +266,7 @@ class PowerBalanceScalingLaw(PowerBalance):
             p_rad_predictor=p_rad_predictor,
         )
 
-    def __call__(
-        self, state: PowerBalance.State, inputs: PowerBalance.Inputs
-    ) -> tuple[PowerBalance.State, PowerBalance.Output]:
+    def __call__(self, state: PowerBalance.State, inputs: PowerBalance.Inputs) -> tuple[PowerBalance.State, PowerBalance.Output]:
         p_oh_predictor_inputs = OhmicPower.Inputs(
             Ip_MA_real=inputs.Ip_MA,
             Ip_MA_nn=inputs.Ip_MA_nn,
@@ -373,9 +359,7 @@ class PowerBalanceSciML(PowerBalance):
             p_rad_predictor=p_rad_predictor,
         )
 
-    def __call__(
-        self, state: PowerBalance.State, inputs: PowerBalance.Inputs
-    ) -> tuple[PowerBalance.State, PowerBalance.Output]:
+    def __call__(self, state: PowerBalance.State, inputs: PowerBalance.Inputs) -> tuple[PowerBalance.State, PowerBalance.Output]:
         p_oh_predictor_inputs = OhmicPower.Inputs(
             Ip_MA_real=inputs.Ip_MA,
             Ip_MA_nn=inputs.Ip_MA_nn,
@@ -434,9 +418,7 @@ class PowerBalanceUnstructuredNN(PowerBalance):
     min_val: float = eqx.field(static=True)
     max_val: float = eqx.field(static=True)
 
-    def __call__(
-        self, state: PowerBalance.State, inputs: PowerBalance.Inputs
-    ) -> tuple[PowerBalance.State, PowerBalance.Output]:
+    def __call__(self, state: PowerBalance.State, inputs: PowerBalance.Inputs) -> tuple[PowerBalance.State, PowerBalance.Output]:
         arr = jnp.array(
             [
                 inputs.Ip_MA_nn,
@@ -451,17 +433,13 @@ class PowerBalanceUnstructuredNN(PowerBalance):
         nn_out = self.nn(arr)
         # TODO(ZanderKeith) this should be predicting in beta or something
         # at least all the inputs are in the same range...
-        Wtot_MJ_dot = soft_clip(
-            nn_out, self.min_val, self.max_val, sharpness=6
-        ).squeeze()
+        Wtot_MJ_dot = soft_clip(nn_out, self.min_val, self.max_val, sharpness=6).squeeze()
 
         state_dot = PowerBalance.State(Wtot_MJ=Wtot_MJ_dot)
         output = PowerBalance.Output(
             Wtot_MJ_pred=state.Wtot_MJ,
             P_cond_MW=jnp.nan,  # Not predicted in this model
-            taue_predictor_output=TauePredictorOutputs(
-                taue_pred=jnp.nan, debug_info={"nn_out": nn_out.squeeze()}
-            ),
+            taue_predictor_output=TauePredictorOutputs(taue_pred=jnp.nan, debug_info={"nn_out": nn_out.squeeze()}),
         )
 
         return state_dot, output
@@ -575,9 +553,7 @@ class PowerBalanceEnv(ModuleTrainingEnv):
                 P_aux_nn=inputs["P_aux_MW_coral"],
             )
         else:
-            raise ValueError(
-                f"Unknown data normalization method: {self.data_normalization}"
-            )
+            raise ValueError(f"Unknown data normalization method: {self.data_normalization}")
         return inputs
 
     def get_trainable(self):
@@ -609,22 +585,14 @@ class PowerBalanceEnv(ModuleTrainingEnv):
             return last_layer_leaves
 
         trainable_leaves = {}
-        if isinstance(self.module, PowerBalanceScalingLaw) or isinstance(
-            self.module, PowerBalanceSciML
-        ):
+        if isinstance(self.module, PowerBalanceScalingLaw) or isinstance(self.module, PowerBalanceSciML):
             if "p_oh_predictor" not in self.freeze_submodules:
-                trainable_leaves["p_oh_predictor"] = eqx.filter(
-                    self.module.p_oh_predictor, eqx.is_inexact_array
-                )
+                trainable_leaves["p_oh_predictor"] = eqx.filter(self.module.p_oh_predictor, eqx.is_inexact_array)
             if "p_rad_predictor" not in self.freeze_submodules:
-                trainable_leaves["p_rad_predictor"] = eqx.filter(
-                    self.module.p_rad_predictor, eqx.is_inexact_array
-                )
+                trainable_leaves["p_rad_predictor"] = eqx.filter(self.module.p_rad_predictor, eqx.is_inexact_array)
 
         if isinstance(self.module, PowerBalanceSciML):
-            trainable_leaves["taue_predictor"] = eqx.filter(
-                self.module.taue_predictor, eqx.is_inexact_array
-            )
+            trainable_leaves["taue_predictor"] = eqx.filter(self.module.taue_predictor, eqx.is_inexact_array)
         elif isinstance(self.module, PowerBalanceUnstructuredNN):
             trainable_leaves["nn"] = eqx.filter(self.module, eqx.is_inexact_array)
 

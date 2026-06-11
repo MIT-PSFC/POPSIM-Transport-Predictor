@@ -4,6 +4,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
+import wandb
 import yaml
 from loguru import logger
 from popsim.ml import DataLoader, TrainConfig, Trainer
@@ -14,7 +15,6 @@ from popsim.ml.launch import (
 )
 from popsim.ml.train_config import load_dict
 
-import wandb
 from transport_study import PACKAGE_ROOT
 from transport_study.config import config
 from transport_study.orchestration.slurm_utils import (

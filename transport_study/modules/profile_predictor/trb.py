@@ -165,13 +165,15 @@ class ProfilePredictorTRB(TrainRunBuilder):
                 psigrid=np.asarray(train_dl.ds["psi_n"]),
                 key=jax.random.PRNGKey(model_init_config["prng_seed"]),
             )
-        elif model_init_config["model_type"] == "torax":
+        elif model_init_config["model_type"].startswith("torax-"):
+            # model_type is "torax-<transport_model>", e.g. "torax-cgm"
             module = ProfilePredictorTorax(
                 nn_width=model_init_config["nn_width"],
                 nn_depth=model_init_config["nn_depth"],
                 psigrid=np.asarray(train_dl.ds["psi_n"]),
                 torax_config=model_init_config["torax_config"],
                 key=jax.random.PRNGKey(model_init_config["prng_seed"]),
+                transport_model=model_init_config["model_type"].removeprefix("torax-"),
             )
         else:
             raise ValueError(f"Invalid model type {model_init_config['model_type']}")
@@ -262,7 +264,7 @@ class ProfilePredictorTRB(TrainRunBuilder):
             return get_trainable_shape_init
         elif model_init_config["model_type"] == "unstructured_nn":
             return get_trainable_nn
-        elif model_init_config["model_type"] == "torax":
+        elif model_init_config["model_type"].startswith("torax-"):
             return get_trainable_torax
         else:
             raise ValueError(f"Invalid model type {model_init_config['model_type']}")

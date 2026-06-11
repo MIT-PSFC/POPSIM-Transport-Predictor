@@ -42,13 +42,7 @@ class RadiatedPowerTRB(TrainRunBuilder):
             else:
                 device_medians = []
                 for device in np.unique(train_dl.ds["ds_source"].values):
-                    device_median = (
-                        train_dl.ds.where(
-                            train_dl.ds["ds_source"] == device, drop=True
-                        )["P_rad_MW"]
-                        .median()
-                        .item()
-                    )
+                    device_median = train_dl.ds.where(train_dl.ds["ds_source"] == device, drop=True)["P_rad_MW"].median().item()
                     device_medians.append(device_median)
                 median = max(device_medians)
             model_init_config["max_val"] = 2 * median
@@ -65,13 +59,9 @@ class RadiatedPowerTRB(TrainRunBuilder):
         )
 
         if model_init_config.get("transfer_checkpoint", False):
-            transfer_manager = create_default_checkpoint_manager(
-                model_init_config["transfer_checkpoint"]
-            )
+            transfer_manager = create_default_checkpoint_manager(model_init_config["transfer_checkpoint"])
             module = restore_model(transfer_manager, module)
-            logger.debug(
-                f"Restoring module from tranfer learning pretrained checkpoint\n{model_init_config['transfer_checkpoint']}"
-            )
+            logger.debug(f"Restoring module from tranfer learning pretrained checkpoint\n{model_init_config['transfer_checkpoint']}")
 
         return module
 
@@ -85,16 +75,9 @@ class RadiatedPowerTRB(TrainRunBuilder):
         def loss_fn(pred, targ):
             absolute_error = jnp.abs(pred.P_rad_MW_pred - targ["P_rad_MW"].data)
             for device, weight in device_weights.items():
-                device_mask = (
-                    targ["ds_source_idx"].data
-                    == dataset_config.ds_source_to_idx[device]
-                )
-                absolute_error = jnp.where(
-                    device_mask, weight * absolute_error, absolute_error
-                )
-            huber_loss = optax.huber_loss(
-                absolute_error, delta=loss_config["huber_delta"]
-            )
+                device_mask = targ["ds_source_idx"].data == dataset_config.ds_source_to_idx[device]
+                absolute_error = jnp.where(device_mask, weight * absolute_error, absolute_error)
+            huber_loss = optax.huber_loss(absolute_error, delta=loss_config["huber_delta"])
             return jnp.mean(huber_loss)
 
         return loss_fn
@@ -159,17 +142,10 @@ class RadiatedPowerTRB(TrainRunBuilder):
             ds_source = eval_data.input_ds["ds_source"]
             if "sample" in ds_source.dims:
                 # Case when there are multiple source datasets present
-                ds_source_array = (
-                    eval_data.input_ds["ds_source"]
-                    .unstack("sample")
-                    .isel({TIME_DIM: 0})
-                    .values
-                )
+                ds_source_array = eval_data.input_ds["ds_source"].unstack("sample").isel({TIME_DIM: 0}).values
             else:
                 # Case when there is a single source dataset present
-                ds_source_array = np.array(
-                    [ds_source.values.item() for _ in range(targ.sizes["shot"])]
-                )
+                ds_source_array = np.array([ds_source.values.item() for _ in range(targ.sizes["shot"])])
 
             ds = xr.Dataset(
                 data_vars={
