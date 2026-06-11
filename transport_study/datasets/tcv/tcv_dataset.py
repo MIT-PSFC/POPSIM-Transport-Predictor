@@ -7,14 +7,16 @@ from pathlib import Path
 import netCDF4  # noqa: F401
 import numpy as np
 import xarray as xr
+from dynaconf import Dynaconf
 from loguru import logger
 
 from transport_study import PACKAGE_ROOT, TIME_COORD, TIME_DIM
-from transport_study.config import config
 from transport_study.datasets import make_uniform_1khz_timebase
 from transport_study.datasets.workflow import DataWorkflow
 
 DEFAULT_SHOTLIST_FILE = Path(PACKAGE_ROOT) / "datasets" / "tcv" / "tcv_shotlist"
+
+config = Dynaconf(settings_files=[Path(PACKAGE_ROOT) / "datasets/tcv/config.toml"])
 
 TCV_0D_SIGNALS = [
     # Required by the transport predictor module
@@ -78,8 +80,8 @@ class TCVDataWorkflow(DataWorkflow):
             Maximum number of shots to process (for testing). If None, process all shots.
         """
 
-        # Use centralized config
-        self.config = config.tcv
+        # Use the TCV dataset config from datasets/tcv/config.toml
+        self.config = config
 
         # Dictionary for valid signal ranges for filtering
         self.filter_config = {

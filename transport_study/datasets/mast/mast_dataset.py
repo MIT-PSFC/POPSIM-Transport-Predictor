@@ -5,7 +5,6 @@ from pathlib import Path
 
 import netCDF4  # noqa: F401
 import numpy as np
-import s3fs
 import xarray as xr
 from disruption_py.core.physics_method.params import PhysicsMethodParams
 from disruption_py.inout.xr import XarrayDataConnection
@@ -18,7 +17,7 @@ from scipy.interpolate import interp1d
 
 from transport_study import EPISODE_DIM, PACKAGE_ROOT, TIME_COORD, TIME_DIM
 from transport_study.datasets import make_uniform_1khz_timebase
-from transport_study.datasets.cmod.gp_fit import fit_gp_hyperparameters, gp_profile
+from transport_study.datasets.cmod.gp_fit import gp_profile
 from transport_study.datasets.workflow import DataWorkflow
 
 DEFAULT_SHOTLIST_FILE = Path(PACKAGE_ROOT) / "datasets" / "mast" / "mast_shotlist"
@@ -36,7 +35,10 @@ def _ensure_verbose_level():
         logger.level("VERBOSE", no=5, color="<cyan>", icon="V")
 
 
-def _make_fs(endpoint_url: str) -> s3fs.S3FileSystem:
+def _make_fs(endpoint_url: str) -> "s3fs.S3FileSystem":  # noqa: F821
+    # Lazy import so machines without s3fs can still import this module (e.g. via the CLI)
+    import s3fs
+
     return s3fs.S3FileSystem(anon=True, endpoint_url=endpoint_url)
 
 
@@ -69,6 +71,8 @@ def _check_required_signals(shot: int, cfg) -> bool:
 
 def _open_level2(shot: int, cfg) -> xr.DataTree | None:
     try:
+        import s3fs
+
         fs = _make_fs(cfg["level2_endpoint"])
         path = f"{cfg['level2_path']}/{shot}.{cfg['level2_ext']}"
         store = s3fs.S3Map(path, s3=fs)
@@ -80,6 +84,8 @@ def _open_level2(shot: int, cfg) -> xr.DataTree | None:
 
 def _open_level1_efm(shot: int, cfg) -> xr.Dataset | None:
     try:
+        import s3fs
+
         fs = _make_fs(cfg["level1_endpoint"])
         path = f"{cfg['level1_path']}/{shot}.{cfg['level2_ext']}"
         store = s3fs.S3Map(path, s3=fs)
@@ -230,7 +236,6 @@ class MASTDataWorkflow(DataWorkflow):
             "equilibrium/beta_pol",
             "equilibrium/triangularity_upper",
             "equilibrium/triangularity_lower",
-            "equilibrium/li",
             "equilibrium/vloop_dynamic",
             "summary/time",
             "summary/ip",
@@ -259,7 +264,6 @@ class MASTDataWorkflow(DataWorkflow):
             "beta_p": "beta_pol",
             "tritop": "triangularity_upper",
             "tribot": "triangularity_lower",
-            "li": "li",
         }
         data = {}
         for key, prop in eq_map.items():
@@ -290,11 +294,12 @@ class MASTDataWorkflow(DataWorkflow):
         shot: int,
         params: PhysicsMethodParams,
         timebase: np.ndarray,
-    ) -> tuple[np.ndarray, np.ndarray, np.ndarray] | None:
-        """Get raw Thomson channel data mapped to psi_n coordinates.
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray] | None:
+        """Get raw Thomson channel data at the TS measurement times, mapped to psi_n.
 
-        Returns (te_eV, ne_m3, psi_n_ts) each shaped (n_t, n_channels), or None
-        on failure. Invalid channels at a given timestep are NaN.
+        Returns (ts_time, te_eV, ne_m3, psi_n_ts) where the arrays are shaped
+        (n_ts_time, n_channels), or None on failure. Invalid channels at a given
+        measurement time are NaN. Only TS times within the shot timebase are kept.
         """
         try:
             ts_data = MastPhysicsMethods.get_ts_channels(params)
@@ -302,11 +307,19 @@ class MASTDataWorkflow(DataWorkflow):
             ne_da = ts_data["ts_ne"]
             ts_time = te_da.coords["time"].values
             r_ts = te_da.coords["major_radius"].values
-            # Transpose to (n_ch, n_ts_time) for per-timestep indexing
-            te_raw = te_da.values.T
-            ne_raw = ne_da.values.T
+            te_raw = te_da.values  # (n_ts_time, n_ch)
+            ne_raw = ne_da.values
         except Exception as e:
             logger.warning(f"Shot {shot}: failed to read Thomson data: {e}")
+            return None
+
+        # Keep only measurement times within the shot timebase
+        time_mask = (ts_time >= timebase[0]) & (ts_time <= timebase[-1])
+        ts_time = ts_time[time_mask]
+        te_raw = te_raw[time_mask, :]
+        ne_raw = ne_raw[time_mask, :]
+        if len(ts_time) == 0:
+            logger.warning(f"Shot {shot}: no Thomson measurement times within shot timebase")
             return None
 
         efm = _open_level1_efm(shot, self.level1_cfg)
@@ -324,15 +337,14 @@ class MASTDataWorkflow(DataWorkflow):
             return None
 
         n_ch = len(r_ts)
-        n_t = len(timebase)
+        n_t = len(ts_time)
         te_out = np.full((n_t, n_ch), np.nan, dtype=np.float32)
         ne_out = np.full((n_t, n_ch), np.nan, dtype=np.float32)
         psi_n_out = np.full((n_t, n_ch), np.nan, dtype=np.float32)
 
-        psi_ax_all = interp1d(efm_time, psi_axis_arr, bounds_error=False, fill_value=np.nan)(timebase)
-        psi_br_all = interp1d(efm_time, psi_bry_arr, bounds_error=False, fill_value=np.nan)(timebase)
-        t_eq_indices = np.argmin(np.abs(efm_time[:, None] - timebase[None, :]), axis=0)
-        t_ts_indices = np.argmin(np.abs(ts_time[:, None] - timebase[None, :]), axis=0)
+        psi_ax_all = interp1d(efm_time, psi_axis_arr, bounds_error=False, fill_value=np.nan)(ts_time)
+        psi_br_all = interp1d(efm_time, psi_bry_arr, bounds_error=False, fill_value=np.nan)(ts_time)
+        t_eq_indices = np.argmin(np.abs(efm_time[:, None] - ts_time[None, :]), axis=0)
 
         for i in range(n_t):
             psi_ax = float(psi_ax_all[i])
@@ -343,8 +355,8 @@ class MASTDataWorkflow(DataWorkflow):
             psi_2d = psirz[t_eq_indices[i], :, :]  # (n_z, n_r)
             psi_n_ts = _map_thomson_to_psi_n(r_ts, psi_2d, z_grid, r_grid_eq, psi_ax, psi_br)
 
-            te_at_t = te_raw[:, t_ts_indices[i]]
-            ne_at_t = ne_raw[:, t_ts_indices[i]]
+            te_at_t = te_raw[i, :]
+            ne_at_t = ne_raw[i, :]
 
             valid = (
                 np.isfinite(te_at_t)
@@ -359,7 +371,7 @@ class MASTDataWorkflow(DataWorkflow):
             te_out[i, valid] = te_at_t[valid]
             ne_out[i, valid] = ne_at_t[valid]
 
-        return te_out, ne_out, psi_n_out
+        return ts_time, te_out, ne_out, psi_n_out
 
     # ------------------------------------------------------------------
     def _make_profile_dataset(
@@ -391,22 +403,6 @@ class MASTDataWorkflow(DataWorkflow):
             err_y_all = np.where(np.isfinite(data_y_all), 0.1 * np.abs(data_y_all), np.nan)
             err_y_all = np.where(err_y_all < 0.01, 0.01, err_y_all)
 
-            cached_hp = None
-            for i_seed in range(n_t):
-                n_valid = int(np.sum(np.isfinite(psi_n_ts[i_seed, :]) & np.isfinite(data_y_all[i_seed, :])))
-                if n_valid < self.min_ts_points:
-                    continue
-                seed_scale = float(np.nanmax(data_y_all[i_seed, :]))
-                if not np.isfinite(seed_scale) or seed_scale < 1e-6:
-                    continue
-                cached_hp = fit_gp_hyperparameters(
-                    data_X=psi_n_ts[i_seed, :],
-                    data_y=data_y_all[i_seed, :] / seed_scale,
-                    err_y=err_y_all[i_seed, :] / seed_scale,
-                )
-                if cached_hp is not None:
-                    break
-
             for i_time in range(n_t):
                 n_valid = int(np.sum(np.isfinite(psi_n_ts[i_time, :]) & np.isfinite(data_y_all[i_time, :])))
                 if n_valid < self.min_ts_points:
@@ -416,18 +412,21 @@ class MASTDataWorkflow(DataWorkflow):
                 scale = float(np.nanmax(data_y_all[i_time, :]))
                 if not np.isfinite(scale) or scale < 1e-6:
                     continue
+                # Optimize hyperparameters for each individual profile, since plasma
+                # conditions (and thus profile shapes) change over the course of a shot
                 y_star, _, _, _ = gp_profile(
                     data_X=psi_n_ts[i_time, :],
                     data_y=data_y_all[i_time, :] / scale,
                     err_y=err_y_all[i_time, :] / scale,
                     X_star=self.gp_fit_psi,
                     calc_gradient=False,
-                    hyperparams=cached_hp,
-                    optimize_hyperparams=cached_hp is None,
+                    optimize_hyperparams=True,
                 )
                 if y_star is None:
                     continue
-                out_arr[i_time, :] = np.asarray(y_star).ravel() * scale
+                # Last resort: the GP mean can ring below zero between the outermost
+                # measurement and the edge boundary conditions, so clamp to non-negative
+                out_arr[i_time, :] = np.clip(np.asarray(y_star).ravel() * scale, 0.0, None)
 
         return Te_out, ne_out
 
@@ -435,22 +434,29 @@ class MASTDataWorkflow(DataWorkflow):
     def _debug_plot_profiles(
         self,
         shot: int,
+        ts_time: np.ndarray,
         te_keV: np.ndarray,
         ne_20: np.ndarray,
         psi_n_ts: np.ndarray,
         Te_out: np.ndarray,
         ne_out: np.ndarray,
-        debug_plot_dir: Path | None = "/home/zkeith/proj/popsim_dirs/POPSIM-Transport-Predictor/scratch/datasets/mast/debug_plots",
+        debug_plot_dir: Path | str | None = None,
     ) -> None:
-        """Save a PDF of raw TS points vs GP fit for sampled timesteps."""
+        """Save a PDF of raw TS points (with error bars) vs GP fit for sampled measurement times.
+
+        MAST has a single Thomson system, so there is no core/edge channel split.
+        """
         import matplotlib
 
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
         from matplotlib.backends.backend_pdf import PdfPages
 
+        if debug_plot_dir is None:
+            debug_plot_dir = self.data_assembly_dir / self.ds_name / "ts_fit_plots"
+        debug_plot_dir = Path(debug_plot_dir)
         debug_plot_dir.mkdir(parents=True, exist_ok=True)
-        pdf_path = debug_plot_dir / f"{shot}_ts_gp_debug.pdf"
+        pdf_path = debug_plot_dir / f"{shot}_ts_gp_fit.pdf"
 
         n_t = te_keV.shape[0]
         step = max(1, n_t // 20)
@@ -458,26 +464,40 @@ class MASTDataWorkflow(DataWorkflow):
 
         with PdfPages(pdf_path) as pdf:
             for i_time in t_indices:
-                fig, axes = plt.subplots(1, 2, figsize=(10, 4))
+                fig, axes = plt.subplots(1, 2, figsize=(12, 5))
                 for ax, data_y, gp_y, label, unit in [
                     (axes[0], te_keV[i_time, :], Te_out[i_time, :], "Te", "[keV]"),
                     (axes[1], ne_20[i_time, :], ne_out[i_time, :], "ne", "[1e20 m^-3]"),
                 ]:
                     psi_raw = psi_n_ts[i_time, :]
                     valid = np.isfinite(psi_raw) & np.isfinite(data_y)
-                    ax.scatter(psi_raw[valid], data_y[valid], s=14, zorder=3, label="raw TS")
+                    # Synthetic errors, matching what is used in _make_profile_dataset
+                    err_y = np.where(0.1 * np.abs(data_y) < 0.01, 0.01, 0.1 * np.abs(data_y))
+                    if valid.any():
+                        ax.errorbar(
+                            psi_raw[valid],
+                            data_y[valid],
+                            yerr=err_y[valid],
+                            fmt="o",
+                            ms=4,
+                            color="tab:blue",
+                            label="raw TS",
+                            zorder=3,
+                        )
                     gp_valid = np.isfinite(gp_y)
                     if gp_valid.any():
-                        ax.plot(self.gp_fit_psi[gp_valid], gp_y[gp_valid], label="GP fit")
+                        ax.plot(self.gp_fit_psi[gp_valid], gp_y[gp_valid], color="black", label="GP fit")
                     ax.set_xlabel("psi_n")
                     ax.set_ylabel(f"{label} {unit}")
-                    ax.set_title(f"shot {shot}  t_idx={i_time}  n_valid={valid.sum()}")
+                    ax.set_ylim(bottom=0)
+                    ax.set_title(f"shot {shot}  t={ts_time[i_time]:.3f} s  n_valid={valid.sum()}")
+                    ax.grid(alpha=0.3)
                     ax.legend(fontsize=8)
                 fig.tight_layout()
                 pdf.savefig(fig)
                 plt.close(fig)
 
-        logger.info(f"Saved debug plot to {pdf_path}")
+        logger.info(f"Saved TS fit diagnostic plot to {pdf_path}")
 
     # ------------------------------------------------------------------
     def make_raw_data_files(self, debug_plot_dir: Path | str | None = None):
@@ -536,38 +556,36 @@ class MASTDataWorkflow(DataWorkflow):
             if raw_ts is None:
                 logger.warning(f"Shot {shot}: failed to get raw Thomson data, skipping")
                 continue
-            te_eV, ne_m3, psi_n_ts = raw_ts
+            ts_time, te_eV, ne_m3, psi_n_ts = raw_ts
 
+            # Fit profiles at the TS measurement times only
             Te_keV_psi, ne20_psi = self._make_profile_dataset(te_eV, ne_m3, psi_n_ts)
 
-            debug_plot_dir = "/home/zkeith/proj/popsim_dirs/POPSIM-Transport-Predictor/scratch/datasets/mast/debug_plots"
-            if debug_plot_dir is not None:
-                self._debug_plot_profiles(
-                    shot,
-                    te_eV / 1e3,
-                    ne_m3 / 1e20,
-                    psi_n_ts,
-                    Te_keV_psi,
-                    ne20_psi,
-                    Path(debug_plot_dir),
-                )
+            # Put the fitted profiles on the 1 kHz timebase using previous value fill,
+            # consistent with the C-Mod workflow (no interpolation in time)
+            ds_profiles = xr.Dataset(
+                data_vars={
+                    "Te_keV_psi": (("time", "psi_n"), Te_keV_psi),
+                    "ne20_psi": (("time", "psi_n"), ne20_psi),
+                },
+                coords={
+                    "time": ts_time,
+                    "psi_n": self.gp_fit_psi.astype(np.float32),
+                },
+            )
+            ds_profiles = ds_profiles.reindex(time=timebase, method="ffill")
 
-            n_ch = te_eV.shape[1]
             data_vars = {}
             for name, vals in raw_0d.items():
                 data_vars[name] = ([TIME_DIM], vals.astype(np.float32))
 
-            data_vars["ts_te_eV"] = ([TIME_DIM, "ts_channel"], te_eV)
-            data_vars["ts_ne"] = ([TIME_DIM, "ts_channel"], ne_m3)
-            data_vars["ts_psi_n"] = ([TIME_DIM, "ts_channel"], psi_n_ts)
-            data_vars["Te_keV_psi"] = ([TIME_DIM, "psi_n"], Te_keV_psi)
-            data_vars["ne20_psi"] = ([TIME_DIM, "psi_n"], ne20_psi)
+            data_vars["Te_keV_psi"] = ([TIME_DIM, "psi_n"], ds_profiles["Te_keV_psi"].values)
+            data_vars["ne20_psi"] = ([TIME_DIM, "psi_n"], ds_profiles["ne20_psi"].values)
 
             coords = {
                 TIME_DIM: np.arange(len(timebase)),
                 TIME_COORD: (TIME_DIM, timebase.astype(np.float32)),
                 "psi_n": self.gp_fit_psi.astype(np.float32),
-                "ts_channel": np.arange(n_ch),
             }
 
             ds = xr.Dataset(data_vars, coords=coords)
@@ -581,6 +599,21 @@ class MASTDataWorkflow(DataWorkflow):
             ds_standardized.to_netcdf(ds_path)
             logger.info(f"Saved raw dataset for shot {shot} to {ds_path}")
             processed_shots += 1
+
+            # Only make fit diagnostic plots for shots that are kept
+            try:
+                self._debug_plot_profiles(
+                    shot,
+                    ts_time,
+                    te_eV / 1e3,
+                    ne_m3 / 1e20,
+                    psi_n_ts,
+                    Te_keV_psi,
+                    ne20_psi,
+                    debug_plot_dir,
+                )
+            except Exception as e:
+                logger.error(f"Failed to make TS fit diagnostic plot for shot {shot}: {e}")
 
         logger.info("Finished making MAST raw data files.")
 
@@ -602,7 +635,6 @@ class MASTDataWorkflow(DataWorkflow):
 
         # Profile predictor signals - map disruption_py names to POPSIM names
         ds["betan"] = ds["beta_n"]
-        ds["beta_pol"] = ds["beta_p"]
         ds["delta_top"] = ds["tritop"]
         ds["delta_bot"] = ds["tribot"]
 
@@ -615,31 +647,32 @@ class MASTDataWorkflow(DataWorkflow):
         if TIME_COORD in ds.coords and TIME_COORD not in ds.data_vars:
             ds = ds.reset_coords([TIME_COORD])
 
+        # Same set of variables as the C-Mod workflow, plus 'time' which the
+        # organize_data profile pipeline needs as a data variable
         kept_vars = {
+            # POWER BALANCE
             "Wtot_MJ",
-            "Ip_MA",
-            "B0",
-            "R0",
-            "a_minor",
-            "kappa",
-            "ne20_line_avg",
             "P_oh_MW",
-            "P_NBI_MW",
-            "P_ECRH_MW",
+            "P_rad_MW",
             "P_ICRF_MW",
             "P_LH_MW",
-            "P_rad_MW",
+            "P_NBI_MW",
+            "P_ECRH_MW",
+            # PROFILE PREDICTOR TRAINING
             "Te_keV_psi",
             "ne20_psi",
-            "ts_te_eV",
-            "ts_ne",
-            "ts_psi_n",
+            "Ip_MA",
+            "B0",
             "betan",
-            "ne20_edge",
+            "ne20_line_avg",
+            "R0",
+            "kappa",
+            "a_minor",
             "delta_top",
             "delta_bot",
-            "beta_pol",
-            "li",
+            # OTHER
+            "beta_p",
+            "ne20_edge",
             "time",
         }
 
@@ -670,10 +703,12 @@ class MASTDataWorkflow(DataWorkflow):
     # ------------------------------------------------------------------
     def device_specific_processing(self, ds: xr.Dataset) -> xr.Dataset:
         """Clip unphysical GP-fitted profile values and fill ne20_edge from profile."""
+        # Clamp to non-negative, consistent with the C-Mod workflow (raw files made
+        # before the fit-time clamp was added can still contain negative values)
         if "ne20_psi" in ds:
-            ds["ne20_psi"] = ds["ne20_psi"].where(ds["ne20_psi"] > 0)
+            ds["ne20_psi"] = ds["ne20_psi"].clip(min=0)
         if "Te_keV_psi" in ds:
-            ds["Te_keV_psi"] = ds["Te_keV_psi"].where(ds["Te_keV_psi"] > 0)
+            ds["Te_keV_psi"] = ds["Te_keV_psi"].clip(min=0)
 
         if "ne20_edge" in ds and "ne20_psi" in ds and "psi_n" in ds["ne20_psi"].dims:
             ne_edge_from_profile = ds["ne20_psi"].sel(psi_n=0.9, method="nearest")

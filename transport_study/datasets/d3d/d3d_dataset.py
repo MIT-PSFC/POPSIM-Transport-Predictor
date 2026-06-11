@@ -12,10 +12,10 @@ from disruption_py.settings import (
 )
 from disruption_py.settings.output_setting import DatasetOutputSetting
 from disruption_py.workflow import get_shots_data
+from dynaconf import Dynaconf
 from loguru import logger
 
-from transport_study import EPISODE_DIM, TIME_COORD, TIME_DIM
-from transport_study.config import config
+from transport_study import EPISODE_DIM, PACKAGE_ROOT, TIME_COORD, TIME_DIM
 from transport_study.datasets import make_uniform_1khz_timebase
 from transport_study.datasets.d3d.utils import (
     Uniform1kHzTimeSetting,
@@ -27,6 +27,8 @@ from transport_study.datasets.dispy_utils import summary
 from transport_study.datasets.workflow import DataWorkflow
 
 INNER_WALL = 1.05  # Location of the inner wall, used to calculate minor radius from gapin and R0
+
+config = Dynaconf(settings_files=[Path(PACKAGE_ROOT) / "datasets/d3d/config.toml"])
 
 
 class D3DDataWorkflow(DataWorkflow):
@@ -133,8 +135,8 @@ class D3DDataWorkflow(DataWorkflow):
             Whether to use IDA for profile data (True) or Zipfit (False). Default is True.
         """
 
-        # Use centralized config
-        self.config = config.d3d
+        # Use the DIII-D dataset config from datasets/d3d/config.toml
+        self.config = config
         self.use_ida = use_ida
 
         # Call parent init (which will call _get_shotlist_from_source if needed)

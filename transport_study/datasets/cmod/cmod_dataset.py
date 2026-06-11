@@ -1,5 +1,6 @@
 """Makes the 'raw' CMOD dataset on mfews, to be processed later by POPSIM"""
 
+import os
 from pathlib import Path
 
 import netCDF4  # noqa: F401
@@ -12,19 +13,23 @@ from disruption_py.settings import (
 )
 from disruption_py.settings.output_setting import DatasetOutputSetting
 from disruption_py.workflow import get_shots_data
+from dynaconf import Dynaconf
 from loguru import logger
 
 from transport_study import EPISODE_DIM, PACKAGE_ROOT, TIME_COORD, TIME_DIM
-from transport_study.config import config
 from transport_study.datasets import make_uniform_1khz_timebase
 from transport_study.datasets.cmod import (
     CMOD_DATASET_SIGNALS,
 )
-from transport_study.datasets.cmod.gp_fit import fit_gp_hyperparameters, gp_profile
+from transport_study.datasets.cmod.gp_fit import gp_profile
 from transport_study.datasets.dispy_utils import summary
 from transport_study.datasets.workflow import DataWorkflow
 
 DEFAULT_SHOTLIST_FILE = PACKAGE_ROOT / "datasets" / "cmod" / "cmod_shotlist"
+
+config = Dynaconf(settings_files=[Path(PACKAGE_ROOT) / "datasets/cmod/config.toml"])
+
+DEBUG = os.environ.get("PTPS_DEBUG", "False").lower() in ("1", "true")
 
 
 class CModDataWorkflow(DataWorkflow):
@@ -65,8 +70,8 @@ class CModDataWorkflow(DataWorkflow):
             If True, skip profile fitting and use zero arrays instead. Useful for testing.
         """
 
-        # Use centralized config
-        self.config = config.cmod
+        # Use the C-Mod dataset config from datasets/cmod/config.toml
+        self.config = config
 
         # Set up GP fitting psi grid
         if gp_fit_psi is not None:
@@ -179,13 +184,12 @@ class CModDataWorkflow(DataWorkflow):
         """
 
         shot_prediction = {}
-        cached_hyperparams: dict[str, np.ndarray | None] = {"te": None, "ne": None}
 
         for shot in ds_thomson["shot"].values:
             ds_shot = ds_thomson.where(ds_thomson["shot"] == shot, drop=True)
             ds_shot = ds_shot.squeeze(dim="shot", drop=True)
             times = ds_shot["time"].values
-            data_x = ds_shot["ts_channel_rho"].values.T  # shape (time, channel)
+            data_x = ds_shot["ts_channel_psi_n"].values.T  # shape (time, channel)
 
             te_data = np.full((len(times), len(self.gp_fit_psi)), np.nan)
             te_err = np.full((len(times), len(self.gp_fit_psi)), np.nan)
@@ -207,29 +211,23 @@ class CModDataWorkflow(DataWorkflow):
                 # Historic data, we're mostly going off vibes anyway
                 err_y = np.where(err_y < 0.1, 0.1, err_y)
 
-                if cached_hyperparams[variable] is None:
-                    # Fit once and reuse for the remainder of the dataset build.
-                    for i_seed, _ in enumerate(times):
-                        cached_hyperparams[variable] = fit_gp_hyperparameters(
-                            data_X=data_x[i_seed, :],
-                            data_y=data_y[i_seed, :],
-                            err_y=err_y[i_seed, :],
-                        )
-                        if cached_hyperparams[variable] is not None:
-                            break
-
                 for i_time, _ in enumerate(times):
+                    # Optimize hyperparameters for each individual profile, since plasma
+                    # conditions (and thus profile shapes) change over the course of a shot
                     y_star, std_y_star, _, _ = gp_profile(
                         data_X=data_x[i_time, :],
                         data_y=data_y[i_time, :],
                         err_y=err_y[i_time, :],
                         X_star=self.gp_fit_psi,
                         calc_gradient=False,
-                        hyperparams=cached_hyperparams[variable],
-                        optimize_hyperparams=cached_hyperparams[variable] is None,
+                        optimize_hyperparams=True,
                     )
                     if y_star is None:
                         continue
+
+                    # Last resort: the GP mean can ring below zero between the outermost
+                    # measurement and the edge boundary conditions, so clamp to non-negative
+                    y_star = np.clip(y_star, 0.0, None)
 
                     if variable == "te":
                         te_data[i_time, :] = y_star
@@ -241,7 +239,7 @@ class CModDataWorkflow(DataWorkflow):
                     if i_time % 10 == 0:
                         logger.verbose(f"Completed {i_time}/{len(times)} fits for {variable}")
 
-                    if config.debug and i_time > 20:
+                    if DEBUG and i_time > 20:
                         break
 
             shot_prediction[shot] = xr.Dataset(
@@ -264,6 +262,111 @@ class CModDataWorkflow(DataWorkflow):
         )
 
         return ds_profiles
+
+    def _debug_plot_profiles(
+        self,
+        shot: int,
+        ds_thomson: xr.Dataset,
+        ds_profiles: xr.Dataset,
+        debug_plot_dir: Path | str | None = None,
+    ) -> None:
+        """Save a PDF comparing the GP fits to the raw TS measurements.
+
+        Core and edge TS channels are differentiated and shown with error bars,
+        with the GP fit mean and +-1 sigma band overlaid. One page per sampled
+        TS measurement time.
+
+        Parameters
+        ----------
+        shot : int
+            Shot number, used for the file name and plot titles
+        ds_thomson : xr.Dataset
+            Raw Thomson channel dataset at the TS measurement times
+        ds_profiles : xr.Dataset
+            GP-fitted profile dataset at the TS measurement times
+        debug_plot_dir : Path | str | None
+            Directory to save the PDF. If None, uses '<ds_name>/ts_fit_plots'
+            next to the raw data directory.
+        """
+        import matplotlib
+
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        from matplotlib.backends.backend_pdf import PdfPages
+
+        if debug_plot_dir is None:
+            debug_plot_dir = self.data_assembly_dir / self.ds_name / "ts_fit_plots"
+        debug_plot_dir = Path(debug_plot_dir)
+        debug_plot_dir.mkdir(parents=True, exist_ok=True)
+        pdf_path = debug_plot_dir / f"{shot}_ts_gp_fit.pdf"
+
+        ds_thomson = ds_thomson.squeeze("shot", drop=True)
+        ds_profiles = ds_profiles.squeeze("shot", drop=True)
+
+        times = ds_thomson["time"].values
+        is_core = ds_thomson["ts_array"].values == "core"
+
+        n_t = len(times)
+        step = max(1, n_t // 20)
+
+        with PdfPages(pdf_path) as pdf:
+            for i_time in range(0, n_t, step):
+                time = times[i_time]
+                ds_ts_t = ds_thomson.isel(time=i_time)
+                ds_prof_t = ds_profiles.sel(time=time, method="nearest")
+                psi_n_ch = ds_ts_t["ts_channel_psi_n"].values
+
+                fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+                for ax, variable, gp_var, scale, label in [
+                    (axes[0], "te", "Te_keV_psi", 1.0, "Te [keV]"),
+                    (axes[1], "ne", "ne20_psi", 1e-20, "ne [1e20 m^-3]"),
+                ]:
+                    data_y = ds_ts_t[f"ts_channel_{variable}"].values * scale
+                    err_y = ds_ts_t[f"ts_channel_{variable}_error"].values * scale
+
+                    for mask, color, name in [
+                        (is_core, "tab:blue", "TS core"),
+                        (~is_core, "tab:orange", "TS edge"),
+                    ]:
+                        valid = mask & np.isfinite(psi_n_ch) & np.isfinite(data_y) & np.isfinite(err_y)
+                        if valid.any():
+                            ax.errorbar(
+                                psi_n_ch[valid],
+                                data_y[valid],
+                                yerr=err_y[valid],
+                                fmt="o",
+                                ms=4,
+                                color=color,
+                                label=name,
+                                zorder=3,
+                            )
+
+                    gp_y = ds_prof_t[gp_var].values
+                    gp_err = ds_prof_t[f"{gp_var}_error"].values
+                    gp_valid = np.isfinite(gp_y)
+                    if gp_valid.any():
+                        ax.plot(self.gp_fit_psi[gp_valid], gp_y[gp_valid], color="black", label="GP fit")
+                        ax.fill_between(
+                            self.gp_fit_psi[gp_valid],
+                            (gp_y - gp_err)[gp_valid],
+                            (gp_y + gp_err)[gp_valid],
+                            color="black",
+                            alpha=0.2,
+                            label="GP +-1 sigma",
+                        )
+
+                    ax.set_xlabel("psi_n")
+                    ax.set_ylabel(label)
+                    ax.set_ylim(bottom=0)
+                    ax.set_title(f"shot {shot}  t={time:.3f} s")
+                    ax.grid(alpha=0.3)
+                    ax.legend(fontsize=8)
+
+                fig.tight_layout()
+                pdf.savefig(fig)
+                plt.close(fig)
+
+        logger.info(f"Saved TS fit diagnostic plot to {pdf_path}")
 
     def _get_efit_dataset(self, shot: int) -> xr.Dataset:
         """Retrieve EFIT and 0D signals for a shot.
@@ -367,6 +470,10 @@ class CModDataWorkflow(DataWorkflow):
                 # Fit Thomson profiles
                 ds_profiles = self._make_profile_dataset(ds_thomson)
 
+                # Keep the datasets at the TS measurement times for fit diagnostics
+                ds_thomson_at_ts_times = ds_thomson
+                ds_profiles_at_ts_times = ds_profiles
+
                 # Put each dataset on a 1 kHz timebase, using previous value fill
                 max_time = max(
                     ds_thomson["time"].max().item(),
@@ -389,6 +496,13 @@ class CModDataWorkflow(DataWorkflow):
             ds_standardized.to_netcdf(ds_path)
             logger.info(f"Saved raw dataset for shot {shot} to {ds_path}")
             processed_shots += 1
+
+            # Only make fit diagnostic plots for shots that are kept
+            if not self.skip_profiles:
+                try:
+                    self._debug_plot_profiles(shot, ds_thomson_at_ts_times, ds_profiles_at_ts_times)
+                except Exception as e:
+                    logger.error(f"Failed to make TS fit diagnostic plot for shot {shot}: {e}")
 
         logger.info("Finished making raw data files.")
 
@@ -442,6 +556,12 @@ class CModDataWorkflow(DataWorkflow):
         kept_vars = {
             # POWER BALANCE
             "Wtot_MJ",
+            "P_oh_MW",
+            "P_rad_MW",
+            "P_ICRF_MW",
+            "P_LH_MW",
+            "P_NBI_MW",
+            "P_ECRH_MW",
             # PROFILE PREDICTOR TRAINING
             "Te_keV_psi",
             "ne20_psi",
@@ -512,3 +632,20 @@ class CModDataWorkflow(DataWorkflow):
         ds = ds.rename_vars({"psi": "psi_n"})
 
         return ds
+
+    def device_specific_culling(self, ds: xr.Dataset) -> bool:
+        """Apply C-Mod specific culling criteria to the dataset
+
+        Returns True if the dataset should be culled, False otherwise
+        """
+        shot_id = ds.shot.values[0] if "shot" in ds else "unknown"
+
+        # Profiles can become all NaN after the raw-file stage, e.g. when
+        # device_specific_processing culls every individual profile or when
+        # filtering cuts the shot down to a window with no valid profiles
+        for signal in ["Te_keV_psi", "ne20_psi"]:
+            if ds[signal].isnull().all():
+                logger.warning(f"Culling shot {shot_id}: {signal} is all NaN after processing and filtering")
+                return True
+
+        return False
