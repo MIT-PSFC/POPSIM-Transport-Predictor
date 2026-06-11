@@ -271,7 +271,7 @@ class ProfilePredictorTorax(TimeIndepModule):
         fixed_dt = float(numerics.fixed_dt.get_value(0.0))
         self.max_steps = int(np.ceil((numerics.t_final - numerics.t_initial) / fixed_dt)) + 1
 
-    def __call__(self, inputs: Inputs | xr.Dataset, debug: bool = False) -> Outputs:
+    def _coerce_inputs(self, inputs: Inputs | xr.Dataset) -> Inputs:
         if isinstance(inputs, xr.Dataset):
             inputs = Inputs(
                 Ip=inputs["Ip_MA"].data,
@@ -285,7 +285,9 @@ class ProfilePredictorTorax(TimeIndepModule):
                 delta_bot=inputs["delta_bot"].data,
                 psi=jnp.array(self.psigrid),
             )
+        return inputs
 
+    def _nn_coefficients(self, inputs: Inputs, debug: bool = False) -> dict:
         # Get transport and source terms from neural networks, bounded to
         # physical ranges so the TORAX solver stays stable during training
         # Approximate ranges taken from DIII-D study and TFTR
@@ -313,6 +315,20 @@ class ProfilePredictorTorax(TimeIndepModule):
                 s=S_total,
                 ni=nn_inputs,
             )
+        return {
+            "chi_i": chi_i,
+            "chi_e": chi_e,
+            "D_e": D_e,
+            "V_e": V_e,
+            "S_total": S_total,
+        }
+
+    def _build_provider_and_geo(self, inputs: Inputs, coeffs: dict):
+        chi_i = coeffs["chi_i"]
+        chi_e = coeffs["chi_e"]
+        D_e = coeffs["D_e"]
+        V_e = coeffs["V_e"]
+        S_total = coeffs["S_total"]
 
         # Build runtime params override
         ip_update = torax_experimental.TimeVaryingScalarUpdate(
@@ -351,6 +367,35 @@ class ProfilePredictorTorax(TimeIndepModule):
             rho_hires_norm_np=rho_hires_norm_np,
         )
         geo_provider = geometry_provider_lib.ConstantGeometryProvider(geo=geo)
+        return new_provider, geo_provider
+
+    @property
+    def rho_norm_grid(self) -> np.ndarray:
+        """Cell-center grid the TORAX core profiles live on.
+
+        This is rho_norm, the normalized toroidal flux coordinate, NOT psi_n
+        (normalized poloidal flux). Use _psi_n_cells to map a TORAX state's
+        cell grid to psi_n.
+        """
+        face_centers = np.array(self._face_centers)
+        return (face_centers[:-1] + face_centers[1:]) / 2.0
+
+    @staticmethod
+    def _psi_n_cells(core_profiles) -> jax.Array:
+        """Normalized poloidal flux psi_n on the cell grid, from the evolved psi profile.
+
+        psi_n = (psi - psi_axis) / (psi_lcfs - psi_axis), monotonic 0 -> 1 from
+        axis to LCFS regardless of the sign of the psi gradient.
+        """
+        psi_face = core_profiles.psi.face_value()
+        psi_axis = psi_face[0]
+        psi_lcfs = psi_face[-1]
+        return (core_profiles.psi.value - psi_axis) / (psi_lcfs - psi_axis)
+
+    def __call__(self, inputs: Inputs | xr.Dataset, debug: bool = False) -> Outputs:
+        inputs = self._coerce_inputs(inputs)
+        coeffs = self._nn_coefficients(inputs, debug=debug)
+        new_provider, geo_provider = self._build_provider_and_geo(inputs, coeffs)
 
         # Get initial state and run simulation
         initial_state, initial_post = torax_experimental.get_initial_state_and_post_processed_outputs(
@@ -381,10 +426,12 @@ class ProfilePredictorTorax(TimeIndepModule):
         ne = state.core_profiles.n_e.value
         te = state.core_profiles.T_e.value
 
-        # Interpolate onto psigrid (rho_norm for circular geometry)
-        rho_norm_grid = jnp.array(torax_mesh.cell_centers)
-        ne_interp = jnp.interp(inputs.psi, rho_norm_grid, ne)
-        te_interp = jnp.interp(inputs.psi, rho_norm_grid, te)
+        # Interpolate onto psigrid in the true psi_n coordinate: TORAX evolves
+        # profiles on rho_norm (toroidal flux), so map the cell grid to
+        # normalized poloidal flux using the evolved psi profile.
+        psi_n_cells = self._psi_n_cells(state.core_profiles)
+        ne_interp = jnp.interp(inputs.psi, psi_n_cells, ne)
+        te_interp = jnp.interp(inputs.psi, psi_n_cells, te)
 
         return Outputs(
             ne=xr.DataArray(
@@ -398,6 +445,72 @@ class ProfilePredictorTorax(TimeIndepModule):
                 coords={"psi_n": list(self.psigrid)},
             ),
         )
+
+    def evolve(
+        self,
+        inputs: Inputs | xr.Dataset,
+        prescribed: dict | None = None,
+    ) -> tuple[list[dict], dict]:
+        """Run the TORAX relaxation step by step, recording the core profiles after every step.
+
+        Diagnostic counterpart of __call__: same provider/geometry construction, but drives
+        step_fn in a plain Python loop instead of the jitted bounded while loop, so the
+        intermediate states are observable. Not differentiable; do not use for training.
+
+        Args:
+            inputs: Same as __call__ (Inputs or single-timeslice xr.Dataset).
+            prescribed: Optional dict overriding NN outputs. Keys from
+                {chi_i, chi_e, D_e, V_e, S_total}; values are floats in the same units the NN
+                outputs use (chi in m^2/s, V_e in m/s, S_total in 1e21 particles/s).
+                Keys not given (or None) keep the NN prediction.
+
+        Returns:
+            (steps, coeffs):
+                steps: list of dicts, one per TORAX state including the initial one, with keys
+                    t [s], ne20 [1e20 m^-3], te_keV [keV] and psi_n (the cell grid mapped to
+                    normalized poloidal flux for that state).
+                coeffs: the transport/source coefficients actually used, as floats.
+        """
+        inputs = self._coerce_inputs(inputs)
+        coeffs = self._nn_coefficients(inputs)
+        if prescribed is not None:
+            unknown = set(prescribed) - set(coeffs)
+            if unknown:
+                raise ValueError(f"Unknown prescribed coefficients {unknown}, valid keys: {sorted(coeffs)}")
+            for name, value in prescribed.items():
+                if value is not None:
+                    coeffs[name] = jnp.atleast_1d(jnp.asarray(float(value)))
+        new_provider, geo_provider = self._build_provider_and_geo(inputs, coeffs)
+
+        state, post = torax_experimental.get_initial_state_and_post_processed_outputs(
+            step_fn=self.step_fn,
+            runtime_params_overrides=new_provider,
+            geometry_overrides=geo_provider,
+        )
+
+        def record(s) -> dict:
+            cp = s.core_profiles
+            return {
+                "t": float(s.t),
+                "ne20": np.asarray(cp.n_e.value) / 1e20,
+                "te_keV": np.asarray(cp.T_e.value),
+                "psi_n": np.asarray(self._psi_n_cells(cp)),
+            }
+
+        steps = [record(state)]
+        for _ in range(self.max_steps):
+            if bool(self.step_fn.is_done(state.t)):
+                break
+            state, post = self.step_fn(
+                state,
+                post,
+                runtime_params_overrides=new_provider,
+                geo_overrides=geo_provider,
+            )
+            steps.append(record(state))
+
+        coeffs_out = {name: float(np.asarray(value).squeeze()) for name, value in coeffs.items()}
+        return steps, coeffs_out
 
     @classmethod
     def init(
