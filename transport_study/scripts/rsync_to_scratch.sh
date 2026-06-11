@@ -40,6 +40,20 @@ else
     rsync -az --info=progress2 --info=name0 "$PTPS_D3D_DATASET" "$PTPS_D3D_SCRATCH_DIR"
 fi
 
+if [ -z "$PTPS_MAST_DATASET" ] || [ -z "$PTPS_MAST_SCRATCH_DIR" ] ; then
+    echo "PTPS_MAST_DATASET or PTPS_MAST_SCRATCH_DIR not set, skipping MAST rsync"
+else
+    echo "MAST"
+    if [[ "$PTPS_MAST_SCRATCH_DIR" == *":"* ]]; then
+        REMOTE_HOST=$(echo "$PTPS_MAST_SCRATCH_DIR" | cut -d':' -f1)
+        REMOTE_PATH=$(echo "$PTPS_MAST_SCRATCH_DIR" | cut -d':' -f2)
+        ssh "$REMOTE_HOST" "mkdir -p '$REMOTE_PATH'"
+    else
+        mkdir -p "$PTPS_MAST_SCRATCH_DIR"
+    fi
+    rsync -az --info=progress2 --info=name0 "$PTPS_MAST_DATASET" "$PTPS_MAST_SCRATCH_DIR"
+fi
+
 if [ -z "$PTPS_TCV_DATASET" ] || [ -z "$PTPS_TCV_SCRATCH_DIR" ] ; then
     echo "PTPS_TCV_DATASET or PTPS_TCV_SCRATCH_DIR not set, skipping TCV rsync"
 else
