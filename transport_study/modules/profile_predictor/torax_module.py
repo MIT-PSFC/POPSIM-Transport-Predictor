@@ -217,6 +217,7 @@ class ProfilePredictorTorax(TimeIndepModule):
 
     nn_transport: RtdMLP
     nn_sources: RtdMLP
+    nn_edge: RtdMLP
 
     step_fn: SimulationStepFn = eqx.field(static=True)
 
@@ -234,7 +235,7 @@ class ProfilePredictorTorax(TimeIndepModule):
         torax_config: ToraxConfig | dict,
         key: jax.random.PRNGKey,
     ):
-        key, subkey_transport, subkey_sources = jax.random.split(key, 3)
+        key, subkey_transport, subkey_sources, subkey_edge = jax.random.split(key, 4)
         self.nn_transport = RtdMLP(
             in_size=9,
             out_size=4,  # chi_i, chi_e, D_e, V_e
@@ -250,6 +251,14 @@ class ProfilePredictorTorax(TimeIndepModule):
             depth=nn_depth,
             activation=Activation.RELU,
             key=subkey_sources,
+        )
+        self.nn_edge = RtdMLP(
+            in_size=9,
+            out_size=2,  # edge density fraction, edge temperature fraction
+            width_size=nn_width,
+            depth=nn_depth,
+            activation=Activation.RELU,
+            key=subkey_edge,
         )
 
         if isinstance(torax_config, dict):
@@ -305,6 +314,16 @@ class ProfilePredictorTorax(TimeIndepModule):
         D_e = 0.1 + 1.9 * jax.nn.sigmoid(nn_transport_out[2:3])
         V_e = 5.0 * jnp.tanh(nn_transport_out[3:4])
         S_total = jax.nn.softplus(self.nn_sources(nn_inputs))
+
+        # Edge boundary conditions as NN-predicted fractions in (0, 1):
+        #   n_e_right_bc = fraction * line-averaged density
+        #   T_e_right_bc = fraction * te_approx (beta-derived temperature guess,
+        #                  same scaling trick as the shape-init predictors)
+        # A fixed edge density BC above the target profile acts as an infinite
+        # particle source, so the BC must scale with the requested density.
+        nn_edge_out = self.nn_edge(nn_inputs)
+        ne_right_bc = jax.nn.sigmoid(nn_edge_out[0:1]) * inputs.ne20_line_avg
+        te_right_bc = jax.nn.sigmoid(nn_edge_out[1:2]) * inputs.te_approx
         if debug:
             jax.debug.print(
                 "[nn] chi_i={ci} chi_e={ce} D_e={d} V_e={v} S_total={s} nn_in={ni}",
@@ -321,6 +340,8 @@ class ProfilePredictorTorax(TimeIndepModule):
             "D_e": D_e,
             "V_e": V_e,
             "S_total": S_total,
+            "n_e_right_bc": ne_right_bc,  # [1e20 m^-3]
+            "T_e_right_bc": te_right_bc,  # [keV]
         }
 
     def _build_provider_and_geo(self, inputs: Inputs, coeffs: dict):
@@ -329,6 +350,8 @@ class ProfilePredictorTorax(TimeIndepModule):
         D_e = coeffs["D_e"]
         V_e = coeffs["V_e"]
         S_total = coeffs["S_total"]
+        ne_right_bc = coeffs["n_e_right_bc"]
+        te_right_bc = coeffs["T_e_right_bc"]
 
         # Build runtime params override
         ip_update = torax_experimental.TimeVaryingScalarUpdate(
@@ -341,11 +364,17 @@ class ProfilePredictorTorax(TimeIndepModule):
         D_e_update = torax_experimental.TimeVaryingArrayUpdate(value=jnp.broadcast_to(D_e[:, jnp.newaxis], (1, 1)), rho_norm=_rho)
         V_e_update = torax_experimental.TimeVaryingArrayUpdate(value=jnp.broadcast_to(V_e[:, jnp.newaxis], (1, 1)), rho_norm=_rho)
         S_total_update = torax_experimental.TimeVaryingScalarUpdate(value=S_total * 1e21)
+        ne_right_bc_update = torax_experimental.TimeVaryingScalarUpdate(value=ne_right_bc * 1e20)
+        te_right_bc_update = torax_experimental.TimeVaryingScalarUpdate(value=te_right_bc)
 
         new_provider = self.step_fn.runtime_params_provider.update_provider_from_mapping(
             {
                 "profile_conditions.Ip": ip_update,
                 "profile_conditions.nbar": nbar_update,
+                "profile_conditions.n_e_right_bc": ne_right_bc_update,
+                # Assume the ion edge temperature matches the electron edge temperature
+                "profile_conditions.T_e_right_bc": te_right_bc_update,
+                "profile_conditions.T_i_right_bc": te_right_bc_update,
                 "transport_model.chi_i": chi_i_update,
                 "transport_model.chi_e": chi_e_update,
                 "transport_model.D_e": D_e_update,
@@ -460,8 +489,9 @@ class ProfilePredictorTorax(TimeIndepModule):
         Args:
             inputs: Same as __call__ (Inputs or single-timeslice xr.Dataset).
             prescribed: Optional dict overriding NN outputs. Keys from
-                {chi_i, chi_e, D_e, V_e, S_total}; values are floats in the same units the NN
-                outputs use (chi in m^2/s, V_e in m/s, S_total in 1e21 particles/s).
+                {chi_i, chi_e, D_e, V_e, S_total, n_e_right_bc, T_e_right_bc}; values are floats
+                in the same units the NN outputs use (chi in m^2/s, V_e in m/s, S_total in
+                1e21 particles/s, n_e_right_bc in 1e20 m^-3, T_e_right_bc in keV).
                 Keys not given (or None) keep the NN prediction.
 
         Returns:
@@ -479,7 +509,9 @@ class ProfilePredictorTorax(TimeIndepModule):
                 raise ValueError(f"Unknown prescribed coefficients {unknown}, valid keys: {sorted(coeffs)}")
             for name, value in prescribed.items():
                 if value is not None:
-                    coeffs[name] = jnp.atleast_1d(jnp.asarray(float(value)))
+                    # Match the NN output dtype exactly: a weakly-typed scalar would get
+                    # demoted to float32 inside TORAX and fail its float64 checks
+                    coeffs[name] = jnp.full_like(coeffs[name], float(value))
         new_provider, geo_provider = self._build_provider_and_geo(inputs, coeffs)
 
         state, post = torax_experimental.get_initial_state_and_post_processed_outputs(

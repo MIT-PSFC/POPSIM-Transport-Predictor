@@ -79,9 +79,10 @@ PROFILE_PREDICTOR_TORAX_CONFIG = {
         "torax_config": {
             "profile_conditions": {
                 "Ip": 9999,  # Overridden by dataloader input
-                # Mild edge BCs to avoid huge initial gradient at LCFS (was crashing solver).
-                "T_i_right_bc": 0.2,  # [keV]
-                "T_e_right_bc": 0.2,  # [keV]
+                # Edge BCs predicted by NN as fractions of te_approx and ne20_line_avg.
+                "T_i_right_bc": 0.2,  # [keV] Predicted by NN
+                "T_e_right_bc": 0.2,  # [keV] Predicted by NN
+                "n_e_right_bc": 0.5e20,  # [m^-3] Predicted by NN
                 # Near-flat initial profiles; will relax up under ohmic heating / NN transport.
                 "T_i": {0: {0: 0.3, 1: 0.2}},
                 "T_e": {0: {0: 0.3, 1: 0.2}},
@@ -89,7 +90,6 @@ PROFILE_PREDICTOR_TORAX_CONFIG = {
                 "normalize_n_e_to_nbar": True,
                 "nbar": 99,  # Overridden by dataloader input
                 "n_e_nbar_is_fGW": True,
-                "n_e_right_bc": 0.5e20,
                 # Initialize psi from Ip and geometry via the current_profile_nu formula.
                 # Same as the legacy fallback for circular geometry, but explicit to
                 # silence the TORAX deprecation warning.

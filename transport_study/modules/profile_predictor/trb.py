@@ -255,7 +255,7 @@ class ProfilePredictorTRB(TrainRunBuilder):
             return [x for x in jax.tree.leaves(module) if id(x) in ids_of_nn_leaves]
 
         def get_trainable_torax(module: ProfilePredictorTorax):
-            ids_of_nn_leaves = [id(x) for x in jax.tree.leaves((module.nn_transport, module.nn_sources))]
+            ids_of_nn_leaves = [id(x) for x in jax.tree.leaves((module.nn_transport, module.nn_sources, module.nn_edge))]
             return [x for x in jax.tree.leaves(module) if id(x) in ids_of_nn_leaves]
 
         if model_init_config["model_type"] in ["shape_init_pca", "shape_init_kmeans"]:

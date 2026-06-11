@@ -116,6 +116,8 @@ def plot_torax_evolution(
     D_e: float | None = None,
     V_e: float | None = None,
     S_total: float | None = None,
+    n_e_right_bc: float | None = None,
+    T_e_right_bc: float | None = None,
     output_dir: str | None = None,
 ):
     """Plot ne/Te profile evolution across the internal TORAX relaxation steps.
@@ -130,6 +132,8 @@ def plot_torax_evolution(
         D_e: Optional prescribed particle diffusivity [m^2/s], bypasses NN output.
         V_e: Optional prescribed particle pinch velocity [m/s], bypasses NN output.
         S_total: Optional prescribed gas puff particle source [1e21 /s], bypasses NN output.
+        n_e_right_bc: Optional prescribed edge density BC [1e20 m^-3], bypasses NN output.
+        T_e_right_bc: Optional prescribed edge temperature BC [keV], bypasses NN output.
         output_dir: Directory to save the figure in (default: current directory).
     """
     timeslice = _load_timeslice(dataset, shot, timestep)
@@ -142,6 +146,8 @@ def plot_torax_evolution(
         "D_e": D_e,
         "V_e": V_e,
         "S_total": S_total,
+        "n_e_right_bc": n_e_right_bc,
+        "T_e_right_bc": T_e_right_bc,
     }
     prescribed_names = {name for name, value in prescribed.items() if value is not None}
 
@@ -160,9 +166,10 @@ def plot_torax_evolution(
         return f"{name}={coeffs[name]:.2f} ({source})"
 
     coeff_line = ", ".join(_coeff_label(name) for name in ["chi_i", "chi_e", "D_e", "V_e", "S_total"])
+    bc_line = ", ".join(_coeff_label(name) for name in ["n_e_right_bc", "T_e_right_bc"])
     fig.suptitle(
-        f"TORAX profile relaxation - shot {shot} @ t={time_s:.3f}s (time_idx {timestep})\n{coeff_line}",
-        fontsize=TITLE_FONTSIZE,
+        f"TORAX profile relaxation - shot {shot} @ t={time_s:.3f}s (time_idx {timestep})\n{coeff_line}\n{bc_line}",
+        fontsize=TITLE_FONTSIZE - 4,
         color=TEXT_COLOR,
     )
 
