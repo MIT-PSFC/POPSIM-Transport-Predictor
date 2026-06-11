@@ -238,7 +238,7 @@ class ProfilePredictorTorax(TimeIndepModule):
         key, subkey_transport, subkey_sources, subkey_edge = jax.random.split(key, 4)
         self.nn_transport = RtdMLP(
             in_size=9,
-            out_size=4,  # chi_i, chi_e, D_e, V_e
+            out_size=5,  # chi_e_i_ratio, chi_D_ratio, VR_D_ratio, alpha, chi_stiff (CGM free parameters)
             width_size=nn_width,
             depth=nn_depth,
             activation=Activation.RELU,
@@ -297,22 +297,24 @@ class ProfilePredictorTorax(TimeIndepModule):
         return inputs
 
     def _nn_coefficients(self, inputs: Inputs, debug: bool = False) -> dict:
-        # Get transport and source terms from neural networks, bounded to
-        # physical ranges so the TORAX solver stays stable during training
-        # Approximate ranges taken from DIII-D study and TFTR
-        # https://iopscience-iop-org.libproxy.mit.edu/article/10.1088/0029-5515/38/4/301/pdf
-        # https://iopscience-iop-org.libproxy.mit.edu/article/10.1088/0029-5515/39/1/309/pdf
-        #   chi_i: 0.1 - 10 m^2/s
-        #   chi_e: 0.1 - 20 m^2/s
-        #   D_e:   0.1 - 3 m^2/s   (nonzero floor prevents advection-only blowup)
-        #   V_e:   -5 - 5 m/s      (signed pinch)
+        # Get the free parameters of the Critical Gradient Model (CGM) and the
+        # particle source from neural networks, bounded to physical ranges so
+        # the TORAX solver stays stable during training. The critical gradient
+        # itself is computed by TORAX from the evolving state and geometry
+        # (known inputs); only the dimensionless ratios are learned.
+        #   chi_e_i_ratio: 0.5 - 5   (chi_e = chi_i / ratio; ITG turbulence > 1)
+        #   chi_D_ratio:   1 - 20    (D_e = chi_i / ratio; must stay positive)
+        #   VR_D_ratio:    -5 - 5    (R0*V_e/D_e; negative peaks the density profile)
+        #   alpha:         1 - 3     (exponent of the chi power law, TORAX default 2)
+        #   chi_stiff:     0.5 - 5   (stiffness parameter, TORAX default 2)
         #   S_total: 0 - 10 (x 1e21 below)
         nn_inputs = inputs.nn_inputs
         nn_transport_out = self.nn_transport(nn_inputs)
-        chi_i = 0.1 + 4.9 * jax.nn.sigmoid(nn_transport_out[0:1])
-        chi_e = 0.1 + 9.9 * jax.nn.sigmoid(nn_transport_out[1:2])
-        D_e = 0.1 + 1.9 * jax.nn.sigmoid(nn_transport_out[2:3])
-        V_e = 5.0 * jnp.tanh(nn_transport_out[3:4])
+        chi_e_i_ratio = 0.5 + 4.5 * jax.nn.sigmoid(nn_transport_out[0:1])
+        chi_D_ratio = 1.0 + 19.0 * jax.nn.sigmoid(nn_transport_out[1:2])
+        VR_D_ratio = 5.0 * jnp.tanh(nn_transport_out[2:3])
+        alpha = 1.0 + 2.0 * jax.nn.sigmoid(nn_transport_out[3:4])
+        chi_stiff = 0.5 + 4.5 * jax.nn.sigmoid(nn_transport_out[4:5])
         S_total = jax.nn.softplus(self.nn_sources(nn_inputs))
 
         # Edge boundary conditions as NN-predicted fractions in (0, 1):
@@ -321,34 +323,42 @@ class ProfilePredictorTorax(TimeIndepModule):
         #                  same scaling trick as the shape-init predictors)
         # A fixed edge density BC above the target profile acts as an infinite
         # particle source, so the BC must scale with the requested density.
+        # The negative bias on the temperature fraction makes random-init edge
+        # temperatures small (~0.007 * te_approx, a few hundred eV): te_approx
+        # is a beta-derived overestimate, and a hot edge BC flattens the profile
+        # relative to itself, which keeps the critical gradient model
+        # subcritical (chi = 0) and kills the gradient to the transport network.
         nn_edge_out = self.nn_edge(nn_inputs)
         ne_right_bc = jax.nn.sigmoid(nn_edge_out[0:1]) * inputs.ne20_line_avg
-        te_right_bc = jax.nn.sigmoid(nn_edge_out[1:2]) * inputs.te_approx
+        te_right_bc = jax.nn.sigmoid(nn_edge_out[1:2] - 5.0) * inputs.te_approx
         if debug:
             jax.debug.print(
-                "[nn] chi_i={ci} chi_e={ce} D_e={d} V_e={v} S_total={s} nn_in={ni}",
-                ci=chi_i,
-                ce=chi_e,
-                d=D_e,
-                v=V_e,
+                "[nn] chi_e_i_ratio={cei} chi_D_ratio={cd} VR_D_ratio={vrd} alpha={a} chi_stiff={cs} S_total={s} nn_in={ni}",
+                cei=chi_e_i_ratio,
+                cd=chi_D_ratio,
+                vrd=VR_D_ratio,
+                a=alpha,
+                cs=chi_stiff,
                 s=S_total,
                 ni=nn_inputs,
             )
         return {
-            "chi_i": chi_i,
-            "chi_e": chi_e,
-            "D_e": D_e,
-            "V_e": V_e,
+            "chi_e_i_ratio": chi_e_i_ratio,
+            "chi_D_ratio": chi_D_ratio,
+            "VR_D_ratio": VR_D_ratio,
+            "alpha": alpha,
+            "chi_stiff": chi_stiff,
             "S_total": S_total,
             "n_e_right_bc": ne_right_bc,  # [1e20 m^-3]
             "T_e_right_bc": te_right_bc,  # [keV]
         }
 
     def _build_provider_and_geo(self, inputs: Inputs, coeffs: dict):
-        chi_i = coeffs["chi_i"]
-        chi_e = coeffs["chi_e"]
-        D_e = coeffs["D_e"]
-        V_e = coeffs["V_e"]
+        chi_e_i_ratio = coeffs["chi_e_i_ratio"]
+        chi_D_ratio = coeffs["chi_D_ratio"]
+        VR_D_ratio = coeffs["VR_D_ratio"]
+        alpha = coeffs["alpha"]
+        chi_stiff = coeffs["chi_stiff"]
         S_total = coeffs["S_total"]
         ne_right_bc = coeffs["n_e_right_bc"]
         te_right_bc = coeffs["T_e_right_bc"]
@@ -358,14 +368,23 @@ class ProfilePredictorTorax(TimeIndepModule):
             value=jnp.atleast_1d(inputs.Ip * 1e6),
         )
         nbar_update = torax_experimental.TimeVaryingScalarUpdate(value=jnp.atleast_1d(inputs.fGW))
-        _rho = jnp.array([1.0])
-        chi_i_update = torax_experimental.TimeVaryingArrayUpdate(value=jnp.broadcast_to(chi_i[:, jnp.newaxis], (1, 1)), rho_norm=_rho)
-        chi_e_update = torax_experimental.TimeVaryingArrayUpdate(value=jnp.broadcast_to(chi_e[:, jnp.newaxis], (1, 1)), rho_norm=_rho)
-        D_e_update = torax_experimental.TimeVaryingArrayUpdate(value=jnp.broadcast_to(D_e[:, jnp.newaxis], (1, 1)), rho_norm=_rho)
-        V_e_update = torax_experimental.TimeVaryingArrayUpdate(value=jnp.broadcast_to(V_e[:, jnp.newaxis], (1, 1)), rho_norm=_rho)
+        chi_e_i_ratio_update = torax_experimental.TimeVaryingScalarUpdate(value=chi_e_i_ratio)
+        chi_D_ratio_update = torax_experimental.TimeVaryingScalarUpdate(value=chi_D_ratio)
+        VR_D_ratio_update = torax_experimental.TimeVaryingScalarUpdate(value=VR_D_ratio)
         S_total_update = torax_experimental.TimeVaryingScalarUpdate(value=S_total * 1e21)
         ne_right_bc_update = torax_experimental.TimeVaryingScalarUpdate(value=ne_right_bc * 1e20)
         te_right_bc_update = torax_experimental.TimeVaryingScalarUpdate(value=te_right_bc)
+
+        # Initial temperature profiles ramp linearly from core = edge BC + 0.3 keV
+        # down to the NN edge BC. This keeps the initial state strictly decreasing
+        # and continuous with the BC for any NN output: a discontinuity at the LCFS
+        # or an exactly-flat profile both NaN the solver under the critical
+        # gradient model.
+        t_init_value = jnp.concatenate([te_right_bc + 0.3, te_right_bc])[jnp.newaxis, :]
+        t_init_update = torax_experimental.TimeVaryingArrayUpdate(
+            value=t_init_value,
+            rho_norm=jnp.array([0.0, 1.0]),
+        )
 
         new_provider = self.step_fn.runtime_params_provider.update_provider_from_mapping(
             {
@@ -375,10 +394,15 @@ class ProfilePredictorTorax(TimeIndepModule):
                 # Assume the ion edge temperature matches the electron edge temperature
                 "profile_conditions.T_e_right_bc": te_right_bc_update,
                 "profile_conditions.T_i_right_bc": te_right_bc_update,
-                "transport_model.chi_i": chi_i_update,
-                "transport_model.chi_e": chi_e_update,
-                "transport_model.D_e": D_e_update,
-                "transport_model.V_e": V_e_update,
+                "profile_conditions.T_e": t_init_update,
+                "profile_conditions.T_i": t_init_update,
+                "transport_model.chi_e_i_ratio": chi_e_i_ratio_update,
+                "transport_model.chi_D_ratio": chi_D_ratio_update,
+                "transport_model.VR_D_ratio": VR_D_ratio_update,
+                # Plain float leaves in the provider: replaced with traced scalars
+                # directly rather than via TimeVaryingScalarUpdate
+                "transport_model.alpha": jnp.squeeze(alpha),
+                "transport_model.chi_stiff": jnp.squeeze(chi_stiff),
                 "sources.gas_puff.S_total": S_total_update,
             }
         )
@@ -489,9 +513,10 @@ class ProfilePredictorTorax(TimeIndepModule):
         Args:
             inputs: Same as __call__ (Inputs or single-timeslice xr.Dataset).
             prescribed: Optional dict overriding NN outputs. Keys from
-                {chi_i, chi_e, D_e, V_e, S_total, n_e_right_bc, T_e_right_bc}; values are floats
-                in the same units the NN outputs use (chi in m^2/s, V_e in m/s, S_total in
-                1e21 particles/s, n_e_right_bc in 1e20 m^-3, T_e_right_bc in keV).
+                {chi_e_i_ratio, chi_D_ratio, VR_D_ratio, alpha, chi_stiff, S_total,
+                n_e_right_bc, T_e_right_bc}; values are floats in the same units the NN
+                outputs use (the CGM parameters are dimensionless, S_total in 1e21
+                particles/s, n_e_right_bc in 1e20 m^-3, T_e_right_bc in keV).
                 Keys not given (or None) keep the NN prediction.
 
         Returns:

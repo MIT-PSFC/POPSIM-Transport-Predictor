@@ -120,11 +120,16 @@ PROFILE_PREDICTOR_TORAX_CONFIG = {
                 "elongation_LCFS": 9999,  # Overridden by dataloader input
             },
             "transport": {
-                "model_name": "constant",
-                "chi_i": 9999,  # Predicted by NN
-                "chi_e": 9999,  # Predicted by NN
-                "D_e": 9999,  # Predicted by NN
-                "V_e": 9999,  # Predicted by NN
+                # Critical Gradient Model: TORAX computes the critical ion temperature
+                # gradient from the evolving state and geometry (known inputs); the NN
+                # predicts the dimensionless free parameters. Values here are
+                # placeholders that must pass validation.
+                "model_name": "CGM",
+                "alpha": 2.0,  # Predicted by NN
+                "chi_stiff": 2.0,  # Predicted by NN
+                "chi_e_i_ratio": 2.0,  # Predicted by NN
+                "chi_D_ratio": 5.0,  # Predicted by NN
+                "VR_D_ratio": 0.0,  # Predicted by NN
             },
             "sources": {
                 "ei_exchange": {},
@@ -134,8 +139,13 @@ PROFILE_PREDICTOR_TORAX_CONFIG = {
                 "gas_puff": {"S_total": 9999},  # Predicted by NN
                 "generic_current": {},
             },
-            # A bunch of stuff that we aren't using but we must include so it doesn't complain
-            "solver": {},
+            "solver": {
+                # CGM transport is stiff (chi jumps once the critical gradient is
+                # exceeded); the Pereverzev-Corrigan terms keep the linear theta
+                # solver stable at large fixed steps.
+                "use_pereverzev": True,
+                "use_predictor_corrector": True,
+            },
             "time_step_calculator": {"calculator_type": "fixed"},
             "neoclassical": {},
             "pedestal": {},

@@ -9,7 +9,7 @@ Example:
         --dataset transport_study/datasets/sample/cmod-low1.nc \
         --shot 1160824011 --timestep 800 \
         --checkpoint /path/to/trained/torax/checkpoint \
-        --chi_e 2.5 --S_total 1.0
+        --chi_e_i_ratio 2.0 --S_total 1.0
 """
 
 from pathlib import Path
@@ -111,10 +111,11 @@ def plot_torax_evolution(
     shot: int,
     timestep: int,
     checkpoint: str | None = None,
-    chi_i: float | None = None,
-    chi_e: float | None = None,
-    D_e: float | None = None,
-    V_e: float | None = None,
+    chi_e_i_ratio: float | None = None,
+    chi_D_ratio: float | None = None,
+    VR_D_ratio: float | None = None,
+    alpha: float | None = None,
+    chi_stiff: float | None = None,
     S_total: float | None = None,
     n_e_right_bc: float | None = None,
     T_e_right_bc: float | None = None,
@@ -127,10 +128,11 @@ def plot_torax_evolution(
         shot: Shot number to select.
         timestep: time_idx index of the timeslice to predict.
         checkpoint: Optional checkpoint directory of a trained torax profile predictor.
-        chi_i: Optional prescribed ion heat diffusivity [m^2/s], bypasses NN output.
-        chi_e: Optional prescribed electron heat diffusivity [m^2/s], bypasses NN output.
-        D_e: Optional prescribed particle diffusivity [m^2/s], bypasses NN output.
-        V_e: Optional prescribed particle pinch velocity [m/s], bypasses NN output.
+        chi_e_i_ratio: Optional prescribed CGM chi_i / chi_e ratio, bypasses NN output.
+        chi_D_ratio: Optional prescribed CGM chi_i / D_e ratio, bypasses NN output.
+        VR_D_ratio: Optional prescribed CGM R0 * V_e / D_e ratio, bypasses NN output.
+        alpha: Optional prescribed CGM chi power law exponent, bypasses NN output.
+        chi_stiff: Optional prescribed CGM stiffness parameter, bypasses NN output.
         S_total: Optional prescribed gas puff particle source [1e21 /s], bypasses NN output.
         n_e_right_bc: Optional prescribed edge density BC [1e20 m^-3], bypasses NN output.
         T_e_right_bc: Optional prescribed edge temperature BC [keV], bypasses NN output.
@@ -141,10 +143,11 @@ def plot_torax_evolution(
     module = _build_module(timeslice, checkpoint)
 
     prescribed = {
-        "chi_i": chi_i,
-        "chi_e": chi_e,
-        "D_e": D_e,
-        "V_e": V_e,
+        "chi_e_i_ratio": chi_e_i_ratio,
+        "chi_D_ratio": chi_D_ratio,
+        "VR_D_ratio": VR_D_ratio,
+        "alpha": alpha,
+        "chi_stiff": chi_stiff,
         "S_total": S_total,
         "n_e_right_bc": n_e_right_bc,
         "T_e_right_bc": T_e_right_bc,
@@ -165,7 +168,7 @@ def plot_torax_evolution(
         source = "prescribed" if name in prescribed_names else "NN"
         return f"{name}={coeffs[name]:.2f} ({source})"
 
-    coeff_line = ", ".join(_coeff_label(name) for name in ["chi_i", "chi_e", "D_e", "V_e", "S_total"])
+    coeff_line = ", ".join(_coeff_label(name) for name in ["chi_e_i_ratio", "chi_D_ratio", "VR_D_ratio", "alpha", "chi_stiff", "S_total"])
     bc_line = ", ".join(_coeff_label(name) for name in ["n_e_right_bc", "T_e_right_bc"])
     fig.suptitle(
         f"TORAX profile relaxation - shot {shot} @ t={time_s:.3f}s (time_idx {timestep})\n{coeff_line}\n{bc_line}",
