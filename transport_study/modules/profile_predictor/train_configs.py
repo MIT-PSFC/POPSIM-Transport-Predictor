@@ -90,6 +90,10 @@ PROFILE_PREDICTOR_TORAX_CONFIG = {
                 "nbar": 99,  # Overridden by dataloader input
                 "n_e_nbar_is_fGW": True,
                 "n_e_right_bc": 0.5e20,
+                # Initialize psi from Ip and geometry via the current_profile_nu formula.
+                # Same as the legacy fallback for circular geometry, but explicit to
+                # silence the TORAX deprecation warning.
+                "initial_psi_mode": "j",
             },
             "numerics": {
                 "t_initial": 0.0,
