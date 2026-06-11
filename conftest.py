@@ -4,7 +4,6 @@ from datetime import datetime
 from pathlib import Path
 from loguru import logger
 
-os.environ.setdefault("JAX_PLATFORMS", "cpu")
 os.environ.setdefault("JAX_DEBUG_NANS", "0")
 os.environ.setdefault("MPLBACKEND", "Agg")
 
@@ -16,8 +15,7 @@ DEBUG_LOG_PATH = DEBUG_LOG_DIR / f"{datetime.now().strftime('%Y%m%d-%H%M%S')}.lo
 logger.remove()
 logger.add(sys.stderr, colorize=True)
 logger.add(DEBUG_LOG_PATH)
-
-
+    
 class _StdoutTee:
     def __init__(self, orig, path):
         self._orig = orig

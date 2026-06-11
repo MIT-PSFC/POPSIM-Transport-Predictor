@@ -203,7 +203,7 @@ def test_study_cmod_to_cmod_no_tuning():
         max_epochs=2,
         epochs_per_val=1,
         patience=2,
-        model_types=["torax"],
+        model_types=["shape_init_pca", "shape_init_kmeans", "unstructured_nn", "torax"],
         training_datasets=[
             "exnihilo",
             "cmod-low",

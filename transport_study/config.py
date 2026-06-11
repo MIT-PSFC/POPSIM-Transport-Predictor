@@ -8,7 +8,9 @@ import tomllib
 from pathlib import Path
 from types import MappingProxyType
 
+import jax
 import toml
+from loguru import logger
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 # 80/20 between train/val
@@ -123,3 +125,7 @@ def load_config(cfg: "StudyConfig | Path") -> "StudyConfig":
         cfg = StudyConfig.from_toml(cfg)
     _ConfigProxy._cfg = cfg
     return cfg
+
+
+if jax.devices()[0].platform not in ["gpu", "tpu", "cuda"]:
+    logger.warning("JAX could not find GPU/TPU/CUDA, is your environment set correctly?")
