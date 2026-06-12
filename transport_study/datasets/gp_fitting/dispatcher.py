@@ -20,6 +20,7 @@ resubmitting them.
 import hashlib
 import shutil
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -36,6 +37,17 @@ from transport_study.datasets.gp_fitting.fit_worker import (
 
 WORKER_FILENAME = "fit_worker.py"
 WORKER_SOURCE = Path(fit_worker.__file__)
+
+# rsync transfers go through the cluster login node, which sometimes drops
+# connections (exit 255), so transfers are retried before giving up
+_TRANSFER_ATTEMPTS = 3
+_TRANSFER_RETRY_DELAY_S = 10.0
+# rsync exit codes that mean the source file does not exist (not a
+# connection problem), so retrying the transfer is pointless
+_RSYNC_SOURCE_MISSING_CODES = {23, 24}
+# polls to wait for a COMPLETED job's output to become pullable before
+# declaring the batch failed
+_MAX_OUTPUT_PULL_POLLS = 3
 
 # SLURM states that mean the job will never produce output
 _TERMINAL_FAILURE_STATES = {
@@ -135,6 +147,21 @@ def plan_batches(
     return batches
 
 
+@contextmanager
+def _srunx_rsync_logs_disabled():
+    """Silence srunx's per-call rsync warning.
+
+    Pulls regularly probe for output files that may not exist yet, and
+    srunx logs a warning for every miss. The dispatcher logs the failures
+    it actually cares about itself, with retry context and stderr.
+    """
+    logger.disable("srunx.sync.rsync")
+    try:
+        yield
+    finally:
+        logger.enable("srunx.sync.rsync")
+
+
 class _SSHBackend:
     """File transfer and job control on a remote cluster via srunx."""
 
@@ -167,15 +194,35 @@ class _SSHBackend:
         self._rsync._supports_mkpath = False
 
     def push_file(self, local: Path, remote_dir: str) -> None:
-        result = self._rsync.push(str(local), f"{remote_dir}/", delete=False)
-        if result.returncode != 0:
-            raise RuntimeError(f"rsync push of {local} failed: {result.stderr}")
+        for attempt in range(1, _TRANSFER_ATTEMPTS + 1):
+            result = self._rsync.push(str(local), f"{remote_dir}/", delete=False)
+            if result.returncode == 0:
+                return
+            if attempt < _TRANSFER_ATTEMPTS:
+                logger.warning(
+                    f"rsync push of {local} failed (attempt {attempt}/{_TRANSFER_ATTEMPTS}), "
+                    f"retrying in {_TRANSFER_RETRY_DELAY_S:.0f}s: {result.stderr.strip()}"
+                )
+                time.sleep(_TRANSFER_RETRY_DELAY_S)
+        raise RuntimeError(f"rsync push of {local} failed: {result.stderr}")
 
     def pull_file(self, remote_path: str, local_dir: Path) -> bool:
         """Pull a single remote file into local_dir. Returns False if unavailable."""
         local_dir.mkdir(parents=True, exist_ok=True)
-        result = self._rsync.pull(remote_path, f"{local_dir}/")
-        return result.returncode == 0 and (local_dir / Path(remote_path).name).exists()
+        for attempt in range(1, _TRANSFER_ATTEMPTS + 1):
+            with _srunx_rsync_logs_disabled():
+                result = self._rsync.pull(remote_path, f"{local_dir}/")
+            if result.returncode == 0:
+                return (local_dir / Path(remote_path).name).exists()
+            if result.returncode in _RSYNC_SOURCE_MISSING_CODES:
+                return False
+            if attempt < _TRANSFER_ATTEMPTS:
+                logger.warning(
+                    f"rsync pull of {remote_path} failed (attempt {attempt}/{_TRANSFER_ATTEMPTS}), "
+                    f"retrying in {_TRANSFER_RETRY_DELAY_S:.0f}s: {result.stderr.strip()}"
+                )
+                time.sleep(_TRANSFER_RETRY_DELAY_S)
+        return False
 
     def submit(self, job) -> int:
         return self._client.submit(job).job_id
@@ -234,6 +281,7 @@ class _BatchState:
     job_id: int | None = None
     done: bool = False
     failed: bool = False
+    output_pull_polls: int = 0
 
 
 class ClusterFitDispatcher:
@@ -323,6 +371,18 @@ class ClusterFitDispatcher:
         if not todo:
             return
 
+        # A previous run's job may have produced output that never made it
+        # back (e.g. the pull failed transiently), so check the cluster
+        # before submitting anything.
+        for state in todo:
+            remote_out = f"{self.config.remote_workdir}/{state.output_path.name}"
+            if self.backend.pull_file(remote_out, self.batches_dir):
+                state.done = True
+                logger.info(f"Batch {state.bid}: pulled existing results from cluster, skipping job")
+        todo = [b for b in todo if not b.done]
+        if not todo:
+            return
+
         logger.info(f"Uploading worker script to {self.config.remote_workdir}")
         self.backend.push_file(WORKER_SOURCE, self.config.remote_workdir)
 
@@ -402,12 +462,28 @@ class ClusterFitDispatcher:
             if self.backend.pull_file(remote_out, self.batches_dir):
                 state.done = True
                 logger.info(f"Batch {state.bid}: job {state.job_id} finished, results pulled back")
-            elif slurm_state in _TERMINAL_FAILURE_STATES or slurm_state == "COMPLETED":
+            elif slurm_state in _TERMINAL_FAILURE_STATES:
                 state.failed = True
                 logger.error(
                     f"Batch {state.bid}: job {state.job_id} ended in state {slurm_state} without producing "
                     f"{remote_out}; see logs in {self.config.remote_workdir}/logs"
                 )
+            elif slurm_state == "COMPLETED":
+                # The job claims success, so the output may exist but be
+                # unreachable (login node dropping connections) or still
+                # in flight. Keep trying for a few polls before giving up.
+                state.output_pull_polls += 1
+                if state.output_pull_polls >= _MAX_OUTPUT_PULL_POLLS:
+                    state.failed = True
+                    logger.error(
+                        f"Batch {state.bid}: job {state.job_id} COMPLETED but {remote_out} could not be "
+                        f"pulled after {state.output_pull_polls} polls. See logs in {self.config.remote_workdir}/logs"
+                    )
+                else:
+                    logger.warning(
+                        f"Batch {state.bid}: job {state.job_id} COMPLETED but output not retrieved yet "
+                        f"(poll {state.output_pull_polls}/{_MAX_OUTPUT_PULL_POLLS}), will retry"
+                    )
             else:
                 # UNKNOWN with no output yet: give it until the next poll
                 logger.warning(f"Batch {state.bid}: job {state.job_id} state {slurm_state}, no output yet")
