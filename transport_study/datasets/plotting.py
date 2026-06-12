@@ -215,13 +215,20 @@ def ds_power_balance_time_plot(  # noqa: PLR0915
         plt.close(fig)
 
 
-def ds_profile_time_plot(  # noqa: PLR0915
+def ds_profile_time_plot(  # noqa: PLR0915, PLR0912
     ds: str | xr.Dataset,
     fig_dir: Path | str,
     num_shots: int | None = 9999,
     title: str = "Profile dataset Time Traces",
 ):
-    """Plot time traces of signals from the dataset"""
+    """Plot time traces of all signals of interest from the dataset.
+
+    Four axes:
+    1. Ip_MA, Wtot_MJ, and betan
+    2. Line averaged density and B0
+    3. All power sources and sinks
+    4. Shaping parameters
+    """
     if isinstance(ds, (str, Path)):
         ds_path = str(ds)
         if ds_path.endswith(".zarr"):
@@ -233,9 +240,16 @@ def ds_profile_time_plot(  # noqa: PLR0915
 
     # Compute global y-limits across all shots for consistent axes
     ylim_ip = (0, float(np.nanmax(np.abs(ds["Ip_MA"].values))) * 1.1)
-    ylim_betan = (0, float(np.nanmax(ds["betan"].values)) * 1.1)
+    if "Wtot_MJ" in ds:
+        ylim_wtot = (0, float(np.nanmax(ds["Wtot_MJ"].values)) * 1.1)
+    else:
+        ylim_wtot = (0, 1)  # Default range
+    if "betan" in ds:
+        ylim_betan = (0, float(np.nanmax(ds["betan"].values)) * 1.1)
+    else:
+        ylim_betan = (0, 1)  # Default range
 
-    density_signals = ["ne20_edge"]
+    density_signals = [sig for sig in ["ne20_line_avg", "ne20_edge"] if sig in ds]
     density_max = min(max(float(np.nanmax(ds[sig].values)) for sig in density_signals), 5)
     ylim_ne = (0, density_max * 1.1)
 
@@ -244,6 +258,28 @@ def ds_profile_time_plot(  # noqa: PLR0915
         ylim_b0 = (0, float(np.nanmax(ds["B0"].values)) * 1.1)
     else:
         ylim_b0 = (0, 5)  # Default range
+
+    power_signals = [
+        sig
+        for sig in [
+            "P_oh_MW",
+            "P_rad_MW",
+            "P_NBI_MW",
+            "P_ECRH_MW",
+            "P_LH_MW",
+            "P_ICRF_MW",
+        ]
+        if sig in ds
+    ]
+    if power_signals:
+        power_max = min(max(float(np.nanmax(ds[sig].values)) for sig in power_signals), 10)
+    else:
+        power_max = 1
+    if "LH_transition_threshold_MW" in ds:
+        lh_thresh_max = float(np.nanmax(ds["LH_transition_threshold_MW"].values / 1e6))
+    else:
+        lh_thresh_max = 0
+    ylim_power = (0, max(power_max, lh_thresh_max) * 1.1)
 
     shape_signals = ["a_minor", "kappa", "delta_top", "delta_bot"]
     shape_min = min(float(np.nanmin(ds[sig].values)) for sig in shape_signals)
@@ -262,12 +298,16 @@ def ds_profile_time_plot(  # noqa: PLR0915
     # If any ylim is NaN or infinite, set it to a default range
     if not np.isfinite(ylim_ip).all():
         ylim_ip = (0, 1)
+    if not np.isfinite(ylim_wtot).all():
+        ylim_wtot = (0, 1)
     if not np.isfinite(ylim_betan).all():
         ylim_betan = (0, 1)
     if not np.isfinite(ylim_ne).all():
         ylim_ne = (0, 1)
     if not np.isfinite(ylim_b0).all():
         ylim_b0 = (0, 1)
+    if not np.isfinite(ylim_power).all():
+        ylim_power = (0, 1)
     if not np.isfinite(ylim_shape).all():
         ylim_shape = (0, 1)
     if not np.isfinite(ylim_r0).all():
@@ -276,42 +316,65 @@ def ds_profile_time_plot(  # noqa: PLR0915
     for shot in ds["shot"].data[:num_shots]:
         shot_ds = ds.sel(shot=shot)
 
-        fig, axes = plt.subplots(3, 1, figsize=(16, 12), sharex=True)
+        fig, axes = plt.subplots(4, 1, figsize=(16, 16), sharex=True)
         fig.patch.set_facecolor(BACKGROUND_COLOR)
 
         fig.suptitle(f"{title} - {shot}", fontsize=TITLE_FONTSIZE, color=TEXT_COLOR)
 
-        # Ip and betan
+        # Ip, Wtot, and betan
         ax_ip = axes[0]
-        # Put Ip on the left y axis and Wtot on the right y axis
+        # Put Ip and Wtot on the left y axis and betan on the right y axis
         ax_ip.plot(shot_ds["time"], shot_ds["Ip_MA"], label="Ip [MA]", color="cyan")
-        ax_ip.set_ylabel("Ip [MA]", fontsize=LABEL_FONTSIZE, color="cyan")
-        ax_ip.set_ylim(ylim_ip)
+        if "Wtot_MJ" in shot_ds:
+            ax_ip.plot(shot_ds["time"], shot_ds["Wtot_MJ"], label="Wtot [MJ]", color="red")
+        ax_ip.set_ylabel("Ip [MA] / Wtot [MJ]", fontsize=LABEL_FONTSIZE, color="white")
+        ax_ip.set_ylim((0, max(ylim_ip[1], ylim_wtot[1])))
+        ax_ip.legend(
+            fontsize=LEGEND_FONTSIZE,
+            facecolor=BACKGROUND_COLOR,
+            edgecolor=BACKGROUND_COLOR,
+            loc="upper left",
+        )
         ax_betan = ax_ip.twinx()
         if "betan" in shot_ds:
             ax_betan.plot(shot_ds["time"], shot_ds["betan"], label="betan", color="magenta")
-        ax_betan.set_ylabel("Normalized Beta", fontsize=LABEL_FONTSIZE, color="red")
+        ax_betan.set_ylabel("Normalized Beta", fontsize=LABEL_FONTSIZE, color="magenta")
         ax_betan.set_ylim(ylim_betan)
         ax_betan.tick_params(axis="y", labelsize=TICK_FONTSIZE, colors=TEXT_COLOR)
 
         # line avg and edge density
         ax_ne = axes[1]
-        ax_ne.plot(
-            shot_ds["time"],
-            shot_ds["ne20_edge"],
-            label="ne20_edge",
-            color="yellow",
-        )
-        ax_ne.set_ylabel("ne20 [m^-3]", fontsize=LABEL_FONTSIZE, color="white")
+        if "ne20_line_avg" in shot_ds:
+            ax_ne.plot(
+                shot_ds["time"],
+                shot_ds["ne20_line_avg"],
+                label="ne20_line_avg",
+                color="white",
+            )
+        if "ne20_edge" in shot_ds:
+            ax_ne.plot(
+                shot_ds["time"],
+                shot_ds["ne20_edge"],
+                label="ne20_edge",
+                color="yellow",
+            )
+        ax_ne.set_ylabel("ne20 [10^20 m^-3]", fontsize=LABEL_FONTSIZE, color="white")
         ax_ne.set_ylim(ylim_ne)
 
         # Dots at 0 for fresh profiles
-        ax_ne.plot(
-            shot_ds["time"],
-            np.where(shot_ds["fresh_profiles"] > 0, 0, np.nan),
-            color="green",
-            marker="o",
-            linestyle="None",
+        if "fresh_profiles" in shot_ds:
+            ax_ne.plot(
+                shot_ds["time"],
+                np.where(shot_ds["fresh_profiles"] > 0, 0, np.nan),
+                color="green",
+                marker="o",
+                linestyle="None",
+            )
+        ax_ne.legend(
+            fontsize=LEGEND_FONTSIZE,
+            facecolor=BACKGROUND_COLOR,
+            edgecolor=BACKGROUND_COLOR,
+            loc="upper left",
         )
 
         # Add B0 on right axis
@@ -328,8 +391,42 @@ def ds_profile_time_plot(  # noqa: PLR0915
         ax_b0.set_ylim(ylim_b0)
         ax_b0.tick_params(axis="y", labelsize=TICK_FONTSIZE, colors=TEXT_COLOR)
 
+        # All power sources and sinks
+        ax_power = axes[2]
+        power_colors = {
+            "P_oh_MW": "orange",
+            "P_rad_MW": "red",
+            "P_NBI_MW": "cyan",
+            "P_ECRH_MW": "lime",
+            "P_LH_MW": "yellow",
+            "P_ICRF_MW": "magenta",
+        }
+        for sig in power_signals:
+            ax_power.plot(
+                shot_ds["time"],
+                shot_ds[sig],
+                label=f"{sig.replace('_MW', '')} [MW]",
+                color=power_colors[sig],
+            )
+        if "LH_transition_threshold_MW" in shot_ds:
+            ax_power.plot(
+                shot_ds["time"],
+                shot_ds["LH_transition_threshold_MW"] / 1e6,
+                label="LH_Thresh [MW]",
+                color="white",
+                linestyle="--",
+            )
+        ax_power.set_ylabel("Power [MW]", fontsize=LABEL_FONTSIZE, color="white")
+        ax_power.set_ylim(ylim_power)
+        ax_power.legend(
+            fontsize=LEGEND_FONTSIZE,
+            facecolor=BACKGROUND_COLOR,
+            edgecolor=BACKGROUND_COLOR,
+            loc="upper left",
+        )
+
         # Shaping
-        ax_shape = axes[2]
+        ax_shape = axes[3]
         ax_shape.plot(shot_ds["time"], shot_ds["a_minor"], label="a_minor", color="red")
         ax_shape.plot(shot_ds["time"], shot_ds["kappa"], label="kappa", color="yellow")
         ax_shape.plot(shot_ds["time"], shot_ds["delta_top"], label="delta_top", color="lime")

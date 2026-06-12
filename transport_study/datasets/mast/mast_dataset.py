@@ -3,9 +3,11 @@
 import gc
 from pathlib import Path
 
+# disruption_py physics methods log at their custom VERBOSE level; importing
+# log_settings registers it (and logger.verbose) on the loguru logger class
+import disruption_py.settings.log_settings  # noqa: F401
 import netCDF4  # noqa: F401
 import numpy as np
-import s3fs
 import xarray as xr
 from disruption_py.core.physics_method.params import PhysicsMethodParams
 from disruption_py.inout.xr import XarrayDataConnection
@@ -18,7 +20,11 @@ from scipy.interpolate import interp1d
 
 from transport_study import EPISODE_DIM, PACKAGE_ROOT, TIME_COORD, TIME_DIM
 from transport_study.datasets import make_uniform_1khz_timebase
-from transport_study.datasets.cmod.gp_fit import fit_gp_hyperparameters, gp_profile
+from transport_study.datasets.gp_fitting.fit_worker import (
+    ShotFitInput,
+    ShotFitOutput,
+    fit_batch,
+)
 from transport_study.datasets.workflow import DataWorkflow
 
 DEFAULT_SHOTLIST_FILE = Path(PACKAGE_ROOT) / "datasets" / "mast" / "mast_shotlist"
@@ -28,15 +34,10 @@ config = Dynaconf(settings_files=[Path(PACKAGE_ROOT) / "datasets/mast/config.tom
 GC_INTERVAL = 40  # Every 40 shots force garbage collection
 
 
-def _ensure_verbose_level():
-    """Register loguru VERBOSE level (used by disruption_py physics_method timing)."""
-    try:
-        logger.level("VERBOSE")
-    except ValueError:
-        logger.level("VERBOSE", no=5, color="<cyan>", icon="V")
+def _make_fs(endpoint_url: str) -> "s3fs.S3FileSystem":  # noqa: F821
+    # Lazy import so machines without s3fs can still import this module (e.g. via the CLI)
+    import s3fs
 
-
-def _make_fs(endpoint_url: str) -> s3fs.S3FileSystem:
     return s3fs.S3FileSystem(anon=True, endpoint_url=endpoint_url)
 
 
@@ -69,6 +70,8 @@ def _check_required_signals(shot: int, cfg) -> bool:
 
 def _open_level2(shot: int, cfg) -> xr.DataTree | None:
     try:
+        import s3fs
+
         fs = _make_fs(cfg["level2_endpoint"])
         path = f"{cfg['level2_path']}/{shot}.{cfg['level2_ext']}"
         store = s3fs.S3Map(path, s3=fs)
@@ -80,6 +83,8 @@ def _open_level2(shot: int, cfg) -> xr.DataTree | None:
 
 def _open_level1_efm(shot: int, cfg) -> xr.Dataset | None:
     try:
+        import s3fs
+
         fs = _make_fs(cfg["level1_endpoint"])
         path = f"{cfg['level1_path']}/{shot}.{cfg['level2_ext']}"
         store = s3fs.S3Map(path, s3=fs)
@@ -89,15 +94,34 @@ def _open_level1_efm(shot: int, cfg) -> xr.Dataset | None:
         return None
 
 
-def _map_thomson_to_psi_n(
+def _lcfs_crossing_radius(r_from_axis: np.ndarray, psi_n_from_axis: np.ndarray) -> float:
+    """Midplane radius where psi_n first crosses 1, walking away from the axis.
+
+    Both arrays must be ordered starting at the axis and moving outward
+    (monotonic R, increasing distance). Returns NaN if psi_n never reaches 1.
+    """
+    above = psi_n_from_axis >= 1.0
+    if not above.any():
+        return np.nan
+    idx = int(np.argmax(above))
+    if idx == 0:
+        return float(r_from_axis[0])
+    r0, r1 = float(r_from_axis[idx - 1]), float(r_from_axis[idx])
+    p0, p1 = float(psi_n_from_axis[idx - 1]), float(psi_n_from_axis[idx])
+    if p1 == p0:
+        return r1
+    return r0 + (1.0 - p0) * (r1 - r0) / (p1 - p0)
+
+
+def _map_thomson_midplane(
     ts_r: np.ndarray,
     psi_2d: np.ndarray,
     z_grid: np.ndarray,
     r_grid: np.ndarray,
     psi_axis: float,
     psi_bry: float,
-) -> np.ndarray:
-    """Map Thomson R positions to normalised poloidal flux at the midplane.
+) -> tuple[np.ndarray, np.ndarray]:
+    """Map Thomson R positions to psi_n and rho at the midplane.
 
     Parameters
     ----------
@@ -111,22 +135,56 @@ def _map_thomson_to_psi_n(
     Returns
     -------
     psi_n : (n_channels,) normalised poloidal flux (0 = axis, 1 = boundary)
+    rho : (n_channels,) normalised minor radius - midplane distance from the
+        magnetic axis divided by the axis-to-LCFS distance on the same side
+        (inboard/outboard), so 0 = axis and 1 = LCFS on both sides
     """
+    nan_out = np.full(len(ts_r), np.nan, dtype=np.float32)
     z_mid_idx = int(np.argmin(np.abs(z_grid)))
     psi_midplane = psi_2d[z_mid_idx, :]  # (n_r,)
 
-    psi_ts = np.interp(ts_r, r_grid, psi_midplane)
-
     denom = psi_bry - psi_axis
     if np.abs(denom) < 1e-10:
-        return np.full(len(ts_r), np.nan, dtype=np.float32)
-    psi_n = (psi_ts - psi_axis) / denom
-    return psi_n.astype(np.float32)
+        return nan_out, nan_out.copy()
+
+    # The equilibrium psi map can be NaN outside the converged region, so do
+    # all midplane work on the finite subset of grid points
+    finite = np.isfinite(psi_midplane)
+    if finite.sum() < 4:
+        return nan_out, nan_out.copy()
+    r_f = r_grid[finite]
+    psi_f = psi_midplane[finite]
+
+    psi_ts = np.interp(ts_r, r_f, psi_f)
+    psi_n = ((psi_ts - psi_axis) / denom).astype(np.float32)
+
+    # Magnetic axis radius from the midplane psi_n minimum, parabola-refined
+    # since the equilibrium grid is coarse (a few cm)
+    psi_n_mid = (psi_f - psi_axis) / denom
+    i_axis = int(np.argmin(psi_n_mid))
+    r_axis = float(r_f[i_axis])
+    if 0 < i_axis < len(r_f) - 1:
+        p_m, p_0, p_p = psi_n_mid[i_axis - 1], psi_n_mid[i_axis], psi_n_mid[i_axis + 1]
+        curv = p_m - 2 * p_0 + p_p
+        if curv > 0:
+            r_axis += 0.5 * (p_m - p_p) / curv * float(r_f[i_axis + 1] - r_f[i_axis - 1]) / 2.0
+
+    # LCFS midplane radii on each side of the axis
+    r_lcfs_out = _lcfs_crossing_radius(r_f[i_axis:], psi_n_mid[i_axis:])
+    r_lcfs_in = _lcfs_crossing_radius(r_f[i_axis::-1], psi_n_mid[i_axis::-1])
+
+    rho = nan_out.copy()
+    outboard = ts_r >= r_axis
+    if np.isfinite(r_lcfs_out) and r_lcfs_out > r_axis:
+        rho[outboard] = (ts_r[outboard] - r_axis) / (r_lcfs_out - r_axis)
+    if np.isfinite(r_lcfs_in) and r_lcfs_in < r_axis:
+        rho[~outboard] = (r_axis - ts_r[~outboard]) / (r_axis - r_lcfs_in)
+
+    return psi_n, rho
 
 
 def _make_params(shot: int, dt: xr.DataTree, timebase: np.ndarray) -> PhysicsMethodParams:
     """Wrap an already-opened level2 DataTree in a PhysicsMethodParams."""
-    _ensure_verbose_level()
     conn = XarrayDataConnection(shot, dt)
     return PhysicsMethodParams(
         shot_id=shot,
@@ -156,12 +214,17 @@ class MASTDataWorkflow(DataWorkflow):
         a_minor, kappa, delta_top, delta_bot, Wtot_MJ
     """
 
+    # Normalize each slice to O(1) before fitting (see _extract_fit_input)
+    fit_scale_per_slice = True
+
     def __init__(
         self,
         ds_name: str,
         shotlist_file: Path | str | None,
         data_assembly_dir: Path | str,
         max_num_shots: int | None = None,
+        cluster_config=None,
+        fit_workers: int = 1,
     ):
         self.config = config
         ds_cfg = self.config["data_sources"]
@@ -175,6 +238,8 @@ class MASTDataWorkflow(DataWorkflow):
             prof_cfg["num_psi_points"],
         )
         self.min_ts_points = int(prof_cfg["min_ts_points"])
+        self.fit_min_points = self.min_ts_points
+        self.debug_plot_dir = None
 
         super().__init__(
             ds_name,
@@ -182,6 +247,8 @@ class MASTDataWorkflow(DataWorkflow):
             data_assembly_dir,
             max_num_shots=max_num_shots,
             min_shot_duration=self.config["shot_filters"]["min_duration"],
+            cluster_config=cluster_config,
+            fit_workers=fit_workers,
         )
 
         self.filter_config = {
@@ -230,7 +297,6 @@ class MASTDataWorkflow(DataWorkflow):
             "equilibrium/beta_pol",
             "equilibrium/triangularity_upper",
             "equilibrium/triangularity_lower",
-            "equilibrium/li",
             "equilibrium/vloop_dynamic",
             "summary/time",
             "summary/ip",
@@ -259,7 +325,6 @@ class MASTDataWorkflow(DataWorkflow):
             "beta_p": "beta_pol",
             "tritop": "triangularity_upper",
             "tribot": "triangularity_lower",
-            "li": "li",
         }
         data = {}
         for key, prop in eq_map.items():
@@ -290,11 +355,14 @@ class MASTDataWorkflow(DataWorkflow):
         shot: int,
         params: PhysicsMethodParams,
         timebase: np.ndarray,
-    ) -> tuple[np.ndarray, np.ndarray, np.ndarray] | None:
-        """Get raw Thomson channel data mapped to psi_n coordinates.
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray] | None:
+        """Get raw Thomson channel data at the TS measurement times, mapped to psi_n and rho.
 
-        Returns (te_eV, ne_m3, psi_n_ts) each shaped (n_t, n_channels), or None
-        on failure. Invalid channels at a given timestep are NaN.
+        Returns (ts_time, te_eV, ne_m3, psi_n_ts, rho_ts) where the arrays are
+        shaped (n_ts_time, n_channels), or None on failure. rho is the
+        normalised minor radius (see _map_thomson_midplane). Invalid channels
+        at a given measurement time are NaN. Only TS times within the shot
+        timebase are kept.
         """
         try:
             ts_data = MastPhysicsMethods.get_ts_channels(params)
@@ -302,11 +370,19 @@ class MASTDataWorkflow(DataWorkflow):
             ne_da = ts_data["ts_ne"]
             ts_time = te_da.coords["time"].values
             r_ts = te_da.coords["major_radius"].values
-            # Transpose to (n_ch, n_ts_time) for per-timestep indexing
-            te_raw = te_da.values.T
-            ne_raw = ne_da.values.T
+            te_raw = te_da.values  # (n_ts_time, n_ch)
+            ne_raw = ne_da.values
         except Exception as e:
             logger.warning(f"Shot {shot}: failed to read Thomson data: {e}")
+            return None
+
+        # Keep only measurement times within the shot timebase
+        time_mask = (ts_time >= timebase[0]) & (ts_time <= timebase[-1])
+        ts_time = ts_time[time_mask]
+        te_raw = te_raw[time_mask, :]
+        ne_raw = ne_raw[time_mask, :]
+        if len(ts_time) == 0:
+            logger.warning(f"Shot {shot}: no Thomson measurement times within shot timebase")
             return None
 
         efm = _open_level1_efm(shot, self.level1_cfg)
@@ -324,15 +400,15 @@ class MASTDataWorkflow(DataWorkflow):
             return None
 
         n_ch = len(r_ts)
-        n_t = len(timebase)
+        n_t = len(ts_time)
         te_out = np.full((n_t, n_ch), np.nan, dtype=np.float32)
         ne_out = np.full((n_t, n_ch), np.nan, dtype=np.float32)
         psi_n_out = np.full((n_t, n_ch), np.nan, dtype=np.float32)
+        rho_out = np.full((n_t, n_ch), np.nan, dtype=np.float32)
 
-        psi_ax_all = interp1d(efm_time, psi_axis_arr, bounds_error=False, fill_value=np.nan)(timebase)
-        psi_br_all = interp1d(efm_time, psi_bry_arr, bounds_error=False, fill_value=np.nan)(timebase)
-        t_eq_indices = np.argmin(np.abs(efm_time[:, None] - timebase[None, :]), axis=0)
-        t_ts_indices = np.argmin(np.abs(ts_time[:, None] - timebase[None, :]), axis=0)
+        psi_ax_all = interp1d(efm_time, psi_axis_arr, bounds_error=False, fill_value=np.nan)(ts_time)
+        psi_br_all = interp1d(efm_time, psi_bry_arr, bounds_error=False, fill_value=np.nan)(ts_time)
+        t_eq_indices = np.argmin(np.abs(efm_time[:, None] - ts_time[None, :]), axis=0)
 
         for i in range(n_t):
             psi_ax = float(psi_ax_all[i])
@@ -341,10 +417,10 @@ class MASTDataWorkflow(DataWorkflow):
                 continue
 
             psi_2d = psirz[t_eq_indices[i], :, :]  # (n_z, n_r)
-            psi_n_ts = _map_thomson_to_psi_n(r_ts, psi_2d, z_grid, r_grid_eq, psi_ax, psi_br)
+            psi_n_ts, rho_ts = _map_thomson_midplane(r_ts, psi_2d, z_grid, r_grid_eq, psi_ax, psi_br)
 
-            te_at_t = te_raw[:, t_ts_indices[i]]
-            ne_at_t = ne_raw[:, t_ts_indices[i]]
+            te_at_t = te_raw[i, :]
+            ne_at_t = ne_raw[i, :]
 
             valid = (
                 np.isfinite(te_at_t)
@@ -356,101 +432,219 @@ class MASTDataWorkflow(DataWorkflow):
                 & (ne_at_t > 0)
             )
             psi_n_out[i, valid] = psi_n_ts[valid]
+            rho_out[i, valid] = rho_ts[valid]
             te_out[i, valid] = te_at_t[valid]
             ne_out[i, valid] = ne_at_t[valid]
 
-        return te_out, ne_out, psi_n_out
+        return ts_time, te_out, ne_out, psi_n_out, rho_out
 
     # ------------------------------------------------------------------
-    def _make_profile_dataset(
+    def _extract_fit_input(
         self,
         te_eV: np.ndarray,
         ne_m3: np.ndarray,
         psi_n_ts: np.ndarray,
-    ) -> tuple[np.ndarray, np.ndarray]:
-        """GP fit raw Thomson channel data onto self.gp_fit_psi grid.
+    ) -> ShotFitInput:
+        """Build GP fit input arrays from raw Thomson channel data.
+
+        Converts to standard units (Te [keV], ne [1e20 m^-3]) and attaches
+        synthetic 10% fractional errors with a floor of 0.01 [keV or 1e20 m^-3].
+        The per-slice max normalization and the min_ts_points validity check
+        are applied at fit time (fit_scale_per_slice / fit_min_points).
 
         Parameters
         ----------
         te_eV, ne_m3, psi_n_ts : (n_t, n_ch) - NaN where channel invalid.
-
-        Returns
-        -------
-        (Te_keV_psi, ne20_psi) each (n_t, n_psi) on self.gp_fit_psi.
         """
-        n_t, _ = te_eV.shape
-        n_psi = len(self.gp_fit_psi)
-        Te_out = np.full((n_t, n_psi), np.nan, dtype=np.float32)
-        ne_out = np.full((n_t, n_psi), np.nan, dtype=np.float32)
-
-        te_keV = te_eV / 1e3
-        ne_20 = ne_m3 / 1e20
-
-        for data_y_all, out_arr in [(te_keV, Te_out), (ne_20, ne_out)]:
-            # Synthetic 10% fractional errors with a floor of 0.01 [keV or 1e20 m^-3]
+        arrays = {}
+        for variable, data_y_all in [("te", te_eV / 1e3), ("ne", ne_m3 / 1e20)]:
             err_y_all = np.where(np.isfinite(data_y_all), 0.1 * np.abs(data_y_all), np.nan)
             err_y_all = np.where(err_y_all < 0.01, 0.01, err_y_all)
+            arrays[f"{variable}_y"] = data_y_all
+            arrays[f"{variable}_err"] = err_y_all
 
-            cached_hp = None
-            for i_seed in range(n_t):
-                n_valid = int(np.sum(np.isfinite(psi_n_ts[i_seed, :]) & np.isfinite(data_y_all[i_seed, :])))
-                if n_valid < self.min_ts_points:
-                    continue
-                seed_scale = float(np.nanmax(data_y_all[i_seed, :]))
-                if not np.isfinite(seed_scale) or seed_scale < 1e-6:
-                    continue
-                cached_hp = fit_gp_hyperparameters(
-                    data_X=psi_n_ts[i_seed, :],
-                    data_y=data_y_all[i_seed, :] / seed_scale,
-                    err_y=err_y_all[i_seed, :] / seed_scale,
-                )
-                if cached_hp is not None:
-                    break
+        return ShotFitInput(psi=psi_n_ts, **arrays)
 
-            for i_time in range(n_t):
-                n_valid = int(np.sum(np.isfinite(psi_n_ts[i_time, :]) & np.isfinite(data_y_all[i_time, :])))
-                if n_valid < self.min_ts_points:
-                    continue
-                # Normalize to O(1) before GP fit to prevent amplitude collapse
-                # when channels don't cover the full psi_n range.
-                scale = float(np.nanmax(data_y_all[i_time, :]))
-                if not np.isfinite(scale) or scale < 1e-6:
-                    continue
-                y_star, _, _, _ = gp_profile(
-                    data_X=psi_n_ts[i_time, :],
-                    data_y=data_y_all[i_time, :] / scale,
-                    err_y=err_y_all[i_time, :] / scale,
-                    X_star=self.gp_fit_psi,
-                    calc_gradient=False,
-                    hyperparams=cached_hp,
-                    optimize_hyperparams=cached_hp is None,
-                )
-                if y_star is None:
-                    continue
-                out_arr[i_time, :] = np.asarray(y_star).ravel() * scale
+    # ------------------------------------------------------------------
+    def _staging_path(self, shot: int) -> Path:
+        return self.fit_staging_dir / f"{shot}_staging.nc"
 
-        return Te_out, ne_out
+    def _prepare_shot(self, shot: int) -> ShotFitInput | None:  # noqa: PLR0911 - one early return per validation failure
+        """Retrieve and stage source data for one shot, returning GP fit inputs.
+
+        Reads the 0D signals and raw Thomson channel data from the MAST S3
+        Zarr stores and caches them as netCDF in fit_staging_dir, so restarts
+        (and the later assembly step) don't hit S3 again. Returns None if the
+        shot has no valid data.
+        """
+        staging_path = self._staging_path(shot)
+        self.fit_staging_dir.mkdir(parents=True, exist_ok=True)
+
+        if staging_path.exists():
+            logger.info(f"Using staged source data for shot {shot}")
+            ds_staging = xr.load_dataset(staging_path)
+            return self._extract_fit_input(
+                ds_staging["ts_te_eV"].values,
+                ds_staging["ts_ne_m3"].values,
+                ds_staging["ts_psi_n"].values,
+            )
+
+        if not _check_required_signals(shot, self.level2_cfg):
+            return None
+
+        dt = _open_level2(shot, self.level2_cfg)
+        if dt is None:
+            return None
+
+        try:
+            summ = dt["summary"].ds
+            summ_time = summ.coords["time"].values
+            ip_vals = summ["ip"].values
+            min_ip = self.config["shot_filters"]["min_ip"]
+            ip_mask = np.abs(ip_vals) > min_ip
+            if ip_mask.sum() < 2:
+                logger.warning(f"Shot {shot}: no valid IP above {min_ip} A, skipping")
+                return None
+            t_start = float(summ_time[ip_mask][0])
+            t_end = float(summ_time[ip_mask][-1])
+            if (t_end - t_start) < self.config["shot_filters"]["min_duration"]:
+                logger.warning(f"Shot {shot}: plasma duration too short, skipping")
+                return None
+        except Exception as e:
+            logger.warning(f"Shot {shot}: failed to determine timebase: {e}")
+            return None
+
+        timebase = make_uniform_1khz_timebase(t_end)
+        params = _make_params(shot, dt, timebase)
+
+        raw_0d = self._get_0d_dataset(shot, params)
+        if raw_0d is None:
+            return None
+
+        raw_ts = self._get_thomson_raw(shot, params, timebase)
+        if raw_ts is None:
+            logger.warning(f"Shot {shot}: failed to get raw Thomson data, skipping")
+            return None
+        ts_time, te_eV, ne_m3, psi_n_ts, rho_ts = raw_ts
+
+        ds_staging = xr.Dataset(
+            data_vars={
+                **{name: (("time",), np.asarray(vals, dtype=np.float32)) for name, vals in raw_0d.items()},
+                "ts_te_eV": (("ts_time", "channel"), te_eV),
+                "ts_ne_m3": (("ts_time", "channel"), ne_m3),
+                "ts_psi_n": (("ts_time", "channel"), psi_n_ts),
+                "ts_rho": (("ts_time", "channel"), rho_ts),
+            },
+            coords={
+                "time": timebase,
+                "ts_time": ts_time,
+            },
+        )
+        ds_staging.to_netcdf(staging_path)
+
+        return self._extract_fit_input(te_eV, ne_m3, psi_n_ts)
+
+    # ------------------------------------------------------------------
+    def _assemble_shot(self, shot: int, fit_output: ShotFitOutput) -> bool:
+        """Combine staged source data and GP fit results into the raw data file."""
+        staging_path = self._staging_path(shot)
+        ds_path = Path(self.raw_data_dir) / f"{shot}.nc"
+
+        ds_staging = xr.load_dataset(staging_path)
+        timebase = ds_staging["time"].values
+        ts_time = ds_staging["ts_time"].values
+        te_eV = ds_staging["ts_te_eV"].values
+        ne_m3 = ds_staging["ts_ne_m3"].values
+        psi_n_ts = ds_staging["ts_psi_n"].values
+        raw_0d = {name: ds_staging[name].values for name in ds_staging.data_vars if ds_staging[name].dims == ("time",)}
+
+        Te_keV_psi = fit_output.te_fit.astype(np.float32)
+        ne20_psi = fit_output.ne_fit.astype(np.float32)
+
+        # Put the fitted profiles on the 1 kHz timebase using previous value fill,
+        # consistent with the C-Mod workflow (no interpolation in time)
+        ds_profiles = xr.Dataset(
+            data_vars={
+                "Te_keV_psi": (("time", "psi_n"), Te_keV_psi),
+                "ne20_psi": (("time", "psi_n"), ne20_psi),
+            },
+            coords={
+                "time": ts_time,
+                "psi_n": self.gp_fit_psi.astype(np.float32),
+            },
+        )
+        ds_profiles = ds_profiles.reindex(time=timebase, method="ffill")
+
+        data_vars = {}
+        for name, vals in raw_0d.items():
+            data_vars[name] = ([TIME_DIM], vals.astype(np.float32))
+
+        data_vars["Te_keV_psi"] = ([TIME_DIM, "psi_n"], ds_profiles["Te_keV_psi"].values)
+        data_vars["ne20_psi"] = ([TIME_DIM, "psi_n"], ds_profiles["ne20_psi"].values)
+
+        coords = {
+            TIME_DIM: np.arange(len(timebase)),
+            TIME_COORD: (TIME_DIM, timebase.astype(np.float32)),
+            "psi_n": self.gp_fit_psi.astype(np.float32),
+        }
+
+        ds = xr.Dataset(data_vars, coords=coords)
+        ds = ds.expand_dims(shot=[shot])
+
+        ds_standardized = self.standardize_signal_names(ds)
+        if ds_standardized is None:
+            logger.warning(f"Standardization failed for shot {shot}, skipping")
+            return False
+
+        ds_standardized.to_netcdf(ds_path)
+        logger.info(f"Saved raw dataset for shot {shot} to {ds_path}")
+
+        # Only make fit diagnostic plots for shots that are kept
+        try:
+            self._debug_plot_profiles(
+                shot,
+                ts_time,
+                te_eV / 1e3,
+                ne_m3 / 1e20,
+                psi_n_ts,
+                Te_keV_psi,
+                ne20_psi,
+                self.debug_plot_dir,
+            )
+        except Exception as e:
+            logger.error(f"Failed to make TS fit diagnostic plot for shot {shot}: {e}")
+
+        # Staged source data is no longer needed once the raw file exists
+        staging_path.unlink(missing_ok=True)
+        return True
 
     # ------------------------------------------------------------------
     def _debug_plot_profiles(
         self,
         shot: int,
+        ts_time: np.ndarray,
         te_keV: np.ndarray,
         ne_20: np.ndarray,
         psi_n_ts: np.ndarray,
         Te_out: np.ndarray,
         ne_out: np.ndarray,
-        debug_plot_dir: Path | None = "/home/zkeith/proj/popsim_dirs/POPSIM-Transport-Predictor/scratch/datasets/mast/debug_plots",
+        debug_plot_dir: Path | str | None = None,
     ) -> None:
-        """Save a PDF of raw TS points vs GP fit for sampled timesteps."""
+        """Save a PDF of raw TS points (with error bars) vs GP fit for sampled measurement times.
+
+        MAST has a single Thomson system, so there is no core/edge channel split.
+        """
         import matplotlib
 
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
         from matplotlib.backends.backend_pdf import PdfPages
 
+        if debug_plot_dir is None:
+            debug_plot_dir = self.data_assembly_dir / self.ds_name / "ts_fit_plots"
+        debug_plot_dir = Path(debug_plot_dir)
         debug_plot_dir.mkdir(parents=True, exist_ok=True)
-        pdf_path = debug_plot_dir / f"{shot}_ts_gp_debug.pdf"
+        pdf_path = debug_plot_dir / f"{shot}_ts_gp_fit.pdf"
 
         n_t = te_keV.shape[0]
         step = max(1, n_t // 20)
@@ -458,31 +652,56 @@ class MASTDataWorkflow(DataWorkflow):
 
         with PdfPages(pdf_path) as pdf:
             for i_time in t_indices:
-                fig, axes = plt.subplots(1, 2, figsize=(10, 4))
+                fig, axes = plt.subplots(1, 2, figsize=(12, 5))
                 for ax, data_y, gp_y, label, unit in [
                     (axes[0], te_keV[i_time, :], Te_out[i_time, :], "Te", "[keV]"),
                     (axes[1], ne_20[i_time, :], ne_out[i_time, :], "ne", "[1e20 m^-3]"),
                 ]:
                     psi_raw = psi_n_ts[i_time, :]
                     valid = np.isfinite(psi_raw) & np.isfinite(data_y)
-                    ax.scatter(psi_raw[valid], data_y[valid], s=14, zorder=3, label="raw TS")
+                    # Synthetic errors, matching what is used in _make_profile_dataset
+                    err_y = np.where(0.1 * np.abs(data_y) < 0.01, 0.01, 0.1 * np.abs(data_y))
+                    if valid.any():
+                        ax.errorbar(
+                            psi_raw[valid],
+                            data_y[valid],
+                            yerr=err_y[valid],
+                            fmt="o",
+                            ms=4,
+                            color="tab:blue",
+                            label="raw TS",
+                            zorder=3,
+                        )
                     gp_valid = np.isfinite(gp_y)
                     if gp_valid.any():
-                        ax.plot(self.gp_fit_psi[gp_valid], gp_y[gp_valid], label="GP fit")
+                        ax.plot(self.gp_fit_psi[gp_valid], gp_y[gp_valid], color="black", label="GP fit")
                     ax.set_xlabel("psi_n")
                     ax.set_ylabel(f"{label} {unit}")
-                    ax.set_title(f"shot {shot}  t_idx={i_time}  n_valid={valid.sum()}")
+                    ax.set_ylim(bottom=0)
+                    ax.set_title(f"shot {shot}  t={ts_time[i_time]:.3f} s  n_valid={valid.sum()}")
+                    ax.grid(alpha=0.3)
                     ax.legend(fontsize=8)
                 fig.tight_layout()
                 pdf.savefig(fig)
                 plt.close(fig)
 
-        logger.info(f"Saved debug plot to {pdf_path}")
+        logger.info(f"Saved TS fit diagnostic plot to {pdf_path}")
 
     # ------------------------------------------------------------------
     def make_raw_data_files(self, debug_plot_dir: Path | str | None = None):
-        """Create one netCDF per shot in the raw_data directory."""
+        """Create one netCDF per shot in the raw_data directory.
+
+        GP fitting runs in-process. If a cluster_config was provided, fitting
+        is dispatched to a SLURM cluster via make_raw_data_files_distributed()
+        instead. MAST data is public S3, so the "cluster" can also be the one
+        this process runs on (cluster profile "local").
+        """
         self.raw_data_dir.mkdir(parents=True, exist_ok=True)
+        self.debug_plot_dir = debug_plot_dir
+
+        if self.cluster_config is not None:
+            self.make_raw_data_files_distributed()
+            return
 
         processed_shots = 0
         for i, shot in enumerate(self.shotlist):
@@ -500,87 +719,22 @@ class MASTDataWorkflow(DataWorkflow):
                 processed_shots += 1
                 continue
 
-            if not _check_required_signals(shot, self.level2_cfg):
+            # Retrieve and stage source data
+            fit_input = self._prepare_shot(shot)
+            if fit_input is None:
                 continue
 
-            dt = _open_level2(shot, self.level2_cfg)
-            if dt is None:
-                continue
+            # Fit profiles at the TS measurement times only
+            outputs = fit_batch(
+                {shot: fit_input},
+                x_star=self.gp_fit_psi,
+                min_points=self.fit_min_points,
+                scale_per_slice=self.fit_scale_per_slice,
+                num_workers=self.fit_workers,
+            )
 
-            try:
-                summ = dt["summary"].ds
-                summ_time = summ.coords["time"].values
-                ip_vals = summ["ip"].values
-                min_ip = self.config["shot_filters"]["min_ip"]
-                ip_mask = np.abs(ip_vals) > min_ip
-                if ip_mask.sum() < 2:
-                    logger.warning(f"Shot {shot}: no valid IP above {min_ip} A, skipping")
-                    continue
-                t_start = float(summ_time[ip_mask][0])
-                t_end = float(summ_time[ip_mask][-1])
-                if (t_end - t_start) < self.config["shot_filters"]["min_duration"]:
-                    logger.warning(f"Shot {shot}: plasma duration too short, skipping")
-                    continue
-            except Exception as e:
-                logger.warning(f"Shot {shot}: failed to determine timebase: {e}")
-                continue
-
-            timebase = make_uniform_1khz_timebase(t_end)
-            params = _make_params(shot, dt, timebase)
-
-            raw_0d = self._get_0d_dataset(shot, params)
-            if raw_0d is None:
-                continue
-
-            raw_ts = self._get_thomson_raw(shot, params, timebase)
-            if raw_ts is None:
-                logger.warning(f"Shot {shot}: failed to get raw Thomson data, skipping")
-                continue
-            te_eV, ne_m3, psi_n_ts = raw_ts
-
-            Te_keV_psi, ne20_psi = self._make_profile_dataset(te_eV, ne_m3, psi_n_ts)
-
-            debug_plot_dir = "/home/zkeith/proj/popsim_dirs/POPSIM-Transport-Predictor/scratch/datasets/mast/debug_plots"
-            if debug_plot_dir is not None:
-                self._debug_plot_profiles(
-                    shot,
-                    te_eV / 1e3,
-                    ne_m3 / 1e20,
-                    psi_n_ts,
-                    Te_keV_psi,
-                    ne20_psi,
-                    Path(debug_plot_dir),
-                )
-
-            n_ch = te_eV.shape[1]
-            data_vars = {}
-            for name, vals in raw_0d.items():
-                data_vars[name] = ([TIME_DIM], vals.astype(np.float32))
-
-            data_vars["ts_te_eV"] = ([TIME_DIM, "ts_channel"], te_eV)
-            data_vars["ts_ne"] = ([TIME_DIM, "ts_channel"], ne_m3)
-            data_vars["ts_psi_n"] = ([TIME_DIM, "ts_channel"], psi_n_ts)
-            data_vars["Te_keV_psi"] = ([TIME_DIM, "psi_n"], Te_keV_psi)
-            data_vars["ne20_psi"] = ([TIME_DIM, "psi_n"], ne20_psi)
-
-            coords = {
-                TIME_DIM: np.arange(len(timebase)),
-                TIME_COORD: (TIME_DIM, timebase.astype(np.float32)),
-                "psi_n": self.gp_fit_psi.astype(np.float32),
-                "ts_channel": np.arange(n_ch),
-            }
-
-            ds = xr.Dataset(data_vars, coords=coords)
-            ds = ds.expand_dims(shot=[shot])
-
-            ds_standardized = self.standardize_signal_names(ds)
-            if ds_standardized is None:
-                logger.warning(f"Standardization failed for shot {shot}, skipping")
-                continue
-
-            ds_standardized.to_netcdf(ds_path)
-            logger.info(f"Saved raw dataset for shot {shot} to {ds_path}")
-            processed_shots += 1
+            if self._assemble_shot(shot, outputs[shot]):
+                processed_shots += 1
 
         logger.info("Finished making MAST raw data files.")
 
@@ -602,7 +756,6 @@ class MASTDataWorkflow(DataWorkflow):
 
         # Profile predictor signals - map disruption_py names to POPSIM names
         ds["betan"] = ds["beta_n"]
-        ds["beta_pol"] = ds["beta_p"]
         ds["delta_top"] = ds["tritop"]
         ds["delta_bot"] = ds["tribot"]
 
@@ -615,31 +768,32 @@ class MASTDataWorkflow(DataWorkflow):
         if TIME_COORD in ds.coords and TIME_COORD not in ds.data_vars:
             ds = ds.reset_coords([TIME_COORD])
 
+        # Same set of variables as the C-Mod workflow, plus 'time' which the
+        # organize_data profile pipeline needs as a data variable
         kept_vars = {
+            # POWER BALANCE
             "Wtot_MJ",
-            "Ip_MA",
-            "B0",
-            "R0",
-            "a_minor",
-            "kappa",
-            "ne20_line_avg",
             "P_oh_MW",
-            "P_NBI_MW",
-            "P_ECRH_MW",
+            "P_rad_MW",
             "P_ICRF_MW",
             "P_LH_MW",
-            "P_rad_MW",
+            "P_NBI_MW",
+            "P_ECRH_MW",
+            # PROFILE PREDICTOR TRAINING
             "Te_keV_psi",
             "ne20_psi",
-            "ts_te_eV",
-            "ts_ne",
-            "ts_psi_n",
+            "Ip_MA",
+            "B0",
             "betan",
-            "ne20_edge",
+            "ne20_line_avg",
+            "R0",
+            "kappa",
+            "a_minor",
             "delta_top",
             "delta_bot",
-            "beta_pol",
-            "li",
+            # OTHER
+            "beta_p",
+            "ne20_edge",
             "time",
         }
 
@@ -670,10 +824,12 @@ class MASTDataWorkflow(DataWorkflow):
     # ------------------------------------------------------------------
     def device_specific_processing(self, ds: xr.Dataset) -> xr.Dataset:
         """Clip unphysical GP-fitted profile values and fill ne20_edge from profile."""
+        # Clamp to non-negative, consistent with the C-Mod workflow (raw files made
+        # before the fit-time clamp was added can still contain negative values)
         if "ne20_psi" in ds:
-            ds["ne20_psi"] = ds["ne20_psi"].where(ds["ne20_psi"] > 0)
+            ds["ne20_psi"] = ds["ne20_psi"].clip(min=0)
         if "Te_keV_psi" in ds:
-            ds["Te_keV_psi"] = ds["Te_keV_psi"].where(ds["Te_keV_psi"] > 0)
+            ds["Te_keV_psi"] = ds["Te_keV_psi"].clip(min=0)
 
         if "ne20_edge" in ds and "ne20_psi" in ds and "psi_n" in ds["ne20_psi"].dims:
             ne_edge_from_profile = ds["ne20_psi"].sel(psi_n=0.9, method="nearest")
