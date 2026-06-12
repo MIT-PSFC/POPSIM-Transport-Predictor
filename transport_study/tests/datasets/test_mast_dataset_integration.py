@@ -70,9 +70,15 @@ def test_shot_30284_has_fittable_thomson_slices(fit_input, workflow):
 
 
 def test_shot_30284_production_fit_on_one_slice(fit_input, workflow):
-    """Real hyperparameter optimization on one real measured profile."""
+    """Real hyperparameter optimization on one real measured profile.
+
+    Uses the slice with the most valid channels (mid-shot, hot plasma) so the
+    core Te plausibility check below is meaningful; the first fittable slice
+    can be very early in the shot where core Te is only tens of eV.
+    """
     valid_per_slice = np.sum(np.isfinite(fit_input.psi) & np.isfinite(fit_input.te_y), axis=1)
-    i_time = int(np.argmax(valid_per_slice >= workflow.fit_min_points))
+    i_time = int(np.argmax(valid_per_slice))
+    assert valid_per_slice[i_time] >= workflow.fit_min_points
 
     scale = float(np.nanmax(fit_input.te_y[i_time, :]))
     y_star, _, _, _ = gp_profile(

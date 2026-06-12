@@ -94,15 +94,34 @@ def _open_level1_efm(shot: int, cfg) -> xr.Dataset | None:
         return None
 
 
-def _map_thomson_to_psi_n(
+def _lcfs_crossing_radius(r_from_axis: np.ndarray, psi_n_from_axis: np.ndarray) -> float:
+    """Midplane radius where psi_n first crosses 1, walking away from the axis.
+
+    Both arrays must be ordered starting at the axis and moving outward
+    (monotonic R, increasing distance). Returns NaN if psi_n never reaches 1.
+    """
+    above = psi_n_from_axis >= 1.0
+    if not above.any():
+        return np.nan
+    idx = int(np.argmax(above))
+    if idx == 0:
+        return float(r_from_axis[0])
+    r0, r1 = float(r_from_axis[idx - 1]), float(r_from_axis[idx])
+    p0, p1 = float(psi_n_from_axis[idx - 1]), float(psi_n_from_axis[idx])
+    if p1 == p0:
+        return r1
+    return r0 + (1.0 - p0) * (r1 - r0) / (p1 - p0)
+
+
+def _map_thomson_midplane(
     ts_r: np.ndarray,
     psi_2d: np.ndarray,
     z_grid: np.ndarray,
     r_grid: np.ndarray,
     psi_axis: float,
     psi_bry: float,
-) -> np.ndarray:
-    """Map Thomson R positions to normalised poloidal flux at the midplane.
+) -> tuple[np.ndarray, np.ndarray]:
+    """Map Thomson R positions to psi_n and rho at the midplane.
 
     Parameters
     ----------
@@ -116,17 +135,52 @@ def _map_thomson_to_psi_n(
     Returns
     -------
     psi_n : (n_channels,) normalised poloidal flux (0 = axis, 1 = boundary)
+    rho : (n_channels,) normalised minor radius - midplane distance from the
+        magnetic axis divided by the axis-to-LCFS distance on the same side
+        (inboard/outboard), so 0 = axis and 1 = LCFS on both sides
     """
+    nan_out = np.full(len(ts_r), np.nan, dtype=np.float32)
     z_mid_idx = int(np.argmin(np.abs(z_grid)))
     psi_midplane = psi_2d[z_mid_idx, :]  # (n_r,)
 
-    psi_ts = np.interp(ts_r, r_grid, psi_midplane)
-
     denom = psi_bry - psi_axis
     if np.abs(denom) < 1e-10:
-        return np.full(len(ts_r), np.nan, dtype=np.float32)
-    psi_n = (psi_ts - psi_axis) / denom
-    return psi_n.astype(np.float32)
+        return nan_out, nan_out.copy()
+
+    # The equilibrium psi map can be NaN outside the converged region, so do
+    # all midplane work on the finite subset of grid points
+    finite = np.isfinite(psi_midplane)
+    if finite.sum() < 4:
+        return nan_out, nan_out.copy()
+    r_f = r_grid[finite]
+    psi_f = psi_midplane[finite]
+
+    psi_ts = np.interp(ts_r, r_f, psi_f)
+    psi_n = ((psi_ts - psi_axis) / denom).astype(np.float32)
+
+    # Magnetic axis radius from the midplane psi_n minimum, parabola-refined
+    # since the equilibrium grid is coarse (a few cm)
+    psi_n_mid = (psi_f - psi_axis) / denom
+    i_axis = int(np.argmin(psi_n_mid))
+    r_axis = float(r_f[i_axis])
+    if 0 < i_axis < len(r_f) - 1:
+        p_m, p_0, p_p = psi_n_mid[i_axis - 1], psi_n_mid[i_axis], psi_n_mid[i_axis + 1]
+        curv = p_m - 2 * p_0 + p_p
+        if curv > 0:
+            r_axis += 0.5 * (p_m - p_p) / curv * float(r_f[i_axis + 1] - r_f[i_axis - 1]) / 2.0
+
+    # LCFS midplane radii on each side of the axis
+    r_lcfs_out = _lcfs_crossing_radius(r_f[i_axis:], psi_n_mid[i_axis:])
+    r_lcfs_in = _lcfs_crossing_radius(r_f[i_axis::-1], psi_n_mid[i_axis::-1])
+
+    rho = nan_out.copy()
+    outboard = ts_r >= r_axis
+    if np.isfinite(r_lcfs_out) and r_lcfs_out > r_axis:
+        rho[outboard] = (ts_r[outboard] - r_axis) / (r_lcfs_out - r_axis)
+    if np.isfinite(r_lcfs_in) and r_lcfs_in < r_axis:
+        rho[~outboard] = (r_axis - ts_r[~outboard]) / (r_axis - r_lcfs_in)
+
+    return psi_n, rho
 
 
 def _make_params(shot: int, dt: xr.DataTree, timebase: np.ndarray) -> PhysicsMethodParams:
@@ -301,12 +355,14 @@ class MASTDataWorkflow(DataWorkflow):
         shot: int,
         params: PhysicsMethodParams,
         timebase: np.ndarray,
-    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray] | None:
-        """Get raw Thomson channel data at the TS measurement times, mapped to psi_n.
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray] | None:
+        """Get raw Thomson channel data at the TS measurement times, mapped to psi_n and rho.
 
-        Returns (ts_time, te_eV, ne_m3, psi_n_ts) where the arrays are shaped
-        (n_ts_time, n_channels), or None on failure. Invalid channels at a given
-        measurement time are NaN. Only TS times within the shot timebase are kept.
+        Returns (ts_time, te_eV, ne_m3, psi_n_ts, rho_ts) where the arrays are
+        shaped (n_ts_time, n_channels), or None on failure. rho is the
+        normalised minor radius (see _map_thomson_midplane). Invalid channels
+        at a given measurement time are NaN. Only TS times within the shot
+        timebase are kept.
         """
         try:
             ts_data = MastPhysicsMethods.get_ts_channels(params)
@@ -348,6 +404,7 @@ class MASTDataWorkflow(DataWorkflow):
         te_out = np.full((n_t, n_ch), np.nan, dtype=np.float32)
         ne_out = np.full((n_t, n_ch), np.nan, dtype=np.float32)
         psi_n_out = np.full((n_t, n_ch), np.nan, dtype=np.float32)
+        rho_out = np.full((n_t, n_ch), np.nan, dtype=np.float32)
 
         psi_ax_all = interp1d(efm_time, psi_axis_arr, bounds_error=False, fill_value=np.nan)(ts_time)
         psi_br_all = interp1d(efm_time, psi_bry_arr, bounds_error=False, fill_value=np.nan)(ts_time)
@@ -360,7 +417,7 @@ class MASTDataWorkflow(DataWorkflow):
                 continue
 
             psi_2d = psirz[t_eq_indices[i], :, :]  # (n_z, n_r)
-            psi_n_ts = _map_thomson_to_psi_n(r_ts, psi_2d, z_grid, r_grid_eq, psi_ax, psi_br)
+            psi_n_ts, rho_ts = _map_thomson_midplane(r_ts, psi_2d, z_grid, r_grid_eq, psi_ax, psi_br)
 
             te_at_t = te_raw[i, :]
             ne_at_t = ne_raw[i, :]
@@ -375,10 +432,11 @@ class MASTDataWorkflow(DataWorkflow):
                 & (ne_at_t > 0)
             )
             psi_n_out[i, valid] = psi_n_ts[valid]
+            rho_out[i, valid] = rho_ts[valid]
             te_out[i, valid] = te_at_t[valid]
             ne_out[i, valid] = ne_at_t[valid]
 
-        return ts_time, te_out, ne_out, psi_n_out
+        return ts_time, te_out, ne_out, psi_n_out, rho_out
 
     # ------------------------------------------------------------------
     def _extract_fit_input(
@@ -467,7 +525,7 @@ class MASTDataWorkflow(DataWorkflow):
         if raw_ts is None:
             logger.warning(f"Shot {shot}: failed to get raw Thomson data, skipping")
             return None
-        ts_time, te_eV, ne_m3, psi_n_ts = raw_ts
+        ts_time, te_eV, ne_m3, psi_n_ts, rho_ts = raw_ts
 
         ds_staging = xr.Dataset(
             data_vars={
@@ -475,6 +533,7 @@ class MASTDataWorkflow(DataWorkflow):
                 "ts_te_eV": (("ts_time", "channel"), te_eV),
                 "ts_ne_m3": (("ts_time", "channel"), ne_m3),
                 "ts_psi_n": (("ts_time", "channel"), psi_n_ts),
+                "ts_rho": (("ts_time", "channel"), rho_ts),
             },
             coords={
                 "time": timebase,

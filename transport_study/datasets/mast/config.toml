@@ -14,7 +14,7 @@ psi_n_min = 0.0
 psi_n_max = 1.0
 num_psi_points = 64
 # Minimum valid (psi_n, value) pairs required per timestep to run the GP fit
-min_ts_points = 20
+min_ts_points = 10
 
 [shot_filters]
 # Minimum IP [A] for a valid MAST shot
