@@ -73,7 +73,7 @@ class DatasetCLI:
         cluster_shots_per_batch: int = 50,
         cluster_cpus_per_job: int = 32,
         cluster_mem: str | None = None,
-        cluster_time_limit: str = "3:50:00",
+        cluster_time_limit: str = "7:50:00",
     ):
         data_assembly_dir = Path(data_assembly_dir)
         cluster_config = _build_cluster_config(
@@ -137,7 +137,7 @@ class DatasetCLI:
         cluster_shots_per_batch: int = 50,
         cluster_cpus_per_job: int = 32,
         cluster_mem: str | None = None,
-        cluster_time_limit: str = "3:50:00",
+        cluster_time_limit: str = "7:50:00",
     ):
         data_assembly_dir = Path(data_assembly_dir)
         cluster_config = _build_cluster_config(

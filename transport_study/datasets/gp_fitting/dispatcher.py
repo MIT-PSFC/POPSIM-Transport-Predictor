@@ -72,8 +72,7 @@ class ClusterFitConfig:
         cluster citizen.
     shots_per_batch : int
         Shots packed into one npz / one job. At ~40 core-minutes per shot,
-        50 shots on 32 CPUs is ~1 hour wall time, safely under a 4 hour
-        job limit.
+        50 shots on 32 CPUs is ~1 hour wall time
     cpus_per_job : int
         cpus-per-task for each fitting job; the worker runs this many
         slice-fit processes.
@@ -87,7 +86,7 @@ class ClusterFitConfig:
     shots_per_batch: int = 50
     cpus_per_job: int = 32
     memory_per_node: str | None = None
-    time_limit: str = "3:50:00"
+    time_limit: str = "7:50:00"
     poll_interval_s: float = 60.0
     job_name_prefix: str = "gpfit"
 
@@ -140,23 +139,27 @@ class _SSHBackend:
     """File transfer and job control on a remote cluster via srunx."""
 
     def __init__(self, config: ClusterFitConfig):
-        from srunx.slurm.clients.ssh import ConfigManager, SlurmSSHClient
-        from srunx.sync import RsyncClient
+        from srunx.slurm.clients.ssh import SlurmSSHClient
+        from srunx.ssh.core.config import ConfigManager
+        from srunx.sync.mount_helpers import build_rsync_client
 
         profile = ConfigManager().get_profile(config.profile)
         if profile is None:
             raise ValueError(
                 f"srunx SSH profile '{config.profile}' not found. Create it with: srunx ssh profile add {config.profile} --ssh-host <host>"
             )
-        self._username = profile.username
         self._client = SlurmSSHClient(profile_name=config.profile)
-        self._rsync = RsyncClient(
-            hostname=profile.hostname,
-            username=profile.username,
-            port=profile.port,
-            key_filename=profile.key_filename,
-            proxy_jump=profile.proxy_jump,
-        )
+        # connection_spec carries the username resolved from ~/.ssh/config,
+        # which profile.username lacks for --ssh-host profiles
+        self._username = self._client.connection_spec.username
+        if not self._username:
+            logger.warning(
+                f"No username resolved for profile '{config.profile}' (no User line in ~/.ssh/config?); "
+                "job adoption will scan all users' queued jobs"
+            )
+        # build_rsync_client delegates to ~/.ssh/config for --ssh-host
+        # profiles, where profile.hostname/username are empty
+        self._rsync = build_rsync_client(profile)
 
     def push_file(self, local: Path, remote_dir: str) -> None:
         result = self._rsync.push(str(local), f"{remote_dir}/", delete=False)
