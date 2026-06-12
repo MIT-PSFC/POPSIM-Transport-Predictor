@@ -246,6 +246,18 @@ class DataWorkflow:
 
         logger.info(f"Processing {len(identifiers)} shots to build dataset")
 
+        # Pre-scan the raw files for the maximum size of each dimension. Processing only ever
+        # drops timeslices, so the raw sizes are a valid upper bound for the processed shots.
+        # Passing these to build_tensorized_dataset lets every shot be padded to a fixed shape
+        # up front, so the zarr store never needs to be extended when a later shot is larger.
+        dim_sizes: dict[str, int] = {}
+        for identifier in identifiers:
+            with xr.open_dataset(self.raw_data_dir / f"{identifier}.nc") as raw_ds:
+                for dim, size in raw_ds.sizes.items():
+                    dim_sizes[dim] = max(dim_sizes.get(dim, 0), size)
+        dim_sizes.pop(EPISODE_DIM, None)
+        logger.info(f"Maximum dimension sizes across raw files: {dim_sizes}")
+
         # Run the data processing workflow and save to a POPSIM tensorized dataset
         ds = build_tensorized_dataset(
             process_fn=self.process_fn,
@@ -255,6 +267,7 @@ class DataWorkflow:
             episode_dim=EPISODE_DIM,
             extend_existing=False,
             mb_per_chunk=100,
+            dim_sizes=dim_sizes,
         )
 
         logger.info(f"Saved processed dataset to {zarr_path}")
