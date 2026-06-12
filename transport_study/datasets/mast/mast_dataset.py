@@ -467,6 +467,21 @@ class MASTDataWorkflow(DataWorkflow):
 
         return ShotFitInput(x=rho_ts, **arrays)
 
+    def _checked_fit_input(
+        self,
+        shot: int,
+        te_eV: np.ndarray,
+        ne_m3: np.ndarray,
+        rho_ts: np.ndarray,
+    ) -> ShotFitInput | None:
+        """Extract fit inputs, skipping shots the GP fit could only return all NaN for
+        (e.g. when the rho mapping failed and ts_rho is all NaN)."""
+        fit_input = self._extract_fit_input(te_eV, ne_m3, rho_ts)
+        if not fit_input.has_fittable_points():
+            logger.warning(f"Shot {shot}: no finite (rho, te, ne) channel data to fit, skipping")
+            return None
+        return fit_input
+
     # ------------------------------------------------------------------
     def _staging_path(self, shot: int) -> Path:
         return self.fit_staging_dir / f"{shot}_staging.nc"
@@ -485,7 +500,8 @@ class MASTDataWorkflow(DataWorkflow):
         if staging_path.exists():
             logger.info(f"Using staged source data for shot {shot}")
             ds_staging = xr.load_dataset(staging_path)
-            return self._extract_fit_input(
+            return self._checked_fit_input(
+                shot,
                 ds_staging["ts_te_eV"].values,
                 ds_staging["ts_ne_m3"].values,
                 ds_staging["ts_rho"].values,
@@ -544,7 +560,7 @@ class MASTDataWorkflow(DataWorkflow):
         )
         ds_staging.to_netcdf(staging_path)
 
-        return self._extract_fit_input(te_eV, ne_m3, rho_ts)
+        return self._checked_fit_input(shot, te_eV, ne_m3, rho_ts)
 
     # ------------------------------------------------------------------
     def _assemble_shot(self, shot: int, fit_output: ShotFitOutput) -> bool:

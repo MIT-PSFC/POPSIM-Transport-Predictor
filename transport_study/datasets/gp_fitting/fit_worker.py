@@ -138,6 +138,19 @@ class ShotFitInput:
     ne_y: np.ndarray
     ne_err: np.ndarray
 
+    def has_fittable_points(self) -> bool:
+        """True if te and ne each have at least one finite (x, y, err) point.
+
+        A shot failing this can only come back all NaN from the fit (and would
+        then be culled at assembly), so callers should skip it before staging
+        or batching. Both variables are required because downstream assembly
+        culls the shot if either profile is all NaN.
+        """
+        x_ok = np.isfinite(self.x)
+        te_ok = x_ok & np.isfinite(self.te_y) & np.isfinite(self.te_err)
+        ne_ok = x_ok & np.isfinite(self.ne_y) & np.isfinite(self.ne_err)
+        return bool(te_ok.any() and ne_ok.any())
+
 
 @dataclass
 class ShotFitOutput:

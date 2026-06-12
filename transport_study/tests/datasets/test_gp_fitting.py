@@ -53,6 +53,27 @@ def _synthetic_input(seed: int = 0, amplitude: float = 2.0) -> ShotFitInput:
     return ShotFitInput(x=rho, **arrays)
 
 
+def test_has_fittable_points():
+    si = _synthetic_input()
+    assert si.has_fittable_points()
+
+    # All-NaN radial coordinate (e.g. failed rho mapping) makes the shot unfittable
+    si_bad_x = _synthetic_input()
+    si_bad_x.x[:] = np.nan
+    assert not si_bad_x.has_fittable_points()
+
+    # One all-NaN variable is enough to skip, since assembly culls the shot anyway
+    si_bad_te = _synthetic_input()
+    si_bad_te.te_y[:] = np.nan
+    assert not si_bad_te.has_fittable_points()
+
+    # A single finite point per variable keeps the shot
+    si_sparse = _synthetic_input()
+    si_sparse.x[:] = np.nan
+    si_sparse.x[0, 0] = 0.5
+    assert si_sparse.has_fittable_points()
+
+
 # ----------------------------------------------------------------------
 # Batch file round-trips
 # ----------------------------------------------------------------------

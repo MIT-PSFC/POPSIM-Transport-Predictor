@@ -215,6 +215,15 @@ class CModDataWorkflow(DataWorkflow):
 
         return ShotFitInput(x=data_x, **arrays)
 
+    def _checked_fit_input(self, shot: int, ds_thomson: xr.Dataset) -> ShotFitInput | None:
+        """Extract fit inputs, skipping shots the GP fit could only return all NaN for
+        (e.g. when the rho mapping failed and ts_channel_rho is all NaN)."""
+        fit_input = self._extract_fit_input(ds_thomson)
+        if not fit_input.has_fittable_points():
+            logger.warning(f"Shot {shot}: no finite (rho, te, ne) channel data to fit, skipping")
+            return None
+        return fit_input
+
     def _profiles_dataset_from_fit(self, shot: int, times: np.ndarray, fit_output: ShotFitOutput) -> xr.Dataset:
         """Build the GP-fitted profile dataset (with shot dimension) from fit results."""
         ds_profiles = xr.Dataset(
@@ -251,7 +260,7 @@ class CModDataWorkflow(DataWorkflow):
         if thomson_path.exists() and efit_path.exists():
             logger.info(f"Using staged source data for shot {shot}")
             ds_thomson = xr.load_dataset(thomson_path)
-            return self._extract_fit_input(ds_thomson)
+            return self._checked_fit_input(shot, ds_thomson)
 
         # Get EFIT and 0D data
         try:
@@ -268,7 +277,7 @@ class CModDataWorkflow(DataWorkflow):
 
         ds_efit.to_netcdf(efit_path)
         ds_thomson.to_netcdf(thomson_path)
-        return self._extract_fit_input(ds_thomson)
+        return self._checked_fit_input(shot, ds_thomson)
 
     def _assemble_shot(self, shot: int, fit_output: ShotFitOutput) -> bool:
         """Combine staged source data and GP fit results into the raw data file."""
@@ -414,7 +423,8 @@ class CModDataWorkflow(DataWorkflow):
                     ax.set_ylim(bottom=0)
                     ax.set_title(f"shot {shot}  t={time:.3f} s")
                     ax.grid(alpha=0.3)
-                    ax.legend(fontsize=8)
+                    if ax.get_legend_handles_labels()[0]:
+                        ax.legend(fontsize=8)
 
                 fig.tight_layout()
                 pdf.savefig(fig)
