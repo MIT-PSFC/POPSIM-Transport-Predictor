@@ -27,6 +27,7 @@ Batch file format (npz):
 import argparse
 import multiprocessing
 import os
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -363,6 +364,7 @@ def fit_batch(
 
     n_total = len(tasks)
     n_done = 0
+    t_start = time.monotonic()
     if num_workers <= 1:
         for task in tasks:
             _store(_fit_slice(task))
@@ -377,7 +379,12 @@ def fit_batch(
                 if n_done % 50 == 0:
                     print(f"[fit_worker] {n_done}/{n_total} slice fits done", flush=True)
 
-    print(f"[fit_worker] finished {n_total} slice fits for {len(shot_inputs)} shots", flush=True)
+    elapsed = time.monotonic() - t_start
+    print(
+        f"[fit_worker] finished {n_total} slice fits for {len(shot_inputs)} shots "
+        f"in {elapsed:.0f}s ({elapsed / max(n_total, 1):.2f}s per slice fit)",
+        flush=True,
+    )
     return outputs
 
 
