@@ -41,6 +41,17 @@ workflows run fully serially, so the datasets remain reproducible (for anyone pa
 
 One-time setup per cluster:
 
+The `~/.ssh/config` entry for the cluster host must have an `IdentityFile` line. The python-SLURM library srunx connects with paramiko, which only uses the key named there.
+It does not fall back to the default keys in `~/.ssh/`, and with `ProxyJump` it refuses to connect without an explicit key.
+
+```
+Host <ssh-host>
+  HostName <hostname>
+  User <username>
+  ProxyJump <jump-host>            # if the cluster is behind a login node
+  IdentityFile ~/.ssh/id_ed25519   # required for srunx
+```
+
 ```bash
 # Register the SSH profile (host comes from ~/.ssh/config)
 srunx ssh profile add <profile-name> --ssh-host <ssh-host>

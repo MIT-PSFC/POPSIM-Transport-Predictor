@@ -203,6 +203,7 @@ class CModDataWorkflow(DataWorkflow):
                 err_y = err_y * 1e-20
 
             # If data or error bar is incredibly small, set to NaN since it's probably bad data
+            # At this point, ne is in 1e20 m^-3 and Te is in keV
             data_y = np.where(data_y < 0.001, np.nan, data_y)
             err_y = np.where(err_y < 0.001, np.nan, err_y)
 

@@ -158,7 +158,7 @@ class DataWorkflow:
                 continue
             pending[shot] = fit_input
 
-        logger.info(f"{n_existing} raw files already exist; {len(pending)} shots need GP fitting")
+        logger.info(f"{n_existing} raw files already exist, {len(pending)} shots need GP fitting")
         if not pending:
             logger.info("Nothing to fit, finished making raw data files.")
             return

@@ -160,6 +160,11 @@ class _SSHBackend:
         # build_rsync_client delegates to ~/.ssh/config for --ssh-host
         # profiles, where profile.hostname/username are empty
         self._rsync = build_rsync_client(profile)
+        # srunx detects --mkpath from the local rsync only, but on push the
+        # flag reaches the remote rsync, which may be too old for it
+        # (e.g. Engaging has 3.1.3). Disable it to force srunx's ssh mkdir -p
+        # fallback, which works regardless of remote rsync version.
+        self._rsync._supports_mkpath = False
 
     def push_file(self, local: Path, remote_dir: str) -> None:
         result = self._rsync.push(str(local), f"{remote_dir}/", delete=False)
