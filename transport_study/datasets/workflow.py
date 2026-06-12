@@ -164,7 +164,7 @@ class DataWorkflow:
         dispatcher = ClusterFitDispatcher(self.cluster_config, self.ds_name, self.fit_staging_dir)
         results = dispatcher.run(
             pending,
-            x_star=self.gp_fit_psi,
+            x_star=self.gp_fit_rho,
             min_points=self.fit_min_points,
             scale_per_slice=self.fit_scale_per_slice,
         )
@@ -337,12 +337,12 @@ class DataWorkflow:
 
         # Label where the profiles are fresh (not made by ffill)
         if "fresh_profiles" not in shot_ds:
-            ne20 = shot_ds["ne20_psi"]
+            ne20 = shot_ds["ne20_rho"]
             ne20_filled = ne20.fillna(0)
             diff_result = ne20_filled != ne20_filled.shift(time_idx=1, fill_value=0)
             first_valid_is_fresh = ne20.notnull().cumsum("time_idx") == 1
             fresh_profiles_1D = diff_result | first_valid_is_fresh
-            fresh_profiles = fresh_profiles_1D.any("psi_n")
+            fresh_profiles = fresh_profiles_1D.any("rho")
             shot_ds["fresh_profiles"] = fresh_profiles.astype(np.float32)
 
         debug_ds = shot_ds.copy()  # Copy for plotting later if need be

@@ -452,7 +452,7 @@ class ProfileStudy(Study):
         If a hyperparameter tuned config is available, fills in the hyperparameters from that, otherwise uses default config.
         """
         dataloader_config_base = {
-            "target_vars": ["Te_keV_psi", "ne20_psi", "ds_source_idx"],
+            "target_vars": ["Te_keV_rho", "ne20_rho", "ds_source_idx"],
             "training_data": case.training_data,
             "data_normalization": case.data_normalization,
             "domain_adaptation": case.domain_adaptation,

@@ -17,9 +17,9 @@ from scipy.constants import eV, mu_0
 
 class ProfileShape(TimeIndepModule):
     """
-    A module defining a profile shape on the psi_n grid [0, 1].
+    A module defining a profile shape on the normalized minor radius (rho) grid [0, 1].
 
-    The profile shape can either be specified either directly with points on the psi grid or with a set of coefficients for a B-spline basis.
+    The profile shape can either be specified either directly with points on the rho grid or with a set of coefficients for a B-spline basis.
     """
 
     basis: Basis1DProtocol  # B-spline basis used to define the profile shape
@@ -31,25 +31,25 @@ class ProfileShape(TimeIndepModule):
         self.coeffs = coeffs
         self.normalize = normalize
 
-    def __call__(self, psi: Array, n_normalize: int = 100) -> Array:
-        """Evaluate the profile shape at the given psi values.
+    def __call__(self, rho: Array, n_normalize: int = 100) -> Array:
+        """Evaluate the profile shape at the given rho values.
 
         Args:
-            psi (Array): Grid values at which to evaluate the profile shape.
+            rho (Array): Grid values at which to evaluate the profile shape.
             n_normalize (int, optional): Number of points to use for normalization. Defaults to 100.
 
         Returns:
-            Array: The profile shape evaluated at each psi value.
+            Array: The profile shape evaluated at each rho value.
         """
 
-        # Check that psi values are between 0 and 1.2
-        psi = eqx.error_if(
-            psi,
-            jnp.any(jnp.logical_or(psi < 0.0, psi > 1.2)),
-            "psi values must be in the range [0, 1.2]",
+        # Check that rho values are between 0 and 1.2
+        rho = eqx.error_if(
+            rho,
+            jnp.any(jnp.logical_or(rho < 0.0, rho > 1.2)),
+            "rho values must be in the range [0, 1.2]",
         )
 
-        vals = self.basis(self.coeffs, psi)
+        vals = self.basis(self.coeffs, rho)
         if self.normalize:
             vals = vals / self.integral(n_normalize=n_normalize)
         return vals
@@ -59,27 +59,27 @@ class ProfileShape(TimeIndepModule):
         n_normalize: int = 100,
     ) -> float:
         """Calculate the integral of the profile shape."""
-        psi_norm = jnp.linspace(0, 1.2, n_normalize)
-        vals_psi_norm = self.basis(self.coeffs, psi_norm)
-        integral = jnp.trapezoid(vals_psi_norm, psi_norm)
+        rho_norm = jnp.linspace(0, 1.2, n_normalize)
+        vals_rho_norm = self.basis(self.coeffs, rho_norm)
+        integral = jnp.trapezoid(vals_rho_norm, rho_norm)
         return integral
 
-    def visualize(self, psi: Array = None, ax=None):
+    def visualize(self, rho: Array = None, ax=None):
         """Visualize the profile shape and the components"""
-        if psi is None:
-            psi = jnp.linspace(0, 1.2, 100)
+        if rho is None:
+            rho = jnp.linspace(0, 1.2, 100)
         # Calculate the profile shape and its components
-        profile_shape = self(psi)
+        profile_shape = self(rho)
 
         # Create a new figure and axis if none are provided
         if ax is None:
             _fig, ax = plt.subplots()
 
         # Plot the overall profile shape
-        ax.plot(psi, profile_shape, label="Profile Shape", color="black", linewidth=2)
+        ax.plot(rho, profile_shape, label="Profile Shape", color="black", linewidth=2)
 
         # Add labels and legend
-        ax.set_xlabel("psi_n")
+        ax.set_xlabel("rho")
         ax.set_ylabel("Profile value")
         ax.legend()
 
@@ -136,7 +136,7 @@ class Inputs:
     delta_bot: float  # Bottom triangularity
 
     # Other
-    psi: Array  # Toroidal flux coordinate to evaluate the profiles at
+    rho: Array  # Normalized minor radius coordinate to evaluate the profiles at
 
     @property
     def epsilon(self):
@@ -229,8 +229,8 @@ def kmeans_initial_guess(
 
     ne_kmeans = KMeans(n_clusters=n_shapes, random_state=seed).fit(ne_data.values)
 
-    te_shapes = [ProfileShape.make_points(points=te_kmeans.cluster_centers_[i], grid=te_data.psi_n.values) for i in range(n_shapes)]
-    ne_shapes = [ProfileShape.make_points(points=ne_kmeans.cluster_centers_[i], grid=ne_data.psi_n.values) for i in range(n_shapes)]
+    te_shapes = [ProfileShape.make_points(points=te_kmeans.cluster_centers_[i], grid=te_data.rho.values) for i in range(n_shapes)]
+    ne_shapes = [ProfileShape.make_points(points=ne_kmeans.cluster_centers_[i], grid=ne_data.rho.values) for i in range(n_shapes)]
     return te_shapes, ne_shapes
 
 
@@ -243,7 +243,7 @@ def pca_initial_guess(n_shapes: int, te_data: xr.DataArray, ne_data: xr.DataArra
     te_shapes = [
         ProfileShape.make_points(
             points=te_components.sel(mode=i).values,
-            grid=te_data.psi_n.values,
+            grid=te_data.rho.values,
             normalize=False,
         )
         for i in te_components.mode.values
@@ -254,7 +254,7 @@ def pca_initial_guess(n_shapes: int, te_data: xr.DataArray, ne_data: xr.DataArra
     ne_shapes = [
         ProfileShape.make_points(
             points=ne_components.sel(mode=i).values,
-            grid=ne_data.psi_n.values,
+            grid=ne_data.rho.values,
             normalize=False,
         )
         for i in ne_components.mode.values
@@ -263,7 +263,7 @@ def pca_initial_guess(n_shapes: int, te_data: xr.DataArray, ne_data: xr.DataArra
 
 
 class ProfilePredictor(TimeIndepModule):
-    psigrid: tuple = eqx.field(static=True)  # The psi grid on which the profiles are evaluated
+    rhogrid: tuple = eqx.field(static=True)  # The rho grid on which the profiles are evaluated
 
     nn: RtdMLP
 
@@ -284,7 +284,7 @@ class ProfilePredictorShapeInit(ProfilePredictor):
         in_size: int,
         softmax_temp: float,
         shape_type: ShapeType,
-        psigrid: tuple,
+        rhogrid: tuple,
         key: jax.random.PRNGKey,
     ):
         self.te_shapes = te_shapes
@@ -302,7 +302,7 @@ class ProfilePredictorShapeInit(ProfilePredictor):
         )
         self.softmax_temp = softmax_temp
         self.shape_type = shape_type
-        self.psigrid = psigrid
+        self.rhogrid = rhogrid
 
     def __call__(self, inputs: Inputs | xr.Dataset, debug: bool = False) -> Outputs:
         if isinstance(inputs, xr.Dataset):
@@ -316,7 +316,7 @@ class ProfilePredictorShapeInit(ProfilePredictor):
                 kappa=inputs["kappa"].data,
                 delta_top=inputs["delta_top"].data,
                 delta_bot=inputs["delta_bot"].data,
-                psi=jnp.array(self.psigrid),
+                rho=jnp.array(self.rhogrid),
             )
 
         nn_inputs = inputs.nn_inputs
@@ -338,11 +338,11 @@ class ProfilePredictorShapeInit(ProfilePredictor):
 
         # Compute the shapes.
         ne_shapes = jnp.stack(
-            [w * shape(inputs.psi) for shape, w in zip(self.ne_shapes, ne_coeffs, strict=True)],
+            [w * shape(inputs.rho) for shape, w in zip(self.ne_shapes, ne_coeffs, strict=True)],
             axis=0,
         )
         te_shapes = jnp.stack(
-            [w * shape(inputs.psi) for shape, w in zip(self.te_shapes, te_coeffs, strict=True)],
+            [w * shape(inputs.rho) for shape, w in zip(self.te_shapes, te_coeffs, strict=True)],
             axis=0,
         )
 
@@ -362,8 +362,8 @@ class ProfilePredictorShapeInit(ProfilePredictor):
             debug_info = None
 
         out = Outputs(
-            ne=xr.DataArray(data=ne, dims=("psi_n",), coords={"psi_n": list(self.psigrid)}),
-            te=xr.DataArray(data=te, dims=("psi_n",), coords={"psi_n": list(self.psigrid)}),
+            ne=xr.DataArray(data=ne, dims=("rho",), coords={"rho": list(self.rhogrid)}),
+            te=xr.DataArray(data=te, dims=("rho",), coords={"rho": list(self.rhogrid)}),
             debug_info=debug_info,
         )
 
@@ -373,7 +373,7 @@ class ProfilePredictorShapeInit(ProfilePredictor):
     def init(
         cls,
         n_shapes: int,
-        psigrid: Array,
+        rhogrid: Array,
         nn_width: int,
         nn_depth: int,
         in_size: int,
@@ -381,13 +381,13 @@ class ProfilePredictorShapeInit(ProfilePredictor):
         softmax_temp: float,
         prng_seed: int,
     ) -> "ProfilePredictor":
-        psigrid_jax = jnp.array(psigrid)
-        psigrid_tuple = tuple(psigrid.tolist())
+        rhogrid_jax = jnp.array(rhogrid)
+        rhogrid_tuple = tuple(rhogrid.tolist())
         te_shapes = [
-            ProfileShape.make_points(points=jnp.zeros_like(psigrid_jax), grid=psigrid_jax, normalize=False) for _ in range(n_shapes)
+            ProfileShape.make_points(points=jnp.zeros_like(rhogrid_jax), grid=rhogrid_jax, normalize=False) for _ in range(n_shapes)
         ]
         ne_shapes = [
-            ProfileShape.make_points(points=jnp.zeros_like(psigrid_jax), grid=psigrid_jax, normalize=False) for _ in range(n_shapes)
+            ProfileShape.make_points(points=jnp.zeros_like(rhogrid_jax), grid=rhogrid_jax, normalize=False) for _ in range(n_shapes)
         ]
         return cls(
             te_shapes=te_shapes,
@@ -397,24 +397,24 @@ class ProfilePredictorShapeInit(ProfilePredictor):
             in_size=in_size,
             softmax_temp=softmax_temp,
             shape_type=shape_type,
-            psigrid=psigrid_tuple,
+            rhogrid=rhogrid_tuple,
             key=jax.random.PRNGKey(prng_seed),
         )
 
 
 class ProfilePredictorUnstructuredNN(ProfilePredictor):
-    psi_points: tuple = eqx.field(static=True)  # Hashable points at which the NN predicts
+    rho_points: tuple = eqx.field(static=True)  # Hashable points at which the NN predicts
 
     def __init__(
         self,
         n_points: int,
         nn_width: int,
         nn_depth: int,
-        psigrid: tuple,
+        rhogrid: tuple,
         key: jax.random.PRNGKey,
     ):
-        psigrid_tuple = tuple(psigrid.tolist()) if hasattr(psigrid, "tolist") else tuple(psigrid)
-        self.psi_points = tuple(jnp.linspace(min(psigrid_tuple), max(psigrid_tuple), n_points).tolist())
+        rhogrid_tuple = tuple(rhogrid.tolist()) if hasattr(rhogrid, "tolist") else tuple(rhogrid)
+        self.rho_points = tuple(jnp.linspace(min(rhogrid_tuple), max(rhogrid_tuple), n_points).tolist())
 
         key, subkey = jax.random.split(key)
         self.nn = RtdMLP(
@@ -426,7 +426,7 @@ class ProfilePredictorUnstructuredNN(ProfilePredictor):
             final_activation=Activation.IDENTITY,
             key=subkey,
         )
-        self.psigrid = psigrid_tuple
+        self.rhogrid = rhogrid_tuple
 
     def __call__(self, inputs: Inputs | xr.Dataset, debug: bool = False) -> Outputs:
         if isinstance(inputs, xr.Dataset):
@@ -440,12 +440,12 @@ class ProfilePredictorUnstructuredNN(ProfilePredictor):
                 kappa=inputs["kappa"].data,
                 delta_top=inputs["delta_top"].data,
                 delta_bot=inputs["delta_bot"].data,
-                psi=jnp.array(self.psigrid),
+                rho=jnp.array(self.rhogrid),
             )
 
         nn_inputs = inputs.nn_inputs
-        psi_points = jnp.asarray(self.psi_points)
-        n_pred_points = len(self.psi_points)
+        rho_points = jnp.asarray(self.rho_points)
+        n_pred_points = len(self.rho_points)
 
         # Predict the profile values at the specified points.
         outputs = self.nn(nn_inputs)
@@ -454,13 +454,13 @@ class ProfilePredictorUnstructuredNN(ProfilePredictor):
         ne_correction = jnp.abs(outputs[-1])
         te_correction = jnp.abs(outputs[-2])
 
-        # Interpolate the predicted points to the psigrid
-        ne = jnp.interp(inputs.psi, psi_points, ne_points) * inputs.ne20_line_avg * ne_correction
-        te = jnp.interp(inputs.psi, psi_points, te_points) * te_correction
+        # Interpolate the predicted points to the rhogrid
+        ne = jnp.interp(inputs.rho, rho_points, ne_points) * inputs.ne20_line_avg * ne_correction
+        te = jnp.interp(inputs.rho, rho_points, te_points) * te_correction
 
         out = Outputs(
-            ne=xr.DataArray(data=ne, dims=("psi_n",), coords={"psi_n": list(self.psigrid)}),
-            te=xr.DataArray(data=te, dims=("psi_n",), coords={"psi_n": list(self.psigrid)}),
+            ne=xr.DataArray(data=ne, dims=("rho",), coords={"rho": list(self.rhogrid)}),
+            te=xr.DataArray(data=te, dims=("rho",), coords={"rho": list(self.rhogrid)}),
             debug_info=None,
         )
 

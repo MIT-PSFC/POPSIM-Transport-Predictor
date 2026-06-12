@@ -131,7 +131,7 @@ class ProfilePredictorTRB(TrainRunBuilder):
 
             module = ProfilePredictorShapeInit.init(
                 n_shapes=model_init_config["n_shapes"],
-                psigrid=np.asarray(train_dl.ds["psi_n"]),
+                rhogrid=np.asarray(train_dl.ds["rho"]),
                 nn_width=model_init_config["nn_width"],
                 nn_depth=model_init_config["nn_depth"],
                 in_size=model_init_config["in_size"],
@@ -162,7 +162,7 @@ class ProfilePredictorTRB(TrainRunBuilder):
                 n_points=model_init_config["n_points"],
                 nn_width=model_init_config["nn_width"],
                 nn_depth=model_init_config["nn_depth"],
-                psigrid=np.asarray(train_dl.ds["psi_n"]),
+                rhogrid=np.asarray(train_dl.ds["rho"]),
                 key=jax.random.PRNGKey(model_init_config["prng_seed"]),
             )
         elif model_init_config["model_type"].startswith("torax-"):
@@ -170,7 +170,7 @@ class ProfilePredictorTRB(TrainRunBuilder):
             module = ProfilePredictorTorax(
                 nn_width=model_init_config["nn_width"],
                 nn_depth=model_init_config["nn_depth"],
-                psigrid=np.asarray(train_dl.ds["psi_n"]),
+                rhogrid=np.asarray(train_dl.ds["rho"]),
                 torax_config=model_init_config["torax_config"],
                 key=jax.random.PRNGKey(model_init_config["prng_seed"]),
                 transport_model=model_init_config["model_type"].removeprefix("torax-"),
@@ -195,12 +195,12 @@ class ProfilePredictorTRB(TrainRunBuilder):
         def loss_fn(pred, targ):
             ne_huber = optax.huber_loss(
                 pred.ne.data,
-                targ["ne20_psi"].data,
+                targ["ne20_rho"].data,
                 delta=loss_config["huber_delta"],
             )
             te_huber = optax.huber_loss(
                 pred.te.data,
-                targ["Te_keV_psi"].data,
+                targ["Te_keV_rho"].data,
                 delta=loss_config["huber_delta"],
             )
 
@@ -221,10 +221,10 @@ class ProfilePredictorTRB(TrainRunBuilder):
             ne_weighted = sample_weights * ne_huber
             te_weighted = sample_weights * te_huber
 
-            ne_psi_loss = jnp.trapezoid(ne_weighted, x=pred.ne.psi_n.data)
-            te_psi_loss = jnp.trapezoid(te_weighted, x=pred.te.psi_n.data)
+            ne_rho_loss = jnp.trapezoid(ne_weighted, x=pred.ne.rho.data)
+            te_rho_loss = jnp.trapezoid(te_weighted, x=pred.te.rho.data)
 
-            return ne_psi_loss + te_psi_loss
+            return ne_rho_loss + te_rho_loss
 
         return loss_fn
 
@@ -321,7 +321,7 @@ class ProfilePredictorTRB(TrainRunBuilder):
 
         def study_results(eval_data: EvalData) -> xr.Dataset:
             """Calculate final study results for profile prediction.
-                - Target vs predicted ne20_psi and Te_keV_psi profiles
+                - Target vs predicted ne20_rho and Te_keV_rho profiles
                 - Per-timeslice profile-integrated absolute/relative errors
                 - Per-shot time-integrated errors
             Keeps shot and ds_source coordinates for downstream analysis.
@@ -346,8 +346,8 @@ class ProfilePredictorTRB(TrainRunBuilder):
                 raise KeyError(f"None of the candidate output vars were found: {candidates}")
 
             # Targets from input dataset
-            ne_targ = _unstack_and_rename_time(eval_data.input_ds["ne20_psi"])
-            te_targ = _unstack_and_rename_time(eval_data.input_ds["Te_keV_psi"])
+            ne_targ = _unstack_and_rename_time(eval_data.input_ds["ne20_rho"])
+            te_targ = _unstack_and_rename_time(eval_data.input_ds["Te_keV_rho"])
             time_2d = _unstack_and_rename_time(eval_data.input_ds[TIME_COORD])
 
             # Predictions from output dataset.
@@ -370,11 +370,11 @@ class ProfilePredictorTRB(TrainRunBuilder):
             ne_error_rel_profile = ne_error_abs_profile / (xr.apply_ufunc(np.abs, ne_targ) + 0.1)
             te_error_rel_profile = te_error_abs_profile / (xr.apply_ufunc(np.abs, te_targ) + 0.1)
 
-            # Integrate profile error over psi for each timeslice
-            ne_error_abs_ts = ne_error_abs_profile.integrate("psi_n")
-            te_error_abs_ts = te_error_abs_profile.integrate("psi_n")
-            ne_error_rel_ts = ne_error_rel_profile.integrate("psi_n")
-            te_error_rel_ts = te_error_rel_profile.integrate("psi_n")
+            # Integrate profile error over rho for each timeslice
+            ne_error_abs_ts = ne_error_abs_profile.integrate("rho")
+            te_error_abs_ts = te_error_abs_profile.integrate("rho")
+            ne_error_rel_ts = ne_error_rel_profile.integrate("rho")
+            te_error_rel_ts = te_error_rel_profile.integrate("rho")
 
             # Combined timeslice errors (equal weighting between ne and Te channels)
             error_abs_ts = 0.5 * (ne_error_abs_ts + te_error_abs_ts)
@@ -444,10 +444,10 @@ class ProfilePredictorTRB(TrainRunBuilder):
 
             ds = xr.Dataset(
                 data_vars={
-                    "ne20_psi_targ": ne_targ,
-                    "ne20_psi_pred": ne_pred,
-                    "Te_keV_psi_targ": te_targ,
-                    "Te_keV_psi_pred": te_pred,
+                    "ne20_rho_targ": ne_targ,
+                    "ne20_rho_pred": ne_pred,
+                    "Te_keV_rho_targ": te_targ,
+                    "Te_keV_rho_pred": te_pred,
                     "ne_error_abs_ts": ne_error_abs_ts,
                     "te_error_abs_ts": te_error_abs_ts,
                     "ne_error_rel_ts": ne_error_rel_ts,

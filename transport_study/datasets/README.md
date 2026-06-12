@@ -19,7 +19,9 @@ and do the remainder of the data preparation workflow from there.
 4. MAST
 
 Reads 0D signals and raw Thomson channel data from the STFC ECHO S3 open-access Zarr store (no credentials needed),
-maps Thomson positions to psi_n using the level1 EFM equilibrium, and GP fits profiles the same way as C-Mod.
+maps Thomson positions to the normalized minor radius rho (midplane distance from the magnetic axis divided by the
+axis-to-LCFS distance, from the level1 EFM equilibrium), and GP fits profiles the same way as C-Mod. Profiles are
+fit and stored in rho, not psi_n, because psi_n squishes the core in real space.
 
 ## Distributed GP profile fitting (C-Mod and MAST)
 

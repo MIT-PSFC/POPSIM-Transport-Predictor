@@ -34,7 +34,7 @@ def test_torax_predictor(transport_model):
             "dataloader_config": {
                 **train_config.dataloader_config,
                 "training_data": training_data,
-                "target_vars": ["Te_keV_psi", "ne20_psi", "ds_source_idx"],
+                "target_vars": ["Te_keV_rho", "ne20_rho", "ds_source_idx"],
                 "batch_size": None,
             },
         }

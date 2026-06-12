@@ -1,7 +1,7 @@
 """Evaluate all profile predictor checkpoints against IDA profiles in the reference shot.
 
 Runs each predictor on measured (non-prog) inputs from the reference shot and computes
-the psi-integrated relative error against IDA ne/Te profiles. Output formatted similar
+the rho-integrated relative error against IDA ne/Te profiles. Output formatted similar
 to best_cases.py.
 
 Each evaluation is submitted as an independent SLURM job; the main script waits for all
@@ -78,8 +78,8 @@ def load_valid_timeslices(ref_shot_path: Path | str) -> xr.Dataset:
     valid = np.ones(ds.sizes["time_idx"], dtype=bool)
     for v in INPUT_VARS:
         valid &= ds[v].notnull().values
-    for v in ["ne20_psi", "Te_keV_psi"]:
-        valid &= ds[v].notnull().all(dim="psi_n").values
+    for v in ["ne20_rho", "Te_keV_rho"]:
+        valid &= ds[v].notnull().all(dim="rho").values
 
     ds_valid = ds.isel(time_idx=valid)
     logger.info(f"Valid timeslices: {int(valid.sum())} / {ds.sizes['time_idx']}")
@@ -94,11 +94,11 @@ def evaluate_checkpoint(checkpoint_dir: Path | str, ds_valid: xr.Dataset) -> dic
         logger.warning(f"Failed to restore {Path(checkpoint_dir).name}:\n{traceback.format_exc()}")
         return None
 
-    # Predictor evaluates on its own psigrid; targets must be interpolated onto it.
-    psi_pred = np.array(predictor.psigrid)  # (n_pred_psi,)
-    psi_ds = ds_valid["psi_n"].values  # (n_ds_psi,)
+    # Predictor evaluates on its own rhogrid; targets must be interpolated onto it.
+    rho_pred = np.array(predictor.rhogrid)  # (n_pred_rho,)
+    rho_ds = ds_valid["rho"].values  # (n_ds_rho,)
     n_ts = ds_valid.sizes["time_idx"]
-    psi_tiled = jnp.tile(jnp.array(psi_pred), (n_ts, 1))
+    rho_tiled = jnp.tile(jnp.array(rho_pred), (n_ts, 1))
 
     inputs_batched = Inputs(
         Ip=jnp.array(ds_valid["Ip_MA"].values),
@@ -110,7 +110,7 @@ def evaluate_checkpoint(checkpoint_dir: Path | str, ds_valid: xr.Dataset) -> dic
         kappa=jnp.array(ds_valid["kappa"].values),
         delta_top=jnp.array(ds_valid["delta_top"].values),
         delta_bot=jnp.array(ds_valid["delta_bot"].values),
-        psi=psi_tiled,
+        rho=rho_tiled,
     )
 
     def _predict(inp):
@@ -123,18 +123,18 @@ def evaluate_checkpoint(checkpoint_dir: Path | str, ds_valid: xr.Dataset) -> dic
         logger.warning(f"Failed to run {Path(checkpoint_dir).name}:\n{traceback.format_exc()}")
         return None
 
-    ne_pred = np.array(ne_pred)  # (n_ts, n_pred_psi)
+    ne_pred = np.array(ne_pred)  # (n_ts, n_pred_rho)
     te_pred = np.array(te_pred)
 
-    # Interpolate profile targets from dataset psi grid onto predictor psigrid
-    ne_targ_raw = ds_valid["ne20_psi"].values  # (n_ts, n_ds_psi)
-    te_targ_raw = ds_valid["Te_keV_psi"].values
-    ne_targ = np.stack([np.interp(psi_pred, psi_ds, ne_targ_raw[i]) for i in range(n_ts)])
-    te_targ = np.stack([np.interp(psi_pred, psi_ds, te_targ_raw[i]) for i in range(n_ts)])
+    # Interpolate profile targets from dataset rho grid onto predictor rhogrid
+    ne_targ_raw = ds_valid["ne20_rho"].values  # (n_ts, n_ds_rho)
+    te_targ_raw = ds_valid["Te_keV_rho"].values
+    ne_targ = np.stack([np.interp(rho_pred, rho_ds, ne_targ_raw[i]) for i in range(n_ts)])
+    te_targ = np.stack([np.interp(rho_pred, rho_ds, te_targ_raw[i]) for i in range(n_ts)])
 
-    # Psi-integrated relative error per timeslice
-    ne_err_rel = np.trapezoid(np.abs(ne_pred - ne_targ) / (np.abs(ne_targ) + 0.1), psi_pred, axis=-1)
-    te_err_rel = np.trapezoid(np.abs(te_pred - te_targ) / (np.abs(te_targ) + 0.1), psi_pred, axis=-1)
+    # Rho-integrated relative error per timeslice
+    ne_err_rel = np.trapezoid(np.abs(ne_pred - ne_targ) / (np.abs(ne_targ) + 0.1), rho_pred, axis=-1)
+    te_err_rel = np.trapezoid(np.abs(te_pred - te_targ) / (np.abs(te_targ) + 0.1), rho_pred, axis=-1)
     err_rel_ts = 0.5 * (ne_err_rel + te_err_rel)
 
     return {

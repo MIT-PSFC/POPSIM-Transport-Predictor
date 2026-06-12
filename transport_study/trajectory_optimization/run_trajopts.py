@@ -154,7 +154,7 @@ def _compute_loss_metrics(
     delta_top = (R0 - rxtop) / a_minor
 
     n_shot_alt, n_time = R0.shape
-    psi_grid = np.array(profile_predictor.psigrid)
+    psi_grid = np.array(profile_predictor.rhogrid)
 
     Ip_flat = ds_aug["Ip_MA_prog"].values.reshape(-1)
     valid_mask = ~np.isnan(Ip_flat)
@@ -170,7 +170,7 @@ def _compute_loss_metrics(
         kappa=kappa.reshape(-1),
         delta_top=delta_top.reshape(-1),
         delta_bot=delta_bot.reshape(-1),
-        psi=psi_tiled,
+        rho=psi_tiled,
     )
 
     def _predict(inp):

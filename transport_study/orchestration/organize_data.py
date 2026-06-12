@@ -60,8 +60,8 @@ INPUT_POWER_SIGNALS = ["P_ECRH_MW", "P_NBI_MW", "P_ICRF_MW", "P_LH_MW"]
 
 REQUIRED_SIGNALS_PROFILE_TRANSFER = [
     # Target-related
-    "Te_keV_psi",
-    "ne20_psi",
+    "Te_keV_rho",
+    "ne20_rho",
     "fresh_profiles",  # Needed so we only train on time points where the profile data is fresh, avoiding forward-filled.
     # Inputs
     "Ip_MA",
@@ -149,16 +149,16 @@ def get_ds(
 
         # Only keep fresh profiles for training
         ds = ds.where(ds["fresh_profiles"] == 1, drop=True)
-        # TCV only has profile data out to rho=1 / psi_n=1
-        # Put all the datasets on a uniform 51 point psi_n grid for consistency
-        psi_n_grid = np.linspace(0, 1, 51)
-        ds = ds.interp(psi_n=psi_n_grid, kwargs={"fill_value": "extrapolate"})
+        # TCV only has profile data out to rho=1
+        # Put all the datasets on a uniform 51 point rho grid for consistency
+        rho_grid = np.linspace(0, 1, 51)
+        ds = ds.interp(rho=rho_grid, kwargs={"fill_value": "extrapolate"})
 
         # Compute means and shapes.
-        ds["Te_keV_line_avg"] = ds["Te_keV_psi"].integrate("psi_n")
-        ds["ne20_line_avg"] = ds["ne20_psi"].integrate("psi_n")
-        ds["Te_shape"] = ds["Te_keV_psi"] / ds["Te_keV_line_avg"]
-        ds["ne_shape"] = ds["ne20_psi"] / ds["ne20_line_avg"]
+        ds["Te_keV_line_avg"] = ds["Te_keV_rho"].integrate("rho")
+        ds["ne20_line_avg"] = ds["ne20_rho"].integrate("rho")
+        ds["Te_shape"] = ds["Te_keV_rho"] / ds["Te_keV_line_avg"]
+        ds["ne_shape"] = ds["ne20_rho"] / ds["ne20_line_avg"]
         return ds
 
     def _power_balance(ds: xr.Dataset) -> xr.Dataset:

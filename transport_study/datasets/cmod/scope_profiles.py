@@ -29,20 +29,20 @@ def scope_shot(thomson_dir: Path | str, profile_dir: Path | str, figure_dir: Pat
             nearest_idx = abs(time_coord - time).argmin(dim=time_dim)
             ds_profile_time = ds_profile.isel({time_dim: nearest_idx})
 
-        psi_gp = ds_profile_time["psi"].values
-        te_gp = ds_profile_time["Te_keV_psi"].values
-        ne_gp = ds_profile_time["ne20_psi"].values
+        rho_gp = ds_profile_time["rho"].values
+        te_gp = ds_profile_time["Te_keV_rho"].values
+        ne_gp = ds_profile_time["ne20_rho"].values
 
         ds_core = ds_thomson_time.where(ds_thomson_time["ts_array"] == "core", drop=True)
         ds_edge = ds_thomson_time.where(ds_thomson_time["ts_array"] == "edge", drop=True)
 
-        psi_n_ts_core = ds_core["ts_channel_psi_n"].values
+        rho_ts_core = ds_core["ts_channel_rho"].values
         te_ts_core = ds_core["ts_channel_te"].values
         te_ts_err_core = ds_core["ts_channel_te_error"].values
         ne_ts_core = ds_core["ts_channel_ne"].values / 1e20
         ne_ts_err_core = ds_core["ts_channel_ne_error"].values / 1e20
 
-        psi_n_ts_edge = ds_edge["ts_channel_psi_n"].values
+        rho_ts_edge = ds_edge["ts_channel_rho"].values
         te_ts_edge = ds_edge["ts_channel_te"].values
         te_ts_err_edge = ds_edge["ts_channel_te_error"].values
         ne_ts_edge = ds_edge["ts_channel_ne"].values / 1e20
@@ -50,9 +50,9 @@ def scope_shot(thomson_dir: Path | str, profile_dir: Path | str, figure_dir: Pat
 
         # Te profile, TS data and GP fit
         ax_te.plot()
-        ax_te.plot(psi_gp, te_gp, label="GP Mean", color="blue")
+        ax_te.plot(rho_gp, te_gp, label="GP Mean", color="blue")
         ax_te.errorbar(
-            psi_n_ts_core,
+            rho_ts_core,
             te_ts_core,
             yerr=te_ts_err_core,
             fmt="o",
@@ -60,7 +60,7 @@ def scope_shot(thomson_dir: Path | str, profile_dir: Path | str, figure_dir: Pat
             label="TS Core",
         )
         ax_te.errorbar(
-            psi_n_ts_edge,
+            rho_ts_edge,
             te_ts_edge,
             yerr=te_ts_err_edge,
             fmt="o",
@@ -68,7 +68,7 @@ def scope_shot(thomson_dir: Path | str, profile_dir: Path | str, figure_dir: Pat
             label="TS Edge",
         )
 
-        ax_te.set_xlabel("psi_n")
+        ax_te.set_xlabel("rho")
         ax_te.set_ylabel("Te [keV]")
         ax_te.set_title("Te Profile")
         ax_te.set_ylim(bottom=0)
@@ -77,9 +77,9 @@ def scope_shot(thomson_dir: Path | str, profile_dir: Path | str, figure_dir: Pat
 
         # ne profiles, TS data and GP fit
         ax_ne.plot()
-        ax_ne.plot(psi_gp, ne_gp, label="GP Mean", color="red")
+        ax_ne.plot(rho_gp, ne_gp, label="GP Mean", color="red")
         ax_ne.errorbar(
-            psi_n_ts_core,
+            rho_ts_core,
             ne_ts_core,
             yerr=ne_ts_err_core,
             fmt="o",
@@ -87,7 +87,7 @@ def scope_shot(thomson_dir: Path | str, profile_dir: Path | str, figure_dir: Pat
             label="TS Core",
         )
         ax_ne.errorbar(
-            psi_n_ts_edge,
+            rho_ts_edge,
             ne_ts_edge,
             yerr=ne_ts_err_edge,
             fmt="o",
@@ -95,7 +95,7 @@ def scope_shot(thomson_dir: Path | str, profile_dir: Path | str, figure_dir: Pat
             label="TS Edge",
         )
 
-        ax_ne.set_xlabel("psi_n")
+        ax_ne.set_xlabel("rho")
         ax_ne.set_ylabel("ne [10^20 m^-3]")
         ax_ne.set_title("ne Profile")
         ax_ne.set_ylim(bottom=0)

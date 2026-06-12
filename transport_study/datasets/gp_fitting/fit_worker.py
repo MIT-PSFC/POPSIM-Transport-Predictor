@@ -10,10 +10,10 @@ Batch file format (npz):
     Input:
         format_version : int
         shots          : (n_shots,) int64
-        x_star         : (n_psi,) target psi_n grid
+        x_star         : (n_x,) target radial grid (normalized minor radius rho)
         min_points     : int, minimum valid channels per slice to attempt a fit
         scale_per_slice: bool, normalize each slice by its max before fitting
-        {shot}:psi     : (n_t, n_ch) psi_n of each channel at each slice
+        {shot}:x       : (n_t, n_ch) radial location of each channel at each slice
         {shot}:te_y    : (n_t, n_ch) Te [keV], NaN where invalid
         {shot}:te_err  : (n_t, n_ch) Te error [keV]
         {shot}:ne_y    : (n_t, n_ch) ne [1e20 m^-3], NaN where invalid
@@ -21,7 +21,7 @@ Batch file format (npz):
     Output:
         format_version, shots, x_star as above
         {shot}:te_fit, {shot}:te_std, {shot}:ne_fit, {shot}:ne_std
-            each (n_t, n_psi), NaN where the slice was skipped or failed
+            each (n_t, n_x), NaN where the slice was skipped or failed
 """
 
 import argparse
@@ -33,7 +33,7 @@ from pathlib import Path
 import gptools
 import numpy as np
 
-FORMAT_VERSION = 1
+FORMAT_VERSION = 2
 VARIABLES = ("te", "ne")
 
 
@@ -126,11 +126,12 @@ def gp_profile(
 class ShotFitInput:
     """Raw Thomson channel data for one shot, ready for GP fitting.
 
-    All arrays are (n_t, n_ch). psi is shared between te and ne since both
-    come from the same channels. Invalid points are NaN.
+    All arrays are (n_t, n_ch). x is the radial coordinate of each channel
+    (normalized minor radius rho), shared between te and ne since both come
+    from the same channels. Invalid points are NaN.
     """
 
-    psi: np.ndarray
+    x: np.ndarray
     te_y: np.ndarray
     te_err: np.ndarray
     ne_y: np.ndarray
@@ -139,7 +140,7 @@ class ShotFitInput:
 
 @dataclass
 class ShotFitOutput:
-    """GP-fitted profiles for one shot, each (n_t, n_psi)."""
+    """GP-fitted profiles for one shot, each (n_t, n_x)."""
 
     te_fit: np.ndarray
     te_std: np.ndarray
@@ -163,7 +164,7 @@ def pack_fit_batch(
         "scale_per_slice": np.bool_(scale_per_slice),
     }
     for shot, si in shot_inputs.items():
-        arrays[f"{shot}:psi"] = np.asarray(si.psi, dtype=np.float32)
+        arrays[f"{shot}:x"] = np.asarray(si.x, dtype=np.float32)
         arrays[f"{shot}:te_y"] = np.asarray(si.te_y, dtype=np.float32)
         arrays[f"{shot}:te_err"] = np.asarray(si.te_err, dtype=np.float32)
         arrays[f"{shot}:ne_y"] = np.asarray(si.ne_y, dtype=np.float32)
@@ -185,7 +186,7 @@ def unpack_fit_batch(
         scale_per_slice = bool(data["scale_per_slice"])
         shot_inputs = {
             shot: ShotFitInput(
-                psi=data[f"{shot}:psi"],
+                x=data[f"{shot}:x"],
                 te_y=data[f"{shot}:te_y"],
                 te_err=data[f"{shot}:te_err"],
                 ne_y=data[f"{shot}:ne_y"],
@@ -253,23 +254,23 @@ def _atomic_savez(path: Path | str, arrays: dict) -> None:
 # ----------------------------------------------------------------------
 def _fit_slice(task: tuple) -> tuple[tuple[int, str, int], np.ndarray | None, np.ndarray | None]:
     """Fit a single (shot, variable, time slice). Returns (key, y, std) or (key, None, None)."""
-    key, psi, y, err, x_star, min_points, scale_per_slice, gp_num_proc, optimize, hyperparams = task
+    key, x, y, err, x_star, min_points, scale_per_slice, gp_num_proc, optimize, hyperparams = task
 
-    valid = np.isfinite(psi) & np.isfinite(y) & np.isfinite(err)
+    valid = np.isfinite(x) & np.isfinite(y) & np.isfinite(err)
     if int(valid.sum()) < min_points:
         return key, None, None
 
     scale = 1.0
     if scale_per_slice:
         # Normalize to O(1) before GP fit to prevent amplitude collapse
-        # when channels don't cover the full psi_n range.
+        # when channels don't cover the full radial range.
         with np.errstate(all="ignore"):
             scale = float(np.nanmax(y))
         if not np.isfinite(scale) or scale < 1e-6:
             return key, None, None
 
     y_star, std_y_star, _, _ = gp_profile(
-        data_X=np.asarray(psi, dtype=float),
+        data_X=np.asarray(x, dtype=float),
         data_y=np.asarray(y, dtype=float) / scale,
         err_y=np.asarray(err, dtype=float) / scale,
         X_star=x_star,
@@ -328,7 +329,7 @@ def fit_batch(
             tasks.extend(
                 (
                     (shot, var, i_time),
-                    si.psi[i_time, :],
+                    si.x[i_time, :],
                     y_all[i_time, :],
                     err_all[i_time, :],
                     x_star,
@@ -341,13 +342,13 @@ def fit_batch(
                 for i_time in range(n_t)
             )
 
-    n_psi = len(x_star)
+    n_x = len(x_star)
     outputs = {
         shot: ShotFitOutput(
-            te_fit=np.full((si.te_y.shape[0], n_psi), np.nan),
-            te_std=np.full((si.te_y.shape[0], n_psi), np.nan),
-            ne_fit=np.full((si.ne_y.shape[0], n_psi), np.nan),
-            ne_std=np.full((si.ne_y.shape[0], n_psi), np.nan),
+            te_fit=np.full((si.te_y.shape[0], n_x), np.nan),
+            te_std=np.full((si.te_y.shape[0], n_x), np.nan),
+            ne_fit=np.full((si.ne_y.shape[0], n_x), np.nan),
+            ne_std=np.full((si.ne_y.shape[0], n_x), np.nan),
         )
         for shot, si in shot_inputs.items()
     }

@@ -64,7 +64,7 @@ def fit_input(workflow):
 
 
 def test_shot_30284_has_fittable_thomson_slices(fit_input, workflow):
-    valid_per_slice = np.sum(np.isfinite(fit_input.psi) & np.isfinite(fit_input.te_y), axis=1)
+    valid_per_slice = np.sum(np.isfinite(fit_input.x) & np.isfinite(fit_input.te_y), axis=1)
     n_fittable = int(np.sum(valid_per_slice >= workflow.fit_min_points))
     assert n_fittable > 0, f"Shot {SHOT}: no Thomson slices with >= {workflow.fit_min_points} valid points"
 
@@ -76,16 +76,16 @@ def test_shot_30284_production_fit_on_one_slice(fit_input, workflow):
     core Te plausibility check below is meaningful; the first fittable slice
     can be very early in the shot where core Te is only tens of eV.
     """
-    valid_per_slice = np.sum(np.isfinite(fit_input.psi) & np.isfinite(fit_input.te_y), axis=1)
+    valid_per_slice = np.sum(np.isfinite(fit_input.x) & np.isfinite(fit_input.te_y), axis=1)
     i_time = int(np.argmax(valid_per_slice))
     assert valid_per_slice[i_time] >= workflow.fit_min_points
 
     scale = float(np.nanmax(fit_input.te_y[i_time, :]))
     y_star, _, _, _ = gp_profile(
-        data_X=fit_input.psi[i_time, :].astype(float),
+        data_X=fit_input.x[i_time, :].astype(float),
         data_y=fit_input.te_y[i_time, :].astype(float) / scale,
         err_y=fit_input.te_err[i_time, :].astype(float) / scale,
-        X_star=workflow.gp_fit_psi,
+        X_star=workflow.gp_fit_rho,
         optimize_hyperparams=True,
         num_proc=1,
     )
@@ -100,7 +100,7 @@ def test_shot_30284_workflow_produces_profiles(fit_input, workflow):
     """Full pipeline: staged data + batch fit -> raw netCDF with valid profiles."""
     outputs = fit_batch(
         {SHOT: fit_input},
-        x_star=workflow.gp_fit_psi,
+        x_star=workflow.gp_fit_rho,
         min_points=workflow.fit_min_points,
         scale_per_slice=workflow.fit_scale_per_slice,
         num_workers=1,
@@ -117,7 +117,7 @@ def test_shot_30284_workflow_produces_profiles(fit_input, workflow):
     assert raw_path.exists()
     ds = xr.load_dataset(raw_path)
 
-    for var in ("Te_keV_psi", "ne20_psi"):
+    for var in ("Te_keV_rho", "ne20_rho"):
         assert var in ds, f"{var} missing from raw dataset"
         values = ds[var].values
         finite = np.isfinite(values)
@@ -125,5 +125,5 @@ def test_shot_30284_workflow_produces_profiles(fit_input, workflow):
         assert (values[finite] >= 0).all(), f"{var} has negative values"
         assert values[finite].max() > 0, f"{var} is all zeros"
 
-    # Profiles must be on the configured psi_n grid
-    np.testing.assert_allclose(ds["psi_n"].values, workflow.gp_fit_psi, rtol=1e-6)
+    # Profiles must be on the configured rho grid
+    np.testing.assert_allclose(ds["rho"].values, workflow.gp_fit_rho, rtol=1e-6)

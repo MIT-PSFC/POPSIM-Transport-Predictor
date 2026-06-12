@@ -364,8 +364,8 @@ class TCVDataWorkflow(DataWorkflow):
         ds["Wtot_MJ"] = ds["Wtot"] * 1e-6
         ds["LH_transition_threshold_MW"] = ds["P_LH"] * 1e-6
 
-        ds["ne20_psi"] = ds["Ne_rho"] * 1e-20
-        ds["Te_keV_psi"] = ds["Te_rho"] * 1e-3
+        ds["ne20_rho"] = ds["Ne_rho"] * 1e-20
+        ds["Te_keV_rho"] = ds["Te_rho"] * 1e-3
 
         # If the signal is not present, create it as zeros up to shape of Ip_MA
         # But where Ip_MA is NaN, keep it NaN
@@ -385,8 +385,8 @@ class TCVDataWorkflow(DataWorkflow):
             "Ip_MA",
             "ne20_line_avg",
             # PROFILE PREDICTOR PREDICT-FIRST SIGNALS
-            "Te_keV_psi",
-            "ne20_psi",
+            "Te_keV_rho",
+            "ne20_rho",
             "B0",
             "betan",
             "ne20_edge",
@@ -446,12 +446,6 @@ class TCVDataWorkflow(DataWorkflow):
                         ds[density_var].dims,
                         corrected[np.newaxis, :],
                     )
-
-        # Rename "rho" to "psi_n"
-        # This is a little scuffed, but I just need *something* for historic data to compare against
-        # Really making me want to create a fully coupled equilibrium fitter to make this consistent
-        ds = ds.rename_dims({"rho": "psi_n"})
-        ds = ds.rename_vars({"rho": "psi_n"})
 
         return ds
 

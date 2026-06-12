@@ -60,8 +60,8 @@ def _valid_timesteps(shot_ds: xr.Dataset) -> np.ndarray:
     for var in INPUT_VARS:
         valid &= ~np.isnan(shot_ds[var].values)
     valid &= shot_ds["fresh_profiles"].values.astype(bool)
-    valid &= ~np.all(np.isnan(shot_ds["ne20_psi"].values), axis=-1)
-    valid &= ~np.all(np.isnan(shot_ds["Te_keV_psi"].values), axis=-1)
+    valid &= ~np.all(np.isnan(shot_ds["ne20_rho"].values), axis=-1)
+    valid &= ~np.all(np.isnan(shot_ds["Te_keV_rho"].values), axis=-1)
     return np.flatnonzero(valid)
 
 
@@ -89,7 +89,7 @@ def _build_module(timeslice: xr.Dataset, checkpoint: str | Path | None, transpor
     module = ProfilePredictorTorax(
         nn_width=model_cfg["nn_width"],
         nn_depth=model_cfg["nn_depth"],
-        psigrid=tuple(timeslice["psi_n"].values.tolist()),
+        rhogrid=tuple(timeslice["rho"].values.tolist()),
         torax_config=model_cfg["torax_config"],
         key=jax.random.PRNGKey(model_cfg["prng_seed"]),
         transport_model=transport_model,
@@ -123,7 +123,7 @@ def plot_torax_evolution(
     """Plot ne/Te profile evolution across the internal TORAX relaxation steps.
 
     Args:
-        dataset: Path to a NetCDF dataset with dims (shot, time_idx, psi_n).
+        dataset: Path to a NetCDF dataset with dims (shot, time_idx, rho).
         shot: Shot number to select.
         timestep: time_idx index of the timeslice to predict.
         transport_model: TORAX transport model: "constant", "cgm", or "gyrobohm".
@@ -151,9 +151,9 @@ def plot_torax_evolution(
     steps, coeffs = module.evolve(timeslice, prescribed=prescribed)
     logger.info(f"TORAX relaxation recorded {len(steps)} states (initial + {len(steps) - 1} steps)")
 
-    psi_n = timeslice["psi_n"].values
-    ne_targ = timeslice["ne20_psi"].values
-    te_targ = timeslice["Te_keV_psi"].values
+    rho = timeslice["rho"].values
+    ne_targ = timeslice["ne20_rho"].values
+    te_targ = timeslice["Te_keV_rho"].values
 
     fig, (ax_ne, ax_te) = plt.subplots(2, 1, figsize=(12, 10), sharex=True)
     fig.patch.set_facecolor(BACKGROUND_COLOR)
@@ -174,17 +174,17 @@ def plot_torax_evolution(
     colors = cm.viridis(np.linspace(0.25, 1.0, len(steps)))
     for i, step in enumerate(steps):
         label = f"t={step['t'] * 1e3:.0f} ms"
-        ax_ne.plot(step["psi_n"], step["ne20"], color=colors[i], linewidth=2, label=label)
-        ax_te.plot(step["psi_n"], step["te_keV"], color=colors[i], linewidth=2, label=label)
+        ax_ne.plot(step["rho"], step["ne20"], color=colors[i], linewidth=2, label=label)
+        ax_te.plot(step["rho"], step["te_keV"], color=colors[i], linewidth=2, label=label)
 
-    ax_ne.plot(psi_n, ne_targ, color="white", linewidth=3, linestyle="--", label="Measured target")
-    ax_te.plot(psi_n, te_targ, color="white", linewidth=3, linestyle="--", label="Measured target")
+    ax_ne.plot(rho, ne_targ, color="white", linewidth=3, linestyle="--", label="Measured target")
+    ax_te.plot(rho, te_targ, color="white", linewidth=3, linestyle="--", label="Measured target")
 
     ax_ne.set_ylabel(r"$n_e$ [$10^{20}$ m$^{-3}$]", fontsize=LABEL_FONTSIZE, color=TEXT_COLOR)
     ax_te.set_ylabel(r"$T_e$ [keV]", fontsize=LABEL_FONTSIZE, color=TEXT_COLOR)
-    # TORAX states are mapped from rho_norm to psi_n via each state's evolved psi profile,
-    # so both the TORAX steps and the measured targets are in psi_n.
-    ax_te.set_xlabel(r"$\psi_n$", fontsize=LABEL_FONTSIZE, color=TEXT_COLOR)
+    # TORAX evolves profiles on rho_norm, which for circular geometry equals the
+    # normalized minor radius, so both the TORAX steps and the measured targets are in rho.
+    ax_te.set_xlabel(r"$\rho$", fontsize=LABEL_FONTSIZE, color=TEXT_COLOR)
 
     for ax in (ax_ne, ax_te):
         _style_axis(ax)

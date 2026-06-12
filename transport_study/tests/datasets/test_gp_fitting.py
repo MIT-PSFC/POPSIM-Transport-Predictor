@@ -42,15 +42,15 @@ FIXED_HYPERPARAMS = np.array([2.0, 0.8, 0.3, 0.1, 0.95])
 def _synthetic_input(seed: int = 0, amplitude: float = 2.0) -> ShotFitInput:
     """Pedestal-like tanh profiles measured at N_CH channels for N_T slices."""
     rng = np.random.default_rng(seed)
-    psi = np.tile(np.linspace(0.0, 1.05, N_CH), (N_T, 1))
-    profile = amplitude * (1 - np.tanh((psi - 0.95) / 0.08)) / 2 + 0.05
+    rho = np.tile(np.linspace(0.0, 1.05, N_CH), (N_T, 1))
+    profile = amplitude * (1 - np.tanh((rho - 0.95) / 0.08)) / 2 + 0.05
     arrays = {}
     for var in ("te", "ne"):
         y = profile + rng.normal(0, 0.02, size=profile.shape)
         err = np.maximum(0.1 * np.abs(y), 0.05)
         arrays[f"{var}_y"] = y
         arrays[f"{var}_err"] = err
-    return ShotFitInput(psi=psi, **arrays)
+    return ShotFitInput(x=rho, **arrays)
 
 
 # ----------------------------------------------------------------------
@@ -69,7 +69,7 @@ def test_fit_batch_npz_roundtrip(tmp_path):
     np.testing.assert_allclose(x_star, X_STAR)
     assert set(loaded) == {1234, 5678}
     for shot, si in inputs.items():
-        for attr in ("psi", "te_y", "te_err", "ne_y", "ne_err"):
+        for attr in ("x", "te_y", "te_err", "ne_y", "ne_err"):
             np.testing.assert_allclose(getattr(loaded[shot], attr), getattr(si, attr), rtol=1e-6, atol=1e-6)
 
 
@@ -360,7 +360,7 @@ def test_worker_main_end_to_end(tmp_path):
     """
     si = _synthetic_input()
     si_single = ShotFitInput(
-        psi=si.psi[:1],
+        x=si.x[:1],
         te_y=si.te_y[:1],
         te_err=si.te_err[:1],
         ne_y=si.ne_y[:1],

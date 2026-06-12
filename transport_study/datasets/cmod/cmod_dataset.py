@@ -52,7 +52,7 @@ class CModDataWorkflow(DataWorkflow):
         shotlist_file: Path | str | None,
         data_assembly_dir: Path | str,
         max_num_shots: int | None = None,
-        gp_fit_psi: np.ndarray | None = None,
+        gp_fit_rho: np.ndarray | None = None,
         skip_profiles: bool = False,
         cluster_config=None,
         fit_workers: int = 1,
@@ -70,8 +70,9 @@ class CModDataWorkflow(DataWorkflow):
             Directory where data files are stored and final dataset will be saved
         max_num_shots : int | None
             Maximum number of shots to process (for testing). If None, process all shots.
-        gp_fit_psi : np.ndarray | None
-            Radial locations for GP profile fitting. If None, uses default from config.
+        gp_fit_rho : np.ndarray | None
+            Radial locations (normalized minor radius rho) for GP profile fitting.
+            If None, uses default from config.
         skip_profiles : bool
             If True, skip profile fitting and use zero arrays instead. Useful for testing.
         cluster_config : ClusterFitConfig | None
@@ -85,16 +86,16 @@ class CModDataWorkflow(DataWorkflow):
         # Use the C-Mod dataset config from datasets/cmod/config.toml
         self.config = config
 
-        # Set up GP fitting psi grid
-        if gp_fit_psi is not None:
-            self.gp_fit_psi = gp_fit_psi
+        # Set up GP fitting rho grid
+        if gp_fit_rho is not None:
+            self.gp_fit_rho = gp_fit_rho
         else:
             # Use config values
             prof_config = self.config["profile_fitting"]
-            self.gp_fit_psi = np.linspace(
-                prof_config["psi_min"],
-                prof_config["psi_max"],
-                prof_config["num_psi_points"],
+            self.gp_fit_rho = np.linspace(
+                prof_config["rho_min"],
+                prof_config["rho_max"],
+                prof_config["num_rho_points"],
             )
 
         # Call parent init (which will call _get_shotlist_from_source if needed)
@@ -185,10 +186,12 @@ class CModDataWorkflow(DataWorkflow):
 
         This assumes the input data is raw Thomson scattering data from
         _get_thomson_dataset() where Te is in keV and ne is in m^-3. The fit
-        input arrays are Te in keV and ne in 1e20 m^-3.
+        input arrays are Te in keV and ne in 1e20 m^-3. Channel locations are
+        the normalized minor radius (rho) computed by disruption_py from the
+        channel midplane radius relative to the magnetic axis and LCFS.
         """
         ds_shot = ds_thomson.squeeze(dim="shot", drop=True)
-        data_x = ds_shot["ts_channel_psi_n"].values.T  # shape (time, channel)
+        data_x = ds_shot["ts_channel_rho"].values.T  # shape (time, channel)
 
         arrays = {}
         for variable in ["te", "ne"]:
@@ -209,20 +212,20 @@ class CModDataWorkflow(DataWorkflow):
             arrays[f"{variable}_y"] = data_y
             arrays[f"{variable}_err"] = err_y
 
-        return ShotFitInput(psi=data_x, **arrays)
+        return ShotFitInput(x=data_x, **arrays)
 
     def _profiles_dataset_from_fit(self, shot: int, times: np.ndarray, fit_output: ShotFitOutput) -> xr.Dataset:
         """Build the GP-fitted profile dataset (with shot dimension) from fit results."""
         ds_profiles = xr.Dataset(
             data_vars={
-                "Te_keV_psi": (("time", "psi"), fit_output.te_fit),
-                "Te_keV_psi_error": (("time", "psi"), fit_output.te_std),
-                "ne20_psi": (("time", "psi"), fit_output.ne_fit),
-                "ne20_psi_error": (("time", "psi"), fit_output.ne_std),
+                "Te_keV_rho": (("time", "rho"), fit_output.te_fit),
+                "Te_keV_rho_error": (("time", "rho"), fit_output.te_std),
+                "ne20_rho": (("time", "rho"), fit_output.ne_fit),
+                "ne20_rho_error": (("time", "rho"), fit_output.ne_std),
             },
             coords={
                 "time": times,
-                "psi": self.gp_fit_psi,
+                "rho": self.gp_fit_rho,
             },
         )
         return ds_profiles.expand_dims({"shot": [shot]})
@@ -364,12 +367,12 @@ class CModDataWorkflow(DataWorkflow):
                 time = times[i_time]
                 ds_ts_t = ds_thomson.isel(time=i_time)
                 ds_prof_t = ds_profiles.sel(time=time, method="nearest")
-                psi_n_ch = ds_ts_t["ts_channel_psi_n"].values
+                rho_ch = ds_ts_t["ts_channel_rho"].values
 
                 fig, axes = plt.subplots(1, 2, figsize=(12, 5))
                 for ax, variable, gp_var, scale, label in [
-                    (axes[0], "te", "Te_keV_psi", 1.0, "Te [keV]"),
-                    (axes[1], "ne", "ne20_psi", 1e-20, "ne [1e20 m^-3]"),
+                    (axes[0], "te", "Te_keV_rho", 1.0, "Te [keV]"),
+                    (axes[1], "ne", "ne20_rho", 1e-20, "ne [1e20 m^-3]"),
                 ]:
                     data_y = ds_ts_t[f"ts_channel_{variable}"].values * scale
                     err_y = ds_ts_t[f"ts_channel_{variable}_error"].values * scale
@@ -378,10 +381,10 @@ class CModDataWorkflow(DataWorkflow):
                         (is_core, "tab:blue", "TS core"),
                         (~is_core, "tab:orange", "TS edge"),
                     ]:
-                        valid = mask & np.isfinite(psi_n_ch) & np.isfinite(data_y) & np.isfinite(err_y)
+                        valid = mask & np.isfinite(rho_ch) & np.isfinite(data_y) & np.isfinite(err_y)
                         if valid.any():
                             ax.errorbar(
-                                psi_n_ch[valid],
+                                rho_ch[valid],
                                 data_y[valid],
                                 yerr=err_y[valid],
                                 fmt="o",
@@ -395,9 +398,9 @@ class CModDataWorkflow(DataWorkflow):
                     gp_err = ds_prof_t[f"{gp_var}_error"].values
                     gp_valid = np.isfinite(gp_y)
                     if gp_valid.any():
-                        ax.plot(self.gp_fit_psi[gp_valid], gp_y[gp_valid], color="black", label="GP fit")
+                        ax.plot(self.gp_fit_rho[gp_valid], gp_y[gp_valid], color="black", label="GP fit")
                         ax.fill_between(
-                            self.gp_fit_psi[gp_valid],
+                            self.gp_fit_rho[gp_valid],
                             (gp_y - gp_err)[gp_valid],
                             (gp_y + gp_err)[gp_valid],
                             color="black",
@@ -405,7 +408,7 @@ class CModDataWorkflow(DataWorkflow):
                             label="GP +-1 sigma",
                         )
 
-                    ax.set_xlabel("psi_n")
+                    ax.set_xlabel("rho")
                     ax.set_ylabel(label)
                     ax.set_ylim(bottom=0)
                     ax.set_title(f"shot {shot}  t={time:.3f} s")
@@ -481,7 +484,7 @@ class CModDataWorkflow(DataWorkflow):
                     continue
                 outputs = fit_batch(
                     {shot: fit_input},
-                    x_star=self.gp_fit_psi,
+                    x_star=self.gp_fit_rho,
                     min_points=self.fit_min_points,
                     scale_per_slice=self.fit_scale_per_slice,
                     num_workers=self.fit_workers,
@@ -507,26 +510,26 @@ class CModDataWorkflow(DataWorkflow):
             # Create dummy profile dataset with zeros
             ds_profiles = xr.Dataset(
                 data_vars={
-                    "Te_keV_psi": (
-                        ("time", "psi"),
-                        np.zeros((len(timebase), len(self.gp_fit_psi))),
+                    "Te_keV_rho": (
+                        ("time", "rho"),
+                        np.zeros((len(timebase), len(self.gp_fit_rho))),
                     ),
-                    "Te_keV_psi_error": (
-                        ("time", "psi"),
-                        np.zeros((len(timebase), len(self.gp_fit_psi))),
+                    "Te_keV_rho_error": (
+                        ("time", "rho"),
+                        np.zeros((len(timebase), len(self.gp_fit_rho))),
                     ),
-                    "ne20_psi": (
-                        ("time", "psi"),
-                        np.zeros((len(timebase), len(self.gp_fit_psi))),
+                    "ne20_rho": (
+                        ("time", "rho"),
+                        np.zeros((len(timebase), len(self.gp_fit_rho))),
                     ),
-                    "ne20_psi_error": (
-                        ("time", "psi"),
-                        np.zeros((len(timebase), len(self.gp_fit_psi))),
+                    "ne20_rho_error": (
+                        ("time", "rho"),
+                        np.zeros((len(timebase), len(self.gp_fit_rho))),
                     ),
                 },
                 coords={
                     "time": timebase,
-                    "psi": self.gp_fit_psi,
+                    "rho": self.gp_fit_rho,
                     "shot": shot,
                 },
             )
@@ -577,12 +580,14 @@ class CModDataWorkflow(DataWorkflow):
         ds["P_ECRH_MW"] = xr.zeros_like(ds["Ip_MA"])
 
         # PROFILE PREDICTOR TRAINING
-        # Te_kev_psi
-        # ne20_psi
+        # Te_keV_rho
+        # ne20_rho
         # Ip_MA
         # B0
         ds["betan"] = ds["beta_n"]
-        ds["ne20_edge"] = ds["ne20_psi"].sel(psi=0.9)  # C-Mod doesn't have edge interferometry, get the density from psi=0.9
+        ds["ne20_edge"] = ds["ne20_rho"].sel(
+            rho=0.9, method="nearest"
+        )  # C-Mod doesn't have edge interferometry, get the density from rho=0.9
         # R0
         # kappa
         # a_minor
@@ -603,8 +608,8 @@ class CModDataWorkflow(DataWorkflow):
             "P_NBI_MW",
             "P_ECRH_MW",
             # PROFILE PREDICTOR TRAINING
-            "Te_keV_psi",
-            "ne20_psi",
+            "Te_keV_rho",
+            "ne20_rho",
             "Ip_MA",
             "B0",
             "betan",
@@ -622,7 +627,7 @@ class CModDataWorkflow(DataWorkflow):
         ds = ds[list(kept_vars)]
 
         # If any *important* signal is all NaN, return None to skip this shot
-        for signal in ["Te_keV_psi", "ne20_psi", "Ip_MA"]:
+        for signal in ["Te_keV_rho", "ne20_rho", "Ip_MA"]:
             if ds[signal].isnull().all():
                 logger.warning(f"Signal {signal} is all NaN for shot {ds['shot'].item()}, skipping shot.")
                 return None
@@ -651,12 +656,12 @@ class CModDataWorkflow(DataWorkflow):
             Processed dataset ready for general workflow
         """
 
-        # Cull obviously bad fits, such as when the point at psi = 0 is super low (1160503009 0.83)
-        # Or when any profile value at psi < 1.0 is negative
-        negative_profile_mask = (ds["ne20_psi"].where(ds["psi"] < 1.0) < 0).any(dim="psi") | (
-            ds["Te_keV_psi"].where(ds["psi"] < 1.0) < 0
-        ).any(dim="psi")
-        low_value_mask = (ds["Te_keV_psi"].sel(psi=0) < 1.0) | (ds["ne20_psi"].sel(psi=0) < 0.3)
+        # Cull obviously bad fits, such as when the point at rho = 0 is super low (1160503009 0.83)
+        # Or when any profile value at rho < 1.0 is negative
+        negative_profile_mask = (ds["ne20_rho"].where(ds["rho"] < 1.0) < 0).any(dim="rho") | (
+            ds["Te_keV_rho"].where(ds["rho"] < 1.0) < 0
+        ).any(dim="rho")
+        low_value_mask = (ds["Te_keV_rho"].sel(rho=0) < 1.0) | (ds["ne20_rho"].sel(rho=0) < 0.3)
         valid_profile_mask = ~(negative_profile_mask | low_value_mask)
         if valid_profile_mask.sum() == 0:
             logger.warning(f"All profiles are invalid for shot {ds['shot'].item()}")
@@ -664,12 +669,8 @@ class CModDataWorkflow(DataWorkflow):
             logger.debug(
                 f"Culled {(~valid_profile_mask).sum().item() / (valid_profile_mask.sum().item()) * 100:.2f}% invalid profiles for shot {ds['shot'].item()}"
             )
-        ds["ne20_psi"] = ds["ne20_psi"].where(valid_profile_mask)
-        ds["Te_keV_psi"] = ds["Te_keV_psi"].where(valid_profile_mask)
-
-        # Rename 'psi' dimension to 'psi_n'
-        ds = ds.rename_dims({"psi": "psi_n"})
-        ds = ds.rename_vars({"psi": "psi_n"})
+        ds["ne20_rho"] = ds["ne20_rho"].where(valid_profile_mask)
+        ds["Te_keV_rho"] = ds["Te_keV_rho"].where(valid_profile_mask)
 
         return ds
 
@@ -683,7 +684,7 @@ class CModDataWorkflow(DataWorkflow):
         # Profiles can become all NaN after the raw-file stage, e.g. when
         # device_specific_processing culls every individual profile or when
         # filtering cuts the shot down to a window with no valid profiles
-        for signal in ["Te_keV_psi", "ne20_psi"]:
+        for signal in ["Te_keV_rho", "ne20_rho"]:
             if ds[signal].isnull().all():
                 logger.warning(f"Culling shot {shot_id}: {signal} is all NaN after processing and filtering")
                 return True

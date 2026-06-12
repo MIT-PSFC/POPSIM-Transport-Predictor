@@ -4,6 +4,8 @@ rho is the normalised minor radius computed from the midplane equilibrium (see
 _map_thomson_midplane), not sqrt(psi_n). Near the magnetic axis the core
 occupies a narrow psi_n range, so a GP fit in psi_n can make the core look
 more peaked than it should; fitting against rho spreads the core back out.
+The production workflow now fits in rho; this test keeps the side-by-side
+comparison against fits done in psi_n.
 
 For MAST shot 30284 the requested reference timesteps are fit both ways using
 the same fixed-hyperparameter method as test_mast_dataset_integration.py, and
@@ -76,7 +78,7 @@ def test_psin_vs_rho_fit_comparison(workflow):
 
     ds_staging = xr.load_dataset(workflow._staging_path(SHOT))
     ts_time = ds_staging["ts_time"].values
-    rho_all = ds_staging["ts_rho"].values
+    psi_n_all = ds_staging["ts_psi_n"].values
 
     # Select the requested measurement times
     indices = np.unique([int(np.argmin(np.abs(ts_time - t))) for t in REQUESTED_TIMES])
@@ -85,15 +87,17 @@ def test_psin_vs_rho_fit_comparison(workflow):
         f"Requested times {REQUESTED_TIMES} not found near TS times {matched}"
     )
 
-    sub = {attr: np.ascontiguousarray(getattr(fit_input, attr)[indices, :]) for attr in ("psi", "te_y", "te_err", "ne_y", "ne_err")}
-    rho_sub = np.ascontiguousarray(rho_all[indices, :])
+    # fit_input.x is rho (the production coordinate); psi_n comes from staging
+    sub = {attr: np.ascontiguousarray(getattr(fit_input, attr)[indices, :]) for attr in ("x", "te_y", "te_err", "ne_y", "ne_err")}
+    psin_sub = np.ascontiguousarray(psi_n_all[indices, :])
+    rho_sub = sub["x"]
     assert np.isfinite(rho_sub).any(), "rho mapping produced no valid points"
 
-    psin_input = ShotFitInput(**sub)
-    rho_input = ShotFitInput(**{**sub, "psi": rho_sub})
+    rho_input = ShotFitInput(**sub)
+    psin_input = ShotFitInput(**{**sub, "x": psin_sub})
 
-    # Same output grid in both coordinates; for the rho fit the grid values are rho locations
-    x_star = workflow.gp_fit_psi
+    # Same output grid in both coordinates; for the psi_n fit the grid values are psi_n locations
+    x_star = workflow.gp_fit_rho
 
     fit_kwargs = dict(
         x_star=x_star,
@@ -121,7 +125,7 @@ def test_psin_vs_rho_fit_comparison(workflow):
                 err = sub[f"{var}_err"][i_sub, :]
                 for i_row, (coord, x_ch, fit) in enumerate(
                     [
-                        ("psi_n", sub["psi"][i_sub, :], getattr(out_psin, f"{var}_fit")[i_sub, :]),
+                        ("psi_n", psin_sub[i_sub, :], getattr(out_psin, f"{var}_fit")[i_sub, :]),
                         ("rho", rho_sub[i_sub, :], getattr(out_rho, f"{var}_fit")[i_sub, :]),
                     ]
                 ):

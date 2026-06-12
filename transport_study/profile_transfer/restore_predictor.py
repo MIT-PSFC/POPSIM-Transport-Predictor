@@ -62,7 +62,7 @@ def restore_profile_predictor(
     if isinstance(profile_predictor_config, TrainConfig):
         profile_predictor_config = profile_predictor_config.model_dump()
 
-    # Don't need the full dataloader, only want psi grid
+    # Don't need the full dataloader, only want rho grid
     profile_predictor_config["dataloader_config"]["debug"] = True
 
     # TODO(ZanderKeith) ensure this actually completely works for all types of profile predictors

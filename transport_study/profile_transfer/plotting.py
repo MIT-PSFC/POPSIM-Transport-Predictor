@@ -20,15 +20,15 @@ TICK_FONTSIZE = 16
 LEGEND_FONTSIZE = 13
 
 VAR_LABELS = {
-    "Te_keV_psi": r"$T_e$ [keV]",
-    "ne20_psi": r"$n_e$ [$10^{20}$ m$^{-3}$]",
+    "Te_keV_rho": r"$T_e$ [keV]",
+    "ne20_rho": r"$n_e$ [$10^{20}$ m$^{-3}$]",
 }
 
 ds = xr.open_dataset(result_data)
 ds = ds.sortby("shot")
 
-psi_vals = [0, 0.2, 0.4, 0.6, 0.8, 1.0]
-colors = cm.hsv(np.linspace(0.0, 0.85, len(psi_vals)))
+rho_vals = [0, 0.2, 0.4, 0.6, 0.8, 1.0]
+colors = cm.hsv(np.linspace(0.0, 0.85, len(rho_vals)))
 
 for shot in ds.shot.values:
     ds_shot = ds.sel(shot=shot)
@@ -39,22 +39,22 @@ for shot in ds.shot.values:
     fig, axes = plt.subplots(2, 1, figsize=(10, 12))
     fig.patch.set_facecolor(BACKGROUND_COLOR)
 
-    for i, var in enumerate(["Te_keV_psi", "ne20_psi"]):
+    for i, var in enumerate(["Te_keV_rho", "ne20_rho"]):
         ax = axes[i]
         ax.set_facecolor(FACE_COLOR)
 
         pred = ds_shot[f"{var}_pred"]
         targ = ds_shot[f"{var}_targ"]
 
-        for j, psi in enumerate(psi_vals):
+        for j, rho in enumerate(rho_vals):
             color = colors[j]
-            pred_psi = pred.sel(psi_n=psi, method="nearest").values[valid][sort_order]
-            targ_psi = targ.sel(psi_n=psi, method="nearest").values[valid][sort_order]
+            pred_rho = pred.sel(rho=rho, method="nearest").values[valid][sort_order]
+            targ_rho = targ.sel(rho=rho, method="nearest").values[valid][sort_order]
             t_sorted = time[valid][sort_order]
-            ax.plot(t_sorted, pred_psi, color=color, linewidth=1.5, label=f"psi={psi:.1f}")
+            ax.plot(t_sorted, pred_rho, color=color, linewidth=1.5, label=f"rho={rho:.1f}")
             ax.plot(
                 t_sorted,
-                targ_psi,
+                targ_rho,
                 color=color,
                 linewidth=1.5,
                 linestyle="dashed",

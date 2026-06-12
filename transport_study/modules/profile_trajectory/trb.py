@@ -118,7 +118,7 @@ class ProfileTrajectoryOptimizerTRB(TrainRunBuilder):
         module = ProfileTrajectoryOptimizer.init(
             config=config,
             profile_predictor=profile_predictor,
-            psigrid=profile_predictor.psigrid,
+            rhogrid=profile_predictor.rhogrid,
             trajectory=trajectory,
         )
 

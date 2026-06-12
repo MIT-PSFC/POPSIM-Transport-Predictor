@@ -168,7 +168,7 @@ def run_preshot_prediction(  # noqa: PLR0915
 
     # Build batched Inputs for vmap
     n_shot_alt, n_time = R0_prog.shape
-    psi_grid = np.array(profile_predictor.psigrid)
+    psi_grid = np.array(profile_predictor.rhogrid)
     n_psi = len(psi_grid)
 
     Ip_flat = ds_aug["Ip_MA_prog"].values.reshape(-1)
@@ -186,7 +186,7 @@ def run_preshot_prediction(  # noqa: PLR0915
         kappa=kappa.reshape(-1),
         delta_top=delta_top.reshape(-1),
         delta_bot=delta_bot.reshape(-1),
-        psi=psi_tiled,
+        rho=psi_tiled,
     )
 
     # Step 4: Run profile predictor on all samples via vmap

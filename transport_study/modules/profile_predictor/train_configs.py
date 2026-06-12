@@ -26,7 +26,7 @@ PROFILE_PREDICTOR_SHAPE_INIT_CONFIG = {
             "delta_top",
             "delta_bot",
         ],
-        "target_vars": ["ne20_psi", "Te_keV_psi"],
+        "target_vars": ["ne20_rho", "Te_keV_rho"],
         "extra_vars": ["Te_shape", "ne_shape"],
     },
     "model_init_config": {
@@ -112,7 +112,7 @@ _PROFILE_PREDICTOR_TORAX_CONFIG_BASE: dict[str, Any] = {
             "delta_top",
             "delta_bot",
         ],
-        "target_vars": ["ne20_psi", "Te_keV_psi"],
+        "target_vars": ["ne20_rho", "Te_keV_rho"],
     },
     "model_init_config": {
         "model_type": "torax-cgm",  # Overridden per transport model by the builder below
@@ -234,7 +234,7 @@ PROFILE_PREDICTOR_DIRECT_POINTS_CONFIG = {
             "delta_top",
             "delta_bot",
         ],
-        "target_vars": ["ne20_psi", "Te_keV_psi"],
+        "target_vars": ["ne20_rho", "Te_keV_rho"],
     },
     "model_init_config": {
         "model_type": "direct_points",

@@ -63,7 +63,7 @@ class ProfileTrajectoryOptimizer(TimeDepModule):
     config: "Config"
 
     profile_predictor: eqx.Module
-    psigrid: tuple = eqx.field(static=True)
+    rhogrid: tuple = eqx.field(static=True)
 
     # These are the things that we can control over time
     # Note that the PCS needs to be in the proper control mode for these to actually line up
@@ -104,7 +104,7 @@ class ProfileTrajectoryOptimizer(TimeDepModule):
     class Output:
         # Things that are necessary for computing the loss function
         profile_predictor_output: ProfilePredictorOutputs
-        psi: Array
+        rho: Array
         q_star: float  # Edge safety factor proxy for q_min [~]
         fGW: float  # Greenwald density fraction [~]
         R0: float  # Major radius [m], needed for effective collisionality
@@ -114,12 +114,12 @@ class ProfileTrajectoryOptimizer(TimeDepModule):
         self,
         config: Config,
         profile_predictor: eqx.Module,
-        psigrid: tuple,
+        rhogrid: tuple,
         trajectory: dict[str, Array] | None = None,
     ):
         self.config = config
         self.profile_predictor = profile_predictor
-        self.psigrid = psigrid
+        self.rhogrid = rhogrid
 
         num_times = len(config.traj_times)
 
@@ -223,7 +223,7 @@ class ProfileTrajectoryOptimizer(TimeDepModule):
             kappa=pcs_inputs.kappa,
             delta_top=pcs_inputs.delta_top,
             delta_bot=pcs_inputs.delta_bot,
-            psi=jnp.array(self.psigrid),
+            rho=jnp.array(self.rhogrid),
         )
 
         # Get the output from the profile predictor
@@ -249,7 +249,7 @@ class ProfileTrajectoryOptimizer(TimeDepModule):
         # Create the output for this module
         output = ProfileTrajectoryOptimizer.Output(
             profile_predictor_output=profile_predictor_output,
-            psi=self.psigrid,
+            rho=self.rhogrid,
             q_star=profile_predictor_input.q_star,
             fGW=profile_predictor_input.fGW,
             R0=targ_dict["R0"],
@@ -266,16 +266,16 @@ class ProfileTrajectoryOptimizer(TimeDepModule):
         cls,
         config: Config,
         profile_predictor: ProfilePredictor,
-        psigrid: Array,
+        rhogrid: Array,
         trajectory: dict[str, Array] | None = None,
     ):
-        if not isinstance(psigrid, tuple):
-            psigrid = tuple(psigrid.tolist())
+        if not isinstance(rhogrid, tuple):
+            rhogrid = tuple(rhogrid.tolist())
 
         return cls(
             config=config,
             profile_predictor=profile_predictor,
-            psigrid=psigrid,
+            rhogrid=rhogrid,
             trajectory=trajectory,
         )
 

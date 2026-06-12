@@ -228,7 +228,7 @@ def _run_loop_jit_with_geo(
 
 
 class ProfilePredictorTorax(TimeIndepModule):
-    psigrid: tuple = eqx.field(static=True)
+    rhogrid: tuple = eqx.field(static=True)
     # Which TORAX transport model the transport network parameterizes:
     # "constant", "cgm", or "gyrobohm"
     transport_model: str = eqx.field(static=True)
@@ -249,7 +249,7 @@ class ProfilePredictorTorax(TimeIndepModule):
         self,
         nn_width: int,
         nn_depth: int,
-        psigrid: tuple,
+        rhogrid: tuple,
         torax_config: ToraxConfig | dict,
         key: jax.random.PRNGKey,
         transport_model: str = "cgm",
@@ -297,7 +297,7 @@ class ProfilePredictorTorax(TimeIndepModule):
         self.step_fn = torax_experimental.make_step_fn(torax_config)
         # Coerce to tuple: arrays in static fields break pytree metadata
         # equality (ambiguous truth value) when two module instances coexist
-        self.psigrid = tuple(np.asarray(psigrid).tolist())
+        self.rhogrid = tuple(np.asarray(rhogrid).tolist())
 
         static_geo = self.step_fn.geometry_provider(0.0)
         self._face_centers = tuple(static_geo.torax_mesh.face_centers.tolist())
@@ -322,7 +322,7 @@ class ProfilePredictorTorax(TimeIndepModule):
                 kappa=inputs["kappa"].data,
                 delta_top=inputs["delta_top"].data,
                 delta_bot=inputs["delta_bot"].data,
-                psi=jnp.array(self.psigrid),
+                rho=jnp.array(self.rhogrid),
             )
         return inputs
 
@@ -518,24 +518,12 @@ class ProfilePredictorTorax(TimeIndepModule):
     def rho_norm_grid(self) -> np.ndarray:
         """Cell-center grid the TORAX core profiles live on.
 
-        This is rho_norm, the normalized toroidal flux coordinate, NOT psi_n
-        (normalized poloidal flux). Use _psi_n_cells to map a TORAX state's
-        cell grid to psi_n.
+        This is rho_norm, the normalized toroidal flux radius. For the
+        circular geometry used here, minor radius = a * rho_norm, so rho_norm
+        is exactly the normalized minor radius rho the datasets use.
         """
         face_centers = np.array(self._face_centers)
         return (face_centers[:-1] + face_centers[1:]) / 2.0
-
-    @staticmethod
-    def _psi_n_cells(core_profiles) -> jax.Array:
-        """Normalized poloidal flux psi_n on the cell grid, from the evolved psi profile.
-
-        psi_n = (psi - psi_axis) / (psi_lcfs - psi_axis), monotonic 0 -> 1 from
-        axis to LCFS regardless of the sign of the psi gradient.
-        """
-        psi_face = core_profiles.psi.face_value()
-        psi_axis = psi_face[0]
-        psi_lcfs = psi_face[-1]
-        return (core_profiles.psi.value - psi_axis) / (psi_lcfs - psi_axis)
 
     def __call__(self, inputs: Inputs | xr.Dataset, debug: bool = False) -> Outputs:
         inputs = self._coerce_inputs(inputs)
@@ -574,27 +562,27 @@ class ProfilePredictorTorax(TimeIndepModule):
         )
 
         # n_e is in m^-3 inside TORAX; convert to 1e20 m^-3 to match the
-        # ne20_psi targets (and the other profile predictors)
+        # ne20_rho targets (and the other profile predictors)
         ne = state.core_profiles.n_e.value / 1e20
         te = state.core_profiles.T_e.value
 
-        # Interpolate onto psigrid in the true psi_n coordinate: TORAX evolves
-        # profiles on rho_norm so map the cell grid to
-        # normalized poloidal flux using the evolved psi profile.
-        psi_n_cells = self._psi_n_cells(state.core_profiles)
-        ne_interp = jnp.interp(inputs.psi, psi_n_cells, ne)
-        te_interp = jnp.interp(inputs.psi, psi_n_cells, te)
+        # Interpolate onto rhogrid: TORAX evolves profiles on rho_norm, which
+        # for the circular geometry used here equals the normalized minor
+        # radius rho, so no flux-coordinate mapping is needed.
+        rho_cells = jnp.asarray(self.rho_norm_grid)
+        ne_interp = jnp.interp(inputs.rho, rho_cells, ne)
+        te_interp = jnp.interp(inputs.rho, rho_cells, te)
 
         return Outputs(
             ne=xr.DataArray(
                 data=ne_interp,
-                dims=("psi_n",),
-                coords={"psi_n": list(self.psigrid)},
+                dims=("rho",),
+                coords={"rho": list(self.rhogrid)},
             ),
             te=xr.DataArray(
                 data=te_interp,
-                dims=("psi_n",),
-                coords={"psi_n": list(self.psigrid)},
+                dims=("rho",),
+                coords={"rho": list(self.rhogrid)},
             ),
         )
 
@@ -623,8 +611,8 @@ class ProfilePredictorTorax(TimeIndepModule):
         Returns:
             (steps, coeffs):
                 steps: list of dicts, one per TORAX state including the initial one, with keys
-                    t [s], ne20 [1e20 m^-3], te_keV [keV] and psi_n (the cell grid mapped to
-                    normalized poloidal flux for that state).
+                    t [s], ne20 [1e20 m^-3], te_keV [keV] and rho (the static rho_norm cell
+                    grid, equal to the normalized minor radius for circular geometry).
                 coeffs: the transport/source coefficients actually used, as floats.
         """
         inputs = self._coerce_inputs(inputs)
@@ -652,7 +640,7 @@ class ProfilePredictorTorax(TimeIndepModule):
                 "t": float(s.t),
                 "ne20": np.asarray(cp.n_e.value) / 1e20,
                 "te_keV": np.asarray(cp.T_e.value),
-                "psi_n": np.asarray(self._psi_n_cells(cp)),
+                "rho": self.rho_norm_grid,
             }
 
         steps = [record(state)]
@@ -673,18 +661,18 @@ class ProfilePredictorTorax(TimeIndepModule):
     @classmethod
     def init(
         cls,
-        psigrid: Array,
+        rhogrid: Array,
         torax_config: ToraxConfig,
         nn_width: int,
         nn_depth: int,
         prng_seed: int,
         transport_model: str = "cgm",
     ):
-        psigrid_tuple = tuple(psigrid.tolist())
+        rhogrid_tuple = tuple(rhogrid.tolist())
         return cls(
             nn_width=nn_width,
             nn_depth=nn_depth,
-            psigrid=psigrid_tuple,
+            rhogrid=rhogrid_tuple,
             torax_config=torax_config,
             key=jax.random.PRNGKey(prng_seed),
             transport_model=transport_model,
