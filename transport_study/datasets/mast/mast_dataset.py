@@ -3,6 +3,9 @@
 import gc
 from pathlib import Path
 
+# disruption_py physics methods log at their custom VERBOSE level; importing
+# log_settings registers it (and logger.verbose) on the loguru logger class
+import disruption_py.settings.log_settings  # noqa: F401
 import netCDF4  # noqa: F401
 import numpy as np
 import xarray as xr
@@ -17,7 +20,11 @@ from scipy.interpolate import interp1d
 
 from transport_study import EPISODE_DIM, PACKAGE_ROOT, TIME_COORD, TIME_DIM
 from transport_study.datasets import make_uniform_1khz_timebase
-from transport_study.datasets.cmod.gp_fit import gp_profile
+from transport_study.datasets.gp_fitting.fit_worker import (
+    ShotFitInput,
+    ShotFitOutput,
+    fit_batch,
+)
 from transport_study.datasets.workflow import DataWorkflow
 
 DEFAULT_SHOTLIST_FILE = Path(PACKAGE_ROOT) / "datasets" / "mast" / "mast_shotlist"
@@ -25,14 +32,6 @@ DEFAULT_SHOTLIST_FILE = Path(PACKAGE_ROOT) / "datasets" / "mast" / "mast_shotlis
 config = Dynaconf(settings_files=[Path(PACKAGE_ROOT) / "datasets/mast/config.toml"])
 
 GC_INTERVAL = 40  # Every 40 shots force garbage collection
-
-
-def _ensure_verbose_level():
-    """Register loguru VERBOSE level (used by disruption_py physics_method timing)."""
-    try:
-        logger.level("VERBOSE")
-    except ValueError:
-        logger.level("VERBOSE", no=5, color="<cyan>", icon="V")
 
 
 def _make_fs(endpoint_url: str) -> "s3fs.S3FileSystem":  # noqa: F821
@@ -132,7 +131,6 @@ def _map_thomson_to_psi_n(
 
 def _make_params(shot: int, dt: xr.DataTree, timebase: np.ndarray) -> PhysicsMethodParams:
     """Wrap an already-opened level2 DataTree in a PhysicsMethodParams."""
-    _ensure_verbose_level()
     conn = XarrayDataConnection(shot, dt)
     return PhysicsMethodParams(
         shot_id=shot,
@@ -162,12 +160,17 @@ class MASTDataWorkflow(DataWorkflow):
         a_minor, kappa, delta_top, delta_bot, Wtot_MJ
     """
 
+    # Normalize each slice to O(1) before fitting (see _extract_fit_input)
+    fit_scale_per_slice = True
+
     def __init__(
         self,
         ds_name: str,
         shotlist_file: Path | str | None,
         data_assembly_dir: Path | str,
         max_num_shots: int | None = None,
+        cluster_config=None,
+        fit_workers: int = 1,
     ):
         self.config = config
         ds_cfg = self.config["data_sources"]
@@ -181,6 +184,8 @@ class MASTDataWorkflow(DataWorkflow):
             prof_cfg["num_psi_points"],
         )
         self.min_ts_points = int(prof_cfg["min_ts_points"])
+        self.fit_min_points = self.min_ts_points
+        self.debug_plot_dir = None
 
         super().__init__(
             ds_name,
@@ -188,6 +193,8 @@ class MASTDataWorkflow(DataWorkflow):
             data_assembly_dir,
             max_num_shots=max_num_shots,
             min_shot_duration=self.config["shot_filters"]["min_duration"],
+            cluster_config=cluster_config,
+            fit_workers=fit_workers,
         )
 
         self.filter_config = {
@@ -374,61 +381,183 @@ class MASTDataWorkflow(DataWorkflow):
         return ts_time, te_out, ne_out, psi_n_out
 
     # ------------------------------------------------------------------
-    def _make_profile_dataset(
+    def _extract_fit_input(
         self,
         te_eV: np.ndarray,
         ne_m3: np.ndarray,
         psi_n_ts: np.ndarray,
-    ) -> tuple[np.ndarray, np.ndarray]:
-        """GP fit raw Thomson channel data onto self.gp_fit_psi grid.
+    ) -> ShotFitInput:
+        """Build GP fit input arrays from raw Thomson channel data.
+
+        Converts to standard units (Te [keV], ne [1e20 m^-3]) and attaches
+        synthetic 10% fractional errors with a floor of 0.01 [keV or 1e20 m^-3].
+        The per-slice max normalization and the min_ts_points validity check
+        are applied at fit time (fit_scale_per_slice / fit_min_points).
 
         Parameters
         ----------
         te_eV, ne_m3, psi_n_ts : (n_t, n_ch) - NaN where channel invalid.
-
-        Returns
-        -------
-        (Te_keV_psi, ne20_psi) each (n_t, n_psi) on self.gp_fit_psi.
         """
-        n_t, _ = te_eV.shape
-        n_psi = len(self.gp_fit_psi)
-        Te_out = np.full((n_t, n_psi), np.nan, dtype=np.float32)
-        ne_out = np.full((n_t, n_psi), np.nan, dtype=np.float32)
-
-        te_keV = te_eV / 1e3
-        ne_20 = ne_m3 / 1e20
-
-        for data_y_all, out_arr in [(te_keV, Te_out), (ne_20, ne_out)]:
-            # Synthetic 10% fractional errors with a floor of 0.01 [keV or 1e20 m^-3]
+        arrays = {}
+        for variable, data_y_all in [("te", te_eV / 1e3), ("ne", ne_m3 / 1e20)]:
             err_y_all = np.where(np.isfinite(data_y_all), 0.1 * np.abs(data_y_all), np.nan)
             err_y_all = np.where(err_y_all < 0.01, 0.01, err_y_all)
+            arrays[f"{variable}_y"] = data_y_all
+            arrays[f"{variable}_err"] = err_y_all
 
-            for i_time in range(n_t):
-                n_valid = int(np.sum(np.isfinite(psi_n_ts[i_time, :]) & np.isfinite(data_y_all[i_time, :])))
-                if n_valid < self.min_ts_points:
-                    continue
-                # Normalize to O(1) before GP fit to prevent amplitude collapse
-                # when channels don't cover the full psi_n range.
-                scale = float(np.nanmax(data_y_all[i_time, :]))
-                if not np.isfinite(scale) or scale < 1e-6:
-                    continue
-                # Optimize hyperparameters for each individual profile, since plasma
-                # conditions (and thus profile shapes) change over the course of a shot
-                y_star, _, _, _ = gp_profile(
-                    data_X=psi_n_ts[i_time, :],
-                    data_y=data_y_all[i_time, :] / scale,
-                    err_y=err_y_all[i_time, :] / scale,
-                    X_star=self.gp_fit_psi,
-                    calc_gradient=False,
-                    optimize_hyperparams=True,
-                )
-                if y_star is None:
-                    continue
-                # Last resort: the GP mean can ring below zero between the outermost
-                # measurement and the edge boundary conditions, so clamp to non-negative
-                out_arr[i_time, :] = np.clip(np.asarray(y_star).ravel() * scale, 0.0, None)
+        return ShotFitInput(psi=psi_n_ts, **arrays)
 
-        return Te_out, ne_out
+    # ------------------------------------------------------------------
+    def _staging_path(self, shot: int) -> Path:
+        return self.fit_staging_dir / f"{shot}_staging.nc"
+
+    def _prepare_shot(self, shot: int) -> ShotFitInput | None:  # noqa: PLR0911 - one early return per validation failure
+        """Retrieve and stage source data for one shot, returning GP fit inputs.
+
+        Reads the 0D signals and raw Thomson channel data from the MAST S3
+        Zarr stores and caches them as netCDF in fit_staging_dir, so restarts
+        (and the later assembly step) don't hit S3 again. Returns None if the
+        shot has no valid data.
+        """
+        staging_path = self._staging_path(shot)
+        self.fit_staging_dir.mkdir(parents=True, exist_ok=True)
+
+        if staging_path.exists():
+            logger.info(f"Using staged source data for shot {shot}")
+            ds_staging = xr.load_dataset(staging_path)
+            return self._extract_fit_input(
+                ds_staging["ts_te_eV"].values,
+                ds_staging["ts_ne_m3"].values,
+                ds_staging["ts_psi_n"].values,
+            )
+
+        if not _check_required_signals(shot, self.level2_cfg):
+            return None
+
+        dt = _open_level2(shot, self.level2_cfg)
+        if dt is None:
+            return None
+
+        try:
+            summ = dt["summary"].ds
+            summ_time = summ.coords["time"].values
+            ip_vals = summ["ip"].values
+            min_ip = self.config["shot_filters"]["min_ip"]
+            ip_mask = np.abs(ip_vals) > min_ip
+            if ip_mask.sum() < 2:
+                logger.warning(f"Shot {shot}: no valid IP above {min_ip} A, skipping")
+                return None
+            t_start = float(summ_time[ip_mask][0])
+            t_end = float(summ_time[ip_mask][-1])
+            if (t_end - t_start) < self.config["shot_filters"]["min_duration"]:
+                logger.warning(f"Shot {shot}: plasma duration too short, skipping")
+                return None
+        except Exception as e:
+            logger.warning(f"Shot {shot}: failed to determine timebase: {e}")
+            return None
+
+        timebase = make_uniform_1khz_timebase(t_end)
+        params = _make_params(shot, dt, timebase)
+
+        raw_0d = self._get_0d_dataset(shot, params)
+        if raw_0d is None:
+            return None
+
+        raw_ts = self._get_thomson_raw(shot, params, timebase)
+        if raw_ts is None:
+            logger.warning(f"Shot {shot}: failed to get raw Thomson data, skipping")
+            return None
+        ts_time, te_eV, ne_m3, psi_n_ts = raw_ts
+
+        ds_staging = xr.Dataset(
+            data_vars={
+                **{name: (("time",), np.asarray(vals, dtype=np.float32)) for name, vals in raw_0d.items()},
+                "ts_te_eV": (("ts_time", "channel"), te_eV),
+                "ts_ne_m3": (("ts_time", "channel"), ne_m3),
+                "ts_psi_n": (("ts_time", "channel"), psi_n_ts),
+            },
+            coords={
+                "time": timebase,
+                "ts_time": ts_time,
+            },
+        )
+        ds_staging.to_netcdf(staging_path)
+
+        return self._extract_fit_input(te_eV, ne_m3, psi_n_ts)
+
+    # ------------------------------------------------------------------
+    def _assemble_shot(self, shot: int, fit_output: ShotFitOutput) -> bool:
+        """Combine staged source data and GP fit results into the raw data file."""
+        staging_path = self._staging_path(shot)
+        ds_path = Path(self.raw_data_dir) / f"{shot}.nc"
+
+        ds_staging = xr.load_dataset(staging_path)
+        timebase = ds_staging["time"].values
+        ts_time = ds_staging["ts_time"].values
+        te_eV = ds_staging["ts_te_eV"].values
+        ne_m3 = ds_staging["ts_ne_m3"].values
+        psi_n_ts = ds_staging["ts_psi_n"].values
+        raw_0d = {name: ds_staging[name].values for name in ds_staging.data_vars if ds_staging[name].dims == ("time",)}
+
+        Te_keV_psi = fit_output.te_fit.astype(np.float32)
+        ne20_psi = fit_output.ne_fit.astype(np.float32)
+
+        # Put the fitted profiles on the 1 kHz timebase using previous value fill,
+        # consistent with the C-Mod workflow (no interpolation in time)
+        ds_profiles = xr.Dataset(
+            data_vars={
+                "Te_keV_psi": (("time", "psi_n"), Te_keV_psi),
+                "ne20_psi": (("time", "psi_n"), ne20_psi),
+            },
+            coords={
+                "time": ts_time,
+                "psi_n": self.gp_fit_psi.astype(np.float32),
+            },
+        )
+        ds_profiles = ds_profiles.reindex(time=timebase, method="ffill")
+
+        data_vars = {}
+        for name, vals in raw_0d.items():
+            data_vars[name] = ([TIME_DIM], vals.astype(np.float32))
+
+        data_vars["Te_keV_psi"] = ([TIME_DIM, "psi_n"], ds_profiles["Te_keV_psi"].values)
+        data_vars["ne20_psi"] = ([TIME_DIM, "psi_n"], ds_profiles["ne20_psi"].values)
+
+        coords = {
+            TIME_DIM: np.arange(len(timebase)),
+            TIME_COORD: (TIME_DIM, timebase.astype(np.float32)),
+            "psi_n": self.gp_fit_psi.astype(np.float32),
+        }
+
+        ds = xr.Dataset(data_vars, coords=coords)
+        ds = ds.expand_dims(shot=[shot])
+
+        ds_standardized = self.standardize_signal_names(ds)
+        if ds_standardized is None:
+            logger.warning(f"Standardization failed for shot {shot}, skipping")
+            return False
+
+        ds_standardized.to_netcdf(ds_path)
+        logger.info(f"Saved raw dataset for shot {shot} to {ds_path}")
+
+        # Only make fit diagnostic plots for shots that are kept
+        try:
+            self._debug_plot_profiles(
+                shot,
+                ts_time,
+                te_eV / 1e3,
+                ne_m3 / 1e20,
+                psi_n_ts,
+                Te_keV_psi,
+                ne20_psi,
+                self.debug_plot_dir,
+            )
+        except Exception as e:
+            logger.error(f"Failed to make TS fit diagnostic plot for shot {shot}: {e}")
+
+        # Staged source data is no longer needed once the raw file exists
+        staging_path.unlink(missing_ok=True)
+        return True
 
     # ------------------------------------------------------------------
     def _debug_plot_profiles(
@@ -501,8 +630,19 @@ class MASTDataWorkflow(DataWorkflow):
 
     # ------------------------------------------------------------------
     def make_raw_data_files(self, debug_plot_dir: Path | str | None = None):
-        """Create one netCDF per shot in the raw_data directory."""
+        """Create one netCDF per shot in the raw_data directory.
+
+        GP fitting runs in-process. If a cluster_config was provided, fitting
+        is dispatched to a SLURM cluster via make_raw_data_files_distributed()
+        instead. MAST data is public S3, so the "cluster" can also be the one
+        this process runs on (cluster profile "local").
+        """
         self.raw_data_dir.mkdir(parents=True, exist_ok=True)
+        self.debug_plot_dir = debug_plot_dir
+
+        if self.cluster_config is not None:
+            self.make_raw_data_files_distributed()
+            return
 
         processed_shots = 0
         for i, shot in enumerate(self.shotlist):
@@ -520,100 +660,22 @@ class MASTDataWorkflow(DataWorkflow):
                 processed_shots += 1
                 continue
 
-            if not _check_required_signals(shot, self.level2_cfg):
+            # Retrieve and stage source data
+            fit_input = self._prepare_shot(shot)
+            if fit_input is None:
                 continue
-
-            dt = _open_level2(shot, self.level2_cfg)
-            if dt is None:
-                continue
-
-            try:
-                summ = dt["summary"].ds
-                summ_time = summ.coords["time"].values
-                ip_vals = summ["ip"].values
-                min_ip = self.config["shot_filters"]["min_ip"]
-                ip_mask = np.abs(ip_vals) > min_ip
-                if ip_mask.sum() < 2:
-                    logger.warning(f"Shot {shot}: no valid IP above {min_ip} A, skipping")
-                    continue
-                t_start = float(summ_time[ip_mask][0])
-                t_end = float(summ_time[ip_mask][-1])
-                if (t_end - t_start) < self.config["shot_filters"]["min_duration"]:
-                    logger.warning(f"Shot {shot}: plasma duration too short, skipping")
-                    continue
-            except Exception as e:
-                logger.warning(f"Shot {shot}: failed to determine timebase: {e}")
-                continue
-
-            timebase = make_uniform_1khz_timebase(t_end)
-            params = _make_params(shot, dt, timebase)
-
-            raw_0d = self._get_0d_dataset(shot, params)
-            if raw_0d is None:
-                continue
-
-            raw_ts = self._get_thomson_raw(shot, params, timebase)
-            if raw_ts is None:
-                logger.warning(f"Shot {shot}: failed to get raw Thomson data, skipping")
-                continue
-            ts_time, te_eV, ne_m3, psi_n_ts = raw_ts
 
             # Fit profiles at the TS measurement times only
-            Te_keV_psi, ne20_psi = self._make_profile_dataset(te_eV, ne_m3, psi_n_ts)
-
-            # Put the fitted profiles on the 1 kHz timebase using previous value fill,
-            # consistent with the C-Mod workflow (no interpolation in time)
-            ds_profiles = xr.Dataset(
-                data_vars={
-                    "Te_keV_psi": (("time", "psi_n"), Te_keV_psi),
-                    "ne20_psi": (("time", "psi_n"), ne20_psi),
-                },
-                coords={
-                    "time": ts_time,
-                    "psi_n": self.gp_fit_psi.astype(np.float32),
-                },
+            outputs = fit_batch(
+                {shot: fit_input},
+                x_star=self.gp_fit_psi,
+                min_points=self.fit_min_points,
+                scale_per_slice=self.fit_scale_per_slice,
+                num_workers=self.fit_workers,
             )
-            ds_profiles = ds_profiles.reindex(time=timebase, method="ffill")
 
-            data_vars = {}
-            for name, vals in raw_0d.items():
-                data_vars[name] = ([TIME_DIM], vals.astype(np.float32))
-
-            data_vars["Te_keV_psi"] = ([TIME_DIM, "psi_n"], ds_profiles["Te_keV_psi"].values)
-            data_vars["ne20_psi"] = ([TIME_DIM, "psi_n"], ds_profiles["ne20_psi"].values)
-
-            coords = {
-                TIME_DIM: np.arange(len(timebase)),
-                TIME_COORD: (TIME_DIM, timebase.astype(np.float32)),
-                "psi_n": self.gp_fit_psi.astype(np.float32),
-            }
-
-            ds = xr.Dataset(data_vars, coords=coords)
-            ds = ds.expand_dims(shot=[shot])
-
-            ds_standardized = self.standardize_signal_names(ds)
-            if ds_standardized is None:
-                logger.warning(f"Standardization failed for shot {shot}, skipping")
-                continue
-
-            ds_standardized.to_netcdf(ds_path)
-            logger.info(f"Saved raw dataset for shot {shot} to {ds_path}")
-            processed_shots += 1
-
-            # Only make fit diagnostic plots for shots that are kept
-            try:
-                self._debug_plot_profiles(
-                    shot,
-                    ts_time,
-                    te_eV / 1e3,
-                    ne_m3 / 1e20,
-                    psi_n_ts,
-                    Te_keV_psi,
-                    ne20_psi,
-                    debug_plot_dir,
-                )
-            except Exception as e:
-                logger.error(f"Failed to make TS fit diagnostic plot for shot {shot}: {e}")
+            if self._assemble_shot(shot, outputs[shot]):
+                processed_shots += 1
 
         logger.info("Finished making MAST raw data files.")
 

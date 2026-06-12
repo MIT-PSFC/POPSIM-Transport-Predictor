@@ -22,6 +22,10 @@ class DataWorkflow:
     3. Combine all shots together into a single xarray Dataset and save to disk
     """
 
+    # GP fitting options used by fit_batch / the cluster worker; overridden per device
+    fit_min_points = 1
+    fit_scale_per_slice = False
+
     def __init__(
         self,
         ds_name: str,
@@ -29,6 +33,8 @@ class DataWorkflow:
         data_assembly_dir: Path | str,
         max_num_shots: int | None = None,
         min_shot_duration: float = 0.5,
+        cluster_config=None,
+        fit_workers: int = 1,
     ):
         """
         Parameters
@@ -44,11 +50,17 @@ class DataWorkflow:
             Maximum number of shots to process (for testing). If None, process all shots.
         min_shot_duration : float
             Minimum duration (in seconds) for a shot to be included in the dataset.
+        cluster_config : ClusterFitConfig | None
+            If provided, GP profile fitting is dispatched to a SLURM cluster
+            (see datasets/gp_fitting/dispatcher.py). If None, fitting runs in-process.
+        fit_workers : int
+            Number of local processes for in-process GP fitting (serial mode only).
         """
 
         self.ds_name = ds_name
         self.data_assembly_dir = Path(data_assembly_dir)
         self.raw_data_dir = self.data_assembly_dir / ds_name / "raw_data"
+        self.fit_staging_dir = self.data_assembly_dir / ds_name / "fit_staging"
         if max_num_shots is None:
             self.final_ds_dir = self.data_assembly_dir / ds_name / "dataset_full"
         else:
@@ -56,6 +68,8 @@ class DataWorkflow:
 
         self.max_num_shots = max_num_shots
         self.min_shot_duration = min_shot_duration
+        self.cluster_config = cluster_config
+        self.fit_workers = fit_workers
 
         if shotlist_file is None:
             logger.info("No shotlist file provided, retrieving shotlist from device-specific source")
@@ -87,6 +101,83 @@ class DataWorkflow:
         The resulting files should be one per shot, on a common timebase,
         and have standardized signal names
         """
+
+    def _prepare_shot(self, shot: int):
+        """Download and validate source data for one shot, returning a ShotFitInput.
+
+        Implemented by workflows that support distributed GP fitting (C-Mod, MAST).
+        Must be idempotent: cache downloaded data in fit_staging_dir so a restart
+        does not hit the source again. Returns None if the shot is invalid.
+        """
+        raise NotImplementedError(f"{self.ds_name} workflow does not support distributed GP fitting")
+
+    def _assemble_shot(self, shot: int, fit_output) -> bool:
+        """Combine staged source data with GP fit results into the raw data file.
+
+        Returns True if the raw file was written. Implemented by workflows that
+        support distributed GP fitting (C-Mod, MAST).
+        """
+        raise NotImplementedError(f"{self.ds_name} workflow does not support distributed GP fitting")
+
+    def make_raw_data_files_distributed(self):
+        """Create raw data files with GP fitting dispatched to a SLURM cluster.
+
+        Three phases:
+        1. Prepare: download and validate source data locally (the cluster has
+           no access to the data source), staging per-shot files and fit inputs.
+        2. Fit: ship fit inputs to the cluster in batches and wait for results
+           (see ClusterFitDispatcher for batching, dedup, and concurrency).
+        3. Assemble: combine staged data and fitted profiles into one raw
+           netCDF per shot, identical to the serial workflow's output.
+        """
+        import gc
+
+        from transport_study.datasets.gp_fitting.dispatcher import ClusterFitDispatcher
+
+        if self.cluster_config is None:
+            raise ValueError("make_raw_data_files_distributed requires a cluster_config")
+
+        self.raw_data_dir.mkdir(parents=True, exist_ok=True)
+        self.fit_staging_dir.mkdir(parents=True, exist_ok=True)
+
+        target = self.max_num_shots if self.max_num_shots is not None else len(self.shotlist)
+        n_existing = 0
+        pending = {}
+        for i, shot in enumerate(self.shotlist):
+            if n_existing + len(pending) >= target:
+                break
+            if (self.raw_data_dir / f"{shot}.nc").exists():
+                n_existing += 1
+                continue
+            if i > 0 and i % 40 == 0:
+                gc.collect()  # Source datasets can pin a lot of memory (see MAST GC_INTERVAL)
+            fit_input = self._prepare_shot(shot)
+            if fit_input is None:
+                continue
+            pending[shot] = fit_input
+
+        logger.info(f"{n_existing} raw files already exist; {len(pending)} shots need GP fitting")
+        if not pending:
+            logger.info("Nothing to fit, finished making raw data files.")
+            return
+
+        dispatcher = ClusterFitDispatcher(self.cluster_config, self.ds_name, self.fit_staging_dir)
+        results = dispatcher.run(
+            pending,
+            x_star=self.gp_fit_psi,
+            min_points=self.fit_min_points,
+            scale_per_slice=self.fit_scale_per_slice,
+        )
+
+        n_assembled = 0
+        for shot, fit_output in results.items():
+            if fit_output is None:
+                logger.warning(f"No fit results for shot {shot} (batch failed); staging kept for retry")
+                continue
+            if self._assemble_shot(shot, fit_output):
+                n_assembled += 1
+
+        logger.info(f"Assembled {n_assembled}/{len(pending)} shots. Finished making raw data files.")
 
     @abstractmethod
     def standardize_signal_names(self, ds: xr.Dataset) -> xr.Dataset:

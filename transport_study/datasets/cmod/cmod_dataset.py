@@ -21,8 +21,12 @@ from transport_study.datasets import make_uniform_1khz_timebase
 from transport_study.datasets.cmod import (
     CMOD_DATASET_SIGNALS,
 )
-from transport_study.datasets.cmod.gp_fit import gp_profile
 from transport_study.datasets.dispy_utils import summary
+from transport_study.datasets.gp_fitting.fit_worker import (
+    ShotFitInput,
+    ShotFitOutput,
+    fit_batch,
+)
 from transport_study.datasets.workflow import DataWorkflow
 
 DEFAULT_SHOTLIST_FILE = PACKAGE_ROOT / "datasets" / "cmod" / "cmod_shotlist"
@@ -50,6 +54,8 @@ class CModDataWorkflow(DataWorkflow):
         max_num_shots: int | None = None,
         gp_fit_psi: np.ndarray | None = None,
         skip_profiles: bool = False,
+        cluster_config=None,
+        fit_workers: int = 1,
     ):
         """Initialize the C-Mod data workflow.
 
@@ -68,6 +74,12 @@ class CModDataWorkflow(DataWorkflow):
             Radial locations for GP profile fitting. If None, uses default from config.
         skip_profiles : bool
             If True, skip profile fitting and use zero arrays instead. Useful for testing.
+        cluster_config : ClusterFitConfig | None
+            If provided, GP fitting is dispatched to a SLURM cluster. The C-Mod
+            data source is only reachable locally, so data retrieval and dataset
+            assembly always run here; only the fitting is shipped out.
+        fit_workers : int
+            Number of local processes for in-process GP fitting (serial mode only).
         """
 
         # Use the C-Mod dataset config from datasets/cmod/config.toml
@@ -91,6 +103,8 @@ class CModDataWorkflow(DataWorkflow):
             shotlist_file,
             data_assembly_dir,
             max_num_shots=max_num_shots,
+            cluster_config=cluster_config,
+            fit_workers=fit_workers,
         )
 
         self.filter_config = {
@@ -166,102 +180,138 @@ class CModDataWorkflow(DataWorkflow):
         result = result.set_index(idx=["shot", "time"]).unstack("idx")
         return result
 
-    def _make_profile_dataset(self, ds_thomson: xr.Dataset) -> xr.Dataset:
-        """Perform GP fitting on Thomson scattering data.
+    def _extract_fit_input(self, ds_thomson: xr.Dataset) -> ShotFitInput:
+        """Build GP fit input arrays from raw Thomson scattering data.
 
-        This assumes the input data is raw Thomson scattering data from _get_thomson_dataset()
-        where Te is in keV and ne is in m^-3. Returns Te in keV and ne in 1e20 m^-3.
-
-        Parameters
-        ----------
-        ds_thomson : xr.Dataset
-            Raw Thomson scattering dataset
-
-        Returns
-        -------
-        xr.Dataset
-            GP-fitted profiles on psi grid
+        This assumes the input data is raw Thomson scattering data from
+        _get_thomson_dataset() where Te is in keV and ne is in m^-3. The fit
+        input arrays are Te in keV and ne in 1e20 m^-3.
         """
+        ds_shot = ds_thomson.squeeze(dim="shot", drop=True)
+        data_x = ds_shot["ts_channel_psi_n"].values.T  # shape (time, channel)
 
-        shot_prediction = {}
+        arrays = {}
+        for variable in ["te", "ne"]:
+            data_y = ds_shot[f"ts_channel_{variable}"].values.T  # shape (time, channel)
+            err_y = ds_shot[f"ts_channel_{variable}_error"].values.T  # shape (time, channel)
 
-        for shot in ds_thomson["shot"].values:
-            ds_shot = ds_thomson.where(ds_thomson["shot"] == shot, drop=True)
-            ds_shot = ds_shot.squeeze(dim="shot", drop=True)
-            times = ds_shot["time"].values
-            data_x = ds_shot["ts_channel_psi_n"].values.T  # shape (time, channel)
+            if variable == "ne":
+                data_y = data_y * 1e-20  # Convert to [1e20 m^-3]
+                err_y = err_y * 1e-20
 
-            te_data = np.full((len(times), len(self.gp_fit_psi)), np.nan)
-            te_err = np.full((len(times), len(self.gp_fit_psi)), np.nan)
-            ne_data = np.full((len(times), len(self.gp_fit_psi)), np.nan)
-            ne_err = np.full((len(times), len(self.gp_fit_psi)), np.nan)
+            # If data or error bar is incredibly small, set to NaN since it's probably bad data
+            data_y = np.where(data_y < 0.001, np.nan, data_y)
+            err_y = np.where(err_y < 0.001, np.nan, err_y)
 
-            for variable in ["te", "ne"]:
-                data_y = ds_shot[f"ts_channel_{variable}"].values.T  # shape (time, channel)
-                err_y = ds_shot[f"ts_channel_{variable}_error"].values.T  # shape (time, channel)
+            # Historic data, we're mostly going off vibes anyway
+            err_y = np.where(err_y < 0.1, 0.1, err_y)
 
-                if variable == "ne":
-                    data_y = data_y * 1e-20  # Convert to [1e20 m^-3]
-                    err_y = err_y * 1e-20
+            arrays[f"{variable}_y"] = data_y
+            arrays[f"{variable}_err"] = err_y
 
-                # If data or error bar is incredibly small, set to NaN since it's probably bad data
-                data_y = np.where(data_y < 0.001, np.nan, data_y)
-                err_y = np.where(err_y < 0.001, np.nan, err_y)
+        return ShotFitInput(psi=data_x, **arrays)
 
-                # Historic data, we're mostly going off vibes anyway
-                err_y = np.where(err_y < 0.1, 0.1, err_y)
+    def _profiles_dataset_from_fit(self, shot: int, times: np.ndarray, fit_output: ShotFitOutput) -> xr.Dataset:
+        """Build the GP-fitted profile dataset (with shot dimension) from fit results."""
+        ds_profiles = xr.Dataset(
+            data_vars={
+                "Te_keV_psi": (("time", "psi"), fit_output.te_fit),
+                "Te_keV_psi_error": (("time", "psi"), fit_output.te_std),
+                "ne20_psi": (("time", "psi"), fit_output.ne_fit),
+                "ne20_psi_error": (("time", "psi"), fit_output.ne_std),
+            },
+            coords={
+                "time": times,
+                "psi": self.gp_fit_psi,
+            },
+        )
+        return ds_profiles.expand_dims({"shot": [shot]})
 
-                for i_time, _ in enumerate(times):
-                    # Optimize hyperparameters for each individual profile, since plasma
-                    # conditions (and thus profile shapes) change over the course of a shot
-                    y_star, std_y_star, _, _ = gp_profile(
-                        data_X=data_x[i_time, :],
-                        data_y=data_y[i_time, :],
-                        err_y=err_y[i_time, :],
-                        X_star=self.gp_fit_psi,
-                        calc_gradient=False,
-                        optimize_hyperparams=True,
-                    )
-                    if y_star is None:
-                        continue
-
-                    # Last resort: the GP mean can ring below zero between the outermost
-                    # measurement and the edge boundary conditions, so clamp to non-negative
-                    y_star = np.clip(y_star, 0.0, None)
-
-                    if variable == "te":
-                        te_data[i_time, :] = y_star
-                        te_err[i_time, :] = std_y_star
-                    elif variable == "ne":
-                        ne_data[i_time, :] = y_star
-                        ne_err[i_time, :] = std_y_star
-
-                    if i_time % 10 == 0:
-                        logger.verbose(f"Completed {i_time}/{len(times)} fits for {variable}")
-
-                    if DEBUG and i_time > 20:
-                        break
-
-            shot_prediction[shot] = xr.Dataset(
-                data_vars={
-                    "Te_keV_psi": (("time", "psi"), te_data),
-                    "Te_keV_psi_error": (("time", "psi"), te_err),
-                    "ne20_psi": (("time", "psi"), ne_data),
-                    "ne20_psi_error": (("time", "psi"), ne_err),
-                },
-                coords={
-                    "time": times,
-                    "psi": self.gp_fit_psi,
-                },
-            )
-
-        # Put the shots together into the original dataset with shot dimension
-        ds_profiles = xr.concat(
-            [shot_prediction[shot] for shot in shot_prediction],
-            dim=xr.IndexVariable("shot", list(shot_prediction.keys())),
+    def _staging_paths(self, shot: int) -> tuple[Path, Path]:
+        return (
+            self.fit_staging_dir / f"{shot}_thomson.nc",
+            self.fit_staging_dir / f"{shot}_efit.nc",
         )
 
-        return ds_profiles
+    def _prepare_shot(self, shot: int) -> ShotFitInput | None:
+        """Retrieve and stage source data for one shot, returning GP fit inputs.
+
+        Downloads EFIT/0D and Thomson data from the C-Mod MDSplus server and
+        caches them as netCDF in fit_staging_dir, so restarts (and the later
+        assembly step) don't hit the server again. Returns None if the shot
+        has no valid data.
+        """
+        thomson_path, efit_path = self._staging_paths(shot)
+        self.fit_staging_dir.mkdir(parents=True, exist_ok=True)
+
+        if thomson_path.exists() and efit_path.exists():
+            logger.info(f"Using staged source data for shot {shot}")
+            ds_thomson = xr.load_dataset(thomson_path)
+            return self._extract_fit_input(ds_thomson)
+
+        # Get EFIT and 0D data
+        try:
+            ds_efit = self._get_efit_dataset(shot)
+        except Exception as e:
+            logger.warning(f"Failed to retrieve EFIT data for shot {shot}: {e}")
+            return None
+
+        # Get Thomson data
+        ds_thomson = self._get_thomson_dataset(shot)
+        if ds_thomson is None:
+            logger.warning(f"Skipping shot {shot} since no Thomson data was retrieved")
+            return None
+
+        ds_efit.to_netcdf(efit_path)
+        ds_thomson.to_netcdf(thomson_path)
+        return self._extract_fit_input(ds_thomson)
+
+    def _assemble_shot(self, shot: int, fit_output: ShotFitOutput) -> bool:
+        """Combine staged source data and GP fit results into the raw data file."""
+        thomson_path, efit_path = self._staging_paths(shot)
+        ds_path = self.raw_data_dir / f"{shot}.nc"
+
+        ds_thomson = xr.load_dataset(thomson_path)
+        ds_efit = xr.load_dataset(efit_path)
+        times = ds_thomson.squeeze(dim="shot", drop=True)["time"].values
+        ds_profiles = self._profiles_dataset_from_fit(shot, times, fit_output)
+
+        # Keep the datasets at the TS measurement times for fit diagnostics
+        ds_thomson_at_ts_times = ds_thomson
+        ds_profiles_at_ts_times = ds_profiles
+
+        # Put each dataset on a 1 kHz timebase, using previous value fill
+        max_time = max(
+            ds_thomson["time"].max().item(),
+            ds_profiles["time"].max().item(),
+            ds_efit["time"].max().item(),
+        )
+        timebase = make_uniform_1khz_timebase(max_time)
+
+        ds_thomson = ds_thomson.reindex(time=timebase, method="ffill")
+        ds_profiles = ds_profiles.reindex(time=timebase, method="ffill")
+        ds_efit = ds_efit.interp(time=timebase, method="nearest")  # EFIT is already at high time resolution
+
+        ds_assembly = xr.merge([ds_thomson, ds_profiles, ds_efit], compat="override")
+
+        ds_standardized = self.standardize_signal_names(ds_assembly)
+        if ds_standardized is None:
+            logger.warning(f"Standardization failed for shot {shot}, skipping")
+            return False
+
+        ds_standardized.to_netcdf(ds_path)
+        logger.info(f"Saved raw dataset for shot {shot} to {ds_path}")
+
+        # Only make fit diagnostic plots for shots that are kept
+        try:
+            self._debug_plot_profiles(shot, ds_thomson_at_ts_times, ds_profiles_at_ts_times)
+        except Exception as e:
+            logger.error(f"Failed to make TS fit diagnostic plot for shot {shot}: {e}")
+
+        # Staged source data is no longer needed once the raw file exists
+        thomson_path.unlink(missing_ok=True)
+        efit_path.unlink(missing_ok=True)
+        return True
 
     def _debug_plot_profiles(
         self,
@@ -403,7 +453,14 @@ class CModDataWorkflow(DataWorkflow):
         This method retrieves Thomson scattering data, performs GP fitting for profiles,
         retrieves EFIT and 0D signals, combines them on a uniform 1 kHz timebase,
         standardizes signal names, and saves one netCDF file per shot.
+
+        GP fitting runs in-process. If a cluster_config was provided (and
+        profiles are not skipped), fitting is dispatched to the cluster via
+        make_raw_data_files_distributed() instead.
         """
+        if self.cluster_config is not None and not self.skip_profiles:
+            self.make_raw_data_files_distributed()
+            return
 
         processed_shots = 0
         for shot in self.shotlist:
@@ -417,6 +474,24 @@ class CModDataWorkflow(DataWorkflow):
                 processed_shots += 1
                 continue
 
+            if not self.skip_profiles:
+                # Retrieve and stage source data, then fit profiles in-process
+                fit_input = self._prepare_shot(shot)
+                if fit_input is None:
+                    continue
+                outputs = fit_batch(
+                    {shot: fit_input},
+                    x_star=self.gp_fit_psi,
+                    min_points=self.fit_min_points,
+                    scale_per_slice=self.fit_scale_per_slice,
+                    num_workers=self.fit_workers,
+                    max_slices_per_shot=21 if DEBUG else None,
+                )
+                if self._assemble_shot(shot, outputs[shot]):
+                    processed_shots += 1
+                continue
+
+            # skip_profiles=True: build the raw file with zero profiles
             # Get EFIT and 0D data
             try:
                 ds_efit = self._get_efit_dataset(shot)
@@ -424,69 +499,41 @@ class CModDataWorkflow(DataWorkflow):
                 logger.warning(f"Failed to retrieve EFIT data for shot {shot}: {e}")
                 continue
 
-            if self.skip_profiles:
-                # Skip profile fitting, use zeros instead
-                logger.info(f"Skipping profile fitting for shot {shot} (skip_profiles=True)")
-                max_time = ds_efit["time"].max().item()
-                timebase = make_uniform_1khz_timebase(max_time)
+            # Skip profile fitting, use zeros instead
+            logger.info(f"Skipping profile fitting for shot {shot} (skip_profiles=True)")
+            max_time = ds_efit["time"].max().item()
+            timebase = make_uniform_1khz_timebase(max_time)
 
-                # Create dummy profile dataset with zeros
-                ds_profiles = xr.Dataset(
-                    data_vars={
-                        "Te_keV_psi": (
-                            ("time", "psi"),
-                            np.zeros((len(timebase), len(self.gp_fit_psi))),
-                        ),
-                        "Te_keV_psi_error": (
-                            ("time", "psi"),
-                            np.zeros((len(timebase), len(self.gp_fit_psi))),
-                        ),
-                        "ne20_psi": (
-                            ("time", "psi"),
-                            np.zeros((len(timebase), len(self.gp_fit_psi))),
-                        ),
-                        "ne20_psi_error": (
-                            ("time", "psi"),
-                            np.zeros((len(timebase), len(self.gp_fit_psi))),
-                        ),
-                    },
-                    coords={
-                        "time": timebase,
-                        "psi": self.gp_fit_psi,
-                        "shot": shot,
-                    },
-                )
-                ds_profiles = ds_profiles.expand_dims("shot")
+            # Create dummy profile dataset with zeros
+            ds_profiles = xr.Dataset(
+                data_vars={
+                    "Te_keV_psi": (
+                        ("time", "psi"),
+                        np.zeros((len(timebase), len(self.gp_fit_psi))),
+                    ),
+                    "Te_keV_psi_error": (
+                        ("time", "psi"),
+                        np.zeros((len(timebase), len(self.gp_fit_psi))),
+                    ),
+                    "ne20_psi": (
+                        ("time", "psi"),
+                        np.zeros((len(timebase), len(self.gp_fit_psi))),
+                    ),
+                    "ne20_psi_error": (
+                        ("time", "psi"),
+                        np.zeros((len(timebase), len(self.gp_fit_psi))),
+                    ),
+                },
+                coords={
+                    "time": timebase,
+                    "psi": self.gp_fit_psi,
+                    "shot": shot,
+                },
+            )
+            ds_profiles = ds_profiles.expand_dims("shot")
 
-                ds_efit = ds_efit.interp(time=timebase, method="nearest")
-                ds_assembly = xr.merge([ds_profiles, ds_efit], compat="override")
-            else:
-                # Get Thomson data
-                ds_thomson = self._get_thomson_dataset(shot)
-                if ds_thomson is None:
-                    logger.warning(f"Skipping shot {shot} since no Thomson data was retrieved")
-                    continue
-
-                # Fit Thomson profiles
-                ds_profiles = self._make_profile_dataset(ds_thomson)
-
-                # Keep the datasets at the TS measurement times for fit diagnostics
-                ds_thomson_at_ts_times = ds_thomson
-                ds_profiles_at_ts_times = ds_profiles
-
-                # Put each dataset on a 1 kHz timebase, using previous value fill
-                max_time = max(
-                    ds_thomson["time"].max().item(),
-                    ds_profiles["time"].max().item(),
-                    ds_efit["time"].max().item(),
-                )
-                timebase = make_uniform_1khz_timebase(max_time)
-
-                ds_thomson = ds_thomson.reindex(time=timebase, method="ffill")
-                ds_profiles = ds_profiles.reindex(time=timebase, method="ffill")
-                ds_efit = ds_efit.interp(time=timebase, method="nearest")  # EFIT is already at high time resolution
-
-                ds_assembly = xr.merge([ds_thomson, ds_profiles, ds_efit], compat="override")
+            ds_efit = ds_efit.interp(time=timebase, method="nearest")
+            ds_assembly = xr.merge([ds_profiles, ds_efit], compat="override")
 
             ds_standardized = self.standardize_signal_names(ds_assembly)
             if ds_standardized is None:
@@ -496,13 +543,6 @@ class CModDataWorkflow(DataWorkflow):
             ds_standardized.to_netcdf(ds_path)
             logger.info(f"Saved raw dataset for shot {shot} to {ds_path}")
             processed_shots += 1
-
-            # Only make fit diagnostic plots for shots that are kept
-            if not self.skip_profiles:
-                try:
-                    self._debug_plot_profiles(shot, ds_thomson_at_ts_times, ds_profiles_at_ts_times)
-                except Exception as e:
-                    logger.error(f"Failed to make TS fit diagnostic plot for shot {shot}: {e}")
 
         logger.info("Finished making raw data files.")
 
