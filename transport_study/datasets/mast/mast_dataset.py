@@ -25,13 +25,11 @@ from transport_study.datasets.gp_fitting.fit_worker import (
     ShotFitOutput,
     fit_batch,
 )
-from transport_study.datasets.workflow import DataWorkflow
+from transport_study.datasets.workflow import GC_INTERVAL, DataWorkflow
 
 DEFAULT_SHOTLIST_FILE = Path(PACKAGE_ROOT) / "datasets" / "mast" / "mast_shotlist"
 
 config = Dynaconf(settings_files=[Path(PACKAGE_ROOT) / "datasets/mast/config.toml"])
-
-GC_INTERVAL = 40  # Every 40 shots force garbage collection
 
 
 def _make_fs(endpoint_url: str) -> "s3fs.S3FileSystem":  # noqa: F821

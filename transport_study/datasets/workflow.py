@@ -8,6 +8,8 @@ from loguru import logger
 from transport_study import EPISODE_DIM, TIME_DIM
 from transport_study.datasets.plotting import ds_profile_plot, ds_profile_time_plot
 
+GC_INTERVAL = 40  # Every 40 shots force garbage collection
+
 
 class DataWorkflow:
     """Class that handles organization of data processing steps
@@ -149,8 +151,8 @@ class DataWorkflow:
             if (self.raw_data_dir / f"{shot}.nc").exists():
                 n_existing += 1
                 continue
-            if i > 0 and i % 40 == 0:
-                gc.collect()  # Source datasets can pin a lot of memory (see MAST GC_INTERVAL)
+            if i > 0 and i % GC_INTERVAL == 0:
+                gc.collect()  # Source datasets can pin a lot of memory
             fit_input = self._prepare_shot(shot)
             if fit_input is None:
                 continue
