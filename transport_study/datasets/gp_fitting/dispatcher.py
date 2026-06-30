@@ -72,8 +72,8 @@ class ClusterFitConfig:
         srunx SSH profile name, or "local" when already running on the
         target cluster (shared filesystem, local sbatch).
     partition : str
-        SLURM partition for the fitting jobs. gptools is CPU-only, so this
-        must be a CPU partition.
+        SLURM partition for the fitting jobs. mkgp is CPU-only, so this
+        should be a CPU partition.
     remote_workdir : str
         Scratch directory on the cluster where batch files, the worker
         script, and job logs are placed. Cluster-specific.

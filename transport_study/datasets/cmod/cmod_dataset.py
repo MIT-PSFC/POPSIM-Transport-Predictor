@@ -46,6 +46,13 @@ class CModDataWorkflow(DataWorkflow):
     Note: This workflow can execute on the present cluster with C-Mod data access.
     """
 
+    # Normalize each slice to O(1) before the GP fit. C-Mod Te (keV) and ne
+    # (1e20 m^-3) span different magnitudes, so a single set of absolute
+    # hyperparameter bounds only makes sense on normalized data; without this the
+    # optimizer sometimes collapsed the amplitude to ~0 and returned a flat,
+    # near-zero profile.
+    fit_scale_per_slice = True
+
     def __init__(
         self,
         ds_name: str,
@@ -332,6 +339,8 @@ class CModDataWorkflow(DataWorkflow):
         ds_thomson: xr.Dataset,
         ds_profiles: xr.Dataset,
         debug_plot_dir: Path | str | None = None,
+        Te_keV_lim: float | None = 5.0,
+        ne20_lim: float | None = 1.8,
     ) -> None:
         """Save a PDF comparing the GP fits to the raw TS measurements.
 
@@ -363,6 +372,11 @@ class CModDataWorkflow(DataWorkflow):
         debug_plot_dir.mkdir(parents=True, exist_ok=True)
         pdf_path = debug_plot_dir / f"{shot}_ts_gp_fit.pdf"
 
+        # Plot the exact channel data the GP fit consumed (NaN-masked, error
+        # floored at 0.1, ne in 1e20 units), not the raw staged signals, so the
+        # plotted points and error bars match what the fit actually saw.
+        fit_input = self._extract_fit_input(ds_thomson)
+
         ds_thomson = ds_thomson.squeeze("shot", drop=True)
         ds_profiles = ds_profiles.squeeze("shot", drop=True)
 
@@ -375,17 +389,16 @@ class CModDataWorkflow(DataWorkflow):
         with PdfPages(pdf_path) as pdf:
             for i_time in range(0, n_t, step):
                 time = times[i_time]
-                ds_ts_t = ds_thomson.isel(time=i_time)
                 ds_prof_t = ds_profiles.sel(time=time, method="nearest")
-                rho_ch = ds_ts_t["ts_channel_rho"].values
+                rho_ch = fit_input.x[i_time]
 
                 fig, axes = plt.subplots(1, 2, figsize=(12, 5))
-                for ax, variable, gp_var, scale, label in [
-                    (axes[0], "te", "Te_keV_rho", 1.0, "Te [keV]"),
-                    (axes[1], "ne", "ne20_rho", 1e-20, "ne [1e20 m^-3]"),
+                for ax, variable, gp_var, label, ylim in [
+                    (axes[0], "te", "Te_keV_rho", "Te [keV]", Te_keV_lim),
+                    (axes[1], "ne", "ne20_rho", "ne [1e20 m^-3]", ne20_lim),
                 ]:
-                    data_y = ds_ts_t[f"ts_channel_{variable}"].values * scale
-                    err_y = ds_ts_t[f"ts_channel_{variable}_error"].values * scale
+                    data_y = getattr(fit_input, f"{variable}_y")[i_time]
+                    err_y = getattr(fit_input, f"{variable}_err")[i_time]
 
                     for mask, color, name in [
                         (is_core, "tab:blue", "TS core"),
@@ -420,7 +433,7 @@ class CModDataWorkflow(DataWorkflow):
 
                     ax.set_xlabel("rho")
                     ax.set_ylabel(label)
-                    ax.set_ylim(bottom=0)
+                    ax.set_ylim(bottom=0, top=ylim)
                     ax.set_title(f"shot {shot}  t={time:.3f} s")
                     ax.grid(alpha=0.3)
                     if ax.get_legend_handles_labels()[0]:

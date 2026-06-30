@@ -11,7 +11,7 @@ echo $(which python)
 pip install --upgrade pip
 pip install numpy==1.26.4
 pip install -e submodules/disruption-py
-pip install -e submodules/gptools
+pip install mkgp
 pip install -e submodules/popsim
 pip install -e .
 pip install numpy==1.26.4

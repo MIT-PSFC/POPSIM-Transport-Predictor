@@ -2,7 +2,7 @@
 
 This file is shipped by itself to remote SLURM clusters (see dispatcher.py),
 where it runs as `python fit_worker.py input.npz output.npz --num-workers N`.
-It must therefore remain self-contained: stdlib + numpy + gptools only, no
+It must therefore remain self-contained: stdlib + numpy + mkgp only, no
 transport_study imports. The serial (no-cluster) path imports fit_batch() from
 here so local and remote fitting share one implementation.
 
@@ -25,71 +25,239 @@ Batch file format (npz):
 """
 
 import argparse
+import contextlib
+import io
 import multiprocessing
 import os
 import time
 from dataclasses import dataclass
 from pathlib import Path
 
-import gptools
+# Limit BLAS threads before numpy loads so slice-level multiprocessing
+# (fit_batch num_workers) does not oversubscribe cores.
+# mkgp is single-threaded numpy/scipy
+# one thread per worker is the right default.
+# setdefault keeps any explicit override.
+# Effective only when this module is the program entry point
+# (the cluster `python fit_worker.py` path), does nothing otherwise
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+
 import numpy as np
+from mkgp.core.baseclasses import _WarpingFunction
+from mkgp.core.kernels import Gibbs_Kernel
+from mkgp.core.routines import GaussianProcess
 
 FORMAT_VERSION = 2
-VARIABLES = ("te", "ne")
 
 
 # ----------------------------------------------------------------------
-# GP fitting
+# GP fitting (mkgp Gibbs kernel with tanh-warped length scale)
 # ----------------------------------------------------------------------
-def _build_gp() -> gptools.GaussianProcess:
-    """Construct a GP instance with the standard prior/kernel settings."""
-    hp = gptools.UniformJointPrior([[0.0, 20.0]]) * gptools.GammaJointPriorAlt([1.0, 0.5, 0.0, 1.0], [0.3, 0.25, 0.1, 0.1])
-    k_gibbs = gptools.GibbsKernel1dTanh(hyperprior=hp)
-    return gptools.GaussianProcess(k_gibbs)
+# Hyperparameters, order [var, l1, l2, lw, x0]: amplitude, core (small-rho) and
+# edge (large-rho) length scales, tanh transition width, and transition center.
+_HYP_START = np.array([2.0, 1.0, 0.5, 0.1, 1.0])
+# Bounds define the optimizer's random-restart ranges (drawn uniform in log10),
+# loosely mirroring the support of the old gptools Uniform*Gamma hyperprior.
+_HYP_BOUNDS = np.array([[1.0e-2, 0.1, 0.05, 0.01, 0.5], [2.0e1, 3.0, 2.0, 1.0, 1.5]])
+# Edge boundary conditions, informed by Chilenski 2016. Columns: (rho, value, error).
+# Value BCs pull the profile to ~0 past the separatrix
+# gradient BCs flatten it at the axis (rho=0) and past the edge
+# The axis gradient uses a small positive error (mkgp needs a positive diagonal entry to stay invertible)
+_VALUE_BC = np.array([[1.1, 0.0, 0.01], [1.2, 0.0, 0.01], [1.3, 0.0, 0.01], [1.4, 0.0, 0.01]])
+_GRAD_BC = np.array([[0.0, 0.0, 0.01], [1.1, 0.0, 0.1], [1.2, 0.0, 0.1], [1.3, 0.0, 0.1], [1.4, 0.0, 0.1]])
+# Half-width (in rho) of the x0 window used to pin the pedestal location when
+# tying Te to the ne fit. Narrow enough to hold x0, wide enough to stay a valid
+# (lower < upper) bound after clamping to the global x0 range.
+_X0_PIN_HALFWIDTH = 1.0e-3
 
 
-def _add_data_and_bcs(gp, data_X, data_y, err_y) -> bool:
-    """Add measurements and edge boundary conditions to the GP.
+class Tanh_WarpingFunction(_WarpingFunction):
+    """tanh length-scale warp for the mkgp Gibbs kernel.
 
-    Returns False if no valid input data remains after NaN filtering.
+    l(z) = 0.5 * ((l1 + l2) - (l1 - l2) * tanh((z - x0) / lw))
+
+    mkgp ships only Constant/Linear/IG warps, so this reproduces the old gptools
+    GibbsKernel1dTanh length scale. hyps = [l1, l2, lw, x0]. Analytic z- and
+    hyperparameter-derivatives are provided (verified against finite differences)
+    so mkgp's analytic LML-gradient optimizer path stays valid.
     """
-    valid_mask = ~np.isnan(data_y) & ~np.isnan(data_X) & ~np.isnan(err_y)
-    if np.sum(valid_mask) == 0:
-        return False
-    data_X = data_X[valid_mask]
-    data_y = data_y[valid_mask]
-    err_y = err_y[valid_mask]
 
-    gp.add_data(data_X, data_y, err_y)
-    gp.remove_outliers(sigma=2)
+    def __calc_warp(self, zz, der=0, hder=None):
+        l1, l2, lw, x0 = self.hyperparameters
+        u = (zz - x0) / lw
+        tt = np.tanh(u)
+        ss = 1.0 - tt * tt
+        warp = np.zeros(np.shape(zz), dtype=self._dtype)
+        if der == 0:
+            if hder is None:
+                warp = 0.5 * ((l1 + l2) - (l1 - l2) * tt)
+            elif hder == 0:
+                warp = 0.5 * (1.0 - tt)
+            elif hder == 1:
+                warp = 0.5 * (1.0 + tt)
+            elif hder == 2:
+                warp = 0.5 * (l1 - l2) * ss * u / lw
+            elif hder == 3:
+                warp = 0.5 * (l1 - l2) * ss / lw
+        elif der == 1:
+            if hder is None:
+                warp = -0.5 * (l1 - l2) * ss / lw
+            elif hder == 0:
+                warp = -0.5 * ss / lw
+            elif hder == 1:
+                warp = 0.5 * ss / lw
+            elif hder == 2:
+                warp = -0.5 * (l1 - l2) * ss / (lw * lw) * (2.0 * tt * u - 1.0)
+            elif hder == 3:
+                warp = -0.5 * (l1 - l2) * 2.0 * tt * ss / (lw * lw)
+        return warp
 
-    # Boundary conditions, informed by Chilenski 2016
-    val_bc = np.array([[1.1, 0, 0.01], [1.2, 0, 0.01], [1.3, 0, 0.01], [1.4, 0, 0.01]])
-    grad_bc = np.array([[0, 0, 0], [1.1, 0, 0.1], [1.2, 0, 0.1], [1.3, 0, 0.1], [1.4, 0, 0.1]])
-    gp.add_data(val_bc[:, 0], val_bc[:, 1], err_y=val_bc[:, 2], n=0)
-    gp.add_data(grad_bc[:, 0], grad_bc[:, 1], err_y=grad_bc[:, 2], n=1)
-    return True
+    def __init__(self, l1=1.0, l2=0.5, lw=0.1, x0=1.0, dtype=None):
+        hyps = np.array([float(l1), float(l2), float(lw), float(x0)])
+        super().__init__("Wtanh", self.__calc_warp, True, hyps, dtype=dtype)
+
+    def __copy__(self):
+        hyps = self.hyperparameters
+        bnds = self.bounds
+        kcopy = Tanh_WarpingFunction(hyps[0], hyps[1], hyps[2], hyps[3], dtype=self._dtype)
+        kcopy.enforce_bounds(self._force_bounds)
+        if bnds is not None:
+            kcopy.bounds = bnds
+        return kcopy
+
+
+def _build_kernel(hyperparams: np.ndarray | None = None) -> Gibbs_Kernel:
+    """Gibbs kernel with the tanh warp, at the start or given hyperparameters.
+
+    Bound enforcement is turned on for both the kernel and its warp. mkgp's
+    gradient-ascent optimizer never clamps to kbounds, so without this the
+    hyperparameters can wander out of the physical region into the degenerate
+    "all noise" fit (amplitude -> 0, edge length scale -> inf, profile pulled to
+    ~0). Enforcement also lets _run_gp pin the pedestal location by narrowing the
+    x0 bounds. set_kernel/__copy__ both preserve the enforce flag.
+    """
+    hyps = _HYP_START if hyperparams is None else np.asarray(hyperparams, dtype=float)
+    kernel = Gibbs_Kernel(hyps[0], wfunc=Tanh_WarpingFunction(*hyps[1:]))
+    kernel.enforce_bounds(True)
+    kernel._wfunc.enforce_bounds(True)
+    return kernel
+
+
+def _is_pedestal_resolved(x0: float) -> bool:
+    """True if a fitted pedestal location sits inside (not pushed to) the x0 bounds.
+
+    An x0 pinned at a bound means the optimizer found no clear pedestal in range,
+    so it should not be trusted to drive the other profile's location.
+    """
+    lo, hi = _HYP_BOUNDS[0, 4], _HYP_BOUNDS[1, 4]
+    margin = 0.02 * (hi - lo)
+    return lo + margin < x0 < hi - margin
+
+
+def _clean_inputs(data_X, data_y, err_y):
+    """Drop NaN points. Returns (X, y, err) or None if nothing valid remains."""
+    valid = ~np.isnan(data_y) & ~np.isnan(data_X) & ~np.isnan(err_y)
+    if not valid.any():
+        return None
+    return data_X[valid], data_y[valid], err_y[valid]
+
+
+def _run_gp(data_X, data_y, err_y, x_eval, hyperparams=None, optimize=True, pin_x0=None):
+    """Set up the GP with edge BCs and fit. Returns the GaussianProcess or None.
+
+    With optimize=True and hyperparams=None the hyperparameters are tuned (8 random
+    restarts, mkgp's native LML maximization). Otherwise the GP predicts at the
+    given (or default start) hyperparameters with no optimization.
+
+    pin_x0 narrows the x0 (pedestal location) bounds to a tight window around the
+    given value, so bound enforcement holds the pedestal there (used to tie the
+    Te pedestal location to the ne fit).
+    """
+    gp = GaussianProcess()
+    kbounds = _HYP_BOUNDS
+    if pin_x0 is not None:
+        kbounds = _HYP_BOUNDS.astype(float).copy()
+        kbounds[0, 4] = max(_HYP_BOUNDS[0, 4], pin_x0 - _X0_PIN_HALFWIDTH)
+        kbounds[1, 4] = min(_HYP_BOUNDS[1, 4], pin_x0 + _X0_PIN_HALFWIDTH)
+    gp.set_kernel(kernel=_build_kernel(hyperparams), kbounds=kbounds, regpar=1.0)
+    xdata = np.concatenate([data_X, _VALUE_BC[:, 0]])
+    ydata = np.concatenate([data_y, _VALUE_BC[:, 1]])
+    yerr = np.concatenate([err_y, _VALUE_BC[:, 2]])
+    gp.set_raw_data(
+        xdata=xdata,
+        ydata=ydata,
+        yerr=yerr,
+        dxdata=_GRAD_BC[:, 0],
+        dydata=_GRAD_BC[:, 1],
+        dyerr=_GRAD_BC[:, 2],
+    )
+    gp.set_search_parameters(epsilon=1.0e-2)
+    if optimize and hyperparams is None:
+        nrestarts = 8
+    else:
+        # predict-only at fixed hyperparameters. The public maxiter clamps
+        # to >=50, so poke _imax=0 to skip the gradient-ascent loop entirely.
+        gp._imax = 0
+        nrestarts = 0
+    try:
+        # mkgp prints optimizer status to stdout; keep worker logs clean.
+        with contextlib.redirect_stdout(io.StringIO()):
+            gp.GPRFit(np.asarray(x_eval, dtype=float), hsgp_flag=False, nrestarts=nrestarts)
+    except (ValueError, np.linalg.LinAlgError, FloatingPointError):
+        return None
+    return gp
+
+
+def _remove_outliers(data_X, data_y, err_y, sigma=2.0, max_drop_frac=0.3):
+    """Drop points lying > sigma combined-sigma from an un-optimized GP fit.
+
+    Mirrors the old gptools remove_outliers ordering: detect outliers with a fit
+    at the start hyperparameters, then the caller optimizes on the clean data.
+
+    Never drops more than max_drop_frac of the points: a reference fit that flags
+    a large fraction as outliers is itself unreliable (a genuinely bad slice, or
+    a real pedestal the smooth start-hyperparameter fit cannot follow), so in
+    that case all points are kept rather than gutting the profile - which was
+    producing completely wrong fits when most points got dropped.
+    """
+    n = data_X.size
+    if n < 3:
+        return data_X, data_y, err_y
+    gp = _run_gp(data_X, data_y, err_y, data_X, hyperparams=None, optimize=False)
+    if gp is None:
+        return data_X, data_y, err_y
+    mean = gp.get_gp_mean()
+    std = gp.get_gp_std(noise_flag=False)
+    keep = np.abs(data_y - mean) <= sigma * np.sqrt(std**2 + err_y**2)
+    n_keep = int(keep.sum())
+    if n_keep == n or n_keep < 3 or (n - n_keep) > max(1, round(max_drop_frac * n)):
+        return data_X, data_y, err_y
+    return data_X[keep], data_y[keep], err_y[keep]
 
 
 def fit_gp_hyperparameters(
     data_X: np.ndarray,
     data_y: np.ndarray,
     err_y: np.ndarray,
-    num_proc: int = 4,
 ) -> np.ndarray | None:
     """Fit GP hyperparameters once and return them for later reuse.
 
     Returns
     -------
     np.ndarray | None
-        Optimized free hyperparameters, or None if no valid input data remains
-        after NaN filtering.
+        Optimized hyperparameters [var, l1, l2, lw, x0], or None if no valid
+        input data remains after NaN filtering.
     """
-    gp = _build_gp()
-    if not _add_data_and_bcs(gp, data_X, data_y, err_y):
+    cleaned = _clean_inputs(data_X, data_y, err_y)
+    if cleaned is None:
         return None
-    gp.optimize_hyperparameters(verbose=False, random_starts=8, max_tries=4, num_proc=num_proc)
-    return np.asarray(gp.free_params, dtype=float)
+    data_X, data_y, err_y = _remove_outliers(*cleaned)
+    gp = _run_gp(data_X, data_y, err_y, np.asarray(data_X, dtype=float), optimize=True)
+    if gp is None:
+        return None
+    return np.asarray(gp.get_gp_kernel_details()[1], dtype=float)
 
 
 def gp_profile(
@@ -100,24 +268,41 @@ def gp_profile(
     calc_gradient: bool = False,
     hyperparams: np.ndarray | None = None,
     optimize_hyperparams: bool = True,
-    num_proc: int = 4,
+    pin_x0: float | None = None,
 ):
-    gp = _build_gp()
-    if not _add_data_and_bcs(gp, data_X, data_y, err_y):
-        return None, None, None, None
+    """Fit one profile and predict on X_star.
 
-    if hyperparams is not None:
-        gp.update_hyperparameters(np.asarray(hyperparams, dtype=float))
-    elif optimize_hyperparams:
-        gp.optimize_hyperparameters(verbose=False, random_starts=8, max_tries=4, num_proc=num_proc)
+    Returns (mean, std, grad_mean, grad_std, hyperparams), with the gradient
+    entries None unless calc_gradient, and all entries None if no valid data
+    remains. The fitted hyperparameters are returned so callers can read the
+    pedestal location (x0). pin_x0 holds the pedestal at a given location.
+    """
+    cleaned = _clean_inputs(data_X, data_y, err_y)
+    if cleaned is None:
+        return None, None, None, None, None
+    data_X, data_y, err_y = cleaned
 
-    y_star, std_y_star = gp.predict(X_star)
+    if hyperparams is None and optimize_hyperparams:
+        data_X, data_y, err_y = _remove_outliers(data_X, data_y, err_y)
 
+    gp = _run_gp(
+        data_X,
+        data_y,
+        err_y,
+        X_star,
+        hyperparams=hyperparams,
+        optimize=optimize_hyperparams,
+        pin_x0=pin_x0,
+    )
+    if gp is None:
+        return None, None, None, None, None
+
+    y_star = gp.get_gp_mean()
+    std_y_star = gp.get_gp_std(noise_flag=False)
+    hyps_out = np.asarray(gp.get_gp_kernel_details()[1], dtype=float)
     if not calc_gradient:
-        return y_star, std_y_star, None, None
-    else:
-        grad_y_star, std_grad_y_star = gp.predict(X_star, n=1)
-        return y_star, std_y_star, grad_y_star, std_grad_y_star
+        return y_star, std_y_star, None, None, hyps_out
+    return y_star, std_y_star, gp.get_gp_drv_mean(), gp.get_gp_drv_std(noise_flag=False), hyps_out
 
 
 # ----------------------------------------------------------------------
@@ -266,13 +451,15 @@ def _atomic_savez(path: Path | str, arrays: dict) -> None:
 # ----------------------------------------------------------------------
 # Batch fitting
 # ----------------------------------------------------------------------
-def _fit_slice(task: tuple) -> tuple[tuple[int, str, int], np.ndarray | None, np.ndarray | None]:
-    """Fit a single (shot, variable, time slice). Returns (key, y, std) or (key, None, None)."""
-    key, x, y, err, x_star, min_points, scale_per_slice, gp_num_proc, optimize, hyperparams = task
+def _fit_variable(x, y, err, x_star, min_points, scale_per_slice, optimize, hyperparams, pin_x0):
+    """Fit one variable of one time slice.
 
+    Returns (y_out, std_out, x0) or (None, None, None). x0 is the fitted pedestal
+    location (used to tie Te to ne); None when the slice is skipped or fails.
+    """
     valid = np.isfinite(x) & np.isfinite(y) & np.isfinite(err)
     if int(valid.sum()) < min_points:
-        return key, None, None
+        return None, None, None
 
     scale = 1.0
     if scale_per_slice:
@@ -281,9 +468,9 @@ def _fit_slice(task: tuple) -> tuple[tuple[int, str, int], np.ndarray | None, np
         with np.errstate(all="ignore"):
             scale = float(np.nanmax(y))
         if not np.isfinite(scale) or scale < 1e-6:
-            return key, None, None
+            return None, None, None
 
-    y_star, std_y_star, _, _ = gp_profile(
+    y_star, std_y_star, _, _, hyps = gp_profile(
         data_X=np.asarray(x, dtype=float),
         data_y=np.asarray(y, dtype=float) / scale,
         err_y=np.asarray(err, dtype=float) / scale,
@@ -291,16 +478,39 @@ def _fit_slice(task: tuple) -> tuple[tuple[int, str, int], np.ndarray | None, np
         calc_gradient=False,
         hyperparams=hyperparams,
         optimize_hyperparams=optimize,
-        num_proc=gp_num_proc,
+        pin_x0=pin_x0,
     )
     if y_star is None:
-        return key, None, None
+        return None, None, None
 
     # Last resort: the GP mean can ring below zero between the outermost
     # measurement and the edge boundary conditions, so clamp to non-negative
     y_out = np.clip(np.asarray(y_star, dtype=float).ravel() * scale, 0.0, None)
     std_out = np.asarray(std_y_star, dtype=float).ravel() * scale
-    return key, y_out, std_out
+    x0 = None if hyps is None else float(hyps[4])
+    return y_out, std_out, x0
+
+
+def _fit_slice(task: tuple):
+    """Fit Te and ne for one (shot, time slice).
+
+    ne is fit first; when optimizing, its pedestal location pins Te's so both
+    profiles place the high-gradient region at the same rho. (Density is the
+    cleaner pedestal indicator in C-Mod H-mode.) If the ne pedestal is not
+    clearly resolved, Te is fit freely. The fixed-hyperparameter path leaves
+    both profiles independent.
+
+    Returns (shot, i_time, te_y, te_std, ne_y, ne_std); any value is None when
+    that variable's slice was skipped or failed.
+    """
+    (shot, i_time), x, te_y, te_err, ne_y, ne_err, x_star, min_points, scale_per_slice, optimize, hyperparams = task
+    tie_x0 = optimize and hyperparams is None
+
+    ne_y_out, ne_std_out, ne_x0 = _fit_variable(x, ne_y, ne_err, x_star, min_points, scale_per_slice, optimize, hyperparams, None)
+    pin_x0 = ne_x0 if (tie_x0 and ne_x0 is not None and _is_pedestal_resolved(ne_x0)) else None
+    te_y_out, te_std_out, _ = _fit_variable(x, te_y, te_err, x_star, min_points, scale_per_slice, optimize, hyperparams, pin_x0)
+
+    return shot, i_time, te_y_out, te_std_out, ne_y_out, ne_std_out
 
 
 def fit_batch(
@@ -313,16 +523,17 @@ def fit_batch(
     hyperparams: np.ndarray | None = None,
     max_slices_per_shot: int | None = None,
 ) -> dict[int, ShotFitOutput]:
-    """GP fit every (shot, variable, time slice) in the batch.
+    """GP fit every (shot, time slice) in the batch.
 
     Hyperparameters are optimized for each individual profile, since plasma
-    conditions (and thus profile shapes) change over the course of a shot.
+    conditions (and thus profile shapes) change over the course of a shot. Te and
+    ne of a slice are fit together so they can share one pedestal location (see
+    _fit_slice).
 
-    With num_workers == 1, slices are fit serially and the GP hyperparameter
-    optimizer uses its own internal parallelism (num_proc=4, the historical
-    serial behavior). With num_workers > 1, slices are fit in parallel
-    processes and the internal optimizer parallelism is disabled to avoid
-    oversubscription.
+    Slices are fit serially (num_workers == 1) or across worker processes
+    (num_workers > 1). mkgp fits are single-threaded, so parallelism comes only
+    from the slice-level pool. BLAS threads are pinned to 1 (see module top) to
+    avoid oversubscription.
 
     Parameters
     ----------
@@ -330,31 +541,28 @@ def fit_batch(
         If set, only fit the first N time slices of each shot (debug aid).
     """
     x_star = np.asarray(x_star, dtype=float)
-    gp_num_proc = 4 if num_workers == 1 else 1
 
     tasks = []
     for shot, si in shot_inputs.items():
-        for var in VARIABLES:
-            y_all = getattr(si, f"{var}_y")
-            err_all = getattr(si, f"{var}_err")
-            n_t = y_all.shape[0]
-            if max_slices_per_shot is not None:
-                n_t = min(n_t, max_slices_per_shot)
-            tasks.extend(
-                (
-                    (shot, var, i_time),
-                    si.x[i_time, :],
-                    y_all[i_time, :],
-                    err_all[i_time, :],
-                    x_star,
-                    min_points,
-                    scale_per_slice,
-                    gp_num_proc,
-                    optimize_hyperparams,
-                    hyperparams,
-                )
-                for i_time in range(n_t)
+        n_t = si.te_y.shape[0]
+        if max_slices_per_shot is not None:
+            n_t = min(n_t, max_slices_per_shot)
+        tasks.extend(
+            (
+                (shot, i_time),
+                si.x[i_time, :],
+                si.te_y[i_time, :],
+                si.te_err[i_time, :],
+                si.ne_y[i_time, :],
+                si.ne_err[i_time, :],
+                x_star,
+                min_points,
+                scale_per_slice,
+                optimize_hyperparams,
+                hyperparams,
             )
+            for i_time in range(n_t)
+        )
 
     n_x = len(x_star)
     outputs = {
@@ -368,12 +576,14 @@ def fit_batch(
     }
 
     def _store(result):
-        (shot, var, i_time), y_out, std_out = result
-        if y_out is None:
-            return
+        shot, i_time, te_y_out, te_std_out, ne_y_out, ne_std_out = result
         so = outputs[shot]
-        getattr(so, f"{var}_fit")[i_time, :] = y_out
-        getattr(so, f"{var}_std")[i_time, :] = std_out
+        if te_y_out is not None:
+            so.te_fit[i_time, :] = te_y_out
+            so.te_std[i_time, :] = te_std_out
+        if ne_y_out is not None:
+            so.ne_fit[i_time, :] = ne_y_out
+            so.ne_std[i_time, :] = ne_std_out
 
     n_total = len(tasks)
     n_done = 0
@@ -383,19 +593,19 @@ def fit_batch(
             _store(_fit_slice(task))
             n_done += 1
             if n_done % 10 == 0:
-                print(f"[fit_worker] {n_done}/{n_total} slice fits done", flush=True)
+                print(f"[fit_worker] {n_done}/{n_total} slices (Te+ne) done", flush=True)
     else:
         with multiprocessing.Pool(processes=num_workers) as pool:
             for result in pool.imap_unordered(_fit_slice, tasks, chunksize=1):
                 _store(result)
                 n_done += 1
                 if n_done % 50 == 0:
-                    print(f"[fit_worker] {n_done}/{n_total} slice fits done", flush=True)
+                    print(f"[fit_worker] {n_done}/{n_total} slices (Te+ne) done", flush=True)
 
     elapsed = time.monotonic() - t_start
     print(
-        f"[fit_worker] finished {n_total} slice fits for {len(shot_inputs)} shots "
-        f"in {elapsed:.0f}s ({elapsed / max(n_total, 1):.2f}s per slice fit)",
+        f"[fit_worker] finished {n_total} slices (Te+ne) for {len(shot_inputs)} shots "
+        f"in {elapsed:.0f}s ({elapsed / max(n_total, 1):.2f}s per slice)",
         flush=True,
     )
     return outputs
@@ -405,6 +615,7 @@ def fit_batch(
 # CLI entry point (used on the cluster)
 # ----------------------------------------------------------------------
 def main(argv: list[str] | None = None) -> None:
+    # Typically I prefer using fire but to minimize deps we're using argparse here
     parser = argparse.ArgumentParser(description="GP profile fitting worker")
     parser.add_argument("input", help="Path to batch input npz")
     parser.add_argument("output", help="Path to write batch output npz")

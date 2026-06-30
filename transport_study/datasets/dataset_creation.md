@@ -26,7 +26,7 @@ and do the remainder of the data preparation workflow from there.
 
 ## Distributed GP profile fitting (C-Mod and MAST)
 
-GP profile fitting with gptools takes ~10 minutes per shot, so fitting a ~1000 shot dataset serially takes about
+GP profile fitting with mkgp takes ~10 minutes per shot, so fitting a ~1000 shot dataset serially takes about
 a week. The C-Mod and MAST workflows can dispatch the fitting to a SLURM cluster while keeping data retrieval and
 dataset assembly local (the cluster has no access to the C-Mod data source). Without any cluster options the
 workflows run fully serially, so the datasets remain reproducible (for anyone patient enough).
@@ -56,7 +56,7 @@ Host <ssh-host>
 # Register the SSH profile (host comes from ~/.ssh/config)
 srunx ssh profile add <profile-name> --ssh-host <ssh-host>
 
-# Build the minimal fitting venv (numpy + scipy + gptools) on the cluster scratch space
+# Build the minimal fitting venv (numpy + scipy + mkgp) on the cluster scratch space
 bash transport_study/datasets/gp_fitting/bootstrap_remote.sh <ssh-host> <path-to-venv>
 ```
 
@@ -72,7 +72,7 @@ python transport_study/datasets/cli.py cmod \
 ```
 
 Notes:
-- The fitting partition should be a CPU partition since gptools cannot use GPUs.
+- The fitting partition should be a CPU partition since mkgp cannot use GPUs.
 - Configure the following arguments according to your cluster's resources and user quotas
     - `--cluster_max_jobs` (default 8)
     - `--cluster_shots_per_batch` (default 50)

@@ -81,13 +81,12 @@ def test_shot_30284_production_fit_on_one_slice(fit_input, workflow):
     assert valid_per_slice[i_time] >= workflow.fit_min_points
 
     scale = float(np.nanmax(fit_input.te_y[i_time, :]))
-    y_star, _, _, _ = gp_profile(
+    y_star, _, _, _, _ = gp_profile(
         data_X=fit_input.x[i_time, :].astype(float),
         data_y=fit_input.te_y[i_time, :].astype(float) / scale,
         err_y=fit_input.te_err[i_time, :].astype(float) / scale,
         X_star=workflow.gp_fit_rho,
         optimize_hyperparams=True,
-        num_proc=1,
     )
     assert y_star is not None
     te_fit = np.asarray(y_star).ravel() * scale

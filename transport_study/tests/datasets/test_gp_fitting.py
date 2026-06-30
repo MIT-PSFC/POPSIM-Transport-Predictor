@@ -12,6 +12,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
+from transport_study import PACKAGE_ROOT
 from transport_study.datasets.gp_fitting.dispatcher import (
     ClusterFitConfig,
     ClusterFitDispatcher,
@@ -399,3 +400,188 @@ def test_worker_main_end_to_end(tmp_path):
     assert np.isfinite(out.te_fit).all()
     assert (out.te_fit >= 0).all()
     assert abs(out.te_fit[0, 0] - 2.0) < 0.5
+
+
+# ----------------------------------------------------------------------
+# Real-data spot checks (pull source data, fit a few slices, save plots)
+# ----------------------------------------------------------------------
+# One PDF per shot lands here for manual eyeballing of fit quality.
+GP_FIT_PLOT_DIR = PACKAGE_ROOT / "tests" / "test_outputs" / "gp_fitting"
+
+# mkgp's optimizer draws its random restarts from the global numpy RNG. Seed it
+# so these spot-check fits and the plots they save are reproducible run to run.
+# blue: this pins one realization and hides the run-to-run restart variability
+# that is itself a failure mode of the unseeded production fit.
+GP_FIT_SEED = 0
+
+
+def _nearest_indices(times: np.ndarray, targets) -> list[int]:
+    return [int(np.argmin(np.abs(times - t))) for t in targets]
+
+
+def _slice_input(fit_input: ShotFitInput, idxs) -> ShotFitInput:
+    """A ShotFitInput holding only the given time-slice rows (in idxs order)."""
+    return ShotFitInput(
+        x=fit_input.x[idxs],
+        te_y=fit_input.te_y[idxs],
+        te_err=fit_input.te_err[idxs],
+        ne_y=fit_input.ne_y[idxs],
+        ne_err=fit_input.ne_err[idxs],
+    )
+
+
+@pytest.mark.slow
+class TestGPFitCMOD:
+    """Spot check the GP fitting on select C-Mod shots and timesteps.
+
+    Pulls Thomson + EFIT through the same _prepare_shot codepath the cmod CLI
+    uses (so TS channels get mapped onto rho), fits a handful of TS measurement
+    times with the production GP path, and writes one diagnostic PDF per shot to
+    tests/test_outputs/gp_fitting for eyeballing. The plots show the exact
+    (floored, unit-converted) channel data the fit consumed. Requires local
+    C-Mod MDSplus access; skips otherwise.
+    """
+
+    # TS measurement times [s] to spot-check per shot. These slices are the ones
+    # known to produce questionable fits, so they are the ones worth inspecting.
+    SPOT_CHECK = {
+        1160503003: [0.710, 1.610],
+        1160503001: [1.010, 1.110, 1.610],
+    }
+
+    @pytest.fixture(scope="class")
+    def workflow(self, tmp_path_factory):
+        try:
+            from transport_study.datasets.cmod.cmod_dataset import CModDataWorkflow
+        except ImportError as e:
+            pytest.skip(f"C-Mod workflow deps unavailable: {e}")
+        tmp = tmp_path_factory.mktemp("cmod_gpfit")
+        shotlist = tmp / "shotlist"
+        shotlist.write_text("\n".join(str(s) for s in self.SPOT_CHECK) + "\n")
+        return CModDataWorkflow(
+            ds_name="cmod_gpfit_test",
+            shotlist_file=shotlist,
+            data_assembly_dir=tmp,
+            max_num_shots=len(self.SPOT_CHECK),
+        )
+
+    @pytest.mark.parametrize("shot", list(SPOT_CHECK))
+    def test_spot_check_shot(self, workflow, shot):
+        import xarray as xr
+
+        try:
+            fit_input = workflow._prepare_shot(shot)
+        except Exception as e:
+            pytest.skip(f"C-Mod data unreachable for shot {shot}: {e}")
+        if fit_input is None:
+            pytest.skip(f"C-Mod shot {shot} returned no fittable data (data access?)")
+
+        thomson_path, _ = workflow._staging_paths(shot)
+        ds_thomson = xr.load_dataset(thomson_path)
+        times = ds_thomson.squeeze("shot", drop=True)["time"].values
+        idxs = _nearest_indices(times, self.SPOT_CHECK[shot])
+
+        np.random.seed(GP_FIT_SEED)
+        out = fit_batch(
+            {shot: _slice_input(fit_input, idxs)},
+            x_star=workflow.gp_fit_rho,
+            min_points=workflow.fit_min_points,
+            scale_per_slice=workflow.fit_scale_per_slice,
+            num_workers=1,
+        )[shot]
+
+        # Every requested slice must produce a usable (finite, non-empty) fit
+        for k, t in enumerate(self.SPOT_CHECK[shot]):
+            assert np.isfinite(out.te_fit[k]).any(), f"shot {shot} t={t}: Te fit all NaN"
+            assert np.isfinite(out.ne_fit[k]).any(), f"shot {shot} t={t}: ne fit all NaN"
+
+        ds_profiles = workflow._profiles_dataset_from_fit(shot, times[idxs], out)
+        workflow._debug_plot_profiles(
+            shot,
+            ds_thomson.isel(time=idxs),
+            ds_profiles,
+            debug_plot_dir=GP_FIT_PLOT_DIR,
+        )
+        assert (GP_FIT_PLOT_DIR / f"{shot}_ts_gp_fit.pdf").exists()
+
+
+@pytest.mark.slow
+class TestGPFitMAST:
+    """Spot check the GP fitting on a MAST shot and a few timesteps.
+
+    Mirrors TestGPFitCMOD against the open-access MAST S3 store (shot 30284),
+    using the mast CLI's _prepare_shot codepath. The best-covered TS slices are
+    fit and a diagnostic PDF is written to tests/test_outputs/gp_fitting.
+    Requires network access to the MAST store; skips otherwise.
+    """
+
+    SHOT = 30284
+    N_SPOT_CHECK = 3  # number of best-covered TS slices to fit and plot
+
+    @pytest.fixture(scope="class")
+    def workflow(self, tmp_path_factory):
+        try:
+            from transport_study.datasets.mast.mast_dataset import (
+                MASTDataWorkflow,
+                _check_required_signals,
+                config,
+            )
+        except ImportError as e:
+            pytest.skip(f"MAST workflow deps unavailable: {e}")
+        try:
+            reachable = _check_required_signals(self.SHOT, config["data_sources"])
+        except Exception:
+            reachable = False
+        if not reachable:
+            pytest.skip(f"MAST store unreachable or shot {self.SHOT} missing")
+        tmp = tmp_path_factory.mktemp("mast_gpfit")
+        shotlist = tmp / "shotlist"
+        shotlist.write_text(f"{self.SHOT}\n")
+        return MASTDataWorkflow(
+            ds_name="mast_gpfit_test",
+            shotlist_file=shotlist,
+            data_assembly_dir=tmp,
+            max_num_shots=1,
+        )
+
+    def test_spot_check(self, workflow):
+        import xarray as xr
+
+        fit_input = workflow._prepare_shot(self.SHOT)
+        if fit_input is None:
+            pytest.skip(f"MAST shot {self.SHOT} returned no fittable data")
+
+        ds_staging = xr.load_dataset(workflow._staging_path(self.SHOT))
+        ts_time = ds_staging["ts_time"].values
+        te_eV = ds_staging["ts_te_eV"].values
+        ne_m3 = ds_staging["ts_ne_m3"].values
+        rho_ts = ds_staging["ts_rho"].values
+
+        # Plot the slices with the most valid channels (mid-shot, hot plasma)
+        valid_per_slice = np.sum(np.isfinite(fit_input.x) & np.isfinite(fit_input.te_y), axis=1)
+        idxs = sorted(int(i) for i in np.argsort(valid_per_slice)[::-1][: self.N_SPOT_CHECK])
+
+        np.random.seed(GP_FIT_SEED)
+        out = fit_batch(
+            {self.SHOT: _slice_input(fit_input, idxs)},
+            x_star=workflow.gp_fit_rho,
+            min_points=workflow.fit_min_points,
+            scale_per_slice=workflow.fit_scale_per_slice,
+            num_workers=1,
+        )[self.SHOT]
+
+        for k, i in enumerate(idxs):
+            assert np.isfinite(out.te_fit[k]).any(), f"slice {i}: Te fit all NaN"
+            assert np.isfinite(out.ne_fit[k]).any(), f"slice {i}: ne fit all NaN"
+
+        workflow._debug_plot_profiles(
+            self.SHOT,
+            ts_time[idxs],
+            te_eV[idxs] / 1e3,
+            ne_m3[idxs] / 1e20,
+            rho_ts[idxs],
+            out.te_fit,
+            out.ne_fit,
+            GP_FIT_PLOT_DIR,
+        )
+        assert (GP_FIT_PLOT_DIR / f"{self.SHOT}_ts_gp_fit.pdf").exists()
