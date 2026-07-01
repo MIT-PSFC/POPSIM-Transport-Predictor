@@ -3,6 +3,7 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 import numpy as np
 import xarray as xr
+from matplotlib.backends.backend_pdf import PdfPages
 
 BACKGROUND_COLOR = "#2F2F2F"
 FACE_COLOR = "#1A1A1A"
@@ -702,4 +703,166 @@ def compare_powers(
 
         fig.tight_layout()
         fig.savefig(f"{fig_dir}/power_comparison_{shot}.png", dpi=150, bbox_inches="tight")
+        plt.close(fig)
+
+
+_SUMMARY_PANEL_DEFS = [
+    dict(
+        left_vars=["Ip_MA"],
+        left_label="Ip [MA]",
+        left_colors={"Ip_MA": "cyan"},
+        right_vars=["betan"],
+        right_label="betan",
+        right_colors={"betan": "magenta"},
+    ),
+    dict(
+        left_vars=["ne20_line_avg", "ne20_edge"],
+        left_label="ne20 [1e20 m^-3]",
+        left_colors={"ne20_line_avg": "white", "ne20_edge": "yellow"},
+        right_vars=["B0"],
+        right_label="B0 [T]",
+        right_colors={"B0": "magenta"},
+    ),
+    dict(
+        left_vars=["a_minor", "kappa", "delta_top", "delta_bot"],
+        left_label="Shaping",
+        left_colors={"a_minor": "red", "kappa": "yellow", "delta_top": "lime", "delta_bot": "green"},
+    ),
+    dict(
+        left_vars=["P_oh_MW", "P_rad_MW", "P_NBI_MW", "P_ECRH_MW", "P_LH_MW", "P_ICRF_MW"],
+        left_label="Power [MW]",
+        left_colors={
+            "P_oh_MW": "orange",
+            "P_rad_MW": "red",
+            "P_NBI_MW": "cyan",
+            "P_ECRH_MW": "lime",
+            "P_LH_MW": "yellow",
+            "P_ICRF_MW": "magenta",
+        },
+    ),
+]
+
+
+def _plot_summary_panel(ax, shot_ds, left_vars, left_label, left_colors, right_vars=None, right_label=None, right_colors=None):
+    """Plot one group of signals for a single shot onto ax (and a twin axis if right_vars given)"""
+    for var in left_vars:
+        if var in shot_ds:
+            ax.plot(shot_ds["time"], shot_ds[var], label=var, color=left_colors.get(var))
+    ax.set_ylabel(left_label, fontsize=LABEL_FONTSIZE, color=TEXT_COLOR)
+
+    axes = [ax]
+    if right_vars:
+        ax_right = ax.twinx()
+        for var in right_vars:
+            if var in shot_ds:
+                ax_right.plot(shot_ds["time"], shot_ds[var], label=var, color=right_colors.get(var), linestyle="--")
+        ax_right.set_ylabel(right_label, fontsize=LABEL_FONTSIZE, color=TEXT_COLOR)
+        ax_right.tick_params(axis="y", labelsize=TICK_FONTSIZE, colors=TEXT_COLOR)
+        axes.append(ax_right)
+    return axes
+
+
+def _shot_summary_page(shot_ds, shot, title):
+    """Build one page of input-signal time traces for a single shot"""
+    fig, axes = plt.subplots(len(_SUMMARY_PANEL_DEFS), 1, figsize=(11, 14), sharex=True)
+    fig.patch.set_facecolor(BACKGROUND_COLOR)
+    fig.suptitle(f"{title} - shot {shot}", fontsize=TITLE_FONTSIZE, color=TEXT_COLOR)
+
+    all_axes = []
+    for ax, panel in zip(axes, _SUMMARY_PANEL_DEFS, strict=True):
+        all_axes += _plot_summary_panel(ax, shot_ds, **panel)
+        if ax.get_legend_handles_labels()[0]:
+            ax.legend(
+                fontsize=LEGEND_FONTSIZE,
+                facecolor=BACKGROUND_COLOR,
+                edgecolor=BACKGROUND_COLOR,
+                loc="upper left",
+            )
+
+    axes[-1].set_xlabel("Time [s]", fontsize=LABEL_FONTSIZE, color=TEXT_COLOR)
+
+    for ax in all_axes:
+        ax.set_facecolor(FACE_COLOR)
+        ax.tick_params(axis="both", labelsize=TICK_FONTSIZE, colors=TEXT_COLOR)
+    for ax in axes:
+        ax.grid(True, color="gray", linestyle="--", linewidth=0.1)
+        try:
+            for text in ax.get_legend().get_texts():
+                text.set_color(TEXT_COLOR)
+        except AttributeError:
+            pass
+
+    fig.tight_layout()
+    return fig
+
+
+def _summary_stats_page(ds, title):
+    """Build a table figure of min / max / mean / std for every data variable"""
+    rows = []
+    for var in ds.data_vars:
+        values = ds[var]
+        try:
+            var_min = float(values.min(skipna=True).compute())
+            var_max = float(values.max(skipna=True).compute())
+            var_mean = float(values.mean(skipna=True).compute())
+            var_std = float(values.std(skipna=True).compute())
+        except (ValueError, TypeError):
+            continue  # No valid values, or a non-numeric variable
+        rows.append([var, f"{var_min:.4g}", f"{var_max:.4g}", f"{var_mean:.4g}", f"{var_std:.4g}"])
+
+    fig, ax = plt.subplots(figsize=(11, 8.5))
+    fig.patch.set_facecolor(BACKGROUND_COLOR)
+    ax.set_facecolor(BACKGROUND_COLOR)
+    ax.axis("off")
+    fig.suptitle(f"{title} - Summary Statistics", fontsize=TITLE_FONTSIZE, color=TEXT_COLOR)
+
+    table = ax.table(
+        cellText=rows,
+        colLabels=["Variable", "Min", "Max", "Mean", "Std"],
+        loc="center",
+        cellLoc="center",
+    )
+    table.auto_set_font_size(False)
+    table.set_fontsize(9)
+    table.scale(1, 1.2)
+    for (row, _col), cell in table.get_celld().items():
+        cell.set_edgecolor("gray")
+        cell.get_text().set_color(TEXT_COLOR)
+        cell.set_facecolor(FACE_COLOR if row > 0 else BACKGROUND_COLOR)
+
+    fig.tight_layout()
+    return fig
+
+
+def ds_summary_report(
+    ds: str | xr.Dataset,
+    pdf_path: Path | str,
+    title: str = "Dataset Summary Report",
+    num_shots: int | None = None,
+):
+    """Make a multi-page PDF report of time traces for all input signals, plus a summary stats page.
+
+    One page per shot, each with 4 panels:
+    1. Ip_MA and betan
+    2. B0 and ne20 (line-average and edge)
+    3. Shaping parameters (a_minor, kappa, delta_top, delta_bot)
+    4. Power sources and sinks
+
+    A final page has summary statistics (min / max / mean / std) for every variable.
+    """
+    if isinstance(ds, (str, Path)):
+        ds_path = str(ds)
+        ds = xr.open_zarr(ds_path) if ds_path.endswith(".zarr") else xr.open_dataset(ds_path)
+
+    Path(pdf_path).parent.mkdir(parents=True, exist_ok=True)
+    shots = ds["shot"].data if num_shots is None else ds["shot"].data[:num_shots]
+
+    with PdfPages(pdf_path) as pdf:
+        for shot in shots:
+            fig = _shot_summary_page(ds.sel(shot=shot), shot, title)
+            pdf.savefig(fig)
+            plt.close(fig)
+
+        fig = _summary_stats_page(ds, title)
+        pdf.savefig(fig)
         plt.close(fig)
