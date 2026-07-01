@@ -9,9 +9,12 @@ level1_path = "mast/level1/shots"
 level1_efm_group = "efm"
 
 [profile_fitting]
-# Output rho grid (normalized minor radius) for GP-fitted profiles
+# Output rho grid (normalized minor radius) for GP-fitted profiles. rho_max
+# extends past the separatrix so the grid covers the edge value BCs at rho
+# 1.1-1.4 (see fit_worker _VALUE_BC); otherwise the roll-off to zero never
+# appears in the output or the fit diagnostic plots.
 rho_min = 0.0
-rho_max = 1.0
+rho_max = 1.1
 num_rho_points = 64
 # Minimum valid (rho, value) pairs required per timestep to run the GP fit
 min_ts_points = 10
