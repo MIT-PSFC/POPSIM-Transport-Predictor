@@ -104,10 +104,10 @@ class Tanh_WarpingFunction(_WarpingFunction):
 
     l(z) = 0.5 * ((l1 + l2) - (l1 - l2) * tanh((z - x0) / lw))
 
-    mkgp ships only Constant/Linear/IG warps, so this reproduces the old gptools
-    GibbsKernel1dTanh length scale. hyps = [l1, l2, lw, x0]. Analytic z- and
-    hyperparameter-derivatives are provided (verified against finite differences)
-    so mkgp's analytic LML-gradient optimizer path stays valid.
+    mkgp ships only Constant/Linear/IG warps, so this adds the tanh length
+    scale. hyps = [l1, l2, lw, x0]. Analytic z- and hyperparameter-derivatives
+    are provided (verified against finite differences) so mkgp's analytic
+    LML-gradient optimizer path stays valid.
     """
 
     def __calc_warp(self, zz, der=0, hder=None):
@@ -368,44 +368,85 @@ def _run_gp(data_X, data_y, err_y, x_eval, hyperparams=None, optimize=True, pin_
     return best_gp
 
 
-def _remove_outliers(data_X, data_y, err_y, sigma=3.0, max_drop_frac=0.3, ref_hyperparams=None):
-    """Drop points lying > sigma combined-sigma from a reference GP fit.
+def _loo_standardized_residuals(data_X, data_y, err_y, hyperparams) -> np.ndarray | None:
+    """Leave-one-out standardized residual at every data point.
 
-    Mirrors the old gptools remove_outliers ordering: detect outliers with a
-    reference fit, then the caller optimizes on the clean data.
+    Uses the closed-form GP LOO identities (Rasmussen & Williams 5.12): for
+    C = (K + diag(err^2))^-1 and alpha = C @ y, the LOO residual at point i is
+    alpha_i / C_ii and its predictive std is 1/sqrt(C_ii), so the standardized
+    residual is simply alpha_i / sqrt(C_ii). Every point is thus predicted from
+    all the others (never from itself) in a single matrix solve, with no
+    per-point or reference GP fit.
 
-    ref_hyperparams, when given, fixes the reference fit at those (already
-    optimized) hyperparameters instead of the generic, un-tuned _HYP_START.
-    gp_profile's two-pass call supplies its own rough-optimized hyperparameters
-    here: a single generic reference can be too smooth for a genuinely steep or
-    locally noisy slice, and once it is wrong in one spot it can flag several
-    real points as outliers together. Seen on a C-Mod Te slice: a near-zero
-    misfired channel sandwiched between two ~4 keV core points dragged a
-    generic reference down enough that both real points looked like outliers
-    too, and all three got dropped, leaving the core with no supporting data
-    at all. A reference built from the slice's own shape does not have that
-    failure mode. sigma=3.0 (rather than the stricter 2.0) further tolerates
-    reference/data mismatch on genuinely steep slices.
-
-    Never drops more than max_drop_frac of the points: a reference fit that flags
-    a large fraction as outliers is itself unreliable (a genuinely bad slice, or
-    a real pedestal the reference fit cannot follow), so in that case all points
-    are kept rather than gutting the profile - which was producing completely
-    wrong fits when most points got dropped.
+    The edge value BCs (_VALUE_BC) are appended as fixed training points so edge
+    channels are judged against the same "pull to zero past the separatrix"
+    constraint the real fit sees; residuals are returned for the real data
+    points only. hyperparams sets the kernel (length scales etc.). Returns None
+    if the covariance solve fails or is not positive definite.
     """
-    n = data_X.size
-    if n < 3:
+    x = np.concatenate([data_X, _VALUE_BC[:, 0]])
+    y = np.concatenate([data_y, _VALUE_BC[:, 1]])
+    err = np.concatenate([err_y, _VALUE_BC[:, 2]])
+
+    kernel = _build_kernel(hyperparams)
+    try:
+        K = np.asarray(kernel(x, x, der=0), dtype=float)
+        K[np.diag_indices_from(K)] += err**2
+        C = np.linalg.inv(K)
+    except (np.linalg.LinAlgError, ValueError, FloatingPointError):
+        return None
+
+    c_diag = np.diag(C)
+    if np.any(c_diag <= 0) or not np.all(np.isfinite(c_diag)):
+        return None
+    z = (C @ y) / np.sqrt(c_diag)
+    return z[: data_X.size]
+
+
+def _remove_outliers(data_X, data_y, err_y, sigma=3.0, max_drop_frac=0.3, ref_hyperparams=None):
+    """Drop points whose leave-one-out standardized residual exceeds sigma,
+    worst first, one at a time.
+
+    Judging each point by its LOO residual (_loo_standardized_residuals) - the
+    prediction from every other point, never from itself - is what makes this
+    robust: a bad channel cannot pull the reference toward itself to hide, so it
+    stands out as the single largest residual. But one bad point also inflates
+    its neighbors' residuals (they are still predicted using it), so flagging
+    every point over sigma in one pass over-drops - it removes the offender and
+    the good neighbors it swamped together. Instead this drops only the single
+    worst point, recomputes the LOO residuals on what remains, and repeats:
+    once the offender is gone its neighbors fall back below sigma and are kept.
+
+    ref_hyperparams sets the LOO kernel length scales (the slice's own
+    rough-optimized shape from gp_profile's first pass); falls back to the
+    generic _HYP_START if None. Held fixed across iterations - refitting each
+    pass would be the old cost back. sigma=3.0 (rather than a stricter 2.0)
+    tolerates reference/data mismatch on genuinely steep slices.
+
+    Stops at max_drop_frac of the points (and never below 3): a slice needing
+    more than that is either genuinely bad or a real pedestal the fixed length
+    scale cannot follow, and gutting it further only produces worse fits.
+    """
+    n0 = data_X.size
+    if n0 < 3:
         return data_X, data_y, err_y
-    gp = _run_gp(data_X, data_y, err_y, data_X, hyperparams=ref_hyperparams, optimize=False)
-    if gp is None:
-        return data_X, data_y, err_y
-    mean = gp.get_gp_mean()
-    std = gp.get_gp_std(noise_flag=False)
-    keep = np.abs(data_y - mean) <= sigma * np.sqrt(std**2 + err_y**2)
-    n_keep = int(keep.sum())
-    if n_keep == n or n_keep < 3 or (n - n_keep) > max(1, round(max_drop_frac * n)):
-        return data_X, data_y, err_y
-    return data_X[keep], data_y[keep], err_y[keep]
+
+    x, y, err = data_X, data_y, err_y
+    max_drop = max(1, round(max_drop_frac * n0))
+    n_dropped = 0
+    while x.size > 3 and n_dropped < max_drop:
+        z = _loo_standardized_residuals(x, y, err, ref_hyperparams)
+        if z is None:
+            break
+        i_worst = int(np.argmax(np.abs(z)))
+        if np.abs(z[i_worst]) <= sigma:
+            break
+        keep = np.ones(x.size, dtype=bool)
+        keep[i_worst] = False
+        x, y, err = x[keep], y[keep], err[keep]
+        n_dropped += 1
+
+    return x, y, err
 
 
 def _rough_hyperparameters(data_X, data_y, err_y) -> np.ndarray | None:
