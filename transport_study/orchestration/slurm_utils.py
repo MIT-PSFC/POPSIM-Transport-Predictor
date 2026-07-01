@@ -1,3 +1,4 @@
+import getpass
 import re
 import subprocess
 import sys
@@ -68,9 +69,36 @@ def count_idle_gpus(partition: str | None = None, buffer_gpus: int | None = None
     return max(avail - buffer_gpus, 0)  # Don't report negative available GPUs, just 0
 
 
+def count_pending_jobs(partition: str | None = None) -> int:
+    """Count this user's pending jobs on the partition."""
+    if partition is None:
+        partition = config.partition
+    result = subprocess.run(
+        [
+            "squeue",
+            "-p",
+            partition,
+            "-u",
+            getpass.getuser(),
+            "--state=PENDING",
+            "--noheader",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        logger.critical(f"squeue failed: {result.stderr}")
+        return 999999  # Return a large number to prevent launching more jobs if squeue fails
+    return len(result.stdout.strip().split("\n")) if result.stdout.strip() else 0
+
+
 def resources_available(partition: str | None = None, buffer_gpus: int | None = None) -> bool:
     idle_gpus = count_idle_gpus(partition, buffer_gpus)
-    return idle_gpus > 0
+    pending_jobs = count_pending_jobs(partition)
+    # Pending jobs will consume idle GPUs once scheduled, so only launch more
+    # when there are more idle GPUs than jobs already queued.
+    return idle_gpus > pending_jobs
 
 
 def launch_train_parallel(
