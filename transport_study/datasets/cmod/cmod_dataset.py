@@ -215,6 +215,13 @@ class CModDataWorkflow(DataWorkflow):
             data_y = np.where(data_y < 0.001, np.nan, data_y)
             err_y = np.where(err_y < 0.001, np.nan, err_y)
 
+            if variable == "te":
+                # Near the magnetic axis, Te this low is not physically real -
+                # almost certainly a broken channel, not a genuine reading
+                # (unlike near the edge, where Te legitimately falls this low).
+                core_problem = (data_x >= 0.0) & (data_x < 0.4) & (data_y < 0.4)
+                data_y = np.where(core_problem, np.nan, data_y)
+
             # Historic data, we're mostly going off vibes anyway
             err_y = np.where(err_y < 0.1, 0.1, err_y)
 
@@ -325,7 +332,7 @@ class CModDataWorkflow(DataWorkflow):
 
         # Only make fit diagnostic plots for shots that are kept
         try:
-            self._debug_plot_profiles(shot, ds_thomson_at_ts_times, ds_profiles_at_ts_times)
+            self._debug_plot_profiles(shot, ds_thomson_at_ts_times, ds_profiles_at_ts_times, fit_output=fit_output)
         except Exception as e:
             logger.error(f"Failed to make TS fit diagnostic plot for shot {shot}: {e}")
 
@@ -342,6 +349,7 @@ class CModDataWorkflow(DataWorkflow):
         debug_plot_dir: Path | str | None = None,
         Te_keV_lim: float | None = 5.0,
         ne20_lim: float | None = 1.8,
+        fit_output: ShotFitOutput | None = None,
     ) -> None:
         """Save a PDF comparing the GP fits to the raw TS measurements.
 
@@ -360,6 +368,9 @@ class CModDataWorkflow(DataWorkflow):
         debug_plot_dir : Path | str | None
             Directory to save the PDF. If None, uses '<ds_name>/ts_fit_plots'
             next to the raw data directory.
+        fit_output : ShotFitOutput | None
+            When given, its te_hyps/ne_hyps (rows aligned to ds_thomson's time
+            index) are annotated on each panel.
         """
         import matplotlib
 
@@ -394,9 +405,9 @@ class CModDataWorkflow(DataWorkflow):
                 rho_ch = fit_input.x[i_time]
 
                 fig, axes = plt.subplots(1, 2, figsize=(12, 5))
-                for ax, variable, gp_var, label, ylim in [
-                    (axes[0], "te", "Te_keV_rho", "Te [keV]", Te_keV_lim),
-                    (axes[1], "ne", "ne20_rho", "ne [1e20 m^-3]", ne20_lim),
+                for ax, variable, gp_var, label, ylim, hyps_arr in [
+                    (axes[0], "te", "Te_keV_rho", "Te [keV]", Te_keV_lim, None if fit_output is None else fit_output.te_hyps),
+                    (axes[1], "ne", "ne20_rho", "ne [1e20 m^-3]", ne20_lim, None if fit_output is None else fit_output.ne_hyps),
                 ]:
                     data_y = getattr(fit_input, f"{variable}_y")[i_time]
                     err_y = getattr(fit_input, f"{variable}_err")[i_time]
@@ -439,6 +450,18 @@ class CModDataWorkflow(DataWorkflow):
                     ax.grid(alpha=0.3)
                     if ax.get_legend_handles_labels()[0]:
                         ax.legend(fontsize=8)
+                    if hyps_arr is not None and i_time < len(hyps_arr) and np.isfinite(hyps_arr[i_time]).all():
+                        var, l1, l2, lw, x0 = hyps_arr[i_time]
+                        ax.text(
+                            0.98,
+                            0.98,
+                            f"var={var:.2f}  l1={l1:.2f}  l2={l2:.2f}\nlw={lw:.2f}  x0={x0:.2f}",
+                            transform=ax.transAxes,
+                            ha="right",
+                            va="top",
+                            fontsize=7,
+                            family="monospace",
+                        )
 
                 fig.tight_layout()
                 pdf.savefig(fig)

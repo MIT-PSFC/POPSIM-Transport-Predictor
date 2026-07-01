@@ -16,7 +16,6 @@ from disruption_py.machine.mast.util import MastUtilMethods
 from disruption_py.machine.tokamak import Tokamak
 from dynaconf import Dynaconf
 from loguru import logger
-from scipy.interpolate import interp1d
 from threadpoolctl import threadpool_limits
 
 from transport_study import EPISODE_DIM, PACKAGE_ROOT, TIME_COORD, TIME_DIM
@@ -409,17 +408,29 @@ class MASTDataWorkflow(DataWorkflow):
         psi_n_out = np.full((n_t, n_ch), np.nan, dtype=np.float32)
         rho_out = np.full((n_t, n_ch), np.nan, dtype=np.float32)
 
-        psi_ax_all = interp1d(efm_time, psi_axis_arr, bounds_error=False, fill_value=np.nan)(ts_time)
-        psi_br_all = interp1d(efm_time, psi_bry_arr, bounds_error=False, fill_value=np.nan)(ts_time)
         t_eq_indices = np.argmin(np.abs(efm_time[:, None] - ts_time[None, :]), axis=0)
+        # A ts_time outside the EFIT coverage would otherwise still get mapped
+        # to whatever equilibrium sample happens to be nearest (the first or
+        # last one), silently extrapolating rather than skipping.
+        in_efm_range = (ts_time >= efm_time.min()) & (ts_time <= efm_time.max())
 
         for i in range(n_t):
-            psi_ax = float(psi_ax_all[i])
-            psi_br = float(psi_br_all[i])
+            if not in_efm_range[i]:
+                continue
+
+            # psi_axis/psi_bry must come from the same equilibrium time sample
+            # as psi_2d (nearest to ts_time[i]), not interpolated onto ts_time
+            # independently: both come from the same efm_time grid, and psi_2d
+            # is normalized by exactly these two values, so mixing an
+            # interpolated scalar with a nearest-neighbor 2D field drifts the
+            # rho mapping between EFIT samples.
+            idx = t_eq_indices[i]
+            psi_ax = float(psi_axis_arr[idx])
+            psi_br = float(psi_bry_arr[idx])
             if not (np.isfinite(psi_ax) and np.isfinite(psi_br)):
                 continue
 
-            psi_2d = psirz[t_eq_indices[i], :, :]  # (n_z, n_r)
+            psi_2d = psirz[idx, :, :]  # (n_z, n_r)
             psi_n_ts, rho_ts = _map_thomson_midplane(r_ts, psi_2d, z_grid, r_grid_eq, psi_ax, psi_br)
 
             te_at_t = te_raw[i, :]
@@ -629,6 +640,8 @@ class MASTDataWorkflow(DataWorkflow):
                 Te_keV_rho,
                 ne20_rho,
                 self.debug_plot_dir,
+                te_hyps=fit_output.te_hyps,
+                ne_hyps=fit_output.ne_hyps,
             )
         except Exception as e:
             logger.error(f"Failed to make TS fit diagnostic plot for shot {shot}: {e}")
@@ -648,10 +661,14 @@ class MASTDataWorkflow(DataWorkflow):
         Te_out: np.ndarray,
         ne_out: np.ndarray,
         debug_plot_dir: Path | str | None = None,
+        te_hyps: np.ndarray | None = None,
+        ne_hyps: np.ndarray | None = None,
     ) -> None:
         """Save a PDF of raw TS points (with error bars) vs GP fit for sampled measurement times.
 
         MAST has a single Thomson system, so there is no core/edge channel split.
+        te_hyps/ne_hyps, when given (rows aligned to ts_time), are annotated on
+        each panel: [var, l1, l2, lw, x0].
         """
         import matplotlib
 
@@ -672,9 +689,9 @@ class MASTDataWorkflow(DataWorkflow):
         with PdfPages(pdf_path) as pdf:
             for i_time in t_indices:
                 fig, axes = plt.subplots(1, 2, figsize=(12, 5))
-                for ax, data_y, gp_y, label, unit in [
-                    (axes[0], te_keV[i_time, :], Te_out[i_time, :], "Te", "[keV]"),
-                    (axes[1], ne_20[i_time, :], ne_out[i_time, :], "ne", "[1e20 m^-3]"),
+                for ax, data_y, gp_y, label, unit, hyps_arr in [
+                    (axes[0], te_keV[i_time, :], Te_out[i_time, :], "Te", "[keV]", te_hyps),
+                    (axes[1], ne_20[i_time, :], ne_out[i_time, :], "ne", "[1e20 m^-3]", ne_hyps),
                 ]:
                     rho_raw = rho_ts[i_time, :]
                     valid = np.isfinite(rho_raw) & np.isfinite(data_y)
@@ -700,6 +717,18 @@ class MASTDataWorkflow(DataWorkflow):
                     ax.set_title(f"shot {shot}  t={ts_time[i_time]:.3f} s  n_valid={valid.sum()}")
                     ax.grid(alpha=0.3)
                     ax.legend(fontsize=8)
+                    if hyps_arr is not None and i_time < len(hyps_arr) and np.isfinite(hyps_arr[i_time]).all():
+                        var, l1, l2, lw, x0 = hyps_arr[i_time]
+                        ax.text(
+                            0.98,
+                            0.98,
+                            f"var={var:.2f}  l1={l1:.2f}  l2={l2:.2f}\nlw={lw:.2f}  x0={x0:.2f}",
+                            transform=ax.transAxes,
+                            ha="right",
+                            va="top",
+                            fontsize=7,
+                            family="monospace",
+                        )
                 fig.tight_layout()
                 pdf.savefig(fig)
                 plt.close(fig)
