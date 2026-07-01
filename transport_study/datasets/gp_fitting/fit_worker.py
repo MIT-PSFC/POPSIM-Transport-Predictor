@@ -176,12 +176,12 @@ def _pinned_hyperparams(hyps: np.ndarray) -> bool:
 
     Two edges are excluded because a different restart provably re-lands on
     the same edge, making a retry pure waste rather than a chance to escape:
-    - x0 (pedestal location): its bounds - the base [0.9, 1.1] physical
-      pedestal window, or the narrower pin_x0 window tying Te to ne - are
+    - x0 (pedestal location): its bounds - the base physical pedestal window
+      in _HYP_BOUNDS, or the narrower pin_x0 window tying Te to ne - are
       already tight by design, not slack search room.
-    - l2's ceiling (2.0): once x0 is held near the edge, the region beyond it
-      often has no independent short-scale structure left to fit, so mkgp is
-      happy pushing l2 as long/smooth as the box allows - not a collapse.
+    - l2's ceiling: once x0 is held near the edge, the region beyond it often
+      has no independent short-scale structure left to fit, so mkgp is happy
+      pushing l2 as long/smooth as the box allows - not a collapse.
     Confirmed by profiling a real shot: x0 pinned in 10/10 sampled slices and
     l2's ceiling in half of them, every one re-landing on the same edge across
     all _MAX_HYP_RETRIES attempts, tripling fit time for zero change in
