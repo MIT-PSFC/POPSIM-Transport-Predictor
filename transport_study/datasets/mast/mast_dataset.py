@@ -255,7 +255,8 @@ class MASTDataWorkflow(DataWorkflow):
         self.filter_config = {
             "Wtot_MJ": {"min": 0.0005, "max": 2.0},
             "ne20_line_avg": {"min": 0.01, "max": 6.0},
-            "betan": {"min": 0, "max": 10},
+            "betan": {"min": 0.01, "max": 10},
+            "Ip_MA": {"min": 0.21, "max": 1.5},
         }
         self.individual_filter_config = None
         # {signal: max_value}: once any of these exceeds its threshold the shot is

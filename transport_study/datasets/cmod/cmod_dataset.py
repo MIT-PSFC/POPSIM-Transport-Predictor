@@ -216,6 +216,11 @@ class CModDataWorkflow(DataWorkflow):
             if variable == "ne":
                 data_y = data_y * 1e-20  # Convert to [1e20 m^-3]
                 err_y = err_y * 1e-20
+                # Drop density channels too uncertain to constrain the fit
+                # (error > 1e20 m^-3). These are typically bad edge/SOL channels
+                # Seen on shot 1160609014: a ne~4, err~2 channel past the
+                # separatrix (rho~1.05) drove a spike to ne~19 at rho=1.0
+                data_y = np.where(err_y > 1.0, np.nan, data_y)
 
             # If data or error bar is incredibly small, set to NaN since it's probably bad data
             # At this point, ne is in 1e20 m^-3 and Te is in keV
