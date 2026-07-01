@@ -6,7 +6,11 @@ import xarray as xr
 from loguru import logger
 
 from transport_study import EPISODE_DIM, TIME_DIM
-from transport_study.datasets.plotting import ds_profile_plot, ds_profile_time_plot
+from transport_study.datasets.plotting import (
+    ds_profile_plot,
+    ds_profile_time_plot,
+    ds_summary_report,
+)
 
 GC_INTERVAL = 40  # Every 40 shots force garbage collection
 
@@ -120,6 +124,21 @@ class DataWorkflow:
         support distributed GP fitting (C-Mod, MAST).
         """
         raise NotImplementedError(f"{self.ds_name} workflow does not support distributed GP fitting")
+
+    def clean_cluster_state(self):
+        """Cancel this workflow's queued/running cluster fitting jobs and clear staged batches.
+
+        No-op unless cluster_config is set. Called by the CLI's --clean so a
+        from-scratch run doesn't adopt stale jobs or reuse leftover batch
+        outputs left on the cluster from a previous invocation.
+        """
+        if self.cluster_config is None:
+            return
+
+        from transport_study.datasets.gp_fitting.dispatcher import ClusterFitDispatcher
+
+        dispatcher = ClusterFitDispatcher(self.cluster_config, self.ds_name, self.fit_staging_dir)
+        dispatcher.clean()
 
     def make_raw_data_files_distributed(self):
         """Create raw data files with GP fitting dispatched to a SLURM cluster.
@@ -292,12 +311,21 @@ class DataWorkflow:
             )
         except Exception as e:
             logger.error(f"Error generating profile plots: {e}")
+        try:
+            ds_summary_report(
+                zarr_path,
+                self.final_ds_dir / "summary_report.pdf",
+                title=f"{self.ds_name.upper()} Dataset",
+            )
+        except Exception as e:
+            logger.error(f"Error generating summary report: {e}")
 
     def filter_ds(self, shot_ds: xr.Dataset) -> xr.Dataset:
         """Apply filtering steps based on device config"""
 
         # Cut all data 50ms before Ip_MA is NAN to avoid including obviously disruptive data
-        last_valid_idx = np.where(shot_ds["Ip_MA"].notnull())[1][-1]
+        valid_time = shot_ds["Ip_MA"].notnull().any(dim=EPISODE_DIM)
+        last_valid_idx = int(np.where(valid_time.values)[0][-1])
         valid_mask = shot_ds.time <= shot_ds.time[last_valid_idx] - 0.05
 
         # Apply full-timeslice filters
@@ -356,7 +384,11 @@ class DataWorkflow:
             ne20_filled = ne20.fillna(0)
             diff_result = ne20_filled != ne20_filled.shift(time_idx=1, fill_value=0)
             first_valid_is_fresh = ne20.notnull().cumsum("time_idx") == 1
-            fresh_profiles_1D = diff_result | first_valid_is_fresh
+            # A slice where the GP fit failed (all-NaN, per fit_worker's NaN-on-
+            # failure convention) reads as 0 after fillna and so looks "changed"
+            # from the previous slice - require notnull too, so a failed fit
+            # isn't mislabeled fresh.
+            fresh_profiles_1D = (diff_result | first_valid_is_fresh) & ne20.notnull()
             fresh_profiles = fresh_profiles_1D.any("rho")
             shot_ds["fresh_profiles"] = fresh_profiles.astype(np.float32)
 

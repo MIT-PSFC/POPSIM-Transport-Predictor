@@ -385,7 +385,7 @@ class ClusterFitDispatcher:
         self._run_jobs(batches)
         return self._collect_results(batches, shot_inputs)
 
-    def giclean(self) -> None:
+    def clean(self) -> None:
         """Cancel this device's queued/running jobs and remove its batch files, local and remote.
 
         Call before run() for a from-scratch fit (CLI --clean): otherwise

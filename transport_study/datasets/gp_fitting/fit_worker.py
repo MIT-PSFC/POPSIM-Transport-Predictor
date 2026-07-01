@@ -50,18 +50,21 @@ from mkgp.core.baseclasses import _WarpingFunction
 from mkgp.core.kernels import Gibbs_Kernel
 from mkgp.core.routines import GaussianProcess
 
-FORMAT_VERSION = 2
+FORMAT_VERSION = 3
 
 
 # ----------------------------------------------------------------------
 # GP fitting (mkgp Gibbs kernel with tanh-warped length scale)
 # ----------------------------------------------------------------------
-# Hyperparameters, order [var, l1, l2, lw, x0]: amplitude, core (small-rho) and
-# edge (large-rho) length scales, tanh transition width, and transition center.
+# Hyperparameters, order [var, l1, l2, lw, x0]:
+# amplitude
+# core (small-rho) length scale,
+# edge (large-rho) length scale,
+# tanh transition width
+# and transition center.
 _HYP_START = np.array([2.0, 1.0, 0.5, 0.1, 1.0])
-# Bounds define the optimizer's random-restart ranges (drawn uniform in log10),
-# loosely mirroring the support of the old gptools Uniform*Gamma hyperprior.
-_HYP_BOUNDS = np.array([[1.0e-2, 0.1, 0.05, 0.01, 0.5], [2.0e1, 3.0, 2.0, 1.0, 1.5]])
+# Bounds define the optimizer's random-restart ranges (drawn uniform in log10)
+_HYP_BOUNDS = np.array([[1.0e-2, 0.4, 0.1, 0.05, 0.95], [2.0e1, 2.0, 0.5, 0.2, 1.05]])
 # Edge boundary conditions, informed by Chilenski 2016. Columns: (rho, value, error).
 # Value BCs pull the profile to ~0 past the separatrix
 # gradient BCs flatten it at the axis (rho=0) and past the edge
@@ -160,27 +163,49 @@ def _is_pedestal_resolved(x0: float) -> bool:
     return lo + margin < x0 < hi - margin
 
 
-def _pinned_hyperparams(hyps: np.ndarray, skip_x0: bool = False) -> bool:
-    """True if the optimizer pushed any hyperparameter to (not just near) its bound.
+def _pinned_hyperparams(hyps: np.ndarray) -> bool:
+    """True if the optimizer pushed a hyperparameter to (not just near) its bound,
+    in a way a differently-seeded restart could plausibly escape.
 
     Bound enforcement (_build_kernel) exists so a bad restart can't wander into
     the degenerate collapse mkgp is otherwise prone to (see the mkgp-bounds-not-
-    enforced writeup); a hyperparameter still sitting at that bound after
-    optimization means the search ran out of room in that basin rather than
-    converging inside the physical range. _run_gp retries from a different
+    enforced writeup); one of these hyperparameters still sitting at that bound
+    after optimization means the search ran out of room in that basin rather
+    than converging inside the physical range. _run_gp retries from a different
     restart when this happens instead of accepting the degenerate fit.
 
-    skip_x0 excludes the pedestal location, used when pin_x0 has deliberately
-    narrowed x0's bounds to hold it at a location chosen by the other profile's
-    fit - x0 sitting at that (narrow) window's edge is then expected, not a
-    failure.
+    Two edges are excluded because a different restart provably re-lands on
+    the same edge, making a retry pure waste rather than a chance to escape:
+    - x0 (pedestal location): its bounds - the base [0.9, 1.1] physical
+      pedestal window, or the narrower pin_x0 window tying Te to ne - are
+      already tight by design, not slack search room.
+    - l2's ceiling (2.0): once x0 is held near the edge, the region beyond it
+      often has no independent short-scale structure left to fit, so mkgp is
+      happy pushing l2 as long/smooth as the box allows - not a collapse.
+    Confirmed by profiling a real shot: x0 pinned in 10/10 sampled slices and
+    l2's ceiling in half of them, every one re-landing on the same edge across
+    all _MAX_HYP_RETRIES attempts, tripling fit time for zero change in
+    outcome. var, l1, lw, and l2's floor still trigger retries: those bounds
+    guard the genuine degenerate collapse (amplitude -> 0, edge scale ->
+    infinity) that _build_kernel's enforcement exists to prevent, where a bad
+    restart really can land somewhere better.
+
+    The margin itself is measured in log10 space, matching how restarts are
+    drawn (uniform in log10 - see _HYP_BOUNDS). var and lw span 2-3 decades,
+    so a margin taken as a fraction of the raw range is huge in log terms: a
+    var of 0.2755 against bounds [0.01, 20] falls inside a linear 2% margin
+    (~0.4) while actually sitting at 44% of the way up the log-uniform range,
+    nowhere near either wall - a converged interior optimum mislabeled as
+    pinned, burning a retry that only ever re-finds the same interior point.
     """
     lo, hi = _HYP_BOUNDS[0], _HYP_BOUNDS[1]
-    margin = 0.02 * (hi - lo)
-    pinned = (hyps <= lo + margin) | (hyps >= hi - margin)
-    if skip_x0:
-        pinned = pinned[:4]
-    return bool(pinned.any())
+    log_lo, log_hi, log_hyps = np.log10(lo), np.log10(hi), np.log10(hyps)
+    margin = 0.02 * (log_hi - log_lo)
+    pinned_lo = log_hyps <= log_lo + margin
+    pinned_hi = log_hyps >= log_hi - margin
+    pinned_lo[4] = pinned_hi[4] = False  # x0
+    pinned_hi[2] = False  # l2 ceiling
+    return bool((pinned_lo | pinned_hi).any())
 
 
 def _deterministic_seed(*arrays: np.ndarray, salt: int = 0) -> int:
@@ -207,6 +232,49 @@ def _clean_inputs(data_X, data_y, err_y):
     if not valid.any():
         return None
     return data_X[valid], data_y[valid], err_y[valid]
+
+
+def _remove_local_outliers(data_X, data_y, err_y, sigma_neighbor=2.0, sigma_local=3.0):
+    """Drop a point that disagrees with both its immediate neighbors in x, when
+    those neighbors agree with each other.
+
+    Independent of any GP fit or hyperparameters, unlike _remove_outliers: a GP
+    reference fit (however it is built - generic or self-tuned) can be flexible
+    enough to bend down and absorb a single bad point along with its
+    genuinely-consistent neighbors, which is exactly what let a near-zero
+    misfired channel escape _remove_outliers on a C-Mod Te slice (a short core
+    length scale dove down to chase it instead of the reference flagging it).
+    Comparing a point only to its immediate left/right neighbors in rho catches
+    an isolated single-channel spike regardless of how flexible the eventual
+    fit is allowed to be. Runs before the GP-based _remove_outliers.
+
+    A point (not the first or last, by rho) is dropped when its neighbors agree
+    with each other (within sigma_neighbor combined sigma) but it disagrees
+    with their average (by more than sigma_local combined sigma). A genuine
+    trend - where the neighbors themselves disagree - never trips this, since
+    the neighbor-agreement precondition fails first.
+    """
+    n = data_X.size
+    if n < 3:
+        return data_X, data_y, err_y
+    order = np.argsort(data_X)
+    x, y, e = data_X[order], data_y[order], err_y[order]
+
+    y_left, y_right = y[:-2], y[2:]
+    e_left, e_right = e[:-2], e[2:]
+    y_mid, e_mid = y[1:-1], e[1:-1]
+
+    neighbors_agree = np.abs(y_left - y_right) <= sigma_neighbor * np.sqrt(e_left**2 + e_right**2)
+    neighbor_mean = 0.5 * (y_left + y_right)
+    neighbor_mean_err = 0.5 * np.sqrt(e_left**2 + e_right**2)
+    point_disagrees = np.abs(y_mid - neighbor_mean) > sigma_local * np.sqrt(e_mid**2 + neighbor_mean_err**2)
+
+    drop = np.zeros(n, dtype=bool)
+    drop[1:-1] = neighbors_agree & point_disagrees
+    if not drop.any():
+        return data_X, data_y, err_y
+    keep = ~drop
+    return x[keep], y[keep], e[keep]
 
 
 def _run_gp(data_X, data_y, err_y, x_eval, hyperparams=None, optimize=True, pin_x0=None):
@@ -275,37 +343,41 @@ def _run_gp(data_X, data_y, err_y, x_eval, hyperparams=None, optimize=True, pin_
         lml = gp.get_gp_lml()
         if lml is not None and lml > best_lml:
             best_gp, best_lml = gp, lml
-        if not _pinned_hyperparams(hyps, skip_x0=pin_x0 is not None):
+        if not _pinned_hyperparams(hyps):
             return gp  # converged inside the physical range, no need to retry
 
     return best_gp
 
 
-def _remove_outliers(data_X, data_y, err_y, sigma=3.0, max_drop_frac=0.3):
-    """Drop points lying > sigma combined-sigma from an un-optimized GP fit.
+def _remove_outliers(data_X, data_y, err_y, sigma=3.0, max_drop_frac=0.3, ref_hyperparams=None):
+    """Drop points lying > sigma combined-sigma from a reference GP fit.
 
-    Mirrors the old gptools remove_outliers ordering: detect outliers with a fit
-    at the start hyperparameters, then the caller optimizes on the clean data.
+    Mirrors the old gptools remove_outliers ordering: detect outliers with a
+    reference fit, then the caller optimizes on the clean data.
 
-    The reference fit uses generic, un-optimized hyperparameters (_HYP_START),
-    so it can be too smooth for a slice with a genuinely steep core/edge
-    gradient and mistake real high-gradient points for outliers (seen on C-Mod
-    Te slices with a hot, sparsely-sampled core). sigma=3.0 (rather than the
-    stricter 2.0) tolerates that mismatch.
-    # blue: still a single fixed-hyperparameter reference, so an unusually
-    # shaped slice can still trip a 3-sigma threshold; upgrade path is a
-    # second outlier pass using the slice's own optimized hyperparameters.
+    ref_hyperparams, when given, fixes the reference fit at those (already
+    optimized) hyperparameters instead of the generic, un-tuned _HYP_START.
+    gp_profile's two-pass call supplies its own rough-optimized hyperparameters
+    here: a single generic reference can be too smooth for a genuinely steep or
+    locally noisy slice, and once it is wrong in one spot it can flag several
+    real points as outliers together. Seen on a C-Mod Te slice: a near-zero
+    misfired channel sandwiched between two ~4 keV core points dragged a
+    generic reference down enough that both real points looked like outliers
+    too, and all three got dropped, leaving the core with no supporting data
+    at all. A reference built from the slice's own shape does not have that
+    failure mode. sigma=3.0 (rather than the stricter 2.0) further tolerates
+    reference/data mismatch on genuinely steep slices.
 
     Never drops more than max_drop_frac of the points: a reference fit that flags
     a large fraction as outliers is itself unreliable (a genuinely bad slice, or
-    a real pedestal the smooth start-hyperparameter fit cannot follow), so in
-    that case all points are kept rather than gutting the profile - which was
-    producing completely wrong fits when most points got dropped.
+    a real pedestal the reference fit cannot follow), so in that case all points
+    are kept rather than gutting the profile - which was producing completely
+    wrong fits when most points got dropped.
     """
     n = data_X.size
     if n < 3:
         return data_X, data_y, err_y
-    gp = _run_gp(data_X, data_y, err_y, data_X, hyperparams=None, optimize=False)
+    gp = _run_gp(data_X, data_y, err_y, data_X, hyperparams=ref_hyperparams, optimize=False)
     if gp is None:
         return data_X, data_y, err_y
     mean = gp.get_gp_mean()
@@ -315,6 +387,19 @@ def _remove_outliers(data_X, data_y, err_y, sigma=3.0, max_drop_frac=0.3):
     if n_keep == n or n_keep < 3 or (n - n_keep) > max(1, round(max_drop_frac * n)):
         return data_X, data_y, err_y
     return data_X[keep], data_y[keep], err_y[keep]
+
+
+def _rough_hyperparameters(data_X, data_y, err_y) -> np.ndarray | None:
+    """One optimize pass on (possibly outlier-contaminated) data.
+
+    Used only to get a locally-representative reference for outlier removal -
+    see _remove_outliers's ref_hyperparams. Not returned to callers as a real
+    fit result.
+    """
+    gp = _run_gp(data_X, data_y, err_y, data_X, optimize=True)
+    if gp is None:
+        return None
+    return np.asarray(gp.get_gp_kernel_details()[1], dtype=float)
 
 
 def fit_gp_hyperparameters(
@@ -333,7 +418,10 @@ def fit_gp_hyperparameters(
     cleaned = _clean_inputs(data_X, data_y, err_y)
     if cleaned is None:
         return None
-    data_X, data_y, err_y = _remove_outliers(*cleaned)
+    data_X, data_y, err_y = cleaned
+    data_X, data_y, err_y = _remove_local_outliers(data_X, data_y, err_y)
+    rough_hyps = _rough_hyperparameters(data_X, data_y, err_y)
+    data_X, data_y, err_y = _remove_outliers(data_X, data_y, err_y, ref_hyperparams=rough_hyps)
     gp = _run_gp(data_X, data_y, err_y, np.asarray(data_X, dtype=float), optimize=True)
     if gp is None:
         return None
@@ -356,6 +444,14 @@ def gp_profile(
     entries None unless calc_gradient, and all entries None if no valid data
     remains. The fitted hyperparameters are returned so callers can read the
     pedestal location (x0). pin_x0 holds the pedestal at a given location.
+
+    When optimizing with no fixed hyperparams, outlier removal runs in two
+    passes: a cheap neighbor-agreement check first drops isolated single-point
+    spikes independent of any fit (_remove_local_outliers), then a rough
+    optimize on the survivors supplies hyperparameters that already capture
+    the slice's own shape, and remaining outliers are judged against that fit
+    rather than a generic un-tuned reference (see _remove_outliers) before the
+    real optimize on the cleaned data.
     """
     cleaned = _clean_inputs(data_X, data_y, err_y)
     if cleaned is None:
@@ -363,7 +459,9 @@ def gp_profile(
     data_X, data_y, err_y = cleaned
 
     if hyperparams is None and optimize_hyperparams:
-        data_X, data_y, err_y = _remove_outliers(data_X, data_y, err_y)
+        data_X, data_y, err_y = _remove_local_outliers(data_X, data_y, err_y)
+        rough_hyps = _rough_hyperparameters(data_X, data_y, err_y)
+        data_X, data_y, err_y = _remove_outliers(data_X, data_y, err_y, ref_hyperparams=rough_hyps)
 
     gp = _run_gp(
         data_X,
@@ -419,12 +517,19 @@ class ShotFitInput:
 
 @dataclass
 class ShotFitOutput:
-    """GP-fitted profiles for one shot, each (n_t, n_x)."""
+    """GP-fitted profiles for one shot.
+
+    te_fit/te_std/ne_fit/ne_std are (n_t, n_x). te_hyps/ne_hyps are (n_t, 5),
+    columns [var, l1, l2, lw, x0], NaN where a slice was skipped, failed, or
+    fit at fixed (non-optimized) hyperparameters.
+    """
 
     te_fit: np.ndarray
     te_std: np.ndarray
     ne_fit: np.ndarray
     ne_std: np.ndarray
+    te_hyps: np.ndarray
+    ne_hyps: np.ndarray
 
 
 def pack_fit_batch(
@@ -498,6 +603,8 @@ def pack_fit_results(
         arrays[f"{shot}:te_std"] = np.asarray(so.te_std, dtype=np.float32)
         arrays[f"{shot}:ne_fit"] = np.asarray(so.ne_fit, dtype=np.float32)
         arrays[f"{shot}:ne_std"] = np.asarray(so.ne_std, dtype=np.float32)
+        arrays[f"{shot}:te_hyps"] = np.asarray(so.te_hyps, dtype=np.float32)
+        arrays[f"{shot}:ne_hyps"] = np.asarray(so.ne_hyps, dtype=np.float32)
     _atomic_savez(path, arrays)
 
 
@@ -513,6 +620,8 @@ def unpack_fit_results(path: Path | str) -> dict[int, ShotFitOutput]:
                 te_std=data[f"{shot}:te_std"],
                 ne_fit=data[f"{shot}:ne_fit"],
                 ne_std=data[f"{shot}:ne_std"],
+                te_hyps=data[f"{shot}:te_hyps"],
+                ne_hyps=data[f"{shot}:ne_hyps"],
             )
             for shot in data["shots"].tolist()
         }
@@ -534,9 +643,19 @@ def _atomic_savez(path: Path | str, arrays: dict) -> None:
 def _fit_variable(x, y, err, x_star, min_points, scale_per_slice, optimize, hyperparams, pin_x0):
     """Fit one variable of one time slice.
 
-    Returns (y_out, std_out, x0) or (None, None, None). x0 is the fitted pedestal
-    location (used to tie Te to ne); None when the slice is skipped or fails.
+    Returns (y_out, std_out, hyps) or (None, None, None). hyps is the fitted
+    [var, l1, l2, lw, x0] array (x0 is used to tie Te to ne); None when the
+    slice is skipped or fails.
     """
+    # Force float32 here, the same precision the cluster path is stuck at after
+    # its pack_fit_batch npz roundtrip. Without this, in-process fits (which
+    # otherwise keep whatever dtype the source data arrived in, often float64)
+    # hash different bytes into _deterministic_seed than the cluster does for
+    # the same physical shot, landing on a different optimizer restart.
+    x = np.asarray(x, dtype=np.float32)
+    y = np.asarray(y, dtype=np.float32)
+    err = np.asarray(err, dtype=np.float32)
+
     valid = np.isfinite(x) & np.isfinite(y) & np.isfinite(err)
     if int(valid.sum()) < min_points:
         return None, None, None
@@ -567,8 +686,7 @@ def _fit_variable(x, y, err, x_star, min_points, scale_per_slice, optimize, hype
     # measurement and the edge boundary conditions, so clamp to non-negative
     y_out = np.clip(np.asarray(y_star, dtype=float).ravel() * scale, 0.0, None)
     std_out = np.asarray(std_y_star, dtype=float).ravel() * scale
-    x0 = None if hyps is None else float(hyps[4])
-    return y_out, std_out, x0
+    return y_out, std_out, hyps
 
 
 def _fit_slice(task: tuple):
@@ -580,17 +698,18 @@ def _fit_slice(task: tuple):
     clearly resolved, Te is fit freely. The fixed-hyperparameter path leaves
     both profiles independent.
 
-    Returns (shot, i_time, te_y, te_std, ne_y, ne_std); any value is None when
-    that variable's slice was skipped or failed.
+    Returns (shot, i_time, te_y, te_std, ne_y, ne_std, te_hyps, ne_hyps); any
+    value is None when that variable's slice was skipped or failed.
     """
     (shot, i_time), x, te_y, te_err, ne_y, ne_err, x_star, min_points, scale_per_slice, optimize, hyperparams = task
     tie_x0 = optimize and hyperparams is None
 
-    ne_y_out, ne_std_out, ne_x0 = _fit_variable(x, ne_y, ne_err, x_star, min_points, scale_per_slice, optimize, hyperparams, None)
+    ne_y_out, ne_std_out, ne_hyps = _fit_variable(x, ne_y, ne_err, x_star, min_points, scale_per_slice, optimize, hyperparams, None)
+    ne_x0 = None if ne_hyps is None else float(ne_hyps[4])
     pin_x0 = ne_x0 if (tie_x0 and ne_x0 is not None and _is_pedestal_resolved(ne_x0)) else None
-    te_y_out, te_std_out, _ = _fit_variable(x, te_y, te_err, x_star, min_points, scale_per_slice, optimize, hyperparams, pin_x0)
+    te_y_out, te_std_out, te_hyps = _fit_variable(x, te_y, te_err, x_star, min_points, scale_per_slice, optimize, hyperparams, pin_x0)
 
-    return shot, i_time, te_y_out, te_std_out, ne_y_out, ne_std_out
+    return shot, i_time, te_y_out, te_std_out, ne_y_out, ne_std_out, te_hyps, ne_hyps
 
 
 def fit_batch(
@@ -651,19 +770,25 @@ def fit_batch(
             te_std=np.full((si.te_y.shape[0], n_x), np.nan),
             ne_fit=np.full((si.ne_y.shape[0], n_x), np.nan),
             ne_std=np.full((si.ne_y.shape[0], n_x), np.nan),
+            te_hyps=np.full((si.te_y.shape[0], 5), np.nan),
+            ne_hyps=np.full((si.ne_y.shape[0], 5), np.nan),
         )
         for shot, si in shot_inputs.items()
     }
 
     def _store(result):
-        shot, i_time, te_y_out, te_std_out, ne_y_out, ne_std_out = result
+        shot, i_time, te_y_out, te_std_out, ne_y_out, ne_std_out, te_hyps, ne_hyps = result
         so = outputs[shot]
         if te_y_out is not None:
             so.te_fit[i_time, :] = te_y_out
             so.te_std[i_time, :] = te_std_out
+            if te_hyps is not None:
+                so.te_hyps[i_time, :] = te_hyps
         if ne_y_out is not None:
             so.ne_fit[i_time, :] = ne_y_out
             so.ne_std[i_time, :] = ne_std_out
+            if ne_hyps is not None:
+                so.ne_hyps[i_time, :] = ne_hyps
 
     n_total = len(tasks)
     n_done = 0

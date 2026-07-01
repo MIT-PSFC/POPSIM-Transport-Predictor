@@ -106,6 +106,8 @@ def test_fit_results_npz_roundtrip(tmp_path):
             te_std=rng.random((N_T, len(X_STAR))),
             ne_fit=rng.random((N_T, len(X_STAR))),
             ne_std=rng.random((N_T, len(X_STAR))),
+            te_hyps=rng.random((N_T, 5)),
+            ne_hyps=rng.random((N_T, 5)),
         )
     }
     path = tmp_path / "batch_test_out.npz"
@@ -113,7 +115,7 @@ def test_fit_results_npz_roundtrip(tmp_path):
 
     loaded = unpack_fit_results(path)
     assert set(loaded) == {42}
-    for attr in ("te_fit", "te_std", "ne_fit", "ne_std"):
+    for attr in ("te_fit", "te_std", "ne_fit", "ne_std", "te_hyps", "ne_hyps"):
         np.testing.assert_allclose(getattr(loaded[42], attr), getattr(outputs[42], attr), rtol=1e-6, atol=1e-6)
 
 
@@ -273,7 +275,9 @@ class _FakeBackend:
         self.remote_dir.mkdir(parents=True, exist_ok=True)
         self.fail_batch_ids = fail_batch_ids or set()
         self.submitted_names: list[str] = []
+        self.cancelled_ids: list[int] = []
         self._states: dict[int, str] = {}
+        self._queued: dict[str, int] = {}
         self._next_id = 100
 
     def push_file(self, local: Path, remote_dir: str) -> None:
@@ -305,6 +309,8 @@ class _FakeBackend:
                 te_std=np.zeros((si.te_y.shape[0], len(x_star))),
                 ne_fit=np.zeros((si.ne_y.shape[0], len(x_star))),
                 ne_std=np.zeros((si.ne_y.shape[0], len(x_star))),
+                te_hyps=np.zeros((si.te_y.shape[0], 5)),
+                ne_hyps=np.zeros((si.ne_y.shape[0], 5)),
             )
             for shot, si in shot_inputs.items()
         }
@@ -313,10 +319,18 @@ class _FakeBackend:
         return job_id
 
     def queued_job_names(self) -> dict[str, int]:
-        return {}
+        return dict(self._queued)
 
     def job_states(self, job_ids: list[int]) -> dict[int, str]:
         return {jid: self._states[jid] for jid in job_ids if jid in self._states}
+
+    def cancel(self, job_id: int) -> None:
+        self.cancelled_ids.append(job_id)
+        self._states[job_id] = "CANCELLED"
+
+    def remove_files(self, remote_paths: list[str]) -> None:
+        for p in remote_paths:
+            (self.remote_dir / Path(p).name).unlink(missing_ok=True)
 
 
 def _make_dispatcher(tmp_path, monkeypatch, fail_batch_ids=None):
@@ -374,6 +388,24 @@ def test_dispatcher_reuses_local_outputs_without_jobs(tmp_path, monkeypatch):
     results = dispatcher2.run(inputs, X_STAR, min_points=1, scale_per_slice=False)
     assert len(fake2.submitted_names) == 0
     assert all(isinstance(out, ShotFitOutput) for out in results.values())
+
+
+def test_dispatcher_clean_cancels_jobs_and_removes_batches(tmp_path, monkeypatch):
+    dispatcher, fake = _make_dispatcher(tmp_path, monkeypatch)
+    inputs = {s: _synthetic_input(s) for s in (1, 2, 3)}
+    dispatcher.run(inputs, X_STAR, min_points=1, scale_per_slice=False)
+    batches_dir = tmp_path / "staging" / "batches"
+    assert len(list(batches_dir.glob("batch_*.npz"))) > 0
+    assert len(list(fake.remote_dir.glob("batch_*.npz"))) > 0
+
+    # A stale job for this device should be cancelled; another device's job left alone
+    fake._queued = {"gpfit-cmod-stale00000": 555, "gpfit-mast-other000000": 777}
+
+    dispatcher.clean()
+
+    assert fake.cancelled_ids == [555]
+    assert list(batches_dir.glob("batch_*.npz")) == []
+    assert list(fake.remote_dir.glob("batch_*.npz")) == []
 
 
 @pytest.mark.slow
@@ -454,24 +486,34 @@ def _slice_input(fit_input: ShotFitInput, idxs) -> ShotFitInput:
     )
 
 
+#  TS measurement times [s] to spot-check, one (shot, time) pair per case. These
+# slices are the ones known to produce questionable fits, so they are the ones
+# worth inspecting individually.
+CMOD_SPOT_CHECK = [
+    (1160503001, 0.310),
+    (1160503001, 1.010),
+    (1160503001, 1.110),
+    (1160503001, 1.610),
+    (1160503003, 0.710),
+    (1160503003, 1.610),
+]
+
+
 @pytest.mark.slow
 class TestGPFitCMOD:
     """Spot check the GP fitting on select C-Mod shots and timesteps.
 
     Pulls Thomson + EFIT through the same _prepare_shot codepath the cmod CLI
-    uses (so TS channels get mapped onto rho), fits a handful of TS measurement
-    times with the production GP path, and writes one diagnostic PDF per shot to
-    tests/test_outputs/gp_fitting for eyeballing. The plots show the exact
-    (floored, unit-converted) channel data the fit consumed. Requires local
-    C-Mod MDSplus access; skips otherwise.
+    uses (so TS channels get mapped onto rho), fits one TS measurement time per
+    test case with the production GP path, and writes a diagnostic PDF to
+    tests/test_outputs/gp_fitting/{shot}_t{time}/ for eyeballing. Parametrized
+    one timestep at a time (rather than bundling a shot's timesteps into one
+    test) so a single slice can be run, debugged, or inspected in isolation.
+    The plots show the exact (floored, unit-converted) channel data the fit
+    consumed. Requires local C-Mod MDSplus access; skips otherwise.
     """
 
-    # TS measurement times [s] to spot-check per shot. These slices are the ones
-    # known to produce questionable fits, so they are the ones worth inspecting.
-    SPOT_CHECK = {
-        1160503003: [0.710, 1.610],
-        1160503001: [1.010, 1.110, 1.610],
-    }
+    SPOT_CHECK = CMOD_SPOT_CHECK
 
     @pytest.fixture(scope="class")
     def workflow(self, tmp_path_factory):
@@ -480,20 +522,24 @@ class TestGPFitCMOD:
         except ImportError as e:
             pytest.skip(f"C-Mod workflow deps unavailable: {e}")
         tmp = tmp_path_factory.mktemp("cmod_gpfit")
+        shots = sorted({shot for shot, _ in self.SPOT_CHECK})
         shotlist = tmp / "shotlist"
-        shotlist.write_text("\n".join(str(s) for s in self.SPOT_CHECK) + "\n")
+        shotlist.write_text("\n".join(str(s) for s in shots) + "\n")
         return CModDataWorkflow(
             ds_name="cmod_gpfit_test",
             shotlist_file=shotlist,
             data_assembly_dir=tmp,
-            max_num_shots=len(self.SPOT_CHECK),
+            max_num_shots=len(shots),
         )
 
-    @pytest.mark.parametrize("shot", list(SPOT_CHECK))
-    def test_spot_check_shot(self, workflow, shot):
+    @pytest.mark.parametrize(("shot", "t"), SPOT_CHECK, ids=[f"{s}-t{t:.3f}" for s, t in SPOT_CHECK])
+    def test_spot_check_timestep(self, workflow, shot, t):
         import xarray as xr
 
         try:
+            # _prepare_shot stages source data to netCDF and returns early from
+            # that cache on repeat calls, so re-calling it for each of a shot's
+            # timestep cases only hits MDSplus once per shot, not once per case.
             with _spawn_for_disruption_py():
                 fit_input = workflow._prepare_shot(shot)
         except Exception as e:
@@ -504,7 +550,7 @@ class TestGPFitCMOD:
         thomson_path, _ = workflow._staging_paths(shot)
         ds_thomson = xr.load_dataset(thomson_path)
         times = ds_thomson.squeeze("shot", drop=True)["time"].values
-        idxs = _nearest_indices(times, self.SPOT_CHECK[shot])
+        idx = _nearest_indices(times, [t])[0]
 
         np.random.seed(GP_FIT_SEED)
         # By the time this test module is collected, numpy/OpenBLAS is already
@@ -515,36 +561,40 @@ class TestGPFitCMOD:
         # a ~30s/slice fit into something that didn't finish in 15+ minutes.
         with threadpool_limits(1):
             out = fit_batch(
-                {shot: _slice_input(fit_input, idxs)},
+                {shot: _slice_input(fit_input, [idx])},
                 x_star=workflow.gp_fit_rho,
                 min_points=workflow.fit_min_points,
                 scale_per_slice=workflow.fit_scale_per_slice,
                 num_workers=1,
             )[shot]
 
-        # Every requested slice must produce a usable (finite, non-empty) fit
-        for k, t in enumerate(self.SPOT_CHECK[shot]):
-            assert np.isfinite(out.te_fit[k]).any(), f"shot {shot} t={t}: Te fit all NaN"
-            assert np.isfinite(out.ne_fit[k]).any(), f"shot {shot} t={t}: ne fit all NaN"
+        assert np.isfinite(out.te_fit[0]).any(), f"shot {shot} t={t}: Te fit all NaN"
+        assert np.isfinite(out.ne_fit[0]).any(), f"shot {shot} t={t}: ne fit all NaN"
 
-        ds_profiles = workflow._profiles_dataset_from_fit(shot, times[idxs], out)
+        # One directory per (shot, time) case: _debug_plot_profiles always names
+        # its file "{shot}_ts_gp_fit.pdf", so separate cases for the same shot
+        # would otherwise overwrite each other's output.
+        plot_dir = GP_FIT_PLOT_DIR / f"{shot}_t{t:.3f}"
+        ds_profiles = workflow._profiles_dataset_from_fit(shot, times[[idx]], out)
         workflow._debug_plot_profiles(
             shot,
-            ds_thomson.isel(time=idxs),
+            ds_thomson.isel(time=[idx]),
             ds_profiles,
-            debug_plot_dir=GP_FIT_PLOT_DIR,
+            debug_plot_dir=plot_dir,
+            fit_output=out,
         )
-        assert (GP_FIT_PLOT_DIR / f"{shot}_ts_gp_fit.pdf").exists()
+        assert (plot_dir / f"{shot}_ts_gp_fit.pdf").exists()
 
 
 @pytest.mark.slow
 class TestGPFitMAST:
-    """Spot check the GP fitting on a MAST shot and a few timesteps.
+    """Spot check the GP fitting on a MAST shot, one timestep at a time.
 
     Mirrors TestGPFitCMOD against the open-access MAST S3 store (shot 30284),
-    using the mast CLI's _prepare_shot codepath. The best-covered TS slices are
-    fit and a diagnostic PDF is written to tests/test_outputs/gp_fitting.
-    Requires network access to the MAST store; skips otherwise.
+    using the mast CLI's _prepare_shot codepath. Each test case fits one of the
+    best-covered TS slices (ranked by valid-channel count) and writes a
+    diagnostic PDF to tests/test_outputs/gp_fitting/{shot}_t{time}/. Requires
+    network access to the MAST store; skips otherwise.
     """
 
     SHOT = 30284
@@ -576,9 +626,13 @@ class TestGPFitMAST:
             max_num_shots=1,
         )
 
-    def test_spot_check(self, workflow):
+    @pytest.mark.parametrize("rank", range(N_SPOT_CHECK))
+    def test_spot_check_timestep(self, workflow, rank):
+        """rank=0 is the best-covered TS slice, rank=1 the next best, etc."""
         import xarray as xr
 
+        # _prepare_shot stages to netCDF and returns early from that cache on
+        # repeat calls, so re-calling it per rank only hits S3 once per class.
         fit_input = workflow._prepare_shot(self.SHOT)
         if fit_input is None:
             pytest.skip(f"MAST shot {self.SHOT} returned no fittable data")
@@ -589,32 +643,38 @@ class TestGPFitMAST:
         ne_m3 = ds_staging["ts_ne_m3"].values
         rho_ts = ds_staging["ts_rho"].values
 
-        # Plot the slices with the most valid channels (mid-shot, hot plasma)
+        # Rank slices by valid-channel count (mid-shot, hot plasma tends to win)
         valid_per_slice = np.sum(np.isfinite(fit_input.x) & np.isfinite(fit_input.te_y), axis=1)
         idxs = sorted(int(i) for i in np.argsort(valid_per_slice)[::-1][: self.N_SPOT_CHECK])
+        i = idxs[rank]
 
         np.random.seed(GP_FIT_SEED)
         with threadpool_limits(1):
             out = fit_batch(
-                {self.SHOT: _slice_input(fit_input, idxs)},
+                {self.SHOT: _slice_input(fit_input, [i])},
                 x_star=workflow.gp_fit_rho,
                 min_points=workflow.fit_min_points,
                 scale_per_slice=workflow.fit_scale_per_slice,
                 num_workers=1,
             )[self.SHOT]
 
-        for k, i in enumerate(idxs):
-            assert np.isfinite(out.te_fit[k]).any(), f"slice {i}: Te fit all NaN"
-            assert np.isfinite(out.ne_fit[k]).any(), f"slice {i}: ne fit all NaN"
+        assert np.isfinite(out.te_fit[0]).any(), f"slice {i}: Te fit all NaN"
+        assert np.isfinite(out.ne_fit[0]).any(), f"slice {i}: ne fit all NaN"
 
+        # One directory per rank: _debug_plot_profiles always names its file
+        # "{shot}_ts_gp_fit.pdf", so separate cases would otherwise clobber
+        # each other's output.
+        plot_dir = GP_FIT_PLOT_DIR / f"{self.SHOT}_t{ts_time[i]:.3f}"
         workflow._debug_plot_profiles(
             self.SHOT,
-            ts_time[idxs],
-            te_eV[idxs] / 1e3,
-            ne_m3[idxs] / 1e20,
-            rho_ts[idxs],
+            ts_time[[i]],
+            te_eV[[i]] / 1e3,
+            ne_m3[[i]] / 1e20,
+            rho_ts[[i]],
             out.te_fit,
             out.ne_fit,
-            GP_FIT_PLOT_DIR,
+            plot_dir,
+            te_hyps=out.te_hyps,
+            ne_hyps=out.ne_hyps,
         )
-        assert (GP_FIT_PLOT_DIR / f"{self.SHOT}_ts_gp_fit.pdf").exists()
+        assert (plot_dir / f"{self.SHOT}_ts_gp_fit.pdf").exists()
