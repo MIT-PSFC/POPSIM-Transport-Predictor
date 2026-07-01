@@ -8,13 +8,14 @@ from pathlib import Path
 
 import fire
 import netCDF4  # noqa: F401
+import numpy as np
 import toml
 import xarray as xr
 from loguru import logger
 from popsim.ml import TrainConfig
 from pydantic import Field, field_validator, model_validator
 
-from transport_study import PACKAGE_ROOT
+from transport_study import PACKAGE_ROOT, TIME_DIM
 from transport_study.config import StudyConfig, config, load_config
 from transport_study.modules.profile_predictor.train_configs import (
     PROFILE_PREDICTOR_TORAX_CONFIGS,
@@ -734,35 +735,130 @@ class ProfileStudy(Study):
     # COLLECTION #
     ##############
 
+    # Coords describing which case a record belongs to (broadcast over every shot of that case).
+    _CASE_COORD_NAMES = (
+        "case_idx",
+        "model_type",
+        "training_data",
+        "data_normalization",
+        "domain_adaptation",
+        "freeze_shapes",
+        "num_target_shots",
+    )
+
+    def _case_coords(self, case_idx: int, case) -> dict:
+        """Build the per-case coordinate values shared by every shot of a case."""
+        return {
+            "case_idx": case_idx,
+            "model_type": case.model_type,
+            "training_data": str(case.training_data),
+            "data_normalization": case.data_normalization,
+            # Normalize None -> "none" so the coord stays string-typed
+            "domain_adaptation": case.domain_adaptation if case.domain_adaptation is not None else "none",
+            "freeze_shapes": case.freeze_shapes,
+            "num_target_shots": case.num_target_shots,
+        }
+
     def collect_results(self):
-        """Collect results from all cases and combine them into a single xarray dataset for analysis and visualization.
+        """Collect per-shot test errors from all finished cases into one tidy (long-form) dataset.
 
         TODO(ZanderKeith): Cristina really wants more fine-grained statistics for specific situations
         - rampup vs flattop vs rampdown
         - H mode vs L mode
         - disruptive vs non-disruptive shots
 
-        Dims: case_idx, shot_idx
-        Coords:
-        - shot(case_idx, shot_idx)
-        - ds_source(case_idx, shot_idx)
-        - model_type(case_idx)
-        - training_data(case_idx)
-        - data_normalization(case_idx)
-        - domain_adaptation(case_idx)
-        - freeze_shapes(case_idx)
-        - num_target_shots(case_idx)
-        Data variables: (E is either relative 'rel' or absolute 'abs', and D is dimension either 'shot' or per-timeslice 'ts')
-        - error_E_D_mean(case_idx)
-        - error_E_D_std(case_idx)
-        - error_E_D_med(case_idx)
-        - error_E_D_p25(case_idx)
-        - error_E_D_p75(case_idx)
-        - error_E_D_min(case_idx)
-        - error_E_D_max(case_idx)
+        Each row is one (case, shot) pair so individual shots where a model struggles can be
+        inspected directly (e.g. sort by ``err_abs_shot`` within a ``model_type`` group).
+
+        Dims: record (flat index over all case x shot pairs)
+        Coords (along record):
+        - case_idx, model_type, training_data, data_normalization, domain_adaptation,
+          freeze_shapes, num_target_shots (identify the case)
+        - shot (device shot id), ds_source (which dataset the shot came from)
+        Data variables (along record):
+        - err_abs_shot / err_rel_shot: time-integrated combined (ne+Te) error for the shot
+        - ne_err_abs_shot / te_err_abs_shot / ne_err_rel_shot / te_err_rel_shot: per-channel
+          time-integrated errors (see which channel drives a bad shot)
+        - err_abs_ts_max / err_rel_ts_max: worst single timeslice in the shot
+        - err_abs_ts_mean / err_rel_ts_mean: mean over the shot's timeslices
+        - n_valid_ts: number of non-NaN timeslices contributing to the shot
+
+        Use ``collect_case_summary`` for the older scalar-per-case aggregate view.
+        """
+        data_var_names = [
+            "err_abs_shot",
+            "err_rel_shot",
+            "ne_err_abs_shot",
+            "te_err_abs_shot",
+            "ne_err_rel_shot",
+            "te_err_rel_shot",
+            "err_abs_ts_max",
+            "err_rel_ts_max",
+            "err_abs_ts_mean",
+            "err_rel_ts_mean",
+            "n_valid_ts",
+        ]
+
+        records: list[dict] = []
+        for case_idx, case in enumerate(self.cases):
+            result_path = self.result_path(case)
+            if not result_path.exists():
+                continue
+
+            ds = xr.load_dataset(result_path)
+
+            # Reduce per-timeslice errors to per-shot summaries (worst and mean timeslice)
+            err_abs_ts = ds["error_abs_ts"]
+            err_rel_ts = ds["error_rel_ts"]
+            per_shot = {
+                "err_abs_shot": ds["error_abs_shot"].values,
+                "err_rel_shot": ds["error_rel_shot"].values,
+                "ne_err_abs_shot": ds["ne_error_abs_shot"].values,
+                "te_err_abs_shot": ds["te_error_abs_shot"].values,
+                "ne_err_rel_shot": ds["ne_error_rel_shot"].values,
+                "te_err_rel_shot": ds["te_error_rel_shot"].values,
+                "err_abs_ts_max": err_abs_ts.max(TIME_DIM, skipna=True).values,
+                "err_rel_ts_max": err_rel_ts.max(TIME_DIM, skipna=True).values,
+                "err_abs_ts_mean": err_abs_ts.mean(TIME_DIM, skipna=True).values,
+                "err_rel_ts_mean": err_rel_ts.mean(TIME_DIM, skipna=True).values,
+                "n_valid_ts": err_abs_ts.notnull().sum(TIME_DIM).values,
+            }
+
+            shot_ids = ds["shot"].values
+            n_shots = len(shot_ids)
+            ds_source = ds["ds_source"].values if "ds_source" in ds.coords else np.array([""] * n_shots)
+            case_coords = self._case_coords(case_idx, case)
+
+            for i in range(n_shots):
+                record = {name: per_shot[name][i] for name in data_var_names}
+                record.update(case_coords)
+                record["shot"] = shot_ids[i]
+                record["ds_source"] = ds_source[i]
+                records.append(record)
+
+        if not records:
+            return xr.Dataset()
+
+        coord_names = [*self._CASE_COORD_NAMES, "shot", "ds_source"]
+        data_vars = {name: ("record", np.array([r[name] for r in records])) for name in data_var_names}
+        coords = {name: ("record", np.array([r[name] for r in records])) for name in coord_names}
+        return xr.Dataset(data_vars=data_vars, coords=coords)
+
+    def collect_case_summary(self):
+        """Collect scalar summary statistics per case (one row per case).
+
+        Reduces each case's per-shot and per-timeslice error distributions to scalar
+        statistics. Use ``collect_results`` for the per-shot view.
+
+        Dims: case_idx
+        Coords (along case_idx): model_type, training_data, data_normalization,
+        domain_adaptation, freeze_shapes, num_target_shots
+        Data variables (along case_idx): err_E_D_S where E is 'abs' or 'rel', D is
+        'shot' (time-integrated per shot) or 'ts' (per timeslice), and S is one of
+        mean, std, med, p25, p75, min, max. E.g. err_abs_shot_mean, err_rel_ts_p75.
         """
         results = []
-        for case in self.cases:
+        for case_idx, case in enumerate(self.cases):
             result_path = self.result_path(case)
             if not result_path.exists():
                 continue
@@ -805,16 +901,7 @@ class ProfileStudy(Study):
                     "err_rel_ts_min": err_rel_ts.min(),
                     "err_rel_ts_max": err_rel_ts.max(),
                 }
-            ).assign_coords(
-                {
-                    "model_type": case.model_type,
-                    "training_data": str(case.training_data),
-                    "data_normalization": case.data_normalization,
-                    "domain_adaptation": case.domain_adaptation,
-                    "freeze_shapes": case.freeze_shapes,
-                    "num_target_shots": case.num_target_shots,
-                }
-            )
+            ).assign_coords(self._case_coords(case_idx, case))
             results.append(result)
 
         ds_merged = xr.concat(results, dim="case_idx")
