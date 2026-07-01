@@ -18,6 +18,7 @@ dependencies = [
     "freeqdsk>=0.5.2",
     "srunx>=2.2.1",
     "mkgp>=3.1.4",
+    "threadpoolctl>=3.6.0",
 ]
 
 [dependency-groups]

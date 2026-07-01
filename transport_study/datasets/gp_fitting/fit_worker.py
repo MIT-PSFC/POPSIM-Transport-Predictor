@@ -26,6 +26,7 @@ Batch file format (npz):
 
 import argparse
 import contextlib
+import hashlib
 import io
 import multiprocessing
 import os
@@ -71,6 +72,9 @@ _GRAD_BC = np.array([[0.0, 0.0, 0.01], [1.1, 0.0, 0.1], [1.2, 0.0, 0.1], [1.3, 0
 # tying Te to the ne fit. Narrow enough to hold x0, wide enough to stay a valid
 # (lower < upper) bound after clamping to the global x0 range.
 _X0_PIN_HALFWIDTH = 1.0e-3
+# Extra optimizer attempts (beyond the first) when a fit pins a hyperparameter
+# at its bound - a different random restart usually escapes the same basin.
+_MAX_HYP_RETRIES = 2
 
 
 class Tanh_WarpingFunction(_WarpingFunction):
@@ -156,6 +160,47 @@ def _is_pedestal_resolved(x0: float) -> bool:
     return lo + margin < x0 < hi - margin
 
 
+def _pinned_hyperparams(hyps: np.ndarray, skip_x0: bool = False) -> bool:
+    """True if the optimizer pushed any hyperparameter to (not just near) its bound.
+
+    Bound enforcement (_build_kernel) exists so a bad restart can't wander into
+    the degenerate collapse mkgp is otherwise prone to (see the mkgp-bounds-not-
+    enforced writeup); a hyperparameter still sitting at that bound after
+    optimization means the search ran out of room in that basin rather than
+    converging inside the physical range. _run_gp retries from a different
+    restart when this happens instead of accepting the degenerate fit.
+
+    skip_x0 excludes the pedestal location, used when pin_x0 has deliberately
+    narrowed x0's bounds to hold it at a location chosen by the other profile's
+    fit - x0 sitting at that (narrow) window's edge is then expected, not a
+    failure.
+    """
+    lo, hi = _HYP_BOUNDS[0], _HYP_BOUNDS[1]
+    margin = 0.02 * (hi - lo)
+    pinned = (hyps <= lo + margin) | (hyps >= hi - margin)
+    if skip_x0:
+        pinned = pinned[:4]
+    return bool(pinned.any())
+
+
+def _deterministic_seed(*arrays: np.ndarray, salt: int = 0) -> int:
+    """Stable RNG seed derived from the fit's own input data, not call order.
+
+    mkgp draws its optimizer restarts from the global numpy RNG (see
+    GaussianProcess.GPRFit), so without reseeding here a fit's result depends
+    on whatever else already consumed random draws earlier in the process:
+    slice processing order in serial mode, or multiprocessing.Pool scheduling
+    and fork-inherited RNG state in parallel mode. Hashing the fit's own inputs
+    makes every fit reproducible regardless of how the batch happens to be
+    scheduled. `salt` distinguishes retry attempts on the same input.
+    """
+    h = hashlib.sha256()
+    for arr in arrays:
+        h.update(np.ascontiguousarray(arr, dtype=np.float64).tobytes())
+    h.update(int(salt).to_bytes(8, "little", signed=True))
+    return int(h.hexdigest()[:8], 16)
+
+
 def _clean_inputs(data_X, data_y, err_y):
     """Drop NaN points. Returns (X, y, err) or None if nothing valid remains."""
     valid = ~np.isnan(data_y) & ~np.isnan(data_X) & ~np.isnan(err_y)
@@ -174,47 +219,82 @@ def _run_gp(data_X, data_y, err_y, x_eval, hyperparams=None, optimize=True, pin_
     pin_x0 narrows the x0 (pedestal location) bounds to a tight window around the
     given value, so bound enforcement holds the pedestal there (used to tie the
     Te pedestal location to the ne fit).
+
+    The restarts are seeded from the fit's own input data (_deterministic_seed),
+    so the result only depends on (data_X, data_y, err_y), never on multiprocessing
+    scheduling or slice processing order. When optimizing, a fit that pins a
+    hyperparameter at its bound (_pinned_hyperparams) is retried from a fresh,
+    differently-seeded restart set up to _MAX_HYP_RETRIES times; the attempt with
+    the best log marginal likelihood is kept even if every attempt stays pinned
+    (a genuinely unresolvable slice should still return its least-bad fit).
     """
-    gp = GaussianProcess()
     kbounds = _HYP_BOUNDS
     if pin_x0 is not None:
         kbounds = _HYP_BOUNDS.astype(float).copy()
         kbounds[0, 4] = max(_HYP_BOUNDS[0, 4], pin_x0 - _X0_PIN_HALFWIDTH)
         kbounds[1, 4] = min(_HYP_BOUNDS[1, 4], pin_x0 + _X0_PIN_HALFWIDTH)
-    gp.set_kernel(kernel=_build_kernel(hyperparams), kbounds=kbounds, regpar=1.0)
     xdata = np.concatenate([data_X, _VALUE_BC[:, 0]])
     ydata = np.concatenate([data_y, _VALUE_BC[:, 1]])
     yerr = np.concatenate([err_y, _VALUE_BC[:, 2]])
-    gp.set_raw_data(
-        xdata=xdata,
-        ydata=ydata,
-        yerr=yerr,
-        dxdata=_GRAD_BC[:, 0],
-        dydata=_GRAD_BC[:, 1],
-        dyerr=_GRAD_BC[:, 2],
-    )
-    gp.set_search_parameters(epsilon=1.0e-2)
-    if optimize and hyperparams is None:
-        nrestarts = 8
-    else:
-        # predict-only at fixed hyperparameters. The public maxiter clamps
-        # to >=50, so poke _imax=0 to skip the gradient-ascent loop entirely.
-        gp._imax = 0
-        nrestarts = 0
-    try:
-        # mkgp prints optimizer status to stdout; keep worker logs clean.
-        with contextlib.redirect_stdout(io.StringIO()):
-            gp.GPRFit(np.asarray(x_eval, dtype=float), hsgp_flag=False, nrestarts=nrestarts)
-    except (ValueError, np.linalg.LinAlgError, FloatingPointError):
-        return None
-    return gp
+
+    do_optimize = optimize and hyperparams is None
+    n_attempts = (1 + _MAX_HYP_RETRIES) if do_optimize else 1
+
+    best_gp, best_lml = None, -np.inf
+    for attempt in range(n_attempts):
+        gp = GaussianProcess()
+        gp.set_kernel(kernel=_build_kernel(hyperparams), kbounds=kbounds, regpar=1.0)
+        gp.set_raw_data(
+            xdata=xdata,
+            ydata=ydata,
+            yerr=yerr,
+            dxdata=_GRAD_BC[:, 0],
+            dydata=_GRAD_BC[:, 1],
+            dyerr=_GRAD_BC[:, 2],
+        )
+        gp.set_search_parameters(epsilon=1.0e-2)
+        if do_optimize:
+            nrestarts = 8
+            np.random.seed(_deterministic_seed(data_X, data_y, err_y, salt=attempt))
+        else:
+            # predict-only at fixed hyperparameters. The public maxiter clamps
+            # to >=50, so poke _imax=0 to skip the gradient-ascent loop entirely.
+            gp._imax = 0
+            nrestarts = 0
+        try:
+            # mkgp prints optimizer status to stdout; keep worker logs clean.
+            with contextlib.redirect_stdout(io.StringIO()):
+                gp.GPRFit(np.asarray(x_eval, dtype=float), hsgp_flag=False, nrestarts=nrestarts)
+        except (ValueError, np.linalg.LinAlgError, FloatingPointError):
+            continue
+
+        if not do_optimize:
+            return gp
+
+        hyps = np.asarray(gp.get_gp_kernel_details()[1], dtype=float)
+        lml = gp.get_gp_lml()
+        if lml is not None and lml > best_lml:
+            best_gp, best_lml = gp, lml
+        if not _pinned_hyperparams(hyps, skip_x0=pin_x0 is not None):
+            return gp  # converged inside the physical range, no need to retry
+
+    return best_gp
 
 
-def _remove_outliers(data_X, data_y, err_y, sigma=2.0, max_drop_frac=0.3):
+def _remove_outliers(data_X, data_y, err_y, sigma=3.0, max_drop_frac=0.3):
     """Drop points lying > sigma combined-sigma from an un-optimized GP fit.
 
     Mirrors the old gptools remove_outliers ordering: detect outliers with a fit
     at the start hyperparameters, then the caller optimizes on the clean data.
+
+    The reference fit uses generic, un-optimized hyperparameters (_HYP_START),
+    so it can be too smooth for a slice with a genuinely steep core/edge
+    gradient and mistake real high-gradient points for outliers (seen on C-Mod
+    Te slices with a hot, sparsely-sampled core). sigma=3.0 (rather than the
+    stricter 2.0) tolerates that mismatch.
+    # blue: still a single fixed-hyperparameter reference, so an unusually
+    # shaped slice can still trip a 3-sigma threshold; upgrade path is a
+    # second outlier pass using the slice's own optimized hyperparameters.
 
     Never drops more than max_drop_frac of the points: a reference fit that flags
     a large fraction as outliers is itself unreliable (a genuinely bad slice, or

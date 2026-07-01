@@ -6,11 +6,14 @@ exactly the code the cluster path uses: the npz round-trip, deterministic batch
 planning for restart safety, and the fitting math the worker executes.
 """
 
+import multiprocessing
 import shutil
+from contextlib import contextmanager
 from pathlib import Path
 
 import numpy as np
 import pytest
+from threadpoolctl import threadpool_limits
 
 from transport_study import PACKAGE_ROOT
 from transport_study.datasets.gp_fitting.dispatcher import (
@@ -415,6 +418,27 @@ GP_FIT_PLOT_DIR = PACKAGE_ROOT / "tests" / "test_outputs" / "gp_fitting"
 GP_FIT_SEED = 0
 
 
+@contextmanager
+def _spawn_for_disruption_py():
+    """disruption_py's get_shots_data always builds a multiprocessing.Pool, even
+    for num_processes=1. Pool() forks by default, and forking while pytest holds
+    internal logging/thread locks deadlocks the child forever at 0% CPU (verified:
+    reproduces with no fitting code at all, and persists with output capture
+    disabled, so it isn't a captured-stdout pipe issue - it's a fork-inherited
+    lock). "spawn" starts each worker from a fresh interpreter instead of forking,
+    which sidesteps the inherited-lock deadlock; only the C-Mod _prepare_shot call
+    goes through disruption_py's SQL/MDSplus retrieval, so this is scoped tightly
+    around that rather than changed for the whole test session (MAST retrieval and
+    fit_worker's own slice-level multiprocessing.Pool are unaffected either way).
+    """
+    orig = multiprocessing.get_start_method(allow_none=True)
+    multiprocessing.set_start_method("spawn", force=True)
+    try:
+        yield
+    finally:
+        multiprocessing.set_start_method(orig, force=True)
+
+
 def _nearest_indices(times: np.ndarray, targets) -> list[int]:
     return [int(np.argmin(np.abs(times - t))) for t in targets]
 
@@ -470,7 +494,8 @@ class TestGPFitCMOD:
         import xarray as xr
 
         try:
-            fit_input = workflow._prepare_shot(shot)
+            with _spawn_for_disruption_py():
+                fit_input = workflow._prepare_shot(shot)
         except Exception as e:
             pytest.skip(f"C-Mod data unreachable for shot {shot}: {e}")
         if fit_input is None:
@@ -482,13 +507,20 @@ class TestGPFitCMOD:
         idxs = _nearest_indices(times, self.SPOT_CHECK[shot])
 
         np.random.seed(GP_FIT_SEED)
-        out = fit_batch(
-            {shot: _slice_input(fit_input, idxs)},
-            x_star=workflow.gp_fit_rho,
-            min_points=workflow.fit_min_points,
-            scale_per_slice=workflow.fit_scale_per_slice,
-            num_workers=1,
-        )[shot]
+        # By the time this test module is collected, numpy/OpenBLAS is already
+        # loaded (pytest plugins, other test modules), so fit_worker's own
+        # OPENBLAS_NUM_THREADS=1 setdefault came too late and OpenBLAS would
+        # otherwise spin up one thread per core. These per-slice fit matrices
+        # are tiny (tens of points), so that's pure thread overhead - it turned
+        # a ~30s/slice fit into something that didn't finish in 15+ minutes.
+        with threadpool_limits(1):
+            out = fit_batch(
+                {shot: _slice_input(fit_input, idxs)},
+                x_star=workflow.gp_fit_rho,
+                min_points=workflow.fit_min_points,
+                scale_per_slice=workflow.fit_scale_per_slice,
+                num_workers=1,
+            )[shot]
 
         # Every requested slice must produce a usable (finite, non-empty) fit
         for k, t in enumerate(self.SPOT_CHECK[shot]):
@@ -562,13 +594,14 @@ class TestGPFitMAST:
         idxs = sorted(int(i) for i in np.argsort(valid_per_slice)[::-1][: self.N_SPOT_CHECK])
 
         np.random.seed(GP_FIT_SEED)
-        out = fit_batch(
-            {self.SHOT: _slice_input(fit_input, idxs)},
-            x_star=workflow.gp_fit_rho,
-            min_points=workflow.fit_min_points,
-            scale_per_slice=workflow.fit_scale_per_slice,
-            num_workers=1,
-        )[self.SHOT]
+        with threadpool_limits(1):
+            out = fit_batch(
+                {self.SHOT: _slice_input(fit_input, idxs)},
+                x_star=workflow.gp_fit_rho,
+                min_points=workflow.fit_min_points,
+                scale_per_slice=workflow.fit_scale_per_slice,
+                num_workers=1,
+            )[self.SHOT]
 
         for k, i in enumerate(idxs):
             assert np.isfinite(out.te_fit[k]).any(), f"slice {i}: Te fit all NaN"

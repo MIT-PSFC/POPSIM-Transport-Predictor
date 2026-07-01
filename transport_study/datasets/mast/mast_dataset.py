@@ -17,6 +17,7 @@ from disruption_py.machine.tokamak import Tokamak
 from dynaconf import Dynaconf
 from loguru import logger
 from scipy.interpolate import interp1d
+from threadpoolctl import threadpool_limits
 
 from transport_study import EPISODE_DIM, PACKAGE_ROOT, TIME_COORD, TIME_DIM
 from transport_study.datasets import make_uniform_1khz_timebase
@@ -742,14 +743,20 @@ class MASTDataWorkflow(DataWorkflow):
             if fit_input is None:
                 continue
 
-            # Fit profiles at the TS measurement times only
-            outputs = fit_batch(
-                {shot: fit_input},
-                x_star=self.gp_fit_rho,
-                min_points=self.fit_min_points,
-                scale_per_slice=self.fit_scale_per_slice,
-                num_workers=self.fit_workers,
-            )
+            # Fit profiles at the TS measurement times only. numpy is already
+            # imported by this point (this module imports it directly above
+            # fit_worker), so fit_worker's own OPENBLAS_NUM_THREADS=1 setdefault
+            # came too late to take effect and OpenBLAS defaults to one thread
+            # per core. Cap it here instead: GP fit matrices are tiny (tens of
+            # points), so multi-threaded BLAS is pure overhead, not speedup.
+            with threadpool_limits(1):
+                outputs = fit_batch(
+                    {shot: fit_input},
+                    x_star=self.gp_fit_rho,
+                    min_points=self.fit_min_points,
+                    scale_per_slice=self.fit_scale_per_slice,
+                    num_workers=self.fit_workers,
+                )
 
             if self._assemble_shot(shot, outputs[shot]):
                 processed_shots += 1
