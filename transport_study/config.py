@@ -36,8 +36,8 @@ class StudyConfig(BaseModel):
     patience: int = 4  # epochs_per_val * patience = max epochs without improvement before stopping
 
     # Environment-specific orchestration settings
-    partition: str | None = None
-    buffer_gpus: int = 12
+    partition: str | None = Field(default_factory=lambda: os.environ.get("PTPS_PARTITION"))
+    buffer_gpus: int | None = Field(default_factory=lambda: int(os.environ.get("PTPS_BUFFER_GPUS", "12")))
     wandb_entity: str | None = Field(default_factory=lambda: os.environ.get("PTPS_WANDB_ENTITY"))
     scratch_dir: Path | None = (
         None  # TODO(ZanderKeith): Only used for intermediate results from trajectory optimization, can be put in that study config instead

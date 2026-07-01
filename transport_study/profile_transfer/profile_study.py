@@ -22,6 +22,7 @@ from transport_study.modules.profile_predictor.train_configs import (
 )
 from transport_study.orchestration.organize_data import TrainingData
 from transport_study.orchestration.study import Study
+from transport_study.profile_transfer.data_visualization import DataVisualization
 
 # When domain adaptation is None, we aren't using any target data during training anyway so this is unused
 # During domain adaptation, we aren't doing hyperparameter tuning
@@ -963,6 +964,9 @@ def run_study(
         clean_figures=clean_figures,
     )
 
+    if enable_parallelism and not config.partition:
+        raise ValueError("enable_parallelism is True but no SLURM partition is specified in the config")
+
     def _move_data(study: Study):
         logger.info("Moving data to cluster scratch for faster training")
         for ds_path in config.dataset_paths.values():
@@ -986,6 +990,8 @@ def run_study(
     ######################
     if not skip_visualization:
         logger.opt(colors=True).info("<bold><magenta>DATA VISUALIZATION</magenta></bold>")
+        DataVisualization.performance_extrapolation(study.figure_dir)
+        DataVisualization.domain_overlap(study.figure_dir)
 
     ########################
     # Launch Orchestration #
