@@ -122,6 +122,13 @@ class CModDataWorkflow(DataWorkflow):
             "betan": {"min": 0, "max": 5},
         }
         self.individual_filter_config = None
+        # {signal: max_value}: once any of these exceeds its threshold the shot is
+        # cut from 10ms before to the end (transient event, see filter_ds). Set
+        # thresholds per signal, e.g. {"P_rad_MW": 5.0}.
+        self.transient_filter_config = {
+            "P_oh_MW": 5.0,  # Shot 1160503009 at t=0.7 has a UFO
+            "P_rad_MW": 2.5,
+        }
         self.skip_profiles = skip_profiles
 
     def _get_shotlist_from_source(self) -> list[int]:

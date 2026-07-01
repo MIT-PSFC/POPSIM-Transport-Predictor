@@ -77,6 +77,10 @@ class DataWorkflow:
         self.cluster_config = cluster_config
         self.fit_workers = fit_workers
 
+        # Signals that flag a transient event (UFO, minor disruption). Subclasses
+        # set this to {signal: max_value}; see filter_ds / _transient_cutoff_time.
+        self.transient_filter_config = None
+
         if shotlist_file is None:
             logger.info("No shotlist file provided, retrieving shotlist from device-specific source")
             self.shotlist = self._get_shotlist_from_source()
@@ -294,7 +298,8 @@ class DataWorkflow:
         # Log some stats about the resulting dataset
         self.log_ds_details(ds)
 
-        # Make some diagnostic plots of the resulting dataset to check that it looks reasonable. These can be used to spot any remaining issues with the data, and to get a sense of the overall characteristics of the dataset (e.g., typical signal ranges, how many shots have valid profiles, etc.)
+        # Diagnostic plots to sanity-check the resulting dataset (signal ranges,
+        # profile coverage, remaining issues)
         try:
             ds_profile_time_plot(
                 zarr_path,
@@ -320,6 +325,32 @@ class DataWorkflow:
         except Exception as e:
             logger.error(f"Error generating summary report: {e}")
 
+    def _transient_cutoff_time(self, shot_ds: xr.Dataset) -> float | None:
+        """Earliest time [s] any transient_filter_config signal exceeds its threshold.
+
+        These signals flag transient events (UFO, minor disruption) that break
+        the pre-shot prediction we're after, so once one crosses its threshold
+        the shot is no longer usable. Returns None if nothing crosses (or no
+        config). filter_ds drops data from 10ms before this time to end of shot.
+        """
+        if not self.transient_filter_config:
+            return None
+
+        cutoff_idx = None
+        for var, threshold in self.transient_filter_config.items():
+            if var not in shot_ds:
+                logger.debug(f"Transient filter variable {var} not in dataset for shot {shot_ds.shot.values[0]}")
+                continue
+            exceed = shot_ds[var] > threshold
+            reduce_dims = [dim for dim in exceed.dims if dim != TIME_DIM]
+            if reduce_dims:
+                exceed = exceed.any(dim=reduce_dims)
+            exceed_idxs = np.where(exceed.values)[0]
+            if exceed_idxs.size:
+                cutoff_idx = exceed_idxs[0] if cutoff_idx is None else min(cutoff_idx, exceed_idxs[0])
+
+        return None if cutoff_idx is None else float(shot_ds.time[cutoff_idx])
+
     def filter_ds(self, shot_ds: xr.Dataset) -> xr.Dataset:
         """Apply filtering steps based on device config"""
 
@@ -327,6 +358,12 @@ class DataWorkflow:
         valid_time = shot_ds["Ip_MA"].notnull().any(dim=EPISODE_DIM)
         last_valid_idx = int(np.where(valid_time.values)[0][-1])
         valid_mask = shot_ds.time <= shot_ds.time[last_valid_idx] - 0.05
+
+        # Drop everything from 10ms before the first transient event to end of shot
+        cutoff_time = self._transient_cutoff_time(shot_ds)
+        if cutoff_time is not None:
+            logger.info(f"Shot {shot_ds.shot.values[0]}: transient event at t={cutoff_time:.3f}s, cutting from 10ms before")
+            valid_mask = valid_mask & (shot_ds.time < cutoff_time - 0.01)
 
         # Apply full-timeslice filters
         for var, valid_range in self.filter_config.items():
@@ -393,15 +430,13 @@ class DataWorkflow:
             shot_ds["fresh_profiles"] = fresh_profiles.astype(np.float32)
 
         debug_ds = shot_ds.copy()  # Copy for plotting later if need be
-        # Filtering based on config thresholds defined in the subclass
-        # Making sure data is within valid ranges, and cutting data 50ms before Ip_MA goes to NaN to avoid including disruptive data
+        # Subclass filter config: range checks, disruption cutoff, transient events
         shot_ds = self.filter_ds(shot_ds)
         if shot_ds is None:
             self._debug_plots(debug_ds)
             return None
 
-        # Culling that is specific to the device, implemented in the subclass.
-        # This is applied after the device-specific processing and the general processing steps, so that it can take into account any corrections or fixes that were made to the data in those steps.
+        # Device-specific culling, after all processing so it sees the corrected data
         if self.device_specific_culling(shot_ds):
             logger.warning(f"Excluding shot {shot_id} based on device-specific culling criteria")
             self._debug_plots(debug_ds)

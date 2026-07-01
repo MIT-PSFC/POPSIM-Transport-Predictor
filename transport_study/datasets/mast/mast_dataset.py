@@ -258,6 +258,13 @@ class MASTDataWorkflow(DataWorkflow):
             "betan": {"min": 0, "max": 10},
         }
         self.individual_filter_config = None
+        # {signal: max_value}: once any of these exceeds its threshold the shot is
+        # cut from 10ms before to the end (transient event, see filter_ds). Set
+        # thresholds per signal, e.g. {"P_rad_MW": 5.0}.
+        self.transient_filter_config = {
+            "P_rad_MW": 3,  # Just vibes
+            "P_oh_MW": 5,  # Shot 29153 at t ~3.8s
+        }
 
     # ------------------------------------------------------------------
     def _get_shotlist_from_source(self) -> list[int]:
