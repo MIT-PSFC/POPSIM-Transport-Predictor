@@ -62,9 +62,9 @@ FORMAT_VERSION = 3
 # edge (large-rho) length scale,
 # tanh transition width
 # and transition center.
-_HYP_START = np.array([2.0, 1.0, 0.5, 0.1, 1.0])
+_HYP_START = np.array([2.0, 0.8, 0.4, 0.1, 1.0])
 # Bounds define the optimizer's random-restart ranges (drawn uniform in log10)
-_HYP_BOUNDS = np.array([[1.0e-2, 0.4, 0.1, 0.05, 0.95], [2.0e1, 2.0, 0.5, 0.2, 1.05]])
+_HYP_BOUNDS = np.array([[1.0e-2, 0.4, 0.2, 0.05, 0.95], [2.0e1, 0.9, 0.5, 0.2, 1.05]])
 # Edge boundary conditions, informed by Chilenski 2016. Columns: (rho, value, error).
 # Value BCs pull the profile to ~0 past the separatrix
 # gradient BCs flatten it at the axis (rho=0) and past the edge
