@@ -630,7 +630,12 @@ def get_train_test_datasets(
         # All available target shots in training and testing (upper-bound reference, CHEATING!)
         train_ds_hp = ds_target.isel({episode_coord: sorted_shots})
     else:
-        train_shot_pool = sorted_shots[:num_target_shots]
+        # Exclude the held-out test shots before selecting training shots so the two pools
+        # never overlap (otherwise a large num_target_shots would leak high-performance test
+        # shots into training)
+        train_candidate_pool = sorted_shots[:-target_test_set_size] if target_test_set_size else sorted_shots
+        train_shot_pool = train_candidate_pool[:num_target_shots]
+        assert not (set(train_shot_pool.tolist()) & set(test_shot_pool.tolist())), "Target train and test shot pools overlap - data leakage"
         train_ds_hp = ds_target.isel({episode_coord: train_shot_pool})
 
     # Load historic source data for training (and for exnihilo: normalization only)
