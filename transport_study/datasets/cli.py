@@ -1,5 +1,6 @@
 import os
 import shutil
+from datetime import datetime
 from pathlib import Path
 
 import fire
@@ -190,8 +191,16 @@ class DatasetCLI:
         clean: bool,
     ):
         if mode == "raw":
-            if clean and Path(workflow.raw_data_dir).exists():
-                shutil.rmtree(workflow.raw_data_dir)
+            if clean:
+                workflow.clean_cluster_state()
+                if Path(workflow.raw_data_dir).exists():
+                    shutil.rmtree(workflow.raw_data_dir)
+                if Path(workflow.fit_staging_dir).exists():
+                    shutil.rmtree(workflow.fit_staging_dir)
+                ts_fit_plots_dir = workflow.data_assembly_dir / workflow.ds_name / "ts_fit_plots"
+                if ts_fit_plots_dir.exists():
+                    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                    ts_fit_plots_dir.rename(ts_fit_plots_dir.with_name(f"ts_fit_plots_{timestamp}"))
             Path(workflow.raw_data_dir).mkdir(parents=True, exist_ok=True)
             log_path = Path(workflow.raw_data_dir) / f"raw_data_{os.getpid()}.log"
             logger.add(log_path)

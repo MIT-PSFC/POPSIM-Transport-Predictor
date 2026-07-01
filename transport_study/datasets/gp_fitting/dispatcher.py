@@ -18,6 +18,7 @@ resubmitting them.
 """
 
 import hashlib
+import shlex
 import shutil
 import time
 from contextlib import contextmanager
@@ -234,6 +235,18 @@ class _SSHBackend:
     def job_states(self, job_ids: list[int]) -> dict[int, str]:
         return {jid: snap.status for jid, snap in self._client.queue_by_ids(job_ids).items()}
 
+    def cancel(self, job_id: int) -> None:
+        self._client.cancel(job_id)
+
+    def remove_files(self, remote_paths: list[str]) -> None:
+        """Delete remote files via a single ssh rm, reusing the rsync client's SSH options."""
+        if not remote_paths:
+            return
+        quoted = " ".join(shlex.quote(p) for p in remote_paths)
+        result = self._rsync._ssh_run(f"rm -f -- {quoted}")
+        if result.returncode != 0:
+            logger.warning(f"Failed to remove remote files {remote_paths}: {result.stderr.strip()}")
+
 
 class _LocalBackend:
     """Job control when already running on the target cluster (shared FS)."""
@@ -269,6 +282,13 @@ class _LocalBackend:
 
     def job_states(self, job_ids: list[int]) -> dict[int, str]:
         return {jid: snap.status for jid, snap in self._client.queue_by_ids(job_ids).items()}
+
+    def cancel(self, job_id: int) -> None:
+        self._client.cancel(job_id)
+
+    def remove_files(self, remote_paths: list[str]) -> None:
+        for p in remote_paths:
+            Path(p).unlink(missing_ok=True)
 
 
 @dataclass
@@ -364,6 +384,30 @@ class ClusterFitDispatcher:
 
         self._run_jobs(batches)
         return self._collect_results(batches, shot_inputs)
+
+    def giclean(self) -> None:
+        """Cancel this device's queued/running jobs and remove its batch files, local and remote.
+
+        Call before run() for a from-scratch fit (CLI --clean): otherwise
+        plan_batches/_run_jobs would adopt the cancelled jobs or reuse
+        leftover batch outputs on the cluster.
+        """
+        prefix = f"{self.config.job_name_prefix}-{self.device}-"
+        for name, job_id in self.backend.queued_job_names().items():
+            if not name.startswith(prefix):
+                continue
+            logger.info(f"Clean: cancelling job {name} (id {job_id})")
+            try:
+                self.backend.cancel(job_id)
+            except Exception as e:
+                logger.warning(f"Clean: failed to cancel job {name} (id {job_id}): {e}")
+
+        local_batches = sorted(self.batches_dir.glob("batch_*.npz"))
+        remote_paths = [f"{self.config.remote_workdir}/{p.name}" for p in local_batches]
+        self.backend.remove_files(remote_paths)
+        if self.batches_dir.exists():
+            shutil.rmtree(self.batches_dir)
+        self.batches_dir.mkdir(parents=True, exist_ok=True)
 
     # ------------------------------------------------------------------
     def _run_jobs(self, batches: list[_BatchState]) -> None:
