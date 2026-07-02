@@ -16,7 +16,6 @@ def checkpoint_to_profile_case(checkpoint_dir: Path | str) -> ProfileStudy.Case:
     case_pieces = case_name.split(".")
     model_type = case_pieces[1]
     training_data = case_pieces[2][3:]  # remove "td_" prefix
-    data_normalization = "physics"  # Always using this for profile predictor
 
     if len(case_pieces) == 4:
         domain_adaptation = None
@@ -36,7 +35,6 @@ def checkpoint_to_profile_case(checkpoint_dir: Path | str) -> ProfileStudy.Case:
     return ProfileStudy.Case(
         model_type=model_type,
         training_data=training_data,
-        data_normalization=data_normalization,
         domain_adaptation=domain_adaptation,
         freeze_shapes=freeze_shapes,
         num_hp_shots=num_hp_shots,

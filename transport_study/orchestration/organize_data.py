@@ -615,7 +615,6 @@ def get_train_test_datasets(
     # Load the target device dataset and split into train/test
     ds_target, episode_coord = get_ds(target, study_type=study_type)
     ds_target = add_performance(ds_target, episode_coord)
-    ds_target, _ = normalize_domain(ds_target, method="physics")
     ds_target["ds_source_idx"] = (
         episode_coord,
         np.full(ds_target.sizes[episode_coord], config.ds_source_to_idx[target]),
@@ -638,7 +637,7 @@ def get_train_test_datasets(
         assert not (set(train_shot_pool.tolist()) & set(test_shot_pool.tolist())), "Target train and test shot pools overlap - data leakage"
         train_ds_hp = ds_target.isel({episode_coord: train_shot_pool})
 
-    # Load historic source data for training (and for exnihilo: normalization only)
+    # Load historic source data for training (for exnihilo it is stripped again below)
     # exnihilo.sources contains all non-target devices, so we can pass training_data directly
     train_ds_hist, val_ds_hist = get_train_val_datasets(training_data, study_type=study_type)
     train_ds = concat_with_nan_padding(

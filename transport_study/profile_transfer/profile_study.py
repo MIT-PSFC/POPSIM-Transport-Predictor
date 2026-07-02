@@ -47,13 +47,11 @@ class ProfileStudy(Study):
         # The different cases being compared in this study
         model_types: tuple[str, ...] = Field(default_factory=lambda: ("shape_init_pca", "shape_init_kmeans", "unstructured_nn"))
         training_datasets: tuple[TrainingData, ...]
-        data_normalization_methods: tuple[str, ...] = Field(default_factory=lambda: ("physics",))
         domain_adaptation_methods: tuple[str | None, ...] = Field(default_factory=lambda: (None, "mixing", "transfer"))
         freeze_shapes_options: tuple[bool, ...] = Field(default_factory=lambda: (True,))
         num_target_shots_options: tuple[int, ...] = Field(default_factory=lambda: (0, 1, 10, -1))
         target_test_set_size: int
         # configurations for the hyperparameter tuning case
-        hyperparam_data_normalization: str = "physics"
         hyperparam_domain_adaptation: str | None = None
         hyperparam_freeze_shapes: bool = True
         hyperparam_num_target_shots: int = HYPERPARAM_TARGET_SHOTS
@@ -72,14 +70,6 @@ class ProfileStudy(Study):
             for mt in v:
                 if mt not in valid:
                     raise ValueError(f"Invalid model type: {mt}. Must be one of {sorted(valid)}.")
-            return v
-
-        @field_validator("data_normalization_methods")
-        @classmethod
-        def _validate_data_normalization(cls, v: tuple[str, ...]) -> tuple[str, ...]:
-            for dn in v:
-                if dn not in ["physics"]:
-                    raise ValueError(f"Invalid data normalization: {dn}. Only 'physics' is implemented for profile transfer.")
             return v
 
         @field_validator("domain_adaptation_methods")
@@ -133,7 +123,6 @@ class ProfileStudy(Study):
                 and self.dataset_paths == cfg.dataset_paths
                 and self.target_device == cfg.target_device
                 and self.target_test_set_size == cfg.target_test_set_size
-                and self.hyperparam_data_normalization == cfg.hyperparam_data_normalization
                 and self.hyperparam_domain_adaptation == cfg.hyperparam_domain_adaptation
                 and self.hyperparam_freeze_shapes == cfg.hyperparam_freeze_shapes
                 and self.hyperparam_num_target_shots == cfg.hyperparam_num_target_shots
@@ -173,7 +162,6 @@ class ProfileStudy(Study):
         cases = self.make_cases(
             config.model_types,
             config.training_datasets,
-            config.data_normalization_methods,
             config.domain_adaptation_methods,
             config.freeze_shapes_options,
             config.num_target_shots_options,
@@ -182,7 +170,6 @@ class ProfileStudy(Study):
 
         logger.info(f"Model types: {config.model_types}")
         logger.info(f"Training datasets: {config.training_datasets}")
-        logger.info(f"Data normalization methods: {config.data_normalization_methods}")
         logger.info(f"Domain adaptation methods: {config.domain_adaptation_methods}")
         logger.info(f"Freeze shapes options: {config.freeze_shapes_options}")
         logger.info(f"Number of target shots included in training options: {config.num_target_shots_options}")
@@ -202,10 +189,6 @@ class ProfileStudy(Study):
         - cmod_tcv: C-Mod + TCV
         - exnihilo: No historic training data
 
-        data_normalization: The method for normalizing the input data.
-        - physics: Convert to typical dimensionless parameters like beta, q95, f_G, etc.
-        - Since we found that physics transfers best for power balance, only studying it here
-
         domain_adaptation: The method for domain adaptation between source and target devices.
         - none: No domain adaptation, train and test on the same device(s). This is used for hyperparameter tuning and as a baseline for comparison, answering the question "what is the best possible performance we could expect if we had a bunch of data?"
         - mixing: Add a small amount of highly-weighted target data during training
@@ -219,7 +202,6 @@ class ProfileStudy(Study):
 
         model_type: str
         training_data: TrainingData
-        data_normalization: str  # raw, physics, z_score, coral
         domain_adaptation: str  # none, mixing, transfer
         freeze_shapes: bool
         num_target_shots: int  # Number of target shots included in training, or -1 for all (should be HYPERPARAM_TARGET_SHOTS if domain_adaptation is None)
@@ -230,7 +212,6 @@ class ProfileStudy(Study):
         def is_hyperparam_case(self) -> bool:
             if (
                 self.training_data == ProfileStudy._hyperparam_training_data()
-                and self.data_normalization == config.hyperparam_data_normalization
                 and self.domain_adaptation == config.hyperparam_domain_adaptation
                 and self.freeze_shapes == config.hyperparam_freeze_shapes
                 and self.num_target_shots == config.hyperparam_num_target_shots
@@ -258,7 +239,6 @@ class ProfileStudy(Study):
                 return ProfileStudy.Case(
                     model_type=self.model_type,
                     training_data=ProfileStudy._hyperparam_training_data(),
-                    data_normalization=config.hyperparam_data_normalization,
                     domain_adaptation=config.hyperparam_domain_adaptation,
                     freeze_shapes=config.hyperparam_freeze_shapes,
                     num_target_shots=config.hyperparam_num_target_shots,
@@ -268,7 +248,6 @@ class ProfileStudy(Study):
             self,
             model_type: str,
             training_data: TrainingData | str,
-            data_normalization: str,
             domain_adaptation: str,
             freeze_shapes: bool,
             num_target_shots: int,
@@ -277,7 +256,6 @@ class ProfileStudy(Study):
                 training_data = _parse_training_data(training_data, dict(config.dataset_paths), config.target_device)
             self.model_type = model_type
             self.training_data = training_data
-            self.data_normalization = data_normalization
             self.domain_adaptation = domain_adaptation
             self.freeze_shapes = freeze_shapes
             self.num_target_shots = num_target_shots
@@ -307,7 +285,6 @@ class ProfileStudy(Study):
                     ProfileStudy.Case(
                         model_type=model_type,
                         training_data=ProfileStudy._hyperparam_training_data(),
-                        data_normalization=config.hyperparam_data_normalization,
                         domain_adaptation=config.hyperparam_domain_adaptation,
                         freeze_shapes=config.hyperparam_freeze_shapes,
                         num_target_shots=config.hyperparam_num_target_shots,
@@ -323,7 +300,6 @@ class ProfileStudy(Study):
                     ProfileStudy.Case(
                         model_type=model_type,
                         training_data=training_data,
-                        data_normalization=data_normalization,
                         domain_adaptation=None,
                         freeze_shapes=freeze_shapes,
                         num_target_shots=HYPERPARAM_TARGET_SHOTS,
@@ -350,7 +326,6 @@ class ProfileStudy(Study):
                     (
                         self.model_type,
                         self.training_data,
-                        self.data_normalization,
                         self.domain_adaptation,
                         self.freeze_shapes,
                         self.num_target_shots,
@@ -361,7 +336,6 @@ class ProfileStudy(Study):
                     (
                         self.model_type,
                         self.training_data,
-                        self.data_normalization,
                         self.freeze_shapes,
                         self.num_target_shots,
                     )
@@ -371,7 +345,6 @@ class ProfileStudy(Study):
                     (
                         self.model_type,
                         self.training_data,
-                        self.data_normalization,
                         self.domain_adaptation,
                         self.freeze_shapes,
                     )
@@ -381,7 +354,6 @@ class ProfileStudy(Study):
         self,
         model_types,
         training_datasets,
-        data_normalization_methods,
         domain_adaptation_methods,
         freeze_shapes_options,
         num_target_shots_options,
@@ -391,14 +363,12 @@ class ProfileStudy(Study):
         for (
             model_type,
             training_dataset,
-            data_normalization,
             domain_adaptation,
             freeze_shapes,
             num_target_shots,
         ) in product(
             model_types,
             training_datasets,
-            data_normalization_methods,
             domain_adaptation_methods,
             freeze_shapes_options,
             num_target_shots_options,
@@ -415,7 +385,6 @@ class ProfileStudy(Study):
             case = self.Case(
                 model_type=model_type,
                 training_data=training_dataset,
-                data_normalization=data_normalization,
                 domain_adaptation=domain_adaptation,
                 freeze_shapes=freeze_shapes,
                 num_target_shots=num_target_shots,
@@ -457,7 +426,6 @@ class ProfileStudy(Study):
         dataloader_config_base = {
             "target_vars": ["Te_keV_rho", "ne20_rho", "ds_source_idx"],
             "training_data": case.training_data,
-            "data_normalization": case.data_normalization,
             "domain_adaptation": case.domain_adaptation,
             "num_target_shots": case.num_target_shots,
             "target_test_set_size": config.target_test_set_size,
@@ -569,7 +537,6 @@ class ProfileStudy(Study):
                     },
                     model_init_config={
                         "model_type": case.model_type,
-                        "data_normalization": case.data_normalization,
                         "domain_adaptation": case.domain_adaptation,
                         "freeze_shapes": case.freeze_shapes,
                         "te_shape_var": "Te_shape",
@@ -611,7 +578,6 @@ class ProfileStudy(Study):
                     },
                     model_init_config={
                         "model_type": case.model_type,
-                        "data_normalization": case.data_normalization,
                         "domain_adaptation": case.domain_adaptation,
                         "n_points": 21,  # Number of points along the profile to predict for the unstructured NN
                         "nn_depth": 2,
@@ -649,7 +615,6 @@ class ProfileStudy(Study):
                     },
                     model_init_config={
                         "model_type": case.model_type,
-                        "data_normalization": case.data_normalization,
                         "domain_adaptation": case.domain_adaptation,
                         "n_points": 21,  # Number of points along the profile predicted by the readout
                         "reservoir_size": 128,  # Fixed random reservoir state dimension
@@ -691,7 +656,6 @@ class ProfileStudy(Study):
                     },
                     model_init_config={
                         "model_type": case.model_type,
-                        "data_normalization": case.data_normalization,
                         "domain_adaptation": case.domain_adaptation,
                         "freeze_shapes": case.freeze_shapes,
                         "nn_depth": 2,
@@ -714,12 +678,11 @@ class ProfileStudy(Study):
 
         # For transfer learning, point to where this case's pretrained checkpoint
         if case.domain_adaptation == "transfer":
-            # Pretrained model has same model_type, training_data, and data_normalization,
+            # Pretrained model has same model_type and training_data,
             # but no domain adaptation and no high-performance shots
             transfer_case = ProfileStudy.Case(
                 model_type=case.model_type,
                 training_data=case.training_data,
-                data_normalization=case.data_normalization,
                 domain_adaptation=None,
                 freeze_shapes=case.freeze_shapes,
                 num_target_shots=HYPERPARAM_TARGET_SHOTS,
@@ -811,7 +774,6 @@ class ProfileStudy(Study):
         "case_idx",
         "model_type",
         "training_data",
-        "data_normalization",
         "domain_adaptation",
         "freeze_shapes",
         "num_target_shots",
@@ -823,7 +785,6 @@ class ProfileStudy(Study):
             "case_idx": case_idx,
             "model_type": case.model_type,
             "training_data": str(case.training_data),
-            "data_normalization": case.data_normalization,
             # Normalize None -> "none" so the coord stays string-typed
             "domain_adaptation": case.domain_adaptation if case.domain_adaptation is not None else "none",
             "freeze_shapes": case.freeze_shapes,
@@ -843,7 +804,7 @@ class ProfileStudy(Study):
 
         Dims: record (flat index over all case x shot pairs)
         Coords (along record):
-        - case_idx, model_type, training_data, data_normalization, domain_adaptation,
+        - case_idx, model_type, training_data, domain_adaptation,
           freeze_shapes, num_target_shots (identify the case)
         - shot (device shot id), ds_source (which dataset the shot came from)
         Data variables (along record):
@@ -922,7 +883,7 @@ class ProfileStudy(Study):
         statistics. Use ``collect_results`` for the per-shot view.
 
         Dims: case_idx
-        Coords (along case_idx): model_type, training_data, data_normalization,
+        Coords (along case_idx): model_type, training_data,
         domain_adaptation, freeze_shapes, num_target_shots
         Data variables (along case_idx): err_E_D_S where E is 'abs' or 'rel', D is
         'shot' (time-integrated per shot) or 'ts' (per timeslice), and S is one of

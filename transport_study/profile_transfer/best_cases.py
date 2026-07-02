@@ -11,7 +11,6 @@ ds = xr.open_dataset(DS_PATH)
 case_coords = [
     "model_type",
     "training_data",
-    "data_normalization",
     "domain_adaptation",
     "freeze_shapes",
     "num_hp_shots",

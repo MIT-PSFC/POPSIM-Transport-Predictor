@@ -13,6 +13,5 @@ cmod-low1 = "/path/to/mast.nc"
 [study_cases]
 model_types = ["unstructured_nn"]
 training_datasets = ["exnihilo", "cmod-low1"]
-data_normalization_methods = ["physics"]
 num_target_shots_options = [0, 2]
 domain_adaptation_methods = ["transfer"]

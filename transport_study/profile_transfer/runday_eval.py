@@ -50,7 +50,6 @@ TEXT_COLOR = "white"
 CASE_COORDS = [
     "model_type",
     "training_data",
-    "data_normalization",
     "domain_adaptation",
     "freeze_shapes",
     "num_hp_shots",
@@ -282,7 +281,6 @@ def runday_eval(  # noqa: PLR0915
         row = {
             "model_type": case.model_type,
             "training_data": case.training_data,
-            "data_normalization": case.data_normalization,
             "domain_adaptation": case.domain_adaptation or "",
             "freeze_shapes": case.freeze_shapes,
             "num_hp_shots": case.num_hp_shots,
