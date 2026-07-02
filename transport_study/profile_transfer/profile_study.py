@@ -435,12 +435,18 @@ class ProfileStudy(Study):
             "batch_size": 8192,
         }
         loss_config_base = {
-            "huber_delta": 0.5,
+            # The loss runs on peak-normalized profiles (target scaled to max 1),
+            # so both deltas read as fractional errors. Both are swept
+            # hyperparameters (see sweep_configs/*.yaml), these values are the
+            # fallback for cases run without a tuned config. Validation loss is
+            # delta-free (get_val_loss_fn), so the sweep metric cannot be gamed
+            # by shrinking the deltas
+            "huber_delta": 0.1,
             # Penalize profile gradient mismatch too, since stability predictions
-            # depend on dTe/drho and dne/drho. Gradients are ~10x the value scale
-            # over rho in [0, 1], so they get their own huber delta.
+            # depend on dTe/drho and dne/drho. Normalized gradients are ~10x the
+            # normalized value scale over rho in [0, 1], so they get their own delta.
             "gradient_weight": 0.1,
-            "huber_delta_grad": 5.0,
+            "huber_delta_grad": 1.0,
         }
         optimizer_config_base = {
             "lr0": 1e-4,
@@ -705,6 +711,8 @@ class ProfileStudy(Study):
             # Restore hyperparameters from the tuned config, but keep the rest of the settings the same
 
             # Hyperparameters swept for all modules
+            # Only the deltas come from the tuned loss_config: device_weights and
+            # gradient_weight stay case-specific (mixing weights differ per case)
             train_config = train_config_base.model_copy(
                 update={
                     "dataloader_config": {
@@ -712,6 +720,13 @@ class ProfileStudy(Study):
                         "batch_size": tuned_config.dataloader_config["batch_size"],
                     },
                     "optimizer_config": tuned_config.optimizer_config,
+                    "loss_config": {
+                        **train_config_base.loss_config,
+                        "huber_delta": tuned_config.loss_config.get("huber_delta", train_config_base.loss_config["huber_delta"]),
+                        "huber_delta_grad": tuned_config.loss_config.get(
+                            "huber_delta_grad", train_config_base.loss_config["huber_delta_grad"]
+                        ),
+                    },
                 }
             )
 

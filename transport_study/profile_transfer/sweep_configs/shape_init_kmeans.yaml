@@ -41,3 +41,16 @@ parameters:
         max: 0.999
       batch_size:
         values: [4096, 8192, null]
+  loss_config:
+    parameters:
+      # Deltas act on peak-normalized profiles, so they read as fractional errors.
+      # Sweeping them is safe because the sweep metric val/loss.mean is the
+      # delta-free validation loss (trb.get_val_loss_fn)
+      huber_delta:
+        distribution: log_uniform_values
+        min: 0.01
+        max: 1.0
+      huber_delta_grad:
+        distribution: log_uniform_values
+        min: 0.1
+        max: 10.0

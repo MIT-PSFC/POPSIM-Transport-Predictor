@@ -197,8 +197,30 @@ class ProfilePredictorTRB(TrainRunBuilder):
 
         return module
 
+    # Floor on the per-sample target peak used for profile normalization.
+    # In channel units (1e20 m^-3 for ne, keV for Te) any real fresh profile
+    # peaks far above this, so the floor only guards degenerate targets from
+    # blowing up the 1/scale division
+    PROFILE_SCALE_FLOOR = 1e-2
+
     @staticmethod
-    def get_loss_fn(loss_config: dict) -> Callable[[Any, Any], jnp.ndarray]:
+    def _make_profile_loss_fn(loss_config: dict, use_huber: bool) -> Callable[[Any, Any], jnp.ndarray]:
+        """Shared builder for the training and validation losses.
+
+        Both losses operate on peak-normalized profiles: each target profile is
+        scaled so its largest value is 1, and the prediction is divided by the
+        same per-sample scale. This keeps the two channels comparable (ne is
+        ~0.5-4 in 1e20 m^-3, Te up to ~8 keV on C-Mod but ~1 on TCV) so neither
+        channel nor device dominates, and an error of 0.1 always means 10% of
+        the profile peak.
+
+        use_huber=True builds the training loss with the swept huber_delta /
+        huber_delta_grad (deltas read as fractional errors on the normalized
+        profiles). use_huber=False builds the validation loss as plain absolute
+        error with no deltas at all: huber loss shrinks monotonically as
+        delta -> 0, so a delta-dependent sweep metric would reward small deltas
+        instead of good predictions.
+        """
         if "device_weights" not in loss_config:
             device_weights = dict.fromkeys(config.dataset_paths, 1.0)
         else:
@@ -208,25 +230,43 @@ class ProfilePredictorTRB(TrainRunBuilder):
         # Gradient agreement matters for downstream stability predictions, which
         # depend on dTe/drho and dne/drho rather than the values themselves.
         gradient_weight = loss_config.get("gradient_weight", 0.0)
-        # Gradients are much larger in magnitude than values (a few keV over rho in [0, 1]
-        # gives dTe/drho of order 10), so the huber transition needs its own delta
-        huber_delta_grad = loss_config.get("huber_delta_grad", 5.0)
+
+        if use_huber:
+            # Normalized gradients are still larger than normalized values
+            # (a peak-normalized pedestal can have d/drho of order 10), so the
+            # huber transition needs its own delta
+            huber_delta = loss_config["huber_delta"]
+            huber_delta_grad = loss_config.get("huber_delta_grad", 1.0)
+
+            def value_err(pred, targ):
+                return optax.huber_loss(pred, targ, delta=huber_delta)
+
+            def grad_err(pred, targ):
+                return optax.huber_loss(pred, targ, delta=huber_delta_grad)
+        else:
+
+            def value_err(pred, targ):
+                return jnp.abs(pred - targ)
+
+            grad_err = value_err
 
         def loss_fn(pred, targ):
-            ne_huber = optax.huber_loss(
-                pred.ne.data,
-                targ["ne20_rho"].data,
-                delta=loss_config["huber_delta"],
-            )
-            te_huber = optax.huber_loss(
-                pred.te.data,
-                targ["Te_keV_rho"].data,
-                delta=loss_config["huber_delta"],
-            )
+            ne_targ = targ["ne20_rho"].data
+            te_targ = targ["Te_keV_rho"].data
+
+            # Peak-normalize per sample: scale comes from the target only and is
+            # applied to prediction and target alike, so a perfect prediction
+            # still gives zero loss
+            floor = ProfilePredictorTRB.PROFILE_SCALE_FLOOR
+            ne_scale = jnp.maximum(jnp.max(jnp.abs(ne_targ), axis=-1, keepdims=True), floor)
+            te_scale = jnp.maximum(jnp.max(jnp.abs(te_targ), axis=-1, keepdims=True), floor)
+
+            ne_err = value_err(pred.ne.data / ne_scale, ne_targ / ne_scale)
+            te_err = value_err(pred.te.data / te_scale, te_targ / te_scale)
 
             # Build per-sample device weight
             ds_source_idx = targ["ds_source_idx"].data
-            sample_weights = jnp.ones(ds_source_idx.shape, dtype=ne_huber.dtype)
+            sample_weights = jnp.ones(ds_source_idx.shape, dtype=ne_err.dtype)
             for device, weight in device_weights.items():
                 sample_weights = jnp.where(
                     ds_source_idx == config.ds_source_to_idx[device],
@@ -235,40 +275,60 @@ class ProfilePredictorTRB(TrainRunBuilder):
                 )
 
             # Broadcast sample weights across profile/time axes
-            while sample_weights.ndim < ne_huber.ndim:
+            while sample_weights.ndim < ne_err.ndim:
                 sample_weights = sample_weights[..., None]
 
-            ne_weighted = sample_weights * ne_huber
-            te_weighted = sample_weights * te_huber
-
             rho = pred.ne.rho.data
-            ne_rho_loss = jnp.trapezoid(ne_weighted, x=rho)
-            te_rho_loss = jnp.trapezoid(te_weighted, x=rho)
+            ne_rho_loss = jnp.trapezoid(sample_weights * ne_err, x=rho)
+            te_rho_loss = jnp.trapezoid(sample_weights * te_err, x=rho)
 
             loss = ne_rho_loss + te_rho_loss
 
             if gradient_weight > 0.0:
-                # Finite-difference gradients at the rho midpoints (robust to
-                # non-uniform grids, no jnp.gradient spacing support needed)
+                # Finite-difference gradients of the normalized profiles at the
+                # rho midpoints (robust to non-uniform grids, no jnp.gradient
+                # spacing support needed)
                 d_rho = jnp.diff(rho)
                 rho_mid = 0.5 * (rho[:-1] + rho[1:])
 
-                ne_grad_pred = jnp.diff(pred.ne.data, axis=-1) / d_rho
-                ne_grad_targ = jnp.diff(targ["ne20_rho"].data, axis=-1) / d_rho
-                te_grad_pred = jnp.diff(pred.te.data, axis=-1) / d_rho
-                te_grad_targ = jnp.diff(targ["Te_keV_rho"].data, axis=-1) / d_rho
+                ne_grad_pred = jnp.diff(pred.ne.data / ne_scale, axis=-1) / d_rho
+                ne_grad_targ = jnp.diff(ne_targ / ne_scale, axis=-1) / d_rho
+                te_grad_pred = jnp.diff(pred.te.data / te_scale, axis=-1) / d_rho
+                te_grad_targ = jnp.diff(te_targ / te_scale, axis=-1) / d_rho
 
-                ne_grad_huber = sample_weights * optax.huber_loss(ne_grad_pred, ne_grad_targ, delta=huber_delta_grad)
-                te_grad_huber = sample_weights * optax.huber_loss(te_grad_pred, te_grad_targ, delta=huber_delta_grad)
+                ne_grad_err = sample_weights * grad_err(ne_grad_pred, ne_grad_targ)
+                te_grad_err = sample_weights * grad_err(te_grad_pred, te_grad_targ)
 
-                ne_grad_loss = jnp.trapezoid(ne_grad_huber, x=rho_mid)
-                te_grad_loss = jnp.trapezoid(te_grad_huber, x=rho_mid)
+                ne_grad_loss = jnp.trapezoid(ne_grad_err, x=rho_mid)
+                te_grad_loss = jnp.trapezoid(te_grad_err, x=rho_mid)
 
                 loss = loss + gradient_weight * (ne_grad_loss + te_grad_loss)
 
             return loss
 
         return loss_fn
+
+    @staticmethod
+    def get_loss_fn(loss_config: dict) -> Callable[[Any, Any], jnp.ndarray]:
+        """Training loss: huber on peak-normalized profiles.
+
+        huber_delta and huber_delta_grad are swept hyperparameters, so this loss
+        must only be used for training. Validation uses get_val_loss_fn, which
+        is delta-free, so the sweep metric stays comparable across delta values.
+        """
+        return ProfilePredictorTRB._make_profile_loss_fn(loss_config, use_huber=True)
+
+    @staticmethod
+    def get_val_loss_fn(loss_config: dict) -> Callable[[Any, Any], jnp.ndarray]:
+        """Validation loss: plain absolute error on peak-normalized profiles.
+
+        Shares device_weights and gradient_weight with the training loss so
+        validation weights samples consistently, but reads no huber deltas:
+        the sweep metric val/loss.mean must not depend on the swept deltas or
+        the sweep would drive them to their minimum to shrink the reported
+        number instead of improving predictions.
+        """
+        return ProfilePredictorTRB._make_profile_loss_fn(loss_config, use_huber=False)
 
     @staticmethod
     def get_optimizer(config: dict) -> optax.GradientTransformation:
@@ -326,9 +386,11 @@ class ProfilePredictorTRB(TrainRunBuilder):
         if suite_config is None:
             return None
 
-        # Must be an exact copy of the loss_config used in training
+        # Shares device_weights / gradient_weight with the training loss_config,
+        # but builds the delta-free validation loss: huber_delta is a swept
+        # hyperparameter and must not leak into the sweep metric
         loss_config = suite_config["loss_config"]
-        loss_fn = ProfilePredictorTRB.get_loss_fn(loss_config)
+        loss_fn = ProfilePredictorTRB.get_val_loss_fn(loss_config)
 
         def eval_fn(inp: EvalData) -> float:
             loss_vecs = []
