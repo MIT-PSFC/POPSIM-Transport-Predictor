@@ -537,7 +537,10 @@ class ProfileStudy(Study):
                 # Multiply by avg_size so weights go back to around 1
                 dataset_weights[device] = W_x * avg_size
 
-            dataloader_config_base["dataset_weights"] = dataset_weights
+            # Loss function reads these from loss_config as "device_weights".
+            # val_eval_suite_config_base references the same dict, so validation
+            # loss is weighted consistently with training
+            loss_config_base["device_weights"] = dataset_weights
 
         def _make_train_config_base(case: ProfileStudy.Case) -> TrainConfig:
             if case.model_type in ["shape_init_pca", "shape_init_kmeans"]:
