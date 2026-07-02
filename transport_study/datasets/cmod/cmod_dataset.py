@@ -221,6 +221,15 @@ class CModDataWorkflow(DataWorkflow):
                 # Seen on shot 1160609014: a ne~4, err~2 channel past the
                 # separatrix (rho~1.05) drove a spike to ne~19 at rho=1.0
                 data_y = np.where(err_y > 1.0, np.nan, data_y)
+                # Drop density points past the separatrix (rho>1.0) reading
+                # > 0.9e20: SOL density is low out there, so such a point is a
+                # bad channel, and a lone high one beyond the last pedestal
+                # channel makes the GP overshoot upward toward it (shot
+                # 1160503029: a rho~1.07, ne~1.45 point with a small error bar -
+                # so not caught above - drove a spike to ne~13 at rho=1.0).
+                # Restricted to rho>1.0 so genuine H-mode density pedestals at
+                # rho 0.9-1.0 are kept.
+                data_y = np.where((data_x > 1.0) & (data_y > 0.9), np.nan, data_y)
 
             # If data or error bar is incredibly small, set to NaN since it's probably bad data
             # At this point, ne is in 1e20 m^-3 and Te is in keV

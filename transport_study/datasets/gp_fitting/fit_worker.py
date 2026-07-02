@@ -71,25 +71,6 @@ _HYP_BOUNDS = np.array([[1.0e-2, 0.4, 0.2, 0.05, 0.95], [2.0e1, 0.9, 0.5, 0.2, 1
 # The axis gradient uses a small positive error (mkgp needs a positive diagonal entry to stay invertible)
 _VALUE_BC = np.array([[1.1, 0.0, 0.01], [1.2, 0.0, 0.01], [1.3, 0.0, 0.01], [1.4, 0.0, 0.01]])
 _GRAD_BC = np.array([[0.0, 0.0, 0.01], [1.1, 0.0, 0.1], [1.2, 0.0, 0.1], [1.3, 0.0, 0.1], [1.4, 0.0, 0.1]])
-# Smoothness prior: soft zero-derivative pseudo-observations spread across the
-# pedestal/edge region (rho 0.4-1.0, where TS edge channels live), separate from
-# the hard flat-past-separatrix BC above. Transport limits how fast Te/ne can
-# actually vary in rho, so a large local slope should need real supporting data,
-# not just one point. Without this, a single bad edge channel that survives
-# outlier removal (see _remove_local_outliers's docstring - the neighbor-agreement
-# precondition can fail to trip on a genuinely declining edge) can pull the GP
-# mean into an unphysical bump-then-crash between two real points, since nothing
-# else penalizes an implausibly steep local gradient.
-# dyerr=0.5 is a fixed global ceiling, tuned against a known-bad C-Mod
-# slice (shot 1160503004): loose values (>=1) left the pinned,
-# near-interpolating hyperparameter corner reachable and did not stop the
-# resulting bump-then-crash, tighter values (<=0.15) pushed the fit back into
-# that same degenerate corner from the other direction. 0.5 sits in the gap -
-# it does not adapt per-shot or per-slice and cannot distinguish a real narrow
-# H-mode pedestal from an artifact. Upgrade path: derive it from a robust
-# local-slope estimate of the slice's own channel data instead of a constant.
-_SMOOTHNESS_BC = np.array([[rho, 0.0, 0.5] for rho in (0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0)])
-_GRAD_BC = np.concatenate([_GRAD_BC, _SMOOTHNESS_BC])
 # Half-width (in rho) of the x0 window used to pin the pedestal location when
 # tying Te to the ne fit. Narrow enough to hold x0, wide enough to stay a valid
 # (lower < upper) bound after clamping to the global x0 range.

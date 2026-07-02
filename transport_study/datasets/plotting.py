@@ -711,17 +711,30 @@ _SUMMARY_PANEL_DEFS = [
         left_vars=["Ip_MA"],
         left_label="Ip [MA]",
         left_colors={"Ip_MA": "cyan"},
+        left_floor_zero=True,
+        left_abs=True,
+        right_vars=["B0"],
+        right_label="B0 [T]",
+        right_colors={"B0": "magenta"},
+        right_floor_zero=True,
+    ),
+    dict(
+        left_vars=["Wtot_MJ"],
+        left_label="Wtot [MJ]",
+        left_colors={"Wtot_MJ": "red"},
+        left_floor_zero=True,
         right_vars=["betan"],
         right_label="betan",
         right_colors={"betan": "magenta"},
+        right_floor_zero=True,
     ),
     dict(
         left_vars=["ne20_line_avg", "ne20_edge"],
         left_label="ne20 [1e20 m^-3]",
         left_colors={"ne20_line_avg": "white", "ne20_edge": "yellow"},
-        right_vars=["B0"],
-        right_label="B0 [T]",
-        right_colors={"B0": "magenta"},
+        left_floor_zero=True,
+        left_cap=5,
+        show_fresh_profiles=True,
     ),
     dict(
         left_vars=["a_minor", "kappa", "delta_top", "delta_bot"],
@@ -739,38 +752,98 @@ _SUMMARY_PANEL_DEFS = [
             "P_LH_MW": "yellow",
             "P_ICRF_MW": "magenta",
         },
+        left_floor_zero=True,
+        left_cap=10,
     ),
 ]
 
 
-def _plot_summary_panel(ax, shot_ds, left_vars, left_label, left_colors, right_vars=None, right_label=None, right_colors=None):
-    """Plot one group of signals for a single shot onto ax (and a twin axis if right_vars given)"""
-    for var in left_vars:
+def _axis_ylim(ds, variables, floor_zero=False, use_abs=False, cap=None):
+    """Global (lo, hi) y-limits for a set of variables across the whole dataset"""
+    present = [v for v in variables if v in ds]
+    if not present:
+        return None
+    hi = max(float(np.nanmax(np.abs(ds[v].values) if use_abs else ds[v].values)) for v in present)
+    if cap is not None:
+        hi = min(hi, cap)
+    if floor_zero:
+        lo = 0.0
+    else:
+        lo = min(float(np.nanmin(ds[v].values)) for v in present)
+        lo = lo * 0.9 if lo > 0 else lo * 1.1
+    hi = hi * 1.1
+    if not np.isfinite([lo, hi]).all() or hi <= lo:
+        return (0, 1)
+    return (lo, hi)
+
+
+def _summary_ylims(ds):
+    """Precompute per-panel left/right y-limits so axes are consistent across shots"""
+    all_ylims = []
+    for panel in _SUMMARY_PANEL_DEFS:
+        ylims = {
+            "left": _axis_ylim(
+                ds,
+                panel["left_vars"],
+                floor_zero=panel.get("left_floor_zero", False),
+                use_abs=panel.get("left_abs", False),
+                cap=panel.get("left_cap"),
+            )
+        }
+        if panel.get("right_vars"):
+            ylims["right"] = _axis_ylim(
+                ds,
+                panel["right_vars"],
+                floor_zero=panel.get("right_floor_zero", False),
+                use_abs=panel.get("right_abs", False),
+                cap=panel.get("right_cap"),
+            )
+        all_ylims.append(ylims)
+    return all_ylims
+
+
+def _plot_summary_panel(ax, shot_ds, panel, ylims):
+    """Plot one panel's signals for a single shot onto ax (and a twin axis if right_vars given)"""
+    for var in panel["left_vars"]:
         if var in shot_ds:
-            ax.plot(shot_ds["time"], shot_ds[var], label=var, color=left_colors.get(var))
-    ax.set_ylabel(left_label, fontsize=LABEL_FONTSIZE, color=TEXT_COLOR)
+            ax.plot(shot_ds["time"], shot_ds[var], label=var, color=panel["left_colors"].get(var))
+    ax.set_ylabel(panel["left_label"], fontsize=LABEL_FONTSIZE, color=TEXT_COLOR)
+    if ylims.get("left") is not None:
+        ax.set_ylim(ylims["left"])
+
+    # Green dots at 0 marking timesteps that have fresh profiles
+    if panel.get("show_fresh_profiles") and "fresh_profiles" in shot_ds:
+        ax.plot(
+            shot_ds["time"],
+            np.where(shot_ds["fresh_profiles"] > 0, 0, np.nan),
+            color="green",
+            marker="o",
+            linestyle="None",
+        )
 
     axes = [ax]
-    if right_vars:
+    if panel.get("right_vars"):
         ax_right = ax.twinx()
-        for var in right_vars:
+        for var in panel["right_vars"]:
             if var in shot_ds:
-                ax_right.plot(shot_ds["time"], shot_ds[var], label=var, color=right_colors.get(var), linestyle="--")
-        ax_right.set_ylabel(right_label, fontsize=LABEL_FONTSIZE, color=TEXT_COLOR)
+                ax_right.plot(shot_ds["time"], shot_ds[var], label=var, color=panel["right_colors"].get(var), linestyle="--")
+        ax_right.set_ylabel(panel["right_label"], fontsize=LABEL_FONTSIZE, color=TEXT_COLOR)
         ax_right.tick_params(axis="y", labelsize=TICK_FONTSIZE, colors=TEXT_COLOR)
+        if ylims.get("right") is not None:
+            ax_right.set_ylim(ylims["right"])
         axes.append(ax_right)
     return axes
 
 
-def _shot_summary_page(shot_ds, shot, title):
+def _shot_summary_page(shot_ds, shot, title, all_ylims):
     """Build one page of input-signal time traces for a single shot"""
-    fig, axes = plt.subplots(len(_SUMMARY_PANEL_DEFS), 1, figsize=(11, 14), sharex=True)
+    fig, axes = plt.subplots(len(_SUMMARY_PANEL_DEFS), 1, figsize=(11, 16), sharex=True)
     fig.patch.set_facecolor(BACKGROUND_COLOR)
     fig.suptitle(f"{title} - shot {shot}", fontsize=TITLE_FONTSIZE, color=TEXT_COLOR)
 
     all_axes = []
-    for ax, panel in zip(axes, _SUMMARY_PANEL_DEFS, strict=True):
-        all_axes += _plot_summary_panel(ax, shot_ds, **panel)
+    for ax, panel, ylims in zip(axes, _SUMMARY_PANEL_DEFS, all_ylims, strict=True):
+        all_axes += _plot_summary_panel(ax, shot_ds, panel, ylims)
         if ax.get_legend_handles_labels()[0]:
             ax.legend(
                 fontsize=LEGEND_FONTSIZE,
@@ -842,12 +915,14 @@ def ds_summary_report(
 ):
     """Make a multi-page PDF report of time traces for all input signals, plus a summary stats page.
 
-    One page per shot, each with 4 panels:
-    1. Ip_MA and betan
-    2. B0 and ne20 (line-average and edge)
-    3. Shaping parameters (a_minor, kappa, delta_top, delta_bot)
-    4. Power sources and sinks
+    One page per shot, each with 5 panels:
+    1. Ip_MA and B0
+    2. Wtot_MJ and betan
+    3. ne20 (line-average and edge), with green dots marking fresh-profile timesteps
+    4. Shaping parameters (a_minor, kappa, delta_top, delta_bot)
+    5. Power sources and sinks
 
+    Y-limits are computed once across the whole dataset so axes are consistent between shots.
     A final page has summary statistics (min / max / mean / std) for every variable.
     """
     if isinstance(ds, (str, Path)):
@@ -856,10 +931,11 @@ def ds_summary_report(
 
     Path(pdf_path).parent.mkdir(parents=True, exist_ok=True)
     shots = ds["shot"].data if num_shots is None else ds["shot"].data[:num_shots]
+    all_ylims = _summary_ylims(ds)
 
     with PdfPages(pdf_path) as pdf:
         for shot in shots:
-            fig = _shot_summary_page(ds.sel(shot=shot), shot, title)
+            fig = _shot_summary_page(ds.sel(shot=shot), shot, title, all_ylims)
             pdf.savefig(fig)
             plt.close(fig)
 
