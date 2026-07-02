@@ -12,6 +12,34 @@ from popsim.ml import TrainConfig
 from transport_study.config import config
 
 
+def _config_reload_script(study_config_path: Path) -> str:
+    """Python source that reconstructs the current StudyConfig (or subclass) and loads it.
+
+    `load_config(Path(...))` only knows how to build the base `StudyConfig`, but
+    the actual config is often a subclass with extra fields and `extra="forbid"`
+    (e.g. `ProfileStudy.Config`), so a subprocess must import that exact class
+    and call its `from_toml` directly instead of going through `load_config`'s
+    generic Path branch.
+
+    So for example, this will turn into python source like:
+    ```
+    from transport_study.profile_transfer.profile_study import ProfileStudy
+    from transport_study.config import load_config
+    study_config = ProfileStudy.Config.from_toml(Path("/path/to/study_config.toml"))
+    load_config(study_config)
+    ```
+    """
+    cls = config.get_subclass()
+    top_name = cls.__qualname__.split(".")[0]
+    code_str = (
+        f"from {cls.__module__} import {top_name}\n"
+        "from transport_study.config import load_config\n"
+        f"study_config = {cls.__qualname__}.from_toml(Path({str(study_config_path)!r}))\n"
+        "load_config(study_config)\n"
+    )
+    return code_str
+
+
 def count_running_jobs(job_name: str, partition: str | None = None) -> int:
     """Run squeue to list running jobs on the partition with the specific name"""
     if partition is None:
@@ -147,10 +175,7 @@ import yaml
 from pathlib import Path
 from popsim.ml import TrainConfig
 from popsim.ml.launch import launch_train
-from transport_study.config import load_config
-
-load_config(Path({str(study_config_path)!r}))
-
+{_config_reload_script(study_config_path)}
 with open({config_path!r}) as f:
     train_config = TrainConfig(**yaml.safe_load(f))
 
@@ -241,10 +266,7 @@ import yaml
 from pathlib import Path
 from popsim.ml import TrainConfig
 from popsim.ml.launch import launch_agent
-from transport_study.config import load_config
-
-load_config(Path({str(study_config_path)!r}))
-
+{_config_reload_script(study_config_path)}
 with open({config_path!r}) as f:
     train_config = TrainConfig(**yaml.safe_load(f))
 

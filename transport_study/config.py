@@ -113,6 +113,17 @@ class _ConfigProxy:
             raise RuntimeError(f"Config not loaded. Call load_config() before accessing config.{name}")
         return getattr(_ConfigProxy._cfg, name)
 
+    def get_subclass(self) -> type[StudyConfig]:
+        """Return the actual loaded StudyConfig (or subclass) instance, bypassing the proxy.
+
+        Needed when code must know the concrete subclass - e.g. to reconstruct it
+        correctly (with its extra fields) in a subprocess, since `load_config(Path)`
+        only knows how to build the base `StudyConfig`.
+        """
+        if _ConfigProxy._cfg is None:
+            raise RuntimeError("Config not loaded. Call load_config() first.")
+        return type(_ConfigProxy._cfg)
+
 
 config = _ConfigProxy()
 
