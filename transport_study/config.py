@@ -127,5 +127,17 @@ def load_config(cfg: "StudyConfig | Path") -> "StudyConfig":
     return cfg
 
 
+def reset_config() -> None:
+    """Clear the global config so load_config can be called again.
+
+    FOR TESTS ONLY. Production code relies on the config being immutable and
+    loaded exactly once per process. The test conftest calls this around every
+    test so each test starts with a clean slate and loads its own config.
+    """
+    _ConfigProxy._cfg = None
+    _ConfigProxy.initialized = False
+    logger.critical("GLOBAL CONFIG RESET!!! THIS SHOULD ONLY HAPPEN IN TESTS. DO NOT CALL THIS IN PRODUCTION CODE.")
+
+
 if jax.devices()[0].platform not in ["gpu", "tpu", "cuda"]:
     logger.warning("JAX could not find GPU/TPU/CUDA, is your environment set correctly?")

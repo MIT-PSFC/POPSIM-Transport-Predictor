@@ -3,22 +3,15 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
-from transport_study.config import StudyConfig, _ConfigProxy, config, load_config
+from transport_study.config import StudyConfig, config, load_config
 
-
-@pytest.fixture(autouse=True)
-def reset_config():
-    _ConfigProxy._cfg = None
-    _ConfigProxy.initialized = False
-    yield
-    _ConfigProxy._cfg = None
-    _ConfigProxy.initialized = False
+# Global config reset around each test is handled by the shared conftest fixture
 
 
 def test_config_load():
     # Config not loaded yet, should raise error when trying to access
     with pytest.raises(RuntimeError):
-        debug = config.debug
+        _ = config.debug
 
     cfg = StudyConfig(
         study_name="test_study",
@@ -27,6 +20,7 @@ def test_config_load():
             "cmod-low": "path/to/cmod_low.nc",
             "cmod-high": "path/to/cmod_high.nc",
         },
+        target_device="cmod-high",
     )
     load_config(cfg)
 
@@ -43,6 +37,7 @@ def test_config_immutable():
             "cmod-low": "path/to/cmod_low.nc",
             "cmod-high": "path/to/cmod_high.nc",
         },
+        target_device="cmod-high",
     )
     load_config(cfg1)
 
@@ -53,6 +48,7 @@ def test_config_immutable():
             "cmod-low": "path/to/cmod_low.nc",
             "cmod-high": "path/to/cmod_high.nc",
         },
+        target_device="cmod-high",
     )
     with pytest.raises(RuntimeError):
         load_config(cfg2)
