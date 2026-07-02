@@ -659,6 +659,11 @@ class ProfileStudy(Study):
                             "delta_bot",
                         ],
                         **dataloader_config_base,
+                        # Each sample in a batch runs a differentiated multi-step
+                        # TORAX simulation under vmap, so activation memory scales
+                        # linearly with batch size (~11 MB/sample observed)
+                        # 1024 keeps it near ~11 GB with headroom on an A100
+                        "batch_size": 1024,
                     },
                     model_init_config={
                         "model_type": case.model_type,

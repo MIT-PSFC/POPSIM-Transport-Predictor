@@ -124,7 +124,6 @@ def get_ds(
     Args:
         source_ds (str): Identifier for the source dataset.
         study_type (str): Type of study for which to prepare the dataset.
-        debug (bool, optional): Whether to enable debug mode, reducing dataset size to at most 50 shots.
 
     Returns:
         tuple[xr.Dataset, str]: The processed dataset and the dimension along which to group the data
@@ -138,11 +137,8 @@ def get_ds(
     if EPISODE_DIM not in ds.dims:
         raise ValueError(f"Expected dataset to have {EPISODE_DIM} dimension, but it was not found. Found dimensions: {ds.dims}")
 
-    if config.debug:
-        ds = ds.isel({EPISODE_DIM: slice(0, 10)})  # Limit to 10 shots
-    else:
-        # Sort dataset by shot count, get the X most recent as set by config
-        ds = ds.sortby(EPISODE_DIM, ascending=False).isel({EPISODE_DIM: slice(0, config.max_ds_size)})
+    ds = ds.sortby(EPISODE_DIM, ascending=False)  # Most recent shots first
+    ds = ds.isel({EPISODE_DIM: slice(0, config.max_ds_size)})
 
     def _profile_transfer(ds: xr.Dataset) -> xr.Dataset:
         ds = ds[REQUIRED_SIGNALS_PROFILE_TRANSFER]
@@ -633,6 +629,13 @@ def get_train_test_datasets(
         # never overlap (otherwise a large num_target_shots would leak high-performance test
         # shots into training)
         train_candidate_pool = sorted_shots[:-target_test_set_size] if target_test_set_size else sorted_shots
+        if num_target_shots > len(train_candidate_pool):
+            raise ValueError(
+                f"num_target_shots={num_target_shots} requested but only {len(train_candidate_pool)} target "
+                f"shots remain after holding out target_test_set_size={target_test_set_size} of "
+                f"{len(sorted_shots)} loaded shots. Is the dataset smaller than expected "
+                f"(debug mode / max_ds_size truncation)?"
+            )
         train_shot_pool = train_candidate_pool[:num_target_shots]
         assert not (set(train_shot_pool.tolist()) & set(test_shot_pool.tolist())), "Target train and test shot pools overlap - data leakage"
         train_ds_hp = ds_target.isel({episode_coord: train_shot_pool})
