@@ -693,7 +693,7 @@ class ProfileStudy(Study):
                 freeze_shapes=case.freeze_shapes,
                 num_target_shots=HYPERPARAM_TARGET_SHOTS,
             )
-            transfer_case_model_dir = self.trained_model_dir(transfer_case)
+            transfer_case_model_dir = str(self.trained_model_dir(transfer_case))
 
             train_config_base = train_config_base.model_copy(
                 update={

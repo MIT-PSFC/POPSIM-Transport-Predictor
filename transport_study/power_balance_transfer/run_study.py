@@ -666,7 +666,7 @@ class PowerBalanceStudy(Study):
                 freeze_submodules=case.freeze_submodules,
                 num_hp_shots=-1,
             )
-            transfer_case_model_dir = self.trained_model_dir(transfer_case)
+            transfer_case_model_dir = str(self.trained_model_dir(transfer_case))
 
             train_config_base = train_config_base.model_copy(
                 update={

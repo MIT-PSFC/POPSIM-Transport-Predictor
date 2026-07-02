@@ -208,7 +208,9 @@ Path({str(study_config_path)!r}).unlink()
 export WANDB_MODE=offline
 
 {sys.executable} {script_path}
+exit_code=$?
 rm -f {script_path}
+exit $exit_code
 """
 
     result = subprocess.run(
@@ -295,7 +297,9 @@ Path({str(study_config_path)!r}).unlink()
 #SBATCH --error={log_path}
 
 {sys.executable} {script_path}
+exit_code=$?
 rm -f {script_path}
+exit $exit_code
 """
 
     result = subprocess.run(
@@ -362,7 +366,9 @@ if not trajopt.output_path(case).exists():
 
 export WANDB_MODE=offline
 {sys.executable} {script_path}
+exit_code=$?
 rm -f {script_path}
+exit $exit_code
 """
 
     result = subprocess.run(["sbatch"], input=sbatch_script, check=False, capture_output=True, text=True)
