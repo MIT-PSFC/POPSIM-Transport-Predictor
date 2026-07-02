@@ -39,7 +39,7 @@ class ProfilePredictorTRB(TrainRunBuilder):
     @staticmethod
     def get_dataloaders(
         dataloader_config: dict,
-    ) -> tuple[xr.Dataset, tuple[DataLoader, DataLoader, DataLoader]]:
+    ) -> tuple[xr.Dataset, DataLoader, DataLoader, DataLoader]:
         """
         Get the dataset and dataloaders for training.
 
@@ -202,6 +202,13 @@ class ProfilePredictorTRB(TrainRunBuilder):
     # peaks far above this, so the floor only guards degenerate targets from
     # blowing up the 1/scale division
     PROFILE_SCALE_FLOOR = 1e-2
+
+    # Softening fraction for the relative-error denominator in study_results:
+    # the floor added to abs(targ) is this fraction of the profile's own peak
+    # (per timeslice, floored by PROFILE_SCALE_FLOOR), so it reads as the same
+    # relative amount for ne (1e20 m^-3) and Te (keV) on every device instead
+    # of a fixed absolute offset in mismatched units
+    REL_ERROR_FLOOR_FRAC = 0.1
 
     @staticmethod
     def _make_profile_loss_fn(loss_config: dict, use_huber: bool) -> Callable[[Any, Any], jnp.ndarray]:
@@ -473,8 +480,16 @@ class ProfilePredictorTRB(TrainRunBuilder):
             ne_error_abs_profile = xr.apply_ufunc(np.abs, ne_pred - ne_targ)
             te_error_abs_profile = xr.apply_ufunc(np.abs, te_pred - te_targ)
 
-            ne_error_rel_profile = ne_error_abs_profile / (xr.apply_ufunc(np.abs, ne_targ) + 0.1)
-            te_error_rel_profile = te_error_abs_profile / (xr.apply_ufunc(np.abs, te_targ) + 0.1)
+            # Softening floor scales with each profile's own peak (per timeslice)
+            # instead of a fixed absolute value, so it means the same relative
+            # amount for ne and Te on every device (see REL_ERROR_FLOOR_FRAC)
+            floor_frac = ProfilePredictorTRB.REL_ERROR_FLOOR_FRAC
+            scale_floor = ProfilePredictorTRB.PROFILE_SCALE_FLOOR
+            ne_peak = np.maximum(xr.apply_ufunc(np.abs, ne_targ).max(dim="rho"), scale_floor)
+            te_peak = np.maximum(xr.apply_ufunc(np.abs, te_targ).max(dim="rho"), scale_floor)
+
+            ne_error_rel_profile = ne_error_abs_profile / (xr.apply_ufunc(np.abs, ne_targ) + floor_frac * ne_peak)
+            te_error_rel_profile = te_error_abs_profile / (xr.apply_ufunc(np.abs, te_targ) + floor_frac * te_peak)
 
             # Integrate profile error over rho for each timeslice
             ne_error_abs_ts = ne_error_abs_profile.integrate("rho")

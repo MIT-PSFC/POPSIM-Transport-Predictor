@@ -403,7 +403,7 @@ class ProfileStudy(Study):
 
             _unwrap_prereqs(case)
 
-        unique_cases = list(set(unwrapped_cases))  # Remove duplicates
+        unique_cases = sorted(set(unwrapped_cases), key=str)
         possible_cases = [case for case in unique_cases if not case.is_impossible()]  # Remove impossible cases
 
         return possible_cases

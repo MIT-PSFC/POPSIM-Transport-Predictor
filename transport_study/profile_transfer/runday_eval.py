@@ -34,6 +34,7 @@ from loguru import logger
 
 from transport_study.config import config
 from transport_study.modules.profile_predictor.module import Inputs
+from transport_study.modules.profile_predictor.trb import ProfilePredictorTRB
 from transport_study.orchestration.slurm_utils import (
     count_idle_gpus,
     resources_available,
@@ -131,9 +132,16 @@ def evaluate_checkpoint(checkpoint_dir: Path | str, ds_valid: xr.Dataset) -> dic
     ne_targ = np.stack([np.interp(rho_pred, rho_ds, ne_targ_raw[i]) for i in range(n_ts)])
     te_targ = np.stack([np.interp(rho_pred, rho_ds, te_targ_raw[i]) for i in range(n_ts)])
 
-    # Rho-integrated relative error per timeslice
-    ne_err_rel = np.trapezoid(np.abs(ne_pred - ne_targ) / (np.abs(ne_targ) + 0.1), rho_pred, axis=-1)
-    te_err_rel = np.trapezoid(np.abs(te_pred - te_targ) / (np.abs(te_targ) + 0.1), rho_pred, axis=-1)
+    # Rho-integrated relative error per timeslice. Softening floor scales with
+    # each profile's own peak instead of a fixed absolute value, so it means
+    # the same relative amount for ne (1e20 m^-3) and Te (keV) - see trb.py's
+    # ProfilePredictorTRB.REL_ERROR_FLOOR_FRAC
+    floor_frac = ProfilePredictorTRB.REL_ERROR_FLOOR_FRAC
+    scale_floor = ProfilePredictorTRB.PROFILE_SCALE_FLOOR
+    ne_peak = np.maximum(np.abs(ne_targ).max(axis=-1, keepdims=True), scale_floor)
+    te_peak = np.maximum(np.abs(te_targ).max(axis=-1, keepdims=True), scale_floor)
+    ne_err_rel = np.trapezoid(np.abs(ne_pred - ne_targ) / (np.abs(ne_targ) + floor_frac * ne_peak), rho_pred, axis=-1)
+    te_err_rel = np.trapezoid(np.abs(te_pred - te_targ) / (np.abs(te_targ) + floor_frac * te_peak), rho_pred, axis=-1)
     err_rel_ts = 0.5 * (ne_err_rel + te_err_rel)
 
     return {
