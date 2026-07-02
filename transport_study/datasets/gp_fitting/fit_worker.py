@@ -47,7 +47,7 @@ os.environ.setdefault("MKL_NUM_THREADS", "1")
 
 import numpy as np
 from mkgp.core.baseclasses import _WarpingFunction
-from mkgp.core.kernels import Gibbs_Kernel
+from mkgp.core.kernels import Gibbs_Kernel, SE_Kernel
 from mkgp.core.routines import GaussianProcess
 
 FORMAT_VERSION = 3
@@ -71,6 +71,19 @@ _HYP_BOUNDS = np.array([[1.0e-2, 0.4, 0.2, 0.05, 0.95], [2.0e1, 0.9, 0.5, 0.2, 1
 # The axis gradient uses a small positive error (mkgp needs a positive diagonal entry to stay invertible)
 _VALUE_BC = np.array([[1.1, 0.0, 0.01], [1.2, 0.0, 0.01], [1.3, 0.0, 0.01], [1.4, 0.0, 0.01]])
 _GRAD_BC = np.array([[0.0, 0.0, 0.01], [1.1, 0.0, 0.1], [1.2, 0.0, 0.1], [1.3, 0.0, 0.1], [1.4, 0.0, 0.1]])
+# Error kernel (heteroscedastic noise model): a squared-exponential GP is fit to
+# the input error bars themselves (mkgp's HSGP path, make_HSGP_errors). This
+# does two things: the main fit sees smoothed error bars instead of raw ones,
+# and predictions get a rho-varying noise estimate, so the reported predictive
+# std widens where the data is genuinely noisy (sparse fat-error core) and
+# narrows across dense precise channels - instead of the constant RMS-of-errors
+# band mkgp falls back to without an error kernel. Hyps: [amplitude, length
+# scale] on scale_per_slice-normalized data (errors are O(0.01-0.3)).
+# Length scale floor 0.2 keeps the noise model a smooth radial trend rather
+# than chasing individual channels' error bars.
+_ERR_HYP_START = np.array([0.1, 0.5])
+_ERR_HYP_BOUNDS = np.array([[1.0e-3, 0.2], [1.0, 1.5]])
+_ERR_NRESTARTS = 2
 # Half-width (in rho) of the x0 window used to pin the pedestal location when
 # tying Te to the ne fit. Narrow enough to hold x0, wide enough to stay a valid
 # (lower < upper) bound after clamping to the global x0 range.
@@ -312,6 +325,18 @@ def _run_gp(data_X, data_y, err_y, x_eval, hyperparams=None, optimize=True, pin_
     for attempt in range(n_attempts):
         gp = GaussianProcess()
         gp.set_kernel(kernel=_build_kernel(hyperparams), kbounds=kbounds, regpar=1.0)
+        # Heteroscedastic noise model: GP-fit the error bars with an SE kernel
+        # (mkgp HSGP path). The main fit then uses the smoothed errors and the
+        # predictive std picks up a rho-varying noise term (see _ERR_HYP_START).
+        err_kernel = SE_Kernel(*_ERR_HYP_START)
+        err_kernel.enforce_bounds(True)
+        gp.set_error_kernel(
+            kernel=err_kernel,
+            kbounds=_ERR_HYP_BOUNDS,
+            regpar=1.0,
+            nrestarts=_ERR_NRESTARTS,
+        )
+        gp.set_error_search_parameters(epsilon=1.0e-2)
         gp.set_raw_data(
             xdata=xdata,
             ydata=ydata,
@@ -321,9 +346,12 @@ def _run_gp(data_X, data_y, err_y, x_eval, hyperparams=None, optimize=True, pin_
             dyerr=_GRAD_BC[:, 2],
         )
         gp.set_search_parameters(epsilon=1.0e-2)
+        # Seed even on the predict-only path: the error-kernel fit inside
+        # GPRFit runs its own random restarts, so an unseeded RNG would make
+        # the result depend on process history (serial vs parallel workers).
+        np.random.seed(_deterministic_seed(data_X, data_y, err_y, salt=attempt))
         if do_optimize:
             nrestarts = 8
-            np.random.seed(_deterministic_seed(data_X, data_y, err_y, salt=attempt))
         else:
             # predict-only at fixed hyperparameters. The public maxiter clamps
             # to >=50, so poke _imax=0 to skip the gradient-ascent loop entirely.
@@ -332,7 +360,7 @@ def _run_gp(data_X, data_y, err_y, x_eval, hyperparams=None, optimize=True, pin_
         try:
             # mkgp prints optimizer status to stdout; keep worker logs clean.
             with contextlib.redirect_stdout(io.StringIO()):
-                gp.GPRFit(np.asarray(x_eval, dtype=float), hsgp_flag=False, nrestarts=nrestarts)
+                gp.GPRFit(np.asarray(x_eval, dtype=float), hsgp_flag=True, nrestarts=nrestarts)
         except (ValueError, np.linalg.LinAlgError, FloatingPointError):
             continue
 
@@ -384,9 +412,34 @@ def _loo_standardized_residuals(data_X, data_y, err_y, hyperparams) -> np.ndarra
     return z[: data_X.size]
 
 
-def _remove_outliers(data_X, data_y, err_y, sigma=3.0, max_drop_frac=0.3, ref_hyperparams=None):
-    """Drop points whose leave-one-out standardized residual exceeds sigma,
-    worst first, one at a time.
+def _locally_corroborated(x, y, err, i, sigma_corr) -> bool:
+    """True if point i agrees (within sigma_corr combined sigma) with at least
+    one of its immediate rho-neighbors.
+
+    This is what separates a genuinely high, steep core - a run of points that
+    each agree with the next - from an isolated bad channel. The global LOO
+    reference (_loo_standardized_residuals) predicts every point from a single
+    smooth kernel, so a legitimately steep core reads as a cluster of large
+    residuals and gets culled along with the real spikes. A point whose neighbor
+    sits at the same value is corroborated by real data at that rho, so it is
+    protected from the LOO drop; an isolated spike (high or low), disagreeing
+    with both neighbors, is not. Uses immediate sorted neighbors like
+    _remove_local_outliers, but here one agreeing neighbor is enough (that check
+    needs both neighbors to agree with *each other*, which a steep core fails).
+    """
+    order = np.argsort(x)
+    pos = int(np.flatnonzero(order == i)[0])
+    for nb in (pos - 1, pos + 1):
+        if 0 <= nb < x.size:
+            j = int(order[nb])
+            if np.abs(y[i] - y[j]) <= sigma_corr * np.sqrt(err[i] ** 2 + err[j] ** 2):
+                return True
+    return False
+
+
+def _remove_outliers(data_X, data_y, err_y, sigma=3.0, sigma_corr=2.0, max_drop_frac=0.3, ref_hyperparams=None):
+    """Drop points whose leave-one-out standardized residual exceeds sigma and
+    that no immediate rho-neighbor corroborates, worst first, one at a time.
 
     Judging each point by its LOO residual (_loo_standardized_residuals) - the
     prediction from every other point, never from itself - is what makes this
@@ -397,6 +450,16 @@ def _remove_outliers(data_X, data_y, err_y, sigma=3.0, max_drop_frac=0.3, ref_hy
     the good neighbors it swamped together. Instead this drops only the single
     worst point, recomputes the LOO residuals on what remains, and repeats:
     once the offender is gone its neighbors fall back below sigma and are kept.
+
+    The LOO reference is a single smooth kernel, so a genuinely steep, high core
+    (few points, dropping fast to a long low edge) reads as a run of large
+    residuals and the plain rule culls the whole core, collapsing the fit to the
+    edge data. The corroboration gate (_locally_corroborated) fixes that: the
+    worst over-sigma point is only dropped if it also disagrees with both its
+    immediate rho-neighbors, so consistently-high core points protect each other
+    while an isolated spike (no agreeing neighbor) is still removed. When the
+    worst point is corroborated the next-worst uncorroborated point is taken
+    instead; if every remaining over-sigma point is corroborated, stop.
 
     ref_hyperparams sets the LOO kernel length scales (the slice's own
     rough-optimized shape from gp_profile's first pass); falls back to the
@@ -419,11 +482,17 @@ def _remove_outliers(data_X, data_y, err_y, sigma=3.0, max_drop_frac=0.3, ref_hy
         z = _loo_standardized_residuals(x, y, err, ref_hyperparams)
         if z is None:
             break
-        i_worst = int(np.argmax(np.abs(z)))
-        if np.abs(z[i_worst]) <= sigma:
-            break
+        to_drop = None
+        for i in np.argsort(np.abs(z))[::-1]:
+            if np.abs(z[i]) <= sigma:
+                break  # remaining points are all below sigma
+            if not _locally_corroborated(x, y, err, int(i), sigma_corr):
+                to_drop = int(i)
+                break
+        if to_drop is None:
+            break  # every over-sigma point is corroborated by a neighbor
         keep = np.ones(x.size, dtype=bool)
-        keep[i_worst] = False
+        keep[to_drop] = False
         x, y, err = x[keep], y[keep], err[keep]
         n_dropped += 1
 
@@ -516,8 +585,21 @@ def gp_profile(
     if gp is None:
         return None, None, None, None, None
 
-    y_star = gp.get_gp_mean()
-    std_y_star = gp.get_gp_std(noise_flag=False)
+    # Te/ne are physical (positive) quantities but the GP posterior is Gaussian
+    # with unbounded support, so the mean can dip slightly negative past the
+    # separatrix where the value BC pulls it to zero. Clip the mean at 0
+    # downstream should read the band as truncated at 0 likewise.
+    y_star = np.maximum(gp.get_gp_mean(), 0.0)
+    # Predictive std (includes observation noise), not the latent-function std.
+    # With few, high-error core channels the latent band collapses to a
+    # misleadingly tight interval - it conditions on the fitted amplitude being
+    # exactly right and ignores the measurement scatter. noise_flag=True widens
+    # the band where the data is noisy; the noise term is rho-varying because
+    # _run_gp fits an error kernel (HSGP), so the band tracks the local error
+    # bars instead of a constant RMS.
+    # The derivative std stays latent (the gradient is never directly observed,
+    # so folding in point noise there is not meaningful).
+    std_y_star = gp.get_gp_std(noise_flag=True)
     hyps_out = np.asarray(gp.get_gp_kernel_details()[1], dtype=float)
     if not calc_gradient:
         return y_star, std_y_star, None, None, hyps_out
