@@ -8,7 +8,6 @@ here so local and remote fitting share one implementation.
 
 Batch file format (npz):
     Input:
-        format_version : int
         shots          : (n_shots,) int64
         x_star         : (n_x,) target radial grid (normalized minor radius rho)
         min_points     : int, minimum valid channels per slice to attempt a fit
@@ -19,8 +18,9 @@ Batch file format (npz):
         {shot}:ne_y    : (n_t, n_ch) ne [1e20 m^-3], NaN where invalid
         {shot}:ne_err  : (n_t, n_ch) ne error [1e20 m^-3]
     Output:
-        format_version, shots, x_star as above
+        shots, x_star as above
         {shot}:te_fit, {shot}:te_std, {shot}:ne_fit, {shot}:ne_std
+        {shot}:te_grad, {shot}:te_grad_std, {shot}:ne_grad, {shot}:ne_grad_std
             each (n_t, n_x), NaN where the slice was skipped or failed
 """
 
@@ -49,9 +49,6 @@ import numpy as np
 from mkgp.core.baseclasses import _WarpingFunction
 from mkgp.core.kernels import Gibbs_Kernel, SE_Kernel
 from mkgp.core.routines import GaussianProcess
-
-FORMAT_VERSION = 3
-
 
 # ----------------------------------------------------------------------
 # GP fitting (mkgp Gibbs kernel with tanh-warped length scale)
@@ -642,15 +639,21 @@ class ShotFitInput:
 class ShotFitOutput:
     """GP-fitted profiles for one shot.
 
-    te_fit/te_std/ne_fit/ne_std are (n_t, n_x). te_hyps/ne_hyps are (n_t, 5),
-    columns [var, l1, l2, lw, x0], NaN where a slice was skipped, failed, or
-    fit at fixed (non-optimized) hyperparameters.
+    te_fit/te_std/ne_fit/ne_std and the gradient arrays are (n_t, n_x). The
+    gradients are the GP posterior derivative d/drho (mean and latent std) in
+    the profile's units per unit rho. te_hyps/ne_hyps are (n_t, 5), columns
+    [var, l1, l2, lw, x0], NaN where a slice was skipped, failed, or fit at
+    fixed (non-optimized) hyperparameters.
     """
 
     te_fit: np.ndarray
     te_std: np.ndarray
     ne_fit: np.ndarray
     ne_std: np.ndarray
+    te_grad: np.ndarray
+    te_grad_std: np.ndarray
+    ne_grad: np.ndarray
+    ne_grad_std: np.ndarray
     te_hyps: np.ndarray
     ne_hyps: np.ndarray
 
@@ -664,7 +667,6 @@ def pack_fit_batch(
 ) -> None:
     """Write a batch of shot fit inputs to a single npz file."""
     arrays = {
-        "format_version": np.int64(FORMAT_VERSION),
         "shots": np.array(sorted(shot_inputs), dtype=np.int64),
         "x_star": np.asarray(x_star, dtype=np.float64),
         "min_points": np.int64(min_points),
@@ -684,9 +686,6 @@ def unpack_fit_batch(
 ) -> tuple[dict[int, ShotFitInput], np.ndarray, int, bool]:
     """Read a batch input npz. Returns (shot_inputs, x_star, min_points, scale_per_slice)."""
     with np.load(path) as data:
-        version = int(data["format_version"])
-        if version != FORMAT_VERSION:
-            raise ValueError(f"Batch file {path} has format version {version}, expected {FORMAT_VERSION}")
         shots = data["shots"].tolist()
         x_star = data["x_star"]
         min_points = int(data["min_points"])
@@ -717,7 +716,6 @@ def pack_fit_results(
 ) -> None:
     """Write fitted profiles to a single npz file (atomically)."""
     arrays = {
-        "format_version": np.int64(FORMAT_VERSION),
         "shots": np.array(sorted(outputs), dtype=np.int64),
         "x_star": np.asarray(x_star, dtype=np.float64),
     }
@@ -726,6 +724,10 @@ def pack_fit_results(
         arrays[f"{shot}:te_std"] = np.asarray(so.te_std, dtype=np.float32)
         arrays[f"{shot}:ne_fit"] = np.asarray(so.ne_fit, dtype=np.float32)
         arrays[f"{shot}:ne_std"] = np.asarray(so.ne_std, dtype=np.float32)
+        arrays[f"{shot}:te_grad"] = np.asarray(so.te_grad, dtype=np.float32)
+        arrays[f"{shot}:te_grad_std"] = np.asarray(so.te_grad_std, dtype=np.float32)
+        arrays[f"{shot}:ne_grad"] = np.asarray(so.ne_grad, dtype=np.float32)
+        arrays[f"{shot}:ne_grad_std"] = np.asarray(so.ne_grad_std, dtype=np.float32)
         arrays[f"{shot}:te_hyps"] = np.asarray(so.te_hyps, dtype=np.float32)
         arrays[f"{shot}:ne_hyps"] = np.asarray(so.ne_hyps, dtype=np.float32)
     _atomic_savez(path, arrays)
@@ -734,15 +736,16 @@ def pack_fit_results(
 def unpack_fit_results(path: Path | str) -> dict[int, ShotFitOutput]:
     """Read a batch output npz into per-shot fit outputs."""
     with np.load(path) as data:
-        version = int(data["format_version"])
-        if version != FORMAT_VERSION:
-            raise ValueError(f"Result file {path} has format version {version}, expected {FORMAT_VERSION}")
         return {
             shot: ShotFitOutput(
                 te_fit=data[f"{shot}:te_fit"],
                 te_std=data[f"{shot}:te_std"],
                 ne_fit=data[f"{shot}:ne_fit"],
                 ne_std=data[f"{shot}:ne_std"],
+                te_grad=data[f"{shot}:te_grad"],
+                te_grad_std=data[f"{shot}:te_grad_std"],
+                ne_grad=data[f"{shot}:ne_grad"],
+                ne_grad_std=data[f"{shot}:ne_grad_std"],
                 te_hyps=data[f"{shot}:te_hyps"],
                 ne_hyps=data[f"{shot}:ne_hyps"],
             )
@@ -766,9 +769,9 @@ def _atomic_savez(path: Path | str, arrays: dict) -> None:
 def _fit_variable(x, y, err, x_star, min_points, scale_per_slice, optimize, hyperparams, pin_x0):
     """Fit one variable of one time slice.
 
-    Returns (y_out, std_out, hyps) or (None, None, None). hyps is the fitted
-    [var, l1, l2, lw, x0] array (x0 is used to tie Te to ne); None when the
-    slice is skipped or fails.
+    Returns (y_out, std_out, grad_out, grad_std_out, hyps) or five Nones.
+    hyps is the fitted [var, l1, l2, lw, x0] array (x0 is used to tie Te to ne)
+    None when the slice is skipped or fails.
     """
     # Force float32 here, the same precision the cluster path is stuck at after
     # its pack_fit_batch npz roundtrip. Without this, in-process fits (which
@@ -781,7 +784,7 @@ def _fit_variable(x, y, err, x_star, min_points, scale_per_slice, optimize, hype
 
     valid = np.isfinite(x) & np.isfinite(y) & np.isfinite(err)
     if int(valid.sum()) < min_points:
-        return None, None, None
+        return None, None, None, None, None
 
     scale = 1.0
     if scale_per_slice:
@@ -797,26 +800,29 @@ def _fit_variable(x, y, err, x_star, min_points, scale_per_slice, optimize, hype
             _, y_clean, _ = _remove_local_outliers(x[valid], y[valid], err[valid])
             scale = float(np.nanmax(y_clean)) if y_clean.size else float(np.nanmax(y))
         if not np.isfinite(scale) or scale < 1e-6:
-            return None, None, None
+            return None, None, None, None, None
 
-    y_star, std_y_star, _, _, hyps = gp_profile(
+    y_star, std_y_star, grad_y_star, grad_std_y_star, hyps = gp_profile(
         data_X=np.asarray(x, dtype=float),
         data_y=np.asarray(y, dtype=float) / scale,
         err_y=np.asarray(err, dtype=float) / scale,
         X_star=x_star,
-        calc_gradient=False,
+        calc_gradient=True,
         hyperparams=hyperparams,
         optimize_hyperparams=optimize,
         pin_x0=pin_x0,
     )
     if y_star is None:
-        return None, None, None
+        return None, None, None, None, None
 
     # Last resort: the GP mean can ring below zero between the outermost
     # measurement and the edge boundary conditions, so clamp to non-negative
     y_out = np.clip(np.asarray(y_star, dtype=float).ravel() * scale, 0.0, None)
     std_out = np.asarray(std_y_star, dtype=float).ravel() * scale
-    return y_out, std_out, hyps
+    # Gradients are not clamped: negative slopes are physical.
+    grad_out = np.asarray(grad_y_star, dtype=float).ravel() * scale
+    grad_std_out = np.asarray(grad_std_y_star, dtype=float).ravel() * scale
+    return y_out, std_out, grad_out, grad_std_out, hyps
 
 
 def _fit_slice(task: tuple):
@@ -828,18 +834,30 @@ def _fit_slice(task: tuple):
     clearly resolved, Te is fit freely. The fixed-hyperparameter path leaves
     both profiles independent.
 
-    Returns (shot, i_time, te_y, te_std, ne_y, ne_std, te_hyps, ne_hyps); any
-    value is None when that variable's slice was skipped or failed.
+    Returns (shot, i_time, te outputs, ne outputs, te_hyps, ne_hyps) where each
+    variable's outputs are (fit, std, grad, grad_std); any value is None when
+    that variable's slice was skipped or failed.
     """
     (shot, i_time), x, te_y, te_err, ne_y, ne_err, x_star, min_points, scale_per_slice, optimize, hyperparams = task
     tie_x0 = optimize and hyperparams is None
 
-    ne_y_out, ne_std_out, ne_hyps = _fit_variable(x, ne_y, ne_err, x_star, min_points, scale_per_slice, optimize, hyperparams, None)
+    ne_y_out, ne_std_out, ne_grad_out, ne_grad_std_out, ne_hyps = _fit_variable(
+        x, ne_y, ne_err, x_star, min_points, scale_per_slice, optimize, hyperparams, None
+    )
     ne_x0 = None if ne_hyps is None else float(ne_hyps[4])
     pin_x0 = ne_x0 if (tie_x0 and ne_x0 is not None and _is_pedestal_resolved(ne_x0)) else None
-    te_y_out, te_std_out, te_hyps = _fit_variable(x, te_y, te_err, x_star, min_points, scale_per_slice, optimize, hyperparams, pin_x0)
+    te_y_out, te_std_out, te_grad_out, te_grad_std_out, te_hyps = _fit_variable(
+        x, te_y, te_err, x_star, min_points, scale_per_slice, optimize, hyperparams, pin_x0
+    )
 
-    return shot, i_time, te_y_out, te_std_out, ne_y_out, ne_std_out, te_hyps, ne_hyps
+    return (
+        shot,
+        i_time,
+        (te_y_out, te_std_out, te_grad_out, te_grad_std_out),
+        (ne_y_out, ne_std_out, ne_grad_out, ne_grad_std_out),
+        te_hyps,
+        ne_hyps,
+    )
 
 
 def fit_batch(
@@ -900,6 +918,10 @@ def fit_batch(
             te_std=np.full((si.te_y.shape[0], n_x), np.nan),
             ne_fit=np.full((si.ne_y.shape[0], n_x), np.nan),
             ne_std=np.full((si.ne_y.shape[0], n_x), np.nan),
+            te_grad=np.full((si.te_y.shape[0], n_x), np.nan),
+            te_grad_std=np.full((si.te_y.shape[0], n_x), np.nan),
+            ne_grad=np.full((si.ne_y.shape[0], n_x), np.nan),
+            ne_grad_std=np.full((si.ne_y.shape[0], n_x), np.nan),
             te_hyps=np.full((si.te_y.shape[0], 5), np.nan),
             ne_hyps=np.full((si.ne_y.shape[0], 5), np.nan),
         )
@@ -907,16 +929,22 @@ def fit_batch(
     }
 
     def _store(result):
-        shot, i_time, te_y_out, te_std_out, ne_y_out, ne_std_out, te_hyps, ne_hyps = result
+        shot, i_time, te_out, ne_out, te_hyps, ne_hyps = result
+        te_y_out, te_std_out, te_grad_out, te_grad_std_out = te_out
+        ne_y_out, ne_std_out, ne_grad_out, ne_grad_std_out = ne_out
         so = outputs[shot]
         if te_y_out is not None:
             so.te_fit[i_time, :] = te_y_out
             so.te_std[i_time, :] = te_std_out
+            so.te_grad[i_time, :] = te_grad_out
+            so.te_grad_std[i_time, :] = te_grad_std_out
             if te_hyps is not None:
                 so.te_hyps[i_time, :] = te_hyps
         if ne_y_out is not None:
             so.ne_fit[i_time, :] = ne_y_out
             so.ne_std[i_time, :] = ne_std_out
+            so.ne_grad[i_time, :] = ne_grad_out
+            so.ne_grad_std[i_time, :] = ne_grad_std_out
             if ne_hyps is not None:
                 so.ne_hyps[i_time, :] = ne_hyps
 

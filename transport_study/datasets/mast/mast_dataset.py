@@ -599,13 +599,21 @@ class MASTDataWorkflow(DataWorkflow):
         Te_keV_rho = fit_output.te_fit.astype(np.float32)
         ne20_rho = fit_output.ne_fit.astype(np.float32)
 
+        profile_vars = {
+            "Te_keV_rho": Te_keV_rho,
+            "Te_keV_rho_error": fit_output.te_std.astype(np.float32),
+            "Te_keV_rho_grad": fit_output.te_grad.astype(np.float32),
+            "Te_keV_rho_grad_error": fit_output.te_grad_std.astype(np.float32),
+            "ne20_rho": ne20_rho,
+            "ne20_rho_error": fit_output.ne_std.astype(np.float32),
+            "ne20_rho_grad": fit_output.ne_grad.astype(np.float32),
+            "ne20_rho_grad_error": fit_output.ne_grad_std.astype(np.float32),
+        }
+
         # Put the fitted profiles on the 1 kHz timebase using previous value fill,
         # consistent with the C-Mod workflow (no interpolation in time)
         ds_profiles = xr.Dataset(
-            data_vars={
-                "Te_keV_rho": (("time", "rho"), Te_keV_rho),
-                "ne20_rho": (("time", "rho"), ne20_rho),
-            },
+            data_vars={name: (("time", "rho"), vals) for name, vals in profile_vars.items()},
             coords={
                 "time": ts_time,
                 "rho": self.gp_fit_rho.astype(np.float32),
@@ -617,8 +625,8 @@ class MASTDataWorkflow(DataWorkflow):
         for name, vals in raw_0d.items():
             data_vars[name] = ([TIME_DIM], vals.astype(np.float32))
 
-        data_vars["Te_keV_rho"] = ([TIME_DIM, "rho"], ds_profiles["Te_keV_rho"].values)
-        data_vars["ne20_rho"] = ([TIME_DIM, "rho"], ds_profiles["ne20_rho"].values)
+        for name in profile_vars:
+            data_vars[name] = ([TIME_DIM, "rho"], ds_profiles[name].values)
 
         coords = {
             TIME_DIM: np.arange(len(timebase)),
@@ -645,11 +653,8 @@ class MASTDataWorkflow(DataWorkflow):
                 te_eV / 1e3,
                 ne_m3 / 1e20,
                 rho_ts,
-                Te_keV_rho,
-                ne20_rho,
+                fit_output,
                 self.debug_plot_dir,
-                te_hyps=fit_output.te_hyps,
-                ne_hyps=fit_output.ne_hyps,
             )
         except Exception as e:
             logger.error(f"Failed to make TS fit diagnostic plot for shot {shot}: {e}")
@@ -666,17 +671,17 @@ class MASTDataWorkflow(DataWorkflow):
         te_keV: np.ndarray,
         ne_20: np.ndarray,
         rho_ts: np.ndarray,
-        Te_out: np.ndarray,
-        ne_out: np.ndarray,
+        fit_output: ShotFitOutput,
         debug_plot_dir: Path | str | None = None,
-        te_hyps: np.ndarray | None = None,
-        ne_hyps: np.ndarray | None = None,
     ) -> None:
         """Save a PDF of raw TS points (with error bars) vs GP fit for sampled measurement times.
 
-        MAST has a single Thomson system, so there is no core/edge channel split.
-        te_hyps/ne_hyps, when given (rows aligned to ts_time), are annotated on
-        each panel: [var, l1, l2, lw, x0].
+        One page per sampled time, 2x2 panels: Te (top left) and ne (top
+        right) with the GP fit mean and +-1 sigma predictive band; the GP
+        gradients d/drho with their +-1 sigma bands below each profile.
+        MAST has a single Thomson system, so there is no core/edge channel
+        split. Fitted hyperparameters [var, l1, l2, lw, x0] are annotated on
+        the profile panels.
         """
         import matplotlib
 
@@ -696,10 +701,26 @@ class MASTDataWorkflow(DataWorkflow):
 
         with PdfPages(pdf_path) as pdf:
             for i_time in t_indices:
-                fig, axes = plt.subplots(1, 2, figsize=(12, 5))
-                for ax, data_y, gp_y, label, unit, hyps_arr in [
-                    (axes[0], te_keV[i_time, :], Te_out[i_time, :], "Te", "[keV]", te_hyps),
-                    (axes[1], ne_20[i_time, :], ne_out[i_time, :], "ne", "[1e20 m^-3]", ne_hyps),
+                fig, axes = plt.subplots(2, 2, figsize=(12, 10))
+                for ax, data_y, gp_y, gp_err, label, unit, hyps_arr in [
+                    (
+                        axes[0, 0],
+                        te_keV[i_time, :],
+                        fit_output.te_fit[i_time, :],
+                        fit_output.te_std[i_time, :],
+                        "Te",
+                        "[keV]",
+                        fit_output.te_hyps,
+                    ),
+                    (
+                        axes[0, 1],
+                        ne_20[i_time, :],
+                        fit_output.ne_fit[i_time, :],
+                        fit_output.ne_std[i_time, :],
+                        "ne",
+                        "[1e20 m^-3]",
+                        fit_output.ne_hyps,
+                    ),
                 ]:
                     rho_raw = rho_ts[i_time, :]
                     valid = np.isfinite(rho_raw) & np.isfinite(data_y)
@@ -719,13 +740,21 @@ class MASTDataWorkflow(DataWorkflow):
                     gp_valid = np.isfinite(gp_y)
                     if gp_valid.any():
                         ax.plot(self.gp_fit_rho[gp_valid], gp_y[gp_valid], color="black", label="GP fit")
+                        ax.fill_between(
+                            self.gp_fit_rho[gp_valid],
+                            (gp_y - gp_err)[gp_valid],
+                            (gp_y + gp_err)[gp_valid],
+                            color="black",
+                            alpha=0.2,
+                            label="GP +-1 sigma",
+                        )
                     ax.set_xlabel("rho")
                     ax.set_ylabel(f"{label} {unit}")
                     ax.set_ylim(bottom=0)
                     ax.set_title(f"shot {shot}  t={ts_time[i_time]:.3f} s  n_valid={valid.sum()}")
                     ax.grid(alpha=0.3)
                     ax.legend(fontsize=8)
-                    if hyps_arr is not None and i_time < len(hyps_arr) and np.isfinite(hyps_arr[i_time]).all():
+                    if i_time < len(hyps_arr) and np.isfinite(hyps_arr[i_time]).all():
                         var, l1, l2, lw, x0 = hyps_arr[i_time]
                         ax.text(
                             0.98,
@@ -737,6 +766,30 @@ class MASTDataWorkflow(DataWorkflow):
                             fontsize=7,
                             family="monospace",
                         )
+
+                for ax, grad_y, grad_err, label in [
+                    (axes[1, 0], fit_output.te_grad[i_time, :], fit_output.te_grad_std[i_time, :], "dTe/drho [keV]"),
+                    (axes[1, 1], fit_output.ne_grad[i_time, :], fit_output.ne_grad_std[i_time, :], "dne/drho [1e20 m^-3]"),
+                ]:
+                    grad_valid = np.isfinite(grad_y)
+                    if grad_valid.any():
+                        ax.plot(self.gp_fit_rho[grad_valid], grad_y[grad_valid], color="black", label="GP gradient")
+                        ax.fill_between(
+                            self.gp_fit_rho[grad_valid],
+                            (grad_y - grad_err)[grad_valid],
+                            (grad_y + grad_err)[grad_valid],
+                            color="black",
+                            alpha=0.2,
+                            label="GP +-1 sigma",
+                        )
+                    ax.axhline(0.0, color="gray", lw=0.8, alpha=0.5)
+                    ax.set_xlabel("rho")
+                    ax.set_ylabel(label)
+                    ax.set_title(f"shot {shot}  t={ts_time[i_time]:.3f} s")
+                    ax.grid(alpha=0.3)
+                    if ax.get_legend_handles_labels()[0]:
+                        ax.legend(fontsize=8)
+
                 fig.tight_layout()
                 pdf.savefig(fig)
                 plt.close(fig)
@@ -843,7 +896,13 @@ class MASTDataWorkflow(DataWorkflow):
             "P_ECRH_MW",
             # PROFILE PREDICTOR TRAINING
             "Te_keV_rho",
+            "Te_keV_rho_error",
+            "Te_keV_rho_grad",
+            "Te_keV_rho_grad_error",
             "ne20_rho",
+            "ne20_rho_error",
+            "ne20_rho_grad",
+            "ne20_rho_grad_error",
             "Ip_MA",
             "B0",
             "betan",

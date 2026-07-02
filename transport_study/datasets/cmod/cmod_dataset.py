@@ -268,6 +268,10 @@ class CModDataWorkflow(DataWorkflow):
                 "Te_keV_rho_error": (("time", "rho"), fit_output.te_std),
                 "ne20_rho": (("time", "rho"), fit_output.ne_fit),
                 "ne20_rho_error": (("time", "rho"), fit_output.ne_std),
+                "Te_keV_rho_grad": (("time", "rho"), fit_output.te_grad),
+                "Te_keV_rho_grad_error": (("time", "rho"), fit_output.te_grad_std),
+                "ne20_rho_grad": (("time", "rho"), fit_output.ne_grad),
+                "ne20_rho_grad_error": (("time", "rho"), fit_output.ne_grad_std),
             },
             coords={
                 "time": times,
@@ -374,9 +378,9 @@ class CModDataWorkflow(DataWorkflow):
     ) -> None:
         """Save a PDF comparing the GP fits to the raw TS measurements.
 
-        Core and edge TS channels are differentiated and shown with error bars,
-        with the GP fit mean and +-1 sigma band overlaid. One page per sampled
-        TS measurement time.
+        One page per sampled TS measurement time, 2x2 panels:\
+        Te (top left) and ne (top right) with core/edge TS channels, GP fit mean, and +-1 sigma predictive band
+        followed by the GP gradients d/drho with their +-1 sigma bands below each profile
 
         Parameters
         ----------
@@ -425,10 +429,10 @@ class CModDataWorkflow(DataWorkflow):
                 ds_prof_t = ds_profiles.sel(time=time, method="nearest")
                 rho_ch = fit_input.x[i_time]
 
-                fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+                fig, axes = plt.subplots(2, 2, figsize=(12, 10))
                 for ax, variable, gp_var, label, ylim, hyps_arr in [
-                    (axes[0], "te", "Te_keV_rho", "Te [keV]", Te_keV_lim, None if fit_output is None else fit_output.te_hyps),
-                    (axes[1], "ne", "ne20_rho", "ne [1e20 m^-3]", ne20_lim, None if fit_output is None else fit_output.ne_hyps),
+                    (axes[0, 0], "te", "Te_keV_rho", "Te [keV]", Te_keV_lim, None if fit_output is None else fit_output.te_hyps),
+                    (axes[0, 1], "ne", "ne20_rho", "ne [1e20 m^-3]", ne20_lim, None if fit_output is None else fit_output.ne_hyps),
                 ]:
                     data_y = getattr(fit_input, f"{variable}_y")[i_time]
                     err_y = getattr(fit_input, f"{variable}_err")[i_time]
@@ -483,6 +487,33 @@ class CModDataWorkflow(DataWorkflow):
                             fontsize=7,
                             family="monospace",
                         )
+
+                for ax, gp_var, label in [
+                    (axes[1, 0], "Te_keV_rho_grad", "dTe/drho [keV]"),
+                    (axes[1, 1], "ne20_rho_grad", "dne/drho [1e20 m^-3]"),
+                ]:
+                    if gp_var not in ds_prof_t:
+                        continue  # raw files predating gradient outputs
+                    grad_y = ds_prof_t[gp_var].values
+                    grad_err = ds_prof_t[f"{gp_var}_error"].values
+                    grad_valid = np.isfinite(grad_y)
+                    if grad_valid.any():
+                        ax.plot(self.gp_fit_rho[grad_valid], grad_y[grad_valid], color="black", label="GP gradient")
+                        ax.fill_between(
+                            self.gp_fit_rho[grad_valid],
+                            (grad_y - grad_err)[grad_valid],
+                            (grad_y + grad_err)[grad_valid],
+                            color="black",
+                            alpha=0.2,
+                            label="GP +-1 sigma",
+                        )
+                    ax.axhline(0.0, color="gray", lw=0.8, alpha=0.5)
+                    ax.set_xlabel("rho")
+                    ax.set_ylabel(label)
+                    ax.set_title(f"shot {shot}  t={time:.3f} s")
+                    ax.grid(alpha=0.3)
+                    if ax.get_legend_handles_labels()[0]:
+                        ax.legend(fontsize=8)
 
                 fig.tight_layout()
                 pdf.savefig(fig)
@@ -685,7 +716,13 @@ class CModDataWorkflow(DataWorkflow):
             "P_ECRH_MW",
             # PROFILE PREDICTOR TRAINING
             "Te_keV_rho",
+            "Te_keV_rho_error",
+            "Te_keV_rho_grad",
+            "Te_keV_rho_grad_error",
             "ne20_rho",
+            "ne20_rho_error",
+            "ne20_rho_grad",
+            "ne20_rho_grad_error",
             "Ip_MA",
             "B0",
             "betan",

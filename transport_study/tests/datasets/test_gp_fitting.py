@@ -106,6 +106,10 @@ def test_fit_results_npz_roundtrip(tmp_path):
             te_std=rng.random((N_T, len(X_STAR))),
             ne_fit=rng.random((N_T, len(X_STAR))),
             ne_std=rng.random((N_T, len(X_STAR))),
+            te_grad=rng.random((N_T, len(X_STAR))),
+            te_grad_std=rng.random((N_T, len(X_STAR))),
+            ne_grad=rng.random((N_T, len(X_STAR))),
+            ne_grad_std=rng.random((N_T, len(X_STAR))),
             te_hyps=rng.random((N_T, 5)),
             ne_hyps=rng.random((N_T, 5)),
         )
@@ -115,7 +119,7 @@ def test_fit_results_npz_roundtrip(tmp_path):
 
     loaded = unpack_fit_results(path)
     assert set(loaded) == {42}
-    for attr in ("te_fit", "te_std", "ne_fit", "ne_std", "te_hyps", "ne_hyps"):
+    for attr in ("te_fit", "te_std", "ne_fit", "ne_std", "te_grad", "te_grad_std", "ne_grad", "ne_grad_std", "te_hyps", "ne_hyps"):
         np.testing.assert_allclose(getattr(loaded[42], attr), getattr(outputs[42], attr), rtol=1e-6, atol=1e-6)
 
 
@@ -309,6 +313,10 @@ class _FakeBackend:
                 te_std=np.zeros((si.te_y.shape[0], len(x_star))),
                 ne_fit=np.zeros((si.ne_y.shape[0], len(x_star))),
                 ne_std=np.zeros((si.ne_y.shape[0], len(x_star))),
+                te_grad=np.zeros((si.te_y.shape[0], len(x_star))),
+                te_grad_std=np.zeros((si.te_y.shape[0], len(x_star))),
+                ne_grad=np.zeros((si.ne_y.shape[0], len(x_star))),
+                ne_grad_std=np.zeros((si.ne_y.shape[0], len(x_star))),
                 te_hyps=np.zeros((si.te_y.shape[0], 5)),
                 ne_hyps=np.zeros((si.ne_y.shape[0], 5)),
             )
@@ -675,10 +683,7 @@ class TestGPFitMAST:
             te_eV[[i]] / 1e3,
             ne_m3[[i]] / 1e20,
             rho_ts[[i]],
-            out.te_fit,
-            out.ne_fit,
+            out,
             plot_dir,
-            te_hyps=out.te_hyps,
-            ne_hyps=out.ne_hyps,
         )
         assert (plot_dir / f"{self.SHOT}_ts_gp_fit.pdf").exists()
