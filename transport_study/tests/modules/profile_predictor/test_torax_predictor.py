@@ -18,6 +18,9 @@ def test_torax_predictor(transport_model):
             "cmod-high": PACKAGE_ROOT / "datasets" / "sample" / "cmod-high.nc",
         },
         target_device="cmod-high",
+        # large batch with the the full ~100 shot sample dataset OOMs the GPU
+        # 10 shots keeps this a cheap smoke test
+        max_ds_size=10,
     )
     load_config(config)
 
@@ -35,7 +38,7 @@ def test_torax_predictor(transport_model):
                 **train_config.dataloader_config,
                 "training_data": training_data,
                 "target_vars": ["Te_keV_rho", "ne20_rho", "ds_source_idx"],
-                "batch_size": None,
+                "batch_size": 512,
             },
         }
     )

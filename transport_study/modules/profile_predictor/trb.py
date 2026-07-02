@@ -345,7 +345,10 @@ class ProfilePredictorTRB(TrainRunBuilder):
             decay_rate=config["decay_rate"],
             end_value=config["lrf"],
         )
-        opt = optax.adamw(learning_rate=schedule, weight_decay=config["weight_decay"])
+        opt = optax.chain(
+            optax.clip_by_global_norm(config.get("grad_clip_max_norm", 1.0)),
+            optax.adamw(learning_rate=schedule, weight_decay=config["weight_decay"]),
+        )
         return opt
 
     @staticmethod

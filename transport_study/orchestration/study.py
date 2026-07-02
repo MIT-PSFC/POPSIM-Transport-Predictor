@@ -33,6 +33,12 @@ from transport_study.orchestration.wandb_utils import (
 
 CONFIG_LOCK_FILENAME = "config_lock.toml"
 
+# A training job that fails deterministically (e.g. NaN loss) would otherwise be
+# resubmitted forever by the run_study orchestration loop, silently burning GPU
+# time ~10 min at a go. Abort the whole run once a single case has been launched
+# this many times without producing a result file
+MAX_TRAIN_ATTEMPTS = 3
+
 
 class Study:
     """A class for organizing various components of a study, essentially outlining everything that needs to be done
@@ -301,6 +307,24 @@ class Study:
                 f"Case {case} is not a possible case to run, check the logic in the Case dataclass to see why this is. This should have been caught earlier!"
             )
 
+        # Only reached when no result file exists and no job for this case is
+        # running (see _no_blocking_jobs), so every call is a fresh (re)launch.
+        # More than MAX_TRAIN_ATTEMPTS launches means the case fails every time
+        attempts = self.train_attempts.get(str(case), 0)
+        if attempts >= MAX_TRAIN_ATTEMPTS:
+            train_log_path = Path(self.result_dir) / "logs" / f"{self.train_job_name(case)}.log"
+            summary = (
+                f"ABORTING STUDY: case failed training {attempts} times without producing a result.\n"
+                f"Case:      {case}\n"
+                f"Job name:  {self.train_job_name(case)}\n"
+                f"Train log: {train_log_path}\n"
+                f"(log holds the last attempt only - each resubmission truncates it)\n"
+                f"Other unfinished cases were not attempted further. Fix the case or remove it, then rerun."
+            )
+            logger.critical(summary)
+            raise RuntimeError(summary)
+        self.train_attempts[str(case)] = attempts + 1
+
         logger.opt(colors=True).info(f"<bold><red>LAUNCHING TRAINING for case\n{case}</red></bold>")
 
         train_config = self.make_train_config(case)
@@ -365,6 +389,8 @@ class Study:
         """
         self.name = name
         self.cases = cases
+        # Launch counter per case (str(case) -> count) backing MAX_TRAIN_ATTEMPTS
+        self.train_attempts: dict[str, int] = {}
 
         self.working_dir = Path(working_dir_base) / name
         self.model_dir = self.working_dir / "models"

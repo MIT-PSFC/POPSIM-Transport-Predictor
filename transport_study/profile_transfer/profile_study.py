@@ -28,6 +28,11 @@ from transport_study.profile_transfer.data_visualization import DataVisualizatio
 # During domain adaptation, we aren't doing hyperparameter tuning
 HYPERPARAM_TARGET_SHOTS = 0
 
+# Transfer cases fine-tune from a pretrained checkpoint, and the tuned learning
+# rate they inherit was swept for training from scratch - too hot for fine-tuning
+# (torax-constant transfer hit NaN loss with it). Scale the schedule down
+TRANSFER_LR_FACTOR = 0.1
+
 
 def _parse_training_data(s: str, dataset_paths: dict, target_device: str | None) -> TrainingData:
     """Convert a string like 'cmod_tcv' or 'exnihilo' to a TrainingData object."""
@@ -419,6 +424,59 @@ class ProfileStudy(Study):
     # EXECUTION #
     #############
 
+    @staticmethod
+    def _make_mixing_device_weights(case: Case) -> dict[str, float]:
+        """Loss weights per device for mixing domain adaptation.
+
+        Weights are chosen so that each device's effective contribution
+        F_x = W_x * N_x (where N_x is the shot count). Typically the target
+        device is weighted most heavily.
+        """
+        if not config.dataset_sizes:
+            logger.warning(
+                "Dataset sizes not provided in config, reading from disk. This will be slow, consider adding dataset sizes to the config."
+            )
+            dataset_sizes = {}
+            for device, path in config.dataset_paths.items():
+                ds = xr.open_dataset(path)
+                dataset_sizes[device] = len(ds.shot)
+                ds.close()
+        else:
+            dataset_sizes = config.dataset_sizes
+
+        if not config.dataset_fractions:
+            logger.info("Dataset fractions not provided in config. Using 50% for target and dividing remaining 50% evenly among sources.")
+            dataset_fractions = {}
+            num_sources = len(config.dataset_paths) - 1
+            dataset_fractions[config.target_device] = 0.5
+            for device in config.dataset_paths:
+                if device != config.target_device:
+                    dataset_fractions[device] = 0.5 / num_sources
+        else:
+            dataset_fractions = config.dataset_fractions
+
+        if case.num_target_shots in [-1, 0]:
+            # If -1, all target shots are being included
+            # If 0, weights aren't being used anyway
+            N_target = dataset_sizes[config.target_device]
+        else:
+            N_target = case.num_target_shots
+
+        avg_size = sum(dataset_sizes.values()) / len(dataset_sizes)
+        dataset_weights = {}
+        for device in config.dataset_paths.keys():
+            if device == config.target_device:
+                N_x = N_target
+            else:
+                N_x = dataset_sizes[device]
+            F_x = dataset_fractions[device]
+            W_x = F_x / N_x
+            # Dividing by number of shots can make the weight very small, problematic for loss function
+            # Multiply by avg_size so weights go back to around 1
+            dataset_weights[device] = W_x * avg_size
+
+        return dataset_weights
+
     def make_train_config(self, case: Case) -> TrainConfig:
         """Make the TrainConfig for a given case
         If a hyperparameter tuned config is available, fills in the hyperparameters from that, otherwise uses default config.
@@ -454,6 +512,9 @@ class ProfileStudy(Study):
             "decay_rate": 0.5,
             "lrf": 5e-4,
             "weight_decay": 2e-4,
+            # Cap on global L2 gradient norm per update, guards against rare
+            # gradient spikes from the differentiated TORAX solve NaN-ing a run
+            "grad_clip_max_norm": 1.0,
         }
         val_eval_suite_config_base = {
             "loss_config": loss_config_base,
@@ -462,59 +523,10 @@ class ProfileStudy(Study):
             "result_path": str(self.result_path(case)),
         }
         if case.domain_adaptation == "mixing":
-            # Special logic for loss weighting when doing mixing domain adaptation
-            # Weights are chosen so that each device's effective contribution F_x = W_x * N_x
-            # (where N_x is the shot count)
-            # Typically, the target device is weighted most heavily
-            if not config.dataset_sizes:
-                logger.warning(
-                    "Dataset sizes not provided in config, reading from disk. This will be slow, consider adding dataset sizes to the config."
-                )
-                dataset_sizes = {}
-                for device, path in config.dataset_paths.items():
-                    ds = xr.open_dataset(path)
-                    dataset_sizes[device] = len(ds.shot)
-                    ds.close()
-            else:
-                dataset_sizes = config.dataset_sizes
-
-            if not config.dataset_fractions:
-                logger.info(
-                    "Dataset fractions not provided in config. Using 50% for target and dividing remaining 50% evenly among sources."
-                )
-                dataset_fractions = {}
-                num_sources = len(config.dataset_paths) - 1
-                dataset_fractions[config.target_device] = 0.5
-                for device in config.dataset_paths:
-                    if device != config.target_device:
-                        dataset_fractions[device] = 0.5 / num_sources
-            else:
-                dataset_fractions = config.dataset_fractions
-
-            if case.num_target_shots in [-1, 0]:
-                # If -1, all target shots are being included
-                # If 0, weights aren't being used anyway
-                N_target = dataset_sizes[config.target_device]
-            else:
-                N_target = case.num_target_shots
-
-            avg_size = sum(dataset_sizes.values()) / len(dataset_sizes)
-            dataset_weights = {}
-            for device in config.dataset_paths.keys():
-                if device == config.target_device:
-                    N_x = N_target
-                else:
-                    N_x = dataset_sizes[device]
-                F_x = dataset_fractions[device]
-                W_x = F_x / N_x
-                # Dividing by number of shots can make the weight very small, problematic for loss function
-                # Multiply by avg_size so weights go back to around 1
-                dataset_weights[device] = W_x * avg_size
-
             # Loss function reads these from loss_config as "device_weights".
             # val_eval_suite_config_base references the same dict, so validation
             # loss is weighted consistently with training
-            loss_config_base["device_weights"] = dataset_weights
+            loss_config_base["device_weights"] = self._make_mixing_device_weights(case)
 
         def _make_train_config_base(case: ProfileStudy.Case) -> TrainConfig:
             if case.model_type in ["shape_init_pca", "shape_init_kmeans"]:
@@ -737,51 +749,49 @@ class ProfileStudy(Study):
 
             # Hyperparameters swept for only certain modules
             # The reservoir has no MLP depth/width, everything else sweeps them
-            if case.model_type != "reservoir":
-                train_config = train_config.model_copy(
-                    update={
-                        "model_init_config": {
-                            **train_config.model_init_config,
-                            "nn_depth": tuned_config.model_init_config["nn_depth"],
-                            "nn_width": tuned_config.model_init_config["nn_width"],
-                        }
+            def _tuned_model_init_updates() -> dict:
+                updates = {}
+                if case.model_type != "reservoir":
+                    updates["nn_depth"] = tuned_config.model_init_config["nn_depth"]
+                    updates["nn_width"] = tuned_config.model_init_config["nn_width"]
+                if case.model_type in ["shape_init_pca", "shape_init_kmeans"]:
+                    updates["n_shapes"] = tuned_config.model_init_config["n_shapes"]
+                    updates["softmax_temp"] = tuned_config.model_init_config["softmax_temp"]
+                elif case.model_type in ["unstructured_nn"]:
+                    updates["n_points"] = tuned_config.model_init_config["n_points"]
+                elif case.model_type == "reservoir":
+                    updates["n_points"] = tuned_config.model_init_config["n_points"]
+                    updates["reservoir_size"] = tuned_config.model_init_config["reservoir_size"]
+                    updates["spectral_radius"] = tuned_config.model_init_config["spectral_radius"]
+                    updates["input_scaling"] = tuned_config.model_init_config["input_scaling"]
+                    updates["leak_rate"] = tuned_config.model_init_config["leak_rate"]
+                    updates["n_steps"] = tuned_config.model_init_config["n_steps"]
+                return updates
+
+            train_config = train_config.model_copy(
+                update={
+                    "model_init_config": {
+                        **train_config.model_init_config,
+                        **_tuned_model_init_updates(),
                     }
-                )
-            if case.model_type in ["shape_init_pca", "shape_init_kmeans"]:
-                train_config = train_config.model_copy(
-                    update={
-                        "model_init_config": {
-                            **train_config.model_init_config,
-                            "n_shapes": tuned_config.model_init_config["n_shapes"],
-                            "softmax_temp": tuned_config.model_init_config["softmax_temp"],
-                        }
-                    }
-                )
-            elif case.model_type in ["unstructured_nn"]:
-                train_config = train_config.model_copy(
-                    update={
-                        "model_init_config": {
-                            **train_config.model_init_config,
-                            "n_points": tuned_config.model_init_config["n_points"],
-                        }
-                    }
-                )
-            elif case.model_type == "reservoir":
-                train_config = train_config.model_copy(
-                    update={
-                        "model_init_config": {
-                            **train_config.model_init_config,
-                            "n_points": tuned_config.model_init_config["n_points"],
-                            "reservoir_size": tuned_config.model_init_config["reservoir_size"],
-                            "spectral_radius": tuned_config.model_init_config["spectral_radius"],
-                            "input_scaling": tuned_config.model_init_config["input_scaling"],
-                            "leak_rate": tuned_config.model_init_config["leak_rate"],
-                            "n_steps": tuned_config.model_init_config["n_steps"],
-                        }
-                    }
-                )
+                }
+            )
         else:
             train_config = train_config_base
+
+        # Fine-tuning from a pretrained checkpoint needs a cooler learning rate
+        # than training from scratch (see TRANSFER_LR_FACTOR). Applied after the
+        # tuned-config merge so the swept optimizer_config cannot overwrite it
+        if case.domain_adaptation == "transfer":
+            train_config = train_config.model_copy(
+                update={
+                    "optimizer_config": {
+                        **train_config.optimizer_config,
+                        "lr0": train_config.optimizer_config["lr0"] * TRANSFER_LR_FACTOR,
+                        "lrf": train_config.optimizer_config["lrf"] * TRANSFER_LR_FACTOR,
+                    }
+                }
+            )
 
         return train_config
 
