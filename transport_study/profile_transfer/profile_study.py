@@ -68,7 +68,7 @@ class ProfileStudy(Study):
         @field_validator("model_types")
         @classmethod
         def _validate_model_types(cls, v: tuple[str, ...]) -> tuple[str, ...]:
-            valid = {"shape_init_pca", "shape_init_kmeans", "unstructured_nn", "torax-constant", "torax-cgm", "torax-gyrobohm"}
+            valid = {"shape_init_pca", "shape_init_kmeans", "unstructured_nn", "reservoir", "torax-constant", "torax-cgm", "torax-gyrobohm"}
             for mt in v:
                 if mt not in valid:
                     raise ValueError(f"Invalid model type: {mt}. Must be one of {sorted(valid)}.")
@@ -287,6 +287,7 @@ class ProfileStudy(Study):
                 "shape_init_pca",
                 "shape_init_kmeans",
                 "unstructured_nn",
+                "reservoir",
                 "torax-constant",
                 "torax-cgm",
                 "torax-gyrobohm",
@@ -408,7 +409,7 @@ class ProfileStudy(Study):
                         continue  # Can't train from nothing with 0 target shots
                 elif num_target_shots != HYPERPARAM_TARGET_SHOTS:
                     continue  # Invalid case, skip
-            if model_type == "unstructured_nn" and not freeze_shapes:
+            if model_type in ("unstructured_nn", "reservoir") and not freeze_shapes:
                 continue  # No shapes to freeze, just do one of the two
 
             case = self.Case(
@@ -467,6 +468,11 @@ class ProfileStudy(Study):
         }
         loss_config_base = {
             "huber_delta": 0.5,
+            # Penalize profile gradient mismatch too, since stability predictions
+            # depend on dTe/drho and dne/drho. Gradients are ~10x the value scale
+            # over rho in [0, 1], so they get their own huber delta.
+            "gradient_weight": 0.1,
+            "huber_delta_grad": 5.0,
         }
         optimizer_config_base = {
             "lr0": 1e-4,
@@ -615,6 +621,47 @@ class ProfileStudy(Study):
                     val_eval_suite_config=val_eval_suite_config_base,
                     test_eval_suite_config=test_eval_suite_config_base,
                 )
+            elif case.model_type == "reservoir":
+                train_config_base = TrainConfig(
+                    project=self.wandb_project_name(case),
+                    train_run_builder="transport_study.modules.profile_predictor.trb.ProfilePredictorTRB",
+                    max_epochs=config.max_epochs,
+                    epochs_per_val=config.epochs_per_val,
+                    patience=config.patience,
+                    # When doing hyperparameter tuning, this gets overwritten by the wandb agent
+                    checkpoint_dir=str(self.trained_model_dir(case)),
+                    dataloader_config={
+                        "input_vars": [
+                            "Ip_MA",
+                            "B0",
+                            "betan",
+                            "ne20_line_avg",
+                            "R0",
+                            "a_minor",
+                            "kappa",
+                            "delta_top",
+                            "delta_bot",
+                        ],
+                        **dataloader_config_base,
+                    },
+                    model_init_config={
+                        "model_type": case.model_type,
+                        "data_normalization": case.data_normalization,
+                        "domain_adaptation": case.domain_adaptation,
+                        "n_points": 21,  # Number of points along the profile predicted by the readout
+                        "reservoir_size": 128,  # Fixed random reservoir state dimension
+                        "spectral_radius": 0.9,  # Contraction factor of the recurrent weights
+                        "input_scaling": 0.5,  # Scale of the random input weights and bias
+                        "leak_rate": 1.0,  # Leaky integration rate of the state update
+                        "n_steps": 20,  # Reservoir iterations before readout
+                        "in_size": 9,  # Ip_MA, B0, betan, ne20_line_avg, R0, a_minor, kappa, delta_top, delta_bot
+                        "prng_seed": 42,
+                    },
+                    loss_config=loss_config_base,
+                    optimizer_config=optimizer_config_base,
+                    val_eval_suite_config=val_eval_suite_config_base,
+                    test_eval_suite_config=test_eval_suite_config_base,
+                )
             elif case.model_type.startswith("torax-"):
                 transport_model = case.model_type.removeprefix("torax-")
                 train_config_base = TrainConfig(
@@ -694,11 +741,6 @@ class ProfileStudy(Study):
             # Hyperparameters swept for all modules
             train_config = train_config_base.model_copy(
                 update={
-                    "model_init_config": {
-                        **train_config_base.model_init_config,
-                        "nn_depth": tuned_config.model_init_config["nn_depth"],
-                        "nn_width": tuned_config.model_init_config["nn_width"],
-                    },
                     "dataloader_config": {
                         **train_config_base.dataloader_config,
                         "batch_size": tuned_config.dataloader_config["batch_size"],
@@ -708,6 +750,17 @@ class ProfileStudy(Study):
             )
 
             # Hyperparameters swept for only certain modules
+            # The reservoir has no MLP depth/width, everything else sweeps them
+            if case.model_type != "reservoir":
+                train_config = train_config.model_copy(
+                    update={
+                        "model_init_config": {
+                            **train_config.model_init_config,
+                            "nn_depth": tuned_config.model_init_config["nn_depth"],
+                            "nn_width": tuned_config.model_init_config["nn_width"],
+                        }
+                    }
+                )
             if case.model_type in ["shape_init_pca", "shape_init_kmeans"]:
                 train_config = train_config.model_copy(
                     update={
@@ -724,6 +777,20 @@ class ProfileStudy(Study):
                         "model_init_config": {
                             **train_config.model_init_config,
                             "n_points": tuned_config.model_init_config["n_points"],
+                        }
+                    }
+                )
+            elif case.model_type == "reservoir":
+                train_config = train_config.model_copy(
+                    update={
+                        "model_init_config": {
+                            **train_config.model_init_config,
+                            "n_points": tuned_config.model_init_config["n_points"],
+                            "reservoir_size": tuned_config.model_init_config["reservoir_size"],
+                            "spectral_radius": tuned_config.model_init_config["spectral_radius"],
+                            "input_scaling": tuned_config.model_init_config["input_scaling"],
+                            "leak_rate": tuned_config.model_init_config["leak_rate"],
+                            "n_steps": tuned_config.model_init_config["n_steps"],
                         }
                     }
                 )

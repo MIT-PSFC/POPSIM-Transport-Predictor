@@ -1,0 +1,51 @@
+method: bayes
+metric:
+  name: "val/loss.mean"
+  goal: "minimize"
+early_terminate:
+  type: hyperband
+  min_iter: 2
+  eta: 3
+parameters:
+  model_init_config:
+    parameters:
+      reservoir_size:
+        values: [64, 128, 256, 512]
+      spectral_radius:
+        distribution: uniform
+        min: 0.5
+        max: 1.2
+      input_scaling:
+        distribution: log_uniform_values
+        min: 0.05
+        max: 2.0
+      leak_rate:
+        distribution: uniform
+        min: 0.2
+        max: 1.0
+      n_steps:
+        values: [5, 10, 20, 40]
+      n_points:
+        values: [21, 31, 41, 51]
+  optimizer_config:
+    parameters:
+      lr0:
+        distribution: log_uniform_values
+        min: 1.0e-5
+        max: 1.0e-2
+      lrf:
+        distribution: log_uniform_values
+        min: 1.0e-7
+        max: 1.0e-4
+      weight_decay:
+        distribution: log_uniform_values
+        min: 1.0e-6
+        max: 0.1
+      transition_steps:
+        values: [1000, 3000, 10000, 30000]
+      decay_rate:
+        distribution: uniform
+        min: 0.5
+        max: 0.999
+      batch_size:
+        values: [4096, 8192, null]

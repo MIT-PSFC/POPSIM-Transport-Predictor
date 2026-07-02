@@ -16,6 +16,7 @@ from popsim.ml.eval import EvalData, EvaluationSuite, batched_model_eval_and_los
 from transport_study import EPISODE_DIM, TIME_COORD, TIME_DIM
 from transport_study.config import config
 from transport_study.modules.profile_predictor.module import (
+    ProfilePredictorReservoir,
     ProfilePredictorShapeInit,
     ProfilePredictorUnstructuredNN,
     ShapeType,
@@ -165,6 +166,17 @@ class ProfilePredictorTRB(TrainRunBuilder):
                 rhogrid=np.asarray(train_dl.ds["rho"]),
                 key=jax.random.PRNGKey(model_init_config["prng_seed"]),
             )
+        elif model_init_config["model_type"] == "reservoir":
+            module = ProfilePredictorReservoir(
+                n_points=model_init_config["n_points"],
+                reservoir_size=model_init_config["reservoir_size"],
+                spectral_radius=model_init_config.get("spectral_radius", 0.9),
+                input_scaling=model_init_config.get("input_scaling", 0.5),
+                leak_rate=model_init_config.get("leak_rate", 1.0),
+                n_steps=model_init_config.get("n_steps", 20),
+                rhogrid=np.asarray(train_dl.ds["rho"]),
+                key=jax.random.PRNGKey(model_init_config["prng_seed"]),
+            )
         elif model_init_config["model_type"].startswith("torax-"):
             # model_type is "torax-<transport_model>", e.g. "torax-cgm"
             module = ProfilePredictorTorax(
@@ -191,6 +203,14 @@ class ProfilePredictorTRB(TrainRunBuilder):
             device_weights = dict.fromkeys(config.dataset_paths, 1.0)
         else:
             device_weights = loss_config["device_weights"]
+
+        # Weight of the profile-gradient term relative to the value term.
+        # Gradient agreement matters for downstream stability predictions, which
+        # depend on dTe/drho and dne/drho rather than the values themselves.
+        gradient_weight = loss_config.get("gradient_weight", 0.0)
+        # Gradients are much larger in magnitude than values (a few keV over rho in [0, 1]
+        # gives dTe/drho of order 10), so the huber transition needs its own delta
+        huber_delta_grad = loss_config.get("huber_delta_grad", 5.0)
 
         def loss_fn(pred, targ):
             ne_huber = optax.huber_loss(
@@ -221,10 +241,32 @@ class ProfilePredictorTRB(TrainRunBuilder):
             ne_weighted = sample_weights * ne_huber
             te_weighted = sample_weights * te_huber
 
-            ne_rho_loss = jnp.trapezoid(ne_weighted, x=pred.ne.rho.data)
-            te_rho_loss = jnp.trapezoid(te_weighted, x=pred.te.rho.data)
+            rho = pred.ne.rho.data
+            ne_rho_loss = jnp.trapezoid(ne_weighted, x=rho)
+            te_rho_loss = jnp.trapezoid(te_weighted, x=rho)
 
-            return ne_rho_loss + te_rho_loss
+            loss = ne_rho_loss + te_rho_loss
+
+            if gradient_weight > 0.0:
+                # Finite-difference gradients at the rho midpoints (robust to
+                # non-uniform grids, no jnp.gradient spacing support needed)
+                d_rho = jnp.diff(rho)
+                rho_mid = 0.5 * (rho[:-1] + rho[1:])
+
+                ne_grad_pred = jnp.diff(pred.ne.data, axis=-1) / d_rho
+                ne_grad_targ = jnp.diff(targ["ne20_rho"].data, axis=-1) / d_rho
+                te_grad_pred = jnp.diff(pred.te.data, axis=-1) / d_rho
+                te_grad_targ = jnp.diff(targ["Te_keV_rho"].data, axis=-1) / d_rho
+
+                ne_grad_huber = sample_weights * optax.huber_loss(ne_grad_pred, ne_grad_targ, delta=huber_delta_grad)
+                te_grad_huber = sample_weights * optax.huber_loss(te_grad_pred, te_grad_targ, delta=huber_delta_grad)
+
+                ne_grad_loss = jnp.trapezoid(ne_grad_huber, x=rho_mid)
+                te_grad_loss = jnp.trapezoid(te_grad_huber, x=rho_mid)
+
+                loss = loss + gradient_weight * (ne_grad_loss + te_grad_loss)
+
+            return loss
 
         return loss_fn
 
@@ -262,7 +304,9 @@ class ProfilePredictorTRB(TrainRunBuilder):
 
         if model_init_config["model_type"] in ["shape_init_pca", "shape_init_kmeans"]:
             return get_trainable_shape_init
-        elif model_init_config["model_type"] == "unstructured_nn":
+        elif model_init_config["model_type"] in ["unstructured_nn", "reservoir"]:
+            # For the reservoir, only the readout (module.nn) is trainable, the
+            # fixed random reservoir weights stay frozen
             return get_trainable_nn
         elif model_init_config["model_type"].startswith("torax-"):
             return get_trainable_torax

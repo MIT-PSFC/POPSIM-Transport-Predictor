@@ -5,6 +5,7 @@ import equinox as eqx
 import jax
 import jax.numpy as jnp
 import matplotlib.pyplot as plt
+import numpy as np
 import xarray as xr
 from jaxtyping import Array
 from popsim import TimeIndepModule
@@ -400,6 +401,112 @@ class ProfilePredictorShapeInit(ProfilePredictor):
             rhogrid=rhogrid_tuple,
             key=jax.random.PRNGKey(prng_seed),
         )
+
+
+class ProfilePredictorReservoir(ProfilePredictor):
+    """Reservoir computing (echo state network) profile predictor.
+
+    Same input/output contract as ProfilePredictorUnstructuredNN, but instead of an MLP
+    the 9 physics inputs are expanded through a fixed random reservoir. The reservoir
+    state is iterated to a washed-out state with a leaky tanh update, and only the
+    linear readout (self.nn, an RtdMLP with depth=0) is trained. The reservoir weights
+    (w_in, w_res, res_bias) are drawn once at init and kept frozen by the trainable
+    getter, which only exposes self.nn leaves.
+    """
+
+    rho_points: tuple = eqx.field(static=True)  # Hashable points at which the readout predicts
+    w_in: Array  # Fixed random input weights (reservoir_size, 9)
+    w_res: Array  # Fixed random recurrent weights (reservoir_size, reservoir_size)
+    res_bias: Array  # Fixed random bias (reservoir_size,)
+    n_steps: int = eqx.field(static=True)  # Reservoir update iterations before readout
+    leak_rate: float = eqx.field(static=True)  # Leaky integration rate in (0, 1]
+
+    def __init__(
+        self,
+        n_points: int,
+        reservoir_size: int,
+        rhogrid: tuple,
+        key: jax.random.PRNGKey,
+        spectral_radius: float = 0.9,
+        input_scaling: float = 0.5,
+        leak_rate: float = 1.0,
+        n_steps: int = 20,
+    ):
+        rhogrid_tuple = tuple(rhogrid.tolist()) if hasattr(rhogrid, "tolist") else tuple(rhogrid)
+        self.rho_points = tuple(jnp.linspace(min(rhogrid_tuple), max(rhogrid_tuple), n_points).tolist())
+
+        key_in, key_res, key_bias, key_out = jax.random.split(key, 4)
+        self.w_in = input_scaling * jax.random.uniform(key_in, (reservoir_size, 9), minval=-1.0, maxval=1.0)
+        w_res = jax.random.normal(key_res, (reservoir_size, reservoir_size))
+        # Rescale recurrent weights to the requested spectral radius so the state
+        # update is contracting (echo state property). Done with numpy at init time
+        # since general eigvals is host-side anyway.
+        eig_max = float(np.max(np.abs(np.linalg.eigvals(np.asarray(w_res)))))
+        self.w_res = w_res * (spectral_radius / eig_max)
+        self.res_bias = input_scaling * jax.random.uniform(key_bias, (reservoir_size,), minval=-1.0, maxval=1.0)
+
+        # Trainable linear readout, depth=0 makes RtdMLP a single Linear layer
+        self.nn = RtdMLP(
+            in_size=reservoir_size,
+            out_size=(n_points * 2) + 2,  # +2 for the correction factors
+            width_size=reservoir_size,
+            depth=0,
+            activation=Activation.RELU,
+            final_activation=Activation.IDENTITY,
+            key=key_out,
+        )
+        self.n_steps = n_steps
+        self.leak_rate = leak_rate
+        self.rhogrid = rhogrid_tuple
+
+    def reservoir_state(self, nn_inputs: Array) -> Array:
+        """Iterate the leaky tanh reservoir update to a washed-out state."""
+        drive = self.w_in @ nn_inputs + self.res_bias
+
+        def step(_i, h):
+            return (1.0 - self.leak_rate) * h + self.leak_rate * jnp.tanh(drive + self.w_res @ h)
+
+        h0 = jnp.zeros(self.res_bias.shape, dtype=drive.dtype)
+        return jax.lax.fori_loop(0, self.n_steps, step, h0)
+
+    def __call__(self, inputs: Inputs | xr.Dataset, debug: bool = False) -> Outputs:
+        if isinstance(inputs, xr.Dataset):
+            inputs = Inputs(
+                Ip=inputs["Ip_MA"].data,
+                B0=inputs["B0"].data,
+                betan=inputs["betan"].data,
+                ne20_line_avg=inputs["ne20_line_avg"].data,
+                R0=inputs["R0"].data,
+                a_minor=inputs["a_minor"].data,
+                kappa=inputs["kappa"].data,
+                delta_top=inputs["delta_top"].data,
+                delta_bot=inputs["delta_bot"].data,
+                rho=jnp.array(self.rhogrid),
+            )
+
+        nn_inputs = inputs.nn_inputs
+        rho_points = jnp.asarray(self.rho_points)
+        n_pred_points = len(self.rho_points)
+
+        # Expand inputs through the fixed reservoir, then read out profile points.
+        state = self.reservoir_state(nn_inputs)
+        outputs = self.nn(state)
+        ne_points = outputs[:n_pred_points]
+        te_points = outputs[n_pred_points : 2 * n_pred_points]
+        ne_correction = jnp.abs(outputs[-1])
+        te_correction = jnp.abs(outputs[-2])
+
+        # Interpolate the predicted points to the rhogrid
+        ne = jnp.interp(inputs.rho, rho_points, ne_points) * inputs.ne20_line_avg * ne_correction
+        te = jnp.interp(inputs.rho, rho_points, te_points) * te_correction
+
+        out = Outputs(
+            ne=xr.DataArray(data=ne, dims=("rho",), coords={"rho": list(self.rhogrid)}),
+            te=xr.DataArray(data=te, dims=("rho",), coords={"rho": list(self.rhogrid)}),
+            debug_info=None,
+        )
+
+        return out
 
 
 class ProfilePredictorUnstructuredNN(ProfilePredictor):
