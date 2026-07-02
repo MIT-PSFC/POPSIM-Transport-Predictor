@@ -204,7 +204,7 @@ def test_study_cmod_to_cmod_no_tuning():
         ],
         dataset_sizes={"cmod-low": 100, "cmod-high": 100},
         domain_adaptation_methods=[None, "mixing", "transfer"],
-        num_hp_shots_options=[0, 1, -1],
+        num_target_shots_options=[0, 1, -1],
         target_test_set_size=60,
     )
 
@@ -253,7 +253,7 @@ def test_study_cmod_to_cmod_with_tuning():
             "cmod-low",
         ],
         domain_adaptation_methods=[None, "mixing", "transfer"],
-        num_hp_shots_options=[0, -1],
+        num_target_shots_options=[0, -1],
         target_test_set_size=60,
     )
 
@@ -301,7 +301,7 @@ def test_study_cmod_to_mast():
         ],
         dataset_sizes={"cmod-low": 100, "cmod-high": 100, "mast": 41},
         domain_adaptation_methods=[None, "mixing", "transfer"],
-        num_hp_shots_options=[0, 1, -1],
+        num_target_shots_options=[0, 1, -1],
         target_test_set_size=20,
     )
 

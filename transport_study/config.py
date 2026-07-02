@@ -44,7 +44,8 @@ class StudyConfig(BaseModel):
     )
 
     # make everything in the config completely immutable, including the nested dataset_paths dict
-    model_config = ConfigDict(frozen=True)
+    # extra="forbid" so a mistyped field name raises instead of being silently ignored and replaced by the default
+    model_config = ConfigDict(frozen=True, extra="forbid")
 
     @model_validator(mode="after")
     def _freeze_paths(self):

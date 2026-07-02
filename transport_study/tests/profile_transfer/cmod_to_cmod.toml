@@ -3,7 +3,7 @@ debug = true
 max_epochs = 2
 epochs_per_val = 1
 hyperparam_sweeps = 2
-hp_test_set_size = 2
+target_test_set_size = 2
 
 [datasets]
 target = "cmod-high"
@@ -11,7 +11,8 @@ cmod-high = "/path/to/cmod.nc"
 cmod-low1 = "/path/to/mast.nc"
 
 [study_cases]
-model_types = ["unstructured_nn", "sciml"]
-data_normalization_methods = ["physics", "standard"]
-num_hp_shots_options = [0, 2]
+model_types = ["unstructured_nn"]
+training_datasets = ["exnihilo", "cmod-low1"]
+data_normalization_methods = ["physics"]
+num_target_shots_options = [0, 2]
 domain_adaptation_methods = ["transfer"]
