@@ -135,12 +135,21 @@ def launch_train_parallel(
         yaml.dump(train_config.model_dump(), f, indent=4)
         config_path = f.name
 
+    # This runs in a fresh process, so the global transport_study.config
+    # singleton isn't loaded there - serialize it too, or any code path that
+    # touches config.* (e.g. resolving dataset_paths) raises "Config not loaded"
+    study_config_path = Path(log_dir) / f"{job_name}_study_config.toml"
+    config.save(study_config_path)
+
     # Write the serial training logic as a small Python script
     py_script = f"""\
 import yaml
 from pathlib import Path
 from popsim.ml import TrainConfig
 from popsim.ml.launch import launch_train
+from transport_study.config import load_config
+
+load_config(Path({str(study_config_path)!r}))
 
 with open({config_path!r}) as f:
     train_config = TrainConfig(**yaml.safe_load(f))
@@ -150,6 +159,7 @@ ds = result_dict["test/study_results"]
 Path({str(result_path)!r}).parent.mkdir(parents=True, exist_ok=True)
 ds.to_netcdf({str(result_path)!r})
 Path({str(config_path)!r}).unlink()
+Path({str(study_config_path)!r}).unlink()
 """
 
     with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False, prefix=f"{job_name}_script_", dir=log_dir) as f:
@@ -214,17 +224,26 @@ def launch_agent_parallel(
 
     run_dir = tempfile.mkdtemp(prefix=f"{job_name}_", dir=log_dir)
     config_path = Path(run_dir) / "config.yaml"
+    study_config_path = Path(run_dir) / "study_config.toml"
     script_path = Path(run_dir) / "run_agent.py"
     log_path = Path(run_dir) / "slurm.log"
 
     with open(config_path, "w") as f:
         yaml.dump(train_config.model_dump(), f, indent=4)
 
+    # This runs in a fresh process, so the global transport_study.config
+    # singleton isn't loaded there - serialize it too, or any code path that
+    # touches config.* (e.g. resolving dataset_paths) raises "Config not loaded"
+    config.save(study_config_path)
+
     py_script = f"""\
 import yaml
 from pathlib import Path
 from popsim.ml import TrainConfig
 from popsim.ml.launch import launch_agent
+from transport_study.config import load_config
+
+load_config(Path({str(study_config_path)!r}))
 
 with open({config_path!r}) as f:
     train_config = TrainConfig(**yaml.safe_load(f))
@@ -235,6 +254,7 @@ launch_agent(
     kwargs_agent={kwargs_agent!r},
 )
 Path({config_path!r}).unlink()
+Path({str(study_config_path)!r}).unlink()
 """
 
     with open(script_path, "w") as f:
