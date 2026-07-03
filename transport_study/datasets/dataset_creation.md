@@ -66,16 +66,22 @@ Then, for example:
 python transport_study/datasets/cli.py cmod \
     --data_assembly_dir /usr/local/mfe/ml_data_dump/POPSIM/popsim_studies/icddps \
     --cluster_profile <profile-name> \
-    --cluster_partition <cpu-partition> \
+    --cluster_partitions "sched_psfc_mit_r8@8:00:00,mit_preemptable@8:00:00@rocky8" \
     --cluster_remote_workdir <remote-workdir> \
     --cluster_venv <path-to-venv>/.venv
 ```
 
 Notes:
-- The fitting partition should be a CPU partition since mkgp cannot use GPUs.
+- `--cluster_partitions` is an ordered preference list of `name@time_limit` or
+  `name@time_limit@constraint` entries. Killed jobs are retried up to
+  `--cluster_max_retries` (default 2) times, and both retries and jobs stuck PENDING past
+  `--cluster_pending_timeout_s` (default 1800) move to the next partition in the list
+  (wrapping around). Each time limit must not exceed the partition's MaxTime
+  (`scontrol show partition <name> | grep MaxTime`).
+- The fitting partitions should be CPU partitions since mkgp cannot use GPUs.
 - Configure the following arguments according to your cluster's resources and user quotas
     - `--cluster_max_jobs` (default 8)
-    - `--cluster_shots_per_batch` (default 50)
+    - `--cluster_shots_per_batch` (default 10)
     - `--cluster_cpus_per_job` (default 32)
 - For MAST running on the cluster itself, pass `--cluster_profile local` to submit sbatch jobs directly on the
   shared filesystem.

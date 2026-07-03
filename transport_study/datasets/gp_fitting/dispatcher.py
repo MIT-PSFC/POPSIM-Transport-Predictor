@@ -12,9 +12,12 @@ Two backends:
 - "local": running on the cluster itself (e.g. MAST fitting on Engaging);
   files are copied on the shared filesystem and sbatch runs locally.
 
-Jobs get deterministic names gpfit-{device}-{batch_id} (batch_id is a hash of
-the shot list), so a restarted workflow finds in-flight jobs instead of
-resubmitting them.
+Jobs get deterministic names gpfit-{device}-{batch_id}-a{attempt} (batch_id is
+a hash of the shot list), so a restarted workflow finds in-flight jobs instead
+of resubmitting them. Killed jobs (TIMEOUT, PREEMPTED, OOM, ...) are retried up
+to max_retries times, and both retries and jobs stuck PENDING past
+pending_timeout_s move to the next partition in the preference list (wrapping
+around).
 """
 
 import hashlib
@@ -49,6 +52,9 @@ _RSYNC_SOURCE_MISSING_CODES = {23, 24}
 # polls to wait for a COMPLETED job's output to become pullable before
 # declaring the batch failed
 _MAX_OUTPUT_PULL_POLLS = 3
+# polls to tolerate a job in an unrecognized/unknown state (e.g. it vanished
+# from the queue) before treating the attempt as failed
+_MAX_UNKNOWN_POLLS = 5
 
 # SLURM states that mean the job will never produce output
 _TERMINAL_FAILURE_STATES = {
@@ -64,6 +70,47 @@ _TERMINAL_FAILURE_STATES = {
 
 
 @dataclass
+class PartitionSpec:
+    """One partition to try, with its own time limit and optional constraint.
+
+    time_limit must not exceed the partition's MaxTime; query it with:
+        scontrol show partition <name> | grep MaxTime
+    or: sinfo -p <name> -O partitionname,time
+    """
+
+    name: str
+    time_limit: str
+    constraint: str | None = None
+
+
+def parse_partition_specs(value) -> list["PartitionSpec"]:
+    """Parse a partition spec string into PartitionSpecs.
+
+    Format: comma-separated entries of name@time_limit or
+    name@time_limit@constraint, e.g.
+    "sched_psfc_mit_r8@8:00:00,mit_preemptable@8:00:00@rocky8".
+    Also accepts a tuple/list of entry strings (Python Fire may pre-split
+    comma-separated arguments).
+    """
+    if isinstance(value, str):
+        entries = value.split(",")
+    else:
+        entries = list(value)
+    specs = []
+    for entry in entries:
+        fields = entry.strip().split("@")
+        if len(fields) == 2:
+            specs.append(PartitionSpec(name=fields[0], time_limit=fields[1]))
+        elif len(fields) == 3:
+            specs.append(PartitionSpec(name=fields[0], time_limit=fields[1], constraint=fields[2]))
+        else:
+            raise ValueError(f"Bad partition spec '{entry}': expected name@time_limit or name@time_limit@constraint")
+    if not specs:
+        raise ValueError("Empty partition spec")
+    return specs
+
+
+@dataclass
 class ClusterFitConfig:
     """Launch options for cluster-based GP fitting.
 
@@ -72,9 +119,13 @@ class ClusterFitConfig:
     profile : str
         srunx SSH profile name, or "local" when already running on the
         target cluster (shared filesystem, local sbatch).
-    partition : str
-        SLURM partition for the fitting jobs. mkgp is CPU-only, so this
-        should be a CPU partition.
+    partitions : list[PartitionSpec] | str | tuple
+        Ordered partition preference list, each with its own time limit and
+        optional constraint (see parse_partition_specs for the string
+        format). mkgp is CPU-only, so these should be CPU partitions. A
+        batch is submitted to the first partition; it falls back to the
+        next (wrapping around) when its job is killed or sits PENDING
+        longer than pending_timeout_s.
     remote_workdir : str
         Scratch directory on the cluster where batch files, the worker
         script, and job logs are placed. Cluster-specific.
@@ -85,23 +136,36 @@ class ClusterFitConfig:
         cluster citizen.
     shots_per_batch : int
         Shots packed into one npz / one job. At ~40 core-minutes per shot,
-        50 shots on 32 CPUs is ~1 hour wall time
+        10 shots on 32 CPUs is ~15 minutes wall time. Small batches keep
+        jobs running concurrently and bound the work lost to a killed job.
     cpus_per_job : int
         cpus-per-task for each fitting job; the worker runs this many
         slice-fit processes.
+    max_retries : int
+        Resubmissions allowed per batch after a terminal job failure
+        (TIMEOUT, PREEMPTED, OOM, ...). Each retry moves to the next
+        partition in the list, wrapping around.
+    pending_timeout_s : float
+        Cancel a PENDING job and resubmit it on the next partition after
+        this long in the queue. Stops once every partition has been tried.
     """
 
     profile: str
-    partition: str
+    partitions: list[PartitionSpec] | str | tuple
     remote_workdir: str
     venv_path: str
     max_concurrent_jobs: int = 8
-    shots_per_batch: int = 50
+    shots_per_batch: int = 10
     cpus_per_job: int = 32
     memory_per_node: str | None = None
-    time_limit: str = "7:50:00"
     poll_interval_s: float = 60.0
     job_name_prefix: str = "gpfit"
+    max_retries: int = 2
+    pending_timeout_s: float = 1800.0
+
+    def __post_init__(self):
+        if not isinstance(self.partitions, list) or not all(isinstance(p, PartitionSpec) for p in self.partitions):
+            self.partitions = parse_partition_specs(self.partitions)
 
 
 def batch_id(device: str, shots: list[int]) -> str:
@@ -225,8 +289,13 @@ class _SSHBackend:
                 time.sleep(_TRANSFER_RETRY_DELAY_S)
         return False
 
-    def submit(self, job) -> int:
-        return self._client.submit(job).job_id
+    def submit_script(self, script: str, job_name: str) -> int:
+        return int(self._client.submit_job(script, job_name=job_name)["job_id"])
+
+    def ensure_dir(self, path: str) -> None:
+        result = self._rsync._ssh_run(f"mkdir -p {shlex.quote(path)}")
+        if result.returncode != 0:
+            raise RuntimeError(f"Failed to create remote dir {path}: {result.stderr.strip()}")
 
     def queued_job_names(self) -> dict[str, int]:
         """Names of this user's queued/running jobs -> job id."""
@@ -274,8 +343,23 @@ class _LocalBackend:
         shutil.copy2(src, local_dir / src.name)
         return True
 
-    def submit(self, job) -> int:
-        return self._client.submit(job).job_id
+    def submit_script(self, script: str, job_name: str) -> int:
+        import subprocess
+        import tempfile
+
+        with tempfile.NamedTemporaryFile("w", suffix=".sh", delete=False) as f:
+            f.write(script)
+            script_path = f.name
+        try:
+            result = subprocess.run(["sbatch", "--parsable", script_path], capture_output=True, text=True, check=False)
+            if result.returncode != 0:
+                raise RuntimeError(f"sbatch failed for {job_name}: {result.stderr.strip()}")
+            return int(result.stdout.strip().split(";")[0])
+        finally:
+            Path(script_path).unlink(missing_ok=True)
+
+    def ensure_dir(self, path: str) -> None:
+        Path(path).mkdir(parents=True, exist_ok=True)
 
     def queued_job_names(self) -> dict[str, int]:
         return {j.name: j.job_id for j in self._client.queue(user=self._username) if j.job_id}
@@ -297,11 +381,28 @@ class _BatchState:
     shots: list[int]
     input_path: Path
     output_path: Path
-    job_name: str
+    job_base_name: str
     job_id: int | None = None
+    attempt: int = 0  # submissions so far; job names carry -a{attempt}
+    failures: int = 0  # terminal failures so far, vs config.max_retries
+    partition_idx: int = 0
+    pending_since: float | None = None
+    pending_hops: int = 0
+    fail_reason: str | None = None
     done: bool = False
     failed: bool = False
     output_pull_polls: int = 0
+    unknown_polls: int = 0
+
+    @property
+    def job_name(self) -> str:
+        return f"{self.job_base_name}-a{self.attempt}"
+
+    def reset_for_resubmit(self) -> None:
+        self.job_id = None
+        self.pending_since = None
+        self.output_pull_polls = 0
+        self.unknown_polls = 0
 
 
 class ClusterFitDispatcher:
@@ -366,7 +467,7 @@ class ClusterFitDispatcher:
                 shots=shots,
                 input_path=self.input_path(bid),
                 output_path=self.output_path(bid),
-                job_name=self.job_name(bid),
+                job_base_name=self.job_name(bid),
             )
             if not state.input_path.exists():
                 pack_fit_batch(
@@ -383,7 +484,13 @@ class ClusterFitDispatcher:
             batches.append(state)
 
         self._run_jobs(batches)
-        return self._collect_results(batches, shot_inputs)
+        results = self._collect_results(batches, shot_inputs)
+        summary = self._run_summary(batches, results)
+        if any(r is None for r in results.values()):
+            logger.error(summary)
+        else:
+            logger.info(summary)
+        return results
 
     def clean(self) -> None:
         """Cancel this device's queued/running jobs and remove its batch files, local and remote.
@@ -429,13 +536,13 @@ class ClusterFitDispatcher:
 
         logger.info(f"Uploading worker script to {self.config.remote_workdir}")
         self.backend.push_file(WORKER_SOURCE, self.config.remote_workdir)
+        # sbatch does not create --output directories
+        self.backend.ensure_dir(f"{self.config.remote_workdir}/logs")
 
         # Adopt jobs already in the queue from a previous run
         queued = self.backend.queued_job_names()
         for state in todo:
-            if state.job_name in queued:
-                state.job_id = queued[state.job_name]
-                logger.info(f"Batch {state.bid}: found existing job {state.job_id} in queue, not resubmitting")
+            self._adopt_queued_job(state, queued)
 
         while True:
             self._poll_finished(todo)
@@ -460,36 +567,79 @@ class ClusterFitDispatcher:
             state.job_id = self._submit_batch(state)
             budget -= 1
 
-    def _submit_batch(self, state: _BatchState) -> int:
-        from srunx import Job, JobEnvironment, JobResource
+    def _adopt_queued_job(self, state: _BatchState, queued: dict[str, int]) -> None:
+        """Adopt a queued job from a previous run instead of resubmitting.
 
+        Job names carry an attempt suffix (-a{n}); the highest attempt wins
+        and lower-attempt stragglers are cancelled. A bare job_base_name
+        (submitted by pre-retry code) counts as attempt 1.
+        """
+        candidates: list[tuple[int, int]] = []  # (attempt, job_id)
+        for name, job_id in queued.items():
+            if name == state.job_base_name:
+                candidates.append((1, job_id))
+            elif name.startswith(f"{state.job_base_name}-a"):
+                suffix = name.removeprefix(f"{state.job_base_name}-a")
+                if suffix.isdigit():
+                    candidates.append((int(suffix), job_id))
+        if not candidates:
+            return
+        candidates.sort()
+        state.attempt, state.job_id = candidates[-1]
+        state.pending_since = time.monotonic()
+        logger.info(f"Batch {state.bid}: found existing job {state.job_id} (attempt {state.attempt}) in queue, not resubmitting")
+        for _, stale_id in candidates[:-1]:
+            logger.info(f"Batch {state.bid}: cancelling stale lower-attempt job {stale_id}")
+            try:
+                self.backend.cancel(stale_id)
+            except Exception as e:
+                logger.warning(f"Batch {state.bid}: failed to cancel stale job {stale_id}: {e}")
+
+    def _render_script(self, state: _BatchState, part: PartitionSpec) -> str:
+        workdir = self.config.remote_workdir
+        lines = [
+            "#!/bin/bash",
+            "",
+            f"#SBATCH --job-name={state.job_name}",
+            "#SBATCH --nodes=1",
+            "#SBATCH --ntasks-per-node=1",
+            f"#SBATCH --cpus-per-task={self.config.cpus_per_job}",
+        ]
+        if self.config.memory_per_node:
+            lines.append(f"#SBATCH --mem={self.config.memory_per_node}")
+        lines.append(f"#SBATCH --time={part.time_limit}")
+        lines.append(f"#SBATCH --partition={part.name}")
+        if part.constraint:
+            lines.append(f"#SBATCH --constraint={part.constraint}")
+        lines += [
+            f"#SBATCH --output={workdir}/logs/%x_%j.log",
+            f"#SBATCH --error={workdir}/logs/%x_%j.log",
+            f"#SBATCH --chdir={workdir}",
+            "#SBATCH --wait-all-nodes=1",
+            "",
+            "set -euxo pipefail",
+            "",
+            f"source '{self.config.venv_path}/bin/activate'",
+            "",
+            f"srun python {workdir}/{WORKER_FILENAME} {workdir}/{state.input_path.name} "
+            f"{workdir}/{state.output_path.name} --num-workers {self.config.cpus_per_job}",
+            "",
+        ]
+        return "\n".join(lines)
+
+    def _submit_batch(self, state: _BatchState) -> int:
         workdir = self.config.remote_workdir
         self.backend.push_file(state.input_path, workdir)
 
-        job = Job(
-            name=state.job_name,
-            command=[
-                "python",
-                f"{workdir}/{WORKER_FILENAME}",
-                f"{workdir}/{state.input_path.name}",
-                f"{workdir}/{state.output_path.name}",
-                "--num-workers",
-                str(self.config.cpus_per_job),
-            ],
-            resources=JobResource(
-                nodes=1,
-                ntasks_per_node=1,
-                cpus_per_task=self.config.cpus_per_job,
-                partition=self.config.partition,
-                time_limit=self.config.time_limit,
-                memory_per_node=self.config.memory_per_node,
-            ),
-            environment=JobEnvironment(venv=self.config.venv_path),
-            work_dir=workdir,
-            log_dir=f"{workdir}/logs",
+        part = self.config.partitions[state.partition_idx]
+        state.attempt += 1
+        script = self._render_script(state, part)
+        job_id = self.backend.submit_script(script, state.job_name)
+        state.pending_since = time.monotonic()
+        logger.info(
+            f"Batch {state.bid}: submitted job {state.job_name} (id {job_id}, {len(state.shots)} shots, "
+            f"partition {part.name}, attempt {state.attempt})"
         )
-        job_id = self.backend.submit(job)
-        logger.info(f"Batch {state.bid}: submitted job {state.job_name} (id {job_id}, {len(state.shots)} shots)")
         return job_id
 
     def _poll_finished(self, todo: list[_BatchState]) -> None:
@@ -499,7 +649,11 @@ class ClusterFitDispatcher:
         states = self.backend.job_states([b.job_id for b in active])
         for state in active:
             slurm_state = states.get(state.job_id, "UNKNOWN")
-            if slurm_state in ("PENDING", "RUNNING", "COMPLETING", "CONFIGURING"):
+            if slurm_state == "PENDING":
+                self._check_pending_timeout(state)
+                continue
+            if slurm_state in ("RUNNING", "COMPLETING", "CONFIGURING"):
+                state.pending_since = None
                 continue
             # Terminal or unknown: the output file is the source of truth
             remote_out = f"{self.config.remote_workdir}/{state.output_path.name}"
@@ -507,10 +661,9 @@ class ClusterFitDispatcher:
                 state.done = True
                 logger.info(f"Batch {state.bid}: job {state.job_id} finished, results pulled back")
             elif slurm_state in _TERMINAL_FAILURE_STATES:
-                state.failed = True
-                logger.error(
-                    f"Batch {state.bid}: job {state.job_id} ended in state {slurm_state} without producing "
-                    f"{remote_out}; see logs in {self.config.remote_workdir}/logs"
+                self._handle_failure(
+                    state,
+                    f"job {state.job_id} ended in state {slurm_state} without producing {remote_out}",
                 )
             elif slurm_state == "COMPLETED":
                 # The job claims success, so the output may exist but be
@@ -518,10 +671,9 @@ class ClusterFitDispatcher:
                 # in flight. Keep trying for a few polls before giving up.
                 state.output_pull_polls += 1
                 if state.output_pull_polls >= _MAX_OUTPUT_PULL_POLLS:
-                    state.failed = True
-                    logger.error(
-                        f"Batch {state.bid}: job {state.job_id} COMPLETED but {remote_out} could not be "
-                        f"pulled after {state.output_pull_polls} polls. See logs in {self.config.remote_workdir}/logs"
+                    self._handle_failure(
+                        state,
+                        f"job {state.job_id} COMPLETED but {remote_out} could not be pulled after {state.output_pull_polls} polls",
                     )
                 else:
                     logger.warning(
@@ -529,8 +681,63 @@ class ClusterFitDispatcher:
                         f"(poll {state.output_pull_polls}/{_MAX_OUTPUT_PULL_POLLS}), will retry"
                     )
             else:
-                # UNKNOWN with no output yet: give it until the next poll
-                logger.warning(f"Batch {state.bid}: job {state.job_id} state {slurm_state}, no output yet")
+                # UNKNOWN (e.g. the job vanished from the queue): tolerate a
+                # few polls, then treat the attempt as failed
+                state.unknown_polls += 1
+                if state.unknown_polls >= _MAX_UNKNOWN_POLLS:
+                    self._handle_failure(
+                        state,
+                        f"job {state.job_id} in state {slurm_state} for {state.unknown_polls} polls with no output",
+                    )
+                else:
+                    logger.warning(f"Batch {state.bid}: job {state.job_id} state {slurm_state}, no output yet")
+
+    def _check_pending_timeout(self, state: _BatchState) -> None:
+        """Cancel a job stuck PENDING too long and move it to the next partition.
+
+        Stops hopping after one full cycle through the partition list:
+        if every partition is congested, cancelling only resets the batch's
+        queue position.
+        """
+        if state.pending_since is None:
+            # Job returned to PENDING (e.g. preemption requeue): restart the clock
+            state.pending_since = time.monotonic()
+            return
+        if len(self.config.partitions) < 2 or state.pending_hops >= len(self.config.partitions):
+            return
+        elapsed = time.monotonic() - state.pending_since
+        if elapsed <= self.config.pending_timeout_s:
+            return
+        old_part = self.config.partitions[state.partition_idx].name
+        state.partition_idx = (state.partition_idx + 1) % len(self.config.partitions)
+        state.pending_hops += 1
+        new_part = self.config.partitions[state.partition_idx].name
+        logger.warning(
+            f"Batch {state.bid}: job {state.job_id} PENDING for {elapsed:.0f}s on {old_part}, cancelling and falling back to {new_part}"
+        )
+        try:
+            self.backend.cancel(state.job_id)
+        except Exception as e:
+            logger.warning(f"Batch {state.bid}: failed to cancel job {state.job_id}: {e}")
+        state.reset_for_resubmit()
+        if state.pending_hops >= len(self.config.partitions):
+            logger.warning(f"Batch {state.bid}: tried every partition for pending fallback, will wait in queue from now on")
+
+    def _handle_failure(self, state: _BatchState, reason: str) -> None:
+        """Retry a failed batch on the next partition, or give up past max_retries."""
+        state.failures += 1
+        part = self.config.partitions[state.partition_idx]
+        if state.failures > self.config.max_retries:
+            state.failed = True
+            state.fail_reason = (
+                f"{reason} (partition {part.name}, attempt {state.attempt}, {state.failures - 1}/{self.config.max_retries} retries used)"
+            )
+            logger.error(f"Batch {state.bid}: {state.fail_reason}; giving up, see logs in {self.config.remote_workdir}/logs")
+            return
+        state.partition_idx = (state.partition_idx + 1) % len(self.config.partitions)
+        next_part = self.config.partitions[state.partition_idx].name
+        logger.warning(f"Batch {state.bid}: {reason}; retry {state.failures}/{self.config.max_retries} on partition {next_part}")
+        state.reset_for_resubmit()
 
     # ------------------------------------------------------------------
     def _collect_results(
@@ -554,3 +761,23 @@ class ClusterFitDispatcher:
                 else:
                     logger.error(f"Batch {state.bid} results missing shot {shot}")
         return results
+
+    @staticmethod
+    def _run_summary(
+        batches: list[_BatchState],
+        results: dict[int, ShotFitOutput | None],
+    ) -> str:
+        """Reconciliation report: every requested shot is accounted for."""
+        failed_shots = sorted(s for s, r in results.items() if r is None)
+        lines = [
+            f"GP fit reconciliation: {len(results)} shots requested, {len(results) - len(failed_shots)} fitted, {len(failed_shots)} FAILED"
+        ]
+        for state in batches:
+            batch_failed = [s for s in state.shots if results.get(s) is None]
+            if not batch_failed:
+                continue
+            reason = state.fail_reason or "output missing, unreadable, or incomplete"
+            lines.append(f"  batch {state.bid} (attempts {state.attempt}): {reason}; shots: {', '.join(str(s) for s in batch_failed)}")
+        if failed_shots:
+            lines.append(f"  FAILED shots ({len(failed_shots)}): {', '.join(str(s) for s in failed_shots)}")
+        return "\n".join(lines)

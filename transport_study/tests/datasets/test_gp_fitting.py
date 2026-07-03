@@ -7,6 +7,7 @@ planning for restart safety, and the fitting math the worker executes.
 """
 
 import multiprocessing
+import re
 import shutil
 from contextlib import contextmanager
 from pathlib import Path
@@ -19,7 +20,10 @@ from transport_study import PACKAGE_ROOT
 from transport_study.datasets.gp_fitting.dispatcher import (
     ClusterFitConfig,
     ClusterFitDispatcher,
+    PartitionSpec,
+    _BatchState,
     batch_id,
+    parse_partition_specs,
     plan_batches,
 )
 from transport_study.datasets.gp_fitting.fit_worker import (
@@ -269,19 +273,42 @@ def test_fit_batch_max_slices_per_shot():
 class _FakeBackend:
     """Stands in for the srunx SSH/local backends.
 
-    Submitted jobs "complete" immediately: unless the batch is in
-    fail_batch_ids, a zero-filled result npz is written to the fake remote
-    workdir, where the dispatcher's pull will find it.
+    Jobs are submitted as rendered sbatch scripts; the fake parses the batch
+    npz names, partition, and constraint back out of the script text. Unless a
+    failure/pending knob applies, jobs "complete" immediately: a zero-filled
+    result npz is written to the fake remote workdir, where the dispatcher's
+    pull will find it.
+
+    Knobs:
+    - fail_batch_ids: these batches always end FAILED.
+    - fail_first_attempts: bid -> number of leading attempts that end FAILED
+      before the batch completes.
+    - pending_partitions: submissions to these partitions stay PENDING; if
+      release_pending_after is set, they complete after that many job_states
+      polls.
     """
 
-    def __init__(self, remote_dir: Path, fail_batch_ids: set[str] | None = None):
+    def __init__(
+        self,
+        remote_dir: Path,
+        fail_batch_ids: set[str] | None = None,
+        fail_first_attempts: dict[str, int] | None = None,
+        pending_partitions: set[str] | None = None,
+        release_pending_after: int | None = None,
+    ):
         self.remote_dir = Path(remote_dir)
         self.remote_dir.mkdir(parents=True, exist_ok=True)
         self.fail_batch_ids = fail_batch_ids or set()
+        self.fail_first_attempts = fail_first_attempts or {}
+        self.pending_partitions = pending_partitions or set()
+        self.release_pending_after = release_pending_after
         self.submitted_names: list[str] = []
+        self.submissions: list[tuple[str, str, str | None]] = []  # (name, partition, constraint)
         self.cancelled_ids: list[int] = []
         self._states: dict[int, str] = {}
         self._queued: dict[str, int] = {}
+        self._job_paths: dict[int, tuple[Path, Path]] = {}  # job_id -> (in, out)
+        self._pending_polls: dict[int, int] = {}
         self._next_id = 100
 
     def push_file(self, local: Path, remote_dir: str) -> None:
@@ -294,18 +321,7 @@ class _FakeBackend:
         shutil.copy2(src, Path(local_dir) / src.name)
         return True
 
-    def submit(self, job) -> int:
-        self.submitted_names.append(job.name)
-        job_id = self._next_id
-        self._next_id += 1
-
-        in_path = self.remote_dir / Path(job.command[2]).name
-        out_path = self.remote_dir / Path(job.command[3]).name
-        bid = job.name.rsplit("-", 1)[-1]
-        if bid in self.fail_batch_ids:
-            self._states[job_id] = "FAILED"
-            return job_id
-
+    def _write_output(self, in_path: Path, out_path: Path) -> None:
         shot_inputs, x_star, _, _ = unpack_fit_batch(in_path)
         outputs = {
             shot: ShotFitOutput(
@@ -323,13 +339,49 @@ class _FakeBackend:
             for shot, si in shot_inputs.items()
         }
         pack_fit_results(out_path, outputs, x_star)
-        self._states[job_id] = "COMPLETED"
+
+    def submit_script(self, script: str, job_name: str) -> int:
+        assert script.startswith("#!/bin/bash")
+        assert f"#SBATCH --job-name={job_name}" in script
+        self.submitted_names.append(job_name)
+        job_id = self._next_id
+        self._next_id += 1
+
+        bid = re.search(r"batch_([0-9a-f]+)\.npz", script).group(1)
+        partition = re.search(r"--partition=(\S+)", script).group(1)
+        constraint_m = re.search(r"--constraint=(\S+)", script)
+        constraint = constraint_m.group(1) if constraint_m else None
+        attempt = int(job_name.rsplit("-a", 1)[-1])
+        self.submissions.append((job_name, partition, constraint))
+
+        in_path = self.remote_dir / f"batch_{bid}.npz"
+        out_path = self.remote_dir / f"batch_{bid}_out.npz"
+        self._job_paths[job_id] = (in_path, out_path)
+
+        if partition in self.pending_partitions:
+            self._states[job_id] = "PENDING"
+            self._pending_polls[job_id] = 0
+        elif bid in self.fail_batch_ids or attempt <= self.fail_first_attempts.get(bid, 0):
+            self._states[job_id] = "FAILED"
+        else:
+            self._write_output(in_path, out_path)
+            self._states[job_id] = "COMPLETED"
         return job_id
+
+    def ensure_dir(self, path: str) -> None:
+        pass
 
     def queued_job_names(self) -> dict[str, int]:
         return dict(self._queued)
 
     def job_states(self, job_ids: list[int]) -> dict[int, str]:
+        for jid in job_ids:
+            if self._states.get(jid) == "PENDING" and self.release_pending_after is not None:
+                self._pending_polls[jid] = self._pending_polls.get(jid, 0) + 1
+                if self._pending_polls[jid] >= self.release_pending_after:
+                    in_path, out_path = self._job_paths[jid]
+                    self._write_output(in_path, out_path)
+                    self._states[jid] = "COMPLETED"
         return {jid: self._states[jid] for jid in job_ids if jid in self._states}
 
     def cancel(self, job_id: int) -> None:
@@ -341,18 +393,34 @@ class _FakeBackend:
             (self.remote_dir / Path(p).name).unlink(missing_ok=True)
 
 
-def _make_dispatcher(tmp_path, monkeypatch, fail_batch_ids=None):
-    fake = _FakeBackend(tmp_path / "remote", fail_batch_ids)
+def _make_dispatcher(
+    tmp_path,
+    monkeypatch,
+    fail_batch_ids=None,
+    fail_first_attempts=None,
+    pending_partitions=None,
+    release_pending_after=None,
+    **config_overrides,
+):
+    fake = _FakeBackend(
+        tmp_path / "remote",
+        fail_batch_ids,
+        fail_first_attempts,
+        pending_partitions,
+        release_pending_after,
+    )
     monkeypatch.setattr(ClusterFitDispatcher, "_create_backend", staticmethod(lambda config: fake))
-    config = ClusterFitConfig(
+    config_kwargs = dict(
         profile="fake",
-        partition="cpu",
+        partitions="cpu@7:50:00",
         remote_workdir=str(tmp_path / "remote"),
         venv_path="/fake/.venv",
         shots_per_batch=2,
         max_concurrent_jobs=1,
         poll_interval_s=0.01,
     )
+    config_kwargs.update(config_overrides)
+    config = ClusterFitConfig(**config_kwargs)
     dispatcher = ClusterFitDispatcher(config, "cmod", tmp_path / "staging")
     return dispatcher, fake
 
@@ -367,14 +435,14 @@ def test_dispatcher_run_completes_batches(tmp_path, monkeypatch):
     assert all(isinstance(out, ShotFitOutput) for out in results.values())
     # 3 shots with shots_per_batch=2 -> two jobs, despite max_concurrent_jobs=1
     assert len(fake.submitted_names) == 2
-    assert all(name.startswith("gpfit-cmod-") for name in fake.submitted_names)
+    assert all(name.startswith("gpfit-cmod-") and name.endswith("-a1") for name in fake.submitted_names)
     # Outputs were pulled back into local staging
     assert len(list((tmp_path / "staging" / "batches").glob("batch_*_out.npz"))) == 2
 
 
 def test_dispatcher_failed_batch_returns_none(tmp_path, monkeypatch):
     failed_bid = batch_id("cmod", [3])
-    dispatcher, _ = _make_dispatcher(tmp_path, monkeypatch, fail_batch_ids={failed_bid})
+    dispatcher, fake = _make_dispatcher(tmp_path, monkeypatch, fail_batch_ids={failed_bid}, max_retries=0)
     inputs = {s: _synthetic_input(s) for s in (1, 2, 3)}
 
     results = dispatcher.run(inputs, X_STAR, min_points=1, scale_per_slice=False)
@@ -382,6 +450,8 @@ def test_dispatcher_failed_batch_returns_none(tmp_path, monkeypatch):
     assert isinstance(results[1], ShotFitOutput)
     assert isinstance(results[2], ShotFitOutput)
     assert results[3] is None
+    # max_retries=0: the failed batch was submitted exactly once
+    assert len([n for n in fake.submitted_names if failed_bid in n]) == 1
 
 
 def test_dispatcher_reuses_local_outputs_without_jobs(tmp_path, monkeypatch):
@@ -407,13 +477,174 @@ def test_dispatcher_clean_cancels_jobs_and_removes_batches(tmp_path, monkeypatch
     assert len(list(fake.remote_dir.glob("batch_*.npz"))) > 0
 
     # A stale job for this device should be cancelled; another device's job left alone
-    fake._queued = {"gpfit-cmod-stale00000": 555, "gpfit-mast-other000000": 777}
+    fake._queued = {"gpfit-cmod-stale00000-a1": 555, "gpfit-mast-other000000-a1": 777}
 
     dispatcher.clean()
 
     assert fake.cancelled_ids == [555]
     assert list(batches_dir.glob("batch_*.npz")) == []
     assert list(fake.remote_dir.glob("batch_*.npz")) == []
+
+
+# ----------------------------------------------------------------------
+# Retry, partition fallback, and reconciliation
+# ----------------------------------------------------------------------
+def test_parse_partition_specs():
+    specs = parse_partition_specs("p1@8:00:00,p2@1-00:00:00@rocky8")
+    assert specs == [
+        PartitionSpec(name="p1", time_limit="8:00:00"),
+        PartitionSpec(name="p2", time_limit="1-00:00:00", constraint="rocky8"),
+    ]
+    # Fire may pre-split a comma-separated argument into a tuple
+    assert parse_partition_specs(("p1@8:00:00", "p2@1:00:00")) == parse_partition_specs("p1@8:00:00,p2@1:00:00")
+    with pytest.raises(ValueError):
+        parse_partition_specs("p1")
+    with pytest.raises(ValueError):
+        parse_partition_specs("p1@1:00:00@rocky8@extra")
+
+
+def test_cluster_fit_config_parses_partitions():
+    config = ClusterFitConfig(profile="fake", partitions="p1@1:00:00,p2@2:00:00@rocky8", remote_workdir="/r", venv_path="/v")
+    assert config.partitions == [
+        PartitionSpec(name="p1", time_limit="1:00:00"),
+        PartitionSpec(name="p2", time_limit="2:00:00", constraint="rocky8"),
+    ]
+    # An already-parsed list passes through untouched
+    specs = [PartitionSpec(name="p1", time_limit="1:00:00")]
+    config = ClusterFitConfig(profile="fake", partitions=specs, remote_workdir="/r", venv_path="/v")
+    assert config.partitions == specs
+    with pytest.raises(ValueError):
+        ClusterFitConfig(profile="fake", partitions="p1", remote_workdir="/r", venv_path="/v")
+
+
+def test_dispatcher_retries_failed_batch_on_next_partition(tmp_path, monkeypatch):
+    bid = batch_id("cmod", [1, 2])
+    dispatcher, fake = _make_dispatcher(
+        tmp_path,
+        monkeypatch,
+        fail_first_attempts={bid: 1},
+        partitions="p1@1:00:00,p2@2:00:00@rocky8",
+    )
+    inputs = {s: _synthetic_input(s) for s in (1, 2)}
+
+    results = dispatcher.run(inputs, X_STAR, min_points=1, scale_per_slice=False)
+
+    assert all(isinstance(out, ShotFitOutput) for out in results.values())
+    assert [name.rsplit("-", 1)[-1] for name, _, _ in fake.submissions] == ["a1", "a2"]
+    # First attempt on p1 (no constraint), retry lands on p2 with its constraint
+    assert fake.submissions[0][1:] == ("p1", None)
+    assert fake.submissions[1][1:] == ("p2", "rocky8")
+
+
+def test_dispatcher_retry_exhaustion_wraps_partitions(tmp_path, monkeypatch):
+    bid = batch_id("cmod", [1, 2])
+    dispatcher, fake = _make_dispatcher(
+        tmp_path,
+        monkeypatch,
+        fail_batch_ids={bid},
+        partitions="p1@1:00:00,p2@2:00:00",
+        max_retries=3,
+    )
+    inputs = {s: _synthetic_input(s) for s in (1, 2)}
+
+    results = dispatcher.run(inputs, X_STAR, min_points=1, scale_per_slice=False)
+
+    assert results[1] is None and results[2] is None
+    # 1 initial + 3 retries, wrapping around the partition list
+    assert [partition for _, partition, _ in fake.submissions] == ["p1", "p2", "p1", "p2"]
+
+
+def test_dispatcher_pending_timeout_falls_back(tmp_path, monkeypatch):
+    dispatcher, fake = _make_dispatcher(
+        tmp_path,
+        monkeypatch,
+        pending_partitions={"stuck"},
+        partitions="stuck@1:00:00,ok@2:00:00",
+        pending_timeout_s=0.0,
+    )
+    inputs = {s: _synthetic_input(s) for s in (1, 2)}
+
+    results = dispatcher.run(inputs, X_STAR, min_points=1, scale_per_slice=False)
+
+    assert all(isinstance(out, ShotFitOutput) for out in results.values())
+    assert len(fake.cancelled_ids) == 1
+    assert [partition for _, partition, _ in fake.submissions] == ["stuck", "ok"]
+
+
+def test_dispatcher_single_partition_never_cancels_pending(tmp_path, monkeypatch):
+    dispatcher, fake = _make_dispatcher(
+        tmp_path,
+        monkeypatch,
+        pending_partitions={"stuck"},
+        release_pending_after=3,
+        partitions="stuck@1:00:00",
+        pending_timeout_s=0.0,
+    )
+    inputs = {s: _synthetic_input(s) for s in (1, 2)}
+
+    results = dispatcher.run(inputs, X_STAR, min_points=1, scale_per_slice=False)
+
+    assert all(isinstance(out, ShotFitOutput) for out in results.values())
+    assert fake.cancelled_ids == []
+    assert len(fake.submitted_names) == 1
+
+
+def test_dispatcher_adopts_suffixed_job_on_restart(tmp_path, monkeypatch):
+    bid = batch_id("cmod", [1, 2])
+    dispatcher, fake = _make_dispatcher(
+        tmp_path,
+        monkeypatch,
+        release_pending_after=1,
+    )
+    # A previous run left attempt 2 in the queue (plus a stale attempt 1);
+    # once polled, the pending job completes and writes its output.
+    fake._queued = {f"gpfit-cmod-{bid}-a1": 444, f"gpfit-cmod-{bid}-a2": 555}
+    fake._states = {444: "PENDING", 555: "PENDING"}
+    staging_input = tmp_path / "staging" / "batches" / f"batch_{bid}.npz"
+    fake._job_paths = {
+        444: (staging_input, fake.remote_dir / f"batch_{bid}_out.npz"),
+        555: (staging_input, fake.remote_dir / f"batch_{bid}_out.npz"),
+    }
+    inputs = {s: _synthetic_input(s) for s in (1, 2)}
+
+    results = dispatcher.run(inputs, X_STAR, min_points=1, scale_per_slice=False)
+
+    assert all(isinstance(out, ShotFitOutput) for out in results.values())
+    # Adopted the highest attempt instead of resubmitting, cancelled the stale one
+    assert fake.submitted_names == []
+    assert fake.cancelled_ids == [444]
+
+
+def test_run_summary_lists_failed_shots(tmp_path):
+    batches = [
+        _BatchState(
+            bid="aaaa",
+            shots=[1, 2],
+            input_path=tmp_path / "batch_aaaa.npz",
+            output_path=tmp_path / "batch_aaaa_out.npz",
+            job_base_name="gpfit-cmod-aaaa",
+            attempt=3,
+            failed=True,
+            fail_reason="job 42 ended in state TIMEOUT",
+        ),
+        _BatchState(
+            bid="bbbb",
+            shots=[3],
+            input_path=tmp_path / "batch_bbbb.npz",
+            output_path=tmp_path / "batch_bbbb_out.npz",
+            job_base_name="gpfit-cmod-bbbb",
+            attempt=1,
+            done=True,
+        ),
+    ]
+    results = {1: None, 2: None, 3: ShotFitOutput(*[np.zeros((1, 1))] * 10)}
+
+    summary = ClusterFitDispatcher._run_summary(batches, results)
+
+    assert "3 shots requested, 1 fitted, 2 FAILED" in summary
+    assert "TIMEOUT" in summary
+    assert "1, 2" in summary
+    assert "bbbb" not in summary
 
 
 @pytest.mark.slow

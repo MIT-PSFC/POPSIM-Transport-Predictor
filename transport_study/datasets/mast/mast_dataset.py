@@ -944,13 +944,18 @@ class MASTDataWorkflow(DataWorkflow):
 
     # ------------------------------------------------------------------
     def device_specific_processing(self, ds: xr.Dataset) -> xr.Dataset:
-        """Clip unphysical GP-fitted profile values and fill ne20_edge from profile."""
-        # Clamp to non-negative, consistent with the C-Mod workflow (raw files made
-        # before the fit-time clamp was added can still contain negative values)
-        if "ne20_rho" in ds:
-            ds["ne20_rho"] = ds["ne20_rho"].clip(min=0)
-        if "Te_keV_rho" in ds:
-            ds["Te_keV_rho"] = ds["Te_keV_rho"].clip(min=0)
+        """Cull bad GP-fitted profiles and fill ne20_edge from profile."""
+        # NaN out timeslices where the fit went negative inside rho < 1.0
+        if "ne20_rho" in ds and "Te_keV_rho" in ds:
+            negative_profile_mask = (ds["ne20_rho"].where(ds["rho"] < 1.0) < 0).any(dim="rho") | (
+                ds["Te_keV_rho"].where(ds["rho"] < 1.0) < 0
+            ).any(dim="rho")
+            n_culled = negative_profile_mask.sum().item()
+            if n_culled > 0:
+                shot_id = ds["shot"].item() if "shot" in ds else "unknown"
+                logger.info(f"Shot {shot_id}: culling {n_culled} timeslices with negative profile fits")
+            ds["ne20_rho"] = ds["ne20_rho"].where(~negative_profile_mask)
+            ds["Te_keV_rho"] = ds["Te_keV_rho"].where(~negative_profile_mask)
 
         if "ne20_edge" in ds and "ne20_rho" in ds and "rho" in ds["ne20_rho"].dims:
             ne_edge_from_profile = ds["ne20_rho"].sel(rho=0.9, method="nearest")

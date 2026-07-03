@@ -561,6 +561,10 @@ class CModDataWorkflow(DataWorkflow):
         profiles are not skipped), fitting is dispatched to the cluster via
         make_raw_data_files_distributed() instead.
         """
+        if self.skip_profiles:
+            logger.warning("skip_profiles=True: raw files will contain ZERO profiles - do not use for production datasets")
+        if DEBUG:
+            logger.warning("PTPS_DEBUG is set: in-process GP fitting truncates to 21 slices per shot - do not use for production datasets")
         if self.cluster_config is not None and not self.skip_profiles:
             self.make_raw_data_files_distributed()
             return
