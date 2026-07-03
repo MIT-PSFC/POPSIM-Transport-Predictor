@@ -388,9 +388,9 @@ class _FakeBackend:
         self.cancelled_ids.append(job_id)
         self._states[job_id] = "CANCELLED"
 
-    def remove_files(self, remote_paths: list[str]) -> None:
-        for p in remote_paths:
-            (self.remote_dir / Path(p).name).unlink(missing_ok=True)
+    def remove_glob(self, remote_dir: str, pattern: str) -> None:
+        for p in self.remote_dir.glob(pattern):
+            p.unlink(missing_ok=True)
 
 
 def _make_dispatcher(
@@ -483,6 +483,23 @@ def test_dispatcher_clean_cancels_jobs_and_removes_batches(tmp_path, monkeypatch
 
     assert fake.cancelled_ids == [555]
     assert list(batches_dir.glob("batch_*.npz")) == []
+    assert list(fake.remote_dir.glob("batch_*.npz")) == []
+
+
+def test_dispatcher_clean_removes_orphaned_remote_outputs(tmp_path, monkeypatch):
+    """Remote batch files with no local counterpart must not survive clean.
+
+    Regression: clean used to derive the remote deletion list from the local
+    batch files, so a stale remote output (e.g. from a run whose staging was
+    already wiped) survived and was adopted as pre-existing results by the
+    next run, silently reusing old fits.
+    """
+    dispatcher, fake = _make_dispatcher(tmp_path, monkeypatch)
+    (fake.remote_dir / "batch_deadbeef00_out.npz").write_bytes(b"stale")
+    assert list((tmp_path / "staging" / "batches").glob("batch_*.npz")) == []
+
+    dispatcher.clean()
+
     assert list(fake.remote_dir.glob("batch_*.npz")) == []
 
 

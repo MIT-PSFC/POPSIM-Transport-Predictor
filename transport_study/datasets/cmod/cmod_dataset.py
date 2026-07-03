@@ -7,10 +7,7 @@ import netCDF4  # noqa: F401
 import numpy as np
 import xarray as xr
 from disruption_py.machine.tokamak import Tokamak
-from disruption_py.settings import (
-    LogSettings,
-    RetrievalSettings,
-)
+from disruption_py.settings import RetrievalSettings
 from disruption_py.settings.output_setting import DatasetOutputSetting
 from disruption_py.workflow import get_shots_data
 from dynaconf import Dynaconf
@@ -22,7 +19,7 @@ from transport_study.datasets import make_uniform_1khz_timebase
 from transport_study.datasets.cmod import (
     CMOD_DATASET_SIGNALS,
 )
-from transport_study.datasets.dispy_utils import summary
+from transport_study.datasets.dispy_utils import passive_log_settings, summary
 from transport_study.datasets.gp_fitting.fit_worker import (
     ShotFitInput,
     ShotFitOutput,
@@ -188,7 +185,7 @@ class CModDataWorkflow(DataWorkflow):
             shotlist_setting=[shot],
             retrieval_settings=retrieval_settings,
             output_setting=DatasetOutputSetting(path=False),
-            log_settings=LogSettings(file_path=None),
+            log_settings=passive_log_settings(),
             num_processes=1,
         )
         if len(result) == 0:
@@ -544,7 +541,7 @@ class CModDataWorkflow(DataWorkflow):
             shotlist_setting=shot,
             retrieval_settings=retrieval_settings,
             output_setting=DatasetOutputSetting(path=False),
-            log_settings=LogSettings(file_path=None),
+            log_settings=passive_log_settings(),
             num_processes=1,
         )
         result = result.set_index(idx=["shot", "time"]).unstack("idx")

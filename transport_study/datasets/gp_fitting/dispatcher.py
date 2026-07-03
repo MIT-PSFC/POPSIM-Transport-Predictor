@@ -307,14 +307,11 @@ class _SSHBackend:
     def cancel(self, job_id: int) -> None:
         self._client.cancel(job_id)
 
-    def remove_files(self, remote_paths: list[str]) -> None:
-        """Delete remote files via a single ssh rm, reusing the rsync client's SSH options."""
-        if not remote_paths:
-            return
-        quoted = " ".join(shlex.quote(p) for p in remote_paths)
-        result = self._rsync._ssh_run(f"rm -f -- {quoted}")
+    def remove_glob(self, remote_dir: str, pattern: str) -> None:
+        """Delete remote files matching pattern via ssh (the remote shell expands the glob)."""
+        result = self._rsync._ssh_run(f"rm -f -- {shlex.quote(remote_dir)}/{pattern}")
         if result.returncode != 0:
-            logger.warning(f"Failed to remove remote files {remote_paths}: {result.stderr.strip()}")
+            raise RuntimeError(f"Failed to remove remote files {remote_dir}/{pattern}: {result.stderr.strip()}")
 
 
 class _LocalBackend:
@@ -370,9 +367,9 @@ class _LocalBackend:
     def cancel(self, job_id: int) -> None:
         self._client.cancel(job_id)
 
-    def remove_files(self, remote_paths: list[str]) -> None:
-        for p in remote_paths:
-            Path(p).unlink(missing_ok=True)
+    def remove_glob(self, remote_dir: str, pattern: str) -> None:
+        for p in Path(remote_dir).glob(pattern):
+            p.unlink(missing_ok=True)
 
 
 @dataclass
@@ -509,9 +506,12 @@ class ClusterFitDispatcher:
             except Exception as e:
                 logger.warning(f"Clean: failed to cancel job {name} (id {job_id}): {e}")
 
-        local_batches = sorted(self.batches_dir.glob("batch_*.npz"))
-        remote_paths = [f"{self.config.remote_workdir}/{p.name}" for p in local_batches]
-        self.backend.remove_files(remote_paths)
+        # Remove by remote glob, not by mirroring the local batch listing:
+        # remote files with no local counterpart (e.g. outputs from a run
+        # whose staging was already cleaned) would otherwise survive and be
+        # adopted as pre-existing results by the next run. Raises on failure
+        # so a clean that did not actually clean stops the run.
+        self.backend.remove_glob(self.config.remote_workdir, "batch_*.npz")
         if self.batches_dir.exists():
             shutil.rmtree(self.batches_dir)
         self.batches_dir.mkdir(parents=True, exist_ok=True)

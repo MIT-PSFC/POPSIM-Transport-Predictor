@@ -6,10 +6,7 @@ import netCDF4  # noqa: F401
 import numpy as np
 import xarray as xr
 from disruption_py.machine.tokamak import Tokamak
-from disruption_py.settings import (
-    LogSettings,
-    RetrievalSettings,
-)
+from disruption_py.settings import RetrievalSettings
 from disruption_py.settings.output_setting import DatasetOutputSetting
 from disruption_py.workflow import get_shots_data
 from dynaconf import Dynaconf
@@ -23,7 +20,7 @@ from transport_study.datasets.d3d.utils import (
     compare_efits,
     disruption_efit,
 )
-from transport_study.datasets.dispy_utils import summary
+from transport_study.datasets.dispy_utils import passive_log_settings, summary
 from transport_study.datasets.workflow import DataWorkflow
 
 INNER_WALL = 1.05  # Location of the inner wall, used to calculate minor radius from gapin and R0
@@ -455,7 +452,7 @@ class D3DDataWorkflow(DataWorkflow):
             shotlist_setting=shot,
             retrieval_settings=retrieval_settings,
             output_setting=DatasetOutputSetting(path=False),
-            log_settings=LogSettings(file_path=None),
+            log_settings=passive_log_settings(),
             num_processes=1,
         )
         efit_result = efit_result.set_index(idx=["shot", "time"]).unstack("idx")
@@ -551,7 +548,7 @@ class D3DDataWorkflow(DataWorkflow):
             shotlist_setting=shot,
             retrieval_settings=retrieval_settings,
             output_setting=DatasetOutputSetting(path=False),
-            log_settings=LogSettings(file_path=None),
+            log_settings=passive_log_settings(),
             num_processes=1,
         )
         ds = profile_result[["te_rho", "ne_rho"]].rename(
