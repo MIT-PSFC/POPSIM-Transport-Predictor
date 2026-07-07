@@ -918,11 +918,13 @@ class MASTDataWorkflow(DataWorkflow):
             "time",
         }
 
-        present = kept_vars & set(ds.data_vars)
-        missing_critical = {"Te_keV_rho", "ne20_rho", "Ip_MA", "Wtot_MJ"} - present
-        if missing_critical:
+        # Every shot must provide the full variable set: a shot with missing variables
+        # (e.g. a stale raw file from an older pipeline version) cannot be appended to
+        # the zarr store without corrupting it, so exclude it here instead.
+        missing = kept_vars - set(ds.data_vars)
+        if missing:
             shot_id = ds["shot"].item() if "shot" in ds else "unknown"
-            logger.warning(f"Shot {shot_id}: missing critical signals {missing_critical}")
+            logger.warning(f"Shot {shot_id}: missing expected variables {sorted(missing)}, excluding (stale raw file?)")
             return None
 
         for signal in ["Te_keV_rho", "ne20_rho", "Ip_MA"]:
@@ -931,7 +933,7 @@ class MASTDataWorkflow(DataWorkflow):
                 logger.warning(f"Shot {shot_id}: {signal} is all NaN, skipping")
                 return None
 
-        ds = ds[list(present)]
+        ds = ds[list(kept_vars)]
 
         if TIME_DIM not in ds.dims:
             ds = ds.rename_dims({"time": TIME_DIM})
