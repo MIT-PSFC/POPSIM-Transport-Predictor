@@ -6,3 +6,6 @@ transport_study/datasets/sample/cmod_recent.nc filter=lfs diff=lfs merge=lfs -te
 transport_study/datasets/sample/cmod-high.nc filter=lfs diff=lfs merge=lfs -text
 transport_study/datasets/sample/cmod-low1.nc filter=lfs diff=lfs merge=lfs -text
 transport_study/datasets/sample/cmod-low2.nc filter=lfs diff=lfs merge=lfs -text
+transport_study/datasets/sample/mast-high.nc filter=lfs diff=lfs merge=lfs -text
+transport_study/datasets/sample/mast-low1.nc filter=lfs diff=lfs merge=lfs -text
+transport_study/datasets/sample/mast-low2.nc filter=lfs diff=lfs merge=lfs -text
