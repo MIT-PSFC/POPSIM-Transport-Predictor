@@ -167,14 +167,12 @@ def test_config_save_load_with_dataset_weights():
             working_dir_base=Path(tmpdir) / "working_dir_base",
             training_datasets=("exnihilo", "cmod-low"),
             target_test_set_size=60,
-            dataset_sizes={"cmod-low": 1000, "cmod-high": 500},
             dataset_fractions={"cmod-low": 0.25, "cmod-high": 0.75},
         )
         save_path = Path(tmpdir) / "config.toml"
         cfg.save(save_path)
 
         loaded_cfg = ProfileStudy.Config.from_toml(save_path)
-        assert loaded_cfg.dataset_sizes == cfg.dataset_sizes
         assert loaded_cfg.dataset_fractions == cfg.dataset_fractions
         assert cfg == loaded_cfg
 
@@ -202,7 +200,6 @@ def test_study_cmod_to_cmod_no_tuning():
             "exnihilo",
             "cmod-low",
         ],
-        dataset_sizes={"cmod-low": 100, "cmod-high": 100},
         domain_adaptation_methods=[None, "mixing", "transfer"],
         num_target_shots_options=[0, 1, -1],
         target_test_set_size=60,
@@ -299,7 +296,6 @@ def test_study_cmod_to_mast():
             "exnihilo",
             "cmod-low_cmod-high",
         ],
-        dataset_sizes={"cmod-low": 100, "cmod-high": 100, "mast": 41},
         domain_adaptation_methods=[None, "mixing", "transfer"],
         num_target_shots_options=[0, 1, -1],
         target_test_set_size=20,

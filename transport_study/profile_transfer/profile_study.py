@@ -24,6 +24,7 @@ from transport_study.modules.profile_predictor.train_configs import (
 from transport_study.orchestration.organize_data import (
     PROFILE_TARGET_VARS,
     TrainingData,
+    get_loaded_shot_count,
 )
 from transport_study.orchestration.study import Study
 from transport_study.profile_transfer.data_visualization import DataVisualization
@@ -67,9 +68,6 @@ class ProfileStudy(Study):
         hyperparam_freeze_shapes: bool = True
         hyperparam_num_target_shots: int = HYPERPARAM_TARGET_SHOTS
         # Misc configurations
-        dataset_sizes: dict[str, int] = Field(
-            default_factory=dict
-        )  # Optional dict of dataset sizes to use for weighting during domain adaptation, only used if domain_adaptation includes "mixing"
         dataset_fractions: dict[str, float] = Field(
             default_factory=dict
         )  # Optional dict of dataset fractions to use during domain adaptation, only used if domain_adaptation includes "mixing".
@@ -130,7 +128,7 @@ class ProfileStudy(Study):
             3: target device must be the same
             4: target test set size must be the same
             5: hyperparameter tuning configs must match
-            6: Dataset sizes and weights must match
+            6: Dataset fractions must match
             """
             return (
                 self.study_name == cfg.study_name
@@ -140,7 +138,6 @@ class ProfileStudy(Study):
                 and self.hyperparam_domain_adaptation == cfg.hyperparam_domain_adaptation
                 and self.hyperparam_freeze_shapes == cfg.hyperparam_freeze_shapes
                 and self.hyperparam_num_target_shots == cfg.hyperparam_num_target_shots
-                and self.dataset_sizes == cfg.dataset_sizes
                 and self.dataset_fractions == cfg.dataset_fractions
             )
 
@@ -441,52 +438,49 @@ class ProfileStudy(Study):
     def _make_mixing_device_weights(case: Case) -> dict[str, float]:
         """Loss weights per device for mixing domain adaptation.
 
-        Weights are chosen so that each device's effective contribution
-        F_x = W_x * N_x (where N_x is the shot count). Typically the target
-        device is weighted most heavily.
+        Mirrors the actual training-set composition of get_train_test_datasets:
+        every loaded shot of each source device in case.training_data (the
+        historic train and val splits are both concatenated into the mixing
+        training set) plus case.num_target_shots target shots. Shot counts come
+        from get_loaded_shot_count, so max_ds_size truncation and study-type
+        filtering are accounted for.
+
+        Weights are chosen so that each device's effective contribution to the
+        loss is F_x = W_x * N_x (N_x the device's shot count in the training
+        set, F_x its configured fraction). Typically the target device is
+        weighted most heavily. Weights are scaled so the mean per-sample weight
+        over the training set is 1, keeping the loss magnitude comparable
+        across cases.
         """
-        if not config.dataset_sizes:
-            logger.warning(
-                "Dataset sizes not provided in config, reading from disk. This will be slow, consider adding dataset sizes to the config."
-            )
-            dataset_sizes = {}
-            for device, path in config.dataset_paths.items():
-                ds = xr.open_dataset(path)
-                dataset_sizes[device] = len(ds.shot)
-                ds.close()
-        else:
-            dataset_sizes = config.dataset_sizes
+        target = config.target_device
 
-        if not config.dataset_fractions:
+        # Shot counts as the training set actually sees them
+        shot_counts = {source: get_loaded_shot_count(source) for source in case.training_data.sources}
+        if case.num_target_shots == -1:
+            # All loaded target shots end up in training (CHEATING reference case)
+            shot_counts[target] = get_loaded_shot_count(target)
+        elif case.num_target_shots > 0:
+            shot_counts[target] = case.num_target_shots
+        # num_target_shots == 0: no target samples in training, so the target
+        # device gets no weight entry and the sources split the full budget
+
+        if config.dataset_fractions:
+            dataset_fractions = {device: config.dataset_fractions[device] for device in shot_counts}
+        else:
             logger.info("Dataset fractions not provided in config. Using 50% for target and dividing remaining 50% evenly among sources.")
-            dataset_fractions = {}
-            num_sources = len(config.dataset_paths) - 1
-            dataset_fractions[config.target_device] = 0.5
-            for device in config.dataset_paths:
-                if device != config.target_device:
-                    dataset_fractions[device] = 0.5 / num_sources
-        else:
-            dataset_fractions = config.dataset_fractions
+            num_sources = len(case.training_data.sources)
+            dataset_fractions = {device: 0.5 if device == target else 0.5 / num_sources for device in shot_counts}
 
-        if case.num_target_shots in [-1, 0]:
-            # If -1, all target shots are being included
-            # If 0, weights aren't being used anyway
-            N_target = dataset_sizes[config.target_device]
-        else:
-            N_target = case.num_target_shots
-
-        avg_size = sum(dataset_sizes.values()) / len(dataset_sizes)
+        # Renormalize over the devices actually present in this case's training
+        # set (configured fractions may cover devices this case does not use)
+        total_fraction = sum(dataset_fractions.values())
+        total_shots = sum(shot_counts.values())
         dataset_weights = {}
-        for device in config.dataset_paths.keys():
-            if device == config.target_device:
-                N_x = N_target
-            else:
-                N_x = dataset_sizes[device]
-            F_x = dataset_fractions[device]
-            W_x = F_x / N_x
-            # Dividing by number of shots can make the weight very small, problematic for loss function
-            # Multiply by avg_size so weights go back to around 1
-            dataset_weights[device] = W_x * avg_size
+        for device, N_x in shot_counts.items():
+            F_x = dataset_fractions[device] / total_fraction
+            # Scale by total_shots so sum(W_x * N_x) == total_shots, i.e. the
+            # mean per-sample weight is exactly 1
+            dataset_weights[device] = F_x / N_x * total_shots
 
         return dataset_weights
 

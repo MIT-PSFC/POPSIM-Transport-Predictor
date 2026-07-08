@@ -608,6 +608,19 @@ def get_train_val_datasets(
     return train_ds, val_ds
 
 
+def get_loaded_shot_count(source_ds: str, study_type: str = "profile_transfer") -> int:
+    """Episode count get_ds actually yields for this device.
+
+    This is the shot count the training set really sees, after max_ds_size
+    truncation and study-type filtering (e.g. dropping shots without fresh
+    profiles), unlike the raw on-disk shot count. Requires loading the dataset
+    from disk, so it is not free, but it is only needed once per device when
+    building a train config.
+    """
+    ds, episode_coord = get_ds(source_ds, study_type)
+    return int(ds.sizes[episode_coord])
+
+
 def get_train_test_datasets(
     training_data: "TrainingData",
     domain_adaptation: str,
