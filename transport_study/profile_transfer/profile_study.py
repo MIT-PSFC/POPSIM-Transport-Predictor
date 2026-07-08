@@ -1042,6 +1042,9 @@ def run_study(
         config = ProfileStudy.Config.from_toml(Path(config))
     study = ProfileStudy(config)
     study.setup_directories(
+        enable_parallelism=enable_parallelism,
+        skip_tuning=skip_tuning,
+        skip_visualization=skip_visualization,
         clean_sweeps=clean_sweeps,
         clean_models=clean_models,
         clean_results=clean_results,
