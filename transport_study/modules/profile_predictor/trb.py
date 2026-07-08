@@ -142,22 +142,25 @@ class ProfilePredictorTRB(TrainRunBuilder):
             )
 
             # PCA/K-means initial guess for the shapes.
-            ds = train_dl.ds
-            sample_dim = train_dl.dataset.training_metadata.sample_dim
+            # Skipped when restoring from a transfer checkpoint, which overwrites the
+            # shapes anyway and whose fine-tune dataset may have fewer samples than shapes.
+            if not model_init_config.get("transfer_checkpoint", False):
+                ds = train_dl.ds
+                sample_dim = train_dl.dataset.training_metadata.sample_dim
 
-            if shape_type == ShapeType.PCA_LIKE:
-                te_shapes, ne_shapes = pca_initial_guess(n_shapes, ds[te_shape_var], ds[ne_shape_var], sample_dim)
-            elif shape_type == ShapeType.CONVEX_COMBINATION:
-                te_shapes, ne_shapes = kmeans_initial_guess(n_shapes, ds[te_shape_var], ds[ne_shape_var], sample_dim)
-            else:
-                raise ValueError(f"Invalid shape type: {shape_type}")
+                if shape_type == ShapeType.PCA_LIKE:
+                    te_shapes, ne_shapes = pca_initial_guess(n_shapes, ds[te_shape_var], ds[ne_shape_var], sample_dim)
+                elif shape_type == ShapeType.CONVEX_COMBINATION:
+                    te_shapes, ne_shapes = kmeans_initial_guess(n_shapes, ds[te_shape_var], ds[ne_shape_var], sample_dim)
+                else:
+                    raise ValueError(f"Invalid shape type: {shape_type}")
 
-            # Overwrite the initial shapes in the module with the initial guess.
-            module = eqx.tree_at(
-                lambda m: (m.te_shapes, m.ne_shapes),
-                module,
-                (te_shapes, ne_shapes),
-            )
+                # Overwrite the initial shapes in the module with the initial guess.
+                module = eqx.tree_at(
+                    lambda m: (m.te_shapes, m.ne_shapes),
+                    module,
+                    (te_shapes, ne_shapes),
+                )
         elif model_init_config["model_type"] == "unstructured_nn":
             module = ProfilePredictorUnstructuredNN(
                 n_points=model_init_config["n_points"],

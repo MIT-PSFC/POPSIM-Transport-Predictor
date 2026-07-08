@@ -8,6 +8,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import xarray as xr
 from jaxtyping import Array
+from loguru import logger
 from popsim import TimeIndepModule
 from popsim.basis import Basis1DProtocol, BSplineBasis, InterpedLinearBasis
 from popsim.cfspopcon_jax.current_drive import calc_f_shaping, calc_q_star
@@ -226,39 +227,57 @@ def kmeans_initial_guess(
     te_data = te_data.transpose(sample_dim, ...)
     ne_data = ne_data.transpose(sample_dim, ...)
 
-    te_kmeans = KMeans(n_clusters=n_shapes, random_state=seed).fit(te_data.values)
+    # Small datasets (e.g. exnihilo with 1 target shot) may have fewer samples than shapes
+    n_clusters = min(n_shapes, te_data.sizes[sample_dim])
+    if n_clusters < n_shapes:
+        logger.warning(
+            f"Only {te_data.sizes[sample_dim]} samples available for {n_shapes} k-means shapes, clustering into {n_clusters} and repeating centers"
+        )
 
-    ne_kmeans = KMeans(n_clusters=n_shapes, random_state=seed).fit(ne_data.values)
+    te_kmeans = KMeans(n_clusters=n_clusters, random_state=seed).fit(te_data.values)
 
-    te_shapes = [ProfileShape.make_points(points=te_kmeans.cluster_centers_[i], grid=te_data.rho.values) for i in range(n_shapes)]
-    ne_shapes = [ProfileShape.make_points(points=ne_kmeans.cluster_centers_[i], grid=ne_data.rho.values) for i in range(n_shapes)]
+    ne_kmeans = KMeans(n_clusters=n_clusters, random_state=seed).fit(ne_data.values)
+
+    te_shapes = [
+        ProfileShape.make_points(points=te_kmeans.cluster_centers_[i % n_clusters], grid=te_data.rho.values) for i in range(n_shapes)
+    ]
+    ne_shapes = [
+        ProfileShape.make_points(points=ne_kmeans.cluster_centers_[i % n_clusters], grid=ne_data.rho.values) for i in range(n_shapes)
+    ]
     return te_shapes, ne_shapes
 
 
 def pca_initial_guess(n_shapes: int, te_data: xr.DataArray, ne_data: xr.DataArray, sample_dim: str):
     from xeofs.single import EOF
 
-    te_eof = EOF(n_modes=n_shapes)
+    # Small datasets (e.g. exnihilo with 1 target shot) may have fewer samples than shapes
+    n_modes = min(n_shapes, te_data.sizes[sample_dim])
+    if n_modes < n_shapes:
+        logger.warning(
+            f"Only {te_data.sizes[sample_dim]} samples available for {n_shapes} PCA shapes, fitting {n_modes} modes and repeating them"
+        )
+
+    te_eof = EOF(n_modes=n_modes)
     te_eof.fit(te_data, dim=sample_dim)
     te_components = te_eof.components()
     te_shapes = [
         ProfileShape.make_points(
-            points=te_components.sel(mode=i).values,
+            points=te_components.sel(mode=te_components.mode.values[i % n_modes]).values,
             grid=te_data.rho.values,
             normalize=False,
         )
-        for i in te_components.mode.values
+        for i in range(n_shapes)
     ]
-    ne_eof = EOF(n_modes=n_shapes)
+    ne_eof = EOF(n_modes=n_modes)
     ne_eof.fit(ne_data, dim=sample_dim)
     ne_components = ne_eof.components()
     ne_shapes = [
         ProfileShape.make_points(
-            points=ne_components.sel(mode=i).values,
+            points=ne_components.sel(mode=ne_components.mode.values[i % n_modes]).values,
             grid=ne_data.rho.values,
             normalize=False,
         )
-        for i in ne_components.mode.values
+        for i in range(n_shapes)
     ]
     return te_shapes, ne_shapes
 
