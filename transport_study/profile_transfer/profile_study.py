@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import time
 import tomllib
 from dataclasses import dataclass
@@ -16,7 +17,7 @@ from popsim.ml import TrainConfig
 from pydantic import Field, field_validator, model_validator
 
 from transport_study import PACKAGE_ROOT, TIME_DIM
-from transport_study.config import StudyConfig, config, load_config
+from transport_study.config import StudyConfig, _env_dataset_paths, config, load_config
 from transport_study.modules.profile_predictor.train_configs import (
     PROFILE_PREDICTOR_TORAX_CONFIGS,
 )
@@ -51,7 +52,9 @@ class ProfileStudy(Study):
     ##################
     class Config(StudyConfig):
         # Organization for datasets and wandb projects
-        working_dir_base: Path = PACKAGE_ROOT / "popsim_studies" / "working_dir"
+        working_dir_base: Path = Field(
+            default_factory=lambda: Path(os.environ.get("PTPS_WORKING_DIR_BASE", str(PACKAGE_ROOT / "popsim_studies" / "working_dir")))
+        )
         # The different cases being compared in this study
         model_types: tuple[str, ...] = Field(default_factory=lambda: ("shape_init_pca", "shape_init_kmeans", "unstructured_nn"))
         training_datasets: tuple[TrainingData, ...]
@@ -95,7 +98,9 @@ class ProfileStudy(Study):
         def _coerce_training_datasets(cls, data) -> dict:
             if "training_datasets" not in data:
                 return data
-            dataset_paths = dict(data.get("dataset_paths", {}))
+            # Field defaults aren't applied yet in a before-validator, so when
+            # dataset_paths isn't passed explicitly, mirror its default_factory
+            dataset_paths = dict(data.get("dataset_paths") or _env_dataset_paths())
             target_device = data.get("target_device")
             data["training_datasets"] = tuple(
                 _parse_training_data(s, dataset_paths, target_device) if isinstance(s, str) else s for s in data["training_datasets"]
@@ -109,10 +114,11 @@ class ProfileStudy(Study):
             datasets = data.pop("datasets", {})
             target = datasets.pop("target", None)
             study_cases = data.pop("study_cases", {})
+            # PTPS_DATASET_PATHS env var provides defaults, explicit TOML paths win
             return cls(
                 **data,
                 **study_cases,
-                dataset_paths={k: Path(v) for k, v in datasets.items()},
+                dataset_paths=_env_dataset_paths() | {k: Path(v) for k, v in datasets.items()},
                 target_device=target,
             )
 
@@ -165,6 +171,10 @@ class ProfileStudy(Study):
         cfg: str | Path | ProfileStudy.Config,
     ):
         if not config.initialized:
+            # load_config(Path) only knows how to build the base StudyConfig,
+            # which forbids this study's extra fields, so parse with the subclass
+            if isinstance(cfg, (str, Path)):
+                cfg = self.Config.from_toml(Path(cfg))
             load_config(cfg)
 
         cases = self.make_cases(
@@ -1026,6 +1036,10 @@ def run_study(
     # Initialize study and Set up directories #
     ###########################################
 
+    # Parse with the concrete Config subclass so the local `config` name holds a
+    # real config object (it shadows the module-level proxy below)
+    if isinstance(config, (str, Path)):
+        config = ProfileStudy.Config.from_toml(Path(config))
     study = ProfileStudy(config)
     study.setup_directories(
         clean_sweeps=clean_sweeps,

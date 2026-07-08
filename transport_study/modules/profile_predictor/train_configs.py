@@ -201,8 +201,8 @@ _PROFILE_PREDICTOR_TORAX_CONFIG_BASE: dict[str, Any] = {
 def make_profile_predictor_torax_config(transport_model: str) -> dict:
     """Train config for the torax profile predictor with the given transport model.
 
-    transport_model is one of "constant", "cgm", "gyrobohm"; the corresponding
-    model_type is "torax-<transport_model>".
+    transport_model is one of "constant", "cgm", "gyrobohm"
+    the corresponding model_type is "torax-<transport_model>".
     """
     if transport_model not in TORAX_TRANSPORT_BLOCKS:
         raise ValueError(f"Unknown transport model '{transport_model}', valid: {sorted(TORAX_TRANSPORT_BLOCKS)}")

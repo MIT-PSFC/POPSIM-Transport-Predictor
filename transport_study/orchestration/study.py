@@ -385,7 +385,8 @@ class Study:
     ):
         """
         Initialize this study with the given name and cases.
-        Dataset paths are read from env vars (PTPS_DS_*) via DatasetConfig.
+        Dataset paths come from the global config's dataset_paths
+        (TOML [datasets] table, with the PTPS_DATASET_PATHS JSON env var as defaults).
         """
         self.name = name
         self.cases = cases

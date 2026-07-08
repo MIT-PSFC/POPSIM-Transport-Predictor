@@ -3,6 +3,7 @@ Load and parse configuration files for the project.
 This is where we set global variables from env vars or config files
 """
 
+import json
 import os
 import tomllib
 from pathlib import Path
@@ -19,11 +20,18 @@ TRAIN_VAL_SPLIT = (0.8, 0.2)
 TRAIN_VAL_TEST_SPLIT = (0.64, 0.16, 0.2)
 
 
+def _env_dataset_paths() -> dict[str, Path]:
+    """Parse PTPS_DATASET_PATHS, a JSON dict of device -> dataset path,
+    e.g. PTPS_DATASET_PATHS='{"cmod": "/path/to/ds.zarr"}' -> {"cmod": Path(...)}
+    """
+    return {k: Path(v) for k, v in json.loads(os.environ.get("PTPS_DATASET_PATHS", "{}")).items()}
+
+
 # Main config for environment variables
 class StudyConfig(BaseModel):
     # Shared between all studies
     study_name: str
-    dataset_paths: dict[str, Path] = {}
+    dataset_paths: dict[str, Path] = Field(default_factory=_env_dataset_paths)
     target_device: str
 
     # Debugging and dev stuff
@@ -53,14 +61,16 @@ class StudyConfig(BaseModel):
         return self
 
     @classmethod
-    def from_toml(cls, path: Path) -> "StudyConfig":
+    def from_toml(cls, path: Path | str) -> "StudyConfig":
+        path = Path(path)
         with open(path, "rb") as f:
             data = tomllib.load(f)
         datasets = data.pop("datasets", {})
         target = datasets.pop("target", None)
+        # Env vars provide defaults, explicit TOML paths win
         return cls(
             **data,
-            dataset_paths={k: Path(v) for k, v in datasets.items()},
+            dataset_paths=_env_dataset_paths() | {k: Path(v) for k, v in datasets.items()},
             target_device=target,
         )
 
@@ -128,12 +138,12 @@ class _ConfigProxy:
 config = _ConfigProxy()
 
 
-def load_config(cfg: "StudyConfig | Path") -> "StudyConfig":
+def load_config(cfg: "StudyConfig | Path | str") -> "StudyConfig":
     """Load study config from a StudyConfig object or a path to a TOML file."""
     if _ConfigProxy.initialized:
         raise RuntimeError("Config already loaded. Multiple calls to load_config() are not allowed.")
     _ConfigProxy.initialized = True
-    if isinstance(cfg, Path):
+    if isinstance(cfg, (Path, str)):
         cfg = StudyConfig.from_toml(cfg)
     _ConfigProxy._cfg = cfg
     return cfg
