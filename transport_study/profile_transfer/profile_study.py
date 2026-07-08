@@ -20,7 +20,10 @@ from transport_study.config import StudyConfig, config, load_config
 from transport_study.modules.profile_predictor.train_configs import (
     PROFILE_PREDICTOR_TORAX_CONFIGS,
 )
-from transport_study.orchestration.organize_data import TrainingData
+from transport_study.orchestration.organize_data import (
+    PROFILE_TARGET_VARS,
+    TrainingData,
+)
 from transport_study.orchestration.study import Study
 from transport_study.profile_transfer.data_visualization import DataVisualization
 
@@ -482,7 +485,9 @@ class ProfileStudy(Study):
         If a hyperparameter tuned config is available, fills in the hyperparameters from that, otherwise uses default config.
         """
         dataloader_config_base = {
-            "target_vars": ["Te_keV_rho", "ne20_rho", "ds_source_idx"],
+            # Profiles plus their gradient / error-bar companions, the loss
+            # uses the error bars as an epsilon-insensitive deadband
+            "target_vars": [*PROFILE_TARGET_VARS, "ds_source_idx"],
             "training_data": case.training_data,
             "domain_adaptation": case.domain_adaptation,
             "num_target_shots": case.num_target_shots,
@@ -505,6 +510,10 @@ class ProfileStudy(Study):
             # normalized value scale over rho in [0, 1], so they get their own delta.
             "gradient_weight": 0.1,
             "huber_delta_grad": 1.0,
+            # Residual inside the GP-fit error bar is down-weighted by this
+            # factor: predictions are still pulled toward the fit mean, but
+            # landing within the error bars costs much less than missing them
+            "within_error_weight": 0.25,
         }
         optimizer_config_base = {
             "lr0": 1e-4,

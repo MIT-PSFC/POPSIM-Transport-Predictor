@@ -58,10 +58,23 @@ REQUIRED_SIGNALS_POWER_BALANCE = [
 ]
 INPUT_POWER_SIGNALS = ["P_ECRH_MW", "P_NBI_MW", "P_ICRF_MW", "P_LH_MW"]
 
+# Profile channels that carry GP-fit gradient and error-bar companions.
+# For each base signal <v> the companions are <v>_grad, <v>_error and
+# <v>_grad_error. An error of 0 is the sentinel for "no rigorous error
+# quantification", the loss treats it as a zero-width error bar
+PROFILE_BASE_SIGNALS = ["Te_keV_rho", "ne20_rho"]
+PROFILE_GRAD_SIGNALS = [f"{v}_grad" for v in PROFILE_BASE_SIGNALS]
+PROFILE_ERROR_SIGNALS = [f"{v}_error" for v in PROFILE_BASE_SIGNALS] + [f"{v}_grad_error" for v in PROFILE_BASE_SIGNALS]
+
+# Everything the profile-predictor loss reads from the target side:
+# the profiles themselves plus their gradients and error-bars
+PROFILE_TARGET_VARS = [*PROFILE_BASE_SIGNALS, *PROFILE_GRAD_SIGNALS, *PROFILE_ERROR_SIGNALS]
+
 REQUIRED_SIGNALS_PROFILE_TRANSFER = [
     # Target-related
-    "Te_keV_rho",
-    "ne20_rho",
+    *PROFILE_BASE_SIGNALS,
+    *PROFILE_GRAD_SIGNALS,
+    *PROFILE_ERROR_SIGNALS,
     "fresh_profiles",  # Needed so we only train on time points where the profile data is fresh, avoiding forward-filled.
     # Inputs
     "Ip_MA",
@@ -141,6 +154,15 @@ def get_ds(
     ds = ds.isel({EPISODE_DIM: slice(0, config.max_ds_size)})
 
     def _profile_transfer(ds: xr.Dataset) -> xr.Dataset:
+        # Missing gradients fall back to finite differences of the values,
+        # missing errors get the 0 sentinel (no rigorous error quantification)
+        for base in PROFILE_BASE_SIGNALS:
+            if f"{base}_grad" not in ds:
+                ds[f"{base}_grad"] = ds[base].differentiate("rho")
+            for err in (f"{base}_error", f"{base}_grad_error"):
+                if err not in ds:
+                    ds[err] = xr.zeros_like(ds[base])
+
         ds = ds[REQUIRED_SIGNALS_PROFILE_TRANSFER]
 
         # Only keep fresh profiles for training
@@ -150,11 +172,14 @@ def get_ds(
         rho_grid = np.linspace(0, 1, 51)
         ds = ds.interp(rho=rho_grid, kwargs={"fill_value": "extrapolate"})
 
-        # Compute means and shapes.
-        ds["Te_keV_line_avg"] = ds["Te_keV_rho"].integrate("rho")
-        ds["ne20_line_avg"] = ds["ne20_rho"].integrate("rho")
-        ds["Te_shape"] = ds["Te_keV_rho"] / ds["Te_keV_line_avg"]
-        ds["ne_shape"] = ds["ne20_rho"] / ds["ne20_line_avg"]
+        # Linear extrapolation at the grid edges can push error bars slightly
+        # negative, error bars are widths so clamp them
+        for err_sig in PROFILE_ERROR_SIGNALS:
+            ds[err_sig] = ds[err_sig].clip(min=0.0)
+
+        # Compute means and shapes
+        ds["Te_shape"] = ds["Te_keV_rho"] / ds["Te_keV_rho"].integrate("rho")
+        ds["ne_shape"] = ds["ne20_rho"] / ds["ne20_rho"].integrate("rho")
         return ds
 
     def _power_balance(ds: xr.Dataset) -> xr.Dataset:

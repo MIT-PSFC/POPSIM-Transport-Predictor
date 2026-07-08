@@ -7,6 +7,7 @@ from transport_study.config import StudyConfig, load_config
 from transport_study.modules.profile_predictor.train_configs import (
     PROFILE_PREDICTOR_TORAX_CONFIGS,
 )
+from transport_study.orchestration.organize_data import PROFILE_TARGET_VARS
 
 
 @pytest.mark.parametrize("transport_model", ["constant", "cgm", "gyrobohm"])
@@ -37,7 +38,7 @@ def test_torax_predictor(transport_model):
             "dataloader_config": {
                 **train_config.dataloader_config,
                 "training_data": training_data,
-                "target_vars": ["Te_keV_rho", "ne20_rho", "ds_source_idx"],
+                "target_vars": [*PROFILE_TARGET_VARS, "ds_source_idx"],
                 "batch_size": 512,
             },
         }

@@ -210,6 +210,16 @@ class ProfilePredictorTRB(TrainRunBuilder):
     # of a fixed absolute offset in mismatched units
     REL_ERROR_FLOOR_FRAC = 0.1
 
+    # Gradient loss only applies for rho below this. Beyond it the GP fits
+    # are extrapolating into the pedestal / scrape-off layer where the
+    # measured gradients are unreliable, so they should not steer training
+    GRAD_LOSS_RHO_MAX = 0.9
+
+    # Default down-weighting of the residual inside the measurement error bar
+    # The prediction is still pulled toward the GP fit mean inside the bar,
+    # just this much less hard than outside it (loss_config key "within_error_weight")
+    WITHIN_ERROR_WEIGHT = 0.25
+
     @staticmethod
     def _make_profile_loss_fn(loss_config: dict, use_huber: bool) -> Callable[[Any, Any], jnp.ndarray]:
         """Shared builder for the training and validation losses.
@@ -220,6 +230,18 @@ class ProfilePredictorTRB(TrainRunBuilder):
         ~0.5-4 in 1e20 m^-3, Te up to ~8 keV on C-Mod but ~1 on TCV) so neither
         channel nor device dominates, and an error of 0.1 always means 10% of
         the profile peak.
+
+        Measurement error bars (<v>_error / <v>_grad_error target vars, from
+        the GP profile fits) soften the residual: the part of the residual
+        inside the error bar is down-weighted by within_error_weight, the part
+        beyond it is penalized at full weight. The prediction is therefore
+        still pulled toward the GP fit mean everywhere, but landing inside the
+        error bars costs significantly less than missing them. An error of 0
+        is the sentinel for "no rigorous error quantification" and gives a
+        zero-width bar, which reduces to the plain residual loss.
+        When the error / gradient target vars are absent entirely the
+        loss falls back to zero-width error bars and finite-difference
+        gradient targets.
 
         use_huber=True builds the training loss with the swept huber_delta /
         huber_delta_grad (deltas read as fractional errors on the normalized
@@ -238,6 +260,9 @@ class ProfilePredictorTRB(TrainRunBuilder):
         # depend on dTe/drho and dne/drho rather than the values themselves.
         gradient_weight = loss_config.get("gradient_weight", 0.0)
 
+        # Down-weighting of the residual inside the measurement error bar
+        within_error_weight = loss_config.get("within_error_weight", ProfilePredictorTRB.WITHIN_ERROR_WEIGHT)
+
         if use_huber:
             # Normalized gradients are still larger than normalized values
             # (a peak-normalized pedestal can have d/drho of order 10), so the
@@ -245,17 +270,37 @@ class ProfilePredictorTRB(TrainRunBuilder):
             huber_delta = loss_config["huber_delta"]
             huber_delta_grad = loss_config.get("huber_delta_grad", 1.0)
 
-            def value_err(pred, targ):
-                return optax.huber_loss(pred, targ, delta=huber_delta)
+            def value_err(excess):
+                return optax.huber_loss(excess, delta=huber_delta)
 
-            def grad_err(pred, targ):
-                return optax.huber_loss(pred, targ, delta=huber_delta_grad)
+            def grad_err(excess):
+                return optax.huber_loss(excess, delta=huber_delta_grad)
         else:
 
-            def value_err(pred, targ):
-                return jnp.abs(pred - targ)
+            def value_err(excess):
+                return excess
 
             grad_err = value_err
+
+        def _error_softened_residual(pred, targ, sigma):
+            # Piecewise-linear shrink of the residual: full weight on the part
+            # beyond the error bar, within_error_weight on the part inside it.
+            # Continuous and monotone in |residual|, so the pull toward the GP
+            # fit mean never vanishes, it just weakens inside the bar. sigma is
+            # clamped at 0 so a degenerate negative error bar cannot inflate
+            # the residual
+            abs_residual = jnp.abs(pred - targ)
+            sigma = jnp.maximum(sigma, 0.0)
+            outside = jnp.maximum(abs_residual - sigma, 0.0)
+            inside = jnp.minimum(abs_residual, sigma)
+            return outside + within_error_weight * inside
+
+        def _sigma_from_targ(targ, var, scale):
+            # Error-bar target var, normalized like the profiles. Missing var
+            # (older configs / tests) is the same as the 0 sentinel
+            if var in targ:
+                return targ[var].data / scale
+            return 0.0
 
         def loss_fn(pred, targ):
             ne_targ = targ["ne20_rho"].data
@@ -268,8 +313,11 @@ class ProfilePredictorTRB(TrainRunBuilder):
             ne_scale = jnp.maximum(jnp.max(jnp.abs(ne_targ), axis=-1, keepdims=True), floor)
             te_scale = jnp.maximum(jnp.max(jnp.abs(te_targ), axis=-1, keepdims=True), floor)
 
-            ne_err = value_err(pred.ne.data / ne_scale, ne_targ / ne_scale)
-            te_err = value_err(pred.te.data / te_scale, te_targ / te_scale)
+            ne_sigma = _sigma_from_targ(targ, "ne20_rho_error", ne_scale)
+            te_sigma = _sigma_from_targ(targ, "Te_keV_rho_error", te_scale)
+
+            ne_err = value_err(_error_softened_residual(pred.ne.data / ne_scale, ne_targ / ne_scale, ne_sigma))
+            te_err = value_err(_error_softened_residual(pred.te.data / te_scale, te_targ / te_scale, te_sigma))
 
             # Build per-sample device weight
             ds_source_idx = targ["ds_source_idx"].data
@@ -292,22 +340,49 @@ class ProfilePredictorTRB(TrainRunBuilder):
             loss = ne_rho_loss + te_rho_loss
 
             if gradient_weight > 0.0:
-                # Finite-difference gradients of the normalized profiles at the
-                # rho midpoints (robust to non-uniform grids, no jnp.gradient
-                # spacing support needed)
+                # Finite-difference gradients of the normalized predictions at
+                # the rho midpoints (robust to non-uniform grids, no
+                # jnp.gradient spacing support needed)
                 d_rho = jnp.diff(rho)
                 rho_mid = 0.5 * (rho[:-1] + rho[1:])
 
                 ne_grad_pred = jnp.diff(pred.ne.data / ne_scale, axis=-1) / d_rho
-                ne_grad_targ = jnp.diff(ne_targ / ne_scale, axis=-1) / d_rho
                 te_grad_pred = jnp.diff(pred.te.data / te_scale, axis=-1) / d_rho
-                te_grad_targ = jnp.diff(te_targ / te_scale, axis=-1) / d_rho
 
-                ne_grad_err = sample_weights * grad_err(ne_grad_pred, ne_grad_targ)
-                te_grad_err = sample_weights * grad_err(te_grad_pred, te_grad_targ)
+                def _to_mid(arr):
+                    # Grid-point signal averaged to the rho midpoints, matching
+                    # the finite-difference prediction gradients
+                    return 0.5 * (arr[..., :-1] + arr[..., 1:])
 
-                ne_grad_loss = jnp.trapezoid(ne_grad_err, x=rho_mid)
-                te_grad_loss = jnp.trapezoid(te_grad_err, x=rho_mid)
+                # Gradient targets come from the GP-fit gradient signals when
+                # present (measured slope, smoother than differencing the
+                # values), otherwise fall back to finite differences of the
+                # value targets
+                if "ne20_rho_grad" in targ:
+                    ne_grad_targ = _to_mid(targ["ne20_rho_grad"].data) / ne_scale
+                else:
+                    ne_grad_targ = jnp.diff(ne_targ / ne_scale, axis=-1) / d_rho
+                if "Te_keV_rho_grad" in targ:
+                    te_grad_targ = _to_mid(targ["Te_keV_rho_grad"].data) / te_scale
+                else:
+                    te_grad_targ = jnp.diff(te_targ / te_scale, axis=-1) / d_rho
+
+                ne_grad_sigma = _sigma_from_targ(targ, "ne20_rho_grad_error", ne_scale)
+                te_grad_sigma = _sigma_from_targ(targ, "Te_keV_rho_grad_error", te_scale)
+                if not isinstance(ne_grad_sigma, float):
+                    ne_grad_sigma = _to_mid(ne_grad_sigma)
+                if not isinstance(te_grad_sigma, float):
+                    te_grad_sigma = _to_mid(te_grad_sigma)
+
+                ne_grad_err = sample_weights * grad_err(_error_softened_residual(ne_grad_pred, ne_grad_targ, ne_grad_sigma))
+                te_grad_err = sample_weights * grad_err(_error_softened_residual(te_grad_pred, te_grad_targ, te_grad_sigma))
+
+                # Gradient loss only counts for rho below GRAD_LOSS_RHO_MAX,
+                # the measured gradients beyond it are unreliable
+                grad_rho_mask = rho_mid < ProfilePredictorTRB.GRAD_LOSS_RHO_MAX
+
+                ne_grad_loss = jnp.trapezoid(grad_rho_mask * ne_grad_err, x=rho_mid)
+                te_grad_loss = jnp.trapezoid(grad_rho_mask * te_grad_err, x=rho_mid)
 
                 loss = loss + gradient_weight * (ne_grad_loss + te_grad_loss)
 

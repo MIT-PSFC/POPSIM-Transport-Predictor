@@ -7,6 +7,7 @@ from transport_study.modules.profile_predictor.module import (
 from transport_study.modules.profile_predictor.trb import (
     ProfilePredictorTRB,
 )
+from transport_study.orchestration.organize_data import PROFILE_TARGET_VARS
 
 PROFILE_PREDICTOR_SHAPE_INIT_CONFIG = {
     "project": "profile_predictor_shape_init",
@@ -26,7 +27,7 @@ PROFILE_PREDICTOR_SHAPE_INIT_CONFIG = {
             "delta_top",
             "delta_bot",
         ],
-        "target_vars": ["ne20_rho", "Te_keV_rho"],
+        "target_vars": [*PROFILE_TARGET_VARS, "ds_source_idx"],
         "extra_vars": ["Te_shape", "ne_shape"],
     },
     "model_init_config": {
@@ -112,7 +113,7 @@ _PROFILE_PREDICTOR_TORAX_CONFIG_BASE: dict[str, Any] = {
             "delta_top",
             "delta_bot",
         ],
-        "target_vars": ["ne20_rho", "Te_keV_rho"],
+        "target_vars": [*PROFILE_TARGET_VARS, "ds_source_idx"],
     },
     "model_init_config": {
         "model_type": "torax-cgm",  # Overridden per transport model by the builder below
@@ -234,7 +235,7 @@ PROFILE_PREDICTOR_DIRECT_POINTS_CONFIG = {
             "delta_top",
             "delta_bot",
         ],
-        "target_vars": ["ne20_rho", "Te_keV_rho"],
+        "target_vars": [*PROFILE_TARGET_VARS, "ds_source_idx"],
     },
     "model_init_config": {
         "model_type": "direct_points",
