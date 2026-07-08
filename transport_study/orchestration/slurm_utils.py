@@ -1,4 +1,5 @@
 import getpass
+import inspect
 import re
 import subprocess
 import sys
@@ -10,6 +11,26 @@ from loguru import logger
 from popsim.ml import TrainConfig
 
 from transport_study.config import config
+
+
+def _importable_module(cls: type) -> str:
+    """Return a dotted module path a subprocess can import ``cls`` from.
+
+    When the study is launched as a script (e.g. ``python .../profile_study.py``)
+    the entry-point module is ``__main__``, so ``cls.__module__`` is ``"__main__"``
+    and a subprocess cannot ``from __main__ import ...``. Recover the real dotted
+    module by walking up the source-file path while ``__init__.py`` exists.
+    """
+    module = cls.__module__
+    if module != "__main__":
+        return module
+    file = Path(inspect.getfile(cls)).resolve()
+    parts = [file.stem]
+    parent = file.parent
+    while (parent / "__init__.py").exists():
+        parts.append(parent.name)
+        parent = parent.parent
+    return ".".join(reversed(parts))
 
 
 def _config_reload_script(study_config_path: Path) -> str:
@@ -32,7 +53,7 @@ def _config_reload_script(study_config_path: Path) -> str:
     cls = config.get_subclass()
     top_name = cls.__qualname__.split(".")[0]
     code_str = (
-        f"from {cls.__module__} import {top_name}\n"
+        f"from {_importable_module(cls)} import {top_name}\n"
         "from transport_study.config import load_config\n"
         f"study_config = {cls.__qualname__}.from_toml(Path({str(study_config_path)!r}))\n"
         "load_config(study_config)\n"
