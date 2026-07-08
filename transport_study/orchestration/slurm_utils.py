@@ -218,7 +218,7 @@ Path({str(study_config_path)!r}).unlink()
 #SBATCH --job-name={job_name}
 #SBATCH --partition={partition}
 #SBATCH --gres=gpu:1
-#SBATCH --mem=250G
+#SBATCH --mem=120G
 #SBATCH --cpus-per-task=4
 #SBATCH --export=ALL
 #SBATCH --exclude=node2301,node2101
@@ -378,7 +378,7 @@ if not trajopt.output_path(case).exists():
 #SBATCH --job-name={job_name}
 #SBATCH --partition={config.partition}
 #SBATCH --gres=gpu:1
-#SBATCH --mem=250G
+#SBATCH --mem=120G
 #SBATCH --cpus-per-task=4
 #SBATCH --export=ALL
 #SBATCH --exclude=node2301,node2101
