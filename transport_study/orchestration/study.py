@@ -69,6 +69,18 @@ class Study:
         """Given a case, return the path where the results for that case should be stored."""
         return Path(self.result_dir) / str(case) / "result_data.nc"
 
+    def latest_checkpoint_epoch(self, case: Case) -> int | None:
+        """Highest epoch saved in the case's latest-checkpoint (resume) directory, or None if empty.
+
+        Orbax names each checkpoint directory after its step (here the epoch).
+        In-progress saves get a non-numeric tmp suffix and are skipped.
+        """
+        latest_dir = Path(f"{self.trained_model_dir(case)}_latest")
+        if not latest_dir.exists():
+            return None
+        epochs = [int(p.name) for p in latest_dir.iterdir() if p.is_dir() and p.name.isdigit()]
+        return max(epochs, default=None)
+
     def collected_results_path(self) -> Path:
         """Return the path where the collected results for all cases should be stored."""
         return Path(self.result_dir) / "collected_results.nc"
@@ -272,8 +284,18 @@ class Study:
     def launch_sweep(self, case: Case, enable_parallelism: bool = False):
         """Launch a wandb hyperparameter sweep for the given case."""
         train_config = self.make_train_config(case)
-        # Remove the test_eval_suite_config since that's for final results only
-        train_config = train_config.model_copy(update={"test_eval_suite_config": None})
+        # Remove the test_eval_suite_config since that's for final results only.
+        # Trials get the same wall-clock budget as production jobs, making the
+        # sweep an anytime comparison: best val loss reachable within one job.
+        # Resume stays off, a trial is a fresh sample of its hyperparameters.
+        train_config = train_config.model_copy(
+            update={
+                "test_eval_suite_config": None,
+                "max_epochs": min(config.max_epochs, config.hyperparam_max_epochs),
+                "resume": False,
+                "max_wall_seconds": float(config.train_wall_budget_s),
+            }
+        )
         wandb_project_name = self.wandb_project_name(case)
         sweep_id = get_sweep_id(wandb_project_name)
         kwargs_agent = {"count": 1}  # One training run per agent
@@ -309,8 +331,16 @@ class Study:
 
         # Only reached when no result file exists and no job for this case is
         # running (see _no_blocking_jobs), so every call is a fresh (re)launch.
-        # More than MAX_TRAIN_ATTEMPTS launches means the case fails every time
+        # More than MAX_TRAIN_ATTEMPTS launches means the case fails every time.
+        # Exception: a relaunch whose latest checkpoint advanced since the last
+        # launch is a resume of a wall-clock-limited job making real progress,
+        # so the attempt counter resets rather than counting toward the cap
         attempts = self.train_attempts.get(str(case), 0)
+        latest_epoch = self.latest_checkpoint_epoch(case)
+        prev_epoch = self.train_attempt_epochs.get(str(case))
+        if latest_epoch is not None and (prev_epoch is None or latest_epoch > prev_epoch):
+            attempts = 0
+        self.train_attempt_epochs[str(case)] = latest_epoch
         if attempts >= MAX_TRAIN_ATTEMPTS:
             train_log_path = Path(self.result_dir) / "logs" / f"{self.train_job_name(case)}.log"
             summary = (
@@ -328,6 +358,15 @@ class Study:
         logger.opt(colors=True).info(f"<bold><red>LAUNCHING TRAINING for case\n{case}</red></bold>")
 
         train_config = self.make_train_config(case)
+        # Real training runs resume from the latest checkpoint if one exists and
+        # stop cleanly at the wall-clock budget so the next launch can continue.
+        # Sweep trials get neither (see launch_sweep)
+        train_config = train_config.model_copy(
+            update={
+                "resume": True,
+                "max_wall_seconds": float(config.train_wall_budget_s),
+            }
+        )
         result_path = self.result_path(case)
         if enable_parallelism:
             train_job_name = self.train_job_name(case)
@@ -341,6 +380,9 @@ class Study:
         else:
             logger.info("Launching training serially")
             _, _, _, _, result_dict = launch_train(train_config)
+            if result_dict is None:
+                logger.info("Training stopped at the wall-clock budget before finishing, relaunch to resume from the latest checkpoint.")
+                return
             ds = result_dict["test/study_results"]
             result_path.parent.mkdir(parents=True, exist_ok=True)
             ds.to_netcdf(result_path)
@@ -392,6 +434,9 @@ class Study:
         self.cases = cases
         # Launch counter per case (str(case) -> count) backing MAX_TRAIN_ATTEMPTS
         self.train_attempts: dict[str, int] = {}
+        # Latest-checkpoint epoch per case as of its last launch. A relaunch whose
+        # checkpoint advanced past this is a resume making progress, not a failure
+        self.train_attempt_epochs: dict[str, int | None] = {}
 
         self.working_dir = Path(working_dir_base) / name
         self.model_dir = self.working_dir / "models"

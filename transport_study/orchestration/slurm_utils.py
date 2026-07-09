@@ -201,9 +201,15 @@ with open({config_path!r}) as f:
     train_config = TrainConfig(**yaml.safe_load(f))
 
 _, _, _, _, result_dict = launch_train(train_config)
-ds = result_dict["test/study_results"]
-Path({str(result_path)!r}).parent.mkdir(parents=True, exist_ok=True)
-ds.to_netcdf({str(result_path)!r})
+if result_dict is None:
+    # Trainer hit its wall-clock budget and saved the latest checkpoint. Exit
+    # cleanly with no result file, the orchestrator resubmits and the next job
+    # resumes from that checkpoint.
+    print("Training stopped at the wall-clock budget before finishing, resubmitted job will resume.")
+else:
+    ds = result_dict["test/study_results"]
+    Path({str(result_path)!r}).parent.mkdir(parents=True, exist_ok=True)
+    ds.to_netcdf({str(result_path)!r})
 Path({str(config_path)!r}).unlink()
 Path({str(study_config_path)!r}).unlink()
 """
@@ -217,6 +223,7 @@ Path({str(study_config_path)!r}).unlink()
 #!/bin/bash
 #SBATCH --job-name={job_name}
 #SBATCH --partition={partition}
+#SBATCH --time={config.train_time_limit}
 #SBATCH --gres=gpu:1
 #SBATCH --mem=120G
 #SBATCH --cpus-per-task=4
@@ -309,6 +316,7 @@ Path({str(study_config_path)!r}).unlink()
 #!/bin/bash
 #SBATCH --job-name={job_name}
 #SBATCH --partition={partition}
+#SBATCH --time={config.train_time_limit}
 #SBATCH --gres=gpu:1
 #SBATCH --mem=120G
 #SBATCH --cpus-per-task=4

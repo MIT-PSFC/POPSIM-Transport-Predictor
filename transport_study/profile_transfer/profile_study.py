@@ -499,7 +499,7 @@ class ProfileStudy(Study):
             "prng_seed": 42,
             "debug": config.debug,
             # Hyperparameters
-            "batch_size": 8192,
+            "batch_size": 2048,
         }
         loss_config_base = {
             # The loss runs on peak-normalized profiles (target scaled to max 1),
@@ -684,11 +684,7 @@ class ProfileStudy(Study):
                             "delta_bot",
                         ],
                         **dataloader_config_base,
-                        # Each sample in a batch runs a differentiated multi-step
-                        # TORAX simulation under vmap, so activation memory scales
-                        # linearly with batch size (~11 MB/sample observed)
-                        # 1024 keeps it near ~11 GB with headroom on an A100
-                        "batch_size": 1024,
+                        "batch_size": 2048,
                     },
                     model_init_config={
                         "model_type": case.model_type,

@@ -142,10 +142,12 @@ _PROFILE_PREDICTOR_TORAX_CONFIG_BASE: dict[str, Any] = {
                 "t_initial": 0.0,
                 "t_final": 0.1,  # Give it ~100 ms to relax, on order of energy confinement time
                 # Linear theta solver is implicit / unconditionally stable, so we
-                # can take large fixed steps to reach steady state cheaply. 10ms
-                # dt -> 10 steps to cover t_final, vs ~30-100 with chi-based dt.
-                "fixed_dt": 1e-2,
+                # can take large fixed steps to reach steady state cheaply
+                "fixed_dt": 2e-2,
                 "min_dt": 1e-3,
+                # dt never changes with the fixed time-step calculator, so the
+                # adaptive retry loop is pure overhead (1.4x, bit-identical results)
+                "adaptive_dt": False,
                 "evolve_ion_heat": True,
                 "evolve_electron_heat": True,
                 "evolve_current": True,
@@ -178,6 +180,12 @@ _PROFILE_PREDICTOR_TORAX_CONFIG_BASE: dict[str, Any] = {
                 # constant model.
                 "use_pereverzev": True,
                 "use_predictor_corrector": True,
+                # Picard iterations run n_corrector_steps + 1 times with no early exit.
+                # TORAX default of 10 is overkill at 10ms dt, but the 20ms
+                # dt above needs headroom: benchmarked on the cgm base case,
+                # 8 matched baseline val loss per epoch at 3.2x overall speedup,
+                # while 4 was 5.3x but converged to visibly worse loss per epoch.
+                "n_corrector_steps": 8,
             },
             "time_step_calculator": {"calculator_type": "fixed"},
             "neoclassical": {},

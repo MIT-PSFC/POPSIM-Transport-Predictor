@@ -9,24 +9,13 @@ early_terminate:
 parameters:
   model_init_config:
     parameters:
-      reservoir_size:
-        values: [64, 128, 256, 512]
-      spectral_radius:
-        distribution: uniform
-        min: 0.5
-        max: 1.2
-      input_scaling:
-        distribution: log_uniform_values
-        min: 0.05
-        max: 2.0
-      leak_rate:
-        distribution: uniform
-        min: 0.2
-        max: 1.0
-      n_steps:
-        values: [5, 10, 20, 40]
-      n_points:
-        values: [21, 31, 41, 51]
+      # Width and depth are shared by the three coefficient MLPs
+      # (transport, sources, edge). Kept small, each sample already runs a
+      # full differentiated TORAX simulation.
+      nn_width:
+        values: [8, 16, 24, 32]
+      nn_depth:
+        values: [1, 2, 3]
   optimizer_config:
     parameters:
       lr0:
@@ -53,6 +42,9 @@ parameters:
         distribution: uniform
         min: 0.5
         max: 0.999
+      # Activation memory scales linearly with batch size because every sample
+      # runs a differentiated multi-step TORAX simulation under vmap. No
+      # full-batch option for that reason.
       batch_size:
         values: 2048
   loss_config:

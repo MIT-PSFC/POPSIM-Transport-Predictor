@@ -42,9 +42,19 @@ class StudyConfig(BaseModel):
     max_epochs: int = 1000
     epochs_per_val: int = 20
     patience: int = 4  # epochs_per_val * patience = max epochs without improvement before stopping
+    # Epoch cap for hyperparameter sweep trials
+    # Trials are wall-clock limited to train_wall_budget_s and stop early via patience
+    # Matching max_epochs keeps tuned LR schedules consistent between sweep and final training runs
+    hyperparam_max_epochs: int = 1000
 
     # Environment-specific orchestration settings
     partition: str | None = Field(default_factory=lambda: os.environ.get("PTPS_PARTITION"))
+    # SLURM walltime request for training and agent jobs, sbatch --time format
+    train_time_limit: str = Field(default_factory=lambda: os.environ.get("PTPS_TRAIN_TIME_LIMIT", "07:59:59"))
+    # In-job wall-clock training budget in seconds. Set below the SLURM limit so the
+    # trainer can save the latest checkpoint and exit cleanly, then a resubmitted job
+    # resumes from that checkpoint. 27000 s = 7.5 h
+    train_wall_budget_s: int = Field(default_factory=lambda: int(os.environ.get("PTPS_TRAIN_WALL_BUDGET_S", "27000")))
     buffer_gpus: int | None = Field(default_factory=lambda: int(os.environ.get("PTPS_BUFFER_GPUS", "12")))
     wandb_entity: str | None = Field(default_factory=lambda: os.environ.get("PTPS_WANDB_ENTITY"))
     scratch_dir: Path | None = (
