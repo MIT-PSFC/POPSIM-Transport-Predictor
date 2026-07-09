@@ -160,7 +160,7 @@ _PROFILE_PREDICTOR_TORAX_CONFIG_BASE: dict[str, Any] = {
             "geometry": {
                 "geometry_type": "circular",
                 "R_major": 9999,  # Overridden by dataloader input
-                "a_minor": 9999,  # Overridden by dataloader input
+                "a_minor": 3000,  # Overridden by dataloader input (must be less than R_major)
                 "B_0": 9999,  # Overridden by dataloader input
                 "elongation_LCFS": 9999,  # Overridden by dataloader input
             },
