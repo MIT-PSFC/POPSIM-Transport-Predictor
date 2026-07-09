@@ -43,7 +43,7 @@ def _parse_training_data(s: str, dataset_paths: dict, target_device: str | None)
     """Convert a string like 'cmod_tcv' or 'exnihilo' to a TrainingData object."""
     if s == "exnihilo":
         non_target = set(dataset_paths.keys()) - ({target_device} if target_device else set())
-        return TrainingData(sources_unsorted=non_target, exnihilo=True)
+        return TrainingData(sources_unsorted=sorted(non_target), exnihilo=True)
     return TrainingData(sources_unsorted=s.split("_"))
 
 

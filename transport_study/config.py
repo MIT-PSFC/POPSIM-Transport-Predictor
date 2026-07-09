@@ -12,7 +12,7 @@ from types import MappingProxyType
 import jax
 import toml
 from loguru import logger
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_serializer, model_validator
 
 # 80/20 between train/val
 # 80/20 between train+val/test
@@ -69,6 +69,12 @@ class StudyConfig(BaseModel):
     def _freeze_paths(self):
         object.__setattr__(self, "dataset_paths", MappingProxyType(self.dataset_paths))
         return self
+
+    # dataset_paths is stored as a MappingProxyType for immutability, but the field is typed
+    # dict[str, Path], so tell the serializer to emit a plain dict and avoid a Pydantic warning
+    @field_serializer("dataset_paths")
+    def _serialize_dataset_paths(self, v):
+        return dict(v)
 
     @classmethod
     def from_toml(cls, path: Path | str) -> "StudyConfig":
