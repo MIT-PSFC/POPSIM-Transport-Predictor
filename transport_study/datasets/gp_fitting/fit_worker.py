@@ -287,6 +287,72 @@ def _remove_local_outliers(data_X, data_y, err_y, sigma_neighbor=2.0, sigma_loca
     return x[keep], y[keep], e[keep]
 
 
+# Nonphysical-fit detection and repair. Te and ne fall monotonically from the
+# core, so a fitted slice that peaks off-axis is suspect. Two triggers:
+#   Edge bump: the fit at rho >= _EDGE_RHO exceeds everything interior to it by
+#     more than _EDGE_MARGIN. The margin keeps flat profiles whose global max
+#     lands in the edge region by noise (a zero-margin rule culled those). This
+#     fires whether or not the scatter supports the bump: a data-supported edge
+#     bump above the whole interior means miscalibrated edge channels (C-Mod
+#     edge-vs-core TS cross-calibration blocks), and the repair drops them.
+#   Data overshoot: the fit off-axis (rho >= _CORE_RHO) exceeds the local
+#     scatter envelope (_data_envelope) by more than _ENVELOPE_MARGIN - the GP
+#     ringing above its own data (e.g. a 14 keV spike off a 5 keV stray point).
+#     The core is exempt because the fit legitimately extrapolates above the
+#     innermost channel toward the axis. Data-supported off-axis humps (hollow
+#     ramp-up ne) pass: real physics, not an artifact.
+# A flagged slice is repaired by refitting without the channels under the peak
+# (see _fit_variable); it is culled only if the refit is still flagged.
+_EDGE_RHO = 0.9
+_CORE_RHO = 0.4
+_EDGE_MARGIN = 1.1
+_ENVELOPE_MARGIN = 1.2
+_REPAIR_HALFWIDTH = 0.1
+
+
+def _data_envelope(data_x, data_y, data_err, rho0) -> float:
+    """Upper envelope of the scatter near rho0: max(y + 2 err) over channels
+    within _REPAIR_HALFWIDTH of rho0, plus the nearest finite channel on each
+    side. Including the nearest neighbors keeps interpolation across a data gap
+    from reading as overshoot: a fit descending a steep pedestal sits below its
+    inner neighbor, which belongs in the envelope even when it falls outside
+    the fixed window. NaN if there is no finite data at all.
+    """
+    mask = np.isfinite(data_x) & np.isfinite(data_y) & np.isfinite(data_err)
+    if not mask.any():
+        return np.nan
+    x_valid = data_x[mask]
+    top_valid = data_y[mask] + 2.0 * data_err[mask]
+    keep = np.abs(x_valid - rho0) <= _REPAIR_HALFWIDTH
+    inner = x_valid < rho0
+    outer = x_valid > rho0
+    if inner.any():
+        keep[inner & (x_valid == x_valid[inner].max())] = True
+    if outer.any():
+        keep[outer & (x_valid == x_valid[outer].min())] = True
+    return float(np.max(top_valid[keep])) if keep.any() else np.nan
+
+
+def _nonphysical_peak(y, x_star, data_x, data_y, data_err) -> float | None:
+    """rho of the nonphysical off-axis peak of a fitted slice, or None if
+    healthy. See the trigger definitions in the block comment above."""
+    y = np.asarray(y, dtype=float).ravel()
+    x = np.asarray(x_star, dtype=float).ravel()
+    if not np.isfinite(y).any():
+        return None
+    edge, interior = x >= _EDGE_RHO, x < _EDGE_RHO
+    with np.errstate(invalid="ignore"):
+        if np.isfinite(y[edge]).any() and np.isfinite(y[interior]).any():
+            if np.nanmax(y[edge]) > _EDGE_MARGIN * np.nanmax(y[interior]):
+                return float(x[edge][np.nanargmax(y[edge])])
+        worst_rho, worst = None, _ENVELOPE_MARGIN
+        for i in np.flatnonzero((x >= _CORE_RHO) & np.isfinite(y) & (y > 0)):
+            env = _data_envelope(data_x, data_y, data_err, x[i])
+            if np.isfinite(env) and env > 0 and y[i] / env > worst:
+                worst_rho, worst = float(x[i]), y[i] / env
+    return worst_rho
+
+
 def _run_gp(data_X, data_y, err_y, x_eval, hyperparams=None, optimize=True, pin_x0=None):
     """Set up the GP with edge BCs and fit. Returns the GaussianProcess or None.
 
@@ -769,9 +835,11 @@ def _atomic_savez(path: Path | str, arrays: dict) -> None:
 def _fit_variable(x, y, err, x_star, min_points, scale_per_slice, optimize, hyperparams, pin_x0):
     """Fit one variable of one time slice.
 
-    Returns (y_out, std_out, grad_out, grad_std_out, hyps) or five Nones.
+    Returns (y_out, std_out, grad_out, grad_std_out, hyps, status)
     hyps is the fitted [var, l1, l2, lw, x0] array (x0 is used to tie Te to ne)
-    None when the slice is skipped or fails.
+    status is "ok", "repaired" (refit without the channels under a nonphysical peak),
+    "culled" (still nonphysical after the repair), "skipped" (too few points),
+    or "failed" (GP fit failed); the arrays are None for the last three.
     """
     # Force float32 here, the same precision the cluster path is stuck at after
     # its pack_fit_batch npz roundtrip. Without this, in-process fits (which
@@ -782,47 +850,63 @@ def _fit_variable(x, y, err, x_star, min_points, scale_per_slice, optimize, hype
     y = np.asarray(y, dtype=np.float32)
     err = np.asarray(err, dtype=np.float32)
 
-    valid = np.isfinite(x) & np.isfinite(y) & np.isfinite(err)
-    if int(valid.sum()) < min_points:
-        return None, None, None, None, None
+    status = "ok"
+    for _ in range(2):  # first fit, plus at most one repair refit
+        valid = np.isfinite(x) & np.isfinite(y) & np.isfinite(err)
+        if int(valid.sum()) < min_points:
+            return None, None, None, None, None, "skipped" if status == "ok" else "culled"
 
-    scale = 1.0
-    if scale_per_slice:
-        # Normalize to O(1) before GP fit to prevent amplitude collapse
-        # when channels don't cover the full radial range. Runs the same
-        # isolated-spike filter gp_profile applies internally
-        # (_remove_local_outliers) first: a single misfired high-value
-        # channel would otherwise set the scale itself, squashing the rest
-        # of the real profile toward ~0 before it ever reaches outlier
-        # removal - and making that channel look like the profile's own
-        # peak instead of the spike it is.
-        with np.errstate(all="ignore"):
-            _, y_clean, _ = _remove_local_outliers(x[valid], y[valid], err[valid])
-            scale = float(np.nanmax(y_clean)) if y_clean.size else float(np.nanmax(y))
-        if not np.isfinite(scale) or scale < 1e-6:
-            return None, None, None, None, None
+        scale = 1.0
+        if scale_per_slice:
+            # Normalize to O(1) before GP fit to prevent amplitude collapse
+            # when channels don't cover the full radial range. Runs the same
+            # isolated-spike filter gp_profile applies internally
+            # (_remove_local_outliers) first: a single misfired high-value
+            # channel would otherwise set the scale itself, squashing the rest
+            # of the real profile toward ~0 before it ever reaches outlier
+            # removal - and making that channel look like the profile's own
+            # peak instead of the spike it is.
+            with np.errstate(all="ignore"):
+                _, y_clean, _ = _remove_local_outliers(x[valid], y[valid], err[valid])
+                scale = float(np.nanmax(y_clean)) if y_clean.size else float(np.nanmax(y))
+            if not np.isfinite(scale) or scale < 1e-6:
+                return None, None, None, None, None, "failed" if status == "ok" else "culled"
 
-    y_star, std_y_star, grad_y_star, grad_std_y_star, hyps = gp_profile(
-        data_X=np.asarray(x, dtype=float),
-        data_y=np.asarray(y, dtype=float) / scale,
-        err_y=np.asarray(err, dtype=float) / scale,
-        X_star=x_star,
-        calc_gradient=True,
-        hyperparams=hyperparams,
-        optimize_hyperparams=optimize,
-        pin_x0=pin_x0,
-    )
-    if y_star is None:
-        return None, None, None, None, None
+        y_star, std_y_star, grad_y_star, grad_std_y_star, hyps = gp_profile(
+            data_X=np.asarray(x, dtype=float),
+            data_y=np.asarray(y, dtype=float) / scale,
+            err_y=np.asarray(err, dtype=float) / scale,
+            X_star=x_star,
+            calc_gradient=True,
+            hyperparams=hyperparams,
+            optimize_hyperparams=optimize,
+            pin_x0=pin_x0,
+        )
+        if y_star is None:
+            return None, None, None, None, None, "failed" if status == "ok" else "culled"
 
-    # Last resort: the GP mean can ring below zero between the outermost
-    # measurement and the edge boundary conditions, so clamp to non-negative
-    y_out = np.clip(np.asarray(y_star, dtype=float).ravel() * scale, 0.0, None)
-    std_out = np.asarray(std_y_star, dtype=float).ravel() * scale
-    # Gradients are not clamped: negative slopes are physical.
-    grad_out = np.asarray(grad_y_star, dtype=float).ravel() * scale
-    grad_std_out = np.asarray(grad_std_y_star, dtype=float).ravel() * scale
-    return y_out, std_out, grad_out, grad_std_out, hyps
+        # Last resort: the GP mean can ring below zero between the outermost
+        # measurement and the edge boundary conditions, so clamp to non-negative
+        y_out = np.clip(np.asarray(y_star, dtype=float).ravel() * scale, 0.0, None)
+        std_out = np.asarray(std_y_star, dtype=float).ravel() * scale
+        # Gradients are not clamped: negative slopes are physical.
+        grad_out = np.asarray(grad_y_star, dtype=float).ravel() * scale
+        grad_std_out = np.asarray(grad_std_y_star, dtype=float).ravel() * scale
+
+        peak_rho = _nonphysical_peak(y_out, x_star, x, y, err)
+        if peak_rho is None:
+            return y_out, std_out, grad_out, grad_std_out, hyps, status
+
+        # Repair: drop the channels under the nonphysical peak (a stray point
+        # or a miscalibrated block) and refit once. If the refit is still
+        # flagged - or the peak sits where there is no data to drop (pure
+        # extrapolation ringing) - cull the slice rather than emit a spike.
+        drop = valid & (np.abs(x - peak_rho) <= _REPAIR_HALFWIDTH)
+        if status == "repaired" or not drop.any():
+            break
+        y = np.where(drop, np.float32(np.nan), y)
+        status = "repaired"
+    return None, None, None, None, None, "culled"
 
 
 def _fit_slice(task: tuple):
@@ -834,19 +918,20 @@ def _fit_slice(task: tuple):
     clearly resolved, Te is fit freely. The fixed-hyperparameter path leaves
     both profiles independent.
 
-    Returns (shot, i_time, te outputs, ne outputs, te_hyps, ne_hyps) where each
-    variable's outputs are (fit, std, grad, grad_std); any value is None when
-    that variable's slice was skipped or failed.
+    Returns (shot, i_time, te outputs, ne outputs, te_hyps, ne_hyps, te_status,
+    ne_status) where each variable's outputs are (fit, std, grad, grad_std);
+    any value is None when that variable's slice was skipped or failed, and the
+    statuses are as in _fit_variable.
     """
     (shot, i_time), x, te_y, te_err, ne_y, ne_err, x_star, min_points, scale_per_slice, optimize, hyperparams = task
     tie_x0 = optimize and hyperparams is None
 
-    ne_y_out, ne_std_out, ne_grad_out, ne_grad_std_out, ne_hyps = _fit_variable(
+    ne_y_out, ne_std_out, ne_grad_out, ne_grad_std_out, ne_hyps, ne_status = _fit_variable(
         x, ne_y, ne_err, x_star, min_points, scale_per_slice, optimize, hyperparams, None
     )
     ne_x0 = None if ne_hyps is None else float(ne_hyps[4])
     pin_x0 = ne_x0 if (tie_x0 and ne_x0 is not None and _is_pedestal_resolved(ne_x0)) else None
-    te_y_out, te_std_out, te_grad_out, te_grad_std_out, te_hyps = _fit_variable(
+    te_y_out, te_std_out, te_grad_out, te_grad_std_out, te_hyps, te_status = _fit_variable(
         x, te_y, te_err, x_star, min_points, scale_per_slice, optimize, hyperparams, pin_x0
     )
 
@@ -857,6 +942,8 @@ def _fit_slice(task: tuple):
         (ne_y_out, ne_std_out, ne_grad_out, ne_grad_std_out),
         te_hyps,
         ne_hyps,
+        te_status,
+        ne_status,
     )
 
 
@@ -928,10 +1015,21 @@ def fit_batch(
         for shot, si in shot_inputs.items()
     }
 
+    # Per-shot repair/cull tallies (see _fit_variable): repaired slices were
+    # refit without the channels under a nonphysical peak, culled slices were
+    # dropped because the refit stayed nonphysical. Logged so systematic
+    # problems (a bad edge channel wrecking a whole shot) are visible.
+    fix_counts = {shot: {"te": [0, 0], "ne": [0, 0]} for shot in shot_inputs}
+
     def _store(result):
-        shot, i_time, te_out, ne_out, te_hyps, ne_hyps = result
+        shot, i_time, te_out, ne_out, te_hyps, ne_hyps, te_status, ne_status = result
         te_y_out, te_std_out, te_grad_out, te_grad_std_out = te_out
         ne_y_out, ne_std_out, ne_grad_out, ne_grad_std_out = ne_out
+        for var, st in (("te", te_status), ("ne", ne_status)):
+            if st == "repaired":
+                fix_counts[shot][var][0] += 1
+            elif st == "culled":
+                fix_counts[shot][var][1] += 1
         so = outputs[shot]
         if te_y_out is not None:
             so.te_fit[i_time, :] = te_y_out
@@ -971,6 +1069,15 @@ def fit_batch(
         f"in {elapsed:.0f}s ({elapsed / max(n_total, 1):.2f}s per slice)",
         flush=True,
     )
+    for shot in sorted(fix_counts):
+        c = fix_counts[shot]
+        if any(c["te"]) or any(c["ne"]):
+            print(
+                f"[fit_worker] shot {shot} nonphysical fits: "
+                f"Te repaired {c['te'][0]} culled {c['te'][1]}, "
+                f"ne repaired {c['ne'][0]} culled {c['ne'][1]}",
+                flush=True,
+            )
     return outputs
 
 

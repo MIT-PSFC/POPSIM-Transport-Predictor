@@ -372,6 +372,8 @@ class CModDataWorkflow(DataWorkflow):
         Te_keV_lim: float | None = 5.0,
         ne20_lim: float | None = 1.8,
         fit_output: ShotFitOutput | None = None,
+        te_grad_ylim: tuple[float, float] | None = None,
+        ne_grad_ylim: tuple[float, float] | None = None,
     ) -> None:
         """Save a PDF comparing the GP fits to the raw TS measurements.
 
@@ -417,11 +419,15 @@ class CModDataWorkflow(DataWorkflow):
         times = ds_thomson["time"].values
         is_core = ds_thomson["ts_array"].values == "core"
 
-        n_t = len(times)
-        step = max(1, n_t // 20)
+        # Only page over slices where the fit produced a real profile. Times
+        # outside the plasma (pre-breakdown, post-disruption) have no valid TS
+        # channels, so the fit returns all-NaN and the panels come out blank.
+        has_fit = np.isfinite(ds_profiles["Te_keV_rho"].values).any(axis=-1) | np.isfinite(ds_profiles["ne20_rho"].values).any(axis=-1)
+        live = np.flatnonzero(has_fit)
+        step = max(1, len(live) // 20)
 
         with PdfPages(pdf_path) as pdf:
-            for i_time in range(0, n_t, step):
+            for i_time in live[::step]:
                 time = times[i_time]
                 ds_prof_t = ds_profiles.sel(time=time, method="nearest")
                 rho_ch = fit_input.x[i_time]
@@ -485,9 +491,9 @@ class CModDataWorkflow(DataWorkflow):
                             family="monospace",
                         )
 
-                for ax, gp_var, label in [
-                    (axes[1, 0], "Te_keV_rho_grad", "dTe/drho [keV]"),
-                    (axes[1, 1], "ne20_rho_grad", "dne/drho [1e20 m^-3]"),
+                for ax, gp_var, label, grad_ylim in [
+                    (axes[1, 0], "Te_keV_rho_grad", "dTe/drho [keV]", te_grad_ylim),
+                    (axes[1, 1], "ne20_rho_grad", "dne/drho [1e20 m^-3]", ne_grad_ylim),
                 ]:
                     if gp_var not in ds_prof_t:
                         continue  # raw files predating gradient outputs
@@ -505,6 +511,8 @@ class CModDataWorkflow(DataWorkflow):
                             label="GP +-1 sigma",
                         )
                     ax.axhline(0.0, color="gray", lw=0.8, alpha=0.5)
+                    if grad_ylim is not None:
+                        ax.set_ylim(*grad_ylim)
                     ax.set_xlabel("rho")
                     ax.set_ylabel(label)
                     ax.set_title(f"shot {shot}  t={time:.3f} s")

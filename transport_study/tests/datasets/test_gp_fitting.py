@@ -29,6 +29,9 @@ from transport_study.datasets.gp_fitting.dispatcher import (
 from transport_study.datasets.gp_fitting.fit_worker import (
     ShotFitInput,
     ShotFitOutput,
+    _data_envelope,
+    _fit_variable,
+    _nonphysical_peak,
     fit_batch,
     main,
     pack_fit_batch,
@@ -59,6 +62,124 @@ def _synthetic_input(seed: int = 0, amplitude: float = 2.0) -> ShotFitInput:
         arrays[f"{var}_y"] = y
         arrays[f"{var}_err"] = err
     return ShotFitInput(x=rho, **arrays)
+
+
+def _tracking_data(rho_ch, fit, rho_fit, rel_err=0.1):
+    """Scatter that sits exactly on the fitted profile with rel_err error bars."""
+    y = np.interp(rho_ch, rho_fit, fit)
+    return rho_ch, y, np.maximum(rel_err * np.abs(y), 0.02)
+
+
+def test_data_envelope_includes_nearest_neighbors():
+    # A gap between channels at 0.72 and 0.90: envelope at rho 0.84 must stillt (the zero-margin rule culled these).
+    # see the high inner neighbor so pedestal interpolation never reads as
+    # overshoot.
+    x = np.array([0.5, 0.72, 0.90, 1.0])
+    y = np.array([3.5, 3.0, 0.2, 0.05])
+    e = np.array([0.1, 0.1, 0.05, 0.02])
+    assert _data_envelope(x, y, e, 0.84) >= 3.0
+
+    x_nan = np.full(3, np.nan)
+    y_nan = np.full(3, np.nan)
+    e_nan = np.full(3, np.nan)
+
+    assert np.isnan(_data_envelope(x_nan, y_nan, e_nan, 0.9))
+
+
+def test_nonphysical_peak():
+    rho = np.linspace(0.0, 1.1, 56)
+    rho_ch = np.linspace(0.02, 1.05, 20)
+
+    # Monotonic core-peaked profile tracking its data: healthy.
+    mono = np.clip(9.0 * (1 - rho / 1.15), 0, None)
+    x, y, e = _tracking_data(rho_ch, mono, rho)
+    assert _nonphysical_peak(mono, rho, x, y, e) is None
+
+    # Flat profile whose global max lands in the edge region by noise
+    # the margin keeps it
+    flat = np.full_like(rho, 2.7)
+    flat[(rho > 0.9) & (rho < 0.96)] = 2.75
+    x, y, e = _tracking_data(rho_ch, flat, rho)
+    assert _nonphysical_peak(flat, rho, x, y, e) is None
+
+    # Data-supported hollow profile (ramp-up ne): off-axis bump 1.5x the core
+    # but the scatter shows the same shape, so it is real physics.
+    hollow = 1.0 + 0.6 * np.exp(-(((rho - 0.6) / 0.2) ** 2))
+    hollow[rho > 1.0] = 0.1
+    x, y, e = _tracking_data(rho_ch, hollow, rho)
+    assert _nonphysical_peak(hollow, rho, x, y, e) is None
+
+    # Edge bump above the whole interior: flagged at the bump even when the
+    # scatter supports it (miscalibrated edge channels).
+    edge_spike = np.clip(8.0 * (1 - rho / 1.0), 0, None)
+    edge_spike[(rho > 0.92) & (rho < 0.99)] = 14.0
+    x, y, e = _tracking_data(rho_ch, edge_spike, rho)
+    peak = _nonphysical_peak(edge_spike, rho, x, y, e)
+    assert peak is not None and 0.9 <= peak <= 1.0
+
+    # Sub-core ringing: a 6 keV spike under an 8 keV core passes the edge rule
+    # but exceeds the local data envelope (scatter decayed to ~0.2 there).
+    ring = np.clip(8.0 * (1 - rho / 0.9), 0.05, None)
+    ring[(rho > 0.92) & (rho < 0.99)] = 6.0
+    x, y, e = _tracking_data(rho_ch, np.clip(8.0 * (1 - rho / 0.9), 0.05, None), rho)
+    peak = _nonphysical_peak(ring, rho, x, y, e)
+    assert peak is not None and 0.9 <= peak <= 1.0
+
+    # Steep pedestal interpolated across a data gap stays healthy: the fit at
+    # the gap sits below its inner neighbor, which the envelope includes.
+    ped = 3.0 * (1 - np.tanh((rho - 0.85) / 0.06)) / 2 + 0.05
+    gap_ch = np.array([0.1, 0.3, 0.5, 0.72, 0.95, 1.02])
+    x, y, e = _tracking_data(gap_ch, ped, rho)
+    assert _nonphysical_peak(ped, rho, x, y, e) is None
+
+    # All-NaN slice is not flagged (nothing to cull).
+    nan_data = np.full(5, np.nan)
+    assert _nonphysical_peak(np.full_like(rho, np.nan), rho, nan_data, nan_data, nan_data) is None
+
+
+def test_fit_variable_repairs_then_culls(monkeypatch):
+    """Repair path: first fit nonphysical -> refit without the offending
+    channels; healthy refit keeps the slice as "repaired", a still-bad refit
+    culls it. gp_profile is faked so the shapes are exact."""
+    from transport_study.datasets.gp_fitting import fit_worker
+
+    rho = np.linspace(0.0, 1.1, 56)
+    n_ch = 12
+    x = np.linspace(0.02, 1.05, n_ch)
+    good = np.clip(8.0 * (1 - x / 1.0), 0.05, None)
+    y = good.copy()
+    y[9] = 5.0  # stray edge channel near rho 0.9
+    err = np.maximum(0.1 * good, 0.05)
+
+    spiked = np.clip(8.0 * (1 - rho / 1.0), 0.0, None)
+    spiked[(rho > 0.9) & (rho < 0.98)] = 14.0
+    clean = np.clip(8.0 * (1 - rho / 1.0), 0.0, None)
+    band = np.full_like(rho, 0.3)
+    hyps = np.array([2.0, 0.8, 0.3, 0.1, 0.95])
+
+    calls = {"n": 0}  # This is so stupid but needed to make the fit worker get its stuff
+
+    def fake_gp_profile(data_X, data_y, err_y, X_star, **kwargs):
+        calls["n"] += 1
+        out = spiked if calls["n"] == 1 else clean
+        return out, band, np.gradient(out, rho), band, hyps
+
+    monkeypatch.setattr(fit_worker, "gp_profile", fake_gp_profile)
+    y_out, _, _, _, _, status = _fit_variable(x, y, err, rho, 3, False, True, None, None)
+    assert status == "repaired"
+    assert calls["n"] == 2
+    assert np.nanmax(y_out) <= 8.5
+
+    # Always-spiked fit: repair does not help, slice is culled.
+    calls["n"] = 0
+    monkeypatch.setattr(
+        fit_worker,
+        "gp_profile",
+        lambda *a, **k: (spiked, band, np.gradient(spiked, rho), band, hyps),
+    )
+    y_out, _, _, _, _, status = _fit_variable(x, y, err, rho, 3, False, True, None, None)
+    assert status == "culled"
+    assert y_out is None
 
 
 def test_has_fittable_points():

@@ -254,8 +254,9 @@ class MASTDataWorkflow(DataWorkflow):
 
         self.filter_config = {
             "Wtot_MJ": {"min": 0.0005, "max": 2.0},
-            "ne20_line_avg": {"min": 0.01, "max": 6.0},
+            "ne20_line_avg": {"min": 0.01, "max": 1.2},  # 10.1088/1361-6587/ace476
             "betan": {"min": 0.01, "max": 10},
+            "beta_p": {"min": 0.01, "max": 10},
             "Ip_MA": {"min": 0.21, "max": 1.5},
         }
         self.individual_filter_config = None
@@ -695,9 +696,13 @@ class MASTDataWorkflow(DataWorkflow):
         debug_plot_dir.mkdir(parents=True, exist_ok=True)
         pdf_path = debug_plot_dir / f"{shot}_ts_gp_fit.pdf"
 
-        n_t = te_keV.shape[0]
-        step = max(1, n_t // 20)
-        t_indices = range(0, n_t, step)
+        # Only page over slices where the fit produced a real profile. Times
+        # outside the plasma have no valid TS channels, so the fit returns
+        # all-NaN and the panels come out blank.
+        has_fit = np.isfinite(fit_output.te_fit).any(axis=-1) | np.isfinite(fit_output.ne_fit).any(axis=-1)
+        live = np.flatnonzero(has_fit)
+        step = max(1, len(live) // 20)
+        t_indices = live[::step]
 
         with PdfPages(pdf_path) as pdf:
             for i_time in t_indices:
