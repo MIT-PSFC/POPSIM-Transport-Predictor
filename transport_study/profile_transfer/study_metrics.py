@@ -56,6 +56,7 @@ METRIC_NAMES = ("value", "grad", "combined")
 STAGE_AGG_NAMES = ("all", "rampup", "flattop", "flattop_ohmic", "flattop_aux", "rampdown")
 
 COLLECTED_METRICS_FILENAME = "collected_metrics.nc"
+CASE_METRICS_FILENAME = "case_metrics.nc"
 
 
 @cache
@@ -326,60 +327,102 @@ def collected_metrics_path(study: Study) -> Path:
     return study.result_dir / COLLECTED_METRICS_FILENAME
 
 
+def case_metrics_path(study: Study, case) -> Path:
+    """Per-case stage-aggregate cache, next to the case's result_data.nc.
+    An empty dataset is the marker for 'computed, but no valid timeslices',
+    so parallel analysis jobs can signal completion either way."""
+    return study.result_path(case).parent / CASE_METRICS_FILENAME
+
+
+def _aggregate_case_metrics(ts_metrics: CaseTimesliceMetrics) -> xr.Dataset:
+    """Reduce one case's per-timeslice metrics to per-stage statistics.
+
+    Dims: stage (STAGE_AGG_NAMES). Data variables <metric>_<stat> for metric in
+    value/grad/combined and stat in mean/std/med/count. Case-identifying coords
+    are attached later by collect_metrics, which knows the case_idx.
+    """
+    data_vars = {}
+    for metric in METRIC_NAMES:
+        values = ts_metrics.metric(metric)
+        means, stds, meds, counts = [], [], [], []
+        for stage in STAGE_AGG_NAMES:
+            stage_values = values[ts_metrics.stage_mask(stage)]
+            stage_values = stage_values[np.isfinite(stage_values)]
+            counts.append(len(stage_values))
+            if len(stage_values) == 0:
+                means.append(np.nan)
+                stds.append(np.nan)
+                meds.append(np.nan)
+            else:
+                means.append(float(np.mean(stage_values)))
+                stds.append(float(np.std(stage_values)))
+                meds.append(float(np.median(stage_values)))
+        data_vars[f"{metric}_mean"] = ("stage", np.array(means))
+        data_vars[f"{metric}_std"] = ("stage", np.array(stds))
+        data_vars[f"{metric}_med"] = ("stage", np.array(meds))
+        data_vars[f"{metric}_count"] = ("stage", np.array(counts))
+
+    return xr.Dataset(data_vars=data_vars, coords={"stage": list(STAGE_AGG_NAMES)})
+
+
+def compute_and_save_case_metrics(study, case) -> xr.Dataset:
+    """Stage-aggregate metrics for one case, cached to case_metrics_path.
+
+    Returns the cached dataset when present, otherwise computes from the case
+    result file and saves. A case whose result file exists but yields no valid
+    timeslices caches an empty dataset so the work is not retried. A case with
+    no result file returns an empty dataset without caching (results may still
+    appear later).
+    """
+    cache_path = case_metrics_path(study, case)
+    if cache_path.exists():
+        return xr.load_dataset(cache_path)
+
+    result_path = study.result_path(case)
+    if not result_path.exists():
+        return xr.Dataset()
+
+    result_ds = xr.load_dataset(result_path)
+    loss_config = study.make_train_config(case).loss_config
+    ts_metrics = compute_case_timeslice_metrics(result_ds, loss_config)
+    if len(ts_metrics) == 0:
+        logger.warning(f"No valid test timeslices for case {case}, caching empty metrics marker")
+        case_ds = xr.Dataset()
+    else:
+        case_ds = _aggregate_case_metrics(ts_metrics)
+        logger.info(f"Computed stage-resolved metrics for case {case} ({len(ts_metrics)} timeslices)")
+
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    case_ds.to_netcdf(cache_path)
+    return case_ds
+
+
 def collect_metrics(study) -> xr.Dataset:
     """Aggregate stage-resolved metrics for every finished case.
 
     Dims: (case_idx, stage) with stage in STAGE_AGG_NAMES. Data variables
     <metric>_<stat> for metric in value/grad/combined and stat in
     mean/std/med/count. Case-identifying coords along case_idx match
-    collect_results. Cached to collected_metrics.nc in the study result dir.
+    collect_results.
+
+    Reads the per-case caches written by compute_and_save_case_metrics
+    (parallel analysis jobs fill them ahead of time) and computes any that are
+    still missing in-process. The per-case caches are the real cache; the
+    combined dataset is rebuilt (cheap concat) and written to
+    collected_metrics.nc in the study result dir every call, so a partial file
+    from an interrupted run can never mask newly finished cases.
     """
     cache_path = collected_metrics_path(study)
-    if cache_path.exists():
-        logger.info(f"Loading cached stage-resolved metrics from {cache_path}")
-        return xr.load_dataset(cache_path)
 
     results = []
     for case_idx, case in enumerate(study.cases):
-        result_path = study.result_path(case)
-        if not result_path.exists():
+        case_ds = compute_and_save_case_metrics(study, case)
+        if not case_ds.data_vars:
             continue
-        result_ds = xr.load_dataset(result_path)
-
-        loss_config = study.make_train_config(case).loss_config
-        ts_metrics = compute_case_timeslice_metrics(result_ds, loss_config)
-        if len(ts_metrics) == 0:
-            logger.warning(f"No valid test timeslices for case {case}, skipping")
-            continue
-
-        data_vars = {}
-        for metric in METRIC_NAMES:
-            values = ts_metrics.metric(metric)
-            means, stds, meds, counts = [], [], [], []
-            for stage in STAGE_AGG_NAMES:
-                stage_values = values[ts_metrics.stage_mask(stage)]
-                stage_values = stage_values[np.isfinite(stage_values)]
-                counts.append(len(stage_values))
-                if len(stage_values) == 0:
-                    means.append(np.nan)
-                    stds.append(np.nan)
-                    meds.append(np.nan)
-                else:
-                    means.append(float(np.mean(stage_values)))
-                    stds.append(float(np.std(stage_values)))
-                    meds.append(float(np.median(stage_values)))
-            data_vars[f"{metric}_mean"] = ("stage", np.array(means))
-            data_vars[f"{metric}_std"] = ("stage", np.array(stds))
-            data_vars[f"{metric}_med"] = ("stage", np.array(meds))
-            data_vars[f"{metric}_count"] = ("stage", np.array(counts))
-
-        case_ds = xr.Dataset(data_vars=data_vars, coords={"stage": list(STAGE_AGG_NAMES)})
-        case_ds = case_ds.assign_coords(study._case_coords(case_idx, case))
-        results.append(case_ds)
-        logger.info(f"Computed stage-resolved metrics for case {case} ({len(ts_metrics)} timeslices)")
+        results.append(case_ds.assign_coords(study._case_coords(case_idx, case)))
 
     if not results:
-        logger.warning("No finished cases with rho-schema result files, stage-resolved metrics are empty")
+        logger.warning("No finished cases with valid metrics, stage-resolved metrics are empty")
         return xr.Dataset()
 
     metrics_ds = xr.concat(results, dim="case_idx")

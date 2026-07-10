@@ -49,6 +49,11 @@ class StudyConfig(BaseModel):
 
     # Environment-specific orchestration settings
     partition: str | None = Field(default_factory=lambda: os.environ.get("PTPS_PARTITION"))
+    # Partition for CPU-only analysis jobs (per-case metrics and case reports).
+    # These need no GPU, so point this at a CPU partition. Falls back to `partition`
+    analysis_partition: str | None = Field(default_factory=lambda: os.environ.get("PTPS_ANALYSIS_PARTITION"))
+    # SLURM walltime request for analysis jobs, sbatch --time format
+    analysis_time_limit: str = Field(default_factory=lambda: os.environ.get("PTPS_ANALYSIS_TIME_LIMIT", "07:59:59"))
     # SLURM walltime request for training and agent jobs, sbatch --time format
     train_time_limit: str = Field(default_factory=lambda: os.environ.get("PTPS_TRAIN_TIME_LIMIT", "07:59:59"))
     # In-job wall-clock training budget in seconds. Set below the SLURM limit so the

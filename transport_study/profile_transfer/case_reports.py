@@ -14,6 +14,7 @@ measured target shape.
 """
 
 import io
+import time
 from pathlib import Path
 
 import matplotlib.pyplot as plt
@@ -25,6 +26,10 @@ from PIL import Image
 
 from transport_study import EPISODE_DIM, TIME_DIM
 from transport_study.config import config
+from transport_study.orchestration.slurm_utils import (
+    count_running_jobs,
+    launch_profile_analysis_parallel,
+)
 from transport_study.profile_transfer.plot_torax_evolution import plot_relaxation
 from transport_study.profile_transfer.plotting import (
     BACKGROUND_COLOR,
@@ -33,12 +38,18 @@ from transport_study.profile_transfer.plotting import (
 )
 from transport_study.profile_transfer.study_metrics import (
     CaseTimesliceMetrics,
+    case_metrics_path,
     compute_case_timeslice_metrics,
     load_eval_dataset,
 )
 
 N_BEST_WORST = 10
 GIF_FRAME_DURATION_MS = 200
+
+# Parallel analysis orchestration: resubmission cap per case and how often the
+# driver rechecks for finished cases
+ANALYSIS_MAX_ATTEMPTS = 3
+ANALYSIS_POLL_INTERVAL_S = 30
 
 LABEL_FONTSIZE = 11
 TICK_FONTSIZE = 9
@@ -255,30 +266,97 @@ def generate_case_reports(study, figure_dir: Path):
     """Best/worst timeslice PDFs and profile evolution GIFs for every finished
     case. Existing case report directories are left alone (GIF rendering is
     slow); clean_figures wipes the figure dir to force regeneration."""
-    reports_dir = Path(figure_dir) / "case_reports"
     for case in study.cases:
-        result_path = study.result_path(case)
-        if not result_path.exists():
-            continue
-        result_ds = xr.load_dataset(result_path)
-        if "rho" not in result_ds.dims:
-            logger.warning(f"Result file for case {case} predates the rho grid schema, skipping case report")
-            continue
+        generate_case_report(study, case, figure_dir)
 
-        case_dir = reports_dir / str(case)
-        pdf_path = case_dir / "best_worst_timeslices.pdf"
-        if pdf_path.exists() and any(case_dir.glob("shot_*_evolution.gif")):
-            logger.info(f"Case report already exists for {case}, skipping")
-            continue
 
-        loss_config = study.make_train_config(case).loss_config
-        ts_metrics = compute_case_timeslice_metrics(result_ds, loss_config)
-        if len(ts_metrics) == 0:
-            logger.warning(f"No valid test timeslices for case {case}, skipping case report")
-            continue
+def _case_report_dir(figure_dir: Path, case) -> Path:
+    return Path(figure_dir) / "case_reports" / str(case)
 
-        best_worst_pdf(result_ds, ts_metrics, pdf_path)
-        evolution_gifs(result_ds, ts_metrics, case_dir)
+
+def _case_report_done(case_dir: Path) -> bool:
+    return (case_dir / "best_worst_timeslices.pdf").exists() and any(case_dir.glob("shot_*_evolution.gif"))
+
+
+def generate_case_report(study, case, figure_dir: Path):
+    """Best/worst timeslice PDF and profile evolution GIFs for one case.
+    No-op when the case has no result file or the report already exists."""
+    result_path = study.result_path(case)
+    if not result_path.exists():
+        return
+    case_dir = _case_report_dir(figure_dir, case)
+    if _case_report_done(case_dir):
+        logger.info(f"Case report already exists for {case}, skipping")
+        return
+
+    result_ds = xr.load_dataset(result_path)
+    if "rho" not in result_ds.dims:
+        logger.warning(f"Result file for case {case} predates the rho grid schema, skipping case report")
+        return
+
+    loss_config = study.make_train_config(case).loss_config
+    ts_metrics = compute_case_timeslice_metrics(result_ds, loss_config)
+    if len(ts_metrics) == 0:
+        logger.warning(f"No valid test timeslices for case {case}, skipping case report")
+        return
+
+    best_worst_pdf(result_ds, ts_metrics, case_dir / "best_worst_timeslices.pdf")
+    evolution_gifs(result_ds, ts_metrics, case_dir)
+
+
+def analysis_case_done(study, case, figure_dir: Path) -> bool:
+    """Whether a case needs no more analysis work: its metrics cache exists and
+    either it is the empty 'nothing valid' marker or the case report is on disk."""
+    cache_path = case_metrics_path(study, case)
+    if not cache_path.exists():
+        return False
+    case_metrics = xr.load_dataset(cache_path)
+    if not case_metrics.data_vars:
+        return True
+    return _case_report_done(_case_report_dir(figure_dir, case))
+
+
+def run_analysis_parallel(study):
+    """Fan the per-case analysis (stage metrics + case report) out over SLURM.
+
+    Submits one CPU job per finished case that still needs analysis (see
+    launch_profile_analysis_parallel, which targets config.analysis_partition)
+    and polls until every case is done or has exhausted its attempts. Cases
+    that exhaust their attempts fall back to the serial path in
+    collect_metrics / generate_case_reports afterwards.
+    """
+    partition = config.analysis_partition or config.partition
+    pending = [case for case in study.cases if study.result_path(case).exists() and not analysis_case_done(study, case, study.figure_dir)]
+    if not pending:
+        return
+    logger.info(f"Launching parallel analysis for {len(pending)} cases on partition {partition}")
+
+    attempts: dict[str, int] = {}
+    while pending:
+        in_flight = 0
+        for case in pending:
+            job_name = study.analysis_job_name(case)
+            if count_running_jobs(job_name, partition=partition) > 0:
+                in_flight += 1
+                continue
+            if attempts.get(str(case), 0) >= ANALYSIS_MAX_ATTEMPTS:
+                continue
+            attempts[str(case)] = attempts.get(str(case), 0) + 1
+            launch_profile_analysis_parallel(study, case)
+            in_flight += 1
+
+        if in_flight == 0:
+            logger.error(
+                f"{len(pending)} analysis cases did not finish after {ANALYSIS_MAX_ATTEMPTS} attempts each, "
+                "they will be computed serially instead"
+            )
+            break
+
+        time.sleep(ANALYSIS_POLL_INTERVAL_S)
+        pending = [case for case in pending if not analysis_case_done(study, case, study.figure_dir)]
+
+    if not pending:
+        logger.info("Parallel analysis finished for all cases")
 
 
 def torax_relaxation_report(study, metrics_ds: xr.Dataset, figure_dir: Path):

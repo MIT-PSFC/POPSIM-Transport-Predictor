@@ -29,6 +29,7 @@ from transport_study.orchestration.organize_data import (
 from transport_study.orchestration.study import Study
 from transport_study.profile_transfer.case_reports import (
     generate_case_reports,
+    run_analysis_parallel,
     torax_relaxation_report,
 )
 from transport_study.profile_transfer.data_visualization import DataVisualization
@@ -1110,6 +1111,13 @@ def run_study(
 
         ds_final = study.collect_results()
         ds_final.to_netcdf(study.collected_results_path())
+
+    # Per-case analysis (stage metrics + case reports) is CPU-bound matplotlib
+    # and numpy work: with parallelism it fans out as one SLURM job per case on
+    # the analysis partition, and anything unfinished falls back to the serial
+    # paths below (collect_metrics / generate_case_reports skip completed cases)
+    if enable_parallelism:
+        run_analysis_parallel(study)
 
     # Stage-resolved value / gradient / combined metrics for every finished
     # case, cached to collected_metrics.nc alongside collected_results.nc

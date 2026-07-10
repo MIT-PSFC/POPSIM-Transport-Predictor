@@ -103,6 +103,9 @@ class Study:
     def train_job_name(self, case: Case) -> str:
         return f"train_{case}"
 
+    def analysis_job_name(self, case: Case) -> str:
+        return f"analysis_{case}"
+
     def check_prereq_satisfied(self, case: Case) -> bool:
         """Check if the prerequisites for this case have been satisfied by looking for the existence of the result path"""
         if case.prereqs is None:

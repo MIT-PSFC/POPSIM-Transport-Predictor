@@ -344,6 +344,73 @@ exit $exit_code
         logger.info(f"Submitted agent job {job_name}: {result.stdout.strip()}")
 
 
+def launch_profile_analysis_parallel(study, case) -> None:
+    """Submit a CPU SLURM job computing one case's stage metrics and case report.
+
+    Analysis (metrics aggregation, PDF pages, GIF frames) is matplotlib and
+    numpy bound with no GPU work, so it goes to config.analysis_partition when
+    set (config.partition otherwise) and requests no GPU.
+    """
+    partition = config.analysis_partition or config.partition
+    log_dir = study.working_dir / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+
+    job_name = study.analysis_job_name(case)
+    case_str = str(case)
+
+    # This runs in a fresh process, so the global transport_study.config
+    # singleton isn't loaded there. The study class reloads it from this TOML
+    # (per-job file: jobs clean up after themselves, so sharing one would race)
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".toml", delete=False, prefix=f"{job_name}_study_config_", dir=log_dir) as f:
+        study_config_path = f.name
+    config.save(Path(study_config_path))
+
+    study_cls = type(study)
+    py_script = f"""\
+from pathlib import Path
+from {_importable_module(study_cls)} import {study_cls.__name__}
+from transport_study.profile_transfer.case_reports import generate_case_report
+from transport_study.profile_transfer.study_metrics import compute_and_save_case_metrics
+
+study = {study_cls.__name__}(Path({study_config_path!r}))
+case = next(c for c in study.cases if str(c) == {case_str!r})
+
+case_metrics = compute_and_save_case_metrics(study, case)
+if case_metrics.data_vars:
+    generate_case_report(study, case, study.figure_dir)
+Path({study_config_path!r}).unlink()
+"""
+
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False, prefix=f"{job_name}_", dir=log_dir) as f:
+        f.write(py_script)
+        script_path = f.name
+    log_path = log_dir / f"{job_name}.log"
+
+    sbatch_script = f"""\
+#!/bin/bash
+#SBATCH --job-name={job_name}
+#SBATCH --partition={partition}
+#SBATCH --time={config.analysis_time_limit}
+#SBATCH --mem=32G
+#SBATCH --cpus-per-task=4
+#SBATCH --export=ALL
+#SBATCH --output={log_path}
+#SBATCH --error={log_path}
+
+export MPLBACKEND=Agg
+{sys.executable} {script_path}
+exit_code=$?
+rm -f {script_path}
+exit $exit_code
+"""
+
+    result = subprocess.run(["sbatch"], input=sbatch_script, check=False, capture_output=True, text=True)
+    if result.returncode != 0:
+        logger.error(f"sbatch failed for analysis job {job_name}: {result.stderr}")
+    else:
+        logger.info(f"Submitted analysis job {job_name}: {result.stdout.strip()}")
+
+
 def launch_trajopt_case_parallel(
     trajopt,
     case,
