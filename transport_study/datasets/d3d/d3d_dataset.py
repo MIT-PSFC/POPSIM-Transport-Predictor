@@ -850,3 +850,18 @@ class D3DDataWorkflow(DataWorkflow):
             ds["P_NBI_MW"] = np.abs(ds["P_NBI_MW_alt"])
 
         return ds
+
+    def device_specific_culling(self, ds: xr.Dataset) -> bool:
+        """Apply DIII-D specific culling criteria to the dataset.
+
+        TODO(ZanderKeith): no culling implemented yet, every shot is kept. Known
+        issues before D3D can run through the common processing workflow:
+        - process_fn's fresh_profiles labeling reads ne20_rho, but D3D produces
+          ne20_psi (psi_n grid), so processing would fail.
+        - The denv3 -> ne20_line_avg conversion divides by 1e20 in
+          standardize_signal_names while compare_densities divides by 2e20;
+          verify denv3 units (line-averaged vs line-integrated) on DIII-D.
+        - denv3 is an edge vertical chord being used as the line-averaged
+          density, revisit that choice.
+        """
+        return False

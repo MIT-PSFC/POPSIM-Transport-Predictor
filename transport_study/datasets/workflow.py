@@ -1,4 +1,4 @@
-from abc import abstractmethod
+from abc import ABC, abstractmethod
 from pathlib import Path
 
 import numpy as np
@@ -15,7 +15,7 @@ from transport_study.datasets.plotting import (
 GC_INTERVAL = 40  # Every 40 shots force garbage collection
 
 
-class DataWorkflow:
+class DataWorkflow(ABC):
     """Class that handles organization of data processing steps
 
     For this study, the general workflow is:

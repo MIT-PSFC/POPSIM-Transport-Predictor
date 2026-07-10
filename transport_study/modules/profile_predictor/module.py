@@ -175,9 +175,8 @@ class Inputs:
 
     @property
     def beta(self):
-        # betan is in the standard percent m T / MA convention
-        # (beta_N = beta[%] a B0 / Ip), so divide by 100 for the
-        # dimensionless fraction
+        # betan follows the percent Troyon convention (beta[%] * a*B0/Ip)
+        # divide by 100 to return beta as a true fraction
         return self.betan * self.Ip / (self.a_minor * self.B0) / 100.0
 
     @property

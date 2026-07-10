@@ -206,6 +206,10 @@ class MASTDataWorkflow(DataWorkflow):
     psi_axis/psi_boundary from the level1 EFM Zarr. Profiles are fit and
     stored in rho, not psi_n, because psi_n squishes the core in real space.
 
+    R0 is the geometric LCFS center (midplane average of rpsi100_in/out) and
+    B0 is the vacuum toroidal field rescaled to R0, matching the geometric
+    conventions used by the C-Mod, D3D, and TCV workflows.
+
     Power balance signals produced:
         Wtot_MJ, Ip_MA, B0, R0, kappa, a_minor, ne20_line_avg,
         P_oh_MW, P_NBI_MW, P_ECRH_MW (=0), P_ICRF_MW (=0), P_LH_MW (=0),
@@ -256,6 +260,9 @@ class MASTDataWorkflow(DataWorkflow):
         self.filter_config = {
             "Wtot_MJ": {"min": 0.0005, "max": 2.0},
             "ne20_line_avg": {"min": 0.01, "max": 1.2},  # 10.1088/1361-6587/ace476
+            # Bad interferometer data can satisfy the absolute density cap at low Ip
+            # so stack another check based on the Greenwald fraction
+            "fGW": {"min": 0.0, "max": 2.0},
             "betan": {"min": 0.01, "max": 10},
             "beta_p": {"min": 0.01, "max": 10},
             "Ip_MA": {"min": 0.21, "max": 1.5},
@@ -304,6 +311,8 @@ class MASTDataWorkflow(DataWorkflow):
             "equilibrium/elongation",
             "equilibrium/minor_radius",
             "equilibrium/magnetic_axis_r",
+            "equilibrium/rpsi100_in",
+            "equilibrium/rpsi100_out",
             "equilibrium/beta_tor_normal",
             "equilibrium/beta_pol",
             "equilibrium/triangularity_upper",
@@ -332,6 +341,8 @@ class MASTDataWorkflow(DataWorkflow):
             "kappa": "elongation",
             "a_minor": "minor_radius",
             "rmagx": "magnetic_axis_r",
+            "rpsi100_in": "rpsi100_in",
+            "rpsi100_out": "rpsi100_out",
             "beta_n": "beta_tor_normal",
             "beta_p": "beta_pol",
             "tritop": "triangularity_upper",
@@ -871,8 +882,12 @@ class MASTDataWorkflow(DataWorkflow):
         """Rename/convert signals to the POPSIM convention."""
         ds["Wtot_MJ"] = ds["wmhd"] / 1e6
         ds["Ip_MA"] = np.abs(ds["ip"]) / 1e6
-        ds["B0"] = np.abs(ds["bvac_rmag"])
-        ds["R0"] = ds["rmagx"]
+        # Geometric LCFS center from the midplane psi_n=1 crossings, consistent with
+        # the other devices (C-Mod rout, D3D rsurf, TCV R_geom)
+        ds["R0"] = (ds["rpsi100_in"] + ds["rpsi100_out"]) / 2
+        # bvac_rmag is the vacuum toroidal field at the magnetic axis radius, rescale
+        # by 1/R to the geometric center so B0 is referenced at R0 like other devices
+        ds["B0"] = np.abs(ds["bvac_rmag"]) * ds["rmagx"] / ds["R0"]
         ds["ne20_line_avg"] = ds["n_e"] / 1e20
         ds["P_oh_MW"] = ds["p_oh"] / 1e6
         ds["P_NBI_MW"] = ds["p_nbi"] / 1e6
@@ -960,6 +975,11 @@ class MASTDataWorkflow(DataWorkflow):
     # ------------------------------------------------------------------
     def device_specific_processing(self, ds: xr.Dataset) -> xr.Dataset:
         """Cull bad GP-fitted profiles and fill ne20_edge from profile."""
+        # Greenwald fraction for the fGW range filter
+        # n_GW = Ip/(pi a^2) in 1e20 m^-3 with Ip in MA.
+        if all(v in ds for v in ("ne20_line_avg", "Ip_MA", "a_minor")):
+            ds["fGW"] = ds["ne20_line_avg"] / (ds["Ip_MA"] / (np.pi * ds["a_minor"] ** 2))
+
         # NaN out timeslices where the fit went negative inside rho < 1.0
         if "ne20_rho" in ds and "Te_keV_rho" in ds:
             negative_profile_mask = (ds["ne20_rho"].where(ds["rho"] < 1.0) < 0).any(dim="rho") | (
