@@ -25,6 +25,7 @@ from transport_study.datasets.gp_fitting.fit_worker import (
     ShotFitOutput,
     fit_batch,
 )
+from transport_study.datasets.plotting import fit_mean_ylim
 from transport_study.datasets.workflow import GC_INTERVAL, DataWorkflow
 
 DEFAULT_SHOTLIST_FILE = Path(PACKAGE_ROOT) / "datasets" / "mast" / "mast_shotlist"
@@ -704,10 +705,15 @@ class MASTDataWorkflow(DataWorkflow):
         step = max(1, len(live) // 20)
         t_indices = live[::step]
 
+        # Consistent y-limits across every page: 0 to a little over the largest
+        # GP fit mean anywhere in this shot's fits.
+        te_ylim = fit_mean_ylim(fit_output.te_fit, fallback=5.0)
+        ne_ylim = fit_mean_ylim(fit_output.ne_fit, fallback=1.8)
+
         with PdfPages(pdf_path) as pdf:
             for i_time in t_indices:
                 fig, axes = plt.subplots(2, 2, figsize=(12, 10))
-                for ax, data_y, gp_y, gp_err, label, unit, hyps_arr in [
+                for ax, data_y, gp_y, gp_err, label, unit, hyps_arr, ylim in [
                     (
                         axes[0, 0],
                         te_keV[i_time, :],
@@ -716,6 +722,7 @@ class MASTDataWorkflow(DataWorkflow):
                         "Te",
                         "[keV]",
                         fit_output.te_hyps,
+                        te_ylim,
                     ),
                     (
                         axes[0, 1],
@@ -725,6 +732,7 @@ class MASTDataWorkflow(DataWorkflow):
                         "ne",
                         "[1e20 m^-3]",
                         fit_output.ne_hyps,
+                        ne_ylim,
                     ),
                 ]:
                     rho_raw = rho_ts[i_time, :]
@@ -755,7 +763,7 @@ class MASTDataWorkflow(DataWorkflow):
                         )
                     ax.set_xlabel("rho")
                     ax.set_ylabel(f"{label} {unit}")
-                    ax.set_ylim(bottom=0)
+                    ax.set_ylim(bottom=0, top=ylim)
                     ax.set_title(f"shot {shot}  t={ts_time[i_time]:.3f} s  n_valid={valid.sum()}")
                     ax.grid(alpha=0.3)
                     ax.legend(fontsize=8)

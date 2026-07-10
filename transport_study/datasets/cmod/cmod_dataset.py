@@ -25,6 +25,7 @@ from transport_study.datasets.gp_fitting.fit_worker import (
     ShotFitOutput,
     fit_batch,
 )
+from transport_study.datasets.plotting import fit_mean_ylim
 from transport_study.datasets.workflow import DataWorkflow
 
 DEFAULT_SHOTLIST_FILE = PACKAGE_ROOT / "datasets" / "cmod" / "cmod_shotlist"
@@ -369,8 +370,8 @@ class CModDataWorkflow(DataWorkflow):
         ds_thomson: xr.Dataset,
         ds_profiles: xr.Dataset,
         debug_plot_dir: Path | str | None = None,
-        Te_keV_lim: float | None = 5.0,
-        ne20_lim: float | None = 1.8,
+        Te_keV_lim: float | None = None,
+        ne20_lim: float | None = None,
         fit_output: ShotFitOutput | None = None,
         te_grad_ylim: tuple[float, float] | None = None,
         ne_grad_ylim: tuple[float, float] | None = None,
@@ -415,6 +416,14 @@ class CModDataWorkflow(DataWorkflow):
 
         ds_thomson = ds_thomson.squeeze("shot", drop=True)
         ds_profiles = ds_profiles.squeeze("shot", drop=True)
+
+        # Consistent y-limits across every page: 0 to a little over the largest
+        # GP fit mean anywhere in this shot's profiles. Fall back to the fixed
+        # defaults when the fit is all-NaN.
+        if Te_keV_lim is None:
+            Te_keV_lim = fit_mean_ylim(ds_profiles["Te_keV_rho"].values, fallback=5.0)
+        if ne20_lim is None:
+            ne20_lim = fit_mean_ylim(ds_profiles["ne20_rho"].values, fallback=1.8)
 
         times = ds_thomson["time"].values
         is_core = ds_thomson["ts_array"].values == "core"

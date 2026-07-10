@@ -942,3 +942,15 @@ def ds_summary_report(
         fig = _summary_stats_page(ds, title)
         pdf.savefig(fig)
         plt.close(fig)
+
+
+def fit_mean_ylim(fit_mean: np.ndarray, fallback: float, pad: float = 1.05) -> float:
+    """Top y-limit for a TS fit panel: a little over the largest GP fit mean.
+
+    Computed across the whole shot so every page shares the same axis. Returns
+    fallback when the fit is all-NaN or non-positive.
+    """
+    hi = float(np.nanmax(fit_mean)) if np.isfinite(fit_mean).any() else np.nan
+    if not np.isfinite(hi) or hi <= 0:
+        return fallback
+    return hi * pad
