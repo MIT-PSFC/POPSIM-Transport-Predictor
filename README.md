@@ -98,6 +98,13 @@ Helper scripts for organizing training cases, launching SLURM jobs, and hyperpar
 ## Trajectory Optimization
 
 This was briefly attempted on DIII-D in March 2026, though results were inconclusive due to difficulties in reproducing the target scenario.
+# Workflow:
+
+I am not happy with how things are set up right now. The structure is a consequence of my development environment and as such might be tricky to adapt. I've attempted to make it general where possible, but at the end of the day this is a thing I made to facilitate my own work on a tight schedule. It could be tweaked to work for a more general set of environments, I simply do not have the bandwidth to do so.
+
+I run the dataset creation on a local workstation, where it has access to C-Mod/DIII-D/TCV data (private) and MAST data (public). However, this workstation is too small to do the computationally intensive GP fitting routines for C-Mod and MAST. To get around this, it packages the raw TS data, ships it off to a remote cluster with srunx, and pulls back the results for assembly.
+
+I run the training orchestration on an interactive node on a compute cluster (either Engaging or OMEGA). This is convenient for testing because whenever something breaks I can just run the study serially to step through the logic with a debugger without worrying about things being slightly different between CPU and GPU. The downside is the interactive job the orchestrator lives on takes up a GPU which could be used for training. Maybe not the biggest concern (still leveraging 55/56 on my partition) but when going through hundreds of cases and thousands of tuning runs it adds up.
 
 # Generative AI Disclosure
 
