@@ -27,7 +27,18 @@ from transport_study.orchestration.organize_data import (
     get_loaded_shot_count,
 )
 from transport_study.orchestration.study import Study
+from transport_study.profile_transfer.case_reports import (
+    generate_case_reports,
+    torax_relaxation_report,
+)
 from transport_study.profile_transfer.data_visualization import DataVisualization
+from transport_study.profile_transfer.plotting import (
+    domain_adaptation_comparison,
+    freeze_shapes_comparison,
+    model_comparison,
+    training_dataset_comparison,
+)
+from transport_study.profile_transfer.study_metrics import collect_metrics
 
 # When domain adaptation is None, we aren't using any target data during training anyway so this is unused
 # During domain adaptation, we aren't doing hyperparameter tuning
@@ -1075,7 +1086,7 @@ def run_study(
     ########################
     if study.collected_results_path().exists():
         logger.info(
-            f"Collected results file found at\n{study.collected_results_path()}\nSkipping orchestration and going straight to analysis and visualization"
+            f"Collected results file found at\n{study.collected_results_path()}\nSkipping orchestration and going straight to analysis"
         )
     else:
         logger.opt(colors=True).info("<bold><magenta>ORCHESTRATION</magenta></bold>")
@@ -1100,15 +1111,36 @@ def run_study(
         ds_final = study.collect_results()
         ds_final.to_netcdf(study.collected_results_path())
 
-    ############################
-    # Training Data Comparison #
-    ############################
-    logger.info("TRAINING DATA COMPARISON")
+    # Stage-resolved value / gradient / combined metrics for every finished
+    # case, cached to collected_metrics.nc alongside collected_results.nc
+    metrics_ds = collect_metrics(study)
+
+    ###############################
+    # Training Dataset Comparison #
+    ###############################
+    logger.opt(colors=True).info("<bold><magenta>TRAINING DATASET COMPARISON</magenta></bold>")
+    training_dataset_comparison(metrics_ds, study.figure_dir)
 
     ####################
     # Model Comparison #
     ####################
-    logger.info("MODEL COMPARISON")
+    logger.opt(colors=True).info("<bold><magenta>MODEL COMPARISON</magenta></bold>")
+    model_comparison(metrics_ds, study.figure_dir)
+    freeze_shapes_comparison(metrics_ds, study.figure_dir)
+    # Per-case deep dives: best/worst timeslice PDFs and profile evolution GIFs
+    generate_case_reports(study, study.figure_dir)
+
+    ################################
+    # Domain Adaptation Comparison #
+    ################################
+    logger.opt(colors=True).info("<bold><magenta>DOMAIN ADAPTATION COMPARISON</magenta></bold>")
+    domain_adaptation_comparison(metrics_ds, study.figure_dir)
+
+    ##################
+    # TORAX-SPECIFIC #
+    ##################
+    logger.opt(colors=True).info("<bold><magenta>TORAX-SPECIFIC ANALYSIS</magenta></bold>")
+    torax_relaxation_report(study, metrics_ds, study.figure_dir)
 
 
 if __name__ == "__main__":

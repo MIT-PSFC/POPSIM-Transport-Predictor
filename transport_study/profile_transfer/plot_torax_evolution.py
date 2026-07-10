@@ -111,6 +111,82 @@ def _style_axis(ax):
     ax.grid(True, alpha=0.2, color=TEXT_COLOR)
 
 
+def plot_relaxation(
+    steps: list[dict],
+    coeffs: dict,
+    timeslice: xr.Dataset,
+    transport_model: str,
+    title_context: str,
+    plot_path: Path,
+    prescribed_names: set[str] | None = None,
+) -> Path:
+    """Render the recorded TORAX relaxation steps against the measured target profiles.
+
+    Args:
+        steps: Recorded TORAX states from ProfilePredictorTorax.evolve.
+        coeffs: Transport/source coefficients actually used, from evolve.
+        timeslice: The single-timeslice dataset the module was evaluated on.
+        transport_model: TORAX transport model name, for the title.
+        title_context: Shot / time description appended to the title.
+        plot_path: Where to save the figure.
+        prescribed_names: Coefficient names that were prescribed instead of NN-predicted.
+    """
+    prescribed_names = prescribed_names or set()
+
+    rho = timeslice["rho"].values
+    ne_targ = timeslice["ne20_rho"].values
+    te_targ = timeslice["Te_keV_rho"].values
+
+    fig, (ax_ne, ax_te) = plt.subplots(2, 1, figsize=(12, 10), sharex=True)
+    fig.patch.set_facecolor(BACKGROUND_COLOR)
+
+    def _coeff_label(name: str) -> str:
+        source = "prescribed" if name in prescribed_names else "NN"
+        return f"{name}={coeffs[name]:.2f} ({source})"
+
+    coeff_line = ", ".join(_coeff_label(name) for name in [*TRANSPORT_COEFFICIENT_NAMES[transport_model], "S_total"])
+    bc_line = ", ".join(_coeff_label(name) for name in ["n_e_right_bc", "T_e_right_bc"])
+    fig.suptitle(
+        f"TORAX profile relaxation ({transport_model}) - {title_context}\n{coeff_line}\n{bc_line}",
+        fontsize=TITLE_FONTSIZE - 4,
+        color=TEXT_COLOR,
+    )
+
+    # Start colormap above 0 so the earliest steps stay visible on the dark background
+    colors = cm.viridis(np.linspace(0.25, 1.0, len(steps)))
+    for i, step in enumerate(steps):
+        label = f"t={step['t'] * 1e3:.0f} ms"
+        ax_ne.plot(step["rho"], step["ne20"], color=colors[i], linewidth=2, label=label)
+        ax_te.plot(step["rho"], step["te_keV"], color=colors[i], linewidth=2, label=label)
+
+    ax_ne.plot(rho, ne_targ, color="white", linewidth=3, linestyle="--", label="Measured target")
+    ax_te.plot(rho, te_targ, color="white", linewidth=3, linestyle="--", label="Measured target")
+
+    ax_ne.set_ylabel(r"$n_e$ [$10^{20}$ m$^{-3}$]", fontsize=LABEL_FONTSIZE, color=TEXT_COLOR)
+    ax_te.set_ylabel(r"$T_e$ [keV]", fontsize=LABEL_FONTSIZE, color=TEXT_COLOR)
+    # TORAX evolves profiles on rho_norm, which for circular geometry equals the
+    # normalized minor radius, so both the TORAX steps and the measured targets are in rho.
+    ax_te.set_xlabel(r"$\rho$", fontsize=LABEL_FONTSIZE, color=TEXT_COLOR)
+
+    for ax in (ax_ne, ax_te):
+        _style_axis(ax)
+        ax.legend(
+            fontsize=LEGEND_FONTSIZE,
+            labelcolor=TEXT_COLOR,
+            facecolor=BACKGROUND_COLOR,
+            edgecolor=TEXT_COLOR,
+            ncols=2,
+            loc="upper right",
+        )
+
+    plot_path = Path(plot_path)
+    plot_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(plot_path, dpi=150, facecolor=fig.get_facecolor(), bbox_inches="tight")
+    plt.close(fig)
+    logger.info(f"Saved plot to {plot_path}")
+    return plot_path
+
+
 def plot_torax_evolution(
     dataset: str,
     shot: int,
@@ -151,59 +227,17 @@ def plot_torax_evolution(
     steps, coeffs = module.evolve(timeslice, prescribed=prescribed)
     logger.info(f"TORAX relaxation recorded {len(steps)} states (initial + {len(steps) - 1} steps)")
 
-    rho = timeslice["rho"].values
-    ne_targ = timeslice["ne20_rho"].values
-    te_targ = timeslice["Te_keV_rho"].values
-
-    fig, (ax_ne, ax_te) = plt.subplots(2, 1, figsize=(12, 10), sharex=True)
-    fig.patch.set_facecolor(BACKGROUND_COLOR)
-
-    def _coeff_label(name: str) -> str:
-        source = "prescribed" if name in prescribed_names else "NN"
-        return f"{name}={coeffs[name]:.2f} ({source})"
-
-    coeff_line = ", ".join(_coeff_label(name) for name in [*TRANSPORT_COEFFICIENT_NAMES[transport_model], "S_total"])
-    bc_line = ", ".join(_coeff_label(name) for name in ["n_e_right_bc", "T_e_right_bc"])
-    fig.suptitle(
-        f"TORAX profile relaxation ({transport_model}) - shot {shot} @ t={time_s:.3f}s (time_idx {timestep})\n{coeff_line}\n{bc_line}",
-        fontsize=TITLE_FONTSIZE - 4,
-        color=TEXT_COLOR,
-    )
-
-    # Start colormap above 0 so the earliest steps stay visible on the dark background
-    colors = cm.viridis(np.linspace(0.25, 1.0, len(steps)))
-    for i, step in enumerate(steps):
-        label = f"t={step['t'] * 1e3:.0f} ms"
-        ax_ne.plot(step["rho"], step["ne20"], color=colors[i], linewidth=2, label=label)
-        ax_te.plot(step["rho"], step["te_keV"], color=colors[i], linewidth=2, label=label)
-
-    ax_ne.plot(rho, ne_targ, color="white", linewidth=3, linestyle="--", label="Measured target")
-    ax_te.plot(rho, te_targ, color="white", linewidth=3, linestyle="--", label="Measured target")
-
-    ax_ne.set_ylabel(r"$n_e$ [$10^{20}$ m$^{-3}$]", fontsize=LABEL_FONTSIZE, color=TEXT_COLOR)
-    ax_te.set_ylabel(r"$T_e$ [keV]", fontsize=LABEL_FONTSIZE, color=TEXT_COLOR)
-    # TORAX evolves profiles on rho_norm, which for circular geometry equals the
-    # normalized minor radius, so both the TORAX steps and the measured targets are in rho.
-    ax_te.set_xlabel(r"$\rho$", fontsize=LABEL_FONTSIZE, color=TEXT_COLOR)
-
-    for ax in (ax_ne, ax_te):
-        _style_axis(ax)
-        ax.legend(
-            fontsize=LEGEND_FONTSIZE,
-            labelcolor=TEXT_COLOR,
-            facecolor=BACKGROUND_COLOR,
-            edgecolor=TEXT_COLOR,
-            ncols=2,
-            loc="upper right",
-        )
-
     out_dir = Path(output_dir) if output_dir is not None else Path.cwd()
-    out_dir.mkdir(parents=True, exist_ok=True)
     plot_path = out_dir / f"torax_evolution_{transport_model}_{Path(dataset).stem}_{shot}_ts{timestep}.png"
-    fig.savefig(plot_path, dpi=150, facecolor=fig.get_facecolor(), bbox_inches="tight")
-    plt.close(fig)
-    logger.info(f"Saved plot to {plot_path}")
-    return plot_path
+    return plot_relaxation(
+        steps,
+        coeffs,
+        timeslice,
+        transport_model,
+        title_context=f"shot {shot} @ t={time_s:.3f}s (time_idx {timestep})",
+        plot_path=plot_path,
+        prescribed_names=prescribed_names,
+    )
 
 
 if __name__ == "__main__":
