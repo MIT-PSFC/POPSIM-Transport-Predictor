@@ -107,6 +107,12 @@ class ProfilePredictorTRB(TrainRunBuilder):
             batch_size=dataloader_config.get("batch_size", None),
             shuffle=[True, False],
             convert_xr_to_jnp=False,  # Needed to keep the coords for calculating loss
+            # Keep every batch the same shape to avoid an extra XLA compilation
+            # for the final partial batch, which is expensive for TORAX models.
+            # Train drops the ragged tail (reshuffled every epoch, so no data is
+            # permanently lost), val pads it and consumers trim the duplicates.
+            drop_last=[True, False],
+            pad_last=[False, True],
         )
         # Running test evaluation on the validation set, since we don't need a dedicated test set
         # In the no domain adaptation case, we are hyperparameter tuning on all historic data, pick the best one and test on it
@@ -480,11 +486,25 @@ class ProfilePredictorTRB(TrainRunBuilder):
         loss_config = suite_config["loss_config"]
         loss_fn = ProfilePredictorTRB.get_val_loss_fn(loss_config)
 
+        # A fresh closure per suite, jitted once here, so the compiled forward
+        # persists across every validation of this training run while its
+        # cache stays isolated from other cases in the same process. Equinox
+        # keys eqx.filter_jit's cache off the wrapped function's identity, so
+        # jitting the shared module level batched_model_eval_and_loss
+        # directly would let unrelated cases collide in the same cache
+        # entry, which can raise instead of just triggering a retrace (for
+        # example an xarray attrs dict with a multi-element numpy array
+        # value does not compare cleanly with ==)
+        def _eval_and_loss(model, loss_fn, inputs, targets):
+            return batched_model_eval_and_loss(model, loss_fn, inputs, targets)
+
+        jit_eval_and_loss = eqx.filter_jit(_eval_and_loss)
+
         def eval_fn(inp: EvalData) -> float:
             loss_vecs = []
             for batch in inp.dataloader:
                 inputs, targets = batch.get_inputs_and_targets()
-                loss_vec = batched_model_eval_and_loss(
+                loss_vec = jit_eval_and_loss(
                     inp.model,
                     loss_fn,
                     inputs,
@@ -492,6 +512,8 @@ class ProfilePredictorTRB(TrainRunBuilder):
                 )
                 loss_vecs.append(loss_vec)
             loss_vec = jnp.concatenate(loss_vecs)
+            # Drop padded duplicate samples from the pad_last validation dataloader
+            loss_vec = loss_vec[: inp.dataloader.dataset.n_samples]
             loss_vec_mean = loss_vec.mean()
             # Sort loss vec and sample at most 100 points evenly for logging
             if loss_vec.shape[0] > 100:
