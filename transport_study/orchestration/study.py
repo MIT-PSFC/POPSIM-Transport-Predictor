@@ -4,7 +4,6 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
-import wandb
 import yaml
 from loguru import logger
 from popsim.ml import DataLoader, TrainConfig, Trainer
@@ -15,6 +14,7 @@ from popsim.ml.launch import (
 )
 from popsim.ml.train_config import load_dict
 
+import wandb
 from transport_study import PACKAGE_ROOT
 from transport_study.config import config
 from transport_study.orchestration.slurm_utils import (
@@ -287,7 +287,7 @@ class Study:
             return True
         completed_runs = get_completed_runs(self.wandb_project_name(case))
         if len(completed_runs) < config.hyperparam_sweeps:
-            logger.info(f"Hyperparameter sweeps incomplete\n{len(completed_runs)}/{config.hyperparam_sweeps} runs")
+            logger.info(f"Hyperparameter sweeps incomplete ({len(completed_runs)}/{config.hyperparam_sweeps} runs)")
             if enable_parallelism and not resources_available():
                 logger.debug("No resources currently available for sweep agents, waiting before trying again...")
                 return False
@@ -399,7 +399,7 @@ class Study:
                     sweep_id,
                     kwargs_agent,
                     agent_job_name,
-                    Path(self.result_dir) / "logs_sweep",
+                    Path(self.log_dir) / "logs_sweep",
                 )
         else:
             logger.info("Launching agent serially")
@@ -425,13 +425,13 @@ class Study:
             attempts = 0
         self.train_attempt_epochs[str(case)] = latest_epoch
         if attempts >= MAX_TRAIN_ATTEMPTS:
-            train_log_path = Path(self.result_dir) / "logs" / f"{self.train_job_name(case)}.log"
+            train_log_path = Path(self.log_dir) / "logs_train" / f"{self.train_job_name(case)}.log"
             summary = (
                 f"ABORTING STUDY: case failed training {attempts} times without producing a result.\n"
                 f"Case:      {case}\n"
                 f"Job name:  {self.train_job_name(case)}\n"
                 f"Train log: {train_log_path}\n"
-                f"(log holds the last attempt only - each resubmission truncates it)\n"
+                f"(attempts append to the same log, separated by '=== ... job <id> start ===' lines)\n"
                 f"Other unfinished cases were not attempted further. Fix the case or remove it, then rerun."
             )
             logger.critical(summary)
@@ -458,7 +458,7 @@ class Study:
                 train_config,
                 train_job_name,
                 result_path,
-                Path(self.result_dir) / "logs",
+                Path(self.log_dir) / "logs_train",
             )
         else:
             logger.info("Launching training serially")
@@ -525,6 +525,7 @@ class Study:
         self.model_dir = self.working_dir / "models"
         self.result_dir = self.working_dir / "results"
         self.figure_dir = self.working_dir / "figures"
+        self.log_dir = self.working_dir / "logs"
 
         self.working_dir.mkdir(parents=True, exist_ok=True)
 
@@ -544,7 +545,8 @@ class Study:
         else:
             config.save(config_path)
 
-        log_path = self.working_dir / "logs" / f"{os.getpid()}_run_study.log"
+        self.log_dir.mkdir(parents=True, exist_ok=True)
+        log_path = self.log_dir / f"{os.getpid()}_run_study.log"
         logger.add(log_path)
 
         logger.info("INITIALIZING STUDY")

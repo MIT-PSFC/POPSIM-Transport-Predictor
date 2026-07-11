@@ -263,6 +263,10 @@ Path({str(study_config_path)!r}).unlink()
 #SBATCH --exclude=node2301,node2101
 #SBATCH --output={log_path}
 #SBATCH --error={log_path}
+#SBATCH --open-mode=append
+
+# Resubmitted attempts share this log path, mark where each one starts
+echo "=== $(date) job $SLURM_JOB_ID ({job_name}) start ==="
 
 # Save results to netcdf only; no need to sync wandb runs online from batch jobs
 export WANDB_MODE=offline
@@ -329,7 +333,7 @@ from pathlib import Path
 from popsim.ml import TrainConfig
 from popsim.ml.launch import launch_agent
 {_config_reload_script(study_config_path)}
-with open({config_path!r}) as f:
+with open({str(config_path)!r}) as f:
     train_config = TrainConfig(**yaml.safe_load(f))
 
 launch_agent(
@@ -337,7 +341,7 @@ launch_agent(
     {sweep_id!r},
     kwargs_agent={kwargs_agent!r},
 )
-Path({config_path!r}).unlink()
+Path({str(config_path)!r}).unlink()
 Path({str(study_config_path)!r}).unlink()
 """
 
@@ -428,6 +432,10 @@ Path({study_config_path!r}).unlink()
 #SBATCH --export=ALL
 #SBATCH --output={log_path}
 #SBATCH --error={log_path}
+#SBATCH --open-mode=append
+
+# Resubmitted attempts share this log path, mark where each one starts
+echo "=== $(date) job $SLURM_JOB_ID ({job_name}) start ==="
 
 export MPLBACKEND=Agg
 {sys.executable} {script_path}
@@ -461,6 +469,9 @@ def launch_trajopt_case_parallel(
     case_str = str(case)
 
     py_script = f"""\
+# init_kwargs contains Path objects whose repr is PosixPath('...')
+from pathlib import PosixPath  # noqa: F401
+
 from transport_study.trajectory_optimization.optimize import TrajectoryOptimization
 
 trajopt = TrajectoryOptimization(**{init_kwargs!r})
@@ -491,6 +502,10 @@ if not trajopt.output_path(case).exists():
 #SBATCH --exclude=node2301,node2101
 #SBATCH --output={log_path}
 #SBATCH --error={log_path}
+#SBATCH --open-mode=append
+
+# Resubmitted attempts share this log path, mark where each one starts
+echo "=== $(date) job $SLURM_JOB_ID ({job_name}) start ==="
 
 export WANDB_MODE=offline
 {sys.executable} {script_path}

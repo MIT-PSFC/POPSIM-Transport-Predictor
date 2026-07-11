@@ -405,7 +405,7 @@ class ProfileStudy(Study):
                         continue  # Can't train from nothing with 0 target shots
                 elif num_target_shots != HYPERPARAM_TARGET_SHOTS:
                     continue  # Invalid case, skip
-            if model_type in ("unstructured_nn", "reservoir") and not freeze_shapes:
+            if model_type in ("unstructured_nn", "reservoir", "torax-constant", "torax-cgm", "torax-gyrobohm") and not freeze_shapes:
                 continue  # No shapes to freeze, just do one of the two
 
             case = self.Case(
