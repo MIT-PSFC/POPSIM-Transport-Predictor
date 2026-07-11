@@ -1,4 +1,3 @@
-import time
 from dataclasses import dataclass
 from itertools import product
 from pathlib import Path
@@ -1058,23 +1057,7 @@ def run_study(
     else:
         logger.opt(colors=True).info("<bold><magenta>ORCHESTRATION</magenta></bold>")
 
-        # Unfinished cases are those we have data to run but haven't gotten results for yet
-        unfinished_cases = [case for case in study.cases if not study.result_path(case).exists() and study.check_data_requirements(case)]
-        while len(unfinished_cases) > 0:
-            logger.opt(colors=True).info(f"<<bold><green>{len(unfinished_cases)} cases remain</green></bold>>")
-            for case in unfinished_cases:
-                # TODO(ZanderKeith): Duplicates are happening somehow, but going fast
-                if not study.result_path(case).exists():
-                    study.run_case(
-                        case,
-                        skip_tuning=skip_tuning,
-                        enable_parallelism=enable_parallelism,
-                    )
-
-            # Check which cases are still unfinished
-            unfinished_cases = [case for case in unfinished_cases if not study.result_path(case).exists()]
-            # Sleep for a bit before checking again to avoid spamming slurm
-            time.sleep(8)
+        study.run_unfinished_cases(skip_tuning=skip_tuning, enable_parallelism=enable_parallelism)
 
         ds_final = study.collect_results()
         ds_final.to_netcdf(study.collected_results_path())

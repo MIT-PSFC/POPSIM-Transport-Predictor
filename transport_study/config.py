@@ -54,6 +54,9 @@ class StudyConfig(BaseModel):
     analysis_partition: str | None = Field(default_factory=lambda: os.environ.get("PTPS_ANALYSIS_PARTITION"))
     # SLURM walltime request for analysis jobs, sbatch --time format
     analysis_time_limit: str = Field(default_factory=lambda: os.environ.get("PTPS_ANALYSIS_TIME_LIMIT", "07:59:59"))
+    # Cap on this study's concurrent (running + pending) analysis jobs, so a study
+    # with hundreds of cases doesn't flood the queue with pending jobs at once
+    max_analysis_jobs: int = Field(default_factory=lambda: int(os.environ.get("PTPS_MAX_ANALYSIS_JOBS", "20")))
     # SLURM walltime request for training and agent jobs, sbatch --time format
     train_time_limit: str = Field(default_factory=lambda: os.environ.get("PTPS_TRAIN_TIME_LIMIT", "07:59:59"))
     # In-job wall-clock training budget in seconds. Set below the SLURM limit so the

@@ -45,8 +45,6 @@ parameters:
         distribution: uniform
         min: 0.5
         max: 0.999
-      batch_size:
-        values: 2048
   loss_config:
     parameters:
       # Deltas act on peak-normalized profiles, so they read as fractional errors.

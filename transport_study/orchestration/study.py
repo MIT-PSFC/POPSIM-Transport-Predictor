@@ -20,6 +20,7 @@ from transport_study.config import config
 from transport_study.orchestration.slurm_utils import (
     count_idle_gpus,
     count_running_jobs,
+    get_running_job_names,
     launch_agent_parallel,
     launch_train_parallel,
     resources_available,
@@ -38,6 +39,9 @@ CONFIG_LOCK_FILENAME = "config_lock.toml"
 # time ~10 min at a go. Abort the whole run once a single case has been launched
 # this many times without producing a result file
 MAX_TRAIN_ATTEMPTS = 3
+
+# How long the orchestration loop sleeps between passes over the unfinished cases
+ORCHESTRATION_POLL_INTERVAL_S = 8
 
 
 class Study:
@@ -184,8 +188,59 @@ class Study:
             if not self.result_path(case).exists():
                 if not self.check_data_requirements(case):
                     logger.debug(f"Case {case} is missing required data, skipping.")
+                    continue
                 unfinished.append(case)
         return unfinished
+
+    def case_in_flight(self, case: Case, running_job_names: set[str]) -> bool:
+        """Whether a training job for this case is running or pending.
+
+        Deliberately ignores sweep agent jobs: a hyperparam case with agents
+        running may still need more agents launched (launch_sweep tops up to
+        the remaining trial count), so it must stay eligible for pickup.
+        """
+        return self.train_job_name(case) in running_job_names
+
+    def run_unfinished_cases(self, skip_tuning: bool, enable_parallelism: bool):
+        """Loop until every runnable case has a result file.
+
+        Each pass takes one squeue snapshot of this user's job names, then only
+        picks up cases that are actually able to run: prereq results on disk
+        and no job for the case already in flight. Blocked and in-flight cases
+        are counted in a single per-pass summary line instead of being visited
+        (and logged about) individually. Prereqs are themselves cases in
+        self.cases, so a blocked case becomes runnable once its prereq case
+        finishes; nothing needs to recurse into prereq chains here.
+        """
+        unfinished = self.get_unfinished_cases()
+        while unfinished:
+            if enable_parallelism:
+                running_job_names = get_running_job_names(config.partition)
+                if running_job_names is None:
+                    logger.warning("Could not query SLURM job state, waiting before trying again...")
+                    time.sleep(ORCHESTRATION_POLL_INTERVAL_S)
+                    continue
+            else:
+                running_job_names = set()
+
+            runnable = [case for case in unfinished if self.check_prereq_satisfied(case)]
+            in_flight = [case for case in runnable if self.case_in_flight(case, running_job_names)]
+            to_launch = [case for case in runnable if not self.case_in_flight(case, running_job_names)]
+            n_blocked = len(unfinished) - len(runnable)
+            logger.opt(colors=True).info(
+                f"<bold><green>{len(unfinished)} cases remain</green></bold> "
+                f"({len(in_flight)} in flight, {len(to_launch)} ready to launch, {n_blocked} blocked on prereqs)"
+            )
+
+            for case in to_launch:
+                if enable_parallelism and not resources_available():
+                    logger.info(f"No idle resources, holding {len(to_launch)} ready cases until the next pass")
+                    break
+                self.run_case(case, skip_tuning=skip_tuning, enable_parallelism=enable_parallelism)
+
+            # Sleep for a bit before checking again to avoid spamming slurm
+            time.sleep(ORCHESTRATION_POLL_INTERVAL_S)
+            unfinished = [case for case in unfinished if not self.result_path(case).exists()]
 
     def run_case(
         self,
@@ -209,32 +264,34 @@ class Study:
 
     def _run_ready_case(self, case: Case, skip_tuning: bool, enable_parallelism: bool):
         """Execute a case whose prereqs are satisfied."""
-        if enable_parallelism and not resources_available():
-            logger.info("No resources currently available, waiting before trying again...")
-            time.sleep(10)
-            return
-        logger.opt(colors=True).info(f"<bold><cyan>RUNNING CASE:</cyan></bold>\n{case}")
         if case.is_hyperparam_case() and not self._ensure_hyperparams_ready(case, skip_tuning, enable_parallelism):
             return
         if not self._no_blocking_jobs(case, enable_parallelism):
-            logger.debug("Blocking jobs still running, waiting before trying again...")
+            logger.debug(f"Jobs already in flight for case {case}, waiting before trying again...")
             return
+        if enable_parallelism and not resources_available():
+            logger.debug("No resources currently available, waiting before trying again...")
+            return
+        logger.opt(colors=True).info(f"<bold><cyan>RUNNING CASE:</cyan></bold>\n{case}")
         self.launch_train(case, enable_parallelism=enable_parallelism)
 
     def _ensure_hyperparams_ready(self, case: Case, skip_tuning: bool, enable_parallelism: bool) -> bool:
         """Ensure tuned config exists. Returns True if ready to proceed to training."""
-        if skip_tuning:
-            logger.info("Skipping hyperparameter tuning")
-            self._write_tuned_config(case, self.make_train_config(case))
-            return True
         tuned_config_path = self.tuned_config_path(case)
         if tuned_config_path.exists():
-            logger.info(f"Hyperparameter tuning completed, tuned config found at {tuned_config_path}")
+            logger.debug(f"Tuned config found at {tuned_config_path}")
+            return True
+        if skip_tuning:
+            logger.info(f"Skipping hyperparameter tuning, writing default config for {case}")
+            self._write_tuned_config(case, self.make_train_config(case))
             return True
         completed_runs = get_completed_runs(self.wandb_project_name(case))
         if len(completed_runs) < config.hyperparam_sweeps:
             logger.info(f"Hyperparameter sweeps incomplete\n{len(completed_runs)}/{config.hyperparam_sweeps} runs")
-            self.launch_sweep(case, enable_parallelism=enable_parallelism)
+            if enable_parallelism and not resources_available():
+                logger.debug("No resources currently available for sweep agents, waiting before trying again...")
+                return False
+            self.launch_sweep(case, enable_parallelism=enable_parallelism, n_completed_runs=len(completed_runs))
             return False
         return self._finalize_sweep(case, enable_parallelism, completed_runs)
 
@@ -242,11 +299,20 @@ class Study:
         """Save best config once sweep runs are done. Returns True if ready."""
         logger.info(f"Hyperparameter sweeps completed with {len(completed_runs)}/{config.hyperparam_sweeps} runs")
         if enable_parallelism:
-            running_jobs = count_running_jobs(self.sweep_job_name(case), config.partition)
+            # Sweep trials run inside agent jobs, so poll the agent job name.
+            # Picking the best config while agents still run would ignore
+            # their trials (and the last trials are often the best ones)
+            running_jobs = count_running_jobs(self.agent_job_name(case), config.partition)
             if running_jobs > 0:
-                logger.info(f"Found {running_jobs} running jobs, waiting for them to complete before proceeding")
+                logger.info(f"Found {running_jobs} running agent jobs, waiting for them to complete before proceeding")
                 return False
         best_train_config = get_best_train_config(self.wandb_project_name(case))
+        if best_train_config is None:
+            raise RuntimeError(
+                f"Hyperparameter sweep for case {case} reports {len(completed_runs)} completed runs "
+                f"but no best config could be recovered from wandb project {self.wandb_project_name(case)}. "
+                "Check the project for runs missing the val/loss.mean summary metric."
+            )
         self._write_tuned_config(case, best_train_config)
         logger.success(f"Saved best hyperparameter config for {case}")
         return True
@@ -284,8 +350,15 @@ class Study:
                 )
                 return
 
-    def launch_sweep(self, case: Case, enable_parallelism: bool = False):
-        """Launch a wandb hyperparameter sweep for the given case."""
+    def launch_sweep(self, case: Case, enable_parallelism: bool = False, n_completed_runs: int = 0):
+        """Launch a wandb hyperparameter sweep for the given case.
+
+        With parallelism, launches at most as many agent jobs as sweep trials
+        still outstanding (hyperparam_sweeps - completed - agents already
+        running), capped by idle GPUs. Without the outstanding-trial cap the
+        orchestration loop would submit another batch of agents every pass
+        until the queue filled, far past the requested trial count.
+        """
         train_config = self.make_train_config(case)
         # Remove the test_eval_suite_config since that's for final results only.
         # Trials get the same wall-clock budget as production jobs, making the
@@ -311,7 +384,14 @@ class Study:
 
         if enable_parallelism:
             agent_job_name = self.agent_job_name(case)
-            sweep_jobs = count_idle_gpus(config.partition, config.buffer_gpus)
+            running_agents = count_running_jobs(agent_job_name, config.partition)
+            # Each agent runs exactly one trial (count=1), so outstanding trials
+            # bound how many more agents are worth submitting
+            outstanding_trials = config.hyperparam_sweeps - n_completed_runs - running_agents
+            sweep_jobs = min(count_idle_gpus(config.partition, config.buffer_gpus), max(outstanding_trials, 0))
+            if sweep_jobs <= 0:
+                logger.debug(f"No agent jobs needed for case {case} ({running_agents} agents already running)")
+                return
             logger.info(f"Launching {sweep_jobs} agent job(s) {agent_job_name} for case\n{case}")
             for _ in range(sweep_jobs):
                 launch_agent_parallel(

@@ -45,8 +45,6 @@ parameters:
       # Activation memory scales linearly with batch size because every sample
       # runs a differentiated multi-step TORAX simulation under vmap. No
       # full-batch option for that reason.
-      batch_size:
-        values: 2048
   loss_config:
     parameters:
       # Deltas act on peak-normalized profiles, so they read as fractional errors.

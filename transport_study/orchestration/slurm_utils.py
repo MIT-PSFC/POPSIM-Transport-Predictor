@@ -86,6 +86,38 @@ def count_running_jobs(job_name: str, partition: str | None = None) -> int:
     return len(result.stdout.strip().split("\n")) if result.stdout.strip() else 0
 
 
+def get_running_job_names(partition: str | None = None) -> set[str] | None:
+    """Names of this user's running and pending jobs on the partition, in one squeue call.
+
+    Orchestration loops poll job state for every case each pass. One squeue
+    call returning all names (checked by set membership) replaces hundreds of
+    per-case squeue calls. Returns None when squeue fails, so callers can tell
+    "no jobs" apart from "scheduler unreachable" and hold off launching.
+    """
+    if partition is None:
+        partition = config.partition
+    result = subprocess.run(
+        [
+            "squeue",
+            "-p",
+            partition,
+            "-u",
+            getpass.getuser(),
+            "--state=RUNNING,PENDING",
+            "--noheader",
+            # Default %j truncates long names, and case names run long
+            "--format=%512j",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        logger.critical(f"squeue failed: {result.stderr}")
+        return None
+    return {line.strip() for line in result.stdout.splitlines() if line.strip()}
+
+
 def count_idle_gpus(partition: str | None = None, buffer_gpus: int | None = None) -> int:
     """Count the number of idle GPUs on this partition."""
     if partition is None:
