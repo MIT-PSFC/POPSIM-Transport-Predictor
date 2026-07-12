@@ -833,7 +833,8 @@ class PowerBalanceStudy(Study):
             )
             results.append(result)
 
-        ds_merged = xr.concat(results, dim="case_idx")
+        # coords="different" stacks the per-case scalar coords along case_idx
+        ds_merged = xr.concat(results, dim="case_idx", coords="different")
         return ds_merged
 
 

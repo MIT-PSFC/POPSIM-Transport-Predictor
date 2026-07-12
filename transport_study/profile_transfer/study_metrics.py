@@ -425,7 +425,8 @@ def collect_metrics(study) -> xr.Dataset:
         logger.warning("No finished cases with valid metrics, stage-resolved metrics are empty")
         return xr.Dataset()
 
-    metrics_ds = xr.concat(results, dim="case_idx")
+    # coords="different" stacks the per-case scalar coords (model_type, ...)
+    metrics_ds = xr.concat(results, dim="case_idx", coords="different")
     cache_path.parent.mkdir(parents=True, exist_ok=True)
     metrics_ds.to_netcdf(cache_path)
     logger.info(f"Saved stage-resolved metrics to {cache_path}")
