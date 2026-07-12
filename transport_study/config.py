@@ -27,6 +27,14 @@ def _env_dataset_paths() -> dict[str, Path]:
     return {k: Path(v) for k, v in json.loads(os.environ.get("PTPS_DATASET_PATHS", "{}")).items()}
 
 
+def _env_spillover_partitions() -> tuple[str, ...]:
+    """Parse PTPS_SPILLOVER_PARTITIONS, a comma-separated ordered list of
+    partitions, e.g. "mit_preemptable,mit_normal_gpu"
+    """
+    raw = os.environ.get("PTPS_SPILLOVER_PARTITIONS", "")
+    return tuple(p.strip() for p in raw.split(",") if p.strip())
+
+
 # Main config for environment variables
 class StudyConfig(BaseModel):
     # Shared between all studies
@@ -64,6 +72,20 @@ class StudyConfig(BaseModel):
     # resumes from that checkpoint. 27000 s = 7.5 h
     train_wall_budget_s: int = Field(default_factory=lambda: int(os.environ.get("PTPS_TRAIN_WALL_BUDGET_S", "27000")))
     buffer_gpus: int | None = Field(default_factory=lambda: int(os.environ.get("PTPS_BUFFER_GPUS", "12")))
+    # Overflow partitions for GPU jobs once `partition` has no idle GPUs beyond
+    # buffer_gpus, tried in order. Jobs submitted there can be preempted
+    # (requeued) at any time, so training relies on resume-from-checkpoint.
+    # Submissions per partition are capped at its per-user GPU allowance
+    # (QOS MaxTRESPU gres/gpu) so jobs don't pile up pending behind a QOS cap.
+    # Empty disables spillover
+    spillover_partitions: tuple[str, ...] = Field(default_factory=_env_spillover_partitions)
+    # Ceiling on this user's total running + pending jobs across all partitions.
+    # Default matches the mit_preemptable QOS MaxSubmitPU (448), the tightest of
+    # the limits that apply (association MaxSubmit is 500)
+    max_user_jobs: int = Field(default_factory=lambda: int(os.environ.get("PTPS_MAX_USER_JOBS", "448")))
+    # Spillover submissions stop once total jobs reach max_user_jobs - this headroom,
+    # leaving slack for analysis jobs and interactive work
+    spillover_job_headroom: int = Field(default_factory=lambda: int(os.environ.get("PTPS_SPILLOVER_JOB_HEADROOM", "10")))
     wandb_entity: str | None = Field(default_factory=lambda: os.environ.get("PTPS_WANDB_ENTITY"))
     scratch_dir: Path | None = (
         None  # TODO(ZanderKeith): Only used for intermediate results from trajectory optimization, can be put in that study config instead

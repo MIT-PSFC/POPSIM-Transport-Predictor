@@ -1,3 +1,4 @@
+import functools
 import getpass
 import inspect
 import re
@@ -61,10 +62,25 @@ def _config_reload_script(study_config_path: Path) -> str:
     return code_str
 
 
+def query_partitions() -> str:
+    """Comma-separated partition list for squeue queries tracking this study's jobs.
+
+    Covers the primary partition plus the spillover partitions when configured,
+    so in-flight checks see jobs regardless of where they were submitted.
+    squeue -p accepts a comma-separated list.
+    """
+    partitions = [config.partition, *config.spillover_partitions]
+    return ",".join(p for p in partitions if p)
+
+
 def count_running_jobs(job_name: str, partition: str | None = None) -> int:
-    """Run squeue to list running jobs on the partition with the specific name"""
+    """Run squeue to list running jobs on the partition(s) with the specific name.
+
+    Defaults to the primary plus spillover partitions so a case whose job
+    spilled over still counts as in flight.
+    """
     if partition is None:
-        partition = config.partition
+        partition = query_partitions()
     result = subprocess.run(
         [
             "squeue",
@@ -87,15 +103,16 @@ def count_running_jobs(job_name: str, partition: str | None = None) -> int:
 
 
 def get_running_job_names(partition: str | None = None) -> set[str] | None:
-    """Names of this user's running and pending jobs on the partition, in one squeue call.
+    """Names of this user's running and pending jobs, in one squeue call.
 
     Orchestration loops poll job state for every case each pass. One squeue
     call returning all names (checked by set membership) replaces hundreds of
     per-case squeue calls. Returns None when squeue fails, so callers can tell
     "no jobs" apart from "scheduler unreachable" and hold off launching.
+    Defaults to the primary plus spillover partitions.
     """
     if partition is None:
-        partition = config.partition
+        partition = query_partitions()
     result = subprocess.run(
         [
             "squeue",
@@ -182,6 +199,184 @@ def resources_available(partition: str | None = None, buffer_gpus: int | None = 
     return idle_gpus > pending_jobs
 
 
+def count_user_jobs() -> int:
+    """This user's running + pending jobs across all partitions.
+
+    Every job counts toward the association/QOS MaxSubmit ceilings no matter
+    which partition it went to, so the spillover budget is based on this total.
+    """
+    result = subprocess.run(
+        [
+            "squeue",
+            "-u",
+            getpass.getuser(),
+            "--state=RUNNING,PENDING",
+            "--noheader",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        logger.critical(f"squeue failed: {result.stderr}")
+        return 999999  # Return a large number to prevent launching more jobs if squeue fails
+    return len(result.stdout.strip().split("\n")) if result.stdout.strip() else 0
+
+
+@functools.cache
+def _partition_info(partition: str) -> dict[str, str]:
+    """key=value fields from scontrol show partition. Partition limits are
+    static for the lifetime of a study run, so results are cached."""
+    result = subprocess.run(
+        ["scontrol", "show", "partition", partition],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        logger.warning(f"scontrol show partition {partition} failed: {result.stderr}")
+        return {}
+    return dict(token.split("=", 1) for token in result.stdout.split() if "=" in token)
+
+
+@functools.cache
+def partition_user_gpu_cap(partition: str) -> int | None:
+    """Per-user GPU cap on a partition (its QOS MaxTRESPU gres/gpu), None if uncapped.
+
+    E.g. mit_preemptable's QOS allows 4 running GPUs per user, mit_normal_gpu's
+    allows 2. Submitting more jobs than this just parks them pending on the QOS
+    limit, so the spillover logic treats it as that partition's submission cap.
+    """
+    qos = _partition_info(partition).get("QoS")
+    if qos in (None, "N/A"):
+        return None
+    result = subprocess.run(
+        ["sacctmgr", "-nP", "show", "qos", qos, "format=MaxTRESPU"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        logger.warning(f"sacctmgr show qos {qos} failed: {result.stderr}")
+        return None
+    match = re.search(r"gres/gpu=(\d+)", result.stdout)
+    return int(match.group(1)) if match else None
+
+
+def parse_slurm_time_s(time_str: str | None) -> int | None:
+    """Seconds from a SLURM time string like 06:00:00 or 2-00:00:00, None if unlimited."""
+    if not time_str or time_str.upper() in ("UNLIMITED", "NONE", "N/A"):
+        return None
+    days = 0
+    if "-" in time_str:
+        day_str, time_str = time_str.split("-", 1)
+        days = int(day_str)
+    parts = [int(p) for p in time_str.split(":")]
+    while len(parts) < 3:
+        parts.insert(0, 0)
+    hours, minutes, seconds = parts
+    return ((days * 24 + hours) * 60 + minutes) * 60 + seconds
+
+
+def format_slurm_time(seconds: int) -> str:
+    hours, rem = divmod(seconds, 3600)
+    minutes, secs = divmod(rem, 60)
+    return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+
+
+def partition_time_limit_s(partition: str) -> int | None:
+    """Partition MaxTime in seconds, None if unlimited or unknown."""
+    return parse_slurm_time_s(_partition_info(partition).get("MaxTime"))
+
+
+def count_user_gpus(partition: str) -> int:
+    """This user's allocated + requested GPUs among running and pending jobs on a partition."""
+    result = subprocess.run(
+        [
+            "squeue",
+            "-p",
+            partition,
+            "-u",
+            getpass.getuser(),
+            "--state=RUNNING,PENDING",
+            "--noheader",
+            "-O",
+            "tres-alloc:200",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        logger.critical(f"squeue failed: {result.stderr}")
+        return 999999  # Return a large number to prevent launching more jobs if squeue fails
+    # Generic gres/gpu=N only; the typed gres/gpu:<type>=N entry would double count
+    return sum(int(n) for n in re.findall(r"gres/gpu=(\d+)", result.stdout))
+
+
+def spillover_budget() -> int:
+    """Jobs still submittable anywhere before hitting the user-wide MaxSubmit ceiling."""
+    if not config.spillover_partitions:
+        return 0
+    return max(config.max_user_jobs - config.spillover_job_headroom - count_user_jobs(), 0)
+
+
+def spillover_slots(partition: str) -> int:
+    """Jobs still worth submitting to this spillover partition right now.
+
+    Capped by the partition's per-user GPU allowance when its QOS has one
+    (assumes one GPU per job, which matches every template here). Without a
+    cap, only submit what could start immediately, so an unbounded partition
+    doesn't accumulate a deep pending queue either.
+    """
+    cap = partition_user_gpu_cap(partition)
+    if cap is not None:
+        return max(cap - count_user_gpus(partition), 0)
+    idle = count_idle_gpus(partition, buffer_gpus=0)
+    pending = count_pending_jobs(partition)
+    return max(idle - pending, 0)
+
+
+def pick_partition() -> str | None:
+    """Partition the next GPU job should go to, or None to hold off launching.
+
+    The primary partition wins while it has idle GPUs beyond buffer_gpus.
+    Otherwise the spillover partitions are tried in configured order, each
+    limited to its own slot count, all limited by the user-wide job ceiling.
+    """
+    if resources_available():
+        return config.partition
+    if spillover_budget() <= 0:
+        return None
+    for spillover in config.spillover_partitions:
+        if spillover_slots(spillover) > 0:
+            return spillover
+    return None
+
+
+def clamp_time_for_partition(partition: str, train_config: TrainConfig) -> tuple[str, TrainConfig]:
+    """sbatch --time and in-job wall budget fitted to the partition's MaxTime.
+
+    Some spillover partitions cap walltime below train_time_limit
+    and reject over-limit requests outright.
+    The in-job budget shrinks by the same amount, preserving the
+    margin the trainer needs to checkpoint and exit before SLURM kills the job.
+    """
+    requested_s = parse_slurm_time_s(config.train_time_limit)
+    limit_s = partition_time_limit_s(partition)
+    if requested_s is None or limit_s is None or limit_s >= requested_s:
+        return config.train_time_limit, train_config
+    checkpoint_margin_s = max(requested_s - config.train_wall_budget_s, 0)
+    clamped_budget_s = float(max(limit_s - checkpoint_margin_s, 600))
+    if train_config.max_wall_seconds is not None:
+        clamped_budget_s = min(clamped_budget_s, train_config.max_wall_seconds)
+    logger.info(
+        f"Partition {partition} MaxTime {format_slurm_time(limit_s)} is below the requested "
+        f"{config.train_time_limit}, clamping job time and wall budget ({clamped_budget_s:.0f} s)"
+    )
+    return format_slurm_time(limit_s), train_config.model_copy(update={"max_wall_seconds": clamped_budget_s})
+
+
 def launch_train_parallel(
     train_config: TrainConfig,
     job_name: str,
@@ -200,6 +395,7 @@ def launch_train_parallel(
     """
     if partition is None:
         partition = config.partition
+    time_limit, train_config = clamp_time_for_partition(partition, train_config)
     # All temp files must live on the shared filesystem (not /tmp which is
     # node-local), so that compute nodes can read them.
     log_dir = Path(log_dir)
@@ -255,7 +451,7 @@ Path({str(study_config_path)!r}).unlink()
 #!/bin/bash
 #SBATCH --job-name={job_name}
 #SBATCH --partition={partition}
-#SBATCH --time={config.train_time_limit}
+#SBATCH --time={time_limit}
 #SBATCH --gres=gpu:1
 #SBATCH --mem=120G
 #SBATCH --cpus-per-task=4
@@ -263,6 +459,7 @@ Path({str(study_config_path)!r}).unlink()
 #SBATCH --output={log_path}
 #SBATCH --error={log_path}
 #SBATCH --open-mode=append
+#SBATCH --requeue
 
 # Resubmitted attempts share this log path, mark where each one starts
 echo "=== $(date) job $SLURM_JOB_ID ({job_name}) start ==="
@@ -315,6 +512,7 @@ def launch_agent_parallel(
     """
     if partition is None:
         partition = config.partition
+    time_limit, train_config = clamp_time_for_partition(partition, train_config)
     log_dir = Path(log_dir)
     log_dir.mkdir(parents=True, exist_ok=True)
 
@@ -357,13 +555,14 @@ Path({str(study_config_path)!r}).unlink()
 #!/bin/bash
 #SBATCH --job-name={job_name}
 #SBATCH --partition={partition}
-#SBATCH --time={config.train_time_limit}
+#SBATCH --time={time_limit}
 #SBATCH --gres=gpu:1
 #SBATCH --mem=120G
 #SBATCH --cpus-per-task=4
 #SBATCH --export=ALL
 #SBATCH --output={log_path}
 #SBATCH --error={log_path}
+#SBATCH --requeue
 
 # Single-thread host BLAS/OpenMP. Reservoir init runs np.linalg.eigvals whose
 # OpenBLAS threadpool can deadlock nondeterministically under core contention.
@@ -517,6 +716,7 @@ if not trajopt.output_path(case).exists():
 #SBATCH --output={log_path}
 #SBATCH --error={log_path}
 #SBATCH --open-mode=append
+#SBATCH --requeue
 
 # Resubmitted attempts share this log path, mark where each one starts
 echo "=== $(date) job $SLURM_JOB_ID ({job_name}) start ==="

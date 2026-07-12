@@ -23,7 +23,9 @@ from transport_study.orchestration.slurm_utils import (
     get_running_job_names,
     launch_agent_parallel,
     launch_train_parallel,
-    resources_available,
+    pick_partition,
+    spillover_budget,
+    spillover_slots,
 )
 from transport_study.orchestration.wandb_utils import (
     get_best_train_config,
@@ -215,7 +217,7 @@ class Study:
         unfinished = self.get_unfinished_cases()
         while unfinished:
             if enable_parallelism:
-                running_job_names = get_running_job_names(config.partition)
+                running_job_names = get_running_job_names()
                 if running_job_names is None:
                     logger.warning("Could not query SLURM job state, waiting before trying again...")
                     time.sleep(ORCHESTRATION_POLL_INTERVAL_S)
@@ -233,8 +235,8 @@ class Study:
             )
 
             for case in to_launch:
-                if enable_parallelism and not resources_available():
-                    logger.info(f"No idle resources, holding {len(to_launch)} ready cases until the next pass")
+                if enable_parallelism and pick_partition() is None:
+                    logger.info(f"No idle resources or spillover budget, holding {len(to_launch)} ready cases until the next pass")
                     break
                 self.run_case(case, skip_tuning=skip_tuning, enable_parallelism=enable_parallelism)
 
@@ -269,11 +271,12 @@ class Study:
         if not self._no_blocking_jobs(case, enable_parallelism):
             logger.debug(f"Jobs already in flight for case {case}, waiting before trying again...")
             return
-        if enable_parallelism and not resources_available():
+        partition = pick_partition() if enable_parallelism else None
+        if enable_parallelism and partition is None:
             logger.debug("No resources currently available, waiting before trying again...")
             return
         logger.opt(colors=True).info(f"<bold><cyan>RUNNING CASE:</cyan></bold>\n{case}")
-        self.launch_train(case, enable_parallelism=enable_parallelism)
+        self.launch_train(case, enable_parallelism=enable_parallelism, partition=partition)
 
     def _ensure_hyperparams_ready(self, case: Case, skip_tuning: bool, enable_parallelism: bool) -> bool:
         """Ensure tuned config exists. Returns True if ready to proceed to training."""
@@ -288,10 +291,11 @@ class Study:
         completed_runs = get_completed_runs(self.wandb_project_name(case))
         if len(completed_runs) < config.hyperparam_sweeps:
             logger.info(f"Hyperparameter sweeps incomplete ({len(completed_runs)}/{config.hyperparam_sweeps} runs)")
-            if enable_parallelism and not resources_available():
+            partition = pick_partition() if enable_parallelism else None
+            if enable_parallelism and partition is None:
                 logger.debug("No resources currently available for sweep agents, waiting before trying again...")
                 return False
-            self.launch_sweep(case, enable_parallelism=enable_parallelism, n_completed_runs=len(completed_runs))
+            self.launch_sweep(case, enable_parallelism=enable_parallelism, n_completed_runs=len(completed_runs), partition=partition)
             return False
         return self._finalize_sweep(case, enable_parallelism, completed_runs)
 
@@ -302,7 +306,7 @@ class Study:
             # Sweep trials run inside agent jobs, so poll the agent job name.
             # Picking the best config while agents still run would ignore
             # their trials (and the last trials are often the best ones)
-            running_jobs = count_running_jobs(self.agent_job_name(case), config.partition)
+            running_jobs = count_running_jobs(self.agent_job_name(case))
             if running_jobs > 0:
                 logger.info(f"Found {running_jobs} running agent jobs, waiting for them to complete before proceeding")
                 return False
@@ -332,7 +336,7 @@ class Study:
             (self.agent_job_name(case), "agent"),
             (self.train_job_name(case), "training"),
         ]:
-            running = count_running_jobs(job_name, config.partition)
+            running = count_running_jobs(job_name)
             if running > 0:
                 logger.info(f"Found {running} running {label} jobs, waiting for them to complete before proceeding")
                 return False
@@ -350,7 +354,7 @@ class Study:
                 )
                 return
 
-    def launch_sweep(self, case: Case, enable_parallelism: bool = False, n_completed_runs: int = 0):
+    def launch_sweep(self, case: Case, enable_parallelism: bool = False, n_completed_runs: int = 0, partition: str | None = None):
         """Launch a wandb hyperparameter sweep for the given case.
 
         With parallelism, launches at most as many agent jobs as sweep trials
@@ -358,6 +362,10 @@ class Study:
         running), capped by idle GPUs. Without the outstanding-trial cap the
         orchestration loop would submit another batch of agents every pass
         until the queue filled, far past the requested trial count.
+
+        When partition is a spillover partition the idle-GPU cap is replaced by
+        that partition's remaining per-user slots (its QOS GPU allowance minus
+        jobs already there), bounded by the user-wide job ceiling.
         """
         train_config = self.make_train_config(case)
         # Remove the test_eval_suite_config since that's for final results only.
@@ -383,16 +391,22 @@ class Study:
             sweep_id = wandb.sweep(sweep_config, project=wandb_project_name)
 
         if enable_parallelism:
+            if partition is None:
+                partition = config.partition
             agent_job_name = self.agent_job_name(case)
-            running_agents = count_running_jobs(agent_job_name, config.partition)
+            running_agents = count_running_jobs(agent_job_name)
             # Each agent runs exactly one trial (count=1), so outstanding trials
             # bound how many more agents are worth submitting
             outstanding_trials = config.hyperparam_sweeps - n_completed_runs - running_agents
-            sweep_jobs = min(count_idle_gpus(config.partition, config.buffer_gpus), max(outstanding_trials, 0))
+            if partition == config.partition:
+                capacity = count_idle_gpus(config.partition, config.buffer_gpus)
+            else:
+                capacity = min(spillover_budget(), spillover_slots(partition))
+            sweep_jobs = min(capacity, max(outstanding_trials, 0))
             if sweep_jobs <= 0:
                 logger.debug(f"No agent jobs needed for case {case} ({running_agents} agents already running)")
                 return
-            logger.info(f"Launching {sweep_jobs} agent job(s) {agent_job_name} for case\n{case}")
+            logger.info(f"Launching {sweep_jobs} agent job(s) {agent_job_name} on {partition} for case\n{case}")
             for _ in range(sweep_jobs):
                 launch_agent_parallel(
                     train_config,
@@ -400,12 +414,13 @@ class Study:
                     kwargs_agent,
                     agent_job_name,
                     Path(self.log_dir) / "logs_sweep",
+                    partition=partition,
                 )
         else:
             logger.info("Launching agent serially")
             launch_agent(train_config, sweep_id, kwargs_agent=kwargs_agent)
 
-    def launch_train(self, case: Case, enable_parallelism: bool = False):
+    def launch_train(self, case: Case, enable_parallelism: bool = False, partition: str | None = None):
         """Launch a training job for the given case."""
         if case.is_impossible():
             raise ValueError(
@@ -459,6 +474,7 @@ class Study:
                 train_job_name,
                 result_path,
                 Path(self.log_dir) / "logs_train",
+                partition=partition,
             )
         else:
             logger.info("Launching training serially")
