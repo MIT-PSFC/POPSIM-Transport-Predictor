@@ -260,7 +260,6 @@ Path({str(study_config_path)!r}).unlink()
 #SBATCH --mem=120G
 #SBATCH --cpus-per-task=4
 #SBATCH --export=ALL
-#SBATCH --exclude=node2301,node2101
 #SBATCH --output={log_path}
 #SBATCH --error={log_path}
 #SBATCH --open-mode=append
@@ -270,6 +269,12 @@ echo "=== $(date) job $SLURM_JOB_ID ({job_name}) start ==="
 
 # Save results to netcdf only; no need to sync wandb runs online from batch jobs
 export WANDB_MODE=offline
+
+# Single-thread host BLAS/OpenMP. Reservoir init runs np.linalg.eigvals whose
+# OpenBLAS threadpool can deadlock nondeterministically under core contention.
+# eigvals is tiny so single-threaded costs nothing.
+export OPENBLAS_NUM_THREADS=1
+export OMP_NUM_THREADS=1
 
 {sys.executable} {script_path}
 exit_code=$?
@@ -357,9 +362,14 @@ Path({str(study_config_path)!r}).unlink()
 #SBATCH --mem=120G
 #SBATCH --cpus-per-task=4
 #SBATCH --export=ALL
-#SBATCH --exclude=node2301,node2101
 #SBATCH --output={log_path}
 #SBATCH --error={log_path}
+
+# Single-thread host BLAS/OpenMP. Reservoir init runs np.linalg.eigvals whose
+# OpenBLAS threadpool can deadlock nondeterministically under core contention.
+# eigvals is tiny so single-threaded costs nothing.
+export OPENBLAS_NUM_THREADS=1
+export OMP_NUM_THREADS=1
 
 {sys.executable} {script_path}
 exit_code=$?
@@ -388,7 +398,7 @@ def launch_profile_analysis_parallel(study, case) -> None:
     set (config.partition otherwise) and requests no GPU.
     """
     partition = config.analysis_partition or config.partition
-    log_dir = study.working_dir / "logs"
+    log_dir = study.working_dir / "logs" / "logs_analysis"
     log_dir.mkdir(parents=True, exist_ok=True)
 
     job_name = study.analysis_job_name(case)
@@ -438,6 +448,11 @@ Path({study_config_path!r}).unlink()
 echo "=== $(date) job $SLURM_JOB_ID ({job_name}) start ==="
 
 export MPLBACKEND=Agg
+# Single-thread host BLAS/OpenMP. Reservoir init runs np.linalg.eigvals whose
+# OpenBLAS threadpool can deadlock nondeterministically under core contention.
+# eigvals is tiny so single-threaded costs nothing.
+export OPENBLAS_NUM_THREADS=1
+export OMP_NUM_THREADS=1
 {sys.executable} {script_path}
 exit_code=$?
 rm -f {script_path}
@@ -499,7 +514,6 @@ if not trajopt.output_path(case).exists():
 #SBATCH --mem=120G
 #SBATCH --cpus-per-task=4
 #SBATCH --export=ALL
-#SBATCH --exclude=node2301,node2101
 #SBATCH --output={log_path}
 #SBATCH --error={log_path}
 #SBATCH --open-mode=append
@@ -508,6 +522,11 @@ if not trajopt.output_path(case).exists():
 echo "=== $(date) job $SLURM_JOB_ID ({job_name}) start ==="
 
 export WANDB_MODE=offline
+# Single-thread host BLAS/OpenMP. Reservoir init runs np.linalg.eigvals whose
+# OpenBLAS threadpool can deadlock nondeterministically under core contention.
+# eigvals is tiny so single-threaded costs nothing.
+export OPENBLAS_NUM_THREADS=1
+export OMP_NUM_THREADS=1
 {sys.executable} {script_path}
 exit_code=$?
 rm -f {script_path}

@@ -1,10 +1,10 @@
 import subprocess
 from typing import Any
 
-import wandb
 from loguru import logger
 from popsim.ml import TrainConfig
 
+import wandb
 from transport_study.config import config
 
 
@@ -62,28 +62,39 @@ def get_best_train_config(project: str) -> TrainConfig | None:
 
 
 def get_sweep_id(project: str) -> str | None:
+    """Existing active sweep id for a project, if any.
+
+    Only the API call itself is treated as "assume no sweeps and let the
+    caller create one" on failure. An ambiguous multi-active-sweep state is
+    NOT caught here: it must propagate, otherwise launch_sweep sees None,
+    creates yet another sweep, and the project accumulates duplicates forever
+    (each extra active sweep only makes future calls more ambiguous, never
+    less).
+    """
     project_obj = get_project(project)
     if project_obj is None:
         logger.warning(f"No wandb project found for {project}, assuming no sweeps.")
         return None
 
     try:
-        project_sweeps = project_obj.sweeps()
-        if len(project_sweeps) == 0:
-            return None
-        active_sweeps = [s for s in project_sweeps if s.state in ["RUNNING", "PENDING"]]
-        if len(active_sweeps) > 1:
-            raise ValueError(
-                f"Multiple running sweeps found for project {project}, cannot determine which to launch. Active sweeps: {[s.id for s in active_sweeps]}"
-            )
-        elif len(active_sweeps) == 0:
-            return None
-        sweep = active_sweeps[0]
-        return sweep.id
+        project_sweeps = list(project_obj.sweeps())
     except Exception as e:
         logger.warning(f"Error reading sweeps for {project}, assuming no sweeps.")
         logger.debug(e)
         return None
+
+    if len(project_sweeps) == 0:
+        return None
+    active_sweeps = [s for s in project_sweeps if s.state in ["RUNNING", "PENDING"]]
+    if len(active_sweeps) > 1:
+        raise ValueError(
+            f"Multiple active sweeps found for project {project}, cannot determine which to launch. "
+            f"Active sweeps: {[s.id for s in active_sweeps]}. Cancel the extras (wandb sweep --cancel) "
+            "or rerun with clean_sweeps=True before continuing."
+        )
+    if len(active_sweeps) == 0:
+        return None
+    return active_sweeps[0].id
 
 
 def run_clean_sweeps(projects: list[str]):

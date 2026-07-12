@@ -26,6 +26,7 @@ from PIL import Image
 
 from transport_study import EPISODE_DIM, TIME_DIM
 from transport_study.config import config
+from transport_study.modules.profile_predictor.trb import ProfilePredictorTRB
 from transport_study.orchestration.slurm_utils import (
     get_running_job_names,
     launch_profile_analysis_parallel,
@@ -73,6 +74,20 @@ def _style_axis(ax):
     for spine in ax.spines.values():
         spine.set_edgecolor(TEXT_COLOR)
     ax.grid(True, alpha=0.2, color=TEXT_COLOR)
+
+
+def _axis_lims(*arrays: np.ndarray) -> tuple[float, float]:
+    lo = min(np.nanmin(a) for a in arrays if np.isfinite(a).any())
+    hi = max(np.nanmax(a) for a in arrays if np.isfinite(a).any())
+    pad = 0.05 * max(hi - lo, 1e-6)
+    return (lo - pad, hi + pad)
+
+
+def _shade_ignored_grad_region(ax, rho_mid: np.ndarray):
+    """Transparent red span over the rho region excluded from the gradient
+    loss (rho >= GRAD_LOSS_RHO_MAX), where the measured gradients are
+    unreliable and not fit against."""
+    ax.axvspan(ProfilePredictorTRB.GRAD_LOSS_RHO_MAX, rho_mid[-1], color="red", alpha=0.12, linewidth=0, zorder=0)
 
 
 def _record_title(ts_metrics: CaseTimesliceMetrics, record_idx: int) -> str:
@@ -133,6 +148,7 @@ def _timeslice_panel(
 
         ax_grad = axes[1, col]
         _style_axis(ax_grad)
+        _shade_ignored_grad_region(ax_grad, rho_mid)
         ax_grad.fill_between(rho_mid, grad_targ_mid - grad_err_mid, grad_targ_mid + grad_err_mid, color="white", alpha=0.25, linewidth=0)
         ax_grad.plot(rho_mid, grad_targ_mid, color="white", linewidth=2, linestyle="--", label="Measured")
         ax_grad.plot(rho_mid, grad_pred, color="#0095ff", linewidth=2, label="Predicted")
@@ -140,6 +156,15 @@ def _timeslice_panel(
         ax_grad.set_xlabel(r"$\rho$", color=TEXT_COLOR, fontsize=LABEL_FONTSIZE)
         if ylims and f"{var}_grad" in ylims:
             ax_grad.set_ylim(*ylims[f"{var}_grad"])
+        else:
+            grad_rho_mask = rho_mid < ProfilePredictorTRB.GRAD_LOSS_RHO_MAX
+            ax_grad.set_ylim(
+                *_axis_lims(
+                    (grad_targ_mid - grad_err_mid)[grad_rho_mask],
+                    (grad_targ_mid + grad_err_mid)[grad_rho_mask],
+                    grad_pred[grad_rho_mask],
+                )
+            )
 
     axes[0, 0].legend(
         fontsize=TICK_FONTSIZE,
@@ -154,10 +179,17 @@ def _timeslice_panel(
 
 
 def _shot_ylims(result_ds: xr.Dataset, ts_metrics: CaseTimesliceMetrics, record_idxs: np.ndarray) -> dict:
-    """Fixed axis limits over one shot's frames so the GIF does not jump around."""
+    """Fixed axis limits over one shot's frames so the GIF does not jump around.
+
+    Gradient y-lims are computed only over rho < GRAD_LOSS_RHO_MAX, the region
+    actually counted in the gradient loss, so a noisy/unreliable edge gradient
+    outside that region does not blow out the axis scale.
+    """
     ylims = {}
     rho = result_ds["rho"].values
     d_rho = np.diff(rho)
+    rho_mid = 0.5 * (rho[:-1] + rho[1:])
+    grad_rho_mask = rho_mid < ProfilePredictorTRB.GRAD_LOSS_RHO_MAX
     shot = ts_metrics.shot[record_idxs[0]]
     device = ts_metrics.ds_source[record_idxs[0]]
     shot_res = result_ds.sel({EPISODE_DIM: shot})
@@ -171,16 +203,18 @@ def _shot_ylims(result_ds: xr.Dataset, ts_metrics: CaseTimesliceMetrics, record_
         err = shot_eval[f"{var}_error"].transpose(TIME_DIM, "rho").values[eval_idxs]
         grad_targ = shot_eval[f"{var}_grad"].transpose(TIME_DIM, "rho").values[eval_idxs]
         grad_err = shot_eval[f"{var}_grad_error"].transpose(TIME_DIM, "rho").values[eval_idxs]
+        # Measured gradients live on the full rho grid, average to the rho
+        # midpoints where the panel plots them so the mask lines up
+        grad_targ_mid = 0.5 * (grad_targ[:, :-1] + grad_targ[:, 1:])
+        grad_err_mid = 0.5 * (grad_err[:, :-1] + grad_err[:, 1:])
         grad_pred = np.diff(pred, axis=-1) / d_rho
 
-        def _lims(*arrays):
-            lo = min(np.nanmin(a) for a in arrays if np.isfinite(a).any())
-            hi = max(np.nanmax(a) for a in arrays if np.isfinite(a).any())
-            pad = 0.05 * max(hi - lo, 1e-6)
-            return (lo - pad, hi + pad)
-
-        ylims[f"{var}_value"] = _lims(targ - err, targ + err, pred)
-        ylims[f"{var}_grad"] = _lims(grad_targ - grad_err, grad_targ + grad_err, grad_pred)
+        ylims[f"{var}_value"] = _axis_lims(targ - err, targ + err, pred)
+        ylims[f"{var}_grad"] = _axis_lims(
+            (grad_targ_mid - grad_err_mid)[:, grad_rho_mask],
+            (grad_targ_mid + grad_err_mid)[:, grad_rho_mask],
+            grad_pred[:, grad_rho_mask],
+        )
     return ylims
 
 
