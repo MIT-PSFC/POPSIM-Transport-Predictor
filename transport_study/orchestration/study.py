@@ -1,3 +1,4 @@
+import math
 import os
 import shutil
 import time
@@ -41,6 +42,14 @@ CONFIG_LOCK_FILENAME = "config_lock.toml"
 # time ~10 min at a go. Abort the whole run once a single case has been launched
 # this many times without producing a result file
 MAX_TRAIN_ATTEMPTS = 3
+
+# A hyperparam sweep is only done once the trial-count target is met AND this
+# fraction of the target has runs in the "finished" state. Crashed/pruned trials
+# still count toward the trial target, but the tuned config is picked only from
+# finished runs (get_best_train_config), so the sweep must produce enough of them
+# or there is nothing safe to select. Guards against a sweep where most trials
+# diverge to NaN and crash.
+MIN_FINISHED_FRACTION = 0.1
 
 # How long the orchestration loop sleeps between passes over the unfinished cases
 ORCHESTRATION_POLL_INTERVAL_S = 8
@@ -289,13 +298,25 @@ class Study:
             self._write_tuned_config(case, self.make_train_config(case))
             return True
         completed_runs = get_completed_runs(self.wandb_project_name(case))
-        if len(completed_runs) < config.hyperparam_sweeps:
-            logger.info(f"Hyperparameter sweeps incomplete ({len(completed_runs)}/{config.hyperparam_sweeps} runs)")
+        finished_runs = [r for r in completed_runs if r.state == "finished"]
+        min_finished = math.ceil(MIN_FINISHED_FRACTION * config.hyperparam_sweeps)
+        if len(completed_runs) < config.hyperparam_sweeps or len(finished_runs) < min_finished:
+            logger.info(
+                f"Hyperparameter sweeps incomplete "
+                f"({len(completed_runs)}/{config.hyperparam_sweeps} runs, "
+                f"{len(finished_runs)}/{min_finished} finished)"
+            )
             partition = pick_partition() if enable_parallelism else None
             if enable_parallelism and partition is None:
                 logger.debug("No resources currently available for sweep agents, waiting before trying again...")
                 return False
-            self.launch_sweep(case, enable_parallelism=enable_parallelism, n_completed_runs=len(completed_runs), partition=partition)
+            self.launch_sweep(
+                case,
+                enable_parallelism=enable_parallelism,
+                n_completed_runs=len(completed_runs),
+                n_finished_runs=len(finished_runs),
+                partition=partition,
+            )
             return False
         return self._finalize_sweep(case, enable_parallelism, completed_runs)
 
@@ -315,7 +336,8 @@ class Study:
             raise RuntimeError(
                 f"Hyperparameter sweep for case {case} reports {len(completed_runs)} completed runs "
                 f"but no best config could be recovered from wandb project {self.wandb_project_name(case)}. "
-                "Check the project for runs missing the val/loss.mean summary metric."
+                "Only 'finished' runs are eligible, check the project for runs stuck crashing/pruning "
+                "before logging val/loss.mean."
             )
         self._write_tuned_config(case, best_train_config)
         logger.success(f"Saved best hyperparameter config for {case}")
@@ -354,14 +376,25 @@ class Study:
                 )
                 return
 
-    def launch_sweep(self, case: Case, enable_parallelism: bool = False, n_completed_runs: int = 0, partition: str | None = None):
+    def launch_sweep(
+        self,
+        case: Case,
+        enable_parallelism: bool = False,
+        n_completed_runs: int = 0,
+        n_finished_runs: int = 0,
+        partition: str | None = None,
+    ):
         """Launch a wandb hyperparameter sweep for the given case.
 
         With parallelism, launches at most as many agent jobs as sweep trials
-        still outstanding (hyperparam_sweeps - completed - agents already
-        running), capped by idle GPUs. Without the outstanding-trial cap the
-        orchestration loop would submit another batch of agents every pass
-        until the queue filled, far past the requested trial count.
+        still outstanding, capped by idle GPUs. Outstanding is the larger of the
+        two remaining targets (both net of agents already running): trials to
+        reach the completed-count target (hyperparam_sweeps - completed) and
+        trials to reach the finished-run quota (min_finished - finished). Once
+        the count target is met but too many trials have crashed to satisfy the
+        finished quota, the second term keeps agents flowing. Without the
+        outstanding cap the orchestration loop would submit another batch of
+        agents every pass until the queue filled, far past what is needed.
 
         When partition is a spillover partition the idle-GPU cap is replaced by
         that partition's remaining per-user slots (its QOS GPU allowance minus
@@ -396,8 +429,14 @@ class Study:
             agent_job_name = self.agent_job_name(case)
             running_agents = count_running_jobs(agent_job_name)
             # Each agent runs exactly one trial (count=1), so outstanding trials
-            # bound how many more agents are worth submitting
-            outstanding_trials = config.hyperparam_sweeps - n_completed_runs - running_agents
+            # bound how many more agents are worth submitting. Take the larger of
+            # the count target and the finished-quota target so a sweep whose
+            # count target is met but whose trials keep crashing keeps launching
+            # until enough runs finish (each in-flight agent may yet finish).
+            min_finished = math.ceil(MIN_FINISHED_FRACTION * config.hyperparam_sweeps)
+            outstanding_for_count = config.hyperparam_sweeps - n_completed_runs - running_agents
+            outstanding_for_finished = min_finished - n_finished_runs - running_agents
+            outstanding_trials = max(outstanding_for_count, outstanding_for_finished)
             if partition == config.partition:
                 capacity = count_idle_gpus(config.partition, config.buffer_gpus)
             else:

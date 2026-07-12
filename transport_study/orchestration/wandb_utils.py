@@ -60,12 +60,20 @@ def get_completed_runs(project: str) -> list[Any]:
 
 
 def get_best_train_config(project: str) -> TrainConfig | None:
-    """Gets several pieces related to the final model for this case, if it exists."""
+    """Gets several pieces related to the final model for this case, if it exists.
+
+    Only "finished" runs are eligible. A crashed or hyperband-pruned trial can
+    log a low val/loss.mean in an early epoch and then diverge to NaN and die,
+    its summary keeps that pre-divergence dip, so ranking those runs would pick
+    a config that cannot complete a full training run. Restricting to finished
+    runs guarantees the selected config trained to completion at least once.
+    """
     completed_runs = get_completed_runs(project)
-    if len(completed_runs) == 0:
+    finished_runs = [r for r in completed_runs if r.state == "finished"]
+    if len(finished_runs) == 0:
         return None
 
-    sorted_runs = sorted(completed_runs, key=lambda r: r.summary.get(SWEEP_METRIC, float("inf")))
+    sorted_runs = sorted(finished_runs, key=lambda r: r.summary.get(SWEEP_METRIC, float("inf")))
     best_run = sorted_runs[0]
     logger.info(f"Best run is {best_run.name} with val loss {best_run.summary.get(SWEEP_METRIC)}")
     train_config = TrainConfig.load(best_run.config)
