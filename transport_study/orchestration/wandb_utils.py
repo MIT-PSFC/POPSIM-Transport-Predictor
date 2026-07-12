@@ -22,7 +22,19 @@ def get_project(project: str):
         return None
 
 
+# Metric the sweeps optimize. Also used to tell hyperband-pruned trials apart
+SWEEP_METRIC = "val/loss.mean"
+
+
 def get_completed_runs(project: str) -> list[Any]:
+    """Runs that count toward the hyperparam_sweeps trial target.
+
+    A trial counts if it reported the sweep metric at least once: finished
+    runs plus hyperband-pruned ones. Pruning is the intended fate of most
+    trials, so pruned runs must count (and be kept) or the sweep would need
+    many times hyperparam_sweeps trials to reach the target.
+    Metric-less crashed/failed runs carry no information and are deleted.
+    """
     api = wandb.Api()
 
     project_obj = get_project(project)
@@ -35,7 +47,7 @@ def get_completed_runs(project: str) -> list[Any]:
         completed_runs = []
         for run in project_runs:
             run_state = run.state
-            if run_state == "finished":
+            if run_state == "finished" or (run_state in ["crashed", "failed"] and SWEEP_METRIC in run.summary):
                 completed_runs.append(run)
             elif run_state in ["crashed", "failed"]:
                 run.delete()  # Clean up failed runs since they won't be useful and just take up space
@@ -53,9 +65,9 @@ def get_best_train_config(project: str) -> TrainConfig | None:
     if len(completed_runs) == 0:
         return None
 
-    sorted_runs = sorted(completed_runs, key=lambda r: r.summary.get("val/loss.mean", float("inf")))
+    sorted_runs = sorted(completed_runs, key=lambda r: r.summary.get(SWEEP_METRIC, float("inf")))
     best_run = sorted_runs[0]
-    logger.info(f"Best run is {best_run.name} with val loss {best_run.summary.get('val/loss.mean')}")
+    logger.info(f"Best run is {best_run.name} with val loss {best_run.summary.get(SWEEP_METRIC)}")
     train_config = TrainConfig.load(best_run.config)
 
     return train_config

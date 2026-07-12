@@ -510,7 +510,9 @@ class ProfileStudy(Study):
             "prng_seed": 42,
             "debug": config.debug,
             # Hyperparameters
-            "batch_size": 2048,
+            # 1024 keeps the torax train step under the ~36GB JAX pool on 48GB
+            # L40S spillover nodes, batch 2048 needed 40.3GB and OOMed there
+            "batch_size": 1024,
         }
         loss_config_base = {
             # The loss runs on peak-normalized profiles (target scaled to max 1),
@@ -695,7 +697,7 @@ class ProfileStudy(Study):
                             "delta_bot",
                         ],
                         **dataloader_config_base,
-                        "batch_size": 2048,
+                        "batch_size": 1024,
                     },
                     model_init_config={
                         "model_type": case.model_type,
