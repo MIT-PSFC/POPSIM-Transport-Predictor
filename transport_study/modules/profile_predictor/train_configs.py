@@ -78,6 +78,13 @@ TORAX_TRANSPORT_BLOCKS = {
         "chi_e_i_ratio": 2.0,  # Predicted by NN
         "chi_D_ratio": 5.0,  # Predicted by NN
         "VR_D_ratio": 0.0,  # Predicted by NN
+        # Subcritical CGM drops chi to chi_min. The TORAX default of 0.05 m^2/s
+        # is near-zero transport, so ohmic heating in low-density plasmas runs
+        # away within a 20 ms step and NaNs the solver.
+        # A floor of 0.3 keeps some background transport.
+        "chi_min": 0.3,
+        "chi_max": 50.0,
+        "D_e_min": 0.1,
     },
     "gyrobohm": {
         # Bohm-GyroBohm model: TORAX computes the Bohm and GyroBohm chi terms
@@ -92,6 +99,11 @@ TORAX_TRANSPORT_BLOCKS = {
         "D_face_c1": 1.0,  # Predicted by NN
         "D_face_c2": 0.3,  # Predicted by NN
         "V_face_coeff": -0.1,  # Predicted by NN
+        # Same stability clipping as the cgm, floor background transport
+        # so cold low-density samples cannot run away, cap the stiff side.
+        "chi_min": 0.3,
+        "chi_max": 50.0,
+        "D_e_min": 0.1,
     },
 }
 

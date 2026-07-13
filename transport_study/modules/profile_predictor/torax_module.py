@@ -1,3 +1,5 @@
+import dataclasses
+
 import equinox as eqx
 import jax
 import jax.numpy as jnp
@@ -5,6 +7,7 @@ import numpy as np
 import xarray as xr
 from jaxtyping import Array
 from popsim import TimeIndepModule
+from popsim.math_utils import smooth_clamp
 from popsim.ml.rtd_mlp import Activation, RtdMLP
 from torax import ToraxConfig
 from torax import experimental as torax_experimental
@@ -166,6 +169,32 @@ def _build_circular_geometry_jax(
     )
 
 
+# Soft clamp bounds (lo, hi, lo_width, hi_width) for the evolving core
+# profiles, in TORAX internal units: temperatures in keV, density in m^-3.
+# Bounds sit far outside the physical range of C-Mod/MAST/TCV/DIII-D
+# widths set how far past a bound the saturation still has usable gradient.
+_TE_CLAMP_KEV = (0.005, 30.0, 0.005, 4.0)
+_NE_CLAMP_M3 = (1e17, 1e21, 1e17, 5e19)
+
+
+def _clamp_core_profiles(state):
+    """Return state with T_e, T_i, n_e cell values soft-clamped to physical range.
+
+    Applied to the state carried between solver steps, before the next step_fn
+    call, so the clamp acts before the operations that manufacture inf/NaN from
+    an extreme state (resistivity ~ T^-1.5, divisions by n_e). Clamping after
+    the loop would be too late: NaN propagates, and softplus(NaN) stays NaN.
+    """
+    cp = state.core_profiles
+    cp = dataclasses.replace(
+        cp,
+        T_e=dataclasses.replace(cp.T_e, value=smooth_clamp(cp.T_e.value, *_TE_CLAMP_KEV)),
+        T_i=dataclasses.replace(cp.T_i, value=smooth_clamp(cp.T_i.value, *_TE_CLAMP_KEV)),
+        n_e=dataclasses.replace(cp.n_e, value=smooth_clamp(cp.n_e.value, *_NE_CLAMP_M3)),
+    )
+    return dataclasses.replace(state, core_profiles=cp)
+
+
 def _run_loop_jit_with_geo(
     step_fn: SimulationStepFn,
     input_state,
@@ -200,6 +229,7 @@ def _run_loop_jit_with_geo(
             runtime_params_overrides=runtime_params_overrides,
             geo_overrides=geo_provider,
         )
+        current_state = _clamp_core_profiles(current_state)
         cp = current_state.core_profiles
         if debug:
             jax.debug.print(
@@ -349,18 +379,18 @@ class ProfilePredictorTorax(TimeIndepModule):
         elif self.transport_model == "cgm":
             # Free parameters of the Critical Gradient Model. The critical gradient
             # itself is computed by TORAX from the evolving state and geometry
-            # (known inputs); only the dimensionless ratios are learned.
-            #   chi_e_i_ratio: 0.5 - 5   (chi_e = chi_i / ratio; ITG turbulence > 1)
-            #   chi_D_ratio:   1 - 20    (D_e = chi_i / ratio; must stay positive)
-            #   VR_D_ratio:    -5 - 5    (R0*V_e/D_e; negative peaks the density profile)
-            #   alpha:         1 - 3     (exponent of the chi power law, TORAX default 2)
-            #   chi_stiff:     0.5 - 5   (stiffness parameter, TORAX default 2)
+            # (known inputs), only the dimensionless ratios are learned.
+            #   chi_e_i_ratio: 0.5 - 5   (chi_e = chi_i / ratio, ITG turbulence > 1)
+            #   chi_D_ratio:   1 - 20    (D_e = chi_i / ratio, must stay positive)
+            #   VR_D_ratio:    -5 - 5    (R0*V_e/D_e, negative peaks the density profile)
+            #   alpha:      1.8 - 2.2   (critical gradient exponent, TORAX default 2)
+            #   chi_stiff:     0.5 - 3   (stiffness parameter, TORAX default 2)
             return {
                 "chi_e_i_ratio": 0.5 + 4.5 * jax.nn.sigmoid(nn_transport_out[0:1]),
                 "chi_D_ratio": 1.0 + 19.0 * jax.nn.sigmoid(nn_transport_out[1:2]),
                 "VR_D_ratio": 5.0 * jnp.tanh(nn_transport_out[2:3]),
-                "alpha": 1.0 + 2.0 * jax.nn.sigmoid(nn_transport_out[3:4]),
-                "chi_stiff": 0.5 + 4.5 * jax.nn.sigmoid(nn_transport_out[4:5]),
+                "alpha": 1.8 + 0.4 * jax.nn.sigmoid(nn_transport_out[3:4]),
+                "chi_stiff": 0.5 + 2.5 * jax.nn.sigmoid(nn_transport_out[4:5]),
             }
         else:  # gyrobohm
             # Free parameters of the Bohm-GyroBohm model. The Bohm and GyroBohm
@@ -391,20 +421,28 @@ class ProfilePredictorTorax(TimeIndepModule):
         coeffs = self._transport_coefficients(self.nn_transport(nn_inputs))
         S_total = jax.nn.softplus(self.nn_sources(nn_inputs))
 
-        # Edge boundary conditions as NN-predicted fractions in (0, 1):
-        #   n_e_right_bc = fraction * line-averaged density
-        #   T_e_right_bc = fraction * te_approx (beta-derived temperature guess,
-        #                  same scaling trick as the shape-init predictors)
+        # Edge boundary conditions as NN-predicted fractions:
+        #   n_e_right_bc = fraction in (0.05, 0.95) * line-averaged density
+        #   T_e_right_bc = 20 eV + fraction * clipped te_approx (beta-derived
+        #                  temperature guess, same scaling trick as the
+        #                  shape-init predictors)
         # A fixed edge density BC above the target profile acts as an infinite
         # particle source, so the BC must scale with the requested density.
+        # Both BCs are floored: a near-vacuum edge ill-conditions the density
+        # equation, and te_approx (beta / ne_la) is off-scale on early-shot
+        # low-density samples where betan is noisy, which put the solver far
+        # from equilibrium on exactly the samples that NaN'd training. Floors
+        # are affine in the sigmoid so the NN gradient path stays intact,
+        # te_approx carries no NN params so a hard clip on it costs nothing.
         # The negative bias on the temperature fraction makes random-init edge
-        # temperatures small (~0.007 * te_approx, a few hundred eV): te_approx
-        # is a beta-derived overestimate, and a hot edge BC flattens the profile
-        # relative to itself, which keeps the critical gradient model
-        # subcritical (chi = 0) and kills the gradient to the transport network.
+        # temperatures small (a few tens of eV): te_approx is a beta-derived
+        # overestimate, and a hot edge BC flattens the profile relative to
+        # itself, which keeps the critical gradient model subcritical
+        # (chi = chi_min) and kills the gradient to the transport network.
         nn_edge_out = self.nn_edge(nn_inputs)
-        ne_right_bc = jax.nn.sigmoid(nn_edge_out[0:1]) * inputs.ne20_line_avg
-        te_right_bc = jax.nn.sigmoid(nn_edge_out[1:2] - 5.0) * inputs.te_approx
+        ne_right_bc = (0.05 + 0.9 * jax.nn.sigmoid(nn_edge_out[0:1])) * inputs.ne20_line_avg
+        te_scale = jnp.clip(inputs.te_approx, 0.05, 5.0)
+        te_right_bc = 0.02 + jax.nn.sigmoid(nn_edge_out[1:2] - 5.0) * te_scale
 
         coeffs["S_total"] = S_total
         coeffs["n_e_right_bc"] = ne_right_bc  # [1e20 m^-3]
@@ -474,15 +512,23 @@ class ProfilePredictorTorax(TimeIndepModule):
         ne_right_bc_update = torax_experimental.TimeVaryingScalarUpdate(value=ne_right_bc * 1e20)
         te_right_bc_update = torax_experimental.TimeVaryingScalarUpdate(value=te_right_bc)
 
-        # Initial temperature profiles ramp linearly from core = edge BC + 0.3 keV
-        # down to the NN edge BC. This keeps the initial state strictly decreasing
-        # and continuous with the BC for any NN output: a discontinuity at the LCFS
-        # or an exactly-flat profile both NaN the solver under the critical
-        # gradient model.
-        t_init_value = jnp.concatenate([te_right_bc + 0.3, te_right_bc])[jnp.newaxis, :]
+        # Initial temperature profiles: parabolic (1 - rho^2) shape from
+        # core = edge BC + ~2x te_approx down to the NN edge BC, sampled at
+        # rho = 0, 0.5, 1. Scaling the init with te_approx starts the
+        # relaxation near the expected equilibrium (a flat 0.3 keV start is
+        # several keV short on high-performance C-Mod samples, so most of the
+        # few fixed 20 ms steps get burned on the transient). The clip keeps
+        # the old 0.3 keV floor where te_approx is small or unreliable.
+        # Core = edge + positive keeps the initial state strictly decreasing
+        # and continuous with the BC for any NN output: a discontinuity at the
+        # LCFS or an exactly-flat profile both NaN the solver under the
+        # critical gradient model.
+        te_core_init = te_right_bc + jnp.clip(2.0 * inputs.te_approx, 0.3, 10.0)
+        te_mid_init = te_right_bc + 0.75 * (te_core_init - te_right_bc)
+        t_init_value = jnp.concatenate([te_core_init, te_mid_init, te_right_bc])[jnp.newaxis, :]
         t_init_update = torax_experimental.TimeVaryingArrayUpdate(
             value=t_init_value,
-            rho_norm=jnp.array([0.0, 1.0]),
+            rho_norm=jnp.array([0.0, 0.5, 1.0]),
         )
 
         mapping = {
@@ -561,8 +607,7 @@ class ProfilePredictorTorax(TimeIndepModule):
             wrap_body_in_checkpoint=self.transport_model == "gyrobohm",
         )
 
-        # n_e is in m^-3 inside TORAX; convert to 1e20 m^-3 to match the
-        # ne20_rho targets (and the other profile predictors)
+        # n_e is in m^-3 and T_e is keV in TORAX
         ne = state.core_profiles.n_e.value / 1e20
         te = state.core_profiles.T_e.value
 
@@ -595,14 +640,14 @@ class ProfilePredictorTorax(TimeIndepModule):
 
         Diagnostic counterpart of __call__: same provider/geometry construction, but drives
         step_fn in a plain Python loop instead of the jitted bounded while loop, so the
-        intermediate states are observable. Not differentiable; do not use for training.
+        intermediate states are observable. Not differentiable, do not use for training.
 
         Args:
             inputs: Same as __call__ (Inputs or single-timeslice xr.Dataset).
             prescribed: Optional dict overriding NN outputs. Valid keys are the
                 transport coefficients of the configured model
                 (TRANSPORT_COEFFICIENT_NAMES[self.transport_model]) plus
-                {S_total, n_e_right_bc, T_e_right_bc}; values are floats in the same
+                {S_total, n_e_right_bc, T_e_right_bc}, values are floats in the same
                 units the NN outputs use (S_total in 1e21 particles/s, n_e_right_bc
                 in 1e20 m^-3, T_e_right_bc in keV, chi/D/V in m^2/s or m/s for the
                 constant model, dimensionless otherwise).
@@ -653,6 +698,9 @@ class ProfilePredictorTorax(TimeIndepModule):
                 runtime_params_overrides=new_provider,
                 geo_overrides=geo_provider,
             )
+            # Same clamp as the training loop so the recorded trajectory
+            # matches what __call__ actually simulates
+            state = _clamp_core_profiles(state)
             steps.append(record(state))
 
         coeffs_out = {name: float(np.asarray(value).squeeze()) for name, value in coeffs.items()}
