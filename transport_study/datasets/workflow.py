@@ -81,6 +81,10 @@ class DataWorkflow(ABC):
         # set this to {signal: max_value}; see filter_ds / _transient_cutoff_time.
         self.transient_filter_config = None
 
+        # Shots excluded from the processed dataset
+        # Raw data is still fetched, so re-including a shot only needs a dataset rebuild
+        self.shot_blacklist: set[int] = set()
+
         if shotlist_file is None:
             logger.info("No shotlist file provided, retrieving shotlist from device-specific source")
             self.shotlist = self._get_shotlist_from_source()
@@ -264,6 +268,10 @@ class DataWorkflow(ABC):
             return
 
         identifiers = [int(p.stem) for p in self.raw_data_dir.glob("*.nc")]
+        if self.shot_blacklist:
+            n_before = len(identifiers)
+            identifiers = [s for s in identifiers if s not in self.shot_blacklist]
+            logger.info(f"Excluded {n_before - len(identifiers)} blacklisted shots")
         if self.max_num_shots:
             identifiers = identifiers[: self.max_num_shots]
 

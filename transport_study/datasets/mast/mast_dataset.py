@@ -258,8 +258,9 @@ class MASTDataWorkflow(DataWorkflow):
         )
 
         self.filter_config = {
-            "Wtot_MJ": {"min": 0.0005, "max": 2.0},
-            "ne20_line_avg": {"min": 0.01, "max": 1.2},  # 10.1088/1361-6587/ace476
+            "Wtot_MJ": {"min": 0.01, "max": 2.0},
+            "ne20_line_avg": {"min": 0.1, "max": 1.2},  # max: 10.1088/1361-6587/ace476
+            "Te_keV_core": {"min": 0.1, "max": 10},
             # Bad interferometer data can satisfy the absolute density cap at low Ip
             # so stack another check based on the Greenwald fraction
             "fGW": {"min": 0.0, "max": 2.0},
@@ -274,6 +275,44 @@ class MASTDataWorkflow(DataWorkflow):
         self.transient_filter_config = {
             "P_rad_MW": 3,  # Just vibes
             "P_oh_MW": 5,  # Shot 29153 at t ~3.8s
+        }
+        # Early campaign MAST shots
+        self.shot_blacklist = {
+            28897,
+            28898,
+            28899,
+            28900,
+            28901,
+            28906,
+            28907,
+            28909,
+            28910,
+            28911,
+            28938,
+            28939,
+            28956,
+            28957,
+            28972,
+            28973,
+            28975,
+            28976,
+            28982,
+            28986,
+            28988,
+            28989,
+            28991,
+            28993,
+            28995,
+            28996,
+            29008,
+            29009,
+            29012,
+            29017,
+            29020,
+            29120,
+            29144,
+            30317,
+            30318,
         }
 
     # ------------------------------------------------------------------
@@ -998,6 +1037,20 @@ class MASTDataWorkflow(DataWorkflow):
                 ds["ne20_edge"].notnull() & (ds["ne20_edge"] > 0.001),
                 ne_edge_from_profile,
             )
+
+        # Scalar core temperature so filter_config can range-check it: filter_ds
+        # broadcasts masks over every dim of the variable, so the 3D Te_keV_rho
+        # cannot go in filter_config directly.
+        if "Te_keV_rho" in ds and "rho" in ds["Te_keV_rho"].dims:
+            ds["Te_keV_core"] = ds["Te_keV_rho"].sel(rho=0, method="nearest")
+
+        # Raw files store time as a data var on (time_idx,) only. filter_ds's
+        # where() then broadcasts it against the (time_idx, shot) valid mask,
+        # Make it a coordinate (like the C-Mod layout), so where()
+        # leaves coords alone and the tensorized builder promotes it back to a
+        # (shot, time_idx) data var.
+        if TIME_COORD in ds.data_vars:
+            ds = ds.set_coords(TIME_COORD)
 
         return ds
 

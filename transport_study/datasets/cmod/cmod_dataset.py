@@ -115,9 +115,17 @@ class CModDataWorkflow(DataWorkflow):
         )
 
         self.filter_config = {
-            "Wtot_MJ": {"min": 0.001, "max": 2},
+            "Wtot_MJ": {"min": 0.002, "max": 2},
             "ne20_line_avg": {"min": 0.01, "max": 4},
-            "betan": {"min": 0, "max": 5},
+            "betan": {"min": 0, "max": 1.5},
+        }
+        # Shots from run day with UFO
+        self.shot_blacklist = {
+            1160503001,
+            1160503002,
+            1160503003,
+            1160503004,
+            1160621001,
         }
         self.individual_filter_config = None
         # {signal: max_value}: once any of these exceeds its threshold the shot is
