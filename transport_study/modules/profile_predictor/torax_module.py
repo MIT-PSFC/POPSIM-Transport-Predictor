@@ -290,7 +290,7 @@ class ProfilePredictorTorax(TimeIndepModule):
 
         key, subkey_transport, subkey_sources, subkey_edge = jax.random.split(key, 4)
         self.nn_transport = RtdMLP(
-            in_size=9,
+            in_size=10,
             out_size=len(TRANSPORT_COEFFICIENT_NAMES[transport_model]),
             width_size=nn_width,
             depth=nn_depth,
@@ -298,7 +298,7 @@ class ProfilePredictorTorax(TimeIndepModule):
             key=subkey_transport,
         )
         self.nn_sources = RtdMLP(
-            in_size=9,
+            in_size=10,
             out_size=1,  # S_total
             width_size=nn_width,
             depth=nn_depth,
@@ -306,7 +306,7 @@ class ProfilePredictorTorax(TimeIndepModule):
             key=subkey_sources,
         )
         self.nn_edge = RtdMLP(
-            in_size=9,
+            in_size=10,
             out_size=2,  # edge density fraction, edge temperature fraction
             width_size=nn_width,
             depth=nn_depth,

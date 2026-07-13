@@ -588,7 +588,7 @@ class ProfileStudy(Study):
                         "n_shapes": 3,
                         "nn_depth": 2,
                         "nn_width": 16,
-                        "in_size": 9,  # Ip_MA, B0, betan, ne20_line_avg, R0, a_minor, kappa, delta_top, delta_bot
+                        "in_size": 10,  # Dimensionless nn_inputs derived from the raw input_vars, includes log(nu_star)
                         "softmax_temp": 1,
                         "prng_seed": 42,
                     },
@@ -626,7 +626,7 @@ class ProfileStudy(Study):
                         "n_points": 21,  # Number of points along the profile to predict for the unstructured NN
                         "nn_depth": 2,
                         "nn_width": 16,
-                        "in_size": 9,  # Ip_MA, B0, betan, ne20_line_avg, R0, a_minor, kappa, delta_top, delta_bot
+                        "in_size": 10,  # Dimensionless nn_inputs derived from the raw input_vars, includes log(nu_star)
                         "prng_seed": 42,
                     },
                     loss_config=loss_config_base,
@@ -666,7 +666,7 @@ class ProfileStudy(Study):
                         "input_scaling": 0.5,  # Scale of the random input weights and bias
                         "leak_rate": 1.0,  # Leaky integration rate of the state update
                         "n_steps": 20,  # Reservoir iterations before readout
-                        "in_size": 9,  # Ip_MA, B0, betan, ne20_line_avg, R0, a_minor, kappa, delta_top, delta_bot
+                        "in_size": 10,  # Dimensionless nn_inputs derived from the raw input_vars, includes log(nu_star)
                         "prng_seed": 42,
                     },
                     loss_config=loss_config_base,
@@ -705,7 +705,7 @@ class ProfileStudy(Study):
                         "freeze_shapes": case.freeze_shapes,
                         "nn_depth": 2,
                         "nn_width": 16,
-                        "in_size": 9,  # Ip_MA, B0, betan, ne20_line_avg, R0, a_minor, kappa, delta_top, delta_bot
+                        "in_size": 10,  # Dimensionless nn_inputs derived from the raw input_vars, includes log(nu_star)
                         "torax_config": PROFILE_PREDICTOR_TORAX_CONFIGS[transport_model]["model_init_config"]["torax_config"],
                         "prng_seed": 42,
                     },

@@ -13,8 +13,9 @@ from popsim import TimeIndepModule
 from popsim.basis import Basis1DProtocol, BSplineBasis, InterpedLinearBasis
 from popsim.cfspopcon_jax.current_drive import calc_f_shaping, calc_q_star
 from popsim.cfspopcon_jax.geometry import calc_plasma_volume
+from popsim.math_utils import safe_log
 from popsim.ml.rtd_mlp import Activation, RtdMLP
-from scipy.constants import eV, mu_0
+from scipy.constants import epsilon_0, eV, mu_0
 
 
 class ProfileShape(TimeIndepModule):
@@ -174,7 +175,10 @@ class Inputs:
 
     @property
     def beta(self):
-        return self.betan * self.Ip / (self.a_minor * self.B0)
+        # betan is in the standard percent m T / MA convention
+        # (beta_N = beta[%] a B0 / Ip), so divide by 100 for the
+        # dimensionless fraction
+        return self.betan * self.Ip / (self.a_minor * self.B0) / 100.0
 
     @property
     def te_approx(self):
@@ -185,8 +189,27 @@ class Inputs:
         return temp_keV
 
     @property
+    def nu_star(self):
+        # characteristic collisionality, from https://arxiv.org/pdf/2406.18442 eqn 2
+        # SI formula with temperature in joules, rearranged so the physical
+        # constants and unit conversions fold into python-float coefficients
+        # before touching the arrays: float32 array intermediates would
+        # otherwise overflow (ne_m3 / te_J^2 ~ 1e49) or underflow (eV^4 ~ 6.6e-76)
+        # and produce inf * 0 = nan
+        te_eV = self.te_approx * 1e3
+        # coulomb logarithm of debye_length over b90, which expands to
+        # log of 4 pi eps0^1.5 te_J^1.5 / (e^3 ne_m3^0.5) with te_J = te_eV * e
+        lambda_coeff = 4 * jnp.pi * epsilon_0**1.5 / (eV**1.5 * 1e10)
+        ln_lambda = safe_log(lambda_coeff * te_eV**1.5 / jnp.sqrt(self.ne20_line_avg))
+        # e^4 / (2 pi eps0^2) * ne_m3 / te_J^2
+        collision_coeff = eV**2 / (2 * jnp.pi * epsilon_0**2) * 1e20
+        collision_term = collision_coeff * self.ne20_line_avg / te_eV**2
+        geometry_term = self.q_star * self.R0 / (self.epsilon**1.5)
+        return collision_term * geometry_term * ln_lambda
+
+    @property
     def nn_inputs(self):
-        # 9 unitless parameters that maintain the same dimensionality as the original inputs
+        # 10 dimensionless parameters derived from original inputs
         inp_array = jnp.array(
             [
                 self.beta,
@@ -198,6 +221,7 @@ class Inputs:
                 self.kappa,
                 self.delta_top,
                 self.delta_bot,
+                safe_log(self.nu_star),
             ]
         )
         return inp_array
@@ -426,7 +450,7 @@ class ProfilePredictorReservoir(ProfilePredictor):
     """Reservoir computing (echo state network) profile predictor.
 
     Same input/output contract as ProfilePredictorUnstructuredNN, but instead of an MLP
-    the 9 physics inputs are expanded through a fixed random reservoir. The reservoir
+    the physics inputs are expanded through a fixed random reservoir. The reservoir
     state is iterated to a washed-out state with a leaky tanh update, and only the
     linear readout (self.nn, an RtdMLP with depth=0) is trained. The reservoir weights
     (w_in, w_res, res_bias) are drawn once at init and kept frozen by the trainable
@@ -434,7 +458,7 @@ class ProfilePredictorReservoir(ProfilePredictor):
     """
 
     rho_points: tuple = eqx.field(static=True)  # Hashable points at which the readout predicts
-    w_in: Array  # Fixed random input weights (reservoir_size, 9)
+    w_in: Array  # Fixed random input weights (reservoir_size, 10)
     w_res: Array  # Fixed random recurrent weights (reservoir_size, reservoir_size)
     res_bias: Array  # Fixed random bias (reservoir_size,)
     n_steps: int = eqx.field(static=True)  # Reservoir update iterations before readout
@@ -455,7 +479,7 @@ class ProfilePredictorReservoir(ProfilePredictor):
         self.rho_points = tuple(jnp.linspace(min(rhogrid_tuple), max(rhogrid_tuple), n_points).tolist())
 
         key_in, key_res, key_bias, key_out = jax.random.split(key, 4)
-        self.w_in = input_scaling * jax.random.uniform(key_in, (reservoir_size, 9), minval=-1.0, maxval=1.0)
+        self.w_in = input_scaling * jax.random.uniform(key_in, (reservoir_size, 10), minval=-1.0, maxval=1.0)
         w_res = jax.random.normal(key_res, (reservoir_size, reservoir_size))
         # Rescale recurrent weights to the requested spectral radius so the state
         # update is contracting (echo state property). Done with numpy at init time
@@ -544,7 +568,7 @@ class ProfilePredictorUnstructuredNN(ProfilePredictor):
 
         key, subkey = jax.random.split(key)
         self.nn = RtdMLP(
-            in_size=9,
+            in_size=10,
             out_size=(n_points * 2) + 2,  # +2 for the correction factors
             width_size=nn_width,
             depth=nn_depth,
