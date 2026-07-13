@@ -54,6 +54,15 @@ MIN_FINISHED_FRACTION = 0.1
 # How long the orchestration loop sleeps between passes over the unfinished cases
 ORCHESTRATION_POLL_INTERVAL_S = 8
 
+# After a case's training job leaves the queue, its result file can take tens of
+# seconds to become visible to the orchestrator's node (observed: NFS write-back
+# landing ~1 min after job exit, and attribute caching hiding an already-written
+# file for ~20 s). Relaunching in that window submits a duplicate job for a case
+# that is already done. Hold off relaunching a previously in-flight case until it
+# has been out of the queue this long. Wall-budget resumes are delayed by the
+# same amount, negligible against multi-hour training jobs.
+RELAUNCH_GRACE_S = 180
+
 
 class Study:
     """A class for organizing various components of a study, essentially outlining everything that needs to be done
@@ -222,8 +231,15 @@ class Study:
         (and logged about) individually. Prereqs are themselves cases in
         self.cases, so a blocked case becomes runnable once its prereq case
         finishes; nothing needs to recurse into prereq chains here.
+
+        A case whose job just left the queue is held for RELAUNCH_GRACE_S
+        before it can be relaunched: its result file may already be written but
+        not yet visible across nodes, and relaunching in that window submits a
+        duplicate job for a finished case.
         """
         unfinished = self.get_unfinished_cases()
+        # train job name -> monotonic time the job was last seen in the queue
+        last_in_flight: dict[str, float] = {}
         while unfinished:
             if enable_parallelism:
                 running_job_names = get_running_job_names()
@@ -235,12 +251,21 @@ class Study:
                 running_job_names = set()
 
             runnable = [case for case in unfinished if self.check_prereq_satisfied(case)]
-            in_flight = [case for case in runnable if self.case_in_flight(case, running_job_names)]
-            to_launch = [case for case in runnable if not self.case_in_flight(case, running_job_names)]
+            now = time.monotonic()
+            in_flight, in_grace, to_launch = [], [], []
+            for case in runnable:
+                if self.case_in_flight(case, running_job_names):
+                    in_flight.append(case)
+                    last_in_flight[self.train_job_name(case)] = now
+                elif now - last_in_flight.get(self.train_job_name(case), -math.inf) < RELAUNCH_GRACE_S:
+                    in_grace.append(case)
+                else:
+                    to_launch.append(case)
             n_blocked = len(unfinished) - len(runnable)
             logger.opt(colors=True).info(
                 f"<bold><green>{len(unfinished)} cases remain</green></bold> "
-                f"({len(in_flight)} in flight, {len(to_launch)} ready to launch, {n_blocked} blocked on prereqs)"
+                f"({len(in_flight)} in flight, {len(in_grace)} awaiting results, "
+                f"{len(to_launch)} ready to launch, {n_blocked} blocked on prereqs)"
             )
 
             for case in to_launch:
@@ -441,7 +466,9 @@ class Study:
                 capacity = count_idle_gpus(config.partition, config.buffer_gpus)
             else:
                 capacity = min(spillover_budget(), spillover_slots(partition))
-            sweep_jobs = min(capacity, max(outstanding_trials, 0))
+            # Always have at least a couple agents going (up to capacity) to finish out the sweep
+            # Want to avoid launching only one at a time which may get pruned
+            sweep_jobs = min(capacity, max(outstanding_trials, 6 - running_agents))
             if sweep_jobs <= 0:
                 logger.debug(f"No agent jobs needed for case {case} ({running_agents} agents already running)")
                 return
@@ -497,7 +524,6 @@ class Study:
         train_config = self.make_train_config(case)
         # Real training runs resume from the latest checkpoint if one exists and
         # stop cleanly at the wall-clock budget so the next launch can continue.
-        # Sweep trials get neither (see launch_sweep)
         train_config = train_config.model_copy(
             update={
                 "resume": True,
@@ -523,7 +549,11 @@ class Study:
                 return
             ds = result_dict["test/study_results"]
             result_path.parent.mkdir(parents=True, exist_ok=True)
-            ds.to_netcdf(result_path)
+            # Write to a temp name then rename so a partially written file is
+            # never visible at the result path, whose existence marks the case done
+            tmp_path = result_path.with_name(result_path.name + ".tmp")
+            ds.to_netcdf(tmp_path)
+            tmp_path.replace(result_path)
 
     ##############
     # COLLECTION #

@@ -436,8 +436,13 @@ if result_dict is None:
     print("Training stopped at the wall-clock budget before finishing, resubmitted job will resume.")
 else:
     ds = result_dict["test/study_results"]
-    Path({str(result_path)!r}).parent.mkdir(parents=True, exist_ok=True)
-    ds.to_netcdf({str(result_path)!r})
+    result_path = Path({str(result_path)!r})
+    result_path.parent.mkdir(parents=True, exist_ok=True)
+    # Write to a temp name then rename so a partially written file is never
+    # visible at the result path, whose existence marks the case done
+    tmp_path = result_path.with_name(result_path.name + ".tmp")
+    ds.to_netcdf(tmp_path)
+    tmp_path.replace(result_path)
 Path({str(config_path)!r}).unlink()
 Path({str(study_config_path)!r}).unlink()
 """
