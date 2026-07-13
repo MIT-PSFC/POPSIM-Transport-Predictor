@@ -39,6 +39,7 @@ MODEL_COLORS = {
     "torax-constant": "#8dff36",
     "torax-cgm": "#2fbf71",
     "torax-gyrobohm": "#b4ff9e",
+    "torax-qlknn": "#0e8a5f",
 }
 
 MODEL_LABELS = {
@@ -49,6 +50,7 @@ MODEL_LABELS = {
     "torax-constant": "TORAX constant",
     "torax-cgm": "TORAX CGM",
     "torax-gyrobohm": "TORAX GyroBohm",
+    "torax-qlknn": "TORAX QLKNN",
 }
 
 DA_COLORS = {
@@ -82,7 +84,7 @@ STAGE_LABELS = {
 DIVERGED_THRESHOLD = 1e3
 
 # Model families with shape bases that can be frozen or trained
-MODELS_WITH_SHAPES = ("shape_init_pca", "shape_init_kmeans", "torax-constant", "torax-cgm", "torax-gyrobohm")
+MODELS_WITH_SHAPES = ("shape_init_pca", "shape_init_kmeans", "torax-constant", "torax-cgm", "torax-gyrobohm", "torax-qlknn")
 
 
 def _training_data_colors(training_datasets: list[str]) -> dict[str, tuple]:

@@ -57,7 +57,7 @@ PROFILE_PREDICTOR_SHAPE_INIT_CONFIG = {
     },
 }
 
-# Transport blocks for the three TORAX transport models the torax profile
+# Transport blocks for the TORAX transport models the torax profile
 # predictor can be benchmarked with. Values are placeholders that must pass
 # pydantic validation; the NN-driven entries are overridden at call time.
 TORAX_TRANSPORT_BLOCKS = {
@@ -102,6 +102,26 @@ TORAX_TRANSPORT_BLOCKS = {
         "V_face_coeff": -0.1,  # Predicted by NN
         # Same stability clipping as the cgm, floor background transport
         # so cold low-density samples cannot run away, cap the stiff side.
+        "chi_min": 0.3,
+        "chi_max": 50.0,
+        "D_e_min": 0.1,
+    },
+    "qlknn": {
+        # QLKNN surrogate of QuaLiKiz turbulent transport. model_path and
+        # qlknn_model_name left unset so fusion_surrogates loads its bundled
+        # qlknn_7_11_v1 weights.
+        "model_name": "qlknn",
+        "ITG_flux_ratio_correction": 1.0,  # Predicted by NN
+        "ETG_correction_factor": 0.333,  # Predicted by NN
+        "collisionality_multiplier": 1.0,  # Predicted by NN
+        # QLKNN is data-driven itself
+        # Clip inputs so out-of-range samples saturate instead of extrapolating
+        "clip_inputs": True,
+        "clip_margin": 0.95,
+        "DV_effective": False,
+        "smoothing_width": 0.1,
+        # Same stability clipping as cgm and gyrobohm blocks: subcritical QLKNN
+        # drops chi toward zero and low-density ohmic samples run away.
         "chi_min": 0.3,
         "chi_max": 50.0,
         "D_e_min": 0.1,
@@ -222,7 +242,7 @@ _PROFILE_PREDICTOR_TORAX_CONFIG_BASE: dict[str, Any] = {
 def make_profile_predictor_torax_config(transport_model: str) -> dict:
     """Train config for the torax profile predictor with the given transport model.
 
-    transport_model is one of "constant", "cgm", "gyrobohm"
+    transport_model is one of "constant", "cgm", "gyrobohm", "qlknn"
     the corresponding model_type is "torax-<transport_model>".
     """
     if transport_model not in TORAX_TRANSPORT_BLOCKS:

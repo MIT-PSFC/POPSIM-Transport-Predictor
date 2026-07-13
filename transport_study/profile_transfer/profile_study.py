@@ -86,7 +86,16 @@ class ProfileStudy(Study):
         @field_validator("model_types")
         @classmethod
         def _validate_model_types(cls, v: tuple[str, ...]) -> tuple[str, ...]:
-            valid = {"shape_init_pca", "shape_init_kmeans", "unstructured_nn", "reservoir", "torax-constant", "torax-cgm", "torax-gyrobohm"}
+            valid = {
+                "shape_init_pca",
+                "shape_init_kmeans",
+                "unstructured_nn",
+                "reservoir",
+                "torax-constant",
+                "torax-cgm",
+                "torax-gyrobohm",
+                "torax-qlknn",
+            }
             for mt in v:
                 if mt not in valid:
                     raise ValueError(f"Invalid model type: {mt}. Must be one of {sorted(valid)}.")
@@ -206,8 +215,9 @@ class ProfileStudy(Study):
         model_type: The type of profile_predictor model to use
         - shape_init: Use principal component analysis to determine dominant shapes
         - unstructured_nn: a single neural network directly predicts profiles at certain points
-        - torax-constant / torax-cgm / torax-gyrobohm: TORAX simulation with NN-predicted
-          parameters for the constant, critical gradient, or Bohm-GyroBohm transport model
+        - torax-constant / torax-cgm / torax-gyrobohm / torax-qlknn: TORAX simulation with
+          NN-predicted parameters for the constant, critical gradient, Bohm-GyroBohm,
+          or QLKNN surrogate transport model
 
         training_data: The dataset(s) used for training
         - cmod: C-Mod only
@@ -295,6 +305,7 @@ class ProfileStudy(Study):
                 "torax-constant",
                 "torax-cgm",
                 "torax-gyrobohm",
+                "torax-qlknn",
             ]:
                 raise ValueError(f"Unknown model type: {model_type}")
             if domain_adaptation is None:
@@ -405,7 +416,10 @@ class ProfileStudy(Study):
                         continue  # Can't train from nothing with 0 target shots
                 elif num_target_shots != HYPERPARAM_TARGET_SHOTS:
                     continue  # Invalid case, skip
-            if model_type in ("unstructured_nn", "reservoir", "torax-constant", "torax-cgm", "torax-gyrobohm") and not freeze_shapes:
+            if (
+                model_type in ("unstructured_nn", "reservoir", "torax-constant", "torax-cgm", "torax-gyrobohm", "torax-qlknn")
+                and not freeze_shapes
+            ):
                 continue  # No shapes to freeze, just do one of the two
 
             case = self.Case(

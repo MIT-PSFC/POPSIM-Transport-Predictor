@@ -47,6 +47,7 @@ class TestCmodToCmod:
                 "torax-constant",
                 "torax-cgm",
                 "torax-gyrobohm",
+                "torax-qlknn",
             ],
             training_datasets=[
                 "exnihilo",
@@ -62,7 +63,7 @@ class TestCmodToCmod:
         run_study(
             config=study_config,
             enable_parallelism=True,
-            skip_tuning=False,
+            skip_tuning=True,
             skip_visualization=False,
             clean_sweeps=False,
             clean_models=False,

@@ -10,7 +10,7 @@ from transport_study.modules.profile_predictor.train_configs import (
 from transport_study.orchestration.organize_data import PROFILE_TARGET_VARS
 
 
-@pytest.mark.parametrize("transport_model", ["constant", "cgm", "gyrobohm"])
+@pytest.mark.parametrize("transport_model", ["constant", "cgm", "gyrobohm", "qlknn"])
 def test_torax_predictor(transport_model):
     config = StudyConfig(
         study_name=f"test_torax_predictor_{transport_model}",
