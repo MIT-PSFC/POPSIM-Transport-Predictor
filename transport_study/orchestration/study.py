@@ -1,10 +1,15 @@
+from __future__ import annotations
+
 import math
 import os
 import shutil
 import time
+import tomllib
 from dataclasses import dataclass
 from pathlib import Path
 
+import toml
+import xarray as xr
 import yaml
 from loguru import logger
 from popsim.ml import DataLoader, TrainConfig, Trainer
@@ -14,10 +19,16 @@ from popsim.ml.launch import (
     launch_train,
 )
 from popsim.ml.train_config import load_dict
+from pydantic import Field, field_validator, model_validator
 
 import wandb
 from transport_study import PACKAGE_ROOT
-from transport_study.config import config
+from transport_study.config import StudyConfig, _env_dataset_paths, config
+from transport_study.orchestration.organize_data import (
+    TrainingData,
+    get_loaded_shot_count,
+    parse_training_data,
+)
 from transport_study.orchestration.slurm_utils import (
     count_idle_gpus,
     count_running_jobs,
@@ -63,6 +74,90 @@ ORCHESTRATION_POLL_INTERVAL_S = 8
 # same amount, negligible against multi-hour training jobs.
 RELAUNCH_GRACE_S = 180
 
+# Transfer cases fine-tune from a pretrained checkpoint, and the tuned learning
+# rate they inherit was swept for training from scratch
+# too hot for fine-tuning, scale the schedule down
+TRANSFER_LR_FACTOR = 0.1
+
+
+class CaseGridConfig(StudyConfig):
+    """Config base for studies built on a case grid (model_type x training_data x ...).
+
+    Holds the case-grid axes every such study shares. Study-specific axes
+    (model_types, freeze options, hyperparam selections) and is_compatible
+    stay on the study's own Config subclass.
+    """
+
+    # Organization for datasets and wandb projects
+    working_dir_base: Path = Field(
+        default_factory=lambda: Path(os.environ.get("PTPS_WORKING_DIR_BASE", str(PACKAGE_ROOT / "popsim_studies" / "working_dir")))
+    )
+    # Case-grid axes shared by every study of this shape
+    training_datasets: tuple[TrainingData, ...]
+    domain_adaptation_methods: tuple[str | None, ...] = Field(default_factory=lambda: (None, "mixing", "transfer"))
+    target_test_set_size: int
+
+    @field_validator("domain_adaptation_methods")
+    @classmethod
+    def _validate_domain_adaptation(cls, v: tuple[str | None, ...]) -> tuple[str | None, ...]:
+        valid = {None, "mixing", "transfer"}
+        converted = tuple(None if da == "none" else da for da in v)
+        for da in converted:
+            if da not in valid:
+                raise ValueError(f"Invalid domain adaptation: {da}. Must be one of {valid}.")
+        return converted
+
+    @model_validator(mode="before")
+    @classmethod
+    def _coerce_training_datasets(cls, data) -> dict:
+        if "training_datasets" not in data:
+            return data
+        # Field defaults aren't applied yet in a before-validator, so when
+        # dataset_paths isn't passed explicitly, mirror its default_factory
+        dataset_paths = dict(data.get("dataset_paths") or _env_dataset_paths())
+        target_device = data.get("target_device")
+        data["training_datasets"] = tuple(
+            parse_training_data(s, dataset_paths, target_device) if isinstance(s, str) else s for s in data["training_datasets"]
+        )
+        return data
+
+    @classmethod
+    def from_toml(cls, path: Path) -> CaseGridConfig:
+        with open(path, "rb") as f:
+            data = tomllib.load(f)
+        datasets = data.pop("datasets", {})
+        target = datasets.pop("target", None)
+        study_cases = data.pop("study_cases", {})
+        # PTPS_DATASET_PATHS env var provides defaults, explicit TOML paths win
+        return cls(
+            **data,
+            **study_cases,
+            dataset_paths=_env_dataset_paths() | {k: Path(v) for k, v in datasets.items()},
+            target_device=target,
+        )
+
+    def save(self, path: Path):
+        raw = self.model_dump()
+        datasets = {k: str(v) for k, v in self.dataset_paths.items()}
+        if self.target_device is not None:
+            datasets["target"] = self.target_device
+        skip = {"dataset_paths", "target_device", "training_datasets", "domain_adaptation_methods"}
+        data = {}
+        for k, v in raw.items():
+            if k in skip:
+                continue
+            if v is None:
+                continue
+            if isinstance(v, Path):
+                data[k] = str(v)
+            else:
+                data[k] = v
+        data["training_datasets"] = [str(td) for td in self.training_datasets]
+        data["domain_adaptation_methods"] = [da if da is not None else "none" for da in self.domain_adaptation_methods]
+        data["datasets"] = datasets
+        with open(path, "w") as f:
+            toml.dump(data, f)
+
 
 class Study:
     """A class for organizing various components of a study, essentially outlining everything that needs to be done
@@ -71,6 +166,11 @@ class Study:
     - Model checkpoints
     - Results
     """
+
+    # Set by subclasses: directory holding the per-model-type wandb sweep YAMLs
+    SWEEP_CONFIG_DIR: Path
+    # Set by subclasses: study_type passed to organize_data (selects get_ds branch)
+    STUDY_TYPE: str
 
     @dataclass
     class Case:
@@ -183,9 +283,113 @@ class Study:
         for directory in [self.model_dir, self.result_dir, self.figure_dir]:
             directory.mkdir(parents=True, exist_ok=True)
 
+    #################
+    # CASE BUILDING #
+    #################
+    @classmethod
+    def _hyperparam_training_data(cls) -> TrainingData:
+        """All configured non-target source devices, the canonical hyperparam case."""
+        target = config.target_device
+        sources = sorted(set(config.dataset_paths.keys()) - ({target} if target else set()))
+        return TrainingData(sources_unsorted=sources)
+
+    def finalize_cases(self, cases: list[Case]) -> list[Case]:
+        """Unwrap prereq chains into the flat case list, dedupe, sort, drop impossible cases."""
+        unwrapped_cases = []
+
+        def _unwrap_prereqs(case):
+            unwrapped_cases.append(case)
+            if case.prereqs is not None:
+                for prereq in case.prereqs:
+                    _unwrap_prereqs(prereq)
+
+        for case in cases:
+            _unwrap_prereqs(case)
+
+        unique_cases = sorted(set(unwrapped_cases), key=str)
+        possible_cases = [case for case in unique_cases if not case.is_impossible()]  # Remove impossible cases
+
+        return possible_cases
+
     #############
     # EXECUTION #
     #############
+    def _make_mixing_device_weights(self, case: Case) -> dict[str, float]:
+        """Loss weights per device for mixing domain adaptation.
+
+        Mirrors the actual training-set composition of get_train_test_datasets:
+        every loaded shot of each source device in case.training_data (the
+        historic train and val splits are both concatenated into the mixing
+        training set) plus case.num_target_shots target shots.
+        Shot counts come from get_loaded_shot_count, so max_ds_size truncation
+        and study-type filtering are accounted for.
+
+        Weights are chosen so that each device's effective contribution to the
+        loss is F_x = W_x * N_x (N_x the device's shot count in the training
+        set, F_x its configured fraction). Typically the target device is
+        weighted most heavily. Weights are scaled so the mean per-sample weight
+        over the training set is 1, keeping the loss magnitude comparable across cases
+        """
+        target = config.target_device
+
+        # Shot counts as the training set actually sees them
+        shot_counts = {source: get_loaded_shot_count(source, study_type=self.STUDY_TYPE) for source in case.training_data.sources}
+        if case.num_target_shots == -1:
+            # All loaded target shots end up in training (CHEATING reference case)
+            shot_counts[target] = get_loaded_shot_count(target, study_type=self.STUDY_TYPE)
+        elif case.num_target_shots > 0:
+            shot_counts[target] = case.num_target_shots
+        # num_target_shots == 0: no target samples in training, so the target
+        # device gets no weight entry and the sources split the full budget
+
+        if config.dataset_fractions:
+            dataset_fractions = {device: config.dataset_fractions[device] for device in shot_counts}
+        else:
+            logger.info("Dataset fractions not provided in config. Using 50% for target and dividing remaining 50% evenly among sources.")
+            num_sources = len(case.training_data.sources)
+            dataset_fractions = {device: 0.5 if device == target else 0.5 / num_sources for device in shot_counts}
+
+        # Renormalize over the devices actually present in this case's training set
+        # (configured fractions may cover devices this case does not use)
+        total_fraction = sum(dataset_fractions.values())
+        total_shots = sum(shot_counts.values())
+        dataset_weights = {}
+        for device, N_x in shot_counts.items():
+            F_x = dataset_fractions[device] / total_fraction
+            # Scale by total_shots so sum(W_x * N_x) == total_shots, i.e. the
+            # mean per-sample weight is exactly 1
+            dataset_weights[device] = F_x / N_x * total_shots
+
+        return dataset_weights
+
+    def _set_transfer_checkpoint(self, train_config: TrainConfig, transfer_case: Case) -> TrainConfig:
+        """Point model_init at the pretrained checkpoint the transfer case fine-tunes from."""
+        return train_config.model_copy(
+            update={
+                "model_init_config": {
+                    **train_config.model_init_config,
+                    "transfer_checkpoint": str(self.trained_model_dir(transfer_case)),
+                }
+            }
+        )
+
+    @staticmethod
+    def _scale_transfer_lr(train_config: TrainConfig) -> TrainConfig:
+        """Cool the learning-rate schedule for fine-tuning from a pretrained checkpoint.
+
+        Applied after the tuned-config merge so the swept optimizer_config
+        cannot overwrite it (see TRANSFER_LR_FACTOR).
+        """
+        return train_config.model_copy(
+            update={
+                "optimizer_config": {
+                    **train_config.optimizer_config,
+                    "lr0": train_config.optimizer_config["lr0"] * TRANSFER_LR_FACTOR,
+                    "lrf": train_config.optimizer_config["lrf"] * TRANSFER_LR_FACTOR,
+                }
+            }
+        )
+
     def check_data_requirements(self, case: Case) -> bool:
         """Given a case, check if the required data for that case is available."""
         required = set(case.training_data.sources)
@@ -444,7 +648,7 @@ class Study:
 
         if not sweep_id:
             logger.info(f"No existing sweep found for case {case}, creating a new sweep")
-            sweep_config_path = Path(PACKAGE_ROOT) / "profile_transfer" / "sweep_configs" / f"{case.model_type}.yaml"
+            sweep_config_path = Path(self.SWEEP_CONFIG_DIR) / f"{case.model_type}.yaml"
             sweep_config = load_dict(str(sweep_config_path))
             sweep_id = wandb.sweep(sweep_config, project=wandb_project_name)
 
@@ -558,6 +762,53 @@ class Study:
     ##############
     # COLLECTION #
     ##############
+    @staticmethod
+    def _summarize_case_errors(ds: xr.Dataset) -> xr.Dataset:
+        """Reduce a case's result dataset to scalar error statistics.
+
+        Reads the four error variables every study's test eval suite writes
+        (error_{abs,rel}_{shot,ts}) and emits err_E_D_S scalars where E is
+        'abs' or 'rel', D is 'shot' or 'ts', and S is one of mean, std, med,
+        p25, p75, min, max.
+        """
+        err_abs_shot = ds["error_abs_shot"]
+        err_rel_shot = ds["error_rel_shot"]
+        err_abs_ts = ds["error_abs_ts"]
+        err_rel_ts = ds["error_rel_ts"]
+
+        return xr.Dataset(
+            {
+                "err_abs_shot_mean": err_abs_shot.mean(),
+                "err_abs_shot_std": err_abs_shot.std(),
+                "err_abs_shot_med": err_abs_shot.median(),
+                "err_abs_shot_p25": err_abs_shot.quantile(0.25).drop_vars("quantile"),
+                "err_abs_shot_p75": err_abs_shot.quantile(0.75).drop_vars("quantile"),
+                "err_abs_shot_min": err_abs_shot.min(),
+                "err_abs_shot_max": err_abs_shot.max(),
+                "err_rel_shot_mean": err_rel_shot.mean(),
+                "err_rel_shot_std": err_rel_shot.std(),
+                "err_rel_shot_med": err_rel_shot.median(),
+                "err_rel_shot_p25": err_rel_shot.quantile(0.25).drop_vars("quantile"),
+                "err_rel_shot_p75": err_rel_shot.quantile(0.75).drop_vars("quantile"),
+                "err_rel_shot_min": err_rel_shot.min(),
+                "err_rel_shot_max": err_rel_shot.max(),
+                "err_abs_ts_mean": err_abs_ts.mean(),
+                "err_abs_ts_std": err_abs_ts.std(),
+                "err_abs_ts_med": err_abs_ts.median(),
+                "err_abs_ts_p25": err_abs_ts.quantile(0.25).drop_vars("quantile"),
+                "err_abs_ts_p75": err_abs_ts.quantile(0.75).drop_vars("quantile"),
+                "err_abs_ts_min": err_abs_ts.min(),
+                "err_abs_ts_max": err_abs_ts.max(),
+                "err_rel_ts_mean": err_rel_ts.mean(),
+                "err_rel_ts_std": err_rel_ts.std(),
+                "err_rel_ts_med": err_rel_ts.median(),
+                "err_rel_ts_p25": err_rel_ts.quantile(0.25).drop_vars("quantile"),
+                "err_rel_ts_p75": err_rel_ts.quantile(0.75).drop_vars("quantile"),
+                "err_rel_ts_min": err_rel_ts.min(),
+                "err_rel_ts_max": err_rel_ts.max(),
+            }
+        )
+
     def restore_trainer(self, case: Case, restore_best_checkpoint: bool = True) -> tuple[Trainer, DataLoader]:
         """Restore a given case's trainer and the test dataloader"""
         if not self.trained_model_dir(case).exists():
