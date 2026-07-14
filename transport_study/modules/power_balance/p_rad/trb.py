@@ -11,8 +11,9 @@ from popsim.ml.checkpointing import create_default_checkpoint_manager, restore_m
 from popsim.ml.eval import EvalData, EvaluationSuite
 
 from transport_study import EPISODE_DIM, TIME_COORD, TIME_DIM
+from transport_study.config import config
+from transport_study.modules.normalization import make_normalizer
 from transport_study.modules.power_balance.p_rad.module import RadiatedPower
-from transport_study.orchestration.organize_data import dataset_config
 
 
 class RadiatedPowerTRB(TrainRunBuilder):
@@ -47,6 +48,11 @@ class RadiatedPowerTRB(TrainRunBuilder):
                 median = max(device_medians)
             model_init_config["max_val"] = 2 * median
 
+        # Fit normalization stats from the training data only, skipping the fit
+        # when a transfer checkpoint will overwrite the module anyway
+        fit_ds = None if model_init_config.get("transfer_checkpoint") else train_dl.ds
+        normalizer = make_normalizer(model_init_config["data_normalization"], fit_ds, len(config.ds_source_to_idx))
+
         module = RadiatedPower.init(
             in_size=model_init_config["in_size"],
             out_size=model_init_config["out_size"],
@@ -55,7 +61,7 @@ class RadiatedPowerTRB(TrainRunBuilder):
             min_val=model_init_config["min_val"],
             max_val=model_init_config["max_val"],
             prng_seed=model_init_config["prng_seed"],
-            data_normalization=model_init_config["data_normalization"],
+            normalizer=normalizer,
         )
 
         if model_init_config.get("transfer_checkpoint", False):
@@ -68,14 +74,14 @@ class RadiatedPowerTRB(TrainRunBuilder):
     @staticmethod
     def get_loss_fn(loss_config: dict) -> Callable[[Any, Any], jnp.ndarray]:
         if "device_weights" not in loss_config:
-            device_weights = dict.fromkeys(dataset_config.dataset_paths, 1.0)
+            device_weights = dict.fromkeys(config.dataset_paths, 1.0)
         else:
             device_weights = loss_config["device_weights"]
 
         def loss_fn(pred, targ):
             absolute_error = jnp.abs(pred.P_rad_MW_pred - targ["P_rad_MW"].data)
             for device, weight in device_weights.items():
-                device_mask = targ["ds_source_idx"].data == dataset_config.ds_source_to_idx[device]
+                device_mask = targ["ds_source_idx"].data == config.ds_source_to_idx[device]
                 absolute_error = jnp.where(device_mask, weight * absolute_error, absolute_error)
             huber_loss = optax.huber_loss(absolute_error, delta=loss_config["huber_delta"])
             return jnp.mean(huber_loss)
@@ -172,7 +178,12 @@ class RadiatedPowerTRB(TrainRunBuilder):
         domain_adaptation = model_init_config["domain_adaptation"]
 
         if domain_adaptation != "transfer":
-            return None
+            # Only the NN trains, the normalizer stats are frozen buffers
+            # (returning None here would let the trainer train every array leaf)
+            def get_trainable_nn(module: RadiatedPower):
+                return module.nn
+
+            return get_trainable_nn
 
         def get_trainable(module: RadiatedPower):
             return module.nn.layers[-1]

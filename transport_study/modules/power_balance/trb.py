@@ -10,22 +10,27 @@ from loguru import logger
 from popsim.ml import DataLoader, IntegralLoss, TrainConfig, TrainRunBuilder
 from popsim.ml.checkpointing import create_default_checkpoint_manager, restore_model
 from popsim.ml.dataloading import make_dataloaders
-from popsim.ml.eval import EvalData, EvaluationSuite
+from popsim.ml.eval import EvalData, EvaluationSuite, make_val_loss_eval_fn
 
 from transport_study import EPISODE_DIM, TIME_COORD, TIME_DIM
+from transport_study.config import config
+from transport_study.modules.normalization import make_normalizer
 from transport_study.modules.power_balance.module import (
     PowerBalanceEnv,
     PowerBalanceScalingLaw,
     PowerBalanceSciML,
+    PowerBalanceTransformer,
     PowerBalanceUnstructuredNN,
 )
 from transport_study.modules.power_balance.p_oh.trb import OhmicPowerTRB
 from transport_study.modules.power_balance.p_rad.trb import RadiatedPowerTRB
 from transport_study.orchestration.organize_data import (
-    dataset_config,
+    TrainingData,
     get_train_test_datasets,
     get_train_val_datasets,
 )
+
+STUDY_TYPE = "power_balance_transfer"
 
 
 class PowerBalanceTRB(TrainRunBuilder):
@@ -48,20 +53,39 @@ class PowerBalanceTRB(TrainRunBuilder):
         """
 
         training_data = dataloader_config["training_data"]
-        if dataloader_config["domain_adaptation"] is None:
+
+        if isinstance(training_data, dict):  # when the config is passed from WandB, it's a dict
+            training_data = TrainingData(**training_data)
+
+        if dataloader_config.get("domain_adaptation") is None:
             logger.info("Using standard learning dataloader")
-            ds_train, ds_val = get_train_val_datasets(
-                training_data=training_data,
-                data_normalization=dataloader_config["data_normalization"],
-            )
+            if not training_data.exnihilo:
+                ds_train, ds_val = get_train_val_datasets(
+                    training_data=training_data,
+                    study_type=STUDY_TYPE,
+                )
+            else:
+                ds_train, ds_val = get_train_test_datasets(
+                    training_data=training_data,
+                    domain_adaptation=None,
+                    num_target_shots=dataloader_config["num_target_shots"],
+                    target_test_set_size=dataloader_config.get("target_test_set_size", None),
+                    study_type=STUDY_TYPE,
+                )
+                # Double check there's no source (non-target) data anywhere in here
+                non_target = set(config.dataset_paths.keys()) - {config.target_device}
+                if any((ds_train["ds_source"] == src).any() for src in non_target):
+                    raise ValueError(
+                        "Historic data found in training set for exnihilo training_data option. Please check the dataset construction logic."
+                    )
         else:
             logger.info(f"Using transfer learning dataloader with domain adaptation {dataloader_config['domain_adaptation']}")
             ds_train, ds_val = get_train_test_datasets(
                 training_data=training_data,
-                data_normalization=dataloader_config["data_normalization"],
                 domain_adaptation=dataloader_config["domain_adaptation"],
-                num_hp_shots=dataloader_config["num_hp_shots"],
-                hp_test_set_size=dataloader_config.get("hp_test_set_size", None),
+                num_target_shots=dataloader_config["num_target_shots"],
+                target_test_set_size=dataloader_config.get("target_test_set_size", None),
+                study_type=STUDY_TYPE,
             )
 
         # Drop time_idx as a shared coordinate — it has duplicate values across shots and
@@ -69,34 +93,52 @@ class PowerBalanceTRB(TrainRunBuilder):
         ds_train = ds_train.drop_vars(TIME_DIM, errors="ignore")
         ds_val = ds_val.drop_vars(TIME_DIM, errors="ignore")
 
+        # The modules take ds_source_idx as an input (it selects per-device
+        # normalization stats), but it is stored per shot. Broadcast it against
+        # time so the dataloader can slice and segment it like the other inputs
+        input_vars = list(dataloader_config["input_vars"])
+        if "ds_source_idx" not in input_vars:
+            input_vars.append("ds_source_idx")
+        for ds in (ds_train, ds_val):
+            # Float dtype so the dataloader can NaN-pad it like the other inputs
+            ds["ds_source_idx"] = ds["ds_source_idx"].broadcast_like(ds["Ip_MA"]).astype(ds["Ip_MA"].dtype)
+
         if "state_vars" in dataloader_config.keys():
-            segment_lengths = [
+            segment_length = [
                 dataloader_config.get("segment_length_train", None),
                 dataloader_config.get("segment_length_val", None),
             ]
-            segment_overlaps = [
-                dataloader_config.get("segment_overlap_train", None),
-                dataloader_config.get("segment_overlap_val", None),
+            segment_overlap = [
+                dataloader_config.get("segment_overlap_train", 0) or 0,
+                dataloader_config.get("segment_overlap_val", 0) or 0,
             ]
         else:
-            segment_lengths = None
-            segment_overlaps = None
+            # Segments only apply to time-dependent (state-carrying) dataloaders
+            segment_length = None
+            segment_overlap = 0
 
         train_dl, val_dl = make_dataloaders(
             datasets=(ds_train, ds_val),
             time_coord=TIME_COORD,
             episode_coord=EPISODE_DIM,
-            input_vars=dataloader_config["input_vars"],
+            input_vars=input_vars,
             target_vars=dataloader_config["target_vars"],
             extra_vars=dataloader_config.get("extra_vars", None),
             state_init_vars=dataloader_config.get("state_vars", None),
             batch_size=dataloader_config.get("batch_size", None),
-            segment_lengths=segment_lengths,
-            segment_overlaps=segment_overlaps,
+            segment_length=segment_length,
+            segment_overlap=segment_overlap,
             shuffle=[True, False],
             convert_xr_to_jnp=False,  # Needed to keep the coords for calculating loss
             # TODO(ZanderKeith): Switch to 'drop_segment' after you fix the dataset setup
             nan_handling="drop_slice_any",
+            # Keep every batch the same shape so the jitted train step never
+            # retraces on a ragged final batch (whose static xr metadata is not
+            # comparable across calls). Train drops the ragged tail (reshuffled
+            # every epoch, so no data is permanently lost), val pads it and
+            # consumers trim the duplicates.
+            drop_last=[True, False],
+            pad_last=[False, True],
         )
         # Running test evaluation on the validation set, since we don't need a dedicated test set
         # In the no domain adaptation case, we are hyperparameter tuning on all historic data, pick the best one and test on it
@@ -113,6 +155,13 @@ class PowerBalanceTRB(TrainRunBuilder):
 
         def _build_module(train_dl: DataLoader, model_init_config: dict) -> Any:
             model_type = model_init_config["model_type"]
+            # Fit normalization stats from the training data only. When a
+            # transfer checkpoint will overwrite the module anyway, skip the
+            # fit (a CORAL fit on a handful of target shots is ill-conditioned
+            # and the restored source-fitted stats are the correct ones)
+            n_devices = len(config.ds_source_to_idx)
+            fit_ds = None if model_init_config.get("transfer_checkpoint") else train_dl.ds
+            normalizer = make_normalizer(model_init_config["data_normalization"], fit_ds, n_devices)
             if model_type in ["scaling_law", "sciml"]:
                 p_oh_config = model_init_config["submodules"]["p_oh_predictor"]
                 if isinstance(p_oh_config, TrainConfig):
@@ -139,6 +188,7 @@ class PowerBalanceTRB(TrainRunBuilder):
                 module = PowerBalanceSciML.init(
                     p_oh_predictor=p_oh_predictor,
                     p_rad_predictor=p_rad_predictor,
+                    normalizer=normalizer,
                     in_size=model_init_config["in_size"],
                     out_size=model_init_config["out_size"],
                     nn_width=model_init_config["nn_width"],
@@ -153,12 +203,25 @@ class PowerBalanceTRB(TrainRunBuilder):
                     out_size=model_init_config["out_size"],
                     nn_width=model_init_config["nn_width"],
                     nn_depth=model_init_config["nn_depth"],
+                    normalizer=normalizer,
+                    min_val=model_init_config.get("min_val", None),
+                    max_val=model_init_config.get("max_val", None),
+                    prng_seed=model_init_config.get("prng_seed", 42),
+                )
+            elif model_type == "transformer":
+                module = PowerBalanceTransformer.init(
+                    d_model=model_init_config["d_model"],
+                    num_heads=model_init_config["num_heads"],
+                    history_len=model_init_config["history_len"],
+                    nn_width=model_init_config["nn_width"],
+                    nn_depth=model_init_config["nn_depth"],
+                    normalizer=normalizer,
                     min_val=model_init_config.get("min_val", None),
                     max_val=model_init_config.get("max_val", None),
                     prng_seed=model_init_config.get("prng_seed", 42),
                 )
             else:
-                raise ValueError(f"Invalid model case: {model_init_config['model_case']}")
+                raise ValueError(f"Invalid model type: {model_type}")
 
             return module
 
@@ -171,7 +234,6 @@ class PowerBalanceTRB(TrainRunBuilder):
 
         env = PowerBalanceEnv(
             module=module,
-            data_normalization=model_init_config["data_normalization"],
             domain_adaptation=model_init_config["domain_adaptation"],
             freeze_submodules=freeze_submodules,
         )
@@ -213,36 +275,61 @@ class PowerBalanceTRB(TrainRunBuilder):
         return env
 
     @staticmethod
-    def get_loss_fn(loss_config: dict) -> Callable[[Any, Any], jnp.ndarray]:
+    def _make_wtot_loss_fn(loss_config: dict, use_huber: bool) -> IntegralLoss:
+        """Device-weighted loss on Wtot_MJ_pred, wrapped for time integration.
+
+        use_huber selects the training loss (huber, with the swept
+        huber_delta) or the delta-free validation loss (plain absolute error),
+        so the sweep metric val/loss.mean cannot be gamed by shrinking delta.
+        """
         if "device_weights" not in loss_config:
-            device_weights = dict.fromkeys(dataset_config.dataset_paths, 1.0)
+            device_weights = dict.fromkeys(config.dataset_paths, 1.0)
         else:
             device_weights = loss_config["device_weights"]
 
         def loss_fn(pred, targ):
-            huber_loss = optax.huber_loss(
-                pred.Wtot_MJ_pred,
-                targ["Wtot_MJ"].data,
-                delta=loss_config["huber_delta"],
-            )
+            if use_huber:
+                errors = optax.huber_loss(
+                    pred.Wtot_MJ_pred,
+                    targ["Wtot_MJ"].data,
+                    delta=loss_config["huber_delta"],
+                )
+            else:
+                errors = jnp.abs(pred.Wtot_MJ_pred - targ["Wtot_MJ"].data)
 
             # Build per-sample weights from device labels
             ds_source_idx = targ["ds_source_idx"].data
-            sample_weights = jnp.ones(ds_source_idx.shape, dtype=huber_loss.dtype)
+            sample_weights = jnp.ones(ds_source_idx.shape, dtype=errors.dtype)
             for device, weight in device_weights.items():
                 sample_weights = jnp.where(
-                    ds_source_idx == dataset_config.ds_source_to_idx[device],
+                    ds_source_idx == config.ds_source_to_idx[device],
                     weight,
                     sample_weights,
                 )
 
-            # Broadcast sample weights to match huber_loss shape if needed
-            while sample_weights.ndim < huber_loss.ndim:
+            # Broadcast sample weights to match the error shape if needed
+            while sample_weights.ndim < errors.ndim:
                 sample_weights = sample_weights[..., None]
 
-            return jnp.mean(sample_weights * huber_loss)
+            return jnp.mean(sample_weights * errors)
 
         return IntegralLoss(loss_fn)
+
+    @staticmethod
+    def get_loss_fn(loss_config: dict) -> Callable[[Any, Any], jnp.ndarray]:
+        return PowerBalanceTRB._make_wtot_loss_fn(loss_config, use_huber=True)
+
+    @staticmethod
+    def get_val_loss_fn(loss_config: dict) -> Callable[[Any, Any], jnp.ndarray]:
+        return PowerBalanceTRB._make_wtot_loss_fn(loss_config, use_huber=False)
+
+    @staticmethod
+    def get_val_eval_suite(suite_config) -> EvaluationSuite | None:
+        """Validation suite computing the delta-free loss (sweep metric val/loss.mean)."""
+        if suite_config is None:
+            return None
+        loss_fn = PowerBalanceTRB.get_val_loss_fn(suite_config["loss_config"])
+        return {"loss": make_val_loss_eval_fn(loss_fn)}
 
     @staticmethod
     def get_optimizer(config: dict) -> optax.GradientTransformation:

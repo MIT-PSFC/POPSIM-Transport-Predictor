@@ -3,12 +3,13 @@ import equinox as eqx
 import jax
 import jax.numpy as jnp
 import xarray as xr
-from jaxtyping import ArrayLike
-from popsim import TimeDepModule
+from jaxtyping import Array, ArrayLike
+from popsim import TimeDepModule, discrete_no_save_field
 from popsim.math_utils import soft_clip
 from popsim.ml.envs import ModuleTrainingEnv
 from popsim.simulate import StepperType
 
+from transport_study.modules.normalization import InputNormalizer
 from transport_study.modules.power_balance.p_oh.module import OhmicPower
 from transport_study.modules.power_balance.p_rad.module import RadiatedPower
 
@@ -207,6 +208,14 @@ class ScalingLawPredictor(eqx.Module):
 
 
 class PowerBalance(TimeDepModule):
+    """Base for the time-dependent stored-energy models.
+
+    Inputs are always in PHYSICAL units plus the device index
+    Each concrete model normalizes for its neural networks internally
+    (see transport_study.modules.normalization)
+    physics pieces like the scaling laws and the Wtot/tau_e power balance consume the physical values.
+    """
+
     @chex.dataclass
     class State:
         Wtot_MJ: float
@@ -219,16 +228,22 @@ class PowerBalance(TimeDepModule):
         R0: float
         a_minor: float
         kappa: float
-        ne20: float
+        ne20_line_avg: float
         P_aux_MW: float
-        # Things that might get put into a neural network
-        Ip_MA_nn: float
-        B0_nn: float
-        R0_nn: float
-        a_minor_nn: float
-        kappa_nn: float
-        ne20_nn: float
-        P_aux_nn: float
+        # Device index selecting per-device normalization statistics
+        ds_source_idx: float
+
+        def to_normalizer_inputs(self) -> InputNormalizer.Inputs:
+            return InputNormalizer.Inputs(
+                Ip_MA=self.Ip_MA,
+                B0=self.B0,
+                R0=self.R0,
+                a_minor=self.a_minor,
+                kappa=self.kappa,
+                ne20_line_avg=self.ne20_line_avg,
+                P_aux_MW=self.P_aux_MW,
+                ds_source_idx=self.ds_source_idx,
+            )
 
     @chex.dataclass
     class Output:
@@ -267,38 +282,22 @@ class PowerBalanceScalingLaw(PowerBalance):
         )
 
     def __call__(self, state: PowerBalance.State, inputs: PowerBalance.Inputs) -> tuple[PowerBalance.State, PowerBalance.Output]:
-        p_oh_predictor_inputs = OhmicPower.Inputs(
-            Ip_MA_real=inputs.Ip_MA,
-            Ip_MA_nn=inputs.Ip_MA_nn,
-            B0_nn=inputs.B0_nn,
-            R0_nn=inputs.R0_nn,
-            a_minor_nn=inputs.a_minor_nn,
-            kappa_nn=inputs.kappa_nn,
-            ne20_nn=inputs.ne20_nn,
-            P_aux_nn=inputs.P_aux_nn,
-        )
-        p_oh_predictor_output = self.p_oh_predictor(p_oh_predictor_inputs)
+        # Submodules take physical inputs and normalize internally with their own stats
+        normalizer_inputs = inputs.to_normalizer_inputs()
+        p_oh_predictor_output = self.p_oh_predictor(normalizer_inputs)
+        p_rad_predictor_output = self.p_rad_predictor(normalizer_inputs)
 
-        p_rad_predictor_inputs = RadiatedPower.Inputs(
-            ne20_real=inputs.ne20,
-            Ip_MA_nn=inputs.Ip_MA_nn,
-            B0_nn=inputs.B0_nn,
-            R0_nn=inputs.R0_nn,
-            a_minor_nn=inputs.a_minor_nn,
-            kappa_nn=inputs.kappa_nn,
-            ne20_nn=inputs.ne20_nn,
-            P_aux_nn=inputs.P_aux_nn,
-        )
-        p_rad_predictor_output = self.p_rad_predictor(p_rad_predictor_inputs)
-
+        # The scaling law is dimensional physics, it MUST see physical units.
+        # (The pre-normalizer-module code fed it normalized features, which was
+        # only correct for raw normalization.)
         taue_predictor_inputs = ScalingLawPredictor.Inputs(
-            Ip_MA=inputs.Ip_MA_nn,
-            B0=inputs.B0_nn,
-            R0=inputs.R0_nn,
-            a_minor=inputs.a_minor_nn,
-            kappa=inputs.kappa_nn,
-            ne20=inputs.ne20_nn,
-            P_aux_MW=inputs.P_aux_nn,
+            Ip_MA=inputs.Ip_MA,
+            B0=inputs.B0,
+            R0=inputs.R0,
+            a_minor=inputs.a_minor,
+            kappa=inputs.kappa,
+            ne20=inputs.ne20_line_avg,
+            P_aux_MW=inputs.P_aux_MW,
             P_oh_MW=p_oh_predictor_output.P_oh_MW_pred,
         )
         taue_predictor_output = self.taue_predictor(taue_predictor_inputs)
@@ -325,6 +324,7 @@ class PowerBalanceSciML(PowerBalance):
     taue_predictor: BoundedNNPredictor
     p_oh_predictor: OhmicPower
     p_rad_predictor: RadiatedPower
+    normalizer: InputNormalizer
 
     @classmethod
     def init(
@@ -335,6 +335,7 @@ class PowerBalanceSciML(PowerBalance):
         nn_depth: int,
         p_oh_predictor: OhmicPower,
         p_rad_predictor: RadiatedPower,
+        normalizer: InputNormalizer,
         min_taue: float | None = None,
         max_taue: float | None = None,
         prng_seed: int = 42,
@@ -357,41 +358,25 @@ class PowerBalanceSciML(PowerBalance):
             taue_predictor=taue_predictor,
             p_oh_predictor=p_oh_predictor,
             p_rad_predictor=p_rad_predictor,
+            normalizer=normalizer,
         )
 
     def __call__(self, state: PowerBalance.State, inputs: PowerBalance.Inputs) -> tuple[PowerBalance.State, PowerBalance.Output]:
-        p_oh_predictor_inputs = OhmicPower.Inputs(
-            Ip_MA_real=inputs.Ip_MA,
-            Ip_MA_nn=inputs.Ip_MA_nn,
-            B0_nn=inputs.B0_nn,
-            R0_nn=inputs.R0_nn,
-            a_minor_nn=inputs.a_minor_nn,
-            kappa_nn=inputs.kappa_nn,
-            ne20_nn=inputs.ne20_nn,
-            P_aux_nn=inputs.P_aux_nn,
-        )
-        p_oh_predictor_output = self.p_oh_predictor(p_oh_predictor_inputs)
+        # Submodules take physical inputs and normalize internally with their own stats
+        normalizer_inputs = inputs.to_normalizer_inputs()
+        p_oh_predictor_output = self.p_oh_predictor(normalizer_inputs)
+        p_rad_predictor_output = self.p_rad_predictor(normalizer_inputs)
 
-        p_rad_predictor_inputs = RadiatedPower.Inputs(
-            ne20_real=inputs.ne20,
-            Ip_MA_nn=inputs.Ip_MA_nn,
-            B0_nn=inputs.B0_nn,
-            R0_nn=inputs.R0_nn,
-            a_minor_nn=inputs.a_minor_nn,
-            kappa_nn=inputs.kappa_nn,
-            ne20_nn=inputs.ne20_nn,
-            P_aux_nn=inputs.P_aux_nn,
-        )
-        p_rad_predictor_output = self.p_rad_predictor(p_rad_predictor_inputs)
-
+        # The tau_e NN sees this model's own normalized features
+        features = self.normalizer(normalizer_inputs)
         taue_predictor_inputs = BoundedNNPredictor.Inputs(
-            Ip_MA=inputs.Ip_MA_nn,
-            B0=inputs.B0_nn,
-            R0=inputs.R0_nn,
-            a_minor=inputs.a_minor_nn,
-            kappa=inputs.kappa_nn,
-            ne20=inputs.ne20_nn,
-            P_aux_MW=inputs.P_aux_nn,
+            Ip_MA=features.Ip_MA,
+            B0=features.B0,
+            R0=features.R0,
+            a_minor=features.a_minor,
+            kappa=features.kappa,
+            ne20=features.ne20_line_avg,
+            P_aux_MW=features.P_aux_MW,
         )
         taue_predictor_output = self.taue_predictor(taue_predictor_inputs)
 
@@ -415,24 +400,13 @@ class PowerBalanceSciML(PowerBalance):
 
 class PowerBalanceUnstructuredNN(PowerBalance):
     nn: eqx.Module
+    normalizer: InputNormalizer
     min_val: float = eqx.field(static=True)
     max_val: float = eqx.field(static=True)
 
     def __call__(self, state: PowerBalance.State, inputs: PowerBalance.Inputs) -> tuple[PowerBalance.State, PowerBalance.Output]:
-        arr = jnp.array(
-            [
-                inputs.Ip_MA_nn,
-                inputs.B0_nn,
-                inputs.R0_nn,
-                inputs.a_minor_nn,
-                inputs.kappa_nn,
-                inputs.ne20_nn,
-                inputs.P_aux_nn,
-            ]
-        )
-        nn_out = self.nn(arr)
-        # TODO(ZanderKeith) this should be predicting in beta or something
-        # at least all the inputs are in the same range...
+        features = self.normalizer(inputs.to_normalizer_inputs())
+        nn_out = self.nn(features.to_vec())
         Wtot_MJ_dot = soft_clip(nn_out, self.min_val, self.max_val, sharpness=6).squeeze()
 
         state_dot = PowerBalance.State(Wtot_MJ=Wtot_MJ_dot)
@@ -451,6 +425,7 @@ class PowerBalanceUnstructuredNN(PowerBalance):
         out_size: int,
         nn_width: int,
         nn_depth: int,
+        normalizer: InputNormalizer,
         min_val: float | None = None,
         max_val: float | None = None,
         prng_seed: int = 42,
@@ -464,107 +439,145 @@ class PowerBalanceUnstructuredNN(PowerBalance):
         )
         min_val = MIN_POWER if min_val is None else min_val
         max_val = MAX_POWER if max_val is None else max_val
-        return cls(nn=nn, min_val=min_val, max_val=max_val)
+        return cls(nn=nn, normalizer=normalizer, min_val=min_val, max_val=max_val)
+
+
+class PowerBalanceTransformer(PowerBalance):
+    """Purely data-driven dW/dt predictor with recurrent causal attention.
+
+    A rolling buffer of the last history_len embedded input tokens is carried
+    in the module State as a DISCRETE field
+    the simple-Euler stepper integrates only continuous state (Wtot_MJ)
+    and passes discrete fields through as the next state directly
+    (see popsim.simulate._single_step and popsim.modules.delay.DelayBuffer for the pattern),
+    so the buffer update is an exact discrete shift
+    no_save keeps the (K, d) buffer out of the recorded simulation output.
+
+    Each step: embed the normalized 7-vector to a token, roll it into the
+    history, attend with the current token as query over the history
+    (causal by construction, the buffer only ever contains current and past tokens),
+    then a residual connection and an MLP head produce a bounded Wtot_MJ_dot.
+    """
+
+    normalizer: InputNormalizer
+    feature_embed: eqx.nn.Linear
+    attention: eqx.nn.MultiheadAttention
+    head: eqx.nn.MLP
+    history_len: int = eqx.field(static=True)
+    d_model: int = eqx.field(static=True)
+    min_val: float = eqx.field(static=True)
+    max_val: float = eqx.field(static=True)
+
+    @chex.dataclass
+    class State:
+        Wtot_MJ: float
+        history: Array = discrete_no_save_field(default=None)  # (history_len, d_model)
+
+    def __call__(self, state: "PowerBalanceTransformer.State", inputs: PowerBalance.Inputs) -> tuple:
+        features = self.normalizer(inputs.to_normalizer_inputs())
+        token = self.feature_embed(features.to_vec())
+
+        # Shift the buffer by one and insert the newest token at the end
+        new_history = jnp.concatenate([state.history[1:], token[None, :]], axis=0)
+
+        attn_out = self.attention(token[None, :], new_history, new_history)[0]
+        latent = token + attn_out
+        nn_out = self.head(latent)
+        Wtot_MJ_dot = soft_clip(nn_out, self.min_val, self.max_val, sharpness=6).squeeze()
+
+        state_out = PowerBalanceTransformer.State(Wtot_MJ=Wtot_MJ_dot, history=new_history)
+        output = PowerBalance.Output(
+            Wtot_MJ_pred=state.Wtot_MJ,
+            P_cond_MW=jnp.nan,  # Not predicted in this model
+            taue_predictor_output=TauePredictorOutputs(taue_pred=jnp.nan, debug_info={"nn_out": nn_out.squeeze()}),
+        )
+        return state_out, output
+
+    @classmethod
+    def init(
+        cls,
+        d_model: int,
+        num_heads: int,
+        history_len: int,
+        nn_width: int,
+        nn_depth: int,
+        normalizer: InputNormalizer,
+        min_val: float | None = None,
+        max_val: float | None = None,
+        prng_seed: int = 42,
+    ) -> "PowerBalanceTransformer":
+        key_embed, key_attn, key_head = jax.random.split(jax.random.PRNGKey(prng_seed), 3)
+        feature_embed = eqx.nn.Linear(7, d_model, key=key_embed)
+        attention = eqx.nn.MultiheadAttention(num_heads=num_heads, query_size=d_model, key=key_attn)
+        head = eqx.nn.MLP(
+            in_size=d_model,
+            out_size=1,
+            width_size=nn_width,
+            depth=nn_depth,
+            key=key_head,
+        )
+        min_val = MIN_POWER if min_val is None else min_val
+        max_val = MAX_POWER if max_val is None else max_val
+        return cls(
+            normalizer=normalizer,
+            feature_embed=feature_embed,
+            attention=attention,
+            head=head,
+            history_len=history_len,
+            d_model=d_model,
+            min_val=min_val,
+            max_val=max_val,
+        )
 
 
 class PowerBalanceEnv(ModuleTrainingEnv):
     module: PowerBalance
-    data_normalization: str = eqx.field(static=True, default="unset")
     domain_adaptation: str = eqx.field(static=True, default="unset")
     freeze_submodules: list[str] = eqx.field(static=True, default_factory=list)
     stepper: StepperType = eqx.field(static=True, default=StepperType.SIMPLE_EULER)
 
-    @staticmethod
-    def create_state(observations: dict[str, ArrayLike], inputs: dict[str, ArrayLike]):
-        return PowerBalance.State(Wtot_MJ=observations["Wtot_MJ"].data)
+    def create_state(self, observations: dict[str, ArrayLike], inputs: dict[str, ArrayLike]):
+        Wtot_MJ = observations["Wtot_MJ"].data
+        if isinstance(self.module, PowerBalanceTransformer):
+            history = jnp.zeros((self.module.history_len, self.module.d_model))
+            return PowerBalanceTransformer.State(Wtot_MJ=Wtot_MJ, history=history)
+        return PowerBalance.State(Wtot_MJ=Wtot_MJ)
 
-    def create_inputs(self, inputs: dict[str, ArrayLike]):
-        # TODO(ZanderKeith) this needs to be replaced with a thing where we initialize the module with a transform
-        # The inputs to a top-level module should likely ALWAYS be in physical units
+    @staticmethod
+    def create_inputs(inputs: dict[str, ArrayLike]):
+        # Top-level module inputs are always in physical units,
+        # normalization happens inside the modules
         if isinstance(inputs, xr.Dataset):
             inputs = {var: inputs[var].data for var in inputs.data_vars}
-
-        if self.data_normalization == "raw":
-            inputs = PowerBalance.Inputs(
-                Ip_MA=inputs["Ip_MA"],
-                B0=inputs["B0"],
-                R0=inputs["R0"],
-                a_minor=inputs["a_minor"],
-                kappa=inputs["kappa"],
-                ne20=inputs["ne20_line_avg"],
-                P_aux_MW=inputs["P_aux_MW"],
-                Ip_MA_nn=inputs["Ip_MA"],
-                B0_nn=inputs["B0"],
-                R0_nn=inputs["R0"],
-                a_minor_nn=inputs["a_minor"],
-                kappa_nn=inputs["kappa"],
-                ne20_nn=inputs["ne20_line_avg"],
-                P_aux_nn=inputs["P_aux_MW"],
-            )
-        elif self.data_normalization == "physics":
-            inputs = PowerBalance.Inputs(
-                Ip_MA=inputs["Ip_MA"],
-                B0=inputs["B0"],
-                R0=inputs["R0"],
-                a_minor=inputs["a_minor"],
-                kappa=inputs["kappa"],
-                ne20=inputs["ne20_line_avg"],
-                P_aux_MW=inputs["P_aux_MW"],
-                Ip_MA_nn=inputs["Ip_MA"],
-                B0_nn=inputs["q_star"],
-                R0_nn=inputs["epsilon"],
-                a_minor_nn=inputs["aB0"],
-                kappa_nn=inputs["kappa"],
-                ne20_nn=inputs["f_G"],
-                P_aux_nn=inputs["surface_power_density"],
-            )
-        elif self.data_normalization == "z_score":
-            inputs = PowerBalance.Inputs(
-                Ip_MA=inputs["Ip_MA"],
-                B0=inputs["B0"],
-                R0=inputs["R0"],
-                a_minor=inputs["a_minor"],
-                kappa=inputs["kappa"],
-                ne20=inputs["ne20_line_avg"],
-                P_aux_MW=inputs["P_aux_MW"],
-                Ip_MA_nn=inputs["Ip_MA_z"],
-                B0_nn=inputs["B0_z"],
-                R0_nn=inputs["R0_z"],
-                a_minor_nn=inputs["a_minor_z"],
-                kappa_nn=inputs["kappa_z"],
-                ne20_nn=inputs["ne20_line_avg_z"],
-                P_aux_nn=inputs["P_aux_MW_z"],
-            )
-        elif self.data_normalization == "coral":
-            inputs = PowerBalance.Inputs(
-                Ip_MA=inputs["Ip_MA"],
-                B0=inputs["B0"],
-                R0=inputs["R0"],
-                a_minor=inputs["a_minor"],
-                kappa=inputs["kappa"],
-                ne20=inputs["ne20_line_avg"],
-                P_aux_MW=inputs["P_aux_MW"],
-                Ip_MA_nn=inputs["Ip_MA_coral"],
-                B0_nn=inputs["B0_coral"],
-                R0_nn=inputs["R0_coral"],
-                a_minor_nn=inputs["a_minor_coral"],
-                kappa_nn=inputs["kappa_coral"],
-                ne20_nn=inputs["ne20_line_avg_coral"],
-                P_aux_nn=inputs["P_aux_MW_coral"],
-            )
-        else:
-            raise ValueError(f"Unknown data normalization method: {self.data_normalization}")
-        return inputs
+        return PowerBalance.Inputs(
+            Ip_MA=inputs["Ip_MA"],
+            B0=inputs["B0"],
+            R0=inputs["R0"],
+            a_minor=inputs["a_minor"],
+            kappa=inputs["kappa"],
+            ne20_line_avg=inputs["ne20_line_avg"],
+            P_aux_MW=inputs["P_aux_MW"],
+            ds_source_idx=inputs["ds_source_idx"],
+        )
 
     def get_trainable(self):
+        """Trainable leaves for the optimizer partition.
+
+        Selects NN leaves explicitly, never whole modules
+        normalizer statistics are ordinary array leaves on every module and must stay frozen
+        (a broad eqx.filter over a module would silently train them)
+        """
         if self.domain_adaptation == "transfer":
-            # Transfer learning: only the last layer of each NN is trainable.
-            # TODO(ZanderKeith) replace this with an actual partition
             last_layer_leaves = []
             if isinstance(self.module, PowerBalanceUnstructuredNN):
                 last_layer_leaves += [
                     self.module.nn.layers[-1].weight,
                     self.module.nn.layers[-1].bias,
+                ]
+            if isinstance(self.module, PowerBalanceTransformer):
+                last_layer_leaves += [
+                    self.module.head.layers[-1].weight,
+                    self.module.head.layers[-1].bias,
                 ]
             if isinstance(self.module, PowerBalanceSciML):
                 last_layer_leaves += [
@@ -585,15 +598,19 @@ class PowerBalanceEnv(ModuleTrainingEnv):
             return last_layer_leaves
 
         trainable_leaves = {}
-        if isinstance(self.module, PowerBalanceScalingLaw) or isinstance(self.module, PowerBalanceSciML):
+        if isinstance(self.module, (PowerBalanceScalingLaw, PowerBalanceSciML)):
             if "p_oh_predictor" not in self.freeze_submodules:
-                trainable_leaves["p_oh_predictor"] = eqx.filter(self.module.p_oh_predictor, eqx.is_inexact_array)
+                trainable_leaves["p_oh_predictor"] = eqx.filter(self.module.p_oh_predictor.nn, eqx.is_inexact_array)
             if "p_rad_predictor" not in self.freeze_submodules:
-                trainable_leaves["p_rad_predictor"] = eqx.filter(self.module.p_rad_predictor, eqx.is_inexact_array)
+                trainable_leaves["p_rad_predictor"] = eqx.filter(self.module.p_rad_predictor.nn, eqx.is_inexact_array)
 
         if isinstance(self.module, PowerBalanceSciML):
-            trainable_leaves["taue_predictor"] = eqx.filter(self.module.taue_predictor, eqx.is_inexact_array)
+            trainable_leaves["taue_predictor"] = eqx.filter(self.module.taue_predictor.nn, eqx.is_inexact_array)
         elif isinstance(self.module, PowerBalanceUnstructuredNN):
-            trainable_leaves["nn"] = eqx.filter(self.module, eqx.is_inexact_array)
+            trainable_leaves["nn"] = eqx.filter(self.module.nn, eqx.is_inexact_array)
+        elif isinstance(self.module, PowerBalanceTransformer):
+            trainable_leaves["feature_embed"] = eqx.filter(self.module.feature_embed, eqx.is_inexact_array)
+            trainable_leaves["attention"] = eqx.filter(self.module.attention, eqx.is_inexact_array)
+            trainable_leaves["head"] = eqx.filter(self.module.head, eqx.is_inexact_array)
 
         return trainable_leaves
