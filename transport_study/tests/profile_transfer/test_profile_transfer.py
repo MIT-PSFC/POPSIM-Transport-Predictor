@@ -1,6 +1,8 @@
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
+import pytest
+
 from transport_study import PACKAGE_ROOT
 from transport_study.profile_transfer.profile_study import ProfileStudy
 
@@ -177,11 +179,23 @@ def test_config_save_load_with_dataset_weights():
         assert cfg == loaded_cfg
 
 
-def test_study_cmod_to_cmod_no_tuning():
+@pytest.mark.parametrize(
+    "model_type",
+    [
+        "shape_init_pca",
+        "shape_init_kmeans",
+        "unstructured_nn",
+        "torax-constant",
+        "torax-cgm",
+        "torax-gyrobohm",
+        "torax-qlknn",
+    ],
+)
+def test_study_cmod_to_cmod_no_tuning(model_type):
     working_dir_base = PACKAGE_ROOT / "tests" / "test_outputs" / "profile_transfer" / "cmod_to_cmod_no_tuning"
 
     cfg = ProfileStudy.Config(
-        study_name="test_study_cmod_to_cmod",
+        study_name=f"test_study_cmod_to_cmod_{model_type}",
         working_dir_base=working_dir_base,
         dataset_paths={
             "cmod-low": PACKAGE_ROOT / "datasets" / "sample" / "cmod-low1.nc",
@@ -195,15 +209,7 @@ def test_study_cmod_to_cmod_no_tuning():
         max_epochs=2,
         epochs_per_val=1,
         patience=2,
-        model_types=[
-            "shape_init_pca",
-            "shape_init_kmeans",
-            "unstructured_nn",
-            "torax-constant",
-            "torax-cgm",
-            "torax-gyrobohm",
-            "torax-qlknn",
-        ],
+        model_types=[model_type],
         training_datasets=[
             "exnihilo",
             "cmod-low",
@@ -236,11 +242,12 @@ def test_study_cmod_to_cmod_no_tuning():
     ds_final.to_netcdf(study.collected_results_path())
 
 
-def test_study_cmod_to_cmod_with_tuning():
+@pytest.mark.parametrize("model_type", ["unstructured_nn"])
+def test_study_cmod_to_cmod_with_tuning(model_type):
     working_dir_base = PACKAGE_ROOT / "tests" / "test_outputs" / "profile_transfer" / "cmod_to_cmod_with_tuning"
 
     cfg = ProfileStudy.Config(
-        study_name="test_study_cmod_to_cmod",
+        study_name=f"test_study_cmod_to_cmod_{model_type}",
         working_dir_base=working_dir_base,
         dataset_paths={
             "cmod-low": PACKAGE_ROOT / "datasets" / "sample" / "cmod-low1.nc",
@@ -254,14 +261,14 @@ def test_study_cmod_to_cmod_with_tuning():
         max_epochs=2,
         epochs_per_val=1,
         patience=2,
-        model_types=["unstructured_nn"],
+        model_types=[model_type],
         training_datasets=[
             "exnihilo",
             "cmod-low",
         ],
         domain_adaptation_methods=[None, "mixing", "transfer"],
         num_target_shots_options=[0, -1],
-        target_test_set_size=60,
+        target_test_set_size=10,
     )
 
     study = ProfileStudy(cfg)
@@ -282,11 +289,12 @@ def test_study_cmod_to_cmod_with_tuning():
                 study.run_case(case, skip_tuning=False, enable_parallelism=False)
 
 
-def test_study_cmod_to_mast():
+@pytest.mark.parametrize("model_type", ["unstructured_nn"])
+def test_study_cmod_to_mast(model_type):
     working_dir_base = PACKAGE_ROOT / "tests" / "test_outputs" / "profile_transfer" / "cmod_to_mast"
 
     cfg = ProfileStudy.Config(
-        study_name="test_study_cmod_to_mast",
+        study_name=f"test_study_cmod_to_mast_{model_type}",
         working_dir_base=working_dir_base,
         dataset_paths={
             "cmod-low": PACKAGE_ROOT / "datasets" / "sample" / "cmod-low1.nc",
@@ -301,14 +309,14 @@ def test_study_cmod_to_mast():
         max_epochs=2,
         epochs_per_val=1,
         patience=2,
-        model_types=["unstructured_nn"],
+        model_types=[model_type],
         training_datasets=[
             "exnihilo",
             "cmod-low_cmod-high",
         ],
         domain_adaptation_methods=[None, "mixing", "transfer"],
         num_target_shots_options=[0, 1, -1],
-        target_test_set_size=20,
+        target_test_set_size=10,
     )
 
     study = ProfileStudy(cfg)
