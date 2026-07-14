@@ -46,6 +46,14 @@ class TrainingData:
         return [config.ds_source_to_idx[s] for s in self.sources]
 
 
+def parse_training_data(s: str, dataset_paths: dict, target_device: str | None) -> TrainingData:
+    """Convert a string like 'cmod_tcv' or 'exnihilo' to a TrainingData object."""
+    if s == "exnihilo":
+        non_target = set(dataset_paths.keys()) - ({target_device} if target_device else set())
+        return TrainingData(sources_unsorted=sorted(non_target), exnihilo=True)
+    return TrainingData(sources_unsorted=s.split("_"))
+
+
 REQUIRED_SIGNALS_POWER_BALANCE = [
     # Target
     "Wtot_MJ",
@@ -196,6 +204,14 @@ def get_ds(
 
         # Calculate aux power and absorbed power
         ds["P_aux_MW"] = ds["P_NBI_MW"] + ds["P_ECRH_MW"] + ds["P_ICRF_MW"] + ds["P_LH_MW"]
+
+        # Some device datasets carry multi-element numpy arrays in variable
+        # attrs (e.g. a 'validity' time range). Attrs become static jit
+        # metadata in the xarray pytree registration and arrays there break
+        # the treedef equality check, so strip them. (The profile branch loses
+        # attrs implicitly through interp, this branch must do it explicitly.)
+        for var in ds.variables:
+            ds[var].attrs = {}
 
         return ds
 
