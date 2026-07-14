@@ -135,6 +135,75 @@ def get_running_job_names(partition: str | None = None) -> set[str] | None:
     return {line.strip() for line in result.stdout.splitlines() if line.strip()}
 
 
+def get_running_job_elapsed_s(partition: str | None = None) -> dict[str, int] | None:
+    """Elapsed running time in seconds for this user's RUNNING jobs, keyed by job name.
+
+    Pending jobs are excluded, they haven't started accumulating epochs yet.
+    Returns None when squeue fails, so callers can tell "no running jobs" apart
+    from "scheduler unreachable" (mirrors get_running_job_names).
+    """
+    if partition is None:
+        partition = query_partitions()
+    result = subprocess.run(
+        [
+            "squeue",
+            "-p",
+            partition,
+            "-u",
+            getpass.getuser(),
+            "--state=RUNNING",
+            "--noheader",
+            # Default %j truncates long names, and case names run long
+            "--format=%512j %M",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        logger.critical(f"squeue failed: {result.stderr}")
+        return None
+    elapsed: dict[str, int] = {}
+    for line in result.stdout.splitlines():
+        if not line.strip():
+            continue
+        # %M has no internal whitespace, so the token after the last space is
+        # the elapsed time and everything before it (stripped of the %512j
+        # padding) is the job name
+        name, _, time_str = line.rpartition(" ")
+        elapsed_s = parse_slurm_time_s(time_str.strip())
+        if elapsed_s is not None:
+            elapsed[name.strip()] = elapsed_s
+    return elapsed
+
+
+def cancel_job(job_name: str, partition: str | None = None) -> None:
+    """Cancel this user's running job(s) with the given name.
+
+    Used by the stuck-job watchdog to kill a deadlocked training job so the
+    orchestration loop's normal relaunch path can resubmit it fresh.
+    """
+    if partition is None:
+        partition = query_partitions()
+    result = subprocess.run(
+        [
+            "scancel",
+            "-p",
+            partition,
+            "-u",
+            getpass.getuser(),
+            "-n",
+            job_name,
+            "--state=RUNNING",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        logger.error(f"scancel failed for job {job_name}: {result.stderr}")
+
+
 def count_idle_gpus(partition: str | None = None, buffer_gpus: int | None = None) -> int:
     """Count the number of idle GPUs on this partition."""
     if partition is None:

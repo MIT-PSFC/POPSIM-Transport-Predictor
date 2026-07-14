@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import toml
+import wandb
 import xarray as xr
 import yaml
 from loguru import logger
@@ -21,7 +22,6 @@ from popsim.ml.launch import (
 from popsim.ml.train_config import load_dict
 from pydantic import Field, field_validator, model_validator
 
-import wandb
 from transport_study import PACKAGE_ROOT
 from transport_study.config import StudyConfig, _env_dataset_paths, config
 from transport_study.orchestration.organize_data import (
@@ -30,8 +30,10 @@ from transport_study.orchestration.organize_data import (
     parse_training_data,
 )
 from transport_study.orchestration.slurm_utils import (
+    cancel_job,
     count_idle_gpus,
     count_running_jobs,
+    get_running_job_elapsed_s,
     get_running_job_names,
     launch_agent_parallel,
     launch_train_parallel,
@@ -63,7 +65,7 @@ MAX_TRAIN_ATTEMPTS = 3
 MIN_FINISHED_FRACTION = 0.1
 
 # How long the orchestration loop sleeps between passes over the unfinished cases
-ORCHESTRATION_POLL_INTERVAL_S = 8
+ORCHESTRATION_POLL_INTERVAL_S = 20
 
 # After a case's training job leaves the queue, its result file can take tens of
 # seconds to become visible to the orchestrator's node (observed: NFS write-back
@@ -78,6 +80,14 @@ RELAUNCH_GRACE_S = 180
 # rate they inherit was swept for training from scratch
 # too hot for fine-tuning, scale the schedule down
 TRANSFER_LR_FACTOR = 0.1
+
+# Some modules can deadlock (e.g. OpenBLAS eigvals or XLA compile-pool hangs)
+# A training job is considered stuck once it has run at least this long with no progress
+WATCHDOG_MIN_AGE_S = 80 * 60
+
+# Checkpoints are only written at the validation cadence (config.epochs_per_val),
+# not every epoch, so this is a coarse "no epochs completed recently" signal
+WATCHDOG_STALL_S = 60 * 60
 
 
 class CaseGridConfig(StudyConfig):
@@ -193,17 +203,28 @@ class Study:
         """Given a case, return the path where the results for that case should be stored."""
         return Path(self.result_dir) / str(case) / "result_data.nc"
 
-    def latest_checkpoint_epoch(self, case: Case) -> int | None:
-        """Highest epoch saved in the case's latest-checkpoint (resume) directory, or None if empty.
+    def _latest_checkpoint_dir_info(self, case: Case) -> tuple[int, float] | None:
+        """(epoch, mtime) of the highest-epoch dir in the case's latest-checkpoint
+        (resume) directory, or None if empty.
 
-        Orbax names each checkpoint directory after its step (here the epoch).
+        Orbax names each checkpoint directory after its step (here the epoch)
+        and renames it into place atomically once fully written, so the dir's
+        mtime marks the moment that epoch's checkpoint became visible.
         In-progress saves get a non-numeric tmp suffix and are skipped.
         """
         latest_dir = Path(f"{self.trained_model_dir(case)}_latest")
         if not latest_dir.exists():
             return None
-        epochs = [int(p.name) for p in latest_dir.iterdir() if p.is_dir() and p.name.isdigit()]
-        return max(epochs, default=None)
+        epoch_dirs = [p for p in latest_dir.iterdir() if p.is_dir() and p.name.isdigit()]
+        if not epoch_dirs:
+            return None
+        newest = max(epoch_dirs, key=lambda p: int(p.name))
+        return int(newest.name), newest.stat().st_mtime
+
+    def latest_checkpoint_epoch(self, case: Case) -> int | None:
+        """Highest epoch saved in the case's latest-checkpoint (resume) directory, or None if empty."""
+        info = self._latest_checkpoint_dir_info(case)
+        return info[0] if info else None
 
     def collected_results_path(self) -> Path:
         """Return the path where the collected results for all cases should be stored."""
@@ -425,6 +446,37 @@ class Study:
         """
         return self.train_job_name(case) in running_job_names
 
+    def _kill_stuck_jobs(self, cases: list[Case]):
+        """Kill training jobs that are running but making no checkpoint progress.
+
+        A job counts as deadlocked once it has run at least WATCHDOG_MIN_AGE_S
+        with no checkpoint written in the last WATCHDOG_STALL_S (including one
+        that never wrote a first checkpoint at all). Killing it frees the case
+        to be relaunched as a fresh process by the normal orchestration loop;
+        launch_train's attempt counter only resets on checkpoint progress, so a
+        job that keeps deadlocking still hits MAX_TRAIN_ATTEMPTS and aborts the
+        study rather than looping forever.
+        """
+        elapsed = get_running_job_elapsed_s()
+        if not elapsed:
+            return
+        now = time.time()
+        for case in cases:
+            job_name = self.train_job_name(case)
+            job_elapsed = elapsed.get(job_name)
+            if job_elapsed is None or job_elapsed < WATCHDOG_MIN_AGE_S:
+                continue
+            info = self._latest_checkpoint_dir_info(case)
+            last_progress = info[1] if info else None
+            if last_progress is not None and now - last_progress < WATCHDOG_STALL_S:
+                continue
+            logger.warning(
+                f"Job {job_name} has run {job_elapsed}s with no checkpoint progress in "
+                f"the last {WATCHDOG_STALL_S}s, likely deadlocked. Killing so it can be resubmitted.\n"
+                f"Case:\t{case}"
+            )
+            cancel_job(job_name)
+
     def run_unfinished_cases(self, skip_tuning: bool, enable_parallelism: bool):
         """Loop until every runnable case has a result file.
 
@@ -451,6 +503,7 @@ class Study:
                     logger.warning("Could not query SLURM job state, waiting before trying again...")
                     time.sleep(ORCHESTRATION_POLL_INTERVAL_S)
                     continue
+                self._kill_stuck_jobs(unfinished)
             else:
                 running_job_names = set()
 
