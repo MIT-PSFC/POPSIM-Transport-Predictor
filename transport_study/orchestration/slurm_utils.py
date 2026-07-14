@@ -205,32 +205,49 @@ def cancel_job(job_name: str, partition: str | None = None) -> None:
 
 
 def count_idle_gpus(partition: str | None = None, buffer_gpus: int | None = None) -> int:
-    """Count the number of idle GPUs on this partition."""
+    """Count the number of idle GPUs on this partition.
+
+    An 'idle' GPU is one that is either not allocated to any job, or is allocated to a job that is not part of this partition.
+    This is so we actively boot preemptable jobs from this partition.
+    """
     if partition is None:
         partition = config.partition
     if buffer_gpus is None:
         buffer_gpus = config.buffer_gpus
-    result = subprocess.run(
-        ["sinfo", "-p", partition, "-N", "--Format=gres,gresused", "--noheader"],
+    sinfo_result = subprocess.run(
+        ["sinfo", "-p", partition, "-N", "--Format=gres", "--noheader"],
         check=False,
         capture_output=True,
         text=True,
     )
-    if result.returncode != 0:
-        logger.critical(f"sinfo failed: {result.stderr}")
+    if sinfo_result.returncode != 0:
+        logger.critical(f"sinfo failed: {sinfo_result.stderr}")
         return 0  # Return 0 to prevent launching more jobs if sinfo fails
     total = 0
-    used = 0
-    for line in result.stdout.strip().split("\n"):
-        # Each line has two fixed-width columns (gres, gresused). When the gres
-        # value is long it truncates and runs directly into gresused with no
-        # whitespace, so we can't split on spaces. Instead, extract all
-        # gpu:<type>:<count> counts from the line; first match = total,
-        # second match = used (mirrors the grep-oP approach in grunk).
+    for line in sinfo_result.stdout.strip().split("\n"):
         counts = re.findall(r"gpu:\w+:(\d+)", line)
-        if len(counts) >= 2:
+        if counts:
             total += int(counts[0])
-            used += int(counts[1])
+
+    # gresused (from sinfo) counts GPUs busy on the node regardless of which
+    # partition the job landed in, so a node shared with another partition
+    # would look fully busy even when this partition's jobs hold none of it.
+    # Instead, sum GPU allocations only from jobs actually RUNNING in this
+    # partition (squeue resolves %P to the single assigned partition for
+    # running jobs, unlike the requested-partition list shown for pending ones).
+    squeue_result = subprocess.run(
+        ["squeue", "-p", partition, "--states=RUNNING", "-o", "%b", "--noheader"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if squeue_result.returncode != 0:
+        logger.critical(f"squeue failed: {squeue_result.stderr}")
+        return 0  # Return 0 to prevent launching more jobs if squeue fails
+    used = 0
+    for line in squeue_result.stdout.strip().split("\n"):
+        for count in re.findall(r"gpu:(?:\w+:)?(\d+)", line):
+            used += int(count)
 
     avail = total - used
     return max(avail - buffer_gpus, 0)  # Don't report negative available GPUs, just 0
