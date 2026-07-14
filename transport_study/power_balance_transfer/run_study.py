@@ -59,7 +59,8 @@ class PowerBalanceStudy(Study):
         model_type: The type of power_balance model to use.
         - scaling_law: H89, H98, and P_LH scaling laws to predict tau_e
         - sciml: neural network predicts tau_e, and we do the power balance calculation
-        - unstructured_nn: a single neural network directly predicts stored energy evolution
+        - unstructured_nn: a simple MLP directly predicts stored energy evolution
+        - transformer: a transformer model directly predicts stored energy evolution
 
         training_data: The dataset(s) used for training
         - cmod: C-Mod only
