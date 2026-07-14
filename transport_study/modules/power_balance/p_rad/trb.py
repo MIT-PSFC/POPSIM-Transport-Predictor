@@ -1,6 +1,7 @@
 from collections.abc import Callable
 from typing import Any
 
+import equinox as eqx
 import jax.numpy as jnp
 import numpy as np
 import optax
@@ -8,7 +9,7 @@ import xarray as xr
 from loguru import logger
 from popsim.ml import DataLoader, TrainRunBuilder
 from popsim.ml.checkpointing import create_default_checkpoint_manager, restore_model
-from popsim.ml.eval import EvalData, EvaluationSuite
+from popsim.ml.eval import EvalData, EvaluationSuite, batched_model_eval_and_loss
 
 from transport_study import EPISODE_DIM, TIME_COORD, TIME_DIM
 from transport_study.config import config
@@ -100,6 +101,51 @@ class RadiatedPowerTRB(TrainRunBuilder):
         return opt
 
     @staticmethod
+    def get_val_eval_suite(suite_config) -> EvaluationSuite | None:
+        """Validation suite computing the loss (sweep metric val/loss.mean).
+
+        We are running with very large datasets.
+        This means that the regular eval function will be uploading too much data to wandb
+        This eval suite basically does the same thing but cuts the vec to be at most 100 long
+        Can still see the distribution, but without all the data
+        """
+        if suite_config is None:
+            return None
+        loss_fn = RadiatedPowerTRB.get_loss_fn(suite_config["loss_config"])
+
+        def _eval_and_loss(model, loss_fn, inputs, targets):
+            return batched_model_eval_and_loss(model, loss_fn, inputs, targets)
+
+        jit_eval_and_loss = eqx.filter_jit(_eval_and_loss)
+
+        def eval_fn(inp: EvalData) -> float:
+            loss_vecs = []
+            for batch in inp.dataloader:
+                inputs, targets = batch.get_inputs_and_targets()
+                loss_vec = jit_eval_and_loss(
+                    inp.model,
+                    loss_fn,
+                    inputs,
+                    targets,
+                )
+                loss_vecs.append(loss_vec)
+            loss_vec = jnp.concatenate(loss_vecs)
+            # Drop padded duplicate samples from the pad_last validation dataloader
+            loss_vec = loss_vec[: inp.dataloader.dataset.n_samples]
+            loss_vec_mean = loss_vec.mean()
+            # Sort loss vec and sample at most 100 points evenly for logging
+            if loss_vec.shape[0] > 100:
+                sorted_indices = jnp.argsort(loss_vec)
+                selected_indices = sorted_indices[jnp.linspace(0, loss_vec.shape[0] - 1, num=100, dtype=int)]
+                loss_vec = loss_vec[selected_indices]
+            return {
+                "mean": loss_vec_mean,
+                "vec": loss_vec,
+            }
+
+        return {"loss": eval_fn}
+
+    @staticmethod
     def get_test_eval_suite(config) -> EvaluationSuite:
         """Evaluation suite for testing after training."""
 
@@ -167,11 +213,14 @@ class RadiatedPowerTRB(TrainRunBuilder):
             ds = ds.drop_vars("quantile", errors="ignore")
             return ds
 
-        eval_suite = {
-            "study_results": study_results,
-        }
-
-        return eval_suite
+        if config:
+            eval_suite = {
+                "study_results": study_results,
+            }
+            return eval_suite
+        else:
+            # Hyperparameter tuning, do not run test evals
+            return None
 
     @staticmethod
     def get_trainable_getter(model_init_config: dict) -> Callable[[Any], Any] | None:

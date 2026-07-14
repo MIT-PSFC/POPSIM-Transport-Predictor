@@ -486,6 +486,7 @@ class PowerBalanceStudy(Study):
                     },
                     loss_config=loss_config_base,
                     optimizer_config=optimizer_config_base,
+                    val_eval_suite_config=val_eval_suite_config_base,
                     test_eval_suite_config=test_eval_suite_config_base,
                 )
             elif case.model_type in MODEL_TYPES_WITH_SUBMODULES:
