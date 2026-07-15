@@ -1,15 +1,50 @@
+import functools
 import subprocess
+import time
 from typing import Any
 
+import wandb
 from loguru import logger
 from popsim.ml import TrainConfig
+from requests.exceptions import HTTPError
 
-import wandb
 from transport_study.config import config
+
+# Reading run state/summary is one graphql request per run, so projects with
+# many runs can exhaust the wandb rate limit even after the client's own
+# internal retries give up and raise 429
+# The limit window is per-minute, so wait it out and restart the read
+RATE_LIMIT_RETRIES = 5
+RATE_LIMIT_BASE_WAIT_S = 64
+API_TIMEOUT_S = 64
+
+
+def retry_rate_limited(fn):
+    """Retry a wandb API read that raised HTTP 429, with exponential backoff.
+
+    Only 429 is retried, everything else propagates unchanged. The wrapped
+    function must be safe to rerun from the top (all readers here are).
+    """
+
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        for attempt in range(RATE_LIMIT_RETRIES):
+            try:
+                return fn(*args, **kwargs)
+            except HTTPError as e:
+                is_rate_limit = e.response is not None and e.response.status_code == 429
+                if not is_rate_limit or attempt == RATE_LIMIT_RETRIES - 1:
+                    raise
+                wait_s = RATE_LIMIT_BASE_WAIT_S * 1.2**attempt
+                logger.warning(f"wandb rate limit (429) in {fn.__name__}, retrying in {wait_s}s")
+                time.sleep(wait_s)
+        raise AssertionError("unreachable")
+
+    return wrapper
 
 
 def get_project(project: str):
-    api = wandb.Api()
+    api = wandb.Api(timeout=API_TIMEOUT_S)
 
     if config.wandb_entity is None:
         raise ValueError("WANDB_ENTITY is not set, cannot check if project exists.")
@@ -26,6 +61,7 @@ def get_project(project: str):
 SWEEP_METRIC = "val/loss.mean"
 
 
+@retry_rate_limited
 def get_completed_runs(project: str) -> list[Any]:
     """Runs that count toward the hyperparam_sweeps trial target.
 
@@ -35,7 +71,7 @@ def get_completed_runs(project: str) -> list[Any]:
     many times hyperparam_sweeps trials to reach the target.
     Metric-less crashed/failed runs carry no information and are deleted.
     """
-    api = wandb.Api()
+    api = wandb.Api(timeout=API_TIMEOUT_S)
 
     project_obj = get_project(project)
     if project_obj is None:
@@ -59,6 +95,7 @@ def get_completed_runs(project: str) -> list[Any]:
     return completed_runs
 
 
+@retry_rate_limited
 def get_best_train_config(project: str) -> TrainConfig | None:
     """Gets several pieces related to the final model for this case, if it exists.
 
@@ -81,6 +118,7 @@ def get_best_train_config(project: str) -> TrainConfig | None:
     return train_config
 
 
+@retry_rate_limited
 def get_sweep_id(project: str) -> str | None:
     """Existing active sweep id for a project, if any.
 
@@ -90,6 +128,9 @@ def get_sweep_id(project: str) -> str | None:
     creates yet another sweep, and the project accumulates duplicates forever
     (each extra active sweep only makes future calls more ambiguous, never
     less).
+    Rate limit errors (429) also propagate for the same reason, treating a
+    throttled read as "no sweeps" would create a duplicate. The decorator
+    retries them with backoff instead.
     """
     project_obj = get_project(project)
     if project_obj is None:
@@ -98,6 +139,12 @@ def get_sweep_id(project: str) -> str | None:
 
     try:
         project_sweeps = list(project_obj.sweeps())
+    except HTTPError as e:
+        if e.response is not None and e.response.status_code == 429:
+            raise
+        logger.warning(f"Error reading sweeps for {project}, assuming no sweeps.")
+        logger.debug(e)
+        return None
     except Exception as e:
         logger.warning(f"Error reading sweeps for {project}, assuming no sweeps.")
         logger.debug(e)
