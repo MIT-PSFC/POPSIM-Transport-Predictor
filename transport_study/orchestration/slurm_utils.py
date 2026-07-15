@@ -508,6 +508,7 @@ def launch_train_parallel(
     py_script = f"""\
 import yaml
 from pathlib import Path
+from loguru import logger
 from popsim.ml import TrainConfig
 from popsim.ml.launch import launch_train
 {_config_reload_script(study_config_path)}
@@ -519,7 +520,7 @@ if result_dict is None:
     # Trainer hit its wall-clock budget and saved the latest checkpoint. Exit
     # cleanly with no result file, the orchestrator resubmits and the next job
     # resumes from that checkpoint.
-    print("Training stopped at the wall-clock budget before finishing, resubmitted job will resume.")
+    logger.info("Training stopped at the wall-clock budget before finishing, resubmitted job will resume.")
 else:
     ds = result_dict["test/study_results"]
     result_path = Path({str(result_path)!r})
