@@ -93,6 +93,8 @@ def _build_module(timeslice: xr.Dataset, checkpoint: str | Path | None, transpor
         torax_config=model_cfg["torax_config"],
         key=jax.random.PRNGKey(model_cfg["prng_seed"]),
         transport_model=transport_model,
+        geometry_builder=model_cfg.get("geometry_builder", "circular"),
+        delta_exponent=model_cfg.get("delta_exponent", 2.0),
     )
     if checkpoint is not None:
         manager = create_default_checkpoint_manager(checkpoint)

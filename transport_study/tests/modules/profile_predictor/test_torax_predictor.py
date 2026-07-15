@@ -45,3 +45,44 @@ def test_torax_predictor(transport_model):
     )
 
     _trainer, _train_dl, _val_dl, _test_dl, _ = launch_train(train_config)
+
+
+# cgm and qlknn are the models whose training blew up on MAST samples with
+# the circular geometry, so they are the smoke coverage for the miller builder
+@pytest.mark.parametrize("transport_model", ["cgm", "qlknn"])
+def test_torax_predictor_mast_miller(transport_model):
+    config = StudyConfig(
+        study_name=f"test_torax_predictor_mast_miller_{transport_model}",
+        dataset_paths={
+            "mast-low": PACKAGE_ROOT / "datasets" / "sample" / "mast-low1.nc",
+            "mast-high": PACKAGE_ROOT / "datasets" / "sample" / "mast-high.nc",
+        },
+        target_device="mast-high",
+        max_ds_size=10,
+    )
+    load_config(config)
+
+    train_config = TrainConfig(**PROFILE_PREDICTOR_TORAX_CONFIGS[transport_model])
+    training_data = {
+        "sources_unsorted": ["mast-low"],
+        "exnihilo": False,
+    }
+    train_config = train_config.model_copy(
+        update={
+            "project": config.study_name,
+            "max_epochs": 4,
+            "epochs_per_val": 2,
+            "dataloader_config": {
+                **train_config.dataloader_config,
+                "training_data": training_data,
+                "target_vars": [*PROFILE_TARGET_VARS, "ds_source_idx"],
+                "batch_size": 512,
+            },
+            "model_init_config": {
+                **train_config.model_init_config,
+                "geometry_builder": "miller",
+            },
+        }
+    )
+
+    _trainer, _train_dl, _val_dl, _test_dl, _ = launch_train(train_config)

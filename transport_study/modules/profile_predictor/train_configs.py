@@ -159,13 +159,13 @@ _PROFILE_PREDICTOR_TORAX_CONFIG_BASE: dict[str, Any] = {
                 "T_i_right_bc": 0.2,  # [keV] Predicted by NN
                 "T_e_right_bc": 0.2,  # [keV] Predicted by NN
                 "n_e_right_bc": 0.5e20,  # [m^-3] Predicted by NN
-                # Near-flat initial profiles; will relax up under ohmic heating / NN transport.
+                # Placeholder initial profiles; overridden per sample with
+                # parabolic inits scaled to te_approx / ne20_line_avg and
+                # continuous with the NN edge BCs (see _build_provider_and_geo)
                 "T_i": {0: {0: 0.3, 1: 0.2}},
                 "T_e": {0: {0: 0.3, 1: 0.2}},
                 "n_e": {0: {0: 1e20, 1: 0.5e20}},
-                "normalize_n_e_to_nbar": True,
-                "nbar": 99,  # Overridden by dataloader input
-                "n_e_nbar_is_fGW": True,
+                "normalize_n_e_to_nbar": False,
                 # Initialize psi from Ip and geometry via the current_profile_nu formula.
                 # Same as the legacy fallback for circular geometry, but explicit to
                 # silence the TORAX deprecation warning.
@@ -225,6 +225,14 @@ _PROFILE_PREDICTOR_TORAX_CONFIG_BASE: dict[str, Any] = {
             "pedestal": {},
         },
         "prng_seed": 42,
+        # Per-sample geometry builder: "circular" or "miller" (shaped,
+        # uses delta_top/delta_bot with delta ~ rho_norm**delta_exponent)
+        "geometry_builder": "circular",
+        "delta_exponent": 2.0,
+        # Relaxation window overrides, None keeps the torax_config numerics
+        # values. Top-level keys so wandb sweeps can search them like nn_width
+        "t_final": None,
+        "fixed_dt": None,
     },
     "loss_config": {
         "huber_delta": 0.5,
@@ -239,7 +247,7 @@ _PROFILE_PREDICTOR_TORAX_CONFIG_BASE: dict[str, Any] = {
 }
 
 
-def make_profile_predictor_torax_config(transport_model: str) -> dict:
+def make_profile_predictor_torax_config(transport_model: str, geometry_builder: str = "circular", delta_exponent: float = 2.0) -> dict:
     """Train config for the torax profile predictor with the given transport model.
 
     transport_model is one of "constant", "cgm", "gyrobohm", "qlknn"
@@ -251,6 +259,8 @@ def make_profile_predictor_torax_config(transport_model: str) -> dict:
     cfg["project"] = f"profile_predictor_torax_{transport_model}"
     cfg["model_init_config"]["model_type"] = f"torax-{transport_model}"
     cfg["model_init_config"]["torax_config"]["transport"] = copy.deepcopy(TORAX_TRANSPORT_BLOCKS[transport_model])
+    cfg["model_init_config"]["geometry_builder"] = geometry_builder
+    cfg["model_init_config"]["delta_exponent"] = delta_exponent
     return cfg
 
 

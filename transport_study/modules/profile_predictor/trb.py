@@ -1,3 +1,4 @@
+import copy
 from collections.abc import Callable
 from typing import Any
 
@@ -188,13 +189,29 @@ class ProfilePredictorTRB(TrainRunBuilder):
             )
         elif model_init_config["model_type"].startswith("torax-"):
             # model_type is "torax-<transport_model>", e.g. "torax-cgm"
+            torax_config = model_init_config["torax_config"]
+            # Sweepable relaxation window: t_final / fixed_dt live as
+            # top-level model_init_config keys and override the numerics
+            # block here (max_steps is re-derived in the module __init__)
+            t_final = model_init_config.get("t_final")
+            fixed_dt = model_init_config.get("fixed_dt")
+            if t_final is not None or fixed_dt is not None:
+                if not isinstance(torax_config, dict):
+                    raise ValueError("t_final / fixed_dt overrides require torax_config as a dict")
+                torax_config = copy.deepcopy(torax_config)
+                if t_final is not None:
+                    torax_config["numerics"]["t_final"] = float(t_final)
+                if fixed_dt is not None:
+                    torax_config["numerics"]["fixed_dt"] = float(fixed_dt)
             module = ProfilePredictorTorax(
                 nn_width=model_init_config["nn_width"],
                 nn_depth=model_init_config["nn_depth"],
                 rhogrid=np.asarray(train_dl.ds["rho"]),
-                torax_config=model_init_config["torax_config"],
+                torax_config=torax_config,
                 key=jax.random.PRNGKey(model_init_config["prng_seed"]),
                 transport_model=model_init_config["model_type"].removeprefix("torax-"),
+                geometry_builder=model_init_config.get("geometry_builder", "circular"),
+                delta_exponent=model_init_config.get("delta_exponent", 2.0),
             )
         else:
             raise ValueError(f"Invalid model type {model_init_config['model_type']}")

@@ -569,6 +569,12 @@ class ProfileStudy(Study):
                         "nn_width": 16,
                         "in_size": 10,  # Dimensionless nn_inputs derived from the raw input_vars, includes log(nu_star)
                         "torax_config": PROFILE_PREDICTOR_TORAX_CONFIGS[transport_model]["model_init_config"]["torax_config"],
+                        "geometry_builder": PROFILE_PREDICTOR_TORAX_CONFIGS[transport_model]["model_init_config"].get(
+                            "geometry_builder", "circular"
+                        ),
+                        "delta_exponent": PROFILE_PREDICTOR_TORAX_CONFIGS[transport_model]["model_init_config"].get("delta_exponent", 2.0),
+                        "t_final": PROFILE_PREDICTOR_TORAX_CONFIGS[transport_model]["model_init_config"].get("t_final"),
+                        "fixed_dt": PROFILE_PREDICTOR_TORAX_CONFIGS[transport_model]["model_init_config"].get("fixed_dt"),
                         "prng_seed": 42,
                     },
                     loss_config=loss_config_base,
