@@ -14,6 +14,7 @@ from scipy.linalg import fractional_matrix_power
 from transport_study import EPISODE_DIM, TIME_COORD, TIME_DIM
 from transport_study.config import TRAIN_VAL_SPLIT, config
 from transport_study.datasets import make_uniform_1khz_timebase
+from transport_study.modules.normalization import MIN_CORAL_SAMPLES
 
 
 @dataclass(frozen=True)
@@ -79,6 +80,23 @@ PROFILE_ERROR_SIGNALS = [f"{v}_error" for v in PROFILE_BASE_SIGNALS] + [f"{v}_gr
 # the profiles themselves plus their gradients and error-bars
 PROFILE_TARGET_VARS = [*PROFILE_BASE_SIGNALS, *PROFILE_GRAD_SIGNALS, *PROFILE_ERROR_SIGNALS]
 
+
+def add_missing_profile_companions(ds: xr.Dataset) -> xr.Dataset:
+    """Fill in gradient and error-bar companions for datasets that lack them.
+
+    Some device workflows (TCV) produce no GP-fit gradients or error bars.
+    Missing gradients fall back to finite differences of the values, missing
+    errors get the 0 sentinel (no rigorous error quantification).
+    """
+    for base in PROFILE_BASE_SIGNALS:
+        if f"{base}_grad" not in ds:
+            ds[f"{base}_grad"] = ds[base].differentiate("rho")
+        for err in (f"{base}_error", f"{base}_grad_error"):
+            if err not in ds:
+                ds[err] = xr.zeros_like(ds[base])
+    return ds
+
+
 REQUIRED_SIGNALS_PROFILE_TRANSFER = [
     # Target-related
     *PROFILE_BASE_SIGNALS,
@@ -96,7 +114,7 @@ REQUIRED_SIGNALS_PROFILE_TRANSFER = [
     "delta_top",
     "delta_bot",
     # Extra
-    "time",  # TODO(ZanderKeith) I forget why this was here
+    "time",  # Data variable holding per-shot time values, the var selection below would drop it and the dataloader consumes it as the time coordinate
     "Wtot_MJ",  # Not strictly necessary but used for performance extrapolation
 ]
 
@@ -249,15 +267,7 @@ def get_ds(
     ds = ds.isel({EPISODE_DIM: slice(0, config.max_ds_size)})
 
     def _profile_transfer(ds: xr.Dataset) -> xr.Dataset:
-        # Missing gradients fall back to finite differences of the values,
-        # missing errors get the 0 sentinel (no rigorous error quantification)
-        for base in PROFILE_BASE_SIGNALS:
-            if f"{base}_grad" not in ds:
-                ds[f"{base}_grad"] = ds[base].differentiate("rho")
-            for err in (f"{base}_error", f"{base}_grad_error"):
-                if err not in ds:
-                    ds[err] = xr.zeros_like(ds[base])
-
+        ds = add_missing_profile_companions(ds)
         ds = ds[REQUIRED_SIGNALS_PROFILE_TRANSFER]
 
         # Only keep fresh profiles for training
@@ -399,7 +409,7 @@ def normalize_domain(  # noqa: PLR0915
     Methods:
         - "raw": No normalization, Ip, Wtot, etc. are in their original units
         - "physics": Convert to typical dimensionless parameters like beta, q95, f_G, etc.
-        - "z_score": Within each device, normalize each variable to zero mean and unit variance. Variable gets a `_zscore` suffix after normalization.
+        - "z_score": Within each device, normalize each variable to zero mean and unit variance. Variable gets a `_z` suffix after normalization.
         - "coral": Use the CORAL method to align covariances of various devices. Variable gets a `_coral` suffix after normalization.
 
     Args:
@@ -436,8 +446,7 @@ def normalize_domain(  # noqa: PLR0915
             return beta
 
         def _q_star(ds: xr.Dataset) -> xr.DataArray:
-            # TODO(ZanderKeith) using 0 triangularity because it isn't part of H89/H98.
-            # Do we care about doing that comparison? If not, could easily add delta_top and delta_bottom to the dataset and use them here.
+            # Zero triangularity, since the H89/H98 scalings this feeds have no triangularity term
             f_shaping = calc_f_shaping(ds["epsilon"], ds["kappa"], xr.zeros_like(ds["epsilon"]))
             q_star = calc_q_star(ds["B0"], ds["R0"], ds["epsilon"], ds["Ip_MA"], f_shaping)
             return q_star
@@ -527,7 +536,7 @@ def normalize_domain(  # noqa: PLR0915
         # each device's features so their covariance matches the reference.
         # The transform for device d is: center, whiten with C_d^{-1/2}, re-color with C_ref^{1/2}, then re-add mean.
         # A small regularization term is added to covariance diagonals for numerical stability.
-        # TODO(ZanderKeith) vet this thoroughly!!!
+        # Visualization-only counterpart of modules.normalization.CoralNormalizer
 
         reg = 1e-6  # Regularization for covariance matrix inversion
 
@@ -570,7 +579,7 @@ def normalize_domain(  # noqa: PLR0915
             X_device = _build_feature_matrix(ds_device, normalize_vars)
             valid = ~np.any(np.isnan(X_device), axis=1)
             X_valid = X_device[valid]
-            if len(X_valid) > 1:
+            if len(X_valid) >= MIN_CORAL_SAMPLES:
                 device_stats[device] = {
                     "mean": np.mean(X_valid, axis=0),
                     "cov": np.cov(X_valid, rowvar=False),
@@ -764,7 +773,7 @@ def get_train_test_datasets(
     ds_target = ds_target.assign_coords(ds_source=target)
     sorted_shots = np.argsort(ds_target["performance"].values)
 
-    test_shot_pool = sorted_shots[-target_test_set_size:]
+    test_shot_pool = sorted_shots[-target_test_set_size:] if target_test_set_size else sorted_shots[:0]
     test_ds = ds_target.isel({episode_coord: test_shot_pool})
 
     if num_target_shots == -1:

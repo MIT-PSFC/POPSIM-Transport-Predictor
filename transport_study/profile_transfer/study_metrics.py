@@ -30,9 +30,9 @@ from transport_study.config import config
 from transport_study.modules.profile_predictor.trb import ProfilePredictorTRB
 from transport_study.orchestration.organize_data import (
     INPUT_POWER_SIGNALS,
-    PROFILE_BASE_SIGNALS,
     PROFILE_ERROR_SIGNALS,
     PROFILE_TARGET_VARS,
+    add_missing_profile_companions,
 )
 from transport_study.orchestration.study import Study
 
@@ -72,12 +72,7 @@ def load_eval_dataset(device: str) -> xr.Dataset:
     ds_path = Path(config.dataset_paths[device])
     ds = xr.open_dataset(ds_path)
 
-    for base in PROFILE_BASE_SIGNALS:
-        if f"{base}_grad" not in ds:
-            ds[f"{base}_grad"] = ds[base].differentiate("rho")
-        for err in (f"{base}_error", f"{base}_grad_error"):
-            if err not in ds:
-                ds[err] = xr.zeros_like(ds[base])
+    ds = add_missing_profile_companions(ds)
 
     for sig in INPUT_POWER_SIGNALS:
         if sig not in ds:
