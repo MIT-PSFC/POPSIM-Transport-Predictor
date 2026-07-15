@@ -5,8 +5,9 @@ import os
 import shutil
 import time
 import tomllib
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from pathlib import Path
+from typing import ClassVar
 
 import toml
 import wandb
@@ -23,7 +24,7 @@ from popsim.ml.train_config import load_dict
 from pydantic import Field, field_validator, model_validator
 
 from transport_study import PACKAGE_ROOT
-from transport_study.config import StudyConfig, _env_dataset_paths, config
+from transport_study.config import StudyConfig, config, env_dataset_paths, load_config
 from transport_study.orchestration.organize_data import (
     TrainingData,
     get_loaded_shot_count,
@@ -50,43 +51,30 @@ from transport_study.orchestration.wandb_utils import (
 
 CONFIG_LOCK_FILENAME = "config_lock.toml"
 
-# A training job that fails deterministically (e.g. NaN loss) would otherwise be
-# resubmitted forever by the run_study orchestration loop, silently burning GPU
-# time ~10 min at a go. Abort the whole run once a single case has been launched
-# this many times without producing a result file
+# Target-shot count for hyperparameter tuning cases. When domain adaptation is
+# None no target data is used during training, and during domain adaptation no
+# hyperparameter tuning is done, so 0 is the canonical value
+HYPERPARAM_TARGET_SHOTS = 0
+
+# Abort the run once a single case has been launched this many times without a result file, guards against deterministically failing jobs being resubmitted forever
 MAX_TRAIN_ATTEMPTS = 3
 
-# A hyperparam sweep is only done once the trial-count target is met AND this
-# fraction of the target has runs in the "finished" state. Crashed/pruned trials
-# still count toward the trial target, but the tuned config is picked only from
-# finished runs (get_best_train_config), so the sweep must produce enough of them
-# or there is nothing safe to select. Guards against a sweep where most trials
-# diverge to NaN and crash.
+# A sweep is done once the trial target is met AND this fraction of it finished, since the tuned config is picked from finished runs only
 MIN_FINISHED_FRACTION = 0.1
 
 # How long the orchestration loop sleeps between passes over the unfinished cases
 ORCHESTRATION_POLL_INTERVAL_S = 20
 
-# After a case's training job leaves the queue, its result file can take tens of
-# seconds to become visible to the orchestrator's node (observed: NFS write-back
-# landing ~1 min after job exit, and attribute caching hiding an already-written
-# file for ~20 s). Relaunching in that window submits a duplicate job for a case
-# that is already done. Hold off relaunching a previously in-flight case until it
-# has been out of the queue this long. Wall-budget resumes are delayed by the
-# same amount, negligible against multi-hour training jobs.
+# Result files can lag job exit by ~1 min on NFS, so wait this long after a case leaves the queue before relaunching it
 RELAUNCH_GRACE_S = 180
 
-# Transfer cases fine-tune from a pretrained checkpoint, and the tuned learning
-# rate they inherit was swept for training from scratch
-# too hot for fine-tuning, scale the schedule down
+# Tuned learning rates were swept for from-scratch training and are too hot for fine-tuning, scale the schedule down
 TRANSFER_LR_FACTOR = 0.1
 
-# Some modules can deadlock (e.g. OpenBLAS eigvals or XLA compile-pool hangs)
-# A training job is considered stuck once it has run at least this long with no progress
+# A training job is considered stuck once it has run at least this long with no progress (e.g. OpenBLAS or XLA compile-pool deadlocks)
 WATCHDOG_MIN_AGE_S = 80 * 60
 
-# Checkpoints are only written at the validation cadence (config.epochs_per_val),
-# not every epoch, so this is a coarse "no epochs completed recently" signal
+# Checkpoints are only written at the validation cadence, so stall detection is a coarse "no epochs completed recently" signal
 WATCHDOG_STALL_S = 60 * 60
 
 
@@ -106,6 +94,31 @@ class CaseGridConfig(StudyConfig):
     training_datasets: tuple[TrainingData, ...]
     domain_adaptation_methods: tuple[str | None, ...] = Field(default_factory=lambda: (None, "mixing", "transfer"))
     target_test_set_size: int
+    # Hyperparameter tuning case axes shared by every study of this shape
+    hyperparam_domain_adaptation: str | None = None
+    hyperparam_num_target_shots: int = HYPERPARAM_TARGET_SHOTS
+    # Optional dict of dataset fractions to use during domain adaptation, only used if domain_adaptation includes "mixing"
+    dataset_fractions: dict[str, float] = Field(default_factory=dict)
+
+    # Study-specific hyperparam field names checked by is_compatible, set per subclass
+    COMPAT_HYPERPARAM_FIELDS: ClassVar[tuple[str, ...]] = ()
+
+    def is_compatible(self, cfg: CaseGridConfig) -> bool:
+        """Whether two configs can run the same study (the config-lock check).
+
+        Compares study identity (name, datasets, target, test set size,
+        dataset fractions) and the hyperparameter tuning configuration.
+        Case-grid axes like model_types may differ between runs.
+        """
+        names = (
+            "study_name",
+            "dataset_paths",
+            "target_device",
+            "target_test_set_size",
+            "dataset_fractions",
+            *self.COMPAT_HYPERPARAM_FIELDS,
+        )
+        return all(getattr(self, name) == getattr(cfg, name) for name in names)
 
     @field_validator("domain_adaptation_methods")
     @classmethod
@@ -124,7 +137,7 @@ class CaseGridConfig(StudyConfig):
             return data
         # Field defaults aren't applied yet in a before-validator, so when
         # dataset_paths isn't passed explicitly, mirror its default_factory
-        dataset_paths = dict(data.get("dataset_paths") or _env_dataset_paths())
+        dataset_paths = dict(data.get("dataset_paths") or env_dataset_paths())
         target_device = data.get("target_device")
         data["training_datasets"] = tuple(
             parse_training_data(s, dataset_paths, target_device) if isinstance(s, str) else s for s in data["training_datasets"]
@@ -142,7 +155,7 @@ class CaseGridConfig(StudyConfig):
         return cls(
             **data,
             **study_cases,
-            dataset_paths=_env_dataset_paths() | {k: Path(v) for k, v in datasets.items()},
+            dataset_paths=env_dataset_paths() | {k: Path(v) for k, v in datasets.items()},
             target_device=target,
         )
 
@@ -169,28 +182,151 @@ class CaseGridConfig(StudyConfig):
             toml.dump(data, f)
 
 
+@dataclass
+class ModelTrainSpec:
+    """The per-model-type pieces of a TrainConfig, returned by Study._model_train_spec."""
+
+    train_run_builder: str
+    dataloader_config: dict
+    model_init_config: dict
+
+
 class Study:
     """A class for organizing various components of a study, essentially outlining everything that needs to be done
     to go from raw data to comparison figures.
     - Paths to source data
     - Model checkpoints
     - Results
+
+    Subclasses define a nested Config (CaseGridConfig subclass) and Case
+    (Study.Case subclass), make_cases, the make_train_config hooks
+    (_base_dataloader_config / _base_loss_config / _model_train_spec /
+    _tuned_model_init_updates), collect_results, and _run_analysis.
     """
 
+    # Set by subclasses: the study's nested Config class (CaseGridConfig subclass)
+    Config: ClassVar[type[CaseGridConfig]]
     # Set by subclasses: directory holding the per-model-type wandb sweep YAMLs
-    SWEEP_CONFIG_DIR: Path
+    SWEEP_CONFIG_DIR: ClassVar[Path]
     # Set by subclasses: study_type passed to organize_data (selects get_ds branch)
-    STUDY_TYPE: str
+    STUDY_TYPE: ClassVar[str]
+    # Set by subclasses: the study's DataVisualization class
+    DATA_VISUALIZATION: ClassVar[type]
+    # Set by subclasses: config attribute names of the case-grid axes (logged at init)
+    CASE_AXIS_FIELDS: ClassVar[tuple[str, ...]] = ()
+    # Tuned-config dataloader keys merged by strict indexing (KeyError when a tuned config lacks one)
+    TUNED_DATALOADER_KEYS: ClassVar[tuple[str, ...]] = ()
+    # Tuned-config loss keys merged with .get fallback to the base value (tuned configs on disk may lack them)
+    TUNED_LOSS_KEYS: ClassVar[tuple[str, ...]] = ()
 
     @dataclass
     class Case:
-        """A class for organizing the different cases we want to compare in this study.
-        For example, different treatments of the transport predictor module, different training datasets, different normalization methods, etc.
-        Each case should have all the information needed to train and evaluate a model for that case, and to compare it to other cases.
+        """A unique combination of case-grid axes to compare in this study.
+
+        Each case holds everything needed to train and evaluate a model and to
+        compare it to other cases. Subclasses declare their extra fields plus
+        the VALID_MODEL_TYPES / STR_TOKEN_FIELDS / HYPERPARAM_FIELDS ClassVars,
+        keep a thin __init__ in the class body that sets the extra fields and
+        then calls _init_common, and alias __hash__ = Study.Case.__hash__
+        (a dataclass body without its own __init__ or __hash__ would have them
+        regenerated or nulled by the dataclass decorator).
         """
 
+        model_type: str
+        training_data: TrainingData
+        domain_adaptation: str | None  # None, mixing, transfer
+        num_target_shots: int  # Target shots included in training, or -1 for all (HYPERPARAM_TARGET_SHOTS when domain_adaptation is None)
+        # Cases this one depends on, run first (None when independent)
+        prereqs: list[Study.Case] | None
+
+        # Model types accepted by _validate
+        VALID_MODEL_TYPES: ClassVar[tuple[str, ...]] = ()
+        # (prefix, field name) tokens between the td_ and targ_ tokens of str(case)
+        STR_TOKEN_FIELDS: ClassVar[tuple[tuple[str, str], ...]] = ()
+        # Per-case fields with a config.hyperparam_<name> counterpart
+        HYPERPARAM_FIELDS: ClassVar[tuple[str, ...]] = ()
+
+        def _init_common(self, model_type, training_data, domain_adaptation, num_target_shots):
+            """Shared between every subclass __init__: parse, validate, build prereqs."""
+            if isinstance(training_data, str):
+                training_data = parse_training_data(training_data, dict(config.dataset_paths), config.target_device)
+            self.model_type = model_type
+            self.training_data = training_data
+            self.domain_adaptation = domain_adaptation
+            self.num_target_shots = num_target_shots
+            self._validate()
+            prereqs = self._build_prereqs()
+            self.prereqs = prereqs if prereqs else None
+
+        def _validate(self):
+            if self.model_type not in self.VALID_MODEL_TYPES:
+                raise ValueError(f"Unknown model type: {self.model_type}")
+            if self.domain_adaptation is None:
+                if not self.training_data.exnihilo and self.num_target_shots != HYPERPARAM_TARGET_SHOTS:
+                    raise ValueError(
+                        "If domain_adaptation is None and training data is not 'exnihilo', num_target_shots must be HYPERPARAM_TARGET_SHOTS since this means we're training and testing on the same dataset"
+                    )
+
+        def _build_prereqs(self) -> list[Study.Case]:
+            """[hyperparam case, model-type prereqs, transfer pretrain case], deduped in order."""
+            prereqs = []
+            if not self.is_hyperparam_case():
+                prereqs.append(self._replace(**self._hyperparam_field_values()))
+            prereqs.extend(self._model_type_prereqs())
+            if self.domain_adaptation == "transfer":
+                prereqs.append(self._replace(domain_adaptation=None, num_target_shots=HYPERPARAM_TARGET_SHOTS))
+            return list(dict.fromkeys(prereqs))
+
+        def _model_type_prereqs(self) -> list[Study.Case]:
+            """Extra prereq cases implied by the model type (e.g. submodule predictors)."""
+            return []
+
+        def _replace(self, **changes) -> Study.Case:
+            """Rebuild through the real constructor with some fields changed, so validation and prereqs stay consistent."""
+            kwargs = {f.name: getattr(self, f.name) for f in fields(self) if f.name != "prereqs"}
+            kwargs.update(changes)
+            return type(self)(**kwargs)
+
+        @classmethod
+        def _hyperparam_field_values(cls) -> dict:
+            values = {"training_data": Study._hyperparam_training_data()}
+            for name in cls.HYPERPARAM_FIELDS:
+                values[name] = getattr(config, f"hyperparam_{name}")
+            return values
+
+        def is_hyperparam_case(self) -> bool:
+            return all(getattr(self, name) == value for name, value in self._hyperparam_field_values().items())
+
+        def get_hyperparam_prereq(self) -> Study.Case:
+            if self.is_hyperparam_case():
+                return self
+            return self._replace(**self._hyperparam_field_values())
+
+        def is_impossible(self) -> bool:
+            """Some cases don't make sense to run. Mark those cases as impossible and raise an error if we try to run them."""
+            # Can't do transfer learning or training from nothing with 0 target shots.
+            if (self.domain_adaptation == "transfer" or self.training_data.exnihilo) and self.num_target_shots == 0:
+                return True
+
+            # exnihilo means training from nothing - no source domain to adapt from
+            if self.training_data.exnihilo and self.domain_adaptation is not None:
+                return True
+
+            return False
+
+        def __str__(self):
+            parts = [f"case.{self.model_type}", f"td_{self.training_data}"]
+            for prefix, field_name in self.STR_TOKEN_FIELDS:
+                parts.append(f"{prefix}{getattr(self, field_name)}")
+            if self.domain_adaptation:
+                parts.append(f"targ_{self.num_target_shots}")
+                parts.append(f"da_{self.domain_adaptation}")
+            elif self.training_data.exnihilo:
+                parts.append(f"targ_{self.num_target_shots}")
+            return ".".join(parts)
+
         def __hash__(self):
-            return hash(tuple(v for k, v in self.__dict__.items() if k not in ("prereq", "weight_submodules")))
+            return hash(tuple(v for k, v in self.__dict__.items() if k != "prereqs"))
 
     ####################
     # PATHING / NAMING #
@@ -269,7 +405,7 @@ class Study:
         clean_sweeps: bool = False,
         clean_models: bool = False,
         clean_results: bool = False,
-        clean_figures: bool = True,
+        clean_figures: bool = False,
     ):
         logger.info("SETTING UP DIRECTORIES")
         logger.info(f"Enable parallelism: {enable_parallelism}")
@@ -313,6 +449,10 @@ class Study:
         target = config.target_device
         sources = sorted(set(config.dataset_paths.keys()) - ({target} if target else set()))
         return TrainingData(sources_unsorted=sources)
+
+    def make_cases(self) -> list[Case]:
+        """Build every case of the study's case grid from the global config (study-specific)."""
+        raise NotImplementedError
 
     def finalize_cases(self, cases: list[Case]) -> list[Case]:
         """Unwrap prereq chains into the flat case list, dedupe, sort, drop impossible cases."""
@@ -410,6 +550,113 @@ class Study:
                 }
             }
         )
+
+    def make_train_config(self, case: Case) -> TrainConfig:
+        """Make the TrainConfig for a given case.
+
+        Builds the shared scaffold (dataloader/loss/optimizer bases, mixing
+        device weights, transfer checkpoint wiring, tuned-config merge,
+        transfer LR scaling) around the per-model-type pieces supplied by
+        the _model_train_spec hook.
+        """
+        dataloader_config_base = self._base_dataloader_config(case)
+        loss_config = self._base_loss_config()
+        optimizer_config = self._base_optimizer_config()
+        if case.domain_adaptation == "mixing":
+            # Loss function reads these from loss_config as "device_weights".
+            # val_eval_suite_config references the same dict, so validation
+            # loss is weighted consistently with training
+            loss_config["device_weights"] = self._make_mixing_device_weights(case)
+
+        spec = self._model_train_spec(case, dataloader_config_base)
+        train_config_base = TrainConfig(
+            project=self.wandb_project_name(case),
+            train_run_builder=spec.train_run_builder,
+            max_epochs=config.max_epochs,
+            epochs_per_val=config.epochs_per_val,
+            patience=config.patience,
+            # When doing hyperparameter tuning, this gets overwritten by the wandb agent
+            checkpoint_dir=str(self.trained_model_dir(case)),
+            dataloader_config=spec.dataloader_config,
+            model_init_config=spec.model_init_config,
+            loss_config=loss_config,
+            optimizer_config=optimizer_config,
+            val_eval_suite_config={"loss_config": loss_config},
+            test_eval_suite_config={"result_path": str(self.result_path(case))},
+        )
+
+        if case.domain_adaptation == "transfer":
+            # Point model_init at the pretrained checkpoint: same case minus
+            # the domain adaptation and target shots
+            transfer_case = case._replace(domain_adaptation=None, num_target_shots=HYPERPARAM_TARGET_SHOTS)
+            train_config_base = self._set_transfer_checkpoint(train_config_base, transfer_case)
+
+        train_config = self._apply_tuned_config(case, train_config_base)
+
+        # Fine-tuning from a pretrained checkpoint needs a cooler learning rate
+        # than training from scratch (see TRANSFER_LR_FACTOR). Applied after the
+        # tuned-config merge so the swept optimizer_config cannot overwrite it
+        if case.domain_adaptation == "transfer":
+            train_config = self._scale_transfer_lr(train_config)
+
+        return train_config
+
+    def _apply_tuned_config(self, case: Case, train_config_base: TrainConfig) -> TrainConfig:
+        """Merge swept hyperparameters from the case's tuned config, when one exists.
+
+        Only the TUNED_* keys come from the tuned dataloader/loss configs, so
+        case-specific entries (e.g. mixing device_weights) stay intact. The
+        optimizer_config is replaced entirely.
+        """
+        tuned_config_path = self.tuned_config_path(case)
+        if not tuned_config_path.exists():
+            return train_config_base
+        tuned_config = TrainConfig.load(str(tuned_config_path))
+        logger.info(f"Found tuned hyperparameter config for case {case}, using hyperparameters from that config")
+
+        tuned_dataloader = {key: tuned_config.dataloader_config[key] for key in self.TUNED_DATALOADER_KEYS}
+        tuned_loss = {key: tuned_config.loss_config.get(key, train_config_base.loss_config[key]) for key in self.TUNED_LOSS_KEYS}
+        train_config = train_config_base.model_copy(
+            update={
+                "dataloader_config": {**train_config_base.dataloader_config, **tuned_dataloader},
+                "optimizer_config": tuned_config.optimizer_config,
+                "loss_config": {**train_config_base.loss_config, **tuned_loss},
+            }
+        )
+        return train_config.model_copy(
+            update={
+                "model_init_config": {
+                    **train_config.model_init_config,
+                    **self._tuned_model_init_updates(case, tuned_config),
+                }
+            }
+        )
+
+    def _base_optimizer_config(self) -> dict:
+        """Fallback optimizer hyperparameters for cases run without a tuned config."""
+        return {
+            "lr0": 5e-4,
+            "transition_steps": 500,
+            "decay_rate": 0.5,
+            "lrf": 1e-4,
+            "weight_decay": 2e-4,
+        }
+
+    def _base_dataloader_config(self, case: Case) -> dict:
+        """Dataloader settings shared by every model type of this study."""
+        raise NotImplementedError
+
+    def _base_loss_config(self) -> dict:
+        """Fallback loss hyperparameters for cases run without a tuned config."""
+        raise NotImplementedError
+
+    def _model_train_spec(self, case: Case, dataloader_config_base: dict) -> ModelTrainSpec:
+        """Per-model-type train_run_builder, dataloader_config, and model_init_config."""
+        raise NotImplementedError
+
+    def _tuned_model_init_updates(self, case: Case, tuned_config: TrainConfig) -> dict:
+        """model_init_config entries swept only for certain model types."""
+        raise NotImplementedError
 
     def check_data_requirements(self, case: Case) -> bool:
         """Given a case, check if the required data for that case is available."""
@@ -553,7 +800,7 @@ class Study:
         if self.check_prereq_satisfied(case):
             self._run_ready_case(case, skip_tuning, enable_parallelism)
         else:
-            self._run_first_unmet_prereq(case, skip_tuning, enable_parallelism)
+            logger.debug(f"Case blocked on unmet prereqs, skipping until they finish.\nCase:\t{case}")
 
     def _run_ready_case(self, case: Case, skip_tuning: bool, enable_parallelism: bool):
         """Execute a case whose prereqs are satisfied."""
@@ -645,18 +892,6 @@ class Study:
                 logger.info(f"Found {running} running {label} jobs, waiting for them to complete before proceeding")
                 return False
         return True
-
-    def _run_first_unmet_prereq(self, case: Case, skip_tuning: bool, enable_parallelism: bool):
-        """Find the first unsatisfied prereq and recurse into it."""
-        for prereq in case.prereqs:
-            if not self.result_path(prereq).exists():
-                logger.debug(f"Prereq not satisfied yet, running that first.\nCase:\t{case}\nPrereq:\t{prereq}")
-                self.run_case(
-                    prereq,
-                    skip_tuning=skip_tuning,
-                    enable_parallelism=enable_parallelism,
-                )
-                return
 
     def launch_sweep(
         self,
@@ -891,26 +1126,134 @@ class Study:
 
         return trainer, test_dl
 
-    def __init__(
-        self,
-        name: str,
-        working_dir_base: Path | str,
-        cases: list[Case],
+    # Coords describing which case a record belongs to, set per subclass
+    _CASE_COORD_NAMES: ClassVar[tuple[str, ...]] = ()
+
+    def _case_coords(self, case_idx: int, case: Case) -> dict:
+        """Build the per-case coordinate values for collect_results."""
+        coords = {}
+        for name in self._CASE_COORD_NAMES:
+            if name == "case_idx":
+                coords[name] = case_idx
+            elif name == "training_data":
+                coords[name] = str(case.training_data)
+            elif name == "domain_adaptation":
+                # Normalize None -> "none" so the coord stays string-typed
+                coords[name] = case.domain_adaptation if case.domain_adaptation is not None else "none"
+            else:
+                coords[name] = getattr(case, name)
+        return coords
+
+    def collect_results(self) -> xr.Dataset:
+        """Collect every finished case's results into one dataset (schema is study-specific)."""
+        raise NotImplementedError
+
+    def _run_analysis(self, enable_parallelism: bool) -> None:
+        """Post-orchestration analysis and plotting (study-specific)."""
+        raise NotImplementedError
+
+    def _visualize_data(self):
+        self.DATA_VISUALIZATION.performance_extrapolation(self.figure_dir)
+        self.DATA_VISUALIZATION.domain_overlap(self.figure_dir)
+
+    @classmethod
+    def run_study(
+        cls,
+        config: CaseGridConfig | str | Path,
+        enable_parallelism: bool | None = False,
+        skip_tuning: bool | None = True,
+        skip_visualization: bool | None = False,
+        clean_sweeps: bool | None = False,
+        clean_models: bool | None = False,
+        clean_results: bool | None = False,
+        clean_figures: bool | None = False,
     ):
         """
-        Initialize this study with the given name and cases.
+        Go from datasets to collected results and figures in one command.
+
+        Requires specifying paths to the source datasets in the config TOML or environment variables.
+        Due to data sharing restrictions, the only dataset included in this repository is for C-Mod.
+        If you have access to data from other tokamaks (e.g. DIII-D), create a source dataset using the scripts in `transport_study/datasets/`
+        and provide the path when running this script.
+        If a dataset is not provided for a tokamak, figures which require that data will be skipped.
+
+        Parameters
+        ----------
+        config : CaseGridConfig | str | Path
+            The study config, or a path to its TOML file.
+        enable_parallelism : bool | None
+            If false, runs the entire study sequentially in one process.
+            If true, submits independent training steps with SLURM up to configurable resource limits.
+            The idea is you would periodically call this 'run_study' function, and it checks what models still need to be trained and submit jobs for those, until eventually all models are trained and all results are computed.
+        skip_tuning : bool | None
+            If True, skip hyperparameter tuning steps.
+        skip_visualization : bool | None
+            If True, skip data visualization steps.
+        clean_sweeps : bool | None
+            If True, delete any existing wandb sweeps for this project before running.
+        clean_models : bool | None
+            If True, delete any existing trained models in the working directory before running.
+        clean_results : bool | None
+            If True, delete any existing intermediate results in the working directory before running.
+        clean_figures : bool | None
+            If True, delete any existing figures in the figure directory before running.
+        """
+        # Parse with the concrete Config subclass so the local `config` name holds a
+        # real config object (it shadows the module-level proxy)
+        if isinstance(config, (str, Path)):
+            config = cls.Config.from_toml(Path(config))
+        study = cls(config)
+        study.setup_directories(
+            enable_parallelism=enable_parallelism,
+            skip_tuning=skip_tuning,
+            skip_visualization=skip_visualization,
+            clean_sweeps=clean_sweeps,
+            clean_models=clean_models,
+            clean_results=clean_results,
+            clean_figures=clean_figures,
+        )
+
+        if enable_parallelism and not config.partition:
+            raise ValueError("enable_parallelism is True but no SLURM partition is specified in the config")
+
+        if not skip_visualization:
+            logger.opt(colors=True).info("<bold><magenta>DATA VISUALIZATION</magenta></bold>")
+            study._visualize_data()
+
+        if study.collected_results_path().exists():
+            logger.info(
+                f"Collected results file found at\n{study.collected_results_path()}\nSkipping orchestration and going straight to analysis"
+            )
+        else:
+            logger.opt(colors=True).info("<bold><magenta>ORCHESTRATION</magenta></bold>")
+            study.run_unfinished_cases(skip_tuning=skip_tuning, enable_parallelism=enable_parallelism)
+            ds_final = study.collect_results()
+            ds_final.to_netcdf(study.collected_results_path())
+
+        study._run_analysis(enable_parallelism=bool(enable_parallelism))
+
+    def __init__(self, cfg: str | Path | CaseGridConfig):
+        """
+        Initialize this study from its Config object or a path to its TOML file.
         Dataset paths come from the global config's dataset_paths
         (TOML [datasets] table, with the PTPS_DATASET_PATHS JSON env var as defaults).
         """
-        self.name = name
-        self.cases = cases
+        if not config.initialized:
+            # load_config(Path) only knows how to build the base StudyConfig,
+            # which forbids this study's extra fields, so parse with the subclass
+            if isinstance(cfg, (str, Path)):
+                cfg = self.Config.from_toml(Path(cfg))
+            load_config(cfg)
+
+        self.name = config.study_name
+        self.cases = self.make_cases()
         # Launch counter per case (str(case) -> count) backing MAX_TRAIN_ATTEMPTS
         self.train_attempts: dict[str, int] = {}
         # Latest-checkpoint epoch per case as of its last launch. A relaunch whose
         # checkpoint advanced past this is a resume making progress, not a failure
         self.train_attempt_epochs: dict[str, int | None] = {}
 
-        self.working_dir = Path(working_dir_base) / name
+        self.working_dir = Path(config.working_dir_base) / self.name
         self.model_dir = self.working_dir / "models"
         self.result_dir = self.working_dir / "results"
         self.figure_dir = self.working_dir / "figures"
@@ -939,32 +1282,11 @@ class Study:
         logger.add(log_path)
 
         logger.info("INITIALIZING STUDY")
-        logger.info(f"Study name: {name}")
-        logger.info(f"Working directory base: {working_dir_base}")
-        logger.info(f"Total number of cases: {len(cases)}")
+        logger.info(f"Study name: {self.name}")
+        logger.info(f"Working directory base: {config.working_dir_base}")
+        logger.info(f"Total number of cases: {len(self.cases)}")
         logger.info(f"Target test set size: {config.target_test_set_size}")
         logger.info(f"Dataset paths: {config.dataset_paths}")
         logger.info(f"Target device: {config.target_device}")
-
-
-def update_submodule_configs(main_config: dict, submodules: list[str]) -> TrainConfig:
-    new_submodule_configs = {}
-    for submodule in submodules:
-        submodule_config = main_config["model_init_config"]["submodules"][submodule]
-        if not isinstance(submodule_config, dict):
-            submodule_config = submodule_config.model_dump()
-
-        # Set the data_train_run_builder for the submodules to match the main module's train_run_builder.
-        submodule_config["dataloader_config"]["data_train_run_builder"] = main_config["train_run_builder"]
-
-        # Ensure there is a perfect match between the dataloader configs of the main module and the submodules,
-        # excepting the state_vars, input_vars, target_vars, and extra_vars which are specific to each submodule.
-        for key in main_config["dataloader_config"].keys():
-            if key not in ["state_vars", "input_vars", "target_vars", "extra_vars"]:
-                submodule_config["dataloader_config"][key] = main_config["dataloader_config"][key]
-
-        new_submodule_configs[submodule] = submodule_config
-
-    main_config["model_init_config"]["submodules"] = new_submodule_configs
-
-    return TrainConfig(**main_config)
+        for axis_field in self.CASE_AXIS_FIELDS:
+            logger.info(f"{axis_field}: {getattr(config, axis_field)}")

@@ -7,37 +7,31 @@ from transport_study.modules.profile_predictor.module import ProfilePredictor
 from transport_study.modules.profile_predictor.trb import (
     ProfilePredictorTRB,
 )
-from transport_study.profile_transfer.profile_study import ProfileStudy
+from transport_study.profile_transfer.profile_study import (
+    HYPERPARAM_TARGET_SHOTS,
+    ProfileStudy,
+)
 
 
 def checkpoint_to_profile_case(checkpoint_dir: Path | str) -> ProfileStudy.Case:
-    # Extract the case name from the path, assuming it's the name of the last directory in the path
-    case_name = Path(checkpoint_dir).name
-    case_pieces = case_name.split(".")
-    model_type = case_pieces[1]
-    training_data = case_pieces[2][3:]  # remove "td_" prefix
+    """Parse a case directory name back into a ProfileStudy.Case.
 
-    if len(case_pieces) == 4:
-        domain_adaptation = None
-        freeze_shapes = case_pieces[3][7:] == "True"  # remove "freeze_" prefix and convert to bool
-        num_hp_shots = -1
-    elif len(case_pieces) == 5:
-        domain_adaptation = None
-        freeze_shapes = case_pieces[4][7:] == "True"  # remove "freeze_" prefix and convert to bool
-        num_hp_shots = -1
-    elif len(case_pieces) == 6:
-        domain_adaptation = case_pieces[3][3:]  # remove "da_" prefix
-        freeze_shapes = case_pieces[4][7:] == "True"  # remove "freeze_" prefix and convert to bool
-        num_hp_shots = int(case_pieces[5][3:])  # remove "hp_" prefix and convert to int
-    else:
+    Mirrors ProfileStudy.Case.__str__:
+    case.{model_type}.td_{td}.freeze_{f}                   source-trained, no adaptation
+    case.{model_type}.td_{td}.freeze_{f}.targ_{n}          exnihilo
+    case.{model_type}.td_{td}.freeze_{f}.targ_{n}.da_{da}  domain adaptation
+    """
+    case_name = Path(checkpoint_dir).name
+    pieces = case_name.split(".")
+    if len(pieces) not in (4, 5, 6) or pieces[0] != "case" or not pieces[2].startswith("td_") or not pieces[3].startswith("freeze_"):
         raise ValueError(f"Unexpected case name format: {case_name}")
 
     return ProfileStudy.Case(
-        model_type=model_type,
-        training_data=training_data,
-        domain_adaptation=domain_adaptation,
-        freeze_shapes=freeze_shapes,
-        num_hp_shots=num_hp_shots,
+        model_type=pieces[1],
+        training_data=pieces[2].removeprefix("td_"),
+        domain_adaptation=pieces[5].removeprefix("da_") if len(pieces) == 6 else None,
+        freeze_shapes=pieces[3].removeprefix("freeze_") == "True",
+        num_target_shots=int(pieces[4].removeprefix("targ_")) if len(pieces) >= 5 else HYPERPARAM_TARGET_SHOTS,
     )
 
 
@@ -63,8 +57,6 @@ def restore_profile_predictor(
     # Don't need the full dataloader, only want rho grid
     profile_predictor_config["dataloader_config"]["debug"] = True
 
-    # TODO(ZanderKeith) ensure this actually completely works for all types of profile predictors
-    # Make a test that trains a thing and restores it and checks that the predictions are the same
     _, profile_predictor_train_dl, _, _ = ProfilePredictorTRB.get_dataloaders(profile_predictor_config["dataloader_config"])
     profile_predictor = ProfilePredictorTRB.model_init(
         profile_predictor_train_dl,

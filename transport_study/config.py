@@ -20,7 +20,7 @@ TRAIN_VAL_SPLIT = (0.8, 0.2)
 TRAIN_VAL_TEST_SPLIT = (0.64, 0.16, 0.2)
 
 
-def _env_dataset_paths() -> dict[str, Path]:
+def env_dataset_paths() -> dict[str, Path]:
     """Parse PTPS_DATASET_PATHS, a JSON dict of device -> dataset path,
     e.g. PTPS_DATASET_PATHS='{"cmod": "/path/to/ds.zarr"}' -> {"cmod": Path(...)}
     """
@@ -39,7 +39,7 @@ def _env_spillover_partitions() -> tuple[str, ...]:
 class StudyConfig(BaseModel):
     # Shared between all studies
     study_name: str
-    dataset_paths: dict[str, Path] = Field(default_factory=_env_dataset_paths)
+    dataset_paths: dict[str, Path] = Field(default_factory=env_dataset_paths)
     target_device: str
 
     # Debugging and dev stuff
@@ -87,9 +87,8 @@ class StudyConfig(BaseModel):
     # leaving slack for analysis jobs and interactive work
     spillover_job_headroom: int = Field(default_factory=lambda: int(os.environ.get("PTPS_SPILLOVER_JOB_HEADROOM", "10")))
     wandb_entity: str | None = Field(default_factory=lambda: os.environ.get("PTPS_WANDB_ENTITY"))
-    scratch_dir: Path | None = (
-        None  # TODO(ZanderKeith): Only used for intermediate results from trajectory optimization, can be put in that study config instead
-    )
+    # Scratch directory for trajectory-optimization intermediate results
+    scratch_dir: Path | None = None
 
     # make everything in the config completely immutable, including the nested dataset_paths dict
     # extra="forbid" so a mistyped field name raises instead of being silently ignored and replaced by the default
@@ -116,7 +115,7 @@ class StudyConfig(BaseModel):
         # Env vars provide defaults, explicit TOML paths win
         return cls(
             **data,
-            dataset_paths=_env_dataset_paths() | {k: Path(v) for k, v in datasets.items()},
+            dataset_paths=env_dataset_paths() | {k: Path(v) for k, v in datasets.items()},
             target_device=target,
         )
 
