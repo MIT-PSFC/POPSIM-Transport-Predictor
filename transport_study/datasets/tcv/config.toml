@@ -9,3 +9,7 @@ default_source_dir = "/usr/local/mfe/ml_data_dump/TCV/DB_nc"
 # For TCV, shotlist is retrieved from the source directory
 # No SQL database query needed
 use_source_dir = true
+
+[shot_filters]
+# Minimum shot duration [s] after filtering to valid signal ranges
+min_duration = 0.5

@@ -1,7 +1,6 @@
 """Makes the 'raw' TCV dataset, to be processed later by POPSIM"""
 
 import gc
-import glob
 from pathlib import Path
 
 import netCDF4  # noqa: F401
@@ -13,8 +12,6 @@ from loguru import logger
 from transport_study import PACKAGE_ROOT, TIME_COORD, TIME_DIM
 from transport_study.datasets import make_uniform_1khz_timebase
 from transport_study.datasets.workflow import DataWorkflow
-
-DEFAULT_SHOTLIST_FILE = Path(PACKAGE_ROOT) / "datasets" / "tcv" / "tcv_shotlist"
 
 config = Dynaconf(settings_files=[Path(PACKAGE_ROOT) / "datasets/tcv/config.toml"])
 
@@ -28,6 +25,7 @@ TCV_0D_SIGNALS = [
     "ECRH",
     "KAPPA",
     "NBI",
+    "NBI2",
     "NEavg",
     "Ne_edge_avg",
     "POHM",
@@ -41,6 +39,27 @@ TCV_0D_SIGNALS = [
     "BETAN",
     "TAU_conf_calc",
 ]
+
+# Raw DEFUSE signals that standardize_signal_names cannot do without
+# A source file missing any of these (partial DEFUSE export) is skipped, not crashed on.
+TCV_REQUIRED_RAW_SIGNALS = {
+    "I_P",
+    "BZERO",
+    "POHM",
+    "PradBulk",
+    "NEavg",
+    "Ne_edge_avg",
+    "Wtot",
+    "R_geom",
+    "KAPPA",
+    "DELTA_TOP",
+    "DELTA_BOTTOM",
+    "BETAN",
+    "BETAP",
+    "a_minor",
+    "Ne_rho",
+    "Te_rho",
+}
 
 
 class TCVDataWorkflow(DataWorkflow):
@@ -89,6 +108,17 @@ class TCVDataWorkflow(DataWorkflow):
             "ne20_line_avg": {"min": 0.01, "max": 4},
             "ne20_edge": {"min": 0.01, "max": 4},
             "P_ECRH_MW": {"min": 0, "max": 10},
+            # Bad interferometer data can satisfy the absolute density cap at low Ip
+            # so stack another check based on the Greenwald fraction
+            "fGW": {"min": 0.0, "max": 2.0},
+            "Ip_MA": {"min": 0.05, "max": 0.5},
+            "betan": {"min": 0.01, "max": 10},
+            # LIUQE geometry moments go nonphysical during the current ramp
+            # (a_minor down to 0.04 m, kappa below 1), which drives derived
+            # features like q_star far outside the physical range
+            "a_minor": {"min": 0.15, "max": 0.30},
+            "R0": {"min": 0.80, "max": 1.0},
+            "kappa": {"min": 0.9, "max": 3.0},
         }
         self.individual_filter_config = None
 
@@ -104,6 +134,7 @@ class TCVDataWorkflow(DataWorkflow):
             shotlist_file,
             data_assembly_dir,
             max_num_shots=max_num_shots,
+            min_shot_duration=self.config["shot_filters"]["min_duration"],
         )
 
     def _get_shotlist_from_source(self) -> list[int]:
@@ -120,12 +151,12 @@ class TCVDataWorkflow(DataWorkflow):
         logger.info(f"Loading shotlist from TCV source directory {self.source_dir}")
 
         # List all .nc files in the directory
-        files = glob.glob(Path(self.source_dir) / "TCVno*.nc")
+        files = Path(self.source_dir).glob("TCVno*.nc")
 
         # Extract shot numbers from filenames (TCVno{shot}.nc)
         shotlist = []
         for file in files:
-            basename = Path(file).name
+            basename = file.name
             if basename.startswith("TCVno") and basename.endswith(".nc"):
                 shot_str = basename[5:-3]  # Extract the number between "TCVno" and ".nc"
                 try:
@@ -215,6 +246,9 @@ class TCVDataWorkflow(DataWorkflow):
             # Put signals on uniform timebase with standardized names
             ds_standardized = self._create_uniform_timebase_dataset(ds_shot, timebase)
             ds_standardized = self.standardize_signal_names(ds_standardized)
+            if ds_standardized is None:
+                logger.warning(f"Shot {shot} failed signal standardization, skipping")
+                continue
 
             # Add shot as a dimension (not just coordinate) - required for processing pipeline
             # The processing pipeline expects all data files to have shape (1, time_idx, ...)
@@ -343,6 +377,13 @@ class TCVDataWorkflow(DataWorkflow):
             Dataset ready for interpolation, or None if critical signals are missing
         """
 
+        # A source file missing required signals (partial DEFUSE export) is
+        # skipped instead of crashing the whole run on a KeyError below
+        missing = TCV_REQUIRED_RAW_SIGNALS - set(ds.data_vars)
+        if missing:
+            logger.warning(f"Missing required raw signals {sorted(missing)}, skipping shot (partial DEFUSE export?)")
+            return None
+
         # Simple renames
         ds = ds.rename(
             {
@@ -351,6 +392,7 @@ class TCVDataWorkflow(DataWorkflow):
                 "DELTA_TOP": "delta_top",
                 "DELTA_BOTTOM": "delta_bot",
                 "BETAN": "betan",
+                "BETAP": "beta_p",
             }
         )
 
@@ -362,43 +404,65 @@ class TCVDataWorkflow(DataWorkflow):
         ds["ne20_line_avg"] = ds["NEavg"] * 1e-20
         ds["ne20_edge"] = ds["Ne_edge_avg"] * 1e-20
         ds["Wtot_MJ"] = ds["Wtot"] * 1e-6
-        ds["LH_transition_threshold_MW"] = ds["P_LH"] * 1e-6
+        if "P_LH" in ds:
+            ds["LH_transition_threshold_MW"] = ds["P_LH"] * 1e-6
+        else:
+            ds["LH_transition_threshold_MW"] = xr.full_like(ds["Ip_MA"], np.nan)
 
         ds["ne20_rho"] = ds["Ne_rho"] * 1e-20
         ds["Te_keV_rho"] = ds["Te_rho"] * 1e-3
 
-        # If the signal is not present, create it as zeros up to shape of Ip_MA
-        # But where Ip_MA is NaN, keep it NaN
-        for new_name, original_name in zip(
-            ["P_NBI_MW", "P_ECRH_MW", "P_LH_MW", "P_ICRF_MW"],
-            ["NBI", "ECRH", "P_LH_MW", "P_ICRF_MW"],
-            strict=True,
-        ):
-            if original_name not in ds:
-                ds[new_name] = xr.where(ds["Ip_MA"].notnull(), 0.0, np.nan)
-            else:
-                ds[new_name] = xr.where(ds["Ip_MA"].notnull(), ds[original_name].fillna(0.0), np.nan)
-                # Only keep variables of interest
+        # Auxiliary heating
+        # DEFUSE stores NBI/NBI2/ECRH in MW already (everything else is SI)
+        # Either beam and ECRH can be absent or (1,) in some shots
+        # Missing heating means zero power where the plasma exists, NaN elsewhere.
+        valid_ip = ds["Ip_MA"].notnull()
+        nbi_total = xr.zeros_like(ds["Ip_MA"])
+        for beam in ["NBI", "NBI2"]:
+            if beam in ds:
+                nbi_total = nbi_total + ds[beam].fillna(0.0)
+        ds["P_NBI_MW"] = xr.where(valid_ip, nbi_total, np.nan)
+        ecrh = ds["ECRH"].fillna(0.0) if "ECRH" in ds else xr.zeros_like(ds["Ip_MA"])
+        ds["P_ECRH_MW"] = xr.where(valid_ip, ecrh, np.nan)
+        # TCV has no ICRF or LH heating systems
+        ds["P_ICRF_MW"] = xr.where(valid_ip, 0.0, np.nan)
+        ds["P_LH_MW"] = xr.where(valid_ip, 0.0, np.nan)
+
+        # Only keep variables of interest
         kept_vars = {
-            # POWER BALANCE TRAINING
+            # POWER BALANCE
             "Wtot_MJ",
-            "Ip_MA",
-            "ne20_line_avg",
-            # PROFILE PREDICTOR PREDICT-FIRST SIGNALS
+            "P_oh_MW",
+            "P_rad_MW",
+            "P_ICRF_MW",
+            "P_LH_MW",
+            "P_NBI_MW",
+            "P_ECRH_MW",
+            # PROFILE PREDICTOR TRAINING
             "Te_keV_rho",
             "ne20_rho",
+            "Ip_MA",
             "B0",
             "betan",
-            "ne20_edge",
+            "ne20_line_avg",
             "R0",
             "kappa",
             "a_minor",
             "delta_top",
             "delta_bot",
             # OTHER
+            "beta_p",  # LIUQE
+            "ne20_edge",
+            "LH_transition_threshold_MW",
         }
 
         ds = ds[list(kept_vars)]
+
+        # If any *important* signal is all NaN, return None to skip this shot
+        for signal in ["Te_keV_rho", "ne20_rho", "Ip_MA"]:
+            if ds[signal].isnull().all():
+                logger.warning(f"Signal {signal} is all NaN, skipping shot")
+                return None
 
         return ds
 
@@ -406,6 +470,7 @@ class TCVDataWorkflow(DataWorkflow):
         """Apply TCV specific processing steps.
 
         This includes:
+        - Greenwald fraction for the fGW range filter
         - Simple fringe-jump correction for ne20_line_avg
 
         Parameters
@@ -418,6 +483,11 @@ class TCVDataWorkflow(DataWorkflow):
         xr.Dataset
             Processed dataset ready for general workflow
         """
+
+        # Greenwald fraction for the fGW range filter
+        # n_GW = Ip/(pi a^2) in 1e20 m^-3 with Ip in MA.
+        if all(v in ds for v in ("ne20_line_avg", "Ip_MA", "a_minor")):
+            ds["fGW"] = ds["ne20_line_avg"] / (ds["Ip_MA"] / (np.pi * ds["a_minor"] ** 2))
 
         # Simple fringe-jump correction for ne20_line_avg
         # Detect large step changes and remove the offset for the remainder of the trace
@@ -456,8 +526,7 @@ class TCVDataWorkflow(DataWorkflow):
         """
 
         sus_shots = [
-            85117,  # P_rad consistently higher than P_oh and no other power sources
-            83412,  # P_rad consistently higher than P_oh and no other power sources
+            85117,  # P_rad consistently higher than P_oh with no aux power (checked raw: no NBI/NBI2/ECRH)
         ]
 
         if ds.shot.values[0] in sus_shots:
@@ -476,5 +545,6 @@ class TCVDataWorkflow(DataWorkflow):
         ne_edge_avg = ds["ne20_edge"].mean().item()
         if ne_edge_avg > (2 * ne_line_avg) or ds["ne20_line_avg"].isnull().all() or ds["ne20_edge"].isnull().all():
             logger.info(f"Culling shot {ds.shot.values[0]} due to edge density being significantly higher than line-avg density")
+            return True
 
         return False
