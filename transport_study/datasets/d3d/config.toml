@@ -1,13 +1,16 @@
 # DIII-D Dataset Configuration
 
-[shotlist_query]
-# SQL query parameters for retrieving shotlist when no shotlist file is provided
-summary_table = "summaries"
-ipmax = 400000.0  # Maximum plasma current threshold [A]
-pulse_length = 1.0  # Minimum pulse length [s]
-min_shot = 160000
-max_shot = 999999
-
 [data_sources]
-# IDA profile database path pattern
-ida_path_pattern = "/fusion/projects/results/ida-results/HBP_database/IDA_{shot}_.cdf"
+# IDA profile databases, one file per shot. Searched in priority order:
+# a shot is read from the first pattern that has a file for it.
+# The union across patterns also defines shot availability for the default shotlist.
+ida_path_patterns = [
+  "/fusion/projects/results/ida-results/HBP_database/IDA_{shot}_.cdf",
+]
+
+[profile_grid]
+# Uniform rho grid for the IDA profiles (rho = normalized midplane minor radius)
+# rho_max 1.1 covers the usable part of IDA's psi_n <= 1.2 domain
+rho_min = 0.0
+rho_max = 1.1
+num_rho_points = 64

@@ -15,7 +15,6 @@ dependencies = [
     "pydantic-settings>=2.12.0",
     "dynaconf>=3.2.12",
     "wandb>=0.25.0",
-    "freeqdsk>=0.5.2",
     "srunx>=2.2.1",
     "mkgp>=3.1.4",
     "threadpoolctl>=3.6.0",

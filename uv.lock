@@ -1307,19 +1307,6 @@ wheels = [
 ]
 
 [[package]]
-name = "freeqdsk"
-version = "0.5.2"
-source = { registry = "https://pypi.org/simple" }
-dependencies = [
-    { name = "fortranformat" },
-    { name = "numpy" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/51/cd/a98eea70d69fbee460278d54ca94370ad659f4245e96f1383471749c7e57/freeqdsk-0.5.2.tar.gz", hash = "sha256:7b40430f8368a9ac130d441d43aa50944b4165c8c44fc49b752836bd8e822b4b", size = 201827 }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/3b/c3/27c40f49900c200ff1655af3070cd5f9e796e39e85e3d7edb452a9874f30/freeqdsk-0.5.2-py3-none-any.whl", hash = "sha256:36f9b614b03b7af930b5239e1f9e0ea2da4a8b16de8284b8e8c96a8160a08895", size = 25751 },
-]
-
-[[package]]
 name = "frozenlist"
 version = "1.8.0"
 source = { registry = "https://pypi.org/simple" }
@@ -3606,7 +3593,6 @@ dependencies = [
     { name = "disruption-py" },
     { name = "dynaconf" },
     { name = "fire" },
-    { name = "freeqdsk" },
     { name = "mkgp" },
     { name = "netcdf4" },
     { name = "popsim" },
@@ -3641,7 +3627,6 @@ requires-dist = [
     { name = "disruption-py", editable = "submodules/disruption-py" },
     { name = "dynaconf", specifier = ">=3.2.12" },
     { name = "fire", specifier = ">=0.7.1" },
-    { name = "freeqdsk", specifier = ">=0.5.2" },
     { name = "mkgp", specifier = ">=3.1.4" },
     { name = "netcdf4" },
     { name = "popsim", editable = "submodules/popsim-public" },
@@ -3997,6 +3982,10 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/30/a6/9f9f380dbb301f67023bf8f707aaa75daadf84f7152d95c410fd7e81d994/pydantic_core-2.46.4-cp314-cp314t-win32.whl", hash = "sha256:e846ae7835bf0703ae43f534ab79a867146dadd59dc9ca5c8b53d5c8f7c9ef02", size = 1955575 },
     { url = "https://files.pythonhosted.org/packages/40/1f/f1eb9eb350e795d1af8586289746f5c5677d16043040d63710e22abc43c9/pydantic_core-2.46.4-cp314-cp314t-win_amd64.whl", hash = "sha256:2108ba5c1c1eca18030634489dc544844144ee36357f2f9f780b93e7ddbb44b5", size = 2051624 },
     { url = "https://files.pythonhosted.org/packages/f6/d2/42dd53d0a85c27606f316d3aa5d2869c4e8470a5ed6dec30e4a1abe19192/pydantic_core-2.46.4-cp314-cp314t-win_arm64.whl", hash = "sha256:4fcbe087dbc2068af7eda3aa87634eba216dbda64d1ae73c8684b621d33f6596", size = 2017325 },
+    { url = "https://files.pythonhosted.org/packages/9d/1d/8987ad40f65ae1432753072f214fb5c74fe47ffbd0698bb9cbbb585664f8/pydantic_core-2.46.4-graalpy312-graalpy250_312_native-macosx_10_12_x86_64.whl", hash = "sha256:1d8ba486450b14f3b1d63bc521d410ec7565e52f887b9fb671791886436a42f7", size = 2095527 },
+    { url = "https://files.pythonhosted.org/packages/64/d3/84c282a7eee1d3ac4c0377546ef5a1ea436ce26840d9ac3b7ed54a377507/pydantic_core-2.46.4-graalpy312-graalpy250_312_native-macosx_11_0_arm64.whl", hash = "sha256:3009f12e4e90b7f88b4f9adb1b0c4a3d58fe7820f3238c190047209d148026df", size = 1936024 },
+    { url = "https://files.pythonhosted.org/packages/d7/ca/eac61596cdeb4d7e174d3dc0bd8a6238f14f75f97a24e7b7db4c7e7340a0/pydantic_core-2.46.4-graalpy312-graalpy250_312_native-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:ad785e92e6dc634c21555edc8bd6b64957ab844541bcb96a1366c202951ae526", size = 1990696 },
+    { url = "https://files.pythonhosted.org/packages/fa/c3/7c8b240552251faf6b3a957db200fcfbbcec36763c050428b601e0c9b83b/pydantic_core-2.46.4-graalpy312-graalpy250_312_native-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:00c603d540afdd6b80eb39f078f33ebd46211f02f33e34a32d9f053bba711de0", size = 2147590 },
 ]
 
 [[package]]

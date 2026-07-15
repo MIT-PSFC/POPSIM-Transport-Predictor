@@ -119,7 +119,6 @@ class DatasetCLI:
         max_num_shots: int | None = None,
         mode: str | None = "raw",
         clean: bool | None = False,
-        use_ida: bool | None = True,
     ):
         data_assembly_dir = Path(data_assembly_dir)
         workflow = D3DDataWorkflow(
@@ -127,7 +126,6 @@ class DatasetCLI:
             shotlist_file=shotlist_file,
             data_assembly_dir=data_assembly_dir,
             max_num_shots=max_num_shots,
-            use_ida=use_ida,
         )
 
         self._execute(workflow, mode, clean)

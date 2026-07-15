@@ -10,6 +10,14 @@ Use Disruption-Py to get the 0D scalars and the 1D data separately, do some prep
 MDSPlus on Omega requires numpy < 2 which is incompatible with POPSIM, so we have a separate virtual environment
 that only has the requirements for Disruption-Py to first pull the data. (set up this venv with `make_d3d_venv.sh`)
 Further filtering and preprocessing is done on the uv-managed venv with numpy >= 2.
+All signals come from Disruption-Py in one call per shot: 1 kHz EFIT via the DISPY runtag trees, PTDATA and
+pedestal-tree signals via the custom physics methods in `d3d/physics_methods.py`, and Te/ne profiles from the
+IDA database (`IDA_{shot}_.cdf` files) mapped from psi_n onto the same normalized-minor-radius rho grid
+definition as C-Mod and MAST using the EFIT equilibrium. No GP fitting is needed since IDA profiles are
+already a Bayesian fit with errors.
+Note for `--mode process` on Omega: the login environment exports PYTHONPATH pointing at the system MDSplus,
+which cannot import under numpy >= 2 and makes disruption-py refuse to import. Strip it for the processing
+step: `PYTHONPATH= python -m transport_study.datasets.cli d3d --mode process ...`
 
 3. MAST
 
