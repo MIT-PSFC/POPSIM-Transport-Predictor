@@ -459,10 +459,8 @@ class TCVDataWorkflow(DataWorkflow):
         ds = ds[list(kept_vars)]
 
         # If any *important* signal is all NaN, return None to skip this shot
-        for signal in ["Te_keV_rho", "ne20_rho", "Ip_MA"]:
-            if ds[signal].isnull().all():
-                logger.warning(f"Signal {signal} is all NaN, skipping shot")
-                return None
+        if self.has_all_nan_signal(ds, ["Te_keV_rho", "ne20_rho", "Ip_MA"]):
+            return None
 
         return ds
 

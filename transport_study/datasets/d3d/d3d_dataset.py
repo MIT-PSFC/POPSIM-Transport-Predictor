@@ -13,7 +13,7 @@ from disruption_py.workflow import get_shots_data
 from dynaconf import Dynaconf
 from loguru import logger
 
-from transport_study import EPISODE_DIM, PACKAGE_ROOT, TIME_COORD, TIME_DIM
+from transport_study import PACKAGE_ROOT
 from transport_study.datasets.d3d.physics_methods import (
     D3DDatasetMethods,
     Uniform1kHzTimeSetting,
@@ -399,21 +399,10 @@ class D3DDataWorkflow(DataWorkflow):
         ds = ds[sorted(kept_vars)]
 
         # If any *important* signal is all NaN, return None to skip this shot
-        for signal in ["Te_keV_rho", "ne20_rho", "Te_keV_psi", "ne20_psi", "Ip_MA"]:
-            if ds[signal].isnull().all():
-                logger.warning(f"Signal {signal} is all NaN for shot {ds['shot'].item()}, skipping shot.")
-                return None
+        if self.has_all_nan_signal(ds, ["Te_keV_rho", "ne20_rho", "Te_keV_psi", "ne20_psi", "Ip_MA"]):
+            return None
 
-        # Make episode dimension, time dimension, and time coordinate names consistent
-        # Rename time dimension to follow POPSIM convention: time_dim -> time_idx
-        if TIME_DIM not in ds.dims:
-            ds = ds.rename_dims({"time": TIME_DIM})
-        if EPISODE_DIM not in ds.dims:
-            ds = ds.rename_dims({"shot": EPISODE_DIM})
-        if TIME_COORD not in ds.coords:
-            ds = ds.rename_vars({"time": TIME_COORD})
-
-        return ds
+        return self.standardize_dim_names(ds)
 
     def device_specific_processing(self, ds: xr.Dataset) -> xr.Dataset:
         """Apply DIII-D specific processing steps.
@@ -461,11 +450,3 @@ class D3DDataWorkflow(DataWorkflow):
         ds["Te_keV_core"] = ds["Te_keV_rho"].sel(rho=0, method="nearest")
 
         return ds
-
-    def device_specific_culling(self, ds: xr.Dataset) -> bool:
-        """Cull shots whose profiles are entirely missing after filtering."""
-        for signal in ["Te_keV_rho", "ne20_rho"]:
-            if ds[signal].isnull().all():
-                logger.warning(f"Signal {signal} is all NaN after filtering, culling shot.")
-                return True
-        return False

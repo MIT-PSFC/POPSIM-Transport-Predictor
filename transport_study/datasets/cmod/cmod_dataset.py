@@ -14,7 +14,7 @@ from dynaconf import Dynaconf
 from loguru import logger
 from threadpoolctl import threadpool_limits
 
-from transport_study import EPISODE_DIM, PACKAGE_ROOT, TIME_COORD, TIME_DIM
+from transport_study import PACKAGE_ROOT
 from transport_study.datasets import make_uniform_1khz_timebase
 from transport_study.datasets.cmod import (
     CMOD_DATASET_SIGNALS,
@@ -766,20 +766,10 @@ class CModDataWorkflow(DataWorkflow):
         ds = ds[list(kept_vars)]
 
         # If any *important* signal is all NaN, return None to skip this shot
-        for signal in ["Te_keV_rho", "ne20_rho", "Ip_MA"]:
-            if ds[signal].isnull().all():
-                logger.warning(f"Signal {signal} is all NaN for shot {ds['shot'].item()}, skipping shot.")
-                return None
+        if self.has_all_nan_signal(ds, ["Te_keV_rho", "ne20_rho", "Ip_MA"]):
+            return None
 
-        # Make episode dimension, time dimension, and time coordinate names consistent
-        if TIME_DIM not in ds.dims:
-            ds = ds.rename_dims({"time": TIME_DIM})
-        if EPISODE_DIM not in ds.dims:
-            ds = ds.rename_dims({"shot": EPISODE_DIM})
-        if TIME_COORD not in ds.coords:
-            ds = ds.rename_vars({"time": TIME_COORD})
-
-        return ds
+        return self.standardize_dim_names(ds)
 
     def device_specific_processing(self, ds: xr.Dataset) -> xr.Dataset:
         """Apply C-Mod specific processing steps.
@@ -812,20 +802,3 @@ class CModDataWorkflow(DataWorkflow):
         ds["Te_keV_rho"] = ds["Te_keV_rho"].where(valid_profile_mask)
 
         return ds
-
-    def device_specific_culling(self, ds: xr.Dataset) -> bool:
-        """Apply C-Mod specific culling criteria to the dataset
-
-        Returns True if the dataset should be culled, False otherwise
-        """
-        shot_id = ds.shot.values[0] if "shot" in ds else "unknown"
-
-        # Profiles can become all NaN after the raw-file stage, e.g. when
-        # device_specific_processing culls every individual profile or when
-        # filtering cuts the shot down to a window with no valid profiles
-        for signal in ["Te_keV_rho", "ne20_rho"]:
-            if ds[signal].isnull().all():
-                logger.warning(f"Culling shot {shot_id}: {signal} is all NaN after processing and filtering")
-                return True
-
-        return False

@@ -5,13 +5,13 @@ def make_uniform_1khz_timebase(max_time: float) -> np.ndarray:
     """
     Create a uniform timebase at 1 kHz up to the specified maximum time.
     This is the timebase used for all datasets throughout the study.
-    Using arange and round ensures the timebase is consistent across all shots.
+    Built from an integer millisecond count so no sample can be dropped or duplicated by float accumulation.
 
     Parameters
     ----------
     max_time : float
         The maximum time for the timebase [s].
     """
-    times = np.round(np.arange(0, max_time + 1e-3, 1e-3), 3)
-    times = np.unique(times).astype("float32")
+    last_ms = int(np.ceil(np.round(max_time * 1000, 6)))
+    times = np.round(np.arange(last_ms + 1, dtype=np.float64) * 1e-3, 3).astype("float32")
     return times

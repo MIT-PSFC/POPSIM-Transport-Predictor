@@ -18,7 +18,7 @@ from dynaconf import Dynaconf
 from loguru import logger
 from threadpoolctl import threadpool_limits
 
-from transport_study import EPISODE_DIM, PACKAGE_ROOT, TIME_COORD, TIME_DIM
+from transport_study import PACKAGE_ROOT, TIME_COORD, TIME_DIM
 from transport_study.datasets import make_uniform_1khz_timebase
 from transport_study.datasets.gp_fitting.fit_worker import (
     ShotFitInput,
@@ -61,8 +61,11 @@ def _check_required_signals(shot: int, cfg) -> bool:
             entries = fs.ls(f"{base}/{var_path}", detail=False)
             if not entries:
                 raise FileNotFoundError
-        except Exception:
+        except FileNotFoundError:
             logger.warning(f"Shot {shot}: {var_path} not found in store, skipping")
+            return False
+        except Exception:
+            logger.warning(f"Shot {shot}: error listing {var_path} in store, skipping", exc_info=True)
             return False
     return True
 
@@ -994,22 +997,12 @@ class MASTDataWorkflow(DataWorkflow):
             logger.warning(f"Shot {shot_id}: missing expected variables {sorted(missing)}, excluding (stale raw file?)")
             return None
 
-        for signal in ["Te_keV_rho", "ne20_rho", "Ip_MA"]:
-            if signal in ds and ds[signal].isnull().all():
-                shot_id = ds["shot"].item() if "shot" in ds else "unknown"
-                logger.warning(f"Shot {shot_id}: {signal} is all NaN, skipping")
-                return None
+        if self.has_all_nan_signal(ds, ["Te_keV_rho", "ne20_rho", "Ip_MA"]):
+            return None
 
         ds = ds[list(kept_vars)]
 
-        if TIME_DIM not in ds.dims:
-            ds = ds.rename_dims({"time": TIME_DIM})
-        if EPISODE_DIM not in ds.dims:
-            ds = ds.rename_dims({"shot": EPISODE_DIM})
-        if TIME_COORD not in ds.coords:
-            ds = ds.rename_vars({"time": TIME_COORD})
-
-        return ds
+        return self.standardize_dim_names(ds)
 
     # ------------------------------------------------------------------
     def device_specific_processing(self, ds: xr.Dataset) -> xr.Dataset:

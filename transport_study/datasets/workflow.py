@@ -5,7 +5,7 @@ import numpy as np
 import xarray as xr
 from loguru import logger
 
-from transport_study import EPISODE_DIM, TIME_DIM
+from transport_study import EPISODE_DIM, TIME_COORD, TIME_DIM
 from transport_study.datasets.plotting import (
     ds_profile_plot,
     ds_profile_time_plot,
@@ -26,6 +26,11 @@ class DataWorkflow(ABC):
     2. Process and filter data as needed to remove bad shots / fix signals where possible
     - Logging of issues encountered, with plots where relevant to see what went wrong
     3. Combine all shots together into a single xarray Dataset and save to disk
+
+    Only the raw per-shot files are strictly uniform at 1 kHz. Filtering in
+    step 2 drops interior timeslices, so the processed dataset can have
+    mid-shot dt gaps; consumers needing a uniform grid must reindex
+    (see organize_data.reindex_to_uniform_timebase).
     """
 
     # GP fitting options used by fit_batch / the cluster worker; overridden per device
@@ -216,9 +221,38 @@ class DataWorkflow(ABC):
     def device_specific_processing(self, ds: xr.Dataset) -> xr.Dataset:
         """Apply any device-specific processing steps before the general workflow"""
 
-    @abstractmethod
     def device_specific_culling(self, ds: xr.Dataset) -> bool:
-        """Apply any device-specific culling logic to determine if this shot should be excluded from the dataset"""
+        """Device-specific culling logic, True if this shot should be excluded from the dataset.
+
+        Default: cull when either profile is entirely missing after processing
+        and filtering (e.g. every individual profile was culled, or filtering
+        cut the shot down to a window with no valid profiles).
+        """
+        shot_id = ds["shot"].values[0] if "shot" in ds else "unknown"
+        for signal in ["Te_keV_rho", "ne20_rho"]:
+            if ds[signal].isnull().all():
+                logger.warning(f"Culling shot {shot_id}: {signal} is all NaN after processing and filtering")
+                return True
+        return False
+
+    def has_all_nan_signal(self, ds: xr.Dataset, signals: list[str]) -> bool:
+        """True (with a warning naming the signal) if any given signal is entirely NaN."""
+        shot_id = ds["shot"].item() if "shot" in ds else "unknown"
+        for signal in signals:
+            if ds[signal].isnull().all():
+                logger.warning(f"Signal {signal} is all NaN for shot {shot_id}, skipping shot.")
+                return True
+        return False
+
+    def standardize_dim_names(self, ds: xr.Dataset) -> xr.Dataset:
+        """Make episode dim, time dim, and time coordinate names consistent with POPSIM conventions."""
+        if TIME_DIM not in ds.dims:
+            ds = ds.rename_dims({"time": TIME_DIM})
+        if EPISODE_DIM not in ds.dims:
+            ds = ds.rename_dims({"shot": EPISODE_DIM})
+        if TIME_COORD not in ds.coords:
+            ds = ds.rename_vars({"time": TIME_COORD})
+        return ds
 
     def log_ds_details(self, ds: xr.Dataset):
         logger.info(f"Final dataset dimensions: {ds.dims}")
@@ -264,7 +298,7 @@ class DataWorkflow(ABC):
 
         zarr_path = self.final_ds_dir / "ds.zarr"
         if zarr_path.exists():
-            print(f"Dataset already exists at {zarr_path}, skipping processing.")
+            logger.info(f"Dataset already exists at {zarr_path}, skipping processing.")
             return
 
         identifiers = [int(p.stem) for p in self.raw_data_dir.glob("*.nc")]
