@@ -186,10 +186,11 @@ def run_clean_sweeps(projects: list[str]):
             if project_obj is None:
                 logger.warning(f"No wandb project found for {project}, skipping sweep cleanup.")
                 continue
-            project_sweeps = project_obj.sweeps()
+            project_sweeps = list(project_obj.sweeps())
             for sweep in project_sweeps:
                 logger.info(f"Deleting sweep {sweep.id} for project {project}")
                 _delete_sweep(sweep)
+            if project_sweeps:
                 _delete_runs(project)
         except Exception as e:
             logger.warning(f"Error reading sweeps for project {project}, skipping sweep cleanup.")
