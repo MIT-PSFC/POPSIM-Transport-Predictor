@@ -19,6 +19,12 @@ from transport_study.orchestration.organize_data import (
 )
 from transport_study.orchestration.study import CaseGridConfig, Study
 from transport_study.power_balance_transfer.data_visualization import DataVisualization
+from transport_study.power_balance_transfer.plotting import (
+    data_normalization_comparison,
+    domain_adaptation_comparison,
+    model_comparison,
+    training_dataset_comparison,
+)
 
 # When domain adaptation is None, we aren't using any target data during training anyway so this is unused
 # During domain adaptation, we aren't doing hyperparameter tuning
@@ -810,15 +816,31 @@ def run_study(
         ds_final = study.collect_results()
         ds_final.to_netcdf(study.collected_results_path())
 
+    results_ds = xr.load_dataset(study.collected_results_path())
+
     ############################
     # Training Data Comparison #
     ############################
-    logger.info("TRAINING DATA COMPARISON")
+    logger.opt(colors=True).info("<bold><magenta>TRAINING DATA COMPARISON</magenta></bold>")
+    training_dataset_comparison(results_ds, study.figure_dir)
 
     ####################
     # Model Comparison #
     ####################
-    logger.info("MODEL COMPARISON")
+    logger.opt(colors=True).info("<bold><magenta>MODEL COMPARISON</magenta></bold>")
+    model_comparison(results_ds, study.figure_dir)
+
+    #################################
+    # Data Normalization Comparison #
+    #################################
+    logger.opt(colors=True).info("<bold><magenta>DATA NORMALIZATION COMPARISON</magenta></bold>")
+    data_normalization_comparison(results_ds, study.figure_dir)
+
+    ################################
+    # Domain Adaptation Comparison #
+    ################################
+    logger.opt(colors=True).info("<bold><magenta>DOMAIN ADAPTATION COMPARISON</magenta></bold>")
+    domain_adaptation_comparison(results_ds, study.figure_dir)
 
 
 if __name__ == "__main__":
