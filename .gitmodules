@@ -4,7 +4,7 @@
 	branch = zk/popsim
 [submodule "submodules/torax"]
 	path = submodules/torax
-	url = https://github.com/ZanderKeith/torax.git
+	url = git@github.com:ZanderKeith/torax.git
 [submodule "submodules/popsim-public"]
 	path = submodules/popsim-public
 	url = git@github.com:MIT-PSFC/POPSIM-Public.git
