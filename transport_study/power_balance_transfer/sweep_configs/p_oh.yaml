@@ -1,0 +1,46 @@
+method: bayes
+metric:
+  name: "val/loss.mean"
+  goal: "minimize"
+early_terminate:
+  type: hyperband
+  min_iter: 2
+  eta: 3
+parameters:
+  model_init_config:
+    parameters:
+      nn_width:
+        values: [16, 24, 32, 40, 48, 56, 64]
+      nn_depth:
+        values: [2, 3, 4]
+  dataloader_config:
+    parameters:
+      batch_size:
+        values: [2048, 4096, 8192]
+  optimizer_config:
+    parameters:
+      lr0:
+        distribution: log_uniform_values
+        min: 1.0e-5
+        max: 1.0e-2
+      lrf:
+        distribution: log_uniform_values
+        min: 1.0e-7
+        max: 1.0e-4
+      weight_decay:
+        distribution: log_uniform_values
+        min: 1.0e-6
+        max: 0.1
+      # Learning-rate decay time constant as a fraction of the run's total
+      # optimizer steps, resolved to transition_steps at train time
+      transition_frac:
+        distribution: log_uniform_values
+        min: 0.03
+        max: 3.0
+      decay_rate:
+        distribution: uniform
+        min: 0.5
+        max: 0.999
+# huber_delta is NOT swept here: the submodules have no delta-free validation
+# suite, so their sweep metric depends on the delta and sweeping it would let
+# the sweep shrink the reported loss instead of improving predictions

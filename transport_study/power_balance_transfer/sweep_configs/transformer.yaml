@@ -1,0 +1,59 @@
+method: bayes
+metric:
+  name: "val/loss.mean"
+  goal: "minimize"
+early_terminate:
+  type: hyperband
+  min_iter: 2
+  eta: 3
+parameters:
+  model_init_config:
+    parameters:
+      d_model:
+        values: [8, 16, 32, 64]
+      num_heads:
+        values: [1, 2, 4]
+      history_len:
+        values: [5, 10, 20, 50]
+      nn_width:
+        values: [16, 24, 32, 40, 48, 56, 64]
+      nn_depth:
+        values: [2, 3, 4]
+  dataloader_config:
+    parameters:
+      segment_length_train:
+        values: [50, 100, 200]
+      segment_overlap_train:
+        values: [0, 25, 50]
+      batch_size:
+        values: [2048, 4096, 8192]
+  optimizer_config:
+    parameters:
+      lr0:
+        distribution: log_uniform_values
+        min: 1.0e-5
+        max: 1.0e-2
+      lrf:
+        distribution: log_uniform_values
+        min: 1.0e-7
+        max: 1.0e-4
+      weight_decay:
+        distribution: log_uniform_values
+        min: 1.0e-6
+        max: 0.1
+      transition_frac:
+        distribution: log_uniform_values
+        min: 0.03
+        max: 3.0
+      decay_rate:
+        distribution: uniform
+        min: 0.5
+        max: 0.999
+  loss_config:
+    parameters:
+      # Safe to sweep, the sweep metric val/loss.mean is the delta-free
+      # validation loss (PowerBalanceTRB.get_val_loss_fn)
+      huber_delta:
+        distribution: log_uniform_values
+        min: 0.01
+        max: 1.0
