@@ -24,9 +24,7 @@ import numpy as np
 import xarray as xr
 from loguru import logger
 
-BACKGROUND_COLOR = "#2F2F2F"
-FACE_COLOR = "#1A1A1A"
-TEXT_COLOR = "white"
+from transport_study.plot_style import BACKGROUND_COLOR, TEXT_COLOR, style_axis
 
 TITLE_FONTSIZE = 14
 LABEL_FONTSIZE = 11
@@ -96,14 +94,6 @@ SUBMODULE_MODEL_TYPES = ("p_oh", "p_rad")
 DIVERGED_THRESHOLD = 1e3
 
 
-def _style_axis(ax):
-    ax.set_facecolor(FACE_COLOR)
-    ax.tick_params(colors=TEXT_COLOR, labelsize=TICK_FONTSIZE)
-    for spine in ax.spines.values():
-        spine.set_edgecolor(TEXT_COLOR)
-    ax.grid(True, alpha=0.2, color=TEXT_COLOR)
-
-
 def _mask_select(ds: xr.Dataset, mask) -> xr.Dataset:
     return ds.isel(case_idx=np.asarray(mask))
 
@@ -121,7 +111,7 @@ def _grid_figure() -> tuple[plt.Figure, np.ndarray]:
     for row, metric in enumerate(METRIC_NAMES):
         for col, domain in enumerate(DOMAIN_NAMES):
             ax = axes[row, col]
-            _style_axis(ax)
+            style_axis(ax, TICK_FONTSIZE)
             if row == 0:
                 ax.set_title(DOMAIN_LABELS[domain], color=TEXT_COLOR, fontsize=LABEL_FONTSIZE)
             if col == 0:

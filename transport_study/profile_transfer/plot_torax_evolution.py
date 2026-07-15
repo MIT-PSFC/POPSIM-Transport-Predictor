@@ -31,10 +31,7 @@ from transport_study.modules.profile_predictor.torax_module import (
 from transport_study.modules.profile_predictor.train_configs import (
     PROFILE_PREDICTOR_TORAX_CONFIGS,
 )
-
-BACKGROUND_COLOR = "#2F2F2F"
-FACE_COLOR = "#1A1A1A"
-TEXT_COLOR = "white"
+from transport_study.plot_style import BACKGROUND_COLOR, TEXT_COLOR, style_axis
 
 TITLE_FONTSIZE = 20
 LABEL_FONTSIZE = 18
@@ -105,14 +102,6 @@ def _build_module(timeslice: xr.Dataset, checkpoint: str | Path | None, transpor
     return module
 
 
-def _style_axis(ax):
-    ax.set_facecolor(FACE_COLOR)
-    ax.tick_params(colors=TEXT_COLOR, labelsize=TICK_FONTSIZE)
-    for spine in ax.spines.values():
-        spine.set_edgecolor(TEXT_COLOR)
-    ax.grid(True, alpha=0.2, color=TEXT_COLOR)
-
-
 def plot_relaxation(
     steps: list[dict],
     coeffs: dict,
@@ -171,7 +160,7 @@ def plot_relaxation(
     ax_te.set_xlabel(r"$\rho$", fontsize=LABEL_FONTSIZE, color=TEXT_COLOR)
 
     for ax in (ax_ne, ax_te):
-        _style_axis(ax)
+        style_axis(ax, TICK_FONTSIZE)
         ax.legend(
             fontsize=LEGEND_FONTSIZE,
             labelcolor=TEXT_COLOR,

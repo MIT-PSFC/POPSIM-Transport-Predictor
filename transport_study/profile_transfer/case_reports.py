@@ -31,12 +31,8 @@ from transport_study.orchestration.slurm_utils import (
     get_running_job_names,
     launch_profile_analysis_parallel,
 )
+from transport_study.plot_style import BACKGROUND_COLOR, TEXT_COLOR, style_axis
 from transport_study.profile_transfer.plot_torax_evolution import plot_relaxation
-from transport_study.profile_transfer.plotting import (
-    BACKGROUND_COLOR,
-    FACE_COLOR,
-    TEXT_COLOR,
-)
 from transport_study.profile_transfer.study_metrics import (
     CaseTimesliceMetrics,
     case_metrics_path,
@@ -66,14 +62,6 @@ GRAD_LABELS = {
 }
 # Panel order: Te value, ne value, Te gradient, ne gradient
 PANEL_VARS = ("Te_keV_rho", "ne20_rho")
-
-
-def _style_axis(ax):
-    ax.set_facecolor(FACE_COLOR)
-    ax.tick_params(colors=TEXT_COLOR, labelsize=TICK_FONTSIZE)
-    for spine in ax.spines.values():
-        spine.set_edgecolor(TEXT_COLOR)
-    ax.grid(True, alpha=0.2, color=TEXT_COLOR)
 
 
 def _axis_lims(*arrays: np.ndarray) -> tuple[float, float]:
@@ -138,7 +126,7 @@ def _timeslice_panel(
         grad_pred = np.diff(pred) / d_rho
 
         ax_val = axes[0, col]
-        _style_axis(ax_val)
+        style_axis(ax_val, TICK_FONTSIZE)
         ax_val.fill_between(rho, targ - err, targ + err, color="white", alpha=0.25, linewidth=0)
         ax_val.plot(rho, targ, color="white", linewidth=2, linestyle="--", label="Measured")
         ax_val.plot(rho, pred, color="#0095ff", linewidth=2, label="Predicted")
@@ -147,7 +135,7 @@ def _timeslice_panel(
             ax_val.set_ylim(*ylims[f"{var}_value"])
 
         ax_grad = axes[1, col]
-        _style_axis(ax_grad)
+        style_axis(ax_grad, TICK_FONTSIZE)
         _shade_ignored_grad_region(ax_grad, rho_mid)
         ax_grad.fill_between(rho_mid, grad_targ_mid - grad_err_mid, grad_targ_mid + grad_err_mid, color="white", alpha=0.25, linewidth=0)
         ax_grad.plot(rho_mid, grad_targ_mid, color="white", linewidth=2, linestyle="--", label="Measured")
@@ -324,10 +312,6 @@ def generate_case_report(study, case, figure_dir: Path):
         return
 
     result_ds = xr.load_dataset(result_path)
-    if "rho" not in result_ds.dims:
-        logger.warning(f"Result file for case {case} predates the rho grid schema, skipping case report")
-        return
-
     loss_config = study.make_train_config(case).loss_config
     ts_metrics = compute_case_timeslice_metrics(result_ds, loss_config)
     if len(ts_metrics) == 0:
