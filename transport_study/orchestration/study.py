@@ -568,13 +568,16 @@ class Study:
             # loss is weighted consistently with training
             loss_config["device_weights"] = self._make_mixing_device_weights(case)
 
+        # Mixing with no target shots runs to max_epochs, early stopping disabled
+        patience = None if case.domain_adaptation == "mixing" and case.num_target_shots == 0 else config.patience
+
         spec = self._model_train_spec(case, dataloader_config_base)
         train_config_base = TrainConfig(
             project=self.wandb_project_name(case),
             train_run_builder=spec.train_run_builder,
             max_epochs=config.max_epochs,
             epochs_per_val=config.epochs_per_val,
-            patience=config.patience,
+            patience=patience,
             # When doing hyperparameter tuning, this gets overwritten by the wandb agent
             checkpoint_dir=str(self.trained_model_dir(case)),
             dataloader_config=spec.dataloader_config,

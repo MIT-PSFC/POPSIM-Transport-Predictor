@@ -46,10 +46,10 @@ class StudyConfig(BaseModel):
     debug: bool = True
     dry_run: bool = False
     max_ds_size: int = 1000
-    hyperparam_sweeps: int = 1000
+    hyperparam_sweeps: int = 100
     max_epochs: int = 1000
     epochs_per_val: int = 20
-    patience: int = 4  # epochs_per_val * patience = max epochs without improvement before stopping
+    patience: int = 6  # epochs_per_val * patience = max epochs without improvement before stopping
     # Epoch cap for hyperparameter sweep trials
     # Trials are wall-clock limited to train_wall_budget_s and stop early via patience
     # Matching max_epochs keeps tuned LR schedules consistent between sweep and final training runs
