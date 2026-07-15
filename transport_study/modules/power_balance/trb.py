@@ -10,7 +10,7 @@ from loguru import logger
 from popsim.ml import DataLoader, IntegralLoss, TrainConfig, TrainRunBuilder
 from popsim.ml.checkpointing import create_default_checkpoint_manager, restore_model
 from popsim.ml.dataloading import make_dataloaders
-from popsim.ml.eval import EvalData, EvaluationSuite, batched_model_eval_and_loss
+from popsim.ml.eval import EvalData, EvaluationSuite
 from popsim.ml.preprocess_utils import mask_to_largest_group_mask
 
 from transport_study import EPISODE_DIM, TIME_COORD, TIME_DIM
@@ -25,6 +25,11 @@ from transport_study.modules.power_balance.module import (
 )
 from transport_study.modules.power_balance.p_oh.trb import OhmicPowerTRB
 from transport_study.modules.power_balance.p_rad.trb import RadiatedPowerTRB
+from transport_study.modules.trb_utils import (
+    integrate_error_over_time,
+    make_exponential_adamw,
+    make_loss_eval_suite,
+)
 from transport_study.orchestration.organize_data import (
     TrainingData,
     get_train_test_datasets,
@@ -34,7 +39,7 @@ from transport_study.orchestration.organize_data import (
 STUDY_TYPE = "power_balance_transfer"
 
 
-def _mask_to_largest_contiguous_segment(ds: xr.Dataset, training_vars: list[str]) -> xr.Dataset:
+def mask_to_largest_contiguous_segment(ds: xr.Dataset, training_vars: list[str]) -> xr.Dataset:
     """Keep only each episode's longest contiguous run of non-NaN training vars.
 
     Everything outside that run (including the time coordinate) is set to NaN,
@@ -148,7 +153,7 @@ class PowerBalanceTRB(TrainRunBuilder):
                 }
                 if v in ds_val
             )
-            ds_val = _mask_to_largest_contiguous_segment(ds_val, val_vars)
+            ds_val = mask_to_largest_contiguous_segment(ds_val, val_vars)
 
             segment_length = [
                 dataloader_config.get("segment_length_train", None),
@@ -293,8 +298,7 @@ class PowerBalanceTRB(TrainRunBuilder):
         if model_init_config.get("transfer_checkpoint", False):
             transfer_manager = create_default_checkpoint_manager(model_init_config["transfer_checkpoint"])
             env = restore_model(transfer_manager, env)
-            # Restoring the main module overwrote the submodules new weights with the old one, must go back and fix it
-            # TODO(ZanderKeith) there's gotta be a cleaner way to do this...
+            # Restoring the whole env overwrote the freshly restored submodule weights, restore them again from their own checkpoints
             if model_init_config["model_type"] in ["scaling_law", "sciml"]:
                 p_oh_config = model_init_config["submodules"]["p_oh_predictor"]
                 if isinstance(p_oh_config, TrainConfig):
@@ -313,7 +317,7 @@ class PowerBalanceTRB(TrainRunBuilder):
                     (p_oh_restored, p_rad_restored),
                 )
 
-            logger.debug(f"Restoring module from tranfer learning pretrained checkpoint\n{model_init_config['transfer_checkpoint']}")
+            logger.debug(f"Restoring module from transfer learning pretrained checkpoint\n{model_init_config['transfer_checkpoint']}")
 
         # This restoration of the main module is separate from the transfer learning restoration
         # This would get the post-trained model, AFTER transfer learning has already been done
@@ -322,7 +326,7 @@ class PowerBalanceTRB(TrainRunBuilder):
             env = restore_model(manager, env)
             logger.debug(f"Restoring module from post-training checkpoint\n{model_init_config['checkpoint_dir']}")
         else:
-            logger.warning("Not restoring main module from post-training checkpoint.")
+            logger.debug("Not restoring main module from post-training checkpoint.")
 
         return env
 
@@ -377,59 +381,14 @@ class PowerBalanceTRB(TrainRunBuilder):
 
     @staticmethod
     def get_val_eval_suite(suite_config) -> EvaluationSuite | None:
-        """Validation suite computing the delta-free loss (sweep metric val/loss.mean).
-
-        We are running with very large datasets.
-        This means that the regular eval function will be uploading too much data to wandb
-        This eval suite basically does the same thing but cuts the vec to be at most 100 long
-        Can still see the distribution, but without all the data
-        """
+        """Validation suite computing the delta-free loss (sweep metric val/loss.mean)."""
         if suite_config is None:
             return None
-        loss_fn = PowerBalanceTRB.get_val_loss_fn(suite_config["loss_config"])
-
-        def _eval_and_loss(model, loss_fn, inputs, targets):
-            return batched_model_eval_and_loss(model, loss_fn, inputs, targets)
-
-        jit_eval_and_loss = eqx.filter_jit(_eval_and_loss)
-
-        def eval_fn(inp: EvalData) -> float:
-            loss_vecs = []
-            for batch in inp.dataloader:
-                inputs, targets = batch.get_inputs_and_targets()
-                loss_vec = jit_eval_and_loss(
-                    inp.model,
-                    loss_fn,
-                    inputs,
-                    targets,
-                )
-                loss_vecs.append(loss_vec)
-            loss_vec = jnp.concatenate(loss_vecs)
-            # Drop padded duplicate samples from the pad_last validation dataloader
-            loss_vec = loss_vec[: inp.dataloader.dataset.n_samples]
-            loss_vec_mean = loss_vec.mean()
-            # Sort loss vec and sample at most 100 points evenly for logging
-            if loss_vec.shape[0] > 100:
-                sorted_indices = jnp.argsort(loss_vec)
-                selected_indices = sorted_indices[jnp.linspace(0, loss_vec.shape[0] - 1, num=100, dtype=int)]
-                loss_vec = loss_vec[selected_indices]
-            return {
-                "mean": loss_vec_mean,
-                "vec": loss_vec,
-            }
-
-        return {"loss": eval_fn}
+        return make_loss_eval_suite(PowerBalanceTRB.get_val_loss_fn(suite_config["loss_config"]))
 
     @staticmethod
     def get_optimizer(config: dict) -> optax.GradientTransformation:
-        schedule = optax.exponential_decay(
-            init_value=config["lr0"],
-            transition_steps=config["transition_steps"],
-            decay_rate=config["decay_rate"],
-            end_value=config["lrf"],
-        )
-        opt = optax.adamw(learning_rate=schedule, weight_decay=config["weight_decay"])
-        return opt
+        return make_exponential_adamw(config)
 
     @staticmethod
     def get_test_eval_suite(config) -> EvaluationSuite:
@@ -458,29 +417,8 @@ class PowerBalanceTRB(TrainRunBuilder):
             error_rel_ts = error_abs_ts / (xr.apply_ufunc(np.abs, targ) + 0.1)
 
             # Integrate absolute error over time for each shot, ignoring NaN-padded entries
-            def _trapezoid_dropna(y, x):
-                mask = ~np.isnan(x) & ~np.isnan(y)
-                if mask.sum() < 2:
-                    return np.nan
-                y_valid, x_valid = y[mask], x[mask]
-                sort_idx = np.argsort(x_valid)
-                return np.trapezoid(y_valid[sort_idx], x_valid[sort_idx])
-
-            error_abs_shot = xr.apply_ufunc(
-                _trapezoid_dropna,
-                error_abs_ts,
-                time_2d,
-                input_core_dims=[[TIME_DIM], [TIME_DIM]],
-                vectorize=True,
-            )
-
-            error_rel_shot = xr.apply_ufunc(
-                _trapezoid_dropna,
-                error_rel_ts,
-                time_2d,
-                input_core_dims=[[TIME_DIM], [TIME_DIM]],
-                vectorize=True,
-            )
+            error_abs_shot = integrate_error_over_time(error_abs_ts, time_2d)
+            error_rel_shot = integrate_error_over_time(error_rel_ts, time_2d)
 
             ds_source = eval_data.input_ds["ds_source"]
             if "sample" in ds_source.dims:
