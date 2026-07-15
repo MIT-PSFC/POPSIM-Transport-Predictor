@@ -647,6 +647,9 @@ class ProfileStudy(Study):
                     updates["input_scaling"] = tuned_config.model_init_config["input_scaling"]
                     updates["leak_rate"] = tuned_config.model_init_config["leak_rate"]
                     updates["n_steps"] = tuned_config.model_init_config["n_steps"]
+                elif case.model_type.startswith("torax"):
+                    updates["t_final"] = tuned_config.model_init_config["t_final"]
+                    updates["fixed_dt"] = tuned_config.model_init_config["fixed_dt"]
                 return updates
 
             train_config = train_config.model_copy(
