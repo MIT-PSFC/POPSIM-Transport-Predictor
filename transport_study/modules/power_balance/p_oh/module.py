@@ -43,7 +43,7 @@ class OhmicPower(TimeIndepModule):
         output = OhmicPower.Output(
             P_oh_MW_pred=bounded_out,
             debug_info={
-                "nn_out": nn_out.squeeze(),  # Squeeze to match dimensions with P_oh_MW_pred
+                "nn_out": nn_out.squeeze(),
             },
         )
 
