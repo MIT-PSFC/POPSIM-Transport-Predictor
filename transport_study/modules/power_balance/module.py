@@ -13,7 +13,7 @@ from transport_study.modules.normalization import InputNormalizer
 from transport_study.modules.power_balance.p_oh.module import OhmicPower
 from transport_study.modules.power_balance.p_rad.module import RadiatedPower
 
-MIN_TAUE = 0.001  # Default inimum reasonable value for tau_e [s]
+MIN_TAUE = 0.001  # Default minimum reasonable value for tau_e [s]
 MAX_TAUE = 0.3  # Maximum reasonable value for tau_e [s]
 MIN_POWER = -20  # Minimum reasonable value for power (dW/dt) [MW]
 MAX_POWER = 20  # Maximum reasonable value for power (dW/dt) [MW]
@@ -52,7 +52,7 @@ class BoundedNNPredictor(eqx.Module):
         output = TauePredictorOutputs(
             taue_pred=bounded_out,
             debug_info={
-                "nn_out": nn_out.squeeze(),  # Squeeze to match dimensions with taue_pred
+                "nn_out": nn_out.squeeze(),
             },
         )
 
@@ -68,9 +68,7 @@ class ScalingLawPredictor(eqx.Module):
 
     min_taue: float = eqx.field(static=True)
     max_taue: float = eqx.field(static=True)
-    isotope_mass: float = eqx.field(
-        static=True, default=2
-    )  # Assuming DD operation for now (TODO(ZanderKeith) does this signal exist for source devices?)
+    isotope_mass: float = eqx.field(static=True, default=2)  # Assume DD operation, the source devices carry no per-shot isotope signal
 
     @chex.dataclass
     class Inputs:
@@ -102,8 +100,8 @@ class ScalingLawPredictor(eqx.Module):
         min_taue: float | None = None,
         max_taue: float | None = None,
     ):
-        self.scaling_lmode = scaling_lmode if scaling_lmode is not None else self.create_ipb98()
-        self.scaling_hmode = scaling_hmode if scaling_hmode is not None else self.create_ibp89()
+        self.scaling_lmode = scaling_lmode if scaling_lmode is not None else self.create_iter89()
+        self.scaling_hmode = scaling_hmode if scaling_hmode is not None else self.create_ipb98()
         self.scaling_lh_transition = scaling_lh_transition if scaling_lh_transition is not None else self.create_iter1996()
         self.min_taue = MIN_TAUE if min_taue is None else min_taue
         self.max_taue = MAX_TAUE if max_taue is None else max_taue
@@ -180,7 +178,7 @@ class ScalingLawPredictor(eqx.Module):
         return scaling
 
     @classmethod
-    def create_ibp89(cls):
+    def create_iter89(cls):
         scaling = {
             "coeff": jnp.array(38 * 10**-3),
             "alpha_I": jnp.array(0.85),
