@@ -11,6 +11,7 @@ from transport_study.orchestration.organize_data import (
     get_ds,
     get_train_test_datasets,
     get_train_val_datasets,
+    reindex_to_uniform_timebase,
 )
 
 
@@ -176,3 +177,89 @@ class TestGetTrainTestDatasets:
                 study_type="power_balance_transfer",
                 debug=True,
             )
+
+
+class TestReindexToUniformTimebase:
+    @staticmethod
+    def _make_ds(times, values):
+        import numpy as np
+        import xarray as xr
+
+        times = np.asarray(times, dtype=np.float32)
+        values = np.asarray(values, dtype=np.float32)
+        return xr.Dataset(
+            data_vars={
+                TIME_COORD: ((EPISODE_DIM, TIME_DIM), times),
+                "Wtot_MJ": ((EPISODE_DIM, TIME_DIM), values),
+                "R0": ((EPISODE_DIM,), np.arange(times.shape[0], dtype=np.float32)),
+            },
+            coords={EPISODE_DIM: np.arange(times.shape[0])},
+        )
+
+    def test_gap_becomes_nan_slice(self):
+        import numpy as np
+
+        nan = np.nan
+        # Shot 0 skips t=3,4 ms, shot 1 starts later and is shorter
+        times = [
+            [0.000, 0.001, 0.002, 0.005, 0.006],
+            [0.010, 0.011, 0.012, nan, nan],
+        ]
+        values = [
+            [10.0, 11.0, 12.0, 15.0, 16.0],
+            [20.0, 21.0, 22.0, nan, nan],
+        ]
+        ds = reindex_to_uniform_timebase(self._make_ds(times, values))
+
+        # Columns are absolute canonical-grid slots, so the dim spans t=0..12 ms
+        assert ds.sizes[TIME_DIM] == 13
+        w = ds["Wtot_MJ"].values
+        # Values land on their absolute slots, the mid-shot gap is NaN
+        assert np.allclose(w[0, :7], [10.0, 11.0, 12.0, nan, nan, 15.0, 16.0], equal_nan=True)
+        assert np.isnan(w[0, 7:]).all()
+        assert np.isnan(w[1, :10]).all()
+        assert np.allclose(w[1, 10:], [20.0, 21.0, 22.0], equal_nan=True)
+
+        t = ds[TIME_COORD].values
+        # Time is filled on the grid inside each shot window, including the gap
+        assert np.allclose(t[0, :7], [0.000, 0.001, 0.002, 0.003, 0.004, 0.005, 0.006], atol=1e-6)
+        assert np.isnan(t[0, 7:]).all()
+        # Leading and trailing padding time stays NaN outside the shot window
+        assert np.isnan(t[1, :10]).all()
+        assert np.allclose(t[1, 10:], [0.010, 0.011, 0.012], atol=1e-6)
+
+    def test_time_values_come_from_canonical_timebase(self):
+        import numpy as np
+
+        from transport_study.datasets import make_uniform_1khz_timebase
+
+        times = [[0.000, 0.001, 0.003]]
+        values = [[1.0, 2.0, 3.0]]
+        ds = reindex_to_uniform_timebase(self._make_ds(times, values))
+        expected = make_uniform_1khz_timebase(0.003)
+        assert np.array_equal(ds[TIME_COORD].values[0], expected)
+
+    def test_uniform_input_is_unchanged(self):
+        import numpy as np
+
+        times = [[0.000, 0.001, 0.002, 0.003]]
+        values = [[1.0, 2.0, 3.0, 4.0]]
+        ds = reindex_to_uniform_timebase(self._make_ds(times, values))
+        assert ds.sizes[TIME_DIM] == 4
+        assert np.allclose(ds["Wtot_MJ"].values, values)
+        assert np.allclose(ds[TIME_COORD].values, times, atol=1e-6)
+
+    def test_non_time_vars_untouched(self):
+        import numpy as np
+
+        times = [[0.000, 0.001, 0.003]]
+        values = [[1.0, 2.0, 3.0]]
+        ds = reindex_to_uniform_timebase(self._make_ds(times, values))
+        assert np.allclose(ds["R0"].values, [0.0])
+
+    def test_oversampled_data_raises(self):
+        # Two samples 0.1 ms apart map to the same 1 ms grid slot
+        times = [[0.0000, 0.0001, 0.0010]]
+        values = [[1.0, 2.0, 3.0]]
+        with pytest.raises(ValueError, match="same uniform-grid slot"):
+            reindex_to_uniform_timebase(self._make_ds(times, values))

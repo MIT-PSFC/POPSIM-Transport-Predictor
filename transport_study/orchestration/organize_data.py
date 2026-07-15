@@ -13,6 +13,7 @@ from scipy.linalg import fractional_matrix_power
 
 from transport_study import EPISODE_DIM, TIME_COORD, TIME_DIM
 from transport_study.config import TRAIN_VAL_SPLIT, config
+from transport_study.datasets import make_uniform_1khz_timebase
 
 
 @dataclass(frozen=True)
@@ -136,6 +137,92 @@ def concat_with_nan_padding(
     return ds_padded
 
 
+# Nominal uniform timebase for the standardized datasets (1 kHz)
+UNIFORM_TIMEBASE_DT_S = 1e-3
+
+
+def reindex_to_uniform_timebase(ds: xr.Dataset) -> xr.Dataset:
+    """Place every shot back on the canonical 1 kHz grid, NaN at missing times.
+
+    The device workflows build their timebases with make_uniform_1khz_timebase
+    (an absolute grid anchored at t=0), but the stored shots are compacted and
+    contain mid-shot gaps where time slices were dropped during acquisition or
+    dataset generation. Downstream, the simple-Euler stepper integrates with
+    real dt, and steps with dt >~ tau_e are numerically unstable. Mapping each
+    sample to its slot on the canonical grid turns those gaps into NaN slices,
+    which the dataloader's nan_handling can then drop as whole segments, so
+    every surviving training segment is contiguous.
+
+    Columns are absolute grid slots, so equal columns mean equal times across
+    shots. The time coordinate is NaN outside each shot's first..last sample
+    window (leading and trailing padding convention).
+    """
+    time2d = ds[TIME_COORD].transpose(EPISODE_DIM, TIME_DIM).values
+    n_shots = time2d.shape[0]
+    finite = np.isfinite(time2d)
+    if not finite.any():
+        return ds
+
+    slots = time2d / UNIFORM_TIMEBASE_DT_S
+    k = np.rint(np.where(finite, slots, 0)).astype(np.int64)
+    k_finite = k[finite]
+    if k_finite.min() < 0:
+        raise ValueError("Negative time values found while reindexing to the uniform timebase.")
+
+    residual = np.abs(np.where(finite, slots - k, 0.0))
+    max_residual = float(residual.max())
+    if max_residual > 0.25:
+        logger.warning(
+            f"Time values deviate from the nominal {UNIFORM_TIMEBASE_DT_S} s grid by up to {max_residual:.2f} steps, "
+            "the stored timebase may not actually be uniform at this rate."
+        )
+
+    n_new = int(k_finite.max()) + 1
+    shot_i, time_i = np.nonzero(finite)
+    grid_i = k[shot_i, time_i]
+    keys = shot_i * n_new + grid_i
+    if np.unique(keys).size != keys.size:
+        dup_shots = np.unique(shot_i[np.isin(keys, keys[np.diff(np.sort(keys), prepend=-1) == 0])])
+        raise ValueError(
+            f"Multiple samples map to the same uniform-grid slot for shots {ds[EPISODE_DIM].values[dup_shots]}, "
+            f"the data is sampled faster than the {UNIFORM_TIMEBASE_DT_S} s grid."
+        )
+
+    k_first = np.full(n_shots, n_new, dtype=np.int64)
+    k_last = np.full(n_shots, -1, dtype=np.int64)
+    np.minimum.at(k_first, shot_i, grid_i)
+    np.maximum.at(k_last, shot_i, grid_i)
+
+    grid = make_uniform_1khz_timebase(float(np.nanmax(time2d)))
+    if grid.size < n_new:
+        raise ValueError(f"Canonical timebase has {grid.size} slots but the data spans {n_new}.")
+    col = np.arange(n_new)[None, :]
+    in_window = (col >= k_first[:, None]) & (col <= k_last[:, None])
+    new_time = np.where(in_window, grid[None, :n_new], np.nan).astype(time2d.dtype)
+
+    data_vars = {}
+    for name, da in ds.data_vars.items():
+        if name == TIME_COORD:
+            continue
+        if TIME_DIM not in da.dims:
+            data_vars[name] = da
+            continue
+        da_t = da.transpose(EPISODE_DIM, TIME_DIM, ...)
+        arr = da_t.values
+        new_arr = np.full((n_shots, n_new, *arr.shape[2:]), np.nan, dtype=arr.dtype)
+        new_arr[shot_i, grid_i, ...] = arr[shot_i, time_i, ...]
+        data_vars[name] = xr.DataArray(new_arr, dims=da_t.dims)
+
+    coords = {name: coord for name, coord in ds.coords.items() if TIME_DIM not in coord.dims}
+    time_da = xr.DataArray(new_time, dims=(EPISODE_DIM, TIME_DIM))
+    if TIME_COORD in ds.coords:
+        coords[TIME_COORD] = time_da
+    else:
+        data_vars[TIME_COORD] = time_da
+
+    return xr.Dataset(data_vars=data_vars, coords=coords, attrs=ds.attrs)
+
+
 def get_ds(
     source_ds: str,
     study_type: str,
@@ -212,6 +299,11 @@ def get_ds(
         # attrs implicitly through interp, this branch must do it explicitly.)
         for var in ds.variables:
             ds[var].attrs = {}
+
+        # The stored timebases have mid-shot gaps, put every shot on a strict
+        # 1 kHz grid with NaN at the missing times so the train dataloader's
+        # drop_segment nan_handling only keeps contiguous segments
+        ds = reindex_to_uniform_timebase(ds)
 
         return ds
 

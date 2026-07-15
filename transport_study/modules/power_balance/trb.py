@@ -11,6 +11,7 @@ from popsim.ml import DataLoader, IntegralLoss, TrainConfig, TrainRunBuilder
 from popsim.ml.checkpointing import create_default_checkpoint_manager, restore_model
 from popsim.ml.dataloading import make_dataloaders
 from popsim.ml.eval import EvalData, EvaluationSuite, batched_model_eval_and_loss
+from popsim.ml.preprocess_utils import mask_to_largest_group_mask
 
 from transport_study import EPISODE_DIM, TIME_COORD, TIME_DIM
 from transport_study.config import config
@@ -31,6 +32,33 @@ from transport_study.orchestration.organize_data import (
 )
 
 STUDY_TYPE = "power_balance_transfer"
+
+
+def _mask_to_largest_contiguous_segment(ds: xr.Dataset, training_vars: list[str]) -> xr.Dataset:
+    """Keep only each episode's longest contiguous run of non-NaN training vars.
+
+    Everything outside that run (including the time coordinate) is set to NaN,
+    which the dataloader treats as leading/trailing padding. Uses POPSIM's
+    mask_to_largest_group_mask rather than force_drop_nans because the latter's
+    ds.where() would broadcast per-shot vars (performance etc.) against time.
+    """
+
+    def _var_nan(da: xr.DataArray) -> xr.DataArray:
+        extra_dims = [d for d in da.dims if d not in (EPISODE_DIM, TIME_DIM)]
+        return da.isnull().any(dim=extra_dims) if extra_dims else da.isnull()
+
+    nan_mask = _var_nan(ds[training_vars[0]])
+    for var in training_vars[1:]:
+        nan_mask = nan_mask | _var_nan(ds[var])
+    keep = mask_to_largest_group_mask(~nan_mask, EPISODE_DIM, TIME_DIM)
+
+    out = ds.copy()
+    for name, da in ds.data_vars.items():
+        if TIME_DIM in da.dims:
+            out[name] = da.where(keep)
+    if TIME_DIM in ds[TIME_COORD].dims:
+        out[TIME_COORD] = ds[TIME_COORD].where(keep)
+    return out
 
 
 class PowerBalanceTRB(TrainRunBuilder):
@@ -104,6 +132,24 @@ class PowerBalanceTRB(TrainRunBuilder):
             ds["ds_source_idx"] = ds["ds_source_idx"].broadcast_like(ds["Ip_MA"]).astype(ds["Ip_MA"].dtype)
 
         if "state_vars" in dataloader_config.keys():
+            # Validation samples are whole episodes, so a mid-shot time gap
+            # (NaN slices after the uniform-timebase reindex) would either be
+            # stitched over, handing the Euler stepper a huge dt, or drop the
+            # whole episode under drop_segment. Keep only each episode's
+            # longest contiguous non-NaN run so val simulates a single
+            # gap-free window
+            val_vars = sorted(
+                v
+                for v in {
+                    *input_vars,
+                    *dataloader_config["target_vars"],
+                    *dataloader_config["state_vars"],
+                    *(dataloader_config.get("extra_vars") or []),
+                }
+                if v in ds_val
+            )
+            ds_val = _mask_to_largest_contiguous_segment(ds_val, val_vars)
+
             segment_length = [
                 dataloader_config.get("segment_length_train", None),
                 dataloader_config.get("segment_length_val", None),
@@ -130,8 +176,14 @@ class PowerBalanceTRB(TrainRunBuilder):
             segment_overlap=segment_overlap,
             shuffle=[True, False],
             convert_xr_to_jnp=False,  # Needed to keep the coords for calculating loss
-            # TODO(ZanderKeith): Switch to 'drop_segment' after you fix the dataset setup
-            nan_handling="drop_slice_any",
+            # The datasets are reindexed to a uniform 1 kHz grid with NaN at
+            # missing times (organize_data.reindex_to_uniform_timebase), so
+            # drop_segment discards train segments spanning a time gap and the
+            # Euler stepper never sees dt larger than the nominal timebase.
+            # Val episodes were already masked to their longest contiguous
+            # run above, drop_slice_any there only clears the leading and
+            # trailing padding.
+            nan_handling=["drop_segment", "drop_slice_any"],
             # Keep every batch the same shape so the jitted train step never
             # retraces on a ragged final batch (whose static xr metadata is not
             # comparable across calls). Train drops the ragged tail (reshuffled
