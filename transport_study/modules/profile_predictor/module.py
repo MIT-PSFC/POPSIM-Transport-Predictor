@@ -141,6 +141,21 @@ class Inputs:
     # Other
     rho: Array  # Normalized minor radius coordinate to evaluate the profiles at
 
+    @classmethod
+    def from_dataset(cls, ds: xr.Dataset, rho: Array) -> "Inputs":
+        return cls(
+            Ip=ds["Ip_MA"].data,
+            B0=ds["B0"].data,
+            betan=ds["betan"].data,
+            ne20_line_avg=ds["ne20_line_avg"].data,
+            R0=ds["R0"].data,
+            a_minor=ds["a_minor"].data,
+            kappa=ds["kappa"].data,
+            delta_top=ds["delta_top"].data,
+            delta_bot=ds["delta_bot"].data,
+            rho=rho,
+        )
+
     @property
     def epsilon(self):
         return self.a_minor / self.R0
@@ -349,18 +364,7 @@ class ProfilePredictorShapeInit(ProfilePredictor):
 
     def __call__(self, inputs: Inputs | xr.Dataset, debug: bool = False) -> Outputs:
         if isinstance(inputs, xr.Dataset):
-            inputs = Inputs(
-                Ip=inputs["Ip_MA"].data,
-                B0=inputs["B0"].data,
-                betan=inputs["betan"].data,
-                ne20_line_avg=inputs["ne20_line_avg"].data,
-                R0=inputs["R0"].data,
-                a_minor=inputs["a_minor"].data,
-                kappa=inputs["kappa"].data,
-                delta_top=inputs["delta_top"].data,
-                delta_bot=inputs["delta_bot"].data,
-                rho=jnp.array(self.rhogrid),
-            )
+            inputs = Inputs.from_dataset(inputs, jnp.array(self.rhogrid))
 
         nn_inputs = inputs.nn_inputs
 
@@ -513,18 +517,7 @@ class ProfilePredictorReservoir(ProfilePredictor):
 
     def __call__(self, inputs: Inputs | xr.Dataset, debug: bool = False) -> Outputs:
         if isinstance(inputs, xr.Dataset):
-            inputs = Inputs(
-                Ip=inputs["Ip_MA"].data,
-                B0=inputs["B0"].data,
-                betan=inputs["betan"].data,
-                ne20_line_avg=inputs["ne20_line_avg"].data,
-                R0=inputs["R0"].data,
-                a_minor=inputs["a_minor"].data,
-                kappa=inputs["kappa"].data,
-                delta_top=inputs["delta_top"].data,
-                delta_bot=inputs["delta_bot"].data,
-                rho=jnp.array(self.rhogrid),
-            )
+            inputs = Inputs.from_dataset(inputs, jnp.array(self.rhogrid))
 
         nn_inputs = inputs.nn_inputs
         rho_points = jnp.asarray(self.rho_points)
@@ -579,18 +572,7 @@ class ProfilePredictorUnstructuredNN(ProfilePredictor):
 
     def __call__(self, inputs: Inputs | xr.Dataset, debug: bool = False) -> Outputs:
         if isinstance(inputs, xr.Dataset):
-            inputs = Inputs(
-                Ip=inputs["Ip_MA"].data,
-                B0=inputs["B0"].data,
-                betan=inputs["betan"].data,
-                ne20_line_avg=inputs["ne20_line_avg"].data,
-                R0=inputs["R0"].data,
-                a_minor=inputs["a_minor"].data,
-                kappa=inputs["kappa"].data,
-                delta_top=inputs["delta_top"].data,
-                delta_bot=inputs["delta_bot"].data,
-                rho=jnp.array(self.rhogrid),
-            )
+            inputs = Inputs.from_dataset(inputs, jnp.array(self.rhogrid))
 
         nn_inputs = inputs.nn_inputs
         rho_points = jnp.asarray(self.rho_points)
