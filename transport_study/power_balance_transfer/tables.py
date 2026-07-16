@@ -9,49 +9,57 @@ in the raw time-integrated per-shot errors) with the legacy time-integrated
 medians from collected_results.nc.
 
 A flat case_stats.csv with one row per case and every column is written next
-to the tables for ad hoc analysis.
+to the tables for ad hoc analysis. The table and csv writing itself is the
+shared orchestration.tables machinery, so this module only declares the spec
+and builds the per-case stats frame.
 """
 
 from pathlib import Path
 
-import numpy as np
 import pandas as pd
 import xarray as xr
 from loguru import logger
 
-from transport_study.orchestration.stages import STAGE_AGG_NAMES
+from transport_study.orchestration.tables import (
+    ComparisonTableSpec,
+    merge_stage_metrics,
+    write_case_comparison_tables,
+)
 
 # Submodule prereq cases predict P_oh / P_rad, not Wtot, so their errors are
 # not comparable to the main models and are excluded from every table
 SUBMODULE_MODEL_TYPES = ("p_oh", "p_rad")
 
-# The case axes a table can compare across; freeze_submodules only has one
-# value in practice so it stays a grouping field rather than an axis
-AXIS_NAMES = ("model_type", "training_data", "data_normalization", "domain_adaptation", "num_target_shots")
+# Stage-resolved metric variables in collected_metrics.nc
+_STAGE_METRICS = ("abs", "rel")
 
 CASE_FIELD_ORDER = ("model_type", "training_data", "data_normalization", "domain_adaptation", "freeze_submodules", "num_target_shots")
 
-# Filename tokens per grouping field, mirroring the case-string vocabulary
-_FIELD_TOKENS = {
-    "model_type": "{}",
-    "training_data": "td_{}",
-    "data_normalization": "norm_{}",
-    "domain_adaptation": "da_{}",
-    "freeze_submodules": "freeze_{}",
-    "num_target_shots": "targ_{}",
-}
-
-# Table columns: (header, dataframe column)
-_COLUMNS = (
-    ("rel err (time avg)", "rel_mean_all"),
-    ("rampup", "rel_mean_rampup"),
-    ("flattop", "rel_mean_flattop"),
-    ("flattop ohmic", "rel_mean_flattop_ohmic"),
-    ("flattop aux", "rel_mean_flattop_aux"),
-    ("rampdown", "rel_mean_rampdown"),
-    ("abs err (time avg) [MJ]", "abs_mean_all"),
-    ("rel err (integral, med)", "err_rel_shot_med"),
-    ("abs err (integral, med)", "err_abs_shot_med"),
+SPEC = ComparisonTableSpec(
+    # freeze_submodules only has one value in practice so it stays a grouping
+    # field rather than an axis
+    axis_names=("model_type", "training_data", "data_normalization", "domain_adaptation", "num_target_shots"),
+    case_field_order=CASE_FIELD_ORDER,
+    # Filename tokens per grouping field, mirroring the case-string vocabulary
+    field_tokens={
+        "model_type": "{}",
+        "training_data": "td_{}",
+        "data_normalization": "norm_{}",
+        "domain_adaptation": "da_{}",
+        "freeze_submodules": "freeze_{}",
+        "num_target_shots": "targ_{}",
+    },
+    columns=(
+        ("rel err (time avg)", "rel_mean_all"),
+        ("rampup", "rel_mean_rampup"),
+        ("flattop", "rel_mean_flattop"),
+        ("flattop ohmic", "rel_mean_flattop_ohmic"),
+        ("flattop aux", "rel_mean_flattop_aux"),
+        ("rampdown", "rel_mean_rampdown"),
+        ("abs err (time avg) [MJ]", "abs_mean_all"),
+        ("rel err (integral, med)", "err_rel_shot_med"),
+        ("abs err (integral, med)", "err_abs_shot_med"),
+    ),
 )
 
 
@@ -68,57 +76,8 @@ def _case_stats_frame(results_ds: xr.Dataset, metrics_ds: xr.Dataset) -> pd.Data
         if field not in df.columns:
             df[field] = results_ds[field].item()
     df = df[[*CASE_FIELD_ORDER, "case_idx", *keep_vars]]
-
-    if metrics_ds.data_vars and "case_idx" in metrics_ds.dims:
-        stage_cols = {}
-        for metric in ("abs", "rel"):
-            for stage in STAGE_AGG_NAMES:
-                stage_cols[f"{metric}_mean_{stage}"] = metrics_ds[f"{metric}_mean"].sel(stage=stage).values
-        stage_df = pd.DataFrame({"case_idx": metrics_ds["case_idx"].values, **stage_cols})
-        df = df.merge(stage_df, on="case_idx", how="left")
-    else:
-        for metric in ("abs", "rel"):
-            for stage in STAGE_AGG_NAMES:
-                df[f"{metric}_mean_{stage}"] = np.nan
-
+    df = merge_stage_metrics(df, metrics_ds, _STAGE_METRICS)
     return df[~df["model_type"].isin(SUBMODULE_MODEL_TYPES)]
-
-
-def _fmt(value) -> str:
-    if value is None or (isinstance(value, float) and not np.isfinite(value)):
-        return "-"
-    return f"{value:.4g}"
-
-
-def _group_filename(axis: str, group_key: tuple) -> str:
-    fields = [f for f in CASE_FIELD_ORDER if f != axis]
-    tokens = [_FIELD_TOKENS[field].format(value) for field, value in zip(fields, group_key, strict=True)]
-    return ".".join(tokens) + ".md"
-
-
-def _axis_sort_key(axis: str, value):
-    if axis == "num_target_shots":
-        # The -1 sentinel means all target shots, list it after the real counts
-        return (1, 0) if value == -1 else (0, int(value))
-    return (0, str(value))
-
-
-def _write_group_table(axis: str, group_key: tuple, group: pd.DataFrame, out_path: Path):
-    fields = [f for f in CASE_FIELD_ORDER if f != axis]
-    lines = [
-        f"# {axis} comparison",
-        "",
-        "Fixed: " + ", ".join(f"{field}={value}" for field, value in zip(fields, group_key, strict=True)),
-        "",
-        "| " + " | ".join([axis, *(header for header, _ in _COLUMNS)]) + " |",
-        "|" + "---|" * (len(_COLUMNS) + 1),
-    ]
-    group = group.sort_values(axis, key=lambda s: s.map(lambda v: _axis_sort_key(axis, v)))
-    for _, row in group.iterrows():
-        cells = [str(row[axis]), *(_fmt(row[col]) for _, col in _COLUMNS)]
-        lines.append("| " + " | ".join(cells) + " |")
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    out_path.write_text("\n".join(lines) + "\n")
 
 
 def write_comparison_tables(results_ds: xr.Dataset, metrics_ds: xr.Dataset, figure_dir: Path):
@@ -127,21 +86,8 @@ def write_comparison_tables(results_ds: xr.Dataset, metrics_ds: xr.Dataset, figu
     if not results_ds.data_vars or "case_idx" not in results_ds.dims:
         logger.warning("No collected results available, skipping comparison tables")
         return
-    out_dir = Path(figure_dir) / "tables"
     df = _case_stats_frame(results_ds, metrics_ds)
     if df.empty:
         logger.warning("No main-model cases in the collected results, skipping comparison tables")
         return
-
-    out_dir.mkdir(parents=True, exist_ok=True)
-    df.sort_values(list(CASE_FIELD_ORDER)).to_csv(out_dir / "case_stats.csv", index=False)
-
-    n_tables = 0
-    for axis in AXIS_NAMES:
-        group_fields = [f for f in CASE_FIELD_ORDER if f != axis]
-        for group_key, group in df.groupby(group_fields):
-            if len(group) < 2:
-                continue
-            _write_group_table(axis, group_key, group, out_dir / axis / _group_filename(axis, group_key))
-            n_tables += 1
-    logger.info(f"Saved {n_tables} comparison tables to {out_dir}")
+    write_case_comparison_tables(df, SPEC, figure_dir)

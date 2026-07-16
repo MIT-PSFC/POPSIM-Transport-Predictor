@@ -40,6 +40,7 @@ from transport_study.profile_transfer.plotting import (
     training_dataset_comparison,
 )
 from transport_study.profile_transfer.study_metrics import collect_metrics
+from transport_study.profile_transfer.tables import write_comparison_tables
 
 # Model families: the shape-init predictors have freezable shape bases, the rest do not
 MODEL_TYPES_WITH_SHAPES = ("shape_init_pca", "shape_init_kmeans")
@@ -462,6 +463,11 @@ class ProfileStudy(Study):
 
         logger.opt(colors=True).info("<bold><magenta>TORAX-SPECIFIC ANALYSIS</magenta></bold>")
         torax_relaxation_report(self, metrics_ds, self.figure_dir)
+
+        # One markdown table per case axis and combination of the other axes
+        logger.opt(colors=True).info("<bold><magenta>COMPARISON TABLES</magenta></bold>")
+        results_ds = xr.load_dataset(self.collected_results_path())
+        write_comparison_tables(results_ds, metrics_ds, self.figure_dir)
 
 
 run_study = ProfileStudy.run_study
