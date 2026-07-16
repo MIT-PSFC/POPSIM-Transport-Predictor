@@ -12,7 +12,7 @@ from scipy.constants import mu_0
 from scipy.linalg import fractional_matrix_power
 
 from transport_study import EPISODE_DIM, TIME_COORD, TIME_DIM
-from transport_study.config import TRAIN_VAL_SPLIT, config
+from transport_study.config import RHO_GRID, TRAIN_VAL_SPLIT, config
 from transport_study.datasets import make_uniform_1khz_timebase
 from transport_study.modules.normalization import MIN_CORAL_SAMPLES
 
@@ -283,9 +283,8 @@ def get_ds(
         # Only keep fresh profiles for training
         ds = ds.where(ds["fresh_profiles"] == 1, drop=True)
         # TCV only has profile data out to rho=1
-        # Put all the datasets on a uniform 51 point rho grid for consistency
-        rho_grid = np.linspace(0, 1, 51)
-        ds = ds.interp(rho=rho_grid, kwargs={"fill_value": "extrapolate"})
+        # Put all the datasets on the shared uniform rho grid for consistency
+        ds = ds.interp(rho=RHO_GRID, kwargs={"fill_value": "extrapolate"})
 
         # Linear extrapolation at the grid edges can push error bars slightly
         # negative, error bars are widths so clamp them

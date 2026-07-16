@@ -466,7 +466,6 @@ class ProfilePredictorReservoir(ProfilePredictor):
     getter, which only exposes self.nn leaves.
     """
 
-    rho_points: tuple = eqx.field(static=True)  # Hashable points at which the readout predicts
     w_in: Array  # Fixed random input weights (reservoir_size, 10)
     w_res: Array  # Fixed random recurrent weights (reservoir_size, reservoir_size)
     res_bias: Array  # Fixed random bias (reservoir_size,)
@@ -475,7 +474,6 @@ class ProfilePredictorReservoir(ProfilePredictor):
 
     def __init__(
         self,
-        n_points: int,
         reservoir_size: int,
         rhogrid: tuple,
         key: jax.random.PRNGKey,
@@ -485,7 +483,6 @@ class ProfilePredictorReservoir(ProfilePredictor):
         n_steps: int = 20,
     ):
         rhogrid_tuple = tuple(rhogrid.tolist()) if hasattr(rhogrid, "tolist") else tuple(rhogrid)
-        self.rho_points = tuple(jnp.linspace(min(rhogrid_tuple), max(rhogrid_tuple), n_points).tolist())
 
         key_in, key_res, key_bias, key_out = jax.random.split(key, 4)
         self.w_in = input_scaling * jax.random.uniform(key_in, (reservoir_size, 10), minval=-1.0, maxval=1.0)
@@ -500,7 +497,7 @@ class ProfilePredictorReservoir(ProfilePredictor):
         # Trainable linear readout, depth=0 makes RtdMLP a single Linear layer
         self.nn = RtdMLP(
             in_size=reservoir_size,
-            out_size=(n_points * 2) + 2,  # +2 for the correction factors
+            out_size=(len(rhogrid_tuple) * 2) + 2,  # +2 for the correction factors
             width_size=reservoir_size,
             depth=0,
             activation=Activation.RELU,
@@ -526,10 +523,9 @@ class ProfilePredictorReservoir(ProfilePredictor):
             inputs = Inputs.from_dataset(inputs, jnp.array(self.rhogrid))
 
         nn_inputs = inputs.nn_inputs
-        rho_points = jnp.asarray(self.rho_points)
-        n_pred_points = len(self.rho_points)
+        n_pred_points = len(self.rhogrid)
 
-        # Expand inputs through the fixed reservoir, then read out profile points.
+        # Predict profile values directly on the rhogrid
         state = self.reservoir_state(nn_inputs)
         outputs = self.nn(state)
         ne_points = outputs[:n_pred_points]
@@ -537,9 +533,8 @@ class ProfilePredictorReservoir(ProfilePredictor):
         ne_correction = jnp.abs(outputs[-1])
         te_correction = jnp.abs(outputs[-2])
 
-        # Interpolate the predicted points to the rhogrid
-        ne = jnp.interp(inputs.rho, rho_points, ne_points) * inputs.ne20_line_avg * ne_correction
-        te = jnp.interp(inputs.rho, rho_points, te_points) * te_correction
+        ne = ne_points * inputs.ne20_line_avg * ne_correction
+        te = te_points * inputs.te_approx * te_correction
 
         out = Outputs(
             ne=xr.DataArray(data=ne, dims=("rho",), coords={"rho": list(self.rhogrid)}),
@@ -551,23 +546,19 @@ class ProfilePredictorReservoir(ProfilePredictor):
 
 
 class ProfilePredictorUnstructuredNN(ProfilePredictor):
-    rho_points: tuple = eqx.field(static=True)  # Hashable points at which the NN predicts
-
     def __init__(
         self,
-        n_points: int,
         nn_width: int,
         nn_depth: int,
         rhogrid: tuple,
         key: jax.random.PRNGKey,
     ):
         rhogrid_tuple = tuple(rhogrid.tolist()) if hasattr(rhogrid, "tolist") else tuple(rhogrid)
-        self.rho_points = tuple(jnp.linspace(min(rhogrid_tuple), max(rhogrid_tuple), n_points).tolist())
 
         key, subkey = jax.random.split(key)
         self.nn = RtdMLP(
             in_size=10,
-            out_size=(n_points * 2) + 2,  # +2 for the correction factors
+            out_size=(len(rhogrid_tuple) * 2) + 2,  # +2 for the correction factors
             width_size=nn_width,
             depth=nn_depth,
             activation=Activation.RELU,
@@ -581,19 +572,17 @@ class ProfilePredictorUnstructuredNN(ProfilePredictor):
             inputs = Inputs.from_dataset(inputs, jnp.array(self.rhogrid))
 
         nn_inputs = inputs.nn_inputs
-        rho_points = jnp.asarray(self.rho_points)
-        n_pred_points = len(self.rho_points)
+        n_pred_points = len(self.rhogrid)
 
-        # Predict the profile values at the specified points.
+        # Predict the profile values directly on the rhogrid.
         outputs = self.nn(nn_inputs)
         ne_points = outputs[:n_pred_points]
         te_points = outputs[n_pred_points : 2 * n_pred_points]
         ne_correction = jnp.abs(outputs[-1])
         te_correction = jnp.abs(outputs[-2])
 
-        # Interpolate the predicted points to the rhogrid
-        ne = jnp.interp(inputs.rho, rho_points, ne_points) * inputs.ne20_line_avg * ne_correction
-        te = jnp.interp(inputs.rho, rho_points, te_points) * te_correction
+        ne = ne_points * inputs.ne20_line_avg * ne_correction
+        te = te_points * inputs.te_approx * te_correction
 
         out = Outputs(
             ne=xr.DataArray(data=ne, dims=("rho",), coords={"rho": list(self.rhogrid)}),

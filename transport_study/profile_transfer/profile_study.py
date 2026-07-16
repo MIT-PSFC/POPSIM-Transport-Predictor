@@ -267,7 +267,6 @@ class ProfileStudy(Study):
                 model_init_config={
                     "model_type": case.model_type,
                     "domain_adaptation": case.domain_adaptation,
-                    "n_points": 21,  # Number of points along the profile to predict for the unstructured NN
                     "nn_depth": 2,
                     "nn_width": 16,
                     "in_size": 10,  # Dimensionless nn_inputs derived from the raw input_vars, includes log(nu_star)
@@ -281,7 +280,6 @@ class ProfileStudy(Study):
                 model_init_config={
                     "model_type": case.model_type,
                     "domain_adaptation": case.domain_adaptation,
-                    "n_points": 21,  # Number of points along the profile predicted by the readout
                     "reservoir_size": 128,  # Fixed random reservoir state dimension
                     "spectral_radius": 0.9,  # Contraction factor of the recurrent weights
                     "input_scaling": 0.5,  # Scale of the random input weights and bias
@@ -325,10 +323,7 @@ class ProfileStudy(Study):
         if case.model_type in MODEL_TYPES_WITH_SHAPES:
             updates["n_shapes"] = tuned_config.model_init_config["n_shapes"]
             updates["softmax_temp"] = tuned_config.model_init_config["softmax_temp"]
-        elif case.model_type == "unstructured_nn":
-            updates["n_points"] = tuned_config.model_init_config["n_points"]
         elif case.model_type == "reservoir":
-            updates["n_points"] = tuned_config.model_init_config["n_points"]
             updates["reservoir_size"] = tuned_config.model_init_config["reservoir_size"]
             updates["spectral_radius"] = tuned_config.model_init_config["spectral_radius"]
             updates["input_scaling"] = tuned_config.model_init_config["input_scaling"]

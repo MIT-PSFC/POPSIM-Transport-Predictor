@@ -10,6 +10,7 @@ from pathlib import Path
 from types import MappingProxyType
 
 import jax
+import numpy as np
 import toml
 from loguru import logger
 from pydantic import BaseModel, ConfigDict, Field, field_serializer, model_validator
@@ -18,6 +19,12 @@ from pydantic import BaseModel, ConfigDict, Field, field_serializer, model_valid
 # 80/20 between train+val/test
 TRAIN_VAL_SPLIT = (0.8, 0.2)
 TRAIN_VAL_TEST_SPLIT = (0.64, 0.16, 0.2)
+
+# Uniform normalized-minor-radius grid the profile transfer workflow puts every
+# dataset on and every profile predictor family predicts on
+# Changing this changes the structure of the modules, cannot restore from checkpoints trained on a different grid
+N_RHO_POINTS = 51
+RHO_GRID = np.linspace(0.0, 1.0, N_RHO_POINTS)
 
 
 def env_dataset_paths() -> dict[str, Path]:

@@ -26,7 +26,7 @@ import xarray as xr
 from loguru import logger
 
 from transport_study import EPISODE_DIM, TIME_DIM
-from transport_study.config import config
+from transport_study.config import RHO_GRID, config
 from transport_study.modules.profile_predictor.trb import ProfilePredictorTRB
 from transport_study.orchestration.organize_data import (
     INPUT_POWER_SIGNALS,
@@ -45,10 +45,6 @@ from transport_study.orchestration.study import Study
 # Joined eval timeslice must be within this of the result timeslice.
 # Timebases are 1 kHz, so anything beyond half a sample is a bad join
 TIME_JOIN_TOLERANCE_S = 6e-4
-
-# The uniform rho grid the profile transfer workflow trains on
-# (see organize_data.get_ds._profile_transfer)
-RHO_GRID = np.linspace(0, 1, 51)
 
 METRIC_NAMES = ("value", "grad", "combined")
 

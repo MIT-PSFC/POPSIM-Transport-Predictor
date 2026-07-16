@@ -199,7 +199,6 @@ class ProfilePredictorTRB(TrainRunBuilder):
                 )
         elif model_init_config["model_type"] == "unstructured_nn":
             module = ProfilePredictorUnstructuredNN(
-                n_points=model_init_config["n_points"],
                 nn_width=model_init_config["nn_width"],
                 nn_depth=model_init_config["nn_depth"],
                 rhogrid=np.asarray(train_dl.ds["rho"]),
@@ -207,7 +206,6 @@ class ProfilePredictorTRB(TrainRunBuilder):
             )
         elif model_init_config["model_type"] == "reservoir":
             module = ProfilePredictorReservoir(
-                n_points=model_init_config["n_points"],
                 reservoir_size=model_init_config["reservoir_size"],
                 spectral_radius=model_init_config.get("spectral_radius", 0.9),
                 input_scaling=model_init_config.get("input_scaling", 0.5),
