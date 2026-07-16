@@ -54,7 +54,7 @@ MODEL_TYPES_WITHOUT_SUBMODULES = ("unstructured_nn", "transformer")
 # Submodule pseudo-model-types, they appear as prereq cases of the structured models
 SUBMODULE_MODEL_TYPES = ("p_oh", "p_rad")
 
-VALID_DATA_NORMALIZATIONS = ("raw", "physics", "z_score", "coral")
+VALID_DATA_NORMALIZATIONS = ("raw", "physics", "z_score", "coral", "physics-coral")
 
 
 class PowerBalanceStudy(Study):
@@ -85,7 +85,7 @@ class PowerBalanceStudy(Study):
         num_target_shots_options: tuple[int, ...] = Field(default_factory=lambda: (0, 1, 3, 10, 32, -1))
         # Hyperparameter tuning case configuration
         # (hyperparam_domain_adaptation and hyperparam_num_target_shots live on CaseGridConfig)
-        hyperparam_data_normalization: str = "coral"
+        hyperparam_data_normalization: str = "physics-coral"
         hyperparam_freeze_submodules: bool = True
 
         COMPAT_HYPERPARAM_FIELDS = (
@@ -135,11 +135,13 @@ class PowerBalanceStudy(Study):
         - physics: Convert to typical dimensionless parameters like q_star, f_G, etc.
         - z_score: Within each device, normalize each variable to zero mean and unit variance.
         - coral: Use the CORAL method to align covariances of source and target domains (https://arxiv.org/abs/1612.01939)
+        - physics-coral: The physics parameters followed by CORAL alignment fitted on them.
 
         domain_adaptation: The method for domain adaptation between source and target devices.
         - none: No domain adaptation, train and test on the same device(s). This is used for hyperparameter tuning and as a baseline for comparison, answering the question "what is the best possible performance we could expect if we had a bunch of data?"
         - mixing: Add a small amount of highly-weighted target data during training
         - transfer: Train on source data, freeze all but the last layers of the model, and fine-tune on a small amount of target data
+        - transfer_pretrain: The pretrain half of a stat-normalized transfer case, never a case-grid axis value (see Study.Case.transfer_pretrain_case). Trains on historic data only, with the normalizer fitted on historic + the transfer case's target shots so the fine-tune case inherits target-aware statistics through the checkpoint restore
 
         freeze_submodules: Whether to freeze the p_oh/p_rad submodules of the model during training.
         The P_oh and P_rad signals are hard to quantify, we might want to let them drift from the original targets to better match Wtot_MJ
@@ -169,6 +171,9 @@ class PowerBalanceStudy(Study):
             self.data_normalization = data_normalization
             self.freeze_submodules = freeze_submodules
             self._init_common(model_type, training_data, domain_adaptation, num_target_shots)
+
+        def _normalization_method(self) -> str | None:
+            return self.data_normalization
 
         def _validate(self):
             super()._validate()

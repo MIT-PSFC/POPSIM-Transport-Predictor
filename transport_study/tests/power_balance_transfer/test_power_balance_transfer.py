@@ -140,21 +140,27 @@ def test_power_balance_transfer_cases():
                 continue
             expected_prereqs = _submodule_prereqs(case)
         elif case.domain_adaptation == "transfer":
-            expected_prereqs = [
-                # The original training case with no domain adaptation to re-init the weights
-                PowerBalanceStudy.Case(
-                    model_type=case.model_type,
-                    training_data=case.training_data,
-                    data_normalization=case.data_normalization,
-                    domain_adaptation=None,
-                    freeze_submodules=case.freeze_submodules,
-                    num_target_shots=HYPERPARAM_TARGET_SHOTS,
-                ),
-                _hyperparam_case(case.model_type),
-            ]
+            expected_prereqs = [_hyperparam_case(case.model_type)]
+            if case.data_normalization in ("z_score", "coral", "physics-coral"):
+                # Stat-based normalizations pretrain through a dedicated twin
+                # case that fits the normalizer on historic + this case's
+                # target shots (same num_target_shots)
+                expected_prereqs.append(case._replace(domain_adaptation="transfer_pretrain"))
+            else:
+                # Stateless normalizations restore a shared source-only pretrain
+                expected_prereqs.append(
+                    PowerBalanceStudy.Case(
+                        model_type=case.model_type,
+                        training_data=case.training_data,
+                        data_normalization=case.data_normalization,
+                        domain_adaptation=None,
+                        freeze_submodules=case.freeze_submodules,
+                        num_target_shots=HYPERPARAM_TARGET_SHOTS,
+                    )
+                )
             if case.model_type in ("sciml", "scaling_law"):
                 expected_prereqs += _submodule_prereqs(case)
-        elif case.domain_adaptation in ("mixing", None):
+        elif case.domain_adaptation in ("mixing", None, "transfer_pretrain"):
             expected_prereqs = [_hyperparam_case(case.model_type)]
             if case.model_type in ("sciml", "scaling_law"):
                 expected_prereqs += _submodule_prereqs(case)
@@ -316,6 +322,13 @@ def test_submodule_freezing():
 
 
 def test_transfer_weights():
+    """Transfer with a stat-based normalization runs as two cases: a
+    transfer_pretrain twin trains on the historic data with the normalizer
+    fitted on historic + target shots, then the transfer case restores that
+    checkpoint (normalizer included) and fine-tunes the last layer on the
+    target shots."""
+    from transport_study.config import config
+
     study = PowerBalanceStudy(
         _make_config(
             "test_transfer_weights",
@@ -326,14 +339,6 @@ def test_transfer_weights():
         )
     )
 
-    case_base = PowerBalanceStudy.Case(
-        model_type="unstructured_nn",
-        training_data="cmod-low1_cmod-low2",
-        data_normalization="coral",
-        domain_adaptation=None,
-        freeze_submodules=True,
-        num_target_shots=HYPERPARAM_TARGET_SHOTS,
-    )
     case_transfer = PowerBalanceStudy.Case(
         model_type="unstructured_nn",
         training_data="cmod-low1_cmod-low2",
@@ -342,48 +347,50 @@ def test_transfer_weights():
         freeze_submodules=True,
         num_target_shots=3,
     )
+    # The pretrain twin keeps this case's num_target_shots, the old shared
+    # source-only pretrain (da=None) is not a prereq anymore
+    case_pretrain = case_transfer._replace(domain_adaptation="transfer_pretrain")
+    assert case_pretrain in case_transfer.prereqs
+    assert case_transfer._replace(domain_adaptation=None, num_target_shots=HYPERPARAM_TARGET_SHOTS) not in case_transfer.prereqs
+    assert case_pretrain in study.cases
 
-    if not study.result_path(case_base).exists():
-        study.launch_train(case_base)
-
+    _clean_case(study, case_pretrain)
     _clean_case(study, case_transfer)
+    study.launch_train(case_pretrain)
+    assert study.result_path(case_pretrain).exists()
     study.launch_train(case_transfer)
+    assert study.result_path(case_transfer).exists()
 
-    base_trainer_init, _ = study.restore_trainer(case_base, restore_best_checkpoint=False)
-    transfer_trainer_init, _ = study.restore_trainer(case_transfer, restore_best_checkpoint=False)
-    base_model_init = base_trainer_init.train_state.model.module.nn
-    transfer_model_init = transfer_trainer_init.train_state.model.module.nn
-    # Can't simply call the restore_best_checkpoint on the trainer since it's a pass by reference
-    base_trainer_final, _ = study.restore_trainer(case_base, restore_best_checkpoint=True)
-    transfer_trainer_final, _ = study.restore_trainer(case_transfer, restore_best_checkpoint=True)
-    base_model_final = base_trainer_final.train_state.model.module.nn
-    transfer_model_final = transfer_trainer_final.train_state.model.module.nn
+    pretrain_final = study.restore_trainer(case_pretrain)[0].train_state.model.module
+    # restore_best_checkpoint=False on the transfer case IS the pretrain best:
+    # model_init restores the transfer_checkpoint before fine-tuning starts
+    transfer_init = study.restore_trainer(case_transfer, restore_best_checkpoint=False)[0].train_state.model.module
+    transfer_final = study.restore_trainer(case_transfer)[0].train_state.model.module
 
-    # Base model final weights should be the same as the transfer model initial weights.
-    chex.assert_trees_all_equal(base_model_final, transfer_model_init)
+    # Important! The TARGET device's per-device stats are fitted by the pretrain twin
+    # (identity before this change, the shared pretrain never saw the target device)
+    target_idx = config.ds_source_to_idx[config.target_device]
+    n = np.asarray(pretrain_final.normalizer.transforms[target_idx]).shape[0]
+    assert not np.allclose(np.asarray(pretrain_final.normalizer.transforms[target_idx]), np.eye(n)), (
+        "Target device CORAL transform is identity, the combined fit did not happen"
+    )
+    # The transfer case inherits the pretrain normalizer through the
+    # checkpoint restore and never refits or trains it
+    chex.assert_trees_all_equal(pretrain_final.normalizer, transfer_init.normalizer)
+    chex.assert_trees_all_equal(pretrain_final.normalizer, transfer_final.normalizer)
 
-    # The source-fitted normalizer stats ride along through the transfer restore
-    # and stay frozen through fine-tuning
-    base_norm_final = base_trainer_final.train_state.model.module.normalizer
-    transfer_norm_init = transfer_trainer_init.train_state.model.module.normalizer
-    transfer_norm_final = transfer_trainer_final.train_state.model.module.normalizer
-    chex.assert_trees_all_equal(base_norm_final, transfer_norm_init)
-    chex.assert_trees_all_equal(transfer_norm_init, transfer_norm_final)
-
-    # Transfer learning freezes all but the final layer
-
-    # Base model initial weights should be different from base model final weights in every layer (whole model trained)
-    for i in range(len(base_model_init.layers)):
+    # The pretrain trained the full network from the random init
+    pretrain_random_init = study.restore_trainer(case_pretrain, restore_best_checkpoint=False)[0].train_state.model.module
+    for i in range(len(pretrain_final.nn.layers)):
         with pytest.raises(AssertionError):
-            chex.assert_trees_all_equal(base_model_init.layers[i], base_model_final.layers[i])
+            chex.assert_trees_all_equal(pretrain_random_init.nn.layers[i], pretrain_final.nn.layers[i])
 
-    # Transfer model initial weights in layers 0-(n-1) should be the same as transfer model final weights in layers 0-(n-1)
-    for i in range(len(transfer_model_init.layers) - 1):
-        chex.assert_trees_all_equal(transfer_model_init.layers[i], transfer_model_final.layers[i])
-
-    # Transfer model initial weights in layer n should be different from transfer model final weights in layer n
+    # The transfer case fine-tunes only the final layer on top of the pretrain best
+    chex.assert_trees_all_equal(pretrain_final.nn, transfer_init.nn)
+    for i in range(len(pretrain_final.nn.layers) - 1):
+        chex.assert_trees_all_equal(pretrain_final.nn.layers[i], transfer_final.nn.layers[i])
     with pytest.raises(AssertionError):
-        chex.assert_trees_all_equal(transfer_model_init.layers[-1], transfer_model_final.layers[-1])
+        chex.assert_trees_all_equal(pretrain_final.nn.layers[-1], transfer_final.nn.layers[-1])
 
 
 @pytest.mark.parametrize("freeze_submodules", [True, False], ids=["frozen", "unfrozen"])
@@ -409,67 +416,71 @@ def test_transfer_weights_submodules(freeze_submodules):
             num_target_shots=HYPERPARAM_TARGET_SHOTS if domain_adaptation is None else 3,
         )
 
-    case_p_oh_base = _case("p_oh", None, True)
     case_p_oh_transfer = _case("p_oh", "transfer", True)
-    case_p_rad_base = _case("p_rad", None, True)
     case_p_rad_transfer = _case("p_rad", "transfer", True)
-    case_sciml_base = _case("sciml", None, freeze_submodules)
     case_sciml_transfer = _case("sciml", "transfer", freeze_submodules)
+    case_p_oh_pretrain = case_p_oh_transfer._replace(domain_adaptation="transfer_pretrain")
+    case_p_rad_pretrain = case_p_rad_transfer._replace(domain_adaptation="transfer_pretrain")
+    case_sciml_pretrain = case_sciml_transfer._replace(domain_adaptation="transfer_pretrain")
 
-    # Cases that don't need to be re-run if something's broken
-    for case in [case_p_oh_base, case_p_rad_base, case_sciml_base]:
-        if not study.result_path(case).exists():
-            study.launch_train(case)
-
-    for case in [case_p_oh_transfer, case_p_rad_transfer, case_sciml_transfer]:
+    # Prereq order:
+    # submodule pretrains,
+    # submodule transfers,
+    # sciml pretrain (restores the pretrained submodules),
+    # sciml transfer (restores the sciml pretrain plus the fine-tuned submodules)
+    ordered_cases = [
+        case_p_oh_pretrain,
+        case_p_rad_pretrain,
+        case_p_oh_transfer,
+        case_p_rad_transfer,
+        case_sciml_pretrain,
+        case_sciml_transfer,
+    ]
+    for case in ordered_cases:
         _clean_case(study, case)
+    for case in ordered_cases:
         study.launch_train(case)
+        assert study.result_path(case).exists()
 
     # Get initial and final modules for each case
-    sciml_base_trainer_init, _ = study.restore_trainer(case_sciml_base, restore_best_checkpoint=False)
-    sciml_transfer_trainer_init, _ = study.restore_trainer(case_sciml_transfer, restore_best_checkpoint=False)
-    sciml_base_init = sciml_base_trainer_init.train_state.model.module
-    sciml_transfer_init = sciml_transfer_trainer_init.train_state.model.module
-    p_oh_base_final = study.restore_trainer(case_p_oh_base)[0].train_state.model
+    sciml_transfer_init = study.restore_trainer(case_sciml_transfer, restore_best_checkpoint=False)[0].train_state.model.module
     p_oh_transfer_final = study.restore_trainer(case_p_oh_transfer)[0].train_state.model
-    p_rad_base_final = study.restore_trainer(case_p_rad_base)[0].train_state.model
     p_rad_transfer_final = study.restore_trainer(case_p_rad_transfer)[0].train_state.model
-    sciml_base_final = study.restore_trainer(case_sciml_base)[0].train_state.model.module
     sciml_transfer_final = study.restore_trainer(case_sciml_transfer)[0].train_state.model.module
+    sciml_pretrain_final = study.restore_trainer(case_sciml_pretrain)[0].train_state.model.module
 
-    # 1. Ensure the modules themselves were correctly transferred
-    for base_final, transfer_final in [
-        (p_oh_base_final.nn, p_oh_transfer_final.nn),
-        (p_rad_base_final.nn, p_rad_transfer_final.nn),
-        (sciml_base_final.taue_predictor.nn, sciml_transfer_final.taue_predictor.nn),
-    ]:
-        for i in range(len(base_final.layers) - 1):
-            chex.assert_trees_all_equal(base_final.layers[i], transfer_final.layers[i])
-        with pytest.raises(AssertionError):
-            chex.assert_trees_all_equal(base_final.layers[-1], transfer_final.layers[-1])
+    # 1. The transfer case fine-tunes only the taue network's last layer on
+    # top of the pretrain best
+    taue_pretrain = sciml_pretrain_final.taue_predictor.nn
+    taue_final = sciml_transfer_final.taue_predictor.nn
+    for i in range(len(taue_pretrain.layers) - 1):
+        chex.assert_trees_all_equal(taue_pretrain.layers[i], taue_final.layers[i])
+    with pytest.raises(AssertionError):
+        chex.assert_trees_all_equal(taue_pretrain.layers[-1], taue_final.layers[-1])
 
-    # 2. Ensure the submodules were initialized properly
-    chex.assert_trees_all_equal(p_oh_base_final.nn, sciml_base_init.p_oh_predictor.nn)
-    chex.assert_trees_all_equal(p_rad_base_final.nn, sciml_base_init.p_rad_predictor.nn)
+    # 2. Ensure the submodules were initialized from their own trained checkpoints
     chex.assert_trees_all_equal(p_oh_transfer_final.nn, sciml_transfer_init.p_oh_predictor.nn)
     chex.assert_trees_all_equal(p_rad_transfer_final.nn, sciml_transfer_init.p_rad_predictor.nn)
 
     if freeze_submodules:
-        # 3a. Frozen submodules do not change at all during the sciml transfer
+        # 3a. Frozen submodules do not change at all during the sciml transfer run
         chex.assert_trees_all_equal(p_oh_transfer_final.nn, sciml_transfer_final.p_oh_predictor.nn)
         chex.assert_trees_all_equal(p_rad_transfer_final.nn, sciml_transfer_final.p_rad_predictor.nn)
     else:
-        # 3b. Unfrozen submodules only change their last layers (still transfer learning)
-        for transfer_final, sciml_sub_final in [
-            (p_oh_transfer_final.nn, sciml_transfer_final.p_oh_predictor.nn),
-            (p_rad_transfer_final.nn, sciml_transfer_final.p_rad_predictor.nn),
+        # 3b. Unfrozen submodules fine-tune only their last layers during the
+        # sciml transfer run (the transfer restriction)
+        for init_sub, final_sub in [
+            (sciml_transfer_init.p_oh_predictor.nn, sciml_transfer_final.p_oh_predictor.nn),
+            (sciml_transfer_init.p_rad_predictor.nn, sciml_transfer_final.p_rad_predictor.nn),
         ]:
-            for i in range(len(transfer_final.layers) - 1):
-                chex.assert_trees_all_equal(transfer_final.layers[i], sciml_sub_final.layers[i])
+            for i in range(len(init_sub.layers) - 1):
+                chex.assert_trees_all_equal(init_sub.layers[i], final_sub.layers[i])
             with pytest.raises(AssertionError):
-                chex.assert_trees_all_equal(transfer_final.layers[-1], sciml_sub_final.layers[-1])
+                chex.assert_trees_all_equal(init_sub.layers[-1], final_sub.layers[-1])
 
-    # Normalizer stats never train, anywhere
+    # Normalizer stats never train, anywhere, and the transfer case inherits
+    # the pretrain twin's combined-fit stats through the checkpoint restore
+    chex.assert_trees_all_equal(sciml_pretrain_final.normalizer, sciml_transfer_final.normalizer)
     chex.assert_trees_all_equal(sciml_transfer_init.normalizer, sciml_transfer_final.normalizer)
     chex.assert_trees_all_equal(
         sciml_transfer_init.p_oh_predictor.normalizer,

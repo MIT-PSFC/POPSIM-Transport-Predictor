@@ -62,9 +62,14 @@ class ScalarPowerTRB(TrainRunBuilder):
                 median = max(device_medians)
             model_init_config["max_val"] = 2 * median
 
-        # Fit normalization stats from the training data only,
-        # skipping the fit when a transfer checkpoint will overwrite the module anyway
-        fit_ds = None if model_init_config.get("transfer_checkpoint") else train_dl.ds
+        # Fit normalization stats from the training data only, skipping the
+        # fit when a transfer checkpoint will overwrite the module anyway.
+        # transfer_pretrain dataloaders carry the combined historic + target
+        # fit dataset as an attribute (see PowerBalanceTRB.get_dataloaders)
+        if model_init_config.get("transfer_checkpoint"):
+            fit_ds = None
+        else:
+            fit_ds = getattr(train_dl, "normalizer_fit_ds", train_dl.ds)
         normalizer = make_normalizer(model_init_config["data_normalization"], fit_ds, len(config.ds_source_to_idx))
 
         module = cls.MODULE_CLS.init(

@@ -34,6 +34,7 @@ from transport_study.orchestration.organize_data import (
     TrainingData,
     get_train_test_datasets,
     get_train_val_datasets,
+    get_transfer_pretrain_datasets,
 )
 
 STUDY_TYPE = "power_balance_transfer"
@@ -90,7 +91,16 @@ class PowerBalanceTRB(TrainRunBuilder):
         if isinstance(training_data, dict):  # when the config is passed from WandB, it's a dict
             training_data = TrainingData(**training_data)
 
-        if dataloader_config.get("domain_adaptation") is None:
+        normalizer_fit_ds = None
+        if dataloader_config.get("domain_adaptation") == "transfer_pretrain":
+            logger.info("Using transfer pretrain dataloader (trains on historic data, normalizer fit on historic + target shots)")
+            ds_train, normalizer_fit_ds, ds_val = get_transfer_pretrain_datasets(
+                training_data=training_data,
+                num_target_shots=dataloader_config["num_target_shots"],
+                target_test_set_size=dataloader_config.get("target_test_set_size", None),
+                study_type=STUDY_TYPE,
+            )
+        elif dataloader_config.get("domain_adaptation") is None:
             logger.info("Using standard learning dataloader")
             if not training_data.exnihilo:
                 ds_train, ds_val = get_train_val_datasets(
@@ -197,6 +207,13 @@ class PowerBalanceTRB(TrainRunBuilder):
             drop_last=[True, False],
             pad_last=[False, True],
         )
+        # Transfer pretrain fits the normalizer on more data than it trains on
+        # (historic + target shots). model_init reads this attribute off the
+        # train dataloader, every other case fits on train_dl.ds itself
+        # Yes I know this looks stupid but it's a fairly simlple way to pass the extra dataset
+        # to the model_init without changing everything else
+        if normalizer_fit_ds is not None:
+            train_dl.normalizer_fit_ds = normalizer_fit_ds
         # Running test evaluation on the validation set, since we don't need a dedicated test set
         # In the no domain adaptation case, we are hyperparameter tuning on all historic data, pick the best one and test on it
         # In the domain adaptation case, we are training on all historic data + some new data, and testing on the rest of the new data
@@ -215,9 +232,15 @@ class PowerBalanceTRB(TrainRunBuilder):
             # Fit normalization stats from the training data only. When a
             # transfer checkpoint will overwrite the module anyway, skip the
             # fit (a CORAL fit on a handful of target shots is ill-conditioned
-            # and the restored source-fitted stats are the correct ones)
+            # and the restored stats, fitted on historic + target shots by the
+            # transfer_pretrain prereq case, are the correct ones).
+            # transfer_pretrain dataloaders carry that combined fit dataset as
+            # an attribute (see get_dataloaders)
             n_devices = len(config.ds_source_to_idx)
-            fit_ds = None if model_init_config.get("transfer_checkpoint") else train_dl.ds
+            if model_init_config.get("transfer_checkpoint"):
+                fit_ds = None
+            else:
+                fit_ds = getattr(train_dl, "normalizer_fit_ds", train_dl.ds)
             normalizer = make_normalizer(model_init_config["data_normalization"], fit_ds, n_devices)
             if model_type in ["scaling_law", "sciml"]:
                 p_oh_config = model_init_config["submodules"]["p_oh_predictor"]
