@@ -245,10 +245,14 @@ _PROFILE_PREDICTOR_TORAX_CONFIG_BASE: dict[str, Any] = {
         # uses delta_top/delta_bot with delta ~ rho_norm**delta_exponent)
         "geometry_builder": "circular",
         "delta_exponent": 2.0,
-        # Relaxation window overrides, None keeps the torax_config numerics
-        # values. Top-level keys so wandb sweeps can search them like nn_width
+        # Relaxation window overrides, None keeps the torax_config numerics values.
+        # Top-level keys so wandb sweeps can search them like nn_width.
+        # n_solver_steps derives fixed_dt = t_final / n_solver_steps so sweeps
+        # can widen the horizon without multiplying per-sample solver cost.
+        # Mutually exclusive with an explicit fixed_dt
         "t_final": None,
         "fixed_dt": None,
+        "n_solver_steps": None,
     },
     "loss_config": {
         "huber_delta": 0.5,

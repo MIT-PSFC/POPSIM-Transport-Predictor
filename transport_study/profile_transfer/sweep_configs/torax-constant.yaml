@@ -16,12 +16,10 @@ parameters:
         values: [8, 16, 24, 32]
       nn_depth:
         values: [1, 2, 3]
-      # Relaxation window of the per-sample TORAX solve. Solver steps per
-      # sample = t_final / fixed_dt, and compute scales linearly with it
       t_final:
         values: [0.1, 0.2, 0.4]
-      fixed_dt:
-        values: [0.01, 0.02]
+      n_solver_steps:
+        values: [5, 10]
   optimizer_config:
     parameters:
       lr0:

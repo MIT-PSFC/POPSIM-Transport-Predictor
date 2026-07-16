@@ -155,3 +155,59 @@ def test_torax_output_hits_edge_bc_and_smooth_init():
         d2 = np.diff(init, n=2)
         scale = np.abs(init).max()
         assert np.all(np.abs(d2 - d2.mean()) < 1e-3 * scale), key
+
+
+def test_resolve_relaxation_overrides():
+    from transport_study.modules.profile_predictor.trb import (
+        resolve_relaxation_overrides,
+    )
+
+    # Nothing set: no overrides, torax_config numerics stay authoritative
+    assert resolve_relaxation_overrides({}) == {}
+    assert resolve_relaxation_overrides({"t_final": None, "fixed_dt": None, "n_solver_steps": None}) == {}
+
+    # Explicit t_final / fixed_dt pass through unchanged
+    assert resolve_relaxation_overrides({"t_final": 0.2}) == {"t_final": 0.2}
+    assert resolve_relaxation_overrides({"t_final": 0.2, "fixed_dt": 0.02}) == {"t_final": 0.2, "fixed_dt": 0.02}
+
+    # n_solver_steps derives fixed_dt = t_final / n_solver_steps, so the
+    # swept horizon does not multiply per-sample solver cost
+    assert resolve_relaxation_overrides({"t_final": 0.4, "n_solver_steps": 10}) == {
+        "t_final": 0.4,
+        "fixed_dt": pytest.approx(0.04),
+    }
+    assert resolve_relaxation_overrides({"t_final": 0.1, "n_solver_steps": 5, "fixed_dt": None}) == {
+        "t_final": 0.1,
+        "fixed_dt": pytest.approx(0.02),
+    }
+
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        resolve_relaxation_overrides({"t_final": 0.2, "fixed_dt": 0.02, "n_solver_steps": 5})
+    with pytest.raises(ValueError, match="requires t_final"):
+        resolve_relaxation_overrides({"n_solver_steps": 5})
+
+
+def test_torax_max_steps_from_n_solver_steps():
+    # The module derives max_steps = ceil(t_final / fixed_dt) + 1, so an
+    # n_solver_steps override must bound the scan length to n_solver_steps + 1
+    from transport_study.modules.profile_predictor.trb import (
+        resolve_relaxation_overrides,
+    )
+
+    model_cfg = PROFILE_PREDICTOR_TORAX_CONFIGS["cgm"]["model_init_config"]
+    torax_config = {
+        **model_cfg["torax_config"],
+        "numerics": {
+            **model_cfg["torax_config"]["numerics"],
+            **resolve_relaxation_overrides({"t_final": 0.4, "n_solver_steps": 10}),
+        },
+    }
+    module = ProfilePredictorTorax(
+        nn_width=model_cfg["nn_width"],
+        nn_depth=model_cfg["nn_depth"],
+        rhogrid=tuple(np.linspace(0.0, 1.0, 51).tolist()),
+        torax_config=torax_config,
+        key=jax.random.PRNGKey(42),
+        transport_model="cgm",
+    )
+    assert module.max_steps == 11

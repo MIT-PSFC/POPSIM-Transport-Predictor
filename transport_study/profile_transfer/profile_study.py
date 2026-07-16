@@ -308,6 +308,7 @@ class ProfileStudy(Study):
                     "delta_exponent": torax_defaults.get("delta_exponent", 2.0),
                     "t_final": torax_defaults.get("t_final"),
                     "fixed_dt": torax_defaults.get("fixed_dt"),
+                    "n_solver_steps": torax_defaults.get("n_solver_steps"),
                     "prng_seed": 42,
                 },
             )
@@ -335,6 +336,8 @@ class ProfileStudy(Study):
         elif case.model_type.startswith("torax"):
             updates["t_final"] = tuned_config.model_init_config["t_final"]
             updates["fixed_dt"] = tuned_config.model_init_config["fixed_dt"]
+            # .get: tuned configs written before the n_solver_steps sweep key lack it
+            updates["n_solver_steps"] = tuned_config.model_init_config.get("n_solver_steps")
         return updates
 
     ##############
