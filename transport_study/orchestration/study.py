@@ -25,6 +25,7 @@ from pydantic import Field, field_validator, model_validator
 
 from transport_study import PACKAGE_ROOT
 from transport_study.config import StudyConfig, config, env_dataset_paths, load_config
+from transport_study.modules.normalization import STAT_NORMALIZATIONS
 from transport_study.orchestration.organize_data import (
     TrainingData,
     get_loaded_shot_count,
@@ -246,7 +247,10 @@ class Study:
 
         model_type: str
         training_data: TrainingData
-        domain_adaptation: str | None  # None, mixing, transfer
+        # None, mixing, transfer, or transfer_pretrain
+        # (transfer_pretrain is never a case-grid axis value, it arises only as the
+        # pretrain prereq of a stat-normalized transfer case, see transfer_pretrain_case)
+        domain_adaptation: str | None
         num_target_shots: int  # Target shots included in training, or -1 for all (HYPERPARAM_TARGET_SHOTS when domain_adaptation is None)
         # Cases this one depends on, run first (None when independent)
         prereqs: list[Study.Case] | None
@@ -286,12 +290,30 @@ class Study:
                 prereqs.append(self._replace(**self._hyperparam_field_values()))
             prereqs.extend(self._model_type_prereqs())
             if self.domain_adaptation == "transfer":
-                prereqs.append(self._replace(domain_adaptation=None, num_target_shots=HYPERPARAM_TARGET_SHOTS))
+                prereqs.append(self.transfer_pretrain_case())
             return list(dict.fromkeys(prereqs))
 
         def _model_type_prereqs(self) -> list[Study.Case]:
             """Extra prereq cases implied by the model type (e.g. submodule predictors)."""
             return []
+
+        def _normalization_method(self) -> str | None:
+            """The input normalization method this case trains with, None when the study has none."""
+            return None
+
+        def transfer_pretrain_case(self) -> Study.Case:
+            """The pretrain prereq case this transfer case fine-tunes from.
+
+            Stat-based normalizations (z_score, coral, physics-coral) must fit their per-device
+            statistics on the combined historic + target data of THIS case
+            (a shared source-only pretrain would leave the target device's stats at identity),
+            so their pretrain is a dedicated transfer_pretrain twin keeping this case's num_target_shots.
+            It trains on historic data only but fits the normalizer on historic + target shots.
+            The stateless normalizations (raw, physics) share the plain baseline case.
+            """
+            if self._normalization_method() in STAT_NORMALIZATIONS:
+                return self._replace(domain_adaptation="transfer_pretrain")
+            return self._replace(domain_adaptation=None, num_target_shots=HYPERPARAM_TARGET_SHOTS)
 
         def _replace(self, **changes) -> Study.Case:
             """Rebuild through the real constructor with some fields changed, so validation and prereqs stay consistent."""
@@ -317,7 +339,7 @@ class Study:
         def is_impossible(self) -> bool:
             """Some cases don't make sense to run. Mark those cases as impossible and raise an error if we try to run them."""
             # Can't do transfer learning or training from nothing with 0 target shots.
-            if (self.domain_adaptation == "transfer" or self.training_data.exnihilo) and self.num_target_shots == 0:
+            if (self.domain_adaptation in ("transfer", "transfer_pretrain") or self.training_data.exnihilo) and self.num_target_shots == 0:
                 return True
 
             # exnihilo means training from nothing - no source domain to adapt from
@@ -352,8 +374,8 @@ class Study:
         return Path(self.result_dir) / str(case) / "result_data.nc"
 
     def _latest_checkpoint_dir_info(self, case: Case) -> tuple[int, float] | None:
-        """(epoch, mtime) of the highest-epoch dir in the case's latest-checkpoint
-        (resume) directory, or None if empty.
+        """(epoch, mtime) of the newest resume checkpoint of the case,
+        or None if there is none yet.
 
         Orbax names each checkpoint directory after its step (here the epoch)
         and renames it into place atomically once fully written, so the dir's
@@ -370,7 +392,7 @@ class Study:
         return int(newest.name), newest.stat().st_mtime
 
     def latest_checkpoint_epoch(self, case: Case) -> int | None:
-        """Highest epoch saved in the case's latest-checkpoint (resume) directory, or None if empty."""
+        """Epoch of the newest resume checkpoint, or None if empty."""
         info = self._latest_checkpoint_dir_info(case)
         return info[0] if info else None
 
@@ -601,10 +623,8 @@ class Study:
         )
 
         if case.domain_adaptation == "transfer":
-            # Point model_init at the pretrained checkpoint: same case minus
-            # the domain adaptation and target shots
-            transfer_case = case._replace(domain_adaptation=None, num_target_shots=HYPERPARAM_TARGET_SHOTS)
-            train_config_base = self._set_transfer_checkpoint(train_config_base, transfer_case)
+            # Point model_init at the pretrained checkpoint it fine-tunes from
+            train_config_base = self._set_transfer_checkpoint(train_config_base, case.transfer_pretrain_case())
 
         train_config = self._apply_tuned_config(case, train_config_base)
 
