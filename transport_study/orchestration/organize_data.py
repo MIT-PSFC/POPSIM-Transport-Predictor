@@ -420,6 +420,7 @@ def normalize_domain(  # noqa: PLR0915
         - "physics": Convert to typical dimensionless parameters like beta, q95, f_G, etc.
         - "z_score": Within each device, normalize each variable to zero mean and unit variance. Variable gets a `_z` suffix after normalization.
         - "coral": Use the CORAL method to align covariances of various devices. Variable gets a `_coral` suffix after normalization.
+        - "physics-coral": The physics parameters followed by CORAL alignment on them. Variable gets a `_pcoral` suffix (a `_coral` suffix would collide with the raw coral vars).
 
     Args:
         ds_source: The source dataset (e.g. historic data)
@@ -466,8 +467,9 @@ def normalize_domain(  # noqa: PLR0915
             return f_G
 
         def _aB0(ds: xr.Dataset) -> xr.DataArray:
-            aB0 = ds["a_minor"] * ds["B0"]
-            return aB0
+            # Dimensional, similar to normalized gyroradius,
+            # but actual normalized gyroradius needs a temperature which H89/H98 don't have
+            return ds["a_minor"] * ds["B0"]
 
         def _surface_power_density(ds: xr.Dataset) -> xr.DataArray:
             surface_area = calc_plasma_surface_area(ds["R0"], ds["epsilon"], ds["kappa"])
@@ -539,7 +541,12 @@ def normalize_domain(  # noqa: PLR0915
 
         return ds_source_norm, ds_target_norm
 
-    def _coral_normalization(ds_source: xr.Dataset, ds_target: xr.Dataset | None):
+    def _coral_normalization(
+        ds_source: xr.Dataset,
+        ds_target: xr.Dataset | None,
+        variables: list[str] | None = None,
+        suffix: str = "_coral",
+    ):
         # CORAL aligns second-order statistics (covariance) across domains.
         # We use the pooled source data as the reference domain and transform
         # each device's features so their covariance matches the reference.
@@ -547,6 +554,7 @@ def normalize_domain(  # noqa: PLR0915
         # A small regularization term is added to covariance diagonals for numerical stability.
         # Visualization-only counterpart of modules.normalization.CoralNormalizer
 
+        variables = normalize_vars if variables is None else variables
         reg = 1e-6  # Regularization for covariance matrix inversion
 
         def _build_feature_matrix(ds: xr.Dataset, variables: list[str]) -> np.ndarray:
@@ -576,7 +584,7 @@ def normalize_domain(  # noqa: PLR0915
             return X_transformed
 
         # Compute reference statistics from pooled source data
-        all_source_features = _build_feature_matrix(ds_source, normalize_vars)
+        all_source_features = _build_feature_matrix(ds_source, variables)
         valid_rows = ~np.any(np.isnan(all_source_features), axis=1)
         all_source_valid = all_source_features[valid_rows]
         cov_ref = np.cov(all_source_valid, rowvar=False)
@@ -585,7 +593,7 @@ def normalize_domain(  # noqa: PLR0915
         source_devices = _separate_devices(ds_source)
         device_stats = {}
         for device, ds_device in source_devices.items():
-            X_device = _build_feature_matrix(ds_device, normalize_vars)
+            X_device = _build_feature_matrix(ds_device, variables)
             valid = ~np.any(np.isnan(X_device), axis=1)
             X_valid = X_device[valid]
             if len(X_valid) >= MIN_CORAL_SAMPLES:
@@ -599,11 +607,11 @@ def normalize_domain(  # noqa: PLR0915
             device_stats: dict,
             cov_ref: np.ndarray,
         ) -> xr.Dataset:
-            """Apply CORAL transformation to a dataset, writing results with _coral suffix."""
+            """Apply CORAL transformation to a dataset, writing results with the configured suffix."""
             ds_norm = ds.copy()
             # Initialize coral variables with raw values
-            for var in normalize_vars:
-                ds_norm[f"{var}_coral"] = ds_norm[var].copy()
+            for var in variables:
+                ds_norm[f"{var}{suffix}"] = ds_norm[var].copy()
 
             source_vals = ds.coords["ds_source"].values
             # Handle scalar ds_source (single-device dataset)
@@ -632,7 +640,7 @@ def normalize_domain(  # noqa: PLR0915
                     is_single_device = False
 
                 # Build feature matrix for this device in the dataset
-                X_device = _build_feature_matrix(ds_device, normalize_vars)
+                X_device = _build_feature_matrix(ds_device, variables)
 
                 # Handle NaNs: transform valid rows, leave NaNs in place
                 valid = ~np.any(np.isnan(X_device), axis=1)
@@ -646,17 +654,17 @@ def normalize_domain(  # noqa: PLR0915
                     )
 
                 # Write back transformed values per variable
-                device_shape = ds_device[normalize_vars[0]].shape
-                for j, var in enumerate(normalize_vars):
+                device_shape = ds_device[variables[0]].shape
+                for j, var in enumerate(variables):
                     col = X_transformed[:, j].reshape(device_shape)
                     if is_single_device:
                         # All shots are this device, just assign directly
-                        ds_norm[f"{var}_coral"].values = col
+                        ds_norm[f"{var}{suffix}"].values = col
                     else:
-                        full_vals = ds_norm[f"{var}_coral"].values.copy()
+                        full_vals = ds_norm[f"{var}{suffix}"].values.copy()
                         for idx_out, idx_in in enumerate(device_indices):
                             full_vals[idx_in] = col[idx_out]
-                        ds_norm[f"{var}_coral"].values = full_vals
+                        ds_norm[f"{var}{suffix}"].values = full_vals
 
             return ds_norm
 
@@ -669,6 +677,22 @@ def normalize_domain(  # noqa: PLR0915
 
         return ds_source_norm, ds_target_norm
 
+    def _physics_coral_normalization(ds_source: xr.Dataset, ds_target: xr.Dataset | None):
+        # CORAL alignment in the dimensionless physics space, mirroring
+        # modules.normalization.PhysicsCoralNormalizer (plus beta, viz-only)
+        ds_source, ds_target = _physics_normalization(ds_source, ds_target)
+        physics_vars = [
+            "Ip_MA",
+            "q_star",
+            "epsilon",
+            "aB0",
+            "kappa",
+            "f_G",
+            "surface_power_density",
+            "beta",
+        ]
+        return _coral_normalization(ds_source, ds_target, variables=physics_vars, suffix="_pcoral")
+
     if method == "raw":
         return ds_source, ds_target
     elif method == "physics":
@@ -677,6 +701,8 @@ def normalize_domain(  # noqa: PLR0915
         return _z_score_normalization(ds_source, ds_target)
     elif method == "coral":
         return _coral_normalization(ds_source, ds_target)
+    elif method == "physics-coral":
+        return _physics_coral_normalization(ds_source, ds_target)
     else:
         raise ValueError(f"Unknown normalization method: {method}")
 
@@ -747,6 +773,56 @@ def get_loaded_shot_count(source_ds: str, study_type: str = "profile_transfer") 
     return int(ds.sizes[episode_coord])
 
 
+def _split_target_shots(
+    num_target_shots: int,
+    target_test_set_size: int,
+    study_type: str,
+):
+    """Load the target device and split it into training shots and the held-out test set.
+
+    The test set is the target_test_set_size highest-performance shots
+    The training shots are the first num_target_shots of the remaining pool
+    (or every shot for -1, the cheating upper-bound reference).
+    Returns (train_ds_target, test_ds, episode_coord).
+    """
+    target = config.target_device
+    if target is None:
+        raise ValueError("config.target_device must be set before transfer learning")
+
+    ds_target, episode_coord = get_ds(target, study_type=study_type)
+    ds_target = add_performance(ds_target, episode_coord)
+    ds_target["ds_source_idx"] = (
+        episode_coord,
+        np.full(ds_target.sizes[episode_coord], config.ds_source_to_idx[target]),
+    )
+    ds_target = ds_target.assign_coords(ds_source=target)
+    sorted_shots = np.argsort(ds_target["performance"].values)
+
+    test_shot_pool = sorted_shots[-target_test_set_size:] if target_test_set_size else sorted_shots[:0]
+    test_ds = ds_target.isel({episode_coord: test_shot_pool})
+
+    if num_target_shots == -1:
+        # All available target shots in training and testing (upper-bound reference, CHEATING!)
+        train_ds_target = ds_target.isel({episode_coord: sorted_shots})
+    else:
+        # Exclude the held-out test shots before selecting training shots so the two pools
+        # never overlap (otherwise a large num_target_shots would leak high-performance test
+        # shots into training)
+        train_candidate_pool = sorted_shots[:-target_test_set_size] if target_test_set_size else sorted_shots
+        if num_target_shots > len(train_candidate_pool):
+            raise ValueError(
+                f"num_target_shots={num_target_shots} requested but only {len(train_candidate_pool)} target "
+                f"shots remain after holding out target_test_set_size={target_test_set_size} of "
+                f"{len(sorted_shots)} loaded shots. Is the dataset smaller than expected "
+                f"(debug mode / max_ds_size truncation)?"
+            )
+        train_shot_pool = train_candidate_pool[:num_target_shots]
+        assert not (set(train_shot_pool.tolist()) & set(test_shot_pool.tolist())), "Target train and test shot pools overlap - data leakage"
+        train_ds_target = ds_target.isel({episode_coord: train_shot_pool})
+
+    return train_ds_target, test_ds, episode_coord
+
+
 def get_train_test_datasets(
     training_data: "TrainingData",
     domain_adaptation: str,
@@ -768,54 +844,20 @@ def get_train_test_datasets(
     We treat the test set as a validation set for checkpoint selection, which is slightly optimistic
     but consistent across all models so comparisons are fair.
     """
-    target = config.target_device
-    if target is None:
-        raise ValueError("config.target_device must be set before transfer learning")
-
-    # Load the target device dataset and split into train/test
-    ds_target, episode_coord = get_ds(target, study_type=study_type)
-    ds_target = add_performance(ds_target, episode_coord)
-    ds_target["ds_source_idx"] = (
-        episode_coord,
-        np.full(ds_target.sizes[episode_coord], config.ds_source_to_idx[target]),
-    )
-    ds_target = ds_target.assign_coords(ds_source=target)
-    sorted_shots = np.argsort(ds_target["performance"].values)
-
-    test_shot_pool = sorted_shots[-target_test_set_size:] if target_test_set_size else sorted_shots[:0]
-    test_ds = ds_target.isel({episode_coord: test_shot_pool})
-
-    if num_target_shots == -1:
-        # All available target shots in training and testing (upper-bound reference, CHEATING!)
-        train_ds_hp = ds_target.isel({episode_coord: sorted_shots})
-    else:
-        # Exclude the held-out test shots before selecting training shots so the two pools
-        # never overlap (otherwise a large num_target_shots would leak high-performance test
-        # shots into training)
-        train_candidate_pool = sorted_shots[:-target_test_set_size] if target_test_set_size else sorted_shots
-        if num_target_shots > len(train_candidate_pool):
-            raise ValueError(
-                f"num_target_shots={num_target_shots} requested but only {len(train_candidate_pool)} target "
-                f"shots remain after holding out target_test_set_size={target_test_set_size} of "
-                f"{len(sorted_shots)} loaded shots. Is the dataset smaller than expected "
-                f"(debug mode / max_ds_size truncation)?"
-            )
-        train_shot_pool = train_candidate_pool[:num_target_shots]
-        assert not (set(train_shot_pool.tolist()) & set(test_shot_pool.tolist())), "Target train and test shot pools overlap - data leakage"
-        train_ds_hp = ds_target.isel({episode_coord: train_shot_pool})
+    train_ds_target, test_ds, episode_coord = _split_target_shots(num_target_shots, target_test_set_size, study_type)
 
     # Load historic source data for training (for exnihilo it is stripped again below)
     # exnihilo.sources contains all non-target devices, so we can pass training_data directly
     train_ds_hist, val_ds_hist = get_train_val_datasets(training_data, study_type=study_type)
     train_ds = concat_with_nan_padding(
-        [train_ds_hist, val_ds_hist, train_ds_hp],
+        [train_ds_hist, val_ds_hist, train_ds_target],
         concat_dim=episode_coord,
     )
 
     # For 'transfer' and exnihilo: strip historic data, train only on target device shots
     if domain_adaptation == "transfer" or training_data.exnihilo:
         train_ds = train_ds.where(
-            train_ds["ds_source_idx"] == config.ds_source_to_idx[target],
+            train_ds["ds_source_idx"] == config.ds_source_to_idx[config.target_device],
             drop=True,
         )
 
@@ -823,3 +865,33 @@ def get_train_test_datasets(
     logger.debug("HP Test dataset size: {}", test_ds.sizes[episode_coord])
 
     return train_ds, test_ds
+
+
+def get_transfer_pretrain_datasets(
+    training_data: "TrainingData",
+    num_target_shots: int,
+    target_test_set_size: int,
+    study_type: str = "profile_transfer",
+):
+    """Datasets for a transfer_pretrain case (the pretrain half of a stat-normalized transfer).
+
+    The case trains on ALL historic data (train and val splits together, the
+    source val split is not needed because checkpoint selection uses the
+    target test set, like every other domain-adaptation case). The combined
+    dataset (historic + the transfer case's num_target_shots target shots)
+    exists only to fit the normalization statistics, which the transfer case
+    then inherits through the checkpoint restore.
+
+    Returns (train_ds_hist, train_ds_combined, test_ds).
+    """
+    train_ds_target, test_ds, episode_coord = _split_target_shots(num_target_shots, target_test_set_size, study_type)
+
+    train_ds_hist, val_ds_hist = get_train_val_datasets(training_data, study_type=study_type)
+    train_ds_hist = concat_with_nan_padding([train_ds_hist, val_ds_hist], concat_dim=episode_coord)
+    train_ds_combined = concat_with_nan_padding([train_ds_hist, train_ds_target], concat_dim=episode_coord)
+
+    logger.debug("Transfer pretrain historic dataset size: {}", train_ds_hist.sizes[episode_coord])
+    logger.debug("Transfer pretrain normalizer-fit dataset size: {}", train_ds_combined.sizes[episode_coord])
+    logger.debug("Transfer pretrain test dataset size: {}", test_ds.sizes[episode_coord])
+
+    return train_ds_hist, train_ds_combined, test_ds
