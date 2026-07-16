@@ -53,14 +53,16 @@ class StudyConfig(BaseModel):
     debug: bool = True
     dry_run: bool = False
     max_ds_size: int = 1000
-    hyperparam_sweeps: int = 100
+    hyperparam_sweeps: int = 200
     max_epochs: int = 1000
     epochs_per_val: int = 20
     patience: int = 6  # epochs_per_val * patience = max epochs without improvement before stopping
-    # Epoch cap for hyperparameter sweep trials
+    # Epoch cap for hyperparameter sweep trials and agent jobs
     # Trials are wall-clock limited to train_wall_budget_s and stop early via patience
-    # Matching max_epochs keeps tuned LR schedules consistent between sweep and final training runs
-    hyperparam_max_epochs: int = 1000
+    # Capped below max_epochs so sweep trials stay cheap. The swept LR decay params
+    # (transition_steps, decay_rate) carry into production training unchanged, so
+    # tuned schedules are only validated over this shorter horizon
+    hyperparam_max_epochs: int = 240
 
     # Environment-specific orchestration settings
     partition: str | None = Field(default_factory=lambda: os.environ.get("PTPS_PARTITION"))

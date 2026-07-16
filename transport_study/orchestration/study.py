@@ -62,7 +62,7 @@ MAX_TRAIN_ATTEMPTS = 3
 
 # A sweep is done once the trial target is met AND this fraction of it finished, since the tuned config is picked from finished runs only
 # Hyperband with eta 3 lets only a few percent of trials run to completion, so demanding much more than that forces extra trials far past the count target
-MIN_FINISHED_FRACTION = 0.03
+MIN_FINISHED_FRACTION = 0.05
 
 # How long the orchestration loop sleeps between passes over the unfinished cases
 ORCHESTRATION_POLL_INTERVAL_S = 20
