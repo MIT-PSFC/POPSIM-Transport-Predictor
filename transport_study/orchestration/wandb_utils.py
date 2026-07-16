@@ -1,6 +1,7 @@
 import functools
 import subprocess
 import time
+from datetime import UTC, datetime
 from typing import Any
 
 import wandb
@@ -162,6 +163,40 @@ def get_sweep_id(project: str) -> str | None:
     if len(active_sweeps) == 0:
         return None
     return active_sweeps[0].id
+
+
+@retry_rate_limited
+def has_live_agent_run(project: str, stall_s: float) -> bool:
+    """Whether any run in the project is actively being trained right now.
+
+    A run stays "running" server-side until wandb's own heartbeat timeout
+    trips, so a node that died mid-trial without a clean exit would still
+    read as "running" long after it stopped. Requiring a recent heartbeat on
+    top of state=="running" catches that case too.
+    """
+    project_obj = get_project(project)
+    if project_obj is None:
+        logger.warning(f"No wandb project found for {project}, assuming no live agent run.")
+        return False
+
+    try:
+        project_runs = wandb.Api(timeout=API_TIMEOUT_S).runs(project)
+    except ValueError as e:
+        logger.warning(f"No wandb runs found for {project}, assuming no live agent run.")
+        logger.debug(e)
+        return False
+
+    now = datetime.now(UTC)
+    for run in project_runs:
+        if run.state != "running":
+            continue
+        heartbeat_at = getattr(run, "heartbeat_at", None)
+        if heartbeat_at is None:
+            continue
+        heartbeat_dt = datetime.fromisoformat(heartbeat_at.replace("Z", "+00:00"))
+        if (now - heartbeat_dt).total_seconds() < stall_s:
+            return True
+    return False
 
 
 def run_clean_sweeps(projects: list[str]):

@@ -46,6 +46,7 @@ from transport_study.orchestration.wandb_utils import (
     get_best_train_config,
     get_completed_runs,
     get_sweep_id,
+    has_live_agent_run,
     run_clean_sweeps,
 )
 
@@ -76,6 +77,9 @@ WATCHDOG_MIN_AGE_S = 80 * 60
 
 # Checkpoints are only written at the validation cadence, so stall detection is a coarse "no epochs completed recently" signal
 WATCHDOG_STALL_S = 60 * 60
+
+# wandb heartbeats every ~30s during a live run, so 10 min of silence on a "running" run is already well past any legitimate gap
+AGENT_HEARTBEAT_STALL_S = 10 * 60
 
 
 class CaseGridConfig(StudyConfig):
@@ -727,6 +731,34 @@ class Study:
             )
             cancel_job(job_name)
 
+    def _kill_stuck_agents(self, cases: list[Case]):
+        """Cancel sweep agent jobs whose wandb run has gone stale.
+
+        An agent runs exactly one trial then should exit.
+        If the wandb agent wrapper angs after that trial finishes,
+        the SLURM job holds a GPU until it hits the hard walltime limit.
+        Kill agent jobs old enough to have plausibly finished their trial once
+        wandb shows no actively heartbeating run left for the case's project
+        """
+        elapsed = get_running_job_elapsed_s()
+        if not elapsed:
+            return
+        for case in cases:
+            if not case.is_hyperparam_case():
+                continue
+            job_name = self.agent_job_name(case)
+            job_elapsed = elapsed.get(job_name)
+            if job_elapsed is None or job_elapsed < WATCHDOG_MIN_AGE_S:
+                continue
+            if has_live_agent_run(self.wandb_project_name(case), AGENT_HEARTBEAT_STALL_S):
+                continue
+            logger.warning(
+                f"Agent job {job_name} has run {job_elapsed}s with no actively heartbeating "
+                f"wandb run, likely a zombied agent wrapper. Killing so launch_sweep can resubmit.\n"
+                f"Case:\t{case}"
+            )
+            cancel_job(job_name)
+
     def run_unfinished_cases(self, skip_tuning: bool, enable_parallelism: bool):
         """Loop until every runnable case has a result file.
 
@@ -754,6 +786,7 @@ class Study:
                     time.sleep(ORCHESTRATION_POLL_INTERVAL_S)
                     continue
                 self._kill_stuck_jobs(unfinished)
+                self._kill_stuck_agents(unfinished)
             else:
                 running_job_names = set()
 
