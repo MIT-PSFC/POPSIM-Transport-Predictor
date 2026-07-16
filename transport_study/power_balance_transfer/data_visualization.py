@@ -34,4 +34,10 @@ class DataVisualization(DataVisualizationBase):
             ["ne20_line_avg_coral", "B0_coral"],
             ["P_aux_MW_coral", "kappa_coral"],
         ],
+        "physics-coral": [
+            ["Ip_MA_pcoral", "beta_pcoral"],
+            ["q_star_pcoral", "epsilon_pcoral"],
+            ["f_G_pcoral", "aB0_pcoral"],
+            ["surface_power_density_pcoral", "kappa_pcoral"],
+        ],
     }

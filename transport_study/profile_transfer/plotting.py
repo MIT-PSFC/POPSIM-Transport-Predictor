@@ -54,12 +54,14 @@ DA_COLORS = {
     "none": "#c0c0c0",
     "mixing": "#ad2cfe",
     "transfer": "#00ff5e",
+    "transfer_pretrain": "#00a33c",
 }
 
 DA_LABELS = {
     "none": "No adaptation",
     "mixing": "Mixing",
     "transfer": "Transfer",
+    "transfer_pretrain": "Transfer pretrain",
 }
 
 METRIC_LABELS = {
@@ -331,7 +333,7 @@ def freeze_shapes_comparison(metrics_ds: xr.Dataset, figure_dir: Path):
         return
     out_dir = Path(figure_dir) / "comparison" / "freeze_shapes_comparison"
     td_colors = _training_data_colors(_coord_values(metrics_ds, "training_data"))
-    da_linestyles = {"none": ":", "mixing": "-", "transfer": "--"}
+    da_linestyles = {"none": ":", "mixing": "-", "transfer": "--", "transfer_pretrain": "-."}
 
     for model_type in _coord_values(metrics_ds, "model_type"):
         if model_type not in MODELS_WITH_SHAPES:

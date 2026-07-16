@@ -428,7 +428,7 @@ class DataVisualizationBase:
         save_dir = Path(figure_dir) / "data_visualization" / "domain_overlap"
         colors = _device_colors()
 
-        methods = ["raw", "physics", "z_score", "coral"]
+        methods = ["raw", "physics", "z_score", "coral", "physics-coral"]
         if all((save_dir / f"domain_overlap_{method}.png").exists() for method in methods):
             return
 

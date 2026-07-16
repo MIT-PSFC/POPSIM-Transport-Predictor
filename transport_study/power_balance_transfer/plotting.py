@@ -65,6 +65,7 @@ NORM_COLORS = {
     "physics": "#8dff36",
     "z_score": "#0095ff",
     "coral": "#ff60ec",
+    "physics-coral": "#ffb52e",
 }
 
 NORM_LABELS = {
@@ -72,18 +73,21 @@ NORM_LABELS = {
     "physics": "Physics",
     "z_score": "Z-score",
     "coral": "CORAL",
+    "physics-coral": "Physics CORAL",
 }
 
 DA_COLORS = {
     "none": "#c0c0c0",
     "mixing": "#ad2cfe",
     "transfer": "#00ff5e",
+    "transfer_pretrain": "#00a33c",
 }
 
 DA_LABELS = {
     "none": "No adaptation",
     "mixing": "Mixing",
     "transfer": "Transfer",
+    "transfer_pretrain": "Transfer pretrain",
 }
 
 # Submodule prereq cases predict P_oh / P_rad, not Wtot, so their errors are
