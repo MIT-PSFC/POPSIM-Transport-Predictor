@@ -185,23 +185,27 @@ def cancel_job(job_name: str, partition: str | None = None) -> None:
     """
     if partition is None:
         partition = query_partitions()
-    result = subprocess.run(
-        [
-            "scancel",
-            "-p",
-            partition,
-            "-u",
-            getpass.getuser(),
-            "-n",
-            job_name,
-            "--state=RUNNING",
-        ],
-        check=False,
-        capture_output=True,
-        text=True,
-    )
-    if result.returncode != 0:
-        logger.error(f"scancel failed for job {job_name}: {result.stderr}")
+    # Unlike squeue -p, scancel -p takes a single partition name and treats a
+    # comma-separated list as one literal (nonexistent) name, matching no jobs
+    # while still exiting 0, so cancel each partition separately
+    for single_partition in partition.split(","):
+        result = subprocess.run(
+            [
+                "scancel",
+                "-p",
+                single_partition,
+                "-u",
+                getpass.getuser(),
+                "-n",
+                job_name,
+                "--state=RUNNING",
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            logger.error(f"scancel failed for job {job_name}: {result.stderr}")
 
 
 def count_idle_gpus(partition: str | None = None, buffer_gpus: int | None = None) -> int:
