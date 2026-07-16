@@ -258,7 +258,17 @@ def get_ds(
         raise ValueError(f"Unknown source dataset: {source_ds!r}. Available: {set(config.dataset_paths)}")
     ds_path = Path(config.dataset_paths[source_ds])
 
-    ds = xr.open_dataset(ds_path).astype(jax.numpy.float64 if jax.config.jax_enable_x64 else jax.numpy.float32)
+    ds = xr.open_dataset(ds_path)
+
+    if study_type == "power_balance_transfer":
+        # Power balance only uses scalar time series. Drop profile variables
+        # before the eager astype below so their (shot, time, rho) arrays are
+        # never read from disk. Keeping them OOMs training jobs: concatenating
+        # devices with mismatched rho grids NaN-pads every profile variable to
+        # the union grid across all shots, blowing past the SLURM memory request
+        ds = ds.drop_dims([d for d in ("rho", "psi_n") if d in ds.dims])
+
+    ds = ds.astype(jax.numpy.float64 if jax.config.jax_enable_x64 else jax.numpy.float32)
 
     if EPISODE_DIM not in ds.dims:
         raise ValueError(f"Expected dataset to have {EPISODE_DIM} dimension, but it was not found. Found dimensions: {ds.dims}")
