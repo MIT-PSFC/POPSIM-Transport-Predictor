@@ -9,6 +9,7 @@ from transport_study.modules.normalization import (
     NORM_INPUT_VARS,
     CoralNormalizer,
     InputNormalizer,
+    PhysicsCoralNormalizer,
     PhysicsNormalizer,
     RawNormalizer,
     ZScoreNormalizer,
@@ -135,7 +136,7 @@ def test_coral_aligns_covariance():
 
 
 def test_make_normalizer_identity_without_data():
-    for method, cls in [("z_score", ZScoreNormalizer), ("coral", CoralNormalizer)]:
+    for method, cls in [("z_score", ZScoreNormalizer), ("coral", CoralNormalizer), ("physics-coral", PhysicsCoralNormalizer)]:
         norm = make_normalizer(method, train_ds=None, n_devices=N_DEVICES)
         assert isinstance(norm, cls)
         fitted = make_normalizer(method, train_ds=_toy_dataset(), n_devices=N_DEVICES)

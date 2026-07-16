@@ -16,6 +16,8 @@ Methods:
 - z_score: per-device zero mean and unit variance
 - coral: per-device covariance alignment to the pooled training covariance
   (https://arxiv.org/abs/1612.01939)
+- physics-coral: the physics transform followed by CORAL alignment fitted in
+  the dimensionless physics feature space
 
 organize_data.normalize_domain implements the same math on whole datasets, it
 remains for data visualization only.
@@ -26,6 +28,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import chex
+import jax
 import jax.numpy as jnp
 import numpy as np
 import xarray as xr
@@ -54,6 +57,12 @@ CORAL_REG = 1e-6
 # A device needs at least this many complete samples for a meaningful
 # covariance, below it the device keeps the identity transform
 MIN_CORAL_SAMPLES = 8
+
+# Methods whose per-device statistics are fitted from data
+# Their transfer cases pretrain through a dedicated transfer_pretrain prereq
+# case whose stats are fitted on the combined historic + target data and
+# inherited via the checkpoint restore (see Study.Case.transfer_pretrain_case)
+STAT_NORMALIZATIONS = ("z_score", "coral", "physics-coral")
 
 
 class InputNormalizer(TimeIndepModule):
@@ -148,32 +157,42 @@ class RawNormalizer(InputNormalizer):
         return vec
 
 
-class PhysicsNormalizer(InputNormalizer):
-    """Dimensionless / device-invariant features computed in-graph.
+def physics_feature_vec(vec: jnp.ndarray) -> jnp.ndarray:
+    """The dimensionless physics features for a stacked 7-input vector.
 
-    Stateless, nothing is fitted. Output slot mapping (slot name -> feature):
+    Slot mapping (slot name -> feature):
     - Ip_MA          -> Ip_MA (kept raw, sufficiently device-invariant)
     - B0             -> q_star (zero triangularity, consistent with H89/H98)
     - R0             -> epsilon = a_minor / R0
-    - a_minor        -> a_minor * B0
+    - a_minor        -> aB0 = a_minor * B0 (dimensional, but the dimensionless
+                        alternatives like normalized gyroradius need a temperature,
+                        which the scaling-law baselines do not have. A fair
+                        comparison keeps the same information budget)
     - kappa          -> kappa
     - ne20_line_avg  -> Greenwald fraction f_G
     - P_aux_MW       -> P_aux / plasma surface area
+    """
+    ip_ma, b0, r0, a_minor, kappa, ne20, p_aux = vec
+    epsilon = a_minor / r0
+    f_shaping = calc_f_shaping(epsilon, kappa, jnp.zeros_like(epsilon))
+    q_star = calc_q_star(b0, r0, epsilon, ip_ma, f_shaping)
+    greenwald_limit = ip_ma / (jnp.pi * a_minor**2)
+    f_g = ne20 / greenwald_limit
+    a_b0 = a_minor * b0
+    surface_area = calc_plasma_surface_area(r0, epsilon, kappa)
+    surface_power_density = p_aux / surface_area
+    return jnp.stack([ip_ma, q_star, epsilon, a_b0, kappa, f_g, surface_power_density])
 
-    beta is excluded, it needs Wtot which is module state, not an input.
+
+class PhysicsNormalizer(InputNormalizer):
+    """Dimensionless / device-invariant features computed in-graph.
+
+    Stateless, nothing is fitted. See physics_feature_vec for the slot
+    mapping.
     """
 
     def _normalize_vec(self, vec: jnp.ndarray, ds_source_idx: ArrayLike) -> jnp.ndarray:
-        ip_ma, b0, r0, a_minor, kappa, ne20, p_aux = vec
-        epsilon = a_minor / r0
-        f_shaping = calc_f_shaping(epsilon, kappa, jnp.zeros_like(epsilon))
-        q_star = calc_q_star(b0, r0, epsilon, ip_ma, f_shaping)
-        greenwald_limit = ip_ma / (jnp.pi * a_minor**2)
-        f_g = ne20 / greenwald_limit
-        a_b0 = a_minor * b0
-        surface_area = calc_plasma_surface_area(r0, epsilon, kappa)
-        surface_power_density = p_aux / surface_area
-        return jnp.stack([ip_ma, q_star, epsilon, a_b0, kappa, f_g, surface_power_density])
+        return physics_feature_vec(vec)
 
 
 class ZScoreNormalizer(InputNormalizer):
@@ -224,64 +243,148 @@ class ZScoreNormalizer(InputNormalizer):
         return cls(means=jnp.asarray(means), stds=jnp.asarray(stds))
 
 
-class CoralNormalizer(InputNormalizer):
-    """Per-device CORAL alignment to the pooled training covariance.
+def identity_coral_stats(n_devices: int, n_features: int) -> tuple[jnp.ndarray, jnp.ndarray]:
+    """Identity CORAL statistics: zero means, identity transforms."""
+    return (
+        jnp.zeros((n_devices, n_features)),
+        jnp.tile(jnp.eye(n_features), (n_devices, 1, 1)),
+    )
+
+
+def fit_coral_stats(features: np.ndarray, source_idx: np.ndarray, n_devices: int) -> tuple[jnp.ndarray, jnp.ndarray] | None:
+    """Per-device CORAL statistics from an (N, F) feature matrix.
 
     For device d the transform is: center with the device mean, whiten with
     C_d^{-1/2}, re-color with C_ref^{1/2} (C_ref the pooled covariance over
-    all fitting data), then re-add the device mean. transforms has shape
-    (n_devices, 7, 7) and means (n_devices, 7), rows follow the global
-    config.ds_source_to_idx. Unfitted devices keep the identity transform.
+    all fitting data), then re-add the device mean. Only rows complete in all
+    F features contribute (covariances need complete rows). Devices with fewer
+    than MIN_CORAL_SAMPLES complete rows keep the identity transform. Returns
+    None when the whole pooled set is below MIN_CORAL_SAMPLES.
+    """
+    n_features = features.shape[1]
+    valid = ~np.any(np.isnan(features), axis=1)
+    pooled = features[valid]
+    if len(pooled) < MIN_CORAL_SAMPLES:
+        logger.warning(f"CORAL fit got only {len(pooled)} complete samples, using identity transforms")
+        return None
+    cov_ref = np.cov(pooled, rowvar=False)
+    cr_pos_half = np.real(fractional_matrix_power(cov_ref + CORAL_REG * np.eye(n_features), 0.5))
+
+    means = np.zeros((n_devices, n_features))
+    transforms = np.tile(np.eye(n_features), (n_devices, 1, 1))
+    for device_val in np.unique(source_idx[valid]):
+        device = int(device_val)
+        rows = features[valid & (source_idx == device)]
+        if len(rows) < MIN_CORAL_SAMPLES:
+            continue
+        cov_device = np.cov(rows, rowvar=False)
+        cd_neg_half = np.real(fractional_matrix_power(cov_device + CORAL_REG * np.eye(n_features), -0.5))
+        means[device] = np.mean(rows, axis=0)
+        transforms[device] = cd_neg_half @ cr_pos_half
+    return jnp.asarray(means), jnp.asarray(transforms)
+
+
+def apply_coral(vec: jnp.ndarray, ds_source_idx: ArrayLike, means: jnp.ndarray, transforms: jnp.ndarray) -> jnp.ndarray:
+    """Apply the device's CORAL transform to a feature vector."""
+    idx = jnp.asarray(ds_source_idx).astype(jnp.int32)
+    mean = jnp.take(means, idx, axis=0)
+    transform = jnp.take(transforms, idx, axis=0)
+    return (vec - mean) @ transform + mean
+
+
+class CoralNormalizer(InputNormalizer):
+    """Per-device CORAL alignment to the pooled training covariance.
+
+    transforms has shape (n_devices, 7, 7) and means (n_devices, 7), rows
+    follow the global config.ds_source_to_idx. Unfitted devices keep the
+    identity transform. See fit_coral_stats for the math.
     """
 
     means: jnp.ndarray
     transforms: jnp.ndarray
 
     def _normalize_vec(self, vec: jnp.ndarray, ds_source_idx: ArrayLike) -> jnp.ndarray:
-        idx = jnp.asarray(ds_source_idx).astype(jnp.int32)
-        mean = jnp.take(self.means, idx, axis=0)
-        transform = jnp.take(self.transforms, idx, axis=0)
-        return (vec - mean) @ transform + mean
+        return apply_coral(vec, ds_source_idx, self.means, self.transforms)
 
     @classmethod
     def identity(cls, n_devices: int) -> CoralNormalizer:
-        return cls(
-            means=jnp.zeros((n_devices, N_FEATURES)),
-            transforms=jnp.tile(jnp.eye(N_FEATURES), (n_devices, 1, 1)),
-        )
+        means, transforms = identity_coral_stats(n_devices, N_FEATURES)
+        return cls(means=means, transforms=transforms)
 
     @classmethod
     def fit(cls, ds: xr.Dataset, n_devices: int) -> CoralNormalizer:
         """Fit per-device CORAL transforms over exactly the 7 input vars.
 
-        Only rows complete in all 7 vars contribute (covariances need complete
-        rows). Devices with fewer than MIN_CORAL_SAMPLES complete rows keep the
-        identity transform, a covariance from a handful of samples is
-        ill-conditioned. (normalize_domain also included Wtot_MJ in its
-        feature matrix, the module fits only the model inputs - intentional
-        cleanup.)
+        (normalize_domain also included Wtot_MJ in its feature matrix, the
+        module fits only the model inputs - intentional cleanup.)
         """
         features, source_idx = _feature_matrix(ds)
-        valid = ~np.any(np.isnan(features), axis=1)
-        pooled = features[valid]
-        if len(pooled) < MIN_CORAL_SAMPLES:
-            logger.warning(f"CORAL fit got only {len(pooled)} complete samples, using identity transforms")
+        stats = fit_coral_stats(features, source_idx, n_devices)
+        if stats is None:
             return cls.identity(n_devices)
-        cov_ref = np.cov(pooled, rowvar=False)
-        cr_pos_half = np.real(fractional_matrix_power(cov_ref + CORAL_REG * np.eye(N_FEATURES), 0.5))
+        means, transforms = stats
+        return cls(means=means, transforms=transforms)
 
-        means = np.zeros((n_devices, N_FEATURES))
-        transforms = np.tile(np.eye(N_FEATURES), (n_devices, 1, 1))
-        for device_val in np.unique(source_idx[valid]):
-            device = int(device_val)
-            rows = features[valid & (source_idx == device)]
-            if len(rows) < MIN_CORAL_SAMPLES:
-                continue
-            cov_device = np.cov(rows, rowvar=False)
-            cd_neg_half = np.real(fractional_matrix_power(cov_device + CORAL_REG * np.eye(N_FEATURES), -0.5))
-            means[device] = np.mean(rows, axis=0)
-            transforms[device] = cd_neg_half @ cr_pos_half
-        return cls(means=jnp.asarray(means), transforms=jnp.asarray(transforms))
+
+class PhysicsCoralNormalizer(InputNormalizer):
+    """The physics transform followed by CORAL alignment in physics space.
+
+    The CORAL statistics are fitted on the physics-transformed training
+    features, so the alignment corrects the per-device distribution of the
+    dimensionless parameters rather than the raw inputs.
+    Buffer shapes match CoralNormalizer.
+    """
+
+    means: jnp.ndarray
+    transforms: jnp.ndarray
+
+    def _normalize_vec(self, vec: jnp.ndarray, ds_source_idx: ArrayLike) -> jnp.ndarray:
+        phys = physics_feature_vec(vec)
+        return apply_coral(phys, ds_source_idx, self.means, self.transforms)
+
+    @classmethod
+    def identity(cls, n_devices: int) -> PhysicsCoralNormalizer:
+        means, transforms = identity_coral_stats(n_devices, N_FEATURES)
+        return cls(means=means, transforms=transforms)
+
+    @classmethod
+    def fit(cls, ds: xr.Dataset, n_devices: int) -> PhysicsCoralNormalizer:
+        """Fit per-device CORAL transforms in the physics feature space."""
+        features, source_idx = _feature_matrix(ds)
+        phys_rows = np.asarray(jax.vmap(physics_feature_vec)(jnp.asarray(features)))
+        stats = fit_coral_stats(phys_rows, source_idx, n_devices)
+        if stats is None:
+            return cls.identity(n_devices)
+        means, transforms = stats
+        return cls(means=means, transforms=transforms)
+
+
+class CoralFeatureNormalizer(TimeIndepModule):
+    """Generic per-device CORAL stage over an arbitrary feature vector.
+
+    Used by the profile predictor on its 10 dimensionless nn_inputs. The
+    statistics are frozen buffers exactly like the InputNormalizer methods:
+    they checkpoint with the model and are never in a trainable selection.
+    """
+
+    means: jnp.ndarray
+    transforms: jnp.ndarray
+
+    def __call__(self, vec: jnp.ndarray, ds_source_idx: ArrayLike) -> jnp.ndarray:
+        return apply_coral(vec, ds_source_idx, self.means, self.transforms)
+
+    @classmethod
+    def identity(cls, n_devices: int, n_features: int) -> CoralFeatureNormalizer:
+        means, transforms = identity_coral_stats(n_devices, n_features)
+        return cls(means=means, transforms=transforms)
+
+    @classmethod
+    def fit_from_features(cls, features: np.ndarray, source_idx: np.ndarray, n_devices: int) -> CoralFeatureNormalizer:
+        stats = fit_coral_stats(features, source_idx, n_devices)
+        if stats is None:
+            return cls.identity(n_devices, features.shape[1])
+        means, transforms = stats
+        return cls(means=means, transforms=transforms)
 
 
 def _feature_matrix(ds: xr.Dataset) -> tuple[np.ndarray, np.ndarray]:
@@ -314,4 +417,6 @@ def make_normalizer(
         return ZScoreNormalizer.identity(n_devices) if train_ds is None else ZScoreNormalizer.fit(train_ds, n_devices)
     if method == "coral":
         return CoralNormalizer.identity(n_devices) if train_ds is None else CoralNormalizer.fit(train_ds, n_devices)
+    if method == "physics-coral":
+        return PhysicsCoralNormalizer.identity(n_devices) if train_ds is None else PhysicsCoralNormalizer.fit(train_ds, n_devices)
     raise ValueError(f"Unknown normalization method: {method}")
