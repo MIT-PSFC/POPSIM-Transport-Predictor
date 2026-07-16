@@ -17,6 +17,7 @@ MIN_TAUE = 0.001  # Default minimum reasonable value for tau_e [s]
 MAX_TAUE = 0.3  # Maximum reasonable value for tau_e [s]
 MIN_POWER = -20  # Minimum reasonable value for power (dW/dt) [MW]
 MAX_POWER = 20  # Maximum reasonable value for power (dW/dt) [MW]
+MIN_WTOT_MJ = 0.001  # Floor for predicted stored energy [MJ], keeps Wtot strictly positive
 
 
 @chex.dataclass
@@ -249,6 +250,22 @@ class PowerBalance(TimeDepModule):
         P_cond_MW: float
         taue_predictor_output: TauePredictorOutputs
 
+    @staticmethod
+    def positive_wtot(wtot_mj: ArrayLike) -> ArrayLike:
+        """Stored energy floored to MIN_WTOT_MJ, used for outputs and physics terms.
+
+        The Euler stepper can integrate the raw state below zero
+        (nothing bounds dW/dt against it), so every consumer of the
+        state goes through this floor instead of reading it raw.
+        """
+        return jnp.maximum(wtot_mj, MIN_WTOT_MJ)
+
+    @staticmethod
+    def guard_wtot_dot(wtot_mj: ArrayLike, wtot_mj_dot: ArrayLike) -> ArrayLike:
+        """Block further decrease once the integrated state is at the floor,
+        so the raw state cannot run away to large negative values."""
+        return jnp.where(wtot_mj <= MIN_WTOT_MJ, jnp.maximum(wtot_mj_dot, 0.0), wtot_mj_dot)
+
 
 class PowerBalanceScalingLaw(PowerBalance):
     taue_predictor: ScalingLawPredictor
@@ -301,17 +318,18 @@ class PowerBalanceScalingLaw(PowerBalance):
         taue_predictor_output = self.taue_predictor(taue_predictor_inputs)
 
         taue_pred = taue_predictor_output.taue_pred
-        P_cond_MW = state.Wtot_MJ / taue_pred
+        Wtot_MJ = self.positive_wtot(state.Wtot_MJ)
+        P_cond_MW = Wtot_MJ / taue_pred
         P_rad_MW = p_rad_predictor_output.P_rad_MW_pred
         P_oh_MW = p_oh_predictor_output.P_oh_MW_pred
 
         P_abs_MW = inputs.P_aux_MW + P_oh_MW
 
-        Wtot_MJ_dot = P_abs_MW - P_cond_MW - P_rad_MW
+        Wtot_MJ_dot = self.guard_wtot_dot(state.Wtot_MJ, P_abs_MW - P_cond_MW - P_rad_MW)
 
         state_dot = PowerBalance.State(Wtot_MJ=Wtot_MJ_dot)
         output = PowerBalance.Output(
-            Wtot_MJ_pred=state.Wtot_MJ,
+            Wtot_MJ_pred=Wtot_MJ,
             P_cond_MW=P_cond_MW,
             taue_predictor_output=taue_predictor_output,
         )
@@ -379,17 +397,18 @@ class PowerBalanceSciML(PowerBalance):
         taue_predictor_output = self.taue_predictor(taue_predictor_inputs)
 
         taue_pred = taue_predictor_output.taue_pred
-        P_cond_MW = state.Wtot_MJ / taue_pred
+        Wtot_MJ = self.positive_wtot(state.Wtot_MJ)
+        P_cond_MW = Wtot_MJ / taue_pred
         P_rad_MW = p_rad_predictor_output.P_rad_MW_pred
         P_oh_MW = p_oh_predictor_output.P_oh_MW_pred
 
         P_abs_MW = inputs.P_aux_MW + P_oh_MW
 
-        Wtot_MJ_dot = P_abs_MW - P_cond_MW - P_rad_MW
+        Wtot_MJ_dot = self.guard_wtot_dot(state.Wtot_MJ, P_abs_MW - P_cond_MW - P_rad_MW)
 
         state_dot = PowerBalance.State(Wtot_MJ=Wtot_MJ_dot)
         output = PowerBalance.Output(
-            Wtot_MJ_pred=state.Wtot_MJ,
+            Wtot_MJ_pred=Wtot_MJ,
             P_cond_MW=P_cond_MW,
             taue_predictor_output=taue_predictor_output,
         )
@@ -406,10 +425,11 @@ class PowerBalanceUnstructuredNN(PowerBalance):
         features = self.normalizer(inputs.to_normalizer_inputs())
         nn_out = self.nn(features.to_vec())
         Wtot_MJ_dot = soft_clip(nn_out, self.min_val, self.max_val, sharpness=6).squeeze()
+        Wtot_MJ_dot = self.guard_wtot_dot(state.Wtot_MJ, Wtot_MJ_dot)
 
         state_dot = PowerBalance.State(Wtot_MJ=Wtot_MJ_dot)
         output = PowerBalance.Output(
-            Wtot_MJ_pred=state.Wtot_MJ,
+            Wtot_MJ_pred=self.positive_wtot(state.Wtot_MJ),
             P_cond_MW=jnp.nan,  # Not predicted in this model
             taue_predictor_output=TauePredictorOutputs(taue_pred=jnp.nan, debug_info={"nn_out": nn_out.squeeze()}),
         )
@@ -482,10 +502,11 @@ class PowerBalanceTransformer(PowerBalance):
         latent = token + attn_out
         nn_out = self.head(latent)
         Wtot_MJ_dot = soft_clip(nn_out, self.min_val, self.max_val, sharpness=6).squeeze()
+        Wtot_MJ_dot = self.guard_wtot_dot(state.Wtot_MJ, Wtot_MJ_dot)
 
         state_out = PowerBalanceTransformer.State(Wtot_MJ=Wtot_MJ_dot, history=new_history)
         output = PowerBalance.Output(
-            Wtot_MJ_pred=state.Wtot_MJ,
+            Wtot_MJ_pred=self.positive_wtot(state.Wtot_MJ),
             P_cond_MW=jnp.nan,  # Not predicted in this model
             taue_predictor_output=TauePredictorOutputs(taue_pred=jnp.nan, debug_info={"nn_out": nn_out.squeeze()}),
         )
