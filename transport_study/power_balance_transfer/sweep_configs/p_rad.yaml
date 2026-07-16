@@ -10,13 +10,9 @@ parameters:
   model_init_config:
     parameters:
       nn_width:
-        values: [16, 24, 32, 40, 48, 56, 64]
+        values: [32, 64, 128]
       nn_depth:
-        values: [2, 3, 4]
-  dataloader_config:
-    parameters:
-      batch_size:
-        values: [2048, 4096, 8192]
+        values: [2, 3, 4, 5, 6]
   optimizer_config:
     parameters:
       lr0:

@@ -10,11 +10,11 @@ parameters:
   model_init_config:
     parameters:
       nn_width:
-        values: [16, 24, 32, 40, 48]
+        values: [32, 64, 128]
       nn_depth:
-        values: [2, 3, 4]
+        values: [2, 3, 4, 5, 6]
       n_shapes:
-        values: [2, 3, 4, 5]
+        values: [3, 4, 5, 6]
       softmax_temp:
         distribution: log_uniform_values
         min: 0.1

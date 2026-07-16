@@ -9,17 +9,15 @@ early_terminate:
 parameters:
   model_init_config:
     parameters:
-      # Width and depth are shared by the three coefficient MLPs
-      # (transport, sources, edge). Kept small, each sample already runs a
-      # full differentiated TORAX simulation.
+      # Width and depth are shared by the three coefficient MLPs (transport, sources, edge)
       nn_width:
-        values: [8, 16, 24, 32]
+        values: [8, 16, 32, 64]
       nn_depth:
-        values: [1, 2, 3]
+        values: [1, 2, 3, 4]
       t_final:
         values: [0.1, 0.2, 0.4]
       n_solver_steps:
-        values: [5, 10]
+        values: [4, 6, 8]
   optimizer_config:
     parameters:
       lr0:
