@@ -20,6 +20,7 @@ from transport_study.config import config
 from transport_study.modules.profile_predictor.train_configs import (
     PROFILE_PREDICTOR_TORAX_CONFIGS,
 )
+from transport_study.orchestration.case_analysis import run_case_analysis_parallel
 from transport_study.orchestration.organize_data import PROFILE_TARGET_VARS
 from transport_study.orchestration.study import (
     HYPERPARAM_TARGET_SHOTS,
@@ -29,7 +30,6 @@ from transport_study.orchestration.study import (
 )
 from transport_study.profile_transfer.case_reports import (
     generate_case_reports,
-    run_analysis_parallel,
     torax_relaxation_report,
 )
 from transport_study.profile_transfer.data_visualization import DataVisualization
@@ -63,6 +63,8 @@ class ProfileStudy(Study):
     SWEEP_CONFIG_DIR = Path(PACKAGE_ROOT) / "profile_transfer" / "sweep_configs"
     STUDY_TYPE = "profile_transfer"
     DATA_VISUALIZATION = DataVisualization
+    ANALYSIS_METRICS_MODULE = "transport_study.profile_transfer.study_metrics"
+    ANALYSIS_REPORTS_MODULE = "transport_study.profile_transfer.case_reports"
     CASE_AXIS_FIELDS = (
         "model_types",
         "training_datasets",
@@ -437,7 +439,7 @@ class ProfileStudy(Study):
         # the analysis partition, and anything unfinished falls back to the serial
         # paths below (collect_metrics / generate_case_reports skip completed cases)
         if enable_parallelism:
-            run_analysis_parallel(self)
+            run_case_analysis_parallel(self)
 
         # Stage-resolved value / gradient / combined metrics for every finished
         # case, cached to collected_metrics.nc alongside collected_results.nc

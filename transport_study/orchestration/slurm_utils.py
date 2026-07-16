@@ -685,12 +685,17 @@ exit $exit_code
         logger.info(f"Submitted agent job {job_name}: {result.stdout.strip()}")
 
 
-def launch_profile_analysis_parallel(study, case) -> None:
+def launch_case_analysis_parallel(study, case) -> None:
     """Submit a CPU SLURM job computing one case's stage metrics and case report.
 
     Analysis (metrics aggregation, PDF pages, GIF frames) is matplotlib and
     numpy bound with no GPU work, so it goes to config.analysis_partition when
     set (config.partition otherwise) and requests no GPU.
+
+    The job imports the study's analysis modules from its
+    ANALYSIS_METRICS_MODULE / ANALYSIS_REPORTS_MODULE ClassVars: the metrics
+    module must export ``compute_and_save_case_metrics(study, case)`` and the
+    reports module ``generate_case_report(study, case, figure_dir)``.
     """
     partition = config.analysis_partition or config.partition
     log_dir = study.working_dir / "logs" / "logs_analysis"
@@ -710,8 +715,8 @@ def launch_profile_analysis_parallel(study, case) -> None:
     py_script = f"""\
 from pathlib import Path
 from {_importable_module(study_cls)} import {study_cls.__name__}
-from transport_study.profile_transfer.case_reports import generate_case_report
-from transport_study.profile_transfer.study_metrics import compute_and_save_case_metrics
+from {study_cls.ANALYSIS_REPORTS_MODULE} import generate_case_report
+from {study_cls.ANALYSIS_METRICS_MODULE} import compute_and_save_case_metrics
 
 study = {study_cls.__name__}(Path({study_config_path!r}))
 case = next(c for c in study.cases if str(c) == {case_str!r})

@@ -208,16 +208,23 @@ class Study:
     _tuned_model_init_updates), collect_results, and _run_analysis.
     """
 
-    # Set by subclasses: the study's nested Config class (CaseGridConfig subclass)
+    # Stuff set by subclasses:
+    # study's nested Config class (CaseGridConfig subclass)
     Config: ClassVar[type[CaseGridConfig]]
-    # Set by subclasses: directory holding the per-model-type wandb sweep YAMLs
+    # directory holding the per-model-type wandb sweep YAMLs
     SWEEP_CONFIG_DIR: ClassVar[Path]
-    # Set by subclasses: study_type passed to organize_data (selects get_ds branch)
+    # study_type passed to organize_data (selects get_ds branch)
     STUDY_TYPE: ClassVar[str]
-    # Set by subclasses: the study's DataVisualization class
+    # the study's DataVisualization class
     DATA_VISUALIZATION: ClassVar[type]
-    # Set by subclasses: config attribute names of the case-grid axes (logged at init)
+    # config attribute names of the case-grid axes (logged at init)
     CASE_AXIS_FIELDS: ClassVar[tuple[str, ...]] = ()
+    # dotted paths of the per-case analysis modules dispatched over SLURM (see orchestration.case_analysis)
+    # The metrics module must export a compute_and_save_case_metrics function
+    # The reports module a generate_case_report and an analysis_case_done function
+    ANALYSIS_METRICS_MODULE: ClassVar[str]
+    ANALYSIS_REPORTS_MODULE: ClassVar[str]
+
     # Tuned-config dataloader keys merged by strict indexing (KeyError when a tuned config lacks one)
     TUNED_DATALOADER_KEYS: ClassVar[tuple[str, ...]] = ()
     # Tuned-config loss keys merged with .get fallback to the base value (tuned configs on disk may lack them)

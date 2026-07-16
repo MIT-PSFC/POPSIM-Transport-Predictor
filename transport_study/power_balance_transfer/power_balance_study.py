@@ -16,12 +16,14 @@ from pydantic import Field, field_validator
 
 from transport_study import PACKAGE_ROOT
 from transport_study.config import config
+from transport_study.orchestration.case_analysis import run_case_analysis_parallel
 from transport_study.orchestration.study import (
     HYPERPARAM_TARGET_SHOTS,
     CaseGridConfig,
     ModelTrainSpec,
     Study,
 )
+from transport_study.power_balance_transfer.case_reports import generate_case_reports
 from transport_study.power_balance_transfer.data_visualization import DataVisualization
 from transport_study.power_balance_transfer.plotting import (
     data_normalization_comparison,
@@ -29,6 +31,8 @@ from transport_study.power_balance_transfer.plotting import (
     model_comparison,
     training_dataset_comparison,
 )
+from transport_study.power_balance_transfer.study_metrics import collect_metrics
+from transport_study.power_balance_transfer.tables import write_comparison_tables
 
 # The 7 physical inputs every power-balance model consumes. Normalization is
 # done inside the modules (transport_study.modules.normalization), so the
@@ -57,6 +61,8 @@ class PowerBalanceStudy(Study):
     SWEEP_CONFIG_DIR = Path(PACKAGE_ROOT) / "power_balance_transfer" / "sweep_configs"
     STUDY_TYPE = "power_balance_transfer"
     DATA_VISUALIZATION = DataVisualization
+    ANALYSIS_METRICS_MODULE = "transport_study.power_balance_transfer.study_metrics"
+    ANALYSIS_REPORTS_MODULE = "transport_study.power_balance_transfer.case_reports"
     CASE_AXIS_FIELDS = (
         "model_types",
         "training_datasets",
@@ -423,6 +429,16 @@ class PowerBalanceStudy(Study):
     ############
 
     def _run_analysis(self, enable_parallelism: bool) -> None:
+        # Per-case analysis (stage metrics + best/worst shot PDFs) is CPU-bound
+        # matplotlib and numpy work, so we can fan it out over SLURM to speed things up
+        if enable_parallelism:
+            run_case_analysis_parallel(self)
+
+        # Stage-resolved (rampup / flattop ohmic / flattop aux / rampdown)
+        # time-averaged errors for every finished case, cached to
+        # collected_metrics.nc alongside collected_results.nc
+        metrics_ds = collect_metrics(self)
+
         results_ds = xr.load_dataset(self.collected_results_path())
 
         logger.opt(colors=True).info("<bold><magenta>TRAINING DATA COMPARISON</magenta></bold>")
@@ -436,6 +452,14 @@ class PowerBalanceStudy(Study):
 
         logger.opt(colors=True).info("<bold><magenta>DOMAIN ADAPTATION COMPARISON</magenta></bold>")
         domain_adaptation_comparison(results_ds, self.figure_dir)
+
+        # Per-case deep dives: best/worst holdout shot PDFs by time-averaged error
+        logger.opt(colors=True).info("<bold><magenta>CASE REPORTS</magenta></bold>")
+        generate_case_reports(self, self.figure_dir)
+
+        # One markdown table per case axis and combination of the other axes
+        logger.opt(colors=True).info("<bold><magenta>COMPARISON TABLES</magenta></bold>")
+        write_comparison_tables(results_ds, metrics_ds, self.figure_dir)
 
 
 run_study = PowerBalanceStudy.run_study
