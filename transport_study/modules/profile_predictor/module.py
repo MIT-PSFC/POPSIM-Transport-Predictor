@@ -203,6 +203,12 @@ class Inputs:
         return temp_keV
 
     @property
+    def w_approx(self):
+        # Beta-derived stored energy estimate [MJ], W = (3/2) p V
+        pressure_Pa = self.beta * self.B0**2 / (2 * mu_0)
+        return 1.5 * pressure_Pa * self.volume_approx / 1e6
+
+    @property
     def nu_star(self):
         # characteristic collisionality, from https://arxiv.org/pdf/2406.18442 eqn 2
         # SI formula with temperature in joules, rearranged so the physical

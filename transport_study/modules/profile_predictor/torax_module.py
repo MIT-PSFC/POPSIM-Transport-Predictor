@@ -31,6 +31,19 @@ TRANSPORT_COEFFICIENT_NAMES = {
     "qlknn": ("ITG_flux_ratio_correction", "ETG_correction_factor", "collisionality_multiplier"),
 }
 
+# Coefficients predicted by the sources network, in the order of the network outputs
+SOURCE_COEFFICIENT_NAMES = (
+    "S_total",
+    "P_aux_total",
+    "gaussian_location",
+    "gaussian_width",
+    "electron_heat_fraction",
+)
+
+# Reference confinement time [s] anchoring the NN aux-heating scale:
+# P_aux_total is a bounded fraction of w_approx / TAU_REF
+TAU_REF_S = 0.05
+
 # TORAX transport.model_name expected in the torax_config for each transport model
 TORAX_TRANSPORT_MODEL_NAMES = {
     "constant": "constant",
@@ -524,7 +537,9 @@ class ProfilePredictorTorax(TimeIndepModule):
         )
         self.nn_sources = RtdMLP(
             in_size=10,
-            out_size=1,  # S_total
+            # One output per SOURCE_COEFFICIENT_NAMES entry:
+            # S_total,P_aux_total, gaussian_location, gaussian_width, electron_heat_fraction
+            out_size=len(SOURCE_COEFFICIENT_NAMES),
             width_size=nn_width,
             depth=nn_depth,
             activation=Activation.RELU,
@@ -644,26 +659,43 @@ class ProfilePredictorTorax(TimeIndepModule):
             # learns three scalar correction knobs, each a log-scale multiplier
             # centered on its TORAX default so a zero-mean random init starts at
             # stock QLKNN behavior.
-            #   ITG_flux_ratio_correction: ~0.22 - 4.5 around 1, multiplies the
+            # MAST sitsoutside the QuaLiKiz training domain (clip_inputs saturates),
+            # so the knobs need more authority to compensate.
+            #   ITG_flux_ratio_correction: ~0.08 - 12 around 1, multiplies the
             #     ITG electron heat flux (QLKNN10D heritage value 2.0 in range)
-            #   ETG_correction_factor: ~0.07 - 1.5 around the default 1/3,
+            #   ETG_correction_factor: ~0.03 - 4 around the default 1/3,
             #     multiplies the ETG electron heat flux
-            #   collisionality_multiplier: ~0.22 - 4.5 around 1, scales the
+            #   collisionality_multiplier: ~0.08 - 12 around 1, scales the
             #     collisionality input (QLKNN10D heritage value 0.25 in range)
             return {
-                "ITG_flux_ratio_correction": jnp.exp(1.5 * jnp.tanh(nn_transport_out[0:1])),
-                "ETG_correction_factor": (1.0 / 3.0) * jnp.exp(1.5 * jnp.tanh(nn_transport_out[1:2])),
-                "collisionality_multiplier": jnp.exp(1.5 * jnp.tanh(nn_transport_out[2:3])),
+                "ITG_flux_ratio_correction": jnp.exp(2.5 * jnp.tanh(nn_transport_out[0:1])),
+                "ETG_correction_factor": (1.0 / 3.0) * jnp.exp(2.5 * jnp.tanh(nn_transport_out[1:2])),
+                "collisionality_multiplier": jnp.exp(2.5 * jnp.tanh(nn_transport_out[2:3])),
             }
 
     def _nn_coefficients(self, inputs: Inputs, debug: bool = False) -> dict:
-        # Get the transport model free parameters and the particle source from
-        # neural networks, bounded to physical ranges so the TORAX solver stays
-        # stable during training.
-        #   S_total: 0 - 10 (x 1e21 below)
+        # Get the transport model free parameters and the particle / heat
+        # sources from neural networks, bounded to physical ranges so the
+        # TORAX solver stays stable during training.
+        # Source network outputs are ordered per SOURCE_COEFFICIENT_NAMES:
+        #   S_total: 0 - inf via softplus (x 1e21 below)
+        #   P_aux_total: 0 - 4x the w_approx / TAU_REF_S power scale [MW].
+        #     The heating magnitude is NN-inferred (betan encodes the stored
+        #     energy the heating sustains) rather than a measured input, so
+        #     every model has identical inputs.
+        #     The -2 bias makes random-init heating small, starting the solver near
+        #     the ohmic-only behavior (same trick as the edge-Te bias below).
+        #   gaussian_location: 0 - 0.8 (deposition center in rho_norm)
+        #   gaussian_width: 0.05 - 0.4 (deposition width in rho_norm)
+        #   electron_heat_fraction: 0.2 - 0.8 (both channels keep NN gradient)
         nn_inputs = inputs.nn_inputs
         coeffs = self._transport_coefficients(self.nn_transport(nn_inputs))
-        S_total = jax.nn.softplus(self.nn_sources(nn_inputs))
+        nn_sources_out = self.nn_sources(nn_inputs)
+        S_total = jax.nn.softplus(nn_sources_out[0:1])
+        p_aux_total = 4.0 * jax.nn.sigmoid(nn_sources_out[1:2] - 2.0) * inputs.w_approx / TAU_REF_S
+        gaussian_location = 0.8 * jax.nn.sigmoid(nn_sources_out[2:3])
+        gaussian_width = 0.05 + 0.35 * jax.nn.sigmoid(nn_sources_out[3:4])
+        electron_heat_fraction = 0.2 + 0.6 * jax.nn.sigmoid(nn_sources_out[4:5])
 
         # Edge boundary conditions as NN-predicted fractions:
         #   n_e_right_bc = fraction in (0.05, 0.95) * line-averaged density
@@ -689,6 +721,10 @@ class ProfilePredictorTorax(TimeIndepModule):
         te_right_bc = 0.02 + jax.nn.sigmoid(nn_edge_out[1:2] - 5.0) * te_scale
 
         coeffs["S_total"] = S_total
+        coeffs["P_aux_total"] = p_aux_total  # [MW]
+        coeffs["gaussian_location"] = gaussian_location
+        coeffs["gaussian_width"] = gaussian_width
+        coeffs["electron_heat_fraction"] = electron_heat_fraction
         coeffs["n_e_right_bc"] = ne_right_bc  # [1e20 m^-3]
         coeffs["T_e_right_bc"] = te_right_bc  # [keV]
         if debug:
@@ -760,43 +796,44 @@ class ProfilePredictorTorax(TimeIndepModule):
             value=jnp.atleast_1d(inputs.Ip * 1e6),
         )
         S_total_update = torax_experimental.TimeVaryingScalarUpdate(value=S_total * 1e21)
+        p_aux_update = torax_experimental.TimeVaryingScalarUpdate(value=coeffs["P_aux_total"] * 1e6)
+        gaussian_location_update = torax_experimental.TimeVaryingScalarUpdate(value=coeffs["gaussian_location"])
+        gaussian_width_update = torax_experimental.TimeVaryingScalarUpdate(value=coeffs["gaussian_width"])
+        electron_heat_fraction_update = torax_experimental.TimeVaryingScalarUpdate(value=coeffs["electron_heat_fraction"])
         ne_right_bc_update = torax_experimental.TimeVaryingScalarUpdate(value=ne_right_bc * 1e20)
         te_right_bc_update = torax_experimental.TimeVaryingScalarUpdate(value=te_right_bc)
 
-        # Initial temperature profiles: parabolic (1 - rho^2) shape from
-        # core = edge BC + ~2x te_approx down to the NN edge BC, sampled at
-        # rho = 0, 0.5, 1. Scaling the init with te_approx starts the
-        # relaxation near the expected equilibrium (a flat 0.3 keV start is
-        # several keV short on high-performance C-Mod samples, so most of the
-        # few fixed 20 ms steps get burned on the transient). The clip keeps
-        # the old 0.3 keV floor where te_approx is small or unreliable.
-        # Core = edge + positive keeps the initial state strictly decreasing
-        # and continuous with the BC for any NN output: a discontinuity at the
-        # LCFS or an exactly-flat profile both NaN the solver under the
-        # critical gradient model.
+        # Initial profiles are parabolic (1 - rho^2) from a core anchor down to the NN edge BC,
+        # sampled on the static cell-center grid plus both endpoints
+        # Static shapes, so no retracing.
+        face_centers_np = np.array(self._face_centers)
+        cell_centers_np = (face_centers_np[:-1] + face_centers_np[1:]) / 2.0
+        rho_ic = jnp.array(np.concatenate([[0.0], cell_centers_np, [1.0]]))
+        ic_shape = 1.0 - rho_ic**2
+
+        # Temperature core anchor: edge BC + ~2x te_approx.
+        # Scaling the init with te_approx starts the relaxation near the expected equilibrium
+        # (a flat 0.3 keV start is several keV short on high-performance C-Mod samples,
+        # so most of the few fixed steps get burned on the transient).
+        # The clip keeps a 0.3 keV floor where te_approx is small or unreliable.
+        # Core = edge + positive keeps the initial state strictly decreasing and continuous with the BC for any NN output
+        # A discontinuity at the LCFS or an exactly-flat profile both NaN the solver under the critical gradient model
         te_core_init = te_right_bc + jnp.clip(2.0 * inputs.te_approx, 0.3, 10.0)
-        te_mid_init = te_right_bc + 0.75 * (te_core_init - te_right_bc)
-        t_init_value = jnp.concatenate([te_core_init, te_mid_init, te_right_bc])[jnp.newaxis, :]
+        t_init_value = (te_right_bc + (te_core_init - te_right_bc) * ic_shape)[jnp.newaxis, :]
         t_init_update = torax_experimental.TimeVaryingArrayUpdate(
             value=t_init_value,
-            rho_norm=jnp.array([0.0, 0.5, 1.0]),
+            rho_norm=rho_ic,
         )
 
-        # Initial density: same parabolic construction as the temperature
-        # init, from the core down to the NN edge BC, so the initial state is
-        # continuous with the BC for any NN output (the old nbar-normalized
-        # fixed-shape init left a density discontinuity at the LCFS, the
-        # exact failure mode the temperature init fix removed). The core
-        # value is set so the midplane chord average of the parabola matches
-        # the measured line average: mean of (1 - rho^2) over the chord is
-        # 2/3, so core = bc + 1.5*(line_avg - bc). ne_right_bc is a fraction
-        # in (0.05, 0.95) of ne20_line_avg, so core > bc always holds.
+        # Density core anchor set so the midplane chord average of the parabola matches the measured line average
+        # mean of (1 - rho^2) over the chord is 2/3, so core = bc + 1.5*(line_avg - bc).
+        # ne_right_bc is a fraction in (0.05, 0.95) of ne20_line_avg, so
+        # core > bc always holds and the init is continuous with the BC.
         ne_core_init = ne_right_bc + 1.5 * (inputs.ne20_line_avg - ne_right_bc)
-        ne_mid_init = ne_right_bc + 0.75 * (ne_core_init - ne_right_bc)
-        n_init_value = 1e20 * jnp.concatenate([ne_core_init, ne_mid_init, ne_right_bc])[jnp.newaxis, :]
+        n_init_value = 1e20 * (ne_right_bc + (ne_core_init - ne_right_bc) * ic_shape)[jnp.newaxis, :]
         n_init_update = torax_experimental.TimeVaryingArrayUpdate(
             value=n_init_value,
-            rho_norm=jnp.array([0.0, 0.5, 1.0]),
+            rho_norm=rho_ic,
         )
 
         mapping = {
@@ -809,12 +846,17 @@ class ProfilePredictorTorax(TimeIndepModule):
             "profile_conditions.T_e": t_init_update,
             "profile_conditions.T_i": t_init_update,
             "sources.gas_puff.S_total": S_total_update,
+            # NN-inferred auxiliary heating, absorption_fraction stays at its
+            # config value (fixed, degenerate with P_total)
+            "sources.generic_heat.P_total": p_aux_update,
+            "sources.generic_heat.gaussian_location": gaussian_location_update,
+            "sources.generic_heat.gaussian_width": gaussian_width_update,
+            "sources.generic_heat.electron_heat_fraction": electron_heat_fraction_update,
         }
         mapping.update(self._transport_provider_mapping(coeffs))
         new_provider = self.step_fn.runtime_params_provider.update_provider_from_mapping(mapping)
 
         # Build JAX-differentiable geometry from per-sample inputs
-        face_centers_np = np.array(self._face_centers)
         torax_mesh = torax_pydantic.Grid1D(face_centers=face_centers_np)
         rho_hires_norm_np = np.array(self._rho_hires_norm)
         if self.geometry_builder == "miller":
@@ -881,12 +923,12 @@ class ProfilePredictorTorax(TimeIndepModule):
             geo_provider=geo_provider,
             max_steps=self.max_steps,
             debug=debug,
-            # The Bohm-GyroBohm and QLKNN chi depend on the evolving n_e/T_e
-            # gradients (QLKNN adds a surrogate NN eval per face point), so
-            # reverse-mode autodiff stores much larger per-step intermediates than the
-            # other models (47+ GiB at full batch -> GPU OOM). Recompute the loop
-            # body activations in the backward pass instead of storing them.
-            wrap_body_in_checkpoint=self.transport_model in ("gyrobohm", "qlknn"),
+            # Recompute the loop body activations in the backward pass instead
+            # of storing them: reverse-mode memory otherwise scales with
+            # solver steps times mesh size, and OOMs the GPU at full batch
+            # The sweep now allows up to 40 steps, so every model
+            # needs the flat-memory loop.
+            wrap_body_in_checkpoint=True,
         )
 
         # n_e is in m^-3 and T_e is keV in TORAX
@@ -895,10 +937,18 @@ class ProfilePredictorTorax(TimeIndepModule):
 
         # Interpolate onto rhogrid: TORAX evolves profiles on rho_norm, which
         # for the circular geometry used here equals the normalized minor
-        # radius rho, so no flux-coordinate mapping is needed.
+        # radius rho, so no flux-coordinate mapping is needed. Augment the
+        # cell values with both endpoints before interpolating: jnp.interp
+        # flat-holds outside the data range, which would ignore the exact
+        # Dirichlet edge BC at rho = 1 (the flat-held edge overpredicts
+        # exactly where measured profiles fall steeply). Duplicating the
+        # innermost cell at rho = 0 encodes the zero-gradient axis condition.
         rho_cells = jnp.asarray(self.rho_norm_grid)
-        ne_interp = jnp.interp(inputs.rho, rho_cells, ne)
-        te_interp = jnp.interp(inputs.rho, rho_cells, te)
+        rho_full = jnp.concatenate([jnp.zeros(1), rho_cells, jnp.ones(1)])
+        ne_full = jnp.concatenate([ne[:1], ne, coeffs["n_e_right_bc"]])
+        te_full = jnp.concatenate([te[:1], te, coeffs["T_e_right_bc"]])
+        ne_interp = jnp.interp(inputs.rho, rho_full, ne_full)
+        te_interp = jnp.interp(inputs.rho, rho_full, te_full)
 
         return Outputs(
             ne=xr.DataArray(
@@ -928,11 +978,14 @@ class ProfilePredictorTorax(TimeIndepModule):
             inputs: Same as __call__ (Inputs or single-timeslice xr.Dataset).
             prescribed: Optional dict overriding NN outputs. Valid keys are the
                 transport coefficients of the configured model
-                (TRANSPORT_COEFFICIENT_NAMES[self.transport_model]) plus
-                {S_total, n_e_right_bc, T_e_right_bc}, values are floats in the same
-                units the NN outputs use (S_total in 1e21 particles/s, n_e_right_bc
-                in 1e20 m^-3, T_e_right_bc in keV, chi/D/V in m^2/s or m/s for the
-                constant model, dimensionless otherwise).
+                (TRANSPORT_COEFFICIENT_NAMES[self.transport_model]) plus the
+                source coefficients (SOURCE_COEFFICIENT_NAMES) and
+                {n_e_right_bc, T_e_right_bc}, values are floats in the same
+                units the NN outputs use (S_total in 1e21 particles/s,
+                P_aux_total in MW, gaussian_location/gaussian_width in
+                rho_norm, electron_heat_fraction dimensionless, n_e_right_bc
+                in 1e20 m^-3, T_e_right_bc in keV, chi/D/V in m^2/s or m/s
+                for the constant model, dimensionless otherwise).
                 Keys not given (or None) keep the NN prediction.
 
         Returns:

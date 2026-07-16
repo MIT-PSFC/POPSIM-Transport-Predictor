@@ -196,6 +196,11 @@ _PROFILE_PREDICTOR_TORAX_CONFIG_BASE: dict[str, Any] = {
                 "a_minor": 3000,  # Overridden by dataloader input (must be less than R_major)
                 "B_0": 9999,  # Overridden by dataloader input
                 "elongation_LCFS": 9999,  # Overridden by dataloader input
+                # Internal solver mesh, up from the TORAX default of 25 to
+                # halve the piecewise-linear gradient staircase in the output
+                # interpolation. The 51-point output rhogrid shared by all
+                # model families is unaffected.
+                "n_rho": 50,
             },
             # "transport" block filled per transport model from TORAX_TRANSPORT_BLOCKS
             "sources": {
@@ -204,6 +209,17 @@ _PROFILE_PREDICTOR_TORAX_CONFIG_BASE: dict[str, Any] = {
                 "cyclotron_radiation": {},
                 "ohmic": {},
                 "gas_puff": {"S_total": 9999},  # Predicted by NN
+                # NN-inferred auxiliary heating. All entries except
+                # absorption_fraction are per-sample overridden by the
+                # sources network (absorption is fixed, degenerate with
+                # P_total). Placeholders only need to pass pydantic validation
+                "generic_heat": {
+                    "P_total": 1.0e6,  # Predicted by NN
+                    "gaussian_location": 0.3,  # Predicted by NN
+                    "gaussian_width": 0.25,  # Predicted by NN
+                    "electron_heat_fraction": 0.6,  # Predicted by NN
+                    "absorption_fraction": 0.9,
+                },
                 "generic_current": {},
             },
             "solver": {

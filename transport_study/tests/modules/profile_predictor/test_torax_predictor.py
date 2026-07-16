@@ -1,13 +1,20 @@
+import jax
+import numpy as np
 import pytest
+import xarray as xr
 from popsim.ml import TrainConfig
 from popsim.ml.launch import launch_train
 
 from transport_study import PACKAGE_ROOT
 from transport_study.config import StudyConfig, load_config
+from transport_study.modules.profile_predictor.torax_module import (
+    ProfilePredictorTorax,
+)
 from transport_study.modules.profile_predictor.train_configs import (
     PROFILE_PREDICTOR_TORAX_CONFIGS,
 )
 from transport_study.orchestration.organize_data import PROFILE_TARGET_VARS
+from transport_study.profile_transfer.plot_torax_evolution import _valid_timesteps
 
 
 @pytest.mark.parametrize("transport_model", ["constant", "cgm", "gyrobohm", "qlknn"])
@@ -86,3 +93,65 @@ def test_torax_predictor_mast_miller(transport_model):
     )
 
     _trainer, _train_dl, _val_dl, _test_dl, _ = launch_train(train_config)
+
+
+def _first_valid_timeslice(sample_name: str) -> xr.Dataset:
+    ds = xr.open_dataset(PACKAGE_ROOT / "datasets" / "sample" / sample_name)
+    for shot in ds["shot"].values:
+        shot_ds = ds.sel(shot=shot)
+        valid = _valid_timesteps(shot_ds)
+        if len(valid) > 0:
+            return shot_ds.isel(time_idx=int(valid[0]))
+    raise ValueError(f"No valid timeslice in {sample_name}")
+
+
+def _make_module(transport_model: str) -> ProfilePredictorTorax:
+    model_cfg = PROFILE_PREDICTOR_TORAX_CONFIGS[transport_model]["model_init_config"]
+    return ProfilePredictorTorax(
+        nn_width=model_cfg["nn_width"],
+        nn_depth=model_cfg["nn_depth"],
+        rhogrid=tuple(np.linspace(0.0, 1.0, 51).tolist()),
+        torax_config=model_cfg["torax_config"],
+        key=jax.random.PRNGKey(42),
+        transport_model=transport_model,
+    )
+
+
+def test_torax_heat_source_response():
+    # Pins the generic_heat wiring end to end: prescribing more auxiliary
+    # power through the NN-controlled source must heat the relaxed profile
+    module = _make_module("cgm")
+    timeslice = _first_valid_timeslice("cmod-high.nc")
+
+    steps_cold, coeffs_cold = module.evolve(timeslice, prescribed={"P_aux_total": 0.0})
+    steps_hot, coeffs_hot = module.evolve(timeslice, prescribed={"P_aux_total": 10.0})
+
+    assert coeffs_cold["P_aux_total"] == pytest.approx(0.0)
+    assert coeffs_hot["P_aux_total"] == pytest.approx(10.0)
+    for steps in (steps_cold, steps_hot):
+        for step in steps:
+            assert np.all(np.isfinite(step["ne20"]))
+            assert np.all(np.isfinite(step["te_keV"]))
+
+    te_cold = steps_cold[-1]["te_keV"].mean()
+    te_hot = steps_hot[-1]["te_keV"].mean()
+    assert te_hot > te_cold * 1.05
+
+
+def test_torax_output_hits_edge_bc_and_smooth_init():
+    module = _make_module("cgm")
+    timeslice = _first_valid_timeslice("cmod-high.nc")
+
+    # The 51-point output must pass through the exact Dirichlet edge BC at
+    # rho = 1 instead of flat-holding the outermost cell value
+    outputs = module(timeslice)
+    steps, coeffs = module.evolve(timeslice)
+    assert outputs.te.values[-1] == pytest.approx(coeffs["T_e_right_bc"], rel=1e-3)
+    assert outputs.ne.values[-1] == pytest.approx(coeffs["n_e_right_bc"], rel=1e-3)
+
+    # The initial condition sampled on the cell grid must be a smooth parabola
+    for key in ("te_keV", "ne20"):
+        init = steps[0][key]
+        d2 = np.diff(init, n=2)
+        scale = np.abs(init).max()
+        assert np.all(np.abs(d2 - d2.mean()) < 1e-3 * scale), key

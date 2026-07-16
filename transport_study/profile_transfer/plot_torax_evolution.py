@@ -25,6 +25,7 @@ from matplotlib import cm
 from popsim.ml.checkpointing import create_default_checkpoint_manager, restore_model
 
 from transport_study.modules.profile_predictor.torax_module import (
+    SOURCE_COEFFICIENT_NAMES,
     TRANSPORT_COEFFICIENT_NAMES,
     ProfilePredictorTorax,
 )
@@ -135,10 +136,11 @@ def plot_relaxation(
         source = "prescribed" if name in prescribed_names else "NN"
         return f"{name}={coeffs[name]:.2f} ({source})"
 
-    coeff_line = ", ".join(_coeff_label(name) for name in [*TRANSPORT_COEFFICIENT_NAMES[transport_model], "S_total"])
+    coeff_line = ", ".join(_coeff_label(name) for name in TRANSPORT_COEFFICIENT_NAMES[transport_model])
+    source_line = ", ".join(_coeff_label(name) for name in SOURCE_COEFFICIENT_NAMES)
     bc_line = ", ".join(_coeff_label(name) for name in ["n_e_right_bc", "T_e_right_bc"])
     fig.suptitle(
-        f"TORAX profile relaxation ({transport_model}) - {title_context}\n{coeff_line}\n{bc_line}",
+        f"TORAX profile relaxation ({transport_model}) - {title_context}\n{coeff_line}\n{source_line}\n{bc_line}",
         fontsize=TITLE_FONTSIZE - 4,
         color=TEXT_COLOR,
     )
@@ -202,7 +204,9 @@ def plot_torax_evolution(
             cgm: chi_e_i_ratio, chi_D_ratio, VR_D_ratio, alpha, chi_stiff;
             gyrobohm: chi_bohm_multiplier, chi_gyrobohm_multiplier, D_face_c1,
             D_face_c2, V_face_coeff)
-            plus S_total [1e21 /s], n_e_right_bc [1e20 m^-3], T_e_right_bc [keV].
+            plus the source coefficients (S_total [1e21 /s], P_aux_total [MW],
+            gaussian_location, gaussian_width, electron_heat_fraction) and
+            n_e_right_bc [1e20 m^-3], T_e_right_bc [keV].
             From the CLI pass as a dict literal, e.g. --prescribed '{"S_total": 1.0}'.
         output_dir: Directory to save the figure in (default: current directory).
     """
