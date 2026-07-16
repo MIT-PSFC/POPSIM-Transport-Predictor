@@ -16,7 +16,10 @@ from popsim.ml.eval import EvalData, EvaluationSuite
 
 from transport_study import EPISODE_DIM, TIME_COORD, TIME_DIM
 from transport_study.config import config
+from transport_study.modules.normalization import CoralFeatureNormalizer
 from transport_study.modules.profile_predictor.module import (
+    N_NN_INPUTS,
+    Inputs,
     ProfilePredictorReservoir,
     ProfilePredictorShapeInit,
     ProfilePredictorUnstructuredNN,
@@ -33,6 +36,7 @@ from transport_study.orchestration.organize_data import (
     TrainingData,
     get_train_test_datasets,
     get_train_val_datasets,
+    get_transfer_pretrain_datasets,
 )
 
 
@@ -61,6 +65,37 @@ def resolve_relaxation_overrides(model_init_config: dict) -> dict:
     return overrides
 
 
+def _fit_nn_input_normalizer(train_ds: xr.Dataset, n_devices: int) -> CoralFeatureNormalizer:
+    """Fit the per-device CORAL stage on the 10 dimensionless nn_inputs.
+
+    Evaluates the Inputs properties over the flattened training data
+    (rows with incomplete features or an unattributable device index are
+    dropped by the fit).
+    """
+    reference = train_ds["Ip_MA"]
+
+    def col(var: str) -> np.ndarray:
+        return np.asarray(train_ds[var].broadcast_like(reference).values, dtype=float).ravel()
+
+    source_idx = col("ds_source_idx")
+    inputs = Inputs(
+        Ip=col("Ip_MA"),
+        B0=col("B0"),
+        betan=col("betan"),
+        ne20_line_avg=col("ne20_line_avg"),
+        R0=col("R0"),
+        a_minor=col("a_minor"),
+        kappa=col("kappa"),
+        delta_top=col("delta_top"),
+        delta_bot=col("delta_bot"),
+        ds_source_idx=source_idx,
+        rho=jnp.zeros(1),  # Unused by nn_inputs
+    )
+    features = np.asarray(inputs.nn_inputs).T  # (N, N_NN_INPUTS)
+    attributed = ~np.isnan(source_idx)
+    return CoralFeatureNormalizer.fit_from_features(features[attributed], source_idx[attributed].astype(int), n_devices)
+
+
 class ProfilePredictorTRB(TrainRunBuilder):
     """Training run builder for the profile predictor module,
     based on `popsim.modules.profile_predictor.training_run_builder.ProfilePredictorTrainRunBuilder`
@@ -87,7 +122,16 @@ class ProfilePredictorTRB(TrainRunBuilder):
         if isinstance(training_data, dict):  # when the config is passed from WandB, it's a dict
             training_data = TrainingData(**training_data)
 
-        if dataloader_config.get("domain_adaptation") is None:
+        normalizer_fit_ds = None
+        if dataloader_config.get("domain_adaptation") == "transfer_pretrain":
+            logger.info("Using transfer pretrain dataloader (trains on historic data, normalizer fit on historic + target shots)")
+            ds_train, normalizer_fit_ds, ds_val = get_transfer_pretrain_datasets(
+                training_data=training_data,
+                num_target_shots=dataloader_config["num_target_shots"],
+                target_test_set_size=dataloader_config.get("target_test_set_size", None),
+                study_type="profile_transfer",
+            )
+        elif dataloader_config.get("domain_adaptation") is None:
             logger.info("Using standard learning dataloader")
             if not training_data.exnihilo:
                 ds_train, ds_val = get_train_val_datasets(
@@ -123,7 +167,16 @@ class ProfilePredictorTRB(TrainRunBuilder):
         ds_train = ds_train.drop_vars(TIME_DIM, errors="ignore")
         ds_val = ds_val.drop_vars(TIME_DIM, errors="ignore")
 
-        input_vars = dataloader_config["input_vars"]
+        # The modules take ds_source_idx as an input
+        # (it selects per-device normalization stats), but it is stored per shot.
+        # Broadcast it against time so the dataloader can slice it like the other inputs
+        input_vars = list(dataloader_config["input_vars"])
+        if "ds_source_idx" not in input_vars:
+            input_vars.append("ds_source_idx")
+        for ds in (ds_train, ds_val):
+            # Float dtype so the dataloader can NaN-pad it like the other inputs
+            ds["ds_source_idx"] = ds["ds_source_idx"].broadcast_like(ds["Ip_MA"]).astype(ds["Ip_MA"].dtype)
+
         target_vars = dataloader_config["target_vars"]
         extra_vars = dataloader_config.get("extra_vars", None)
 
@@ -144,6 +197,12 @@ class ProfilePredictorTRB(TrainRunBuilder):
             drop_last=[True, False],
             pad_last=[False, True],
         )
+        # Transfer pretrain fits the normalizer on more data than it trains on
+        # (historic + target shots). model_init reads this attribute off the
+        # train dataloader, every other case fits on train_dl.ds itself
+        # TODO(ZanderKeith): This is stupid
+        if normalizer_fit_ds is not None:
+            train_dl.normalizer_fit_ds = normalizer_fit_ds
         # Running test evaluation on the validation set, since we don't need a dedicated test set
         # In the no domain adaptation case, we are hyperparameter tuning on all historic data, pick the best one and test on it
         # In the domain adaptation case, we are training on all historic data + some new data, and testing on the rest of the new data
@@ -156,6 +215,20 @@ class ProfilePredictorTRB(TrainRunBuilder):
         Instantiate and return your model given a training DataLoader
         and a model config dict.
         """
+        # CORAL stage on the dimensionless nn_inputs. Fitted from the training
+        # data, or left at identity when the physics inputs are used as-is or
+        # a transfer checkpoint will overwrite the buffers anyway.
+        # transfer_pretrain dataloaders carry a combined historic + target
+        # fit dataset as an attribute (see get_dataloaders)
+        data_normalization = model_init_config.get("data_normalization", "physics-coral")
+        if data_normalization not in ("physics", "physics-coral"):
+            raise ValueError(f"Unknown profile data normalization method: {data_normalization}")
+        n_devices = len(config.ds_source_to_idx)
+        if data_normalization == "physics-coral" and not model_init_config.get("transfer_checkpoint"):
+            normalizer = _fit_nn_input_normalizer(getattr(train_dl, "normalizer_fit_ds", train_dl.ds), n_devices)
+        else:
+            normalizer = CoralFeatureNormalizer.identity(n_devices, N_NN_INPUTS)
+
         if model_init_config["model_type"] in ["shape_init_pca", "shape_init_kmeans"]:
             te_shape_var = model_init_config["te_shape_var"]
             ne_shape_var = model_init_config["ne_shape_var"]
@@ -175,6 +248,7 @@ class ProfilePredictorTRB(TrainRunBuilder):
                 shape_type=shape_type,
                 softmax_temp=model_init_config["softmax_temp"],
                 prng_seed=model_init_config["prng_seed"],
+                normalizer=normalizer,
             )
 
             # PCA/K-means initial guess for the shapes.
@@ -203,6 +277,7 @@ class ProfilePredictorTRB(TrainRunBuilder):
                 nn_depth=model_init_config["nn_depth"],
                 rhogrid=np.asarray(train_dl.ds["rho"]),
                 key=jax.random.PRNGKey(model_init_config["prng_seed"]),
+                normalizer=normalizer,
             )
         elif model_init_config["model_type"] == "reservoir":
             module = ProfilePredictorReservoir(
@@ -213,6 +288,7 @@ class ProfilePredictorTRB(TrainRunBuilder):
                 n_steps=model_init_config.get("n_steps", 20),
                 rhogrid=np.asarray(train_dl.ds["rho"]),
                 key=jax.random.PRNGKey(model_init_config["prng_seed"]),
+                normalizer=normalizer,
             )
         elif model_init_config["model_type"].startswith("torax-"):
             # model_type is "torax-<transport_model>", e.g. "torax-cgm"
@@ -229,6 +305,7 @@ class ProfilePredictorTRB(TrainRunBuilder):
                 rhogrid=np.asarray(train_dl.ds["rho"]),
                 torax_config=torax_config,
                 key=jax.random.PRNGKey(model_init_config["prng_seed"]),
+                normalizer=normalizer,
                 transport_model=model_init_config["model_type"].removeprefix("torax-"),
                 geometry_builder=model_init_config.get("geometry_builder", "circular"),
                 delta_exponent=model_init_config.get("delta_exponent", 2.0),
@@ -477,13 +554,14 @@ class ProfilePredictorTRB(TrainRunBuilder):
         """Optionally return a function that takes in the trainable parameters of your model and returns the trainable parameters."""
 
         def get_trainable_shape_init(module: ProfilePredictorShapeInit):
-            # Get all leaves that are not a part of te_shapes and ne_shapes.
-            # All of these leaves are trainable.
-            ids_of_shape_leaves = [id(x) for x in jax.tree.leaves((module.te_shapes, module.ne_shapes))]
+            # The normalizer statistics are never trainable, the shapes only
+            # when freeze_shapes is off. Everything else trains.
             if model_init_config["freeze_shapes"]:
-                return [x for x in jax.tree.leaves(module) if id(x) not in ids_of_shape_leaves]
+                frozen = (module.te_shapes, module.ne_shapes, module.normalizer)
             else:
-                return jax.tree.leaves(module)
+                frozen = (module.normalizer,)
+            ids_of_frozen_leaves = [id(x) for x in jax.tree.leaves(frozen)]
+            return [x for x in jax.tree.leaves(module) if id(x) not in ids_of_frozen_leaves]
 
         def get_trainable_nn(module: ProfilePredictorUnstructuredNN):
             ids_of_nn_leaves = [id(x) for x in jax.tree.leaves(module.nn)]

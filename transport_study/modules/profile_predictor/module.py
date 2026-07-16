@@ -17,6 +17,8 @@ from popsim.math_utils import safe_log
 from popsim.ml.rtd_mlp import Activation, RtdMLP
 from scipy.constants import epsilon_0, eV, mu_0
 
+from transport_study.modules.normalization import CoralFeatureNormalizer
+
 
 class ProfileShape(TimeIndepModule):
     """
@@ -126,6 +128,10 @@ class ProfileShape(TimeIndepModule):
         return cls(basis=basis, coeffs=points, normalize=normalize)
 
 
+# Size of the dimensionless nn_inputs feature vector every profile model consumes
+N_NN_INPUTS = 10
+
+
 @chex.dataclass
 class Inputs:
     Ip: float  # Plasma current [MA]
@@ -137,6 +143,7 @@ class Inputs:
     kappa: float  # Elongation
     delta_top: float  # Upper triangularity
     delta_bot: float  # Bottom triangularity
+    ds_source_idx: float  # Device index selecting per-device normalization statistics
 
     # Other
     rho: Array  # Normalized minor radius coordinate to evaluate the profiles at
@@ -153,6 +160,7 @@ class Inputs:
             kappa=ds["kappa"].data,
             delta_top=ds["delta_top"].data,
             delta_bot=ds["delta_bot"].data,
+            ds_source_idx=ds["ds_source_idx"].data,
             rho=rho,
         )
 
@@ -229,7 +237,7 @@ class Inputs:
 
     @property
     def nn_inputs(self):
-        # 10 dimensionless parameters derived from original inputs
+        # N_NN_INPUTS dimensionless parameters derived from original inputs
         inp_array = jnp.array(
             [
                 self.beta,
@@ -330,6 +338,10 @@ class ProfilePredictor(TimeIndepModule):
     rhogrid: tuple = eqx.field(static=True)  # The rho grid on which the profiles are evaluated
 
     nn: RtdMLP
+    # Per-device CORAL stage over the 10 dimensionless nn_inputs
+    # Identity buffers when data_normalization is 'physics', fitted from training data for 'physics-coral'
+    # Frozen like every normalizer, the trainable getters never include it
+    normalizer: CoralFeatureNormalizer
 
 
 class ProfilePredictorShapeInit(ProfilePredictor):
@@ -350,9 +362,11 @@ class ProfilePredictorShapeInit(ProfilePredictor):
         shape_type: ShapeType,
         rhogrid: tuple,
         key: jax.random.PRNGKey,
+        normalizer: CoralFeatureNormalizer,
     ):
         self.te_shapes = te_shapes
         self.ne_shapes = ne_shapes
+        self.normalizer = normalizer
 
         key, subkey = jax.random.split(key)
         self.nn = RtdMLP(
@@ -372,7 +386,7 @@ class ProfilePredictorShapeInit(ProfilePredictor):
         if isinstance(inputs, xr.Dataset):
             inputs = Inputs.from_dataset(inputs, jnp.array(self.rhogrid))
 
-        nn_inputs = inputs.nn_inputs
+        nn_inputs = self.normalizer(inputs.nn_inputs, inputs.ds_source_idx)
 
         # Predict the coefficients for the shapes and the correction factor.
         coeffs = self.nn(nn_inputs)
@@ -433,6 +447,7 @@ class ProfilePredictorShapeInit(ProfilePredictor):
         shape_type: ShapeType,
         softmax_temp: float,
         prng_seed: int,
+        normalizer: CoralFeatureNormalizer,
     ) -> "ProfilePredictor":
         rhogrid_jax = jnp.array(rhogrid)
         rhogrid_tuple = tuple(rhogrid.tolist())
@@ -452,6 +467,7 @@ class ProfilePredictorShapeInit(ProfilePredictor):
             shape_type=shape_type,
             rhogrid=rhogrid_tuple,
             key=jax.random.PRNGKey(prng_seed),
+            normalizer=normalizer,
         )
 
 
@@ -477,12 +493,14 @@ class ProfilePredictorReservoir(ProfilePredictor):
         reservoir_size: int,
         rhogrid: tuple,
         key: jax.random.PRNGKey,
+        normalizer: CoralFeatureNormalizer,
         spectral_radius: float = 0.9,
         input_scaling: float = 0.5,
         leak_rate: float = 1.0,
         n_steps: int = 20,
     ):
         rhogrid_tuple = tuple(rhogrid.tolist()) if hasattr(rhogrid, "tolist") else tuple(rhogrid)
+        self.normalizer = normalizer
 
         key_in, key_res, key_bias, key_out = jax.random.split(key, 4)
         self.w_in = input_scaling * jax.random.uniform(key_in, (reservoir_size, 10), minval=-1.0, maxval=1.0)
@@ -522,7 +540,7 @@ class ProfilePredictorReservoir(ProfilePredictor):
         if isinstance(inputs, xr.Dataset):
             inputs = Inputs.from_dataset(inputs, jnp.array(self.rhogrid))
 
-        nn_inputs = inputs.nn_inputs
+        nn_inputs = self.normalizer(inputs.nn_inputs, inputs.ds_source_idx)
         n_pred_points = len(self.rhogrid)
 
         # Predict profile values directly on the rhogrid
@@ -552,8 +570,10 @@ class ProfilePredictorUnstructuredNN(ProfilePredictor):
         nn_depth: int,
         rhogrid: tuple,
         key: jax.random.PRNGKey,
+        normalizer: CoralFeatureNormalizer,
     ):
         rhogrid_tuple = tuple(rhogrid.tolist()) if hasattr(rhogrid, "tolist") else tuple(rhogrid)
+        self.normalizer = normalizer
 
         key, subkey = jax.random.split(key)
         self.nn = RtdMLP(
@@ -571,7 +591,7 @@ class ProfilePredictorUnstructuredNN(ProfilePredictor):
         if isinstance(inputs, xr.Dataset):
             inputs = Inputs.from_dataset(inputs, jnp.array(self.rhogrid))
 
-        nn_inputs = inputs.nn_inputs
+        nn_inputs = self.normalizer(inputs.nn_inputs, inputs.ds_source_idx)
         n_pred_points = len(self.rhogrid)
 
         # Predict the profile values directly on the rhogrid.

@@ -84,11 +84,20 @@ class ProfileStudy(Study):
         model_types: tuple[str, ...] = Field(default_factory=lambda: ("shape_init_pca", "shape_init_kmeans", "unstructured_nn"))
         freeze_shapes_options: tuple[bool, ...] = Field(default_factory=lambda: (True,))
         num_target_shots_options: tuple[int, ...] = Field(default_factory=lambda: (0, 1, 10, -1))
+        # Input normalization applied to the 10 dimensionless nn_inputs, one
+        # setting for the whole study run (not a case axis, so it never
+        # appears in case names):
+        # - physics: use the dimensionless parameters as-is
+        # - physics-coral: per-device CORAL alignment fitted on them
+        data_normalization: str = "physics-coral"
         # Hyperparameter tuning case configuration
         # (hyperparam_domain_adaptation and hyperparam_num_target_shots live on CaseGridConfig)
         hyperparam_freeze_shapes: bool = True
 
+        # data_normalization changes model semantics under unchanged case
+        # names, so the config lock must catch reruns with a different value
         COMPAT_HYPERPARAM_FIELDS = (
+            "data_normalization",
             "hyperparam_domain_adaptation",
             "hyperparam_freeze_shapes",
             "hyperparam_num_target_shots",
@@ -101,6 +110,14 @@ class ProfileStudy(Study):
             for mt in v:
                 if mt not in valid:
                     raise ValueError(f"Invalid model type: {mt}. Must be one of {sorted(valid)}.")
+            return v
+
+        @field_validator("data_normalization")
+        @classmethod
+        def _validate_data_normalization(cls, v: str) -> str:
+            valid = ("physics", "physics-coral")
+            if v not in valid:
+                raise ValueError(f"Invalid data normalization method: {v}. Must be one of {valid}.")
             return v
 
     @dataclass
@@ -123,6 +140,7 @@ class ProfileStudy(Study):
         - none: No domain adaptation, train and test on the same device(s). This is used for hyperparameter tuning and as a baseline for comparison, answering the question "what is the best possible performance we could expect if we had a bunch of data?"
         - mixing: Add a small amount of highly-weighted target data during training
         - transfer: Train on source data, freeze all but the last layers of the model, and fine-tune on a small amount of target data
+        - transfer_pretrain: The pretrain half of a transfer case under physics-coral normalization, never a case-grid axis value (see Study.Case.transfer_pretrain_case). Trains on historic data only with the CORAL stage fitted on historic + the transfer case's target shots
 
         freeze_shapes:
         - some profile predictors first use PCA to identify dominant shapes. these shapes may be frozen or modified during module training
@@ -138,6 +156,10 @@ class ProfileStudy(Study):
 
         # The dataclass decorator would null an inherited __hash__
         __hash__ = Study.Case.__hash__
+
+        def _normalization_method(self) -> str | None:
+            # One study-wide setting, not a case axis
+            return config.data_normalization
 
         def __init__(
             self,
@@ -248,6 +270,7 @@ class ProfileStudy(Study):
                 },
                 model_init_config={
                     "model_type": case.model_type,
+                    "data_normalization": config.data_normalization,
                     "domain_adaptation": case.domain_adaptation,
                     "freeze_shapes": case.freeze_shapes,
                     "te_shape_var": "Te_shape",
@@ -266,6 +289,7 @@ class ProfileStudy(Study):
                 dataloader_config={"input_vars": PROFILE_INPUT_VARS, **dataloader_config_base},
                 model_init_config={
                     "model_type": case.model_type,
+                    "data_normalization": config.data_normalization,
                     "domain_adaptation": case.domain_adaptation,
                     "nn_depth": 2,
                     "nn_width": 16,
@@ -279,6 +303,7 @@ class ProfileStudy(Study):
                 dataloader_config={"input_vars": PROFILE_INPUT_VARS, **dataloader_config_base},
                 model_init_config={
                     "model_type": case.model_type,
+                    "data_normalization": config.data_normalization,
                     "domain_adaptation": case.domain_adaptation,
                     "reservoir_size": 128,  # Fixed random reservoir state dimension
                     "spectral_radius": 0.9,  # Contraction factor of the recurrent weights
@@ -297,6 +322,7 @@ class ProfileStudy(Study):
                 dataloader_config={"input_vars": PROFILE_INPUT_VARS, **dataloader_config_base},
                 model_init_config={
                     "model_type": case.model_type,
+                    "data_normalization": config.data_normalization,
                     "domain_adaptation": case.domain_adaptation,
                     "freeze_shapes": case.freeze_shapes,
                     "nn_depth": 2,

@@ -17,6 +17,7 @@ from torax._src.geometry import geometry_provider as geometry_provider_lib
 from torax._src.orchestration.step_function import SimulationStepFn
 from torax._src.torax_pydantic import torax_pydantic
 
+from transport_study.modules.normalization import CoralFeatureNormalizer
 from transport_study.modules.profile_predictor.module import (
     Inputs,
     Outputs,
@@ -498,6 +499,8 @@ class ProfilePredictorTorax(TimeIndepModule):
     nn_transport: RtdMLP
     nn_sources: RtdMLP
     nn_edge: RtdMLP
+    # Per-device CORAL stage over the 10 nn_inputs
+    normalizer: CoralFeatureNormalizer
 
     step_fn: SimulationStepFn = eqx.field(static=True)
 
@@ -514,6 +517,7 @@ class ProfilePredictorTorax(TimeIndepModule):
         rhogrid: tuple,
         torax_config: ToraxConfig | dict,
         key: jax.random.PRNGKey,
+        normalizer: CoralFeatureNormalizer,
         transport_model: str = "cgm",
         geometry_builder: str = "circular",
         delta_exponent: float = 2.0,
@@ -521,6 +525,7 @@ class ProfilePredictorTorax(TimeIndepModule):
         if transport_model not in TRANSPORT_COEFFICIENT_NAMES:
             raise ValueError(f"Unknown transport model '{transport_model}', valid: {sorted(TRANSPORT_COEFFICIENT_NAMES)}")
         self.transport_model = transport_model
+        self.normalizer = normalizer
         if geometry_builder not in ("circular", "miller"):
             raise ValueError(f"Unknown geometry builder '{geometry_builder}', valid: ('circular', 'miller')")
         self.geometry_builder = geometry_builder
@@ -592,6 +597,7 @@ class ProfilePredictorTorax(TimeIndepModule):
                 kappa=inputs["kappa"].data,
                 delta_top=inputs["delta_top"].data,
                 delta_bot=inputs["delta_bot"].data,
+                ds_source_idx=inputs["ds_source_idx"].data,
                 rho=jnp.array(self.rhogrid),
             )
         return inputs
@@ -688,7 +694,7 @@ class ProfilePredictorTorax(TimeIndepModule):
         #   gaussian_location: 0 - 0.8 (deposition center in rho_norm)
         #   gaussian_width: 0.05 - 0.4 (deposition width in rho_norm)
         #   electron_heat_fraction: 0.2 - 0.8 (both channels keep NN gradient)
-        nn_inputs = inputs.nn_inputs
+        nn_inputs = self.normalizer(inputs.nn_inputs, inputs.ds_source_idx)
         coeffs = self._transport_coefficients(self.nn_transport(nn_inputs))
         nn_sources_out = self.nn_sources(nn_inputs)
         S_total = jax.nn.softplus(nn_sources_out[0:1])
@@ -1049,6 +1055,7 @@ class ProfilePredictorTorax(TimeIndepModule):
         nn_width: int,
         nn_depth: int,
         prng_seed: int,
+        normalizer: CoralFeatureNormalizer,
         transport_model: str = "cgm",
         geometry_builder: str = "circular",
         delta_exponent: float = 2.0,
@@ -1060,6 +1067,7 @@ class ProfilePredictorTorax(TimeIndepModule):
             rhogrid=rhogrid_tuple,
             torax_config=torax_config,
             key=jax.random.PRNGKey(prng_seed),
+            normalizer=normalizer,
             transport_model=transport_model,
             geometry_builder=geometry_builder,
             delta_exponent=delta_exponent,
