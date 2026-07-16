@@ -15,6 +15,9 @@ from transport_study.modules.power_balance.p_rad.module import RadiatedPower
 
 MIN_TAUE = 0.001  # Default minimum reasonable value for tau_e [s]
 MAX_TAUE = 0.3  # Maximum reasonable value for tau_e [s]
+# Sharpness of the sigmoid L-H mode blend in the scaling law
+# a hard jnp.where switch would zero the gradient of the P_LH threshold coefficients
+LH_BLEND_SHARPNESS = 10.0
 MIN_POWER = -20  # Minimum reasonable value for power (dW/dt) [MW]
 MAX_POWER = 20  # Maximum reasonable value for power (dW/dt) [MW]
 MIN_WTOT_MJ = 0.001  # Floor for predicted stored energy [MJ], keeps Wtot strictly positive
@@ -63,9 +66,11 @@ class BoundedNNPredictor(eqx.Module):
 class ScalingLawPredictor(eqx.Module):
     """Predict tau_e with a scaling law"""
 
-    scaling_lmode: dict[str, float] = eqx.field(static=True)
-    scaling_hmode: dict[str, float] = eqx.field(static=True)
-    scaling_lh_transition: dict[str, float] = eqx.field(static=True)
+    # Trainable coefficient leaves, NOT static
+    # get_trainable selects them so the scaling law fits its coefficients to data
+    scaling_lmode: dict[str, Array]
+    scaling_hmode: dict[str, Array]
+    scaling_lh_transition: dict[str, Array]
 
     min_taue: float = eqx.field(static=True)
     max_taue: float = eqx.field(static=True)
@@ -95,15 +100,20 @@ class ScalingLawPredictor(eqx.Module):
 
     def __init__(
         self,
-        scaling_lmode: dict[str, float] | None = None,
-        scaling_hmode: dict[str, float] | None = None,
-        scaling_lh_transition: dict[str, float] | None = None,
+        scaling_lmode: dict[str, ArrayLike] | None = None,
+        scaling_hmode: dict[str, ArrayLike] | None = None,
+        scaling_lh_transition: dict[str, ArrayLike] | None = None,
         min_taue: float | None = None,
         max_taue: float | None = None,
     ):
-        self.scaling_lmode = scaling_lmode if scaling_lmode is not None else self.create_iter89()
-        self.scaling_hmode = scaling_hmode if scaling_hmode is not None else self.create_ipb98()
-        self.scaling_lh_transition = scaling_lh_transition if scaling_lh_transition is not None else self.create_iter1996()
+        # Cast to float arrays so every coefficient is an inexact-array leaf
+        # (python float or int values would be dropped by eqx.is_inexact_array)
+        scaling_lmode = scaling_lmode if scaling_lmode is not None else self.create_iter89()
+        scaling_hmode = scaling_hmode if scaling_hmode is not None else self.create_ipb98()
+        scaling_lh_transition = scaling_lh_transition if scaling_lh_transition is not None else self.create_iter1996()
+        self.scaling_lmode = {k: jnp.asarray(v, dtype=float) for k, v in scaling_lmode.items()}
+        self.scaling_hmode = {k: jnp.asarray(v, dtype=float) for k, v in scaling_hmode.items()}
+        self.scaling_lh_transition = {k: jnp.asarray(v, dtype=float) for k, v in scaling_lh_transition.items()}
         self.min_taue = MIN_TAUE if min_taue is None else min_taue
         self.max_taue = MAX_TAUE if max_taue is None else max_taue
 
@@ -146,7 +156,10 @@ class ScalingLawPredictor(eqx.Module):
             * (self.isotope_mass ** self.scaling_hmode["alpha_mass"])
         )
 
-        taue = jnp.where(P_abs_MW < p_thresh, taue_lmode, taue_hmode)
+        # Smooth blend so gradient reaches the scaling_lh_transition coefficients
+        # (jnp.where is piecewise constant in p_thresh, threshold could never train)
+        lh_weight = jax.nn.sigmoid(LH_BLEND_SHARPNESS * (P_abs_MW / p_thresh - 1.0))
+        taue = (1.0 - lh_weight) * taue_lmode + lh_weight * taue_hmode
 
         # Softmax output
         bounded = soft_clip(taue, self.min_taue, self.max_taue, sharpness=10)
@@ -158,13 +171,14 @@ class ScalingLawPredictor(eqx.Module):
                 "p_thresh": p_thresh,
                 "taue_lmode": taue_lmode,
                 "taue_hmode": taue_hmode,
+                "lh_weight": lh_weight,
             },
         )
 
         return out
 
     @classmethod
-    def create_ipb98(cls) -> dict[str, float]:
+    def create_ipb98(cls) -> dict[str, ArrayLike]:
         scaling = {
             "coeff": jnp.array(56.2 * 10**-3),
             "alpha_I": jnp.array(0.93),
@@ -277,9 +291,9 @@ class PowerBalanceScalingLaw(PowerBalance):
         cls,
         p_oh_predictor: OhmicPower,
         p_rad_predictor: RadiatedPower,
-        scaling_lmode: dict[str, float] | None = None,
-        scaling_hmode: dict[str, float] | None = None,
-        scaling_lh_transition: dict[str, float] | None = None,
+        scaling_lmode: dict[str, ArrayLike] | None = None,
+        scaling_hmode: dict[str, ArrayLike] | None = None,
+        scaling_lh_transition: dict[str, ArrayLike] | None = None,
         min_taue: float = MIN_TAUE,
         max_taue: float = MAX_TAUE,
     ) -> "PowerBalanceScalingLaw":
@@ -603,6 +617,11 @@ class PowerBalanceEnv(ModuleTrainingEnv):
                     self.module.taue_predictor.nn.layers[-1].weight,
                     self.module.taue_predictor.nn.layers[-1].bias,
                 ]
+            if isinstance(self.module, PowerBalanceScalingLaw):
+                # No last-layer analog, fine-tune all three coefficient dicts
+                taue = self.module.taue_predictor
+                for scaling in (taue.scaling_lmode, taue.scaling_hmode, taue.scaling_lh_transition):
+                    last_layer_leaves += list(scaling.values())
             if isinstance(self.module, (PowerBalanceSciML, PowerBalanceScalingLaw)):
                 if "p_oh_predictor" not in self.freeze_submodules:
                     last_layer_leaves += [
@@ -625,6 +644,8 @@ class PowerBalanceEnv(ModuleTrainingEnv):
 
         if isinstance(self.module, PowerBalanceSciML):
             trainable_leaves["taue_predictor"] = eqx.filter(self.module.taue_predictor.nn, eqx.is_inexact_array)
+        elif isinstance(self.module, PowerBalanceScalingLaw):
+            trainable_leaves["taue_predictor"] = eqx.filter(self.module.taue_predictor, eqx.is_inexact_array)
         elif isinstance(self.module, PowerBalanceUnstructuredNN):
             trainable_leaves["nn"] = eqx.filter(self.module.nn, eqx.is_inexact_array)
         elif isinstance(self.module, PowerBalanceTransformer):
