@@ -17,21 +17,44 @@ def checkpoint_to_profile_case(checkpoint_dir: Path | str) -> ProfileStudy.Case:
     """Parse a case directory name back into a ProfileStudy.Case.
 
     Mirrors ProfileStudy.Case.__str__:
-    case.{model_type}.td_{td}.freeze_{f}                   source-trained, no adaptation
-    case.{model_type}.td_{td}.freeze_{f}.targ_{n}          exnihilo
-    case.{model_type}.td_{td}.freeze_{f}.targ_{n}.da_{da}  domain adaptation
+    case.{model_type}.td_{td}.freeze_{f}[.geom_{g}]                   source-trained, no adaptation
+    case.{model_type}.td_{td}.freeze_{f}[.geom_{g}].targ_{n}          exnihilo
+    case.{model_type}.td_{td}.freeze_{f}[.geom_{g}].targ_{n}.da_{da}  domain adaptation
+
+    geom_{g} is only present when geometry_builder != "circular"
+    (the suppressed default, see Study.Case.STR_TOKEN_FIELDS),
+    so its position is optional rather than fixed.
     """
     case_name = Path(checkpoint_dir).name
     pieces = case_name.split(".")
-    if len(pieces) not in (4, 5, 6) or pieces[0] != "case" or not pieces[2].startswith("td_") or not pieces[3].startswith("freeze_"):
+    if len(pieces) < 4 or pieces[0] != "case" or not pieces[2].startswith("td_") or not pieces[3].startswith("freeze_"):
+        raise ValueError(f"Unexpected case name format: {case_name}")
+
+    idx = 4
+    geometry_builder = "circular"
+    if idx < len(pieces) and pieces[idx].startswith("geom_"):
+        geometry_builder = pieces[idx].removeprefix("geom_")
+        idx += 1
+
+    num_target_shots = HYPERPARAM_TARGET_SHOTS
+    domain_adaptation = None
+    if idx < len(pieces) and pieces[idx].startswith("targ_"):
+        num_target_shots = int(pieces[idx].removeprefix("targ_"))
+        idx += 1
+        if idx < len(pieces) and pieces[idx].startswith("da_"):
+            domain_adaptation = pieces[idx].removeprefix("da_")
+            idx += 1
+
+    if idx != len(pieces):
         raise ValueError(f"Unexpected case name format: {case_name}")
 
     return ProfileStudy.Case(
         model_type=pieces[1],
         training_data=pieces[2].removeprefix("td_"),
-        domain_adaptation=pieces[5].removeprefix("da_") if len(pieces) == 6 else None,
+        domain_adaptation=domain_adaptation,
         freeze_shapes=pieces[3].removeprefix("freeze_") == "True",
-        num_target_shots=int(pieces[4].removeprefix("targ_")) if len(pieces) >= 5 else HYPERPARAM_TARGET_SHOTS,
+        num_target_shots=num_target_shots,
+        geometry_builder=geometry_builder,
     )
 
 

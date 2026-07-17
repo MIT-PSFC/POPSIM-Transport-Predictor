@@ -369,6 +369,9 @@ def torax_relaxation_report(study, metrics_ds: xr.Dataset, figure_dir: Path):
     # The raw device dataset carries the scalar input vars the module needs.
     # load_eval_dataset keeps the same time_idx indexing (rows are never dropped)
     timeslice = xr.open_dataset(config.dataset_paths[device]).sel({EPISODE_DIM: shot}).isel({TIME_DIM: eval_time_idx})
+    # Raw device files lack the device index organize_data assigns, the
+    # module's normalizer needs it to pick the right per-device statistics
+    timeslice["ds_source_idx"] = float(config.ds_source_to_idx[device])
 
     # Function-level import: restore_predictor imports profile_study, which
     # imports this module at run_study time, so a top-level import would cycle

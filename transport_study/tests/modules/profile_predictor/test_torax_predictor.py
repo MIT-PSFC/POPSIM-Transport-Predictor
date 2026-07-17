@@ -7,6 +7,8 @@ from popsim.ml.launch import launch_train
 
 from transport_study import PACKAGE_ROOT
 from transport_study.config import StudyConfig, load_config
+from transport_study.modules.normalization import CoralFeatureNormalizer
+from transport_study.modules.profile_predictor.module import N_NN_INPUTS
 from transport_study.modules.profile_predictor.torax_module import (
     ProfilePredictorTorax,
 )
@@ -101,7 +103,10 @@ def _first_valid_timeslice(sample_name: str) -> xr.Dataset:
         shot_ds = ds.sel(shot=shot)
         valid = _valid_timesteps(shot_ds)
         if len(valid) > 0:
-            return shot_ds.isel(time_idx=int(valid[0]))
+            timeslice = shot_ds.isel(time_idx=int(valid[0]))
+            # Raw sample files lack the device index organize_data adds
+            timeslice["ds_source_idx"] = 0.0
+            return timeslice
     raise ValueError(f"No valid timeslice in {sample_name}")
 
 
@@ -113,6 +118,7 @@ def _make_module(transport_model: str) -> ProfilePredictorTorax:
         rhogrid=tuple(np.linspace(0.0, 1.0, 51).tolist()),
         torax_config=model_cfg["torax_config"],
         key=jax.random.PRNGKey(42),
+        normalizer=CoralFeatureNormalizer.identity(1, N_NN_INPUTS),
         transport_model=transport_model,
     )
 
@@ -208,6 +214,7 @@ def test_torax_max_steps_from_n_solver_steps():
         rhogrid=tuple(np.linspace(0.0, 1.0, 51).tolist()),
         torax_config=torax_config,
         key=jax.random.PRNGKey(42),
+        normalizer=CoralFeatureNormalizer.identity(1, N_NN_INPUTS),
         transport_model="cgm",
     )
     assert module.max_steps == 11

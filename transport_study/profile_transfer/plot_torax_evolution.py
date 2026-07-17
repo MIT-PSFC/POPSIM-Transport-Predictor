@@ -24,6 +24,8 @@ from loguru import logger
 from matplotlib import cm
 from popsim.ml.checkpointing import create_default_checkpoint_manager, restore_model
 
+from transport_study.modules.normalization import CoralFeatureNormalizer
+from transport_study.modules.profile_predictor.module import N_NN_INPUTS
 from transport_study.modules.profile_predictor.torax_module import (
     SOURCE_COEFFICIENT_NAMES,
     TRANSPORT_COEFFICIENT_NAMES,
@@ -63,7 +65,7 @@ def _valid_timesteps(shot_ds: xr.Dataset) -> np.ndarray:
     return np.flatnonzero(valid)
 
 
-def _load_timeslice(dataset: str | Path, shot: int, timestep: int) -> xr.Dataset:
+def _load_timeslice(dataset: str | Path, shot: int, timestep: int, ds_source_idx: int = 0) -> xr.Dataset:
     ds_path = Path(dataset)
     if not ds_path.exists():
         raise FileNotFoundError(f"Dataset not found: {ds_path}")
@@ -79,10 +81,14 @@ def _load_timeslice(dataset: str | Path, shot: int, timestep: int) -> xr.Dataset
             f"Timestep {timestep} of shot {shot} has NaN inputs, stale profiles, or all-NaN target profiles. "
             f"Nearest valid timestep: {nearest} (valid range {valid.min()}-{valid.max()}, {len(valid)} total)"
         )
-    return shot_ds.isel(time_idx=timestep)
+    timeslice = shot_ds.isel(time_idx=timestep)
+    # Raw device files lack the device index organize_data assigns, the
+    # module's normalizer needs it to pick the right per-device statistics
+    timeslice["ds_source_idx"] = float(ds_source_idx)
+    return timeslice
 
 
-def _build_module(timeslice: xr.Dataset, checkpoint: str | Path | None, transport_model: str) -> ProfilePredictorTorax:
+def _build_module(timeslice: xr.Dataset, checkpoint: str | Path | None, transport_model: str, n_devices: int = 1) -> ProfilePredictorTorax:
     model_cfg = PROFILE_PREDICTOR_TORAX_CONFIGS[transport_model]["model_init_config"]
     module = ProfilePredictorTorax(
         nn_width=model_cfg["nn_width"],
@@ -90,6 +96,9 @@ def _build_module(timeslice: xr.Dataset, checkpoint: str | Path | None, transpor
         rhogrid=tuple(timeslice["rho"].values.tolist()),
         torax_config=model_cfg["torax_config"],
         key=jax.random.PRNGKey(model_cfg["prng_seed"]),
+        # Identity buffers, restore_model overwrites them with the trained
+        # statistics when a checkpoint is given (n_devices must match it)
+        normalizer=CoralFeatureNormalizer.identity(n_devices, N_NN_INPUTS),
         transport_model=transport_model,
         geometry_builder=model_cfg.get("geometry_builder", "circular"),
         delta_exponent=model_cfg.get("delta_exponent", 2.0),
@@ -186,6 +195,8 @@ def plot_torax_evolution(
     timestep: int,
     transport_model: str = "cgm",
     checkpoint: str | None = None,
+    n_devices: int = 1,
+    ds_source_idx: int = 0,
     prescribed: dict | None = None,
     output_dir: str | None = None,
 ):
@@ -198,6 +209,10 @@ def plot_torax_evolution(
         transport_model: TORAX transport model: "constant", "cgm", or "gyrobohm".
         checkpoint: Optional checkpoint directory of a trained torax profile predictor
             (must have been trained with the same transport_model).
+        n_devices: Number of devices the checkpoint was trained with (sizes the
+            normalizer buffers so the checkpoint restores).
+        ds_source_idx: Device index of the plotted dataset in the training
+            source ordering (selects the normalizer's per-device statistics).
         prescribed: Optional dict of coefficients bypassing the NN outputs.
             Valid keys are the transport coefficients of the chosen model
             (constant: chi_i, chi_e, D_e [m^2/s], V_e [m/s];
@@ -212,9 +227,9 @@ def plot_torax_evolution(
     """
     if transport_model not in TRANSPORT_COEFFICIENT_NAMES:
         raise ValueError(f"Unknown transport model '{transport_model}', valid: {sorted(TRANSPORT_COEFFICIENT_NAMES)}")
-    timeslice = _load_timeslice(dataset, shot, timestep)
+    timeslice = _load_timeslice(dataset, shot, timestep, ds_source_idx=ds_source_idx)
     time_s = float(timeslice["time"].values)
-    module = _build_module(timeslice, checkpoint, transport_model)
+    module = _build_module(timeslice, checkpoint, transport_model, n_devices=n_devices)
 
     prescribed = prescribed or {}
     prescribed_names = {name for name, value in prescribed.items() if value is not None}

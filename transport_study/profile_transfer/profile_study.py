@@ -46,6 +46,11 @@ from transport_study.profile_transfer.tables import write_comparison_tables
 MODEL_TYPES_WITH_SHAPES = ("shape_init_pca", "shape_init_kmeans")
 MODEL_TYPES_WITHOUT_SHAPES = ("unstructured_nn", "reservoir", "torax-constant", "torax-cgm", "torax-gyrobohm", "torax-qlknn")
 
+# Per-sample geometry builders the torax model types can be benchmarked with
+# (see modules/profile_predictor/torax_module.py). Only meaningful for
+# torax-* model types, every other model type is pinned to "circular".
+VALID_GEOMETRY_BUILDERS = ("circular", "miller")
+
 # The physical inputs every profile-predictor model consumes
 PROFILE_INPUT_VARS = [
     "Ip_MA",
@@ -71,6 +76,7 @@ class ProfileStudy(Study):
         "training_datasets",
         "domain_adaptation_methods",
         "freeze_shapes_options",
+        "geometry_builders",
         "num_target_shots_options",
     )
     TUNED_DATALOADER_KEYS = ("batch_size",)
@@ -83,6 +89,9 @@ class ProfileStudy(Study):
         # The different cases being compared in this study
         model_types: tuple[str, ...] = Field(default_factory=lambda: ("shape_init_pca", "shape_init_kmeans", "unstructured_nn"))
         freeze_shapes_options: tuple[bool, ...] = Field(default_factory=lambda: (True,))
+        # Per-sample geometry builders to compare for torax-* model types, ignored
+        # by every other model type (see VALID_GEOMETRY_BUILDERS)
+        geometry_builders: tuple[str, ...] = Field(default_factory=lambda: ("circular",))
         num_target_shots_options: tuple[int, ...] = Field(default_factory=lambda: (0, 1, 10, -1))
         # Input normalization applied to the 10 dimensionless nn_inputs, one
         # setting for the whole study run (not a case axis, so it never
@@ -110,6 +119,14 @@ class ProfileStudy(Study):
             for mt in v:
                 if mt not in valid:
                     raise ValueError(f"Invalid model type: {mt}. Must be one of {sorted(valid)}.")
+            return v
+
+        @field_validator("geometry_builders")
+        @classmethod
+        def _validate_geometry_builders(cls, v: tuple[str, ...]) -> tuple[str, ...]:
+            for gb in v:
+                if gb not in VALID_GEOMETRY_BUILDERS:
+                    raise ValueError(f"Invalid geometry builder: {gb}. Must be one of {VALID_GEOMETRY_BUILDERS}.")
             return v
 
         @field_validator("data_normalization")
@@ -145,13 +162,25 @@ class ProfileStudy(Study):
         freeze_shapes:
         - some profile predictors first use PCA to identify dominant shapes. these shapes may be frozen or modified during module training
 
+        geometry_builder: Per-sample TORAX geometry construction, only meaningful for torax-* model
+        types (every other model type is pinned to "circular").
+        - circular: large-aspect-ratio analytic geometry (delta = 0 everywhere)
+        - miller: shaped Miller geometry driven by delta_top/delta_bot
+
         num_target_shots: The number of shots included in the training data from the target dataset, or -1 to include all shots (including all shots in training is cheating, but again answers the question of what is the best possible performance).
         """
 
         freeze_shapes: bool
+        geometry_builder: str
 
         VALID_MODEL_TYPES = (*MODEL_TYPES_WITH_SHAPES, *MODEL_TYPES_WITHOUT_SHAPES)
-        STR_TOKEN_FIELDS = (("freeze_", "freeze_shapes"),)
+        # geometry_builder's default ("circular") is suppressed from the case
+        # name, so pre-existing circular-only studies keep identical case names
+        STR_TOKEN_FIELDS = (("freeze_", "freeze_shapes"), ("geom_", "geometry_builder", "circular"))
+        # geometry_builder is deliberately NOT a hyperparam field (like model_type):
+        # it stays untouched by _hyperparam_field_values, so miller cases get their
+        # own hyperparameter sweep and tuned config (keyed by their own geom_miller
+        # case string) instead of inheriting circular's tuned hyperparameters
         HYPERPARAM_FIELDS = ("domain_adaptation", "freeze_shapes", "num_target_shots")
 
         # The dataclass decorator would null an inherited __hash__
@@ -168,8 +197,10 @@ class ProfileStudy(Study):
             domain_adaptation: str | None,
             freeze_shapes: bool,
             num_target_shots: int,
+            geometry_builder: str = "circular",
         ):
             self.freeze_shapes = freeze_shapes
+            self.geometry_builder = geometry_builder
             self._init_common(model_type, training_data, domain_adaptation, num_target_shots)
 
     def make_cases(self):
@@ -180,12 +211,14 @@ class ProfileStudy(Study):
             training_dataset,
             domain_adaptation,
             freeze_shapes,
+            geometry_builder,
             num_target_shots,
         ) in product(
             config.model_types,
             config.training_datasets,
             config.domain_adaptation_methods,
             config.freeze_shapes_options,
+            config.geometry_builders,
             config.num_target_shots_options,
         ):
             if domain_adaptation is None:
@@ -196,6 +229,8 @@ class ProfileStudy(Study):
                     continue  # Invalid case, skip
             if model_type in MODEL_TYPES_WITHOUT_SHAPES and not freeze_shapes:
                 continue  # No shapes to freeze, just do one of the two
+            if not model_type.startswith("torax-") and geometry_builder != "circular":
+                continue  # geometry_builder only applies to torax model types
 
             case = self.Case(
                 model_type=model_type,
@@ -203,6 +238,7 @@ class ProfileStudy(Study):
                 domain_adaptation=domain_adaptation,
                 freeze_shapes=freeze_shapes,
                 num_target_shots=num_target_shots,
+                geometry_builder=geometry_builder,
             )
 
             cases.append(case)
@@ -329,7 +365,7 @@ class ProfileStudy(Study):
                     "nn_width": 16,
                     "in_size": 10,  # Dimensionless nn_inputs derived from the raw input_vars, includes log(nu_star)
                     "torax_config": torax_defaults["torax_config"],
-                    "geometry_builder": torax_defaults.get("geometry_builder", "circular"),
+                    "geometry_builder": case.geometry_builder,
                     "delta_exponent": torax_defaults.get("delta_exponent", 2.0),
                     "t_final": torax_defaults.get("t_final"),
                     "fixed_dt": torax_defaults.get("fixed_dt"),
@@ -373,6 +409,7 @@ class ProfileStudy(Study):
         "training_data",
         "domain_adaptation",
         "freeze_shapes",
+        "geometry_builder",
         "num_target_shots",
     )
 

@@ -257,8 +257,12 @@ class Study:
 
         # Model types accepted by _validate
         VALID_MODEL_TYPES: ClassVar[tuple[str, ...]] = ()
-        # (prefix, field name) tokens between the td_ and targ_ tokens of str(case)
-        STR_TOKEN_FIELDS: ClassVar[tuple[tuple[str, str], ...]] = ()
+        # (prefix, field name) or (prefix, field name, suppress_value) tokens
+        # between the td_ and targ_ tokens of str(case). The 3-tuple form
+        # omits the token entirely when the field holds suppress_value, so a
+        # new axis whose default reproduces old behavior can be added without
+        # renaming every existing case (see ProfileStudy.Case.geometry_builder)
+        STR_TOKEN_FIELDS: ClassVar[tuple[tuple[str, str] | tuple[str, str, object], ...]] = ()
         # Per-case fields with a config.hyperparam_<name> counterpart
         HYPERPARAM_FIELDS: ClassVar[tuple[str, ...]] = ()
 
@@ -350,8 +354,12 @@ class Study:
 
         def __str__(self):
             parts = [f"case.{self.model_type}", f"td_{self.training_data}"]
-            for prefix, field_name in self.STR_TOKEN_FIELDS:
-                parts.append(f"{prefix}{getattr(self, field_name)}")
+            for token in self.STR_TOKEN_FIELDS:
+                prefix, field_name = token[0], token[1]
+                value = getattr(self, field_name)
+                if len(token) == 3 and value == token[2]:
+                    continue
+                parts.append(f"{prefix}{value}")
             if self.domain_adaptation:
                 parts.append(f"targ_{self.num_target_shots}")
                 parts.append(f"da_{self.domain_adaptation}")
