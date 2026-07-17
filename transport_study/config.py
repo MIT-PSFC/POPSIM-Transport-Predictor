@@ -41,6 +41,14 @@ def _env_spillover_partitions() -> tuple[str, ...]:
     return tuple(p.strip() for p in raw.split(",") if p.strip())
 
 
+def _env_gpu_types() -> tuple[str, ...]:
+    """Parse PTPS_GPU_TYPES, a comma-separated list of SLURM gres GPU type
+    names GPU jobs may land on, e.g. "a100,h100,h200"
+    """
+    raw = os.environ.get("PTPS_GPU_TYPES", "a100,h100,h200")
+    return tuple(t.strip().lower() for t in raw.split(",") if t.strip())
+
+
 # Main config for environment variables
 class StudyConfig(BaseModel):
     # Shared between all studies
@@ -80,6 +88,10 @@ class StudyConfig(BaseModel):
     # resumes from that checkpoint. 27000 s = 7.5 h
     train_wall_budget_s: int = Field(default_factory=lambda: int(os.environ.get("PTPS_TRAIN_WALL_BUDGET_S", "27000")))
     buffer_gpus: int | None = Field(default_factory=lambda: int(os.environ.get("PTPS_BUFFER_GPUS", "12")))
+    # SLURM gres GPU type names training and agent jobs may land on
+    # The default keeps float64 TORAX training off cards with slow fp64
+    # pipelines (l40s, a40, l4, rtx_pro_6000). Empty disables the exclusion
+    gpu_types: tuple[str, ...] = Field(default_factory=_env_gpu_types)
     # Overflow partitions for GPU jobs once `partition` has no idle GPUs beyond
     # buffer_gpus, tried in order. Jobs submitted there can be preempted
     # (requeued) at any time, so training relies on resume-from-checkpoint.

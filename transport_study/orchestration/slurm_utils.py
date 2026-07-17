@@ -444,6 +444,43 @@ def pick_partition() -> str | None:
     return None
 
 
+@functools.cache
+def gpu_type_exclude_nodes(partition: str, allowed_gpu_types: tuple[str, ...]) -> str:
+    """Comma-separated nodes in the partition whose GPUs are not all in allowed_gpu_types.
+
+    Node features on this cluster do not tag GPU models, so sbatch
+    --constraint cannot select card types and gres cannot request an OR of
+    them. An explicit --exclude list is the only way to keep a job on the
+    allowed cards. Cached per (partition, types), the hardware inventory is
+    static. Returns "" (exclude nothing) if sinfo fails: a job that lands on
+    a disallowed card still trains, just slowly.
+    """
+    result = subprocess.run(
+        ["sinfo", "-p", partition, "-N", "--noheader", "-o", "%N %G"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        logger.warning(f"sinfo failed while building the GPU-type exclude list for {partition}: {result.stderr}")
+        return ""
+    nodes = set()
+    for line in result.stdout.splitlines():
+        node, _, gres = line.strip().partition(" ")
+        gpu_types = re.findall(r"gpu:([A-Za-z0-9_]+):", gres)
+        if gpu_types and not all(t.lower() in allowed_gpu_types for t in gpu_types):
+            nodes.add(node)
+    return ",".join(sorted(nodes))
+
+
+def _gpu_exclude_directive(partition: str) -> str:
+    """The #SBATCH --exclude line keeping the job on config.gpu_types cards, or ""."""
+    if not config.gpu_types:
+        return ""
+    exclude_nodes = gpu_type_exclude_nodes(partition, tuple(config.gpu_types))
+    return f"\n#SBATCH --exclude={exclude_nodes}" if exclude_nodes else ""
+
+
 def clamp_time_for_partition(partition: str, train_config: TrainConfig) -> tuple[str, TrainConfig]:
     """sbatch --time and in-job wall budget fitted to the partition's MaxTime.
 
@@ -548,7 +585,7 @@ Path({str(study_config_path)!r}).unlink()
 #SBATCH --job-name={job_name}
 #SBATCH --partition={partition}
 #SBATCH --time={time_limit}
-#SBATCH --gres=gpu:1
+#SBATCH --gres=gpu:1{_gpu_exclude_directive(partition)}
 #SBATCH --mem=120G
 #SBATCH --cpus-per-task=4
 #SBATCH --export=ALL
@@ -581,6 +618,15 @@ export XLA_FLAGS="${{XLA_FLAGS:+$XLA_FLAGS }}--xla_gpu_force_compilation_paralle
 # cpu stays second in the list only so host-side helpers like jax.devices("cpu")
 # keep working. All compute defaults to cuda.
 export JAX_PLATFORMS=cuda,cpu
+
+# One preallocated XLA pool at 80% of VRAM
+# Keep preallocation on: growth-mode allocation fragments the pool,
+# and a batch-2048 TORAX transport grad step needs a single ~36 GB contiguous temp buffer,
+# which fragmentation OOMs even on an idle 80 GB card.
+# 80% still leaves the CUDA context and library kernel images (~0.7 GB measured)
+# room outside the pool.
+export XLA_PYTHON_CLIENT_PREALLOCATE=true
+export XLA_PYTHON_CLIENT_MEM_FRACTION=0.80
 
 {sys.executable} {script_path}
 exit_code=$?
@@ -665,7 +711,7 @@ Path({str(study_config_path)!r}).unlink()
 #SBATCH --job-name={job_name}
 #SBATCH --partition={partition}
 #SBATCH --time={time_limit}
-#SBATCH --gres=gpu:1
+#SBATCH --gres=gpu:1{_gpu_exclude_directive(partition)}
 #SBATCH --mem=120G
 #SBATCH --cpus-per-task=4
 #SBATCH --export=ALL
@@ -693,6 +739,15 @@ export XLA_FLAGS="${{XLA_FLAGS:+$XLA_FLAGS }}--xla_gpu_force_compilation_paralle
 # cpu stays second in the list only so host-side helpers like jax.devices("cpu")
 # keep working. All compute defaults to cuda.
 export JAX_PLATFORMS=cuda,cpu
+
+# One preallocated XLA pool at 80% of VRAM
+# Keep preallocation on: growth-mode allocation fragments the pool,
+# and a batch-2048 TORAX transport grad step needs a single ~36 GB contiguous temp buffer,
+# which fragmentation OOMs even on an idle 80 GB card.
+# 80% still leaves the CUDA context and library kernel images (~0.7 GB measured)
+# room outside the pool.
+export XLA_PYTHON_CLIENT_PREALLOCATE=true
+export XLA_PYTHON_CLIENT_MEM_FRACTION=0.80
 
 {sys.executable} {script_path}
 exit_code=$?
