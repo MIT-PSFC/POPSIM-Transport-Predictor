@@ -1,5 +1,9 @@
 import numpy as np
 
+# Nominal step of the uniform timebase every device workflow builds with
+# make_uniform_1khz_timebase
+UNIFORM_TIMEBASE_DT_S = 1e-3
+
 
 def make_uniform_1khz_timebase(max_time: float) -> np.ndarray:
     """

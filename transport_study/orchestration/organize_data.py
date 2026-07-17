@@ -13,7 +13,7 @@ from scipy.linalg import fractional_matrix_power
 
 from transport_study import EPISODE_DIM, TIME_COORD, TIME_DIM
 from transport_study.config import RHO_GRID, TRAIN_VAL_SPLIT, config
-from transport_study.datasets import make_uniform_1khz_timebase
+from transport_study.datasets import UNIFORM_TIMEBASE_DT_S, make_uniform_1khz_timebase
 from transport_study.modules.normalization import MIN_CORAL_SAMPLES
 
 
@@ -153,10 +153,6 @@ def concat_with_nan_padding(
     )
 
     return ds_padded
-
-
-# Nominal uniform timebase for the standardized datasets (1 kHz)
-UNIFORM_TIMEBASE_DT_S = 1e-3
 
 
 def reindex_to_uniform_timebase(ds: xr.Dataset) -> xr.Dataset:

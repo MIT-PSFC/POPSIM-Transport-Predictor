@@ -6,6 +6,7 @@ import xarray as xr
 from loguru import logger
 
 from transport_study import EPISODE_DIM, TIME_COORD, TIME_DIM
+from transport_study.datasets import UNIFORM_TIMEBASE_DT_S
 from transport_study.datasets.plotting import (
     ds_profile_plot,
     ds_profile_time_plot,
@@ -233,6 +234,46 @@ class DataWorkflow(ABC):
             if ds[signal].isnull().all():
                 logger.warning(f"Culling shot {shot_id}: {signal} is all NaN after processing and filtering")
                 return True
+        return False
+
+    # Auxiliary input power signals a device may carry, summed with ohmic power
+    # for the energy sanity check
+    AUX_POWER_SIGNALS = ("P_NBI_MW", "P_ICRF_MW", "P_LH_MW", "P_ECRH_MW")
+
+    def energy_sanity_cull(self, ds: xr.Dataset) -> bool:
+        """Energy sanity check, True if this shot should be excluded.
+
+        The peak stored energy cannot exceed the total input energy
+        (ohmic + auxiliary) delivered up to that peak
+        A ratio above 1 means an input power record is broken or missing,
+        e.g. MAST shots reaching 0.2 MJ with zero recorded NBI power.
+        Missing power samples count as zero, which only lowers the input estimate,
+        so a healthy shot (input energy far above stored energy) is never culled.
+        """
+        shot_id = ds["shot"].values[0] if "shot" in ds else "unknown"
+        if "Wtot_MJ" not in ds or "P_oh_MW" not in ds:
+            return False
+        time = np.asarray(ds[TIME_COORD].values).reshape(-1)
+        wtot = np.asarray(ds["Wtot_MJ"].values).reshape(-1)
+        valid = np.isfinite(time) & np.isfinite(wtot)
+        if valid.sum() < 2:
+            return False
+        p_total = np.nan_to_num(np.asarray(ds["P_oh_MW"].values, dtype=float).reshape(-1), nan=0.0)
+        for sig in self.AUX_POWER_SIGNALS:
+            if sig in ds:
+                p_total = p_total + np.nan_to_num(np.asarray(ds[sig].values, dtype=float).reshape(-1), nan=0.0)
+        order = np.argsort(time[valid])
+        time_v = time[valid][order]
+        wtot_v = wtot[valid][order]
+        power_v = p_total[valid][order]
+        peak = int(np.argmax(wtot_v))
+        energy_in_MJ = float(np.trapezoid(power_v[: peak + 1], time_v[: peak + 1]))
+        if wtot_v[peak] > energy_in_MJ:
+            logger.info(
+                f"Culling shot {shot_id}: peak stored energy {wtot_v[peak]:.3f} MJ exceeds "
+                f"integrated input energy {energy_in_MJ:.3f} MJ, input power record is broken or missing"
+            )
+            return True
         return False
 
     def has_all_nan_signal(self, ds: xr.Dataset, signals: list[str]) -> bool:
@@ -485,12 +526,32 @@ class DataWorkflow(ABC):
             return None
 
         # Culling that is common across devices
+        if self.common_culling(shot_id, shot_ds):
+            self._debug_plots(debug_ds)
+            return None
+
+        return shot_ds
+
+    def common_culling(self, shot_id: int, shot_ds: xr.Dataset) -> bool:
+        """Device-independent culling, True if this shot should be excluded."""
+        # If input power record cannot account for the stored energy, exclude it
+        if self.energy_sanity_cull(shot_ds):
+            return True
+
         # If shot is too short after processing, exclude it
         cleaned_ds = shot_ds.dropna("time_idx", how="all")
         valid_time_duration = 0 if cleaned_ds.time.size == 0 else float(cleaned_ds.time.max() - cleaned_ds.time.min())
         if valid_time_duration < self.min_shot_duration:
             logger.warning(f"Excluding shot {shot_id} because duration after processing is only {valid_time_duration:.2f} seconds")
-            self._debug_plots(debug_ds)
-            return None
+            return True
 
-        return shot_ds
+        # Also require the accumulated valid time (slice count on the 1 kHz grid) to reach the minimum.
+        valid_data_duration = cleaned_ds.sizes["time_idx"] * UNIFORM_TIMEBASE_DT_S
+        if valid_data_duration < self.min_shot_duration:
+            logger.warning(
+                f"Excluding shot {shot_id} because only {valid_data_duration:.3f} seconds of valid data "
+                f"remain after processing (span {valid_time_duration:.2f} seconds)"
+            )
+            return True
+
+        return False
