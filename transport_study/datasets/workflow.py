@@ -247,8 +247,10 @@ class DataWorkflow(ABC):
         (ohmic + auxiliary) delivered up to that peak
         A ratio above 1 means an input power record is broken or missing,
         e.g. MAST shots reaching 0.2 MJ with zero recorded NBI power.
+        Give a little bit of leeway (10%) to account for measurement noise and integration error.
+        Note this ignores radiated power, so it's a conservative check.
         Missing power samples count as zero, which only lowers the input estimate,
-        so a healthy shot (input energy far above stored energy) is never culled.
+        so a healthy shot (integrated input energy far above stored energy) is never culled.
         """
         shot_id = ds["shot"].values[0] if "shot" in ds else "unknown"
         if "Wtot_MJ" not in ds or "P_oh_MW" not in ds:
@@ -268,7 +270,7 @@ class DataWorkflow(ABC):
         power_v = p_total[valid][order]
         peak = int(np.argmax(wtot_v))
         energy_in_MJ = float(np.trapezoid(power_v[: peak + 1], time_v[: peak + 1]))
-        if wtot_v[peak] > energy_in_MJ:
+        if wtot_v[peak] > (energy_in_MJ * 1.05):
             logger.info(
                 f"Culling shot {shot_id}: peak stored energy {wtot_v[peak]:.3f} MJ exceeds "
                 f"integrated input energy {energy_in_MJ:.3f} MJ, input power record is broken or missing"
