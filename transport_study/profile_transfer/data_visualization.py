@@ -9,6 +9,8 @@ class DataVisualization(DataVisualizationBase):
     # Input-variable pairs to plot per normalization method. Only references
     # variables guaranteed present for profile-transfer datasets
     # (no P_aux_MW / surface_power_density, which are zero here).
+    # Coral and physics-coral pairs use only the module's joint feature set
+    # (adding Wtot_MJ or beta to the fit would change every var's transform).
     VAR_GROUPS: ClassVar[dict[str, list[list[str]]]] = {
         "raw": [
             ["Ip_MA", "Wtot_MJ"],
@@ -29,15 +31,15 @@ class DataVisualization(DataVisualizationBase):
             ["Wtot_MJ_z", "kappa_z"],
         ],
         "coral": [
-            ["Ip_MA_coral", "Wtot_MJ_coral"],
+            ["Ip_MA_coral", "kappa_coral"],
             ["R0_coral", "a_minor_coral"],
             ["ne20_line_avg_coral", "B0_coral"],
-            ["Wtot_MJ_coral", "kappa_coral"],
+            ["Ip_MA_coral", "B0_coral"],
         ],
         "physics-coral": [
-            ["Ip_MA_pcoral", "beta_pcoral"],
+            ["Ip_MA_pcoral", "kappa_pcoral"],
             ["q_star_pcoral", "epsilon_pcoral"],
             ["f_G_pcoral", "aB0_pcoral"],
-            ["beta_pcoral", "kappa_pcoral"],
+            ["q_star_pcoral", "aB0_pcoral"],
         ],
     }

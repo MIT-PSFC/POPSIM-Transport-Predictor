@@ -19,8 +19,9 @@ Methods:
 - physics-coral: the physics transform followed by CORAL alignment fitted in
   the dimensionless physics feature space
 
-organize_data.normalize_domain implements the same math on whole datasets, it
-remains for data visualization only.
+organize_data.normalize_domain (data visualization) is a thin wrapper around
+the fit/apply helpers in this file, so the visualized feature spaces are the
+ones the models actually consume.
 """
 
 from __future__ import annotations
@@ -52,7 +53,7 @@ NORM_INPUT_VARS = (
 )
 N_FEATURES = len(NORM_INPUT_VARS)
 
-# Regularization for covariance matrix roots (matches normalize_domain)
+# Regularization for covariance matrix roots
 CORAL_REG = 1e-6
 # A device needs at least this many complete samples for a meaningful
 # covariance, below it the device keeps the identity transform
@@ -157,6 +158,18 @@ class RawNormalizer(InputNormalizer):
         return vec
 
 
+# Names of the physics_feature_vec output slots, in order
+PHYSICS_FEATURE_NAMES = (
+    "Ip_MA",
+    "q_star",
+    "epsilon",
+    "aB0",
+    "kappa",
+    "f_G",
+    "surface_power_density",
+)
+
+
 def physics_feature_vec(vec: jnp.ndarray) -> jnp.ndarray:
     """The dimensionless physics features for a stacked 7-input vector.
 
@@ -195,6 +208,36 @@ class PhysicsNormalizer(InputNormalizer):
         return physics_feature_vec(vec)
 
 
+def fit_z_score_stats(features: np.ndarray, source_idx: np.ndarray, n_devices: int) -> tuple[jnp.ndarray, jnp.ndarray]:
+    """Per-device mean/std from an (N, F) feature matrix.
+
+    Per-feature statistics ignore NaNs independently (z-scoring is
+    elementwise, so incomplete rows still contribute their valid entries).
+    Devices absent from the data keep the identity row (mean 0, std 1), as do
+    features with zero or undefined spread.
+    """
+    n_features = features.shape[1]
+    means = np.zeros((n_devices, n_features))
+    stds = np.ones((n_devices, n_features))
+    for device_val in np.unique(source_idx):
+        device = int(device_val)
+        rows = features[source_idx == device]
+        with np.errstate(all="ignore"):
+            mean = np.nanmean(rows, axis=0)
+            std = np.nanstd(rows, axis=0)
+        means[device] = np.where(np.isfinite(mean), mean, 0.0)
+        stds[device] = np.where(np.isfinite(std) & (std != 0), std, 1.0)
+    return jnp.asarray(means), jnp.asarray(stds)
+
+
+def apply_z_score(vec: jnp.ndarray, ds_source_idx: ArrayLike, means: jnp.ndarray, stds: jnp.ndarray) -> jnp.ndarray:
+    """Apply the device's z-score to a feature vector (batched inputs broadcast)."""
+    idx = jnp.asarray(ds_source_idx).astype(jnp.int32)
+    mean = jnp.take(means, idx, axis=0)
+    std = jnp.take(stds, idx, axis=0)
+    return (vec - mean) / std
+
+
 class ZScoreNormalizer(InputNormalizer):
     """Per-device zero mean, unit variance.
 
@@ -210,10 +253,7 @@ class ZScoreNormalizer(InputNormalizer):
     stds: jnp.ndarray
 
     def _normalize_vec(self, vec: jnp.ndarray, ds_source_idx: ArrayLike) -> jnp.ndarray:
-        idx = jnp.asarray(ds_source_idx).astype(jnp.int32)
-        mean = jnp.take(self.means, idx, axis=0)
-        std = jnp.take(self.stds, idx, axis=0)
-        return (vec - mean) / std
+        return apply_z_score(vec, ds_source_idx, self.means, self.stds)
 
     @classmethod
     def identity(cls, n_devices: int) -> ZScoreNormalizer:
@@ -221,26 +261,10 @@ class ZScoreNormalizer(InputNormalizer):
 
     @classmethod
     def fit(cls, ds: xr.Dataset, n_devices: int) -> ZScoreNormalizer:
-        """Fit per-device mean/std over exactly the 7 input vars.
-
-        Per-var statistics ignore NaNs independently, matching
-        normalize_domain's z-score. (normalize_domain also normalized Wtot_MJ,
-        the module fits only the model inputs - intentional cleanup.)
-        """
+        """Fit per-device mean/std over exactly the 7 input vars."""
         features, source_idx = _feature_matrix(ds)
-        means = np.zeros((n_devices, N_FEATURES))
-        stds = np.ones((n_devices, N_FEATURES))
-        for device_val in np.unique(source_idx):
-            device = int(device_val)
-            rows = features[source_idx == device]
-            with np.errstate(all="ignore"):
-                mean = np.nanmean(rows, axis=0)
-                std = np.nanstd(rows, axis=0)
-            mean = np.where(np.isfinite(mean), mean, 0.0)
-            std = np.where(np.isfinite(std) & (std != 0), std, 1.0)
-            means[device] = mean
-            stds[device] = std
-        return cls(means=jnp.asarray(means), stds=jnp.asarray(stds))
+        means, stds = fit_z_score_stats(features, source_idx, n_devices)
+        return cls(means=means, stds=stds)
 
 
 def identity_coral_stats(n_devices: int, n_features: int) -> tuple[jnp.ndarray, jnp.ndarray]:
@@ -313,11 +337,7 @@ class CoralNormalizer(InputNormalizer):
 
     @classmethod
     def fit(cls, ds: xr.Dataset, n_devices: int) -> CoralNormalizer:
-        """Fit per-device CORAL transforms over exactly the 7 input vars.
-
-        (normalize_domain also included Wtot_MJ in its feature matrix, the
-        module fits only the model inputs - intentional cleanup.)
-        """
+        """Fit per-device CORAL transforms over exactly the 7 input vars."""
         features, source_idx = _feature_matrix(ds)
         stats = fit_coral_stats(features, source_idx, n_devices)
         if stats is None:

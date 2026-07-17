@@ -2,19 +2,27 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import jax
+import jax.numpy as jnp
 import numpy as np
 import xarray as xr
 from loguru import logger
-from popsim.cfspopcon_jax.current_drive import calc_f_shaping, calc_q_star
-from popsim.cfspopcon_jax.geometry import calc_plasma_surface_area, calc_plasma_volume
+from popsim.cfspopcon_jax.geometry import calc_plasma_volume
 from popsim.ml.split_utils import split_dataset_by_fracs
 from scipy.constants import mu_0
-from scipy.linalg import fractional_matrix_power
 
 from transport_study import EPISODE_DIM, TIME_COORD, TIME_DIM
 from transport_study.config import RHO_GRID, TRAIN_VAL_SPLIT, config
 from transport_study.datasets import UNIFORM_TIMEBASE_DT_S, make_uniform_1khz_timebase
-from transport_study.modules.normalization import MIN_CORAL_SAMPLES
+from transport_study.modules.normalization import (
+    NORM_INPUT_VARS,
+    PHYSICS_FEATURE_NAMES,
+    apply_coral,
+    apply_z_score,
+    fit_coral_stats,
+    fit_z_score_stats,
+    identity_coral_stats,
+    physics_feature_vec,
+)
 
 
 @dataclass(frozen=True)
@@ -401,22 +409,28 @@ def add_performance(
     return ds
 
 
-def normalize_domain(  # noqa: PLR0915
+def normalize_domain(
     ds_source: xr.Dataset,
     ds_target: xr.Dataset | None = None,
     method: str | None = "raw",
-) -> tuple[xr.Dataset, xr.Dataset]:
+) -> tuple[xr.Dataset, xr.Dataset | None]:
     """Apply the specified domain normalization method to the dataset.
+
+    Thin wrapper around transport_study.modules.normalization: the per-method
+    math (physics features, per-device z-score, CORAL) is exactly the module
+    implementation the models consume, fitted here from ds_source and applied
+    to both datasets. Used for data visualization only. Datasets are modified
+    in place and returned.
 
     ds_source is used to inform the normalization parameters (e.g. mean and std for z-score, covariance for coral),
     but the normalization is applied to both source and target datasets.
 
     Methods:
         - "raw": No normalization, Ip, Wtot, etc. are in their original units
-        - "physics": Convert to typical dimensionless parameters like beta, q95, f_G, etc.
-        - "z_score": Within each device, normalize each variable to zero mean and unit variance. Variable gets a `_z` suffix after normalization.
-        - "coral": Use the CORAL method to align covariances of various devices. Variable gets a `_coral` suffix after normalization.
-        - "physics-coral": The physics parameters followed by CORAL alignment on them. Variable gets a `_pcoral` suffix (a `_coral` suffix would collide with the raw coral vars).
+        - "physics": The module's dimensionless features (q_star, epsilon, aB0, f_G, surface_power_density) plus beta as a visualization-only extra
+        - "z_score": Within each device, normalize each variable to zero mean and unit variance. Variable gets a `_z` suffix after normalization. Wtot_MJ is a visualization-only extra column (harmless, z-scoring is per-variable)
+        - "coral": Use the CORAL method to align covariances of various devices over exactly the model's 7 input vars. Variable gets a `_coral` suffix after normalization.
+        - "physics-coral": CORAL alignment over the 7 physics features. Variable gets a `_pcoral` suffix (a `_coral` suffix would collide with the raw coral vars).
 
     Args:
         ds_source: The source dataset (e.g. historic data)
@@ -426,281 +440,93 @@ def normalize_domain(  # noqa: PLR0915
     Returns:
         The normalized source and target datasets.
     """
-    normalize_vars = [
-        "Ip_MA",
-        "B0",
-        "ne20_line_avg",
-        "R0",
-        "kappa",
-        "a_minor",
-        "Wtot_MJ",
-        "P_aux_MW",
-    ]
+    datasets = [ds_source] if ds_target is None else [ds_source, ds_target]
 
-    def _separate_devices(ds: xr.Dataset) -> dict[str, xr.Dataset]:
-        devices = np.unique(ds.coords["ds_source"].values)
-        return {device: ds.where(ds.coords["ds_source"] == device, drop=True) for device in devices}
+    def _reference(ds: xr.Dataset) -> xr.DataArray:
+        # Broadcast template carrying the full per-sample dims
+        return ds[NORM_INPUT_VARS[0]]
 
-    def _physics_normalization(ds_source: xr.Dataset, ds_target: xr.Dataset | None):
-        def _epsilon(ds: xr.Dataset) -> xr.DataArray:
-            return ds["a_minor"] / ds["R0"]
-
-        def _beta(ds: xr.Dataset) -> xr.DataArray:
-            avg_pressure = (2.0 / 3.0) * (ds["Wtot_MJ"] * 1e6) / calc_plasma_volume(ds["R0"], ds["epsilon"], ds["kappa"])
-            magnetic_pressure = (ds["B0"] ** 2) / (2 * mu_0)
-            beta = 100 * avg_pressure / magnetic_pressure
-            return beta
-
-        def _q_star(ds: xr.Dataset) -> xr.DataArray:
-            # Zero triangularity, since the H89/H98 scalings this feeds have no triangularity term
-            f_shaping = calc_f_shaping(ds["epsilon"], ds["kappa"], xr.zeros_like(ds["epsilon"]))
-            q_star = calc_q_star(ds["B0"], ds["R0"], ds["epsilon"], ds["Ip_MA"], f_shaping)
-            return q_star
-
-        def _greenwald_fraction(ds: xr.Dataset) -> xr.DataArray:
-            greenwald_limit = ds["Ip_MA"] / (np.pi * ds["a_minor"] ** 2)
-            f_G = ds["ne20_line_avg"] / greenwald_limit
-            return f_G
-
-        def _aB0(ds: xr.Dataset) -> xr.DataArray:
-            # Dimensional, similar to normalized gyroradius,
-            # but actual normalized gyroradius needs a temperature which H89/H98 don't have
-            return ds["a_minor"] * ds["B0"]
-
-        def _surface_power_density(ds: xr.Dataset) -> xr.DataArray:
-            surface_area = calc_plasma_surface_area(ds["R0"], ds["epsilon"], ds["kappa"])
-            if "P_aux_MW" not in ds:
-                power_density = xr.zeros_like(surface_area)
+    def _feature_matrix_for(ds: xr.Dataset, variables: tuple[str, ...]) -> np.ndarray:
+        reference = _reference(ds)
+        columns = []
+        for var in variables:
+            if var in ds:
+                col = np.asarray(ds[var].broadcast_like(reference).values, dtype=float).ravel()
             else:
-                power_density = ds["P_aux_MW"] / surface_area
-            return power_density
+                # Missing signals become zeros (profile-transfer sets lack P_aux_MW unless zero-filled upstream)
+                col = np.zeros(reference.size)
+            columns.append(col)
+        return np.column_stack(columns)
 
-        for ds in [ds_source, ds_target] if ds_target is not None else [ds_source]:
-            ds["epsilon"] = _epsilon(ds)
-            ds["beta"] = _beta(ds)
-            ds["q_star"] = _q_star(ds)
-            ds["f_G"] = _greenwald_fraction(ds)
-            ds["aB0"] = _aB0(ds)
-            ds["surface_power_density"] = _surface_power_density(ds)
+    def _physics_matrix(ds: xr.Dataset) -> np.ndarray:
+        raw = jnp.asarray(_feature_matrix_for(ds, NORM_INPUT_VARS))
+        return np.asarray(jax.vmap(physics_feature_vec)(raw))
 
-        return ds_source, ds_target
+    def _write_features(ds: xr.Dataset, matrix: np.ndarray, names: tuple[str, ...], suffix: str) -> None:
+        reference = _reference(ds)
+        for j, name in enumerate(names):
+            ds[f"{name}{suffix}"] = (reference.dims, np.asarray(matrix[:, j], dtype=float).reshape(reference.shape))
 
-    def _z_score_normalization(ds_source: xr.Dataset, ds_target: xr.Dataset | None):
-        # Calculate mean and std from source dataset, then apply to both source and target
-        # This is done per device to avoid washing out differences in variable distributions across devices
-        # Calculate normalization parameters from source dataset per device
-        norm_params = {}
-        source_devices = _separate_devices(ds_source)
-
-        for device, ds_device in source_devices.items():
-            device_params = {}
-            for var in normalize_vars:
-                if var in ds_device:
-                    # Calculate mean and std across all dimensions except coordinates
-                    data_var = ds_device[var]
-                    mean_val = data_var.mean(skipna=True)
-                    std_val = data_var.std(skipna=True)
-
-                    # Avoid division by zero
-                    std_val = std_val.where(std_val != 0, 1.0)
-
-                    device_params[var] = {"mean": mean_val, "std": std_val}
-            norm_params[device] = device_params
-
-        # Apply normalization to source dataset
-        ds_source_norm = ds_source.copy()
-        for var in normalize_vars:
-            # Start with raw values, then overwrite per-device
-            z_var = ds_source_norm[var].copy()
-            for device, device_params in norm_params.items():
-                if var in device_params:
-                    mean_val = device_params[var]["mean"]
-                    std_val = device_params[var]["std"]
-                    mask = ds_source_norm.coords["ds_source"] == device
-                    z_var = z_var.where(~mask, (ds_source_norm[var] - mean_val) / std_val)
-            ds_source_norm[f"{var}_z"] = z_var
-
-        # Apply same normalization to target dataset if provided
-        if ds_target is not None:
-            ds_target_norm = ds_target.copy()
-            for var in normalize_vars:
-                z_var = ds_target_norm[var].copy()
-                for device, device_params in norm_params.items():
-                    if var in device_params:
-                        mean_val = device_params[var]["mean"]
-                        std_val = device_params[var]["std"]
-                        mask = ds_target_norm.coords["ds_source"] == device
-                        z_var = z_var.where(~mask, (ds_target_norm[var] - mean_val) / std_val)
-                ds_target_norm[f"{var}_z"] = z_var
-        else:
-            ds_target_norm = None
-
-        return ds_source_norm, ds_target_norm
-
-    def _coral_normalization(
-        ds_source: xr.Dataset,
-        ds_target: xr.Dataset | None,
-        variables: list[str] | None = None,
-        suffix: str = "_coral",
-    ):
-        # CORAL aligns second-order statistics (covariance) across domains.
-        # We use the pooled source data as the reference domain and transform
-        # each device's features so their covariance matches the reference.
-        # The transform for device d is: center, whiten with C_d^{-1/2}, re-color with C_ref^{1/2}, then re-add mean.
-        # A small regularization term is added to covariance diagonals for numerical stability.
-        # Visualization-only counterpart of modules.normalization.CoralNormalizer
-
-        variables = normalize_vars if variables is None else variables
-        reg = 1e-6  # Regularization for covariance matrix inversion
-
-        def _build_feature_matrix(ds: xr.Dataset, variables: list[str]) -> np.ndarray:
-            """Build (N, D) feature matrix from dataset, flattening all dims except variables."""
-            arrays = []
-            for var in variables:
-                arr = ds[var].values.flatten()
-                arrays.append(arr)
-            return np.column_stack(arrays)
-
-        def _coral_transform(
-            X: np.ndarray,
-            mu_source: np.ndarray,
-            cov_source: np.ndarray,
-            cov_ref: np.ndarray,
-        ) -> np.ndarray:
-            """Apply CORAL transformation: whiten with source covariance, re-color with reference."""
-            d = cov_source.shape[0]
-            cov_source_reg = cov_source + reg * np.eye(d)
-            cov_ref_reg = cov_ref + reg * np.eye(d)
-
-            cs_neg_half = np.real(fractional_matrix_power(cov_source_reg, -0.5))
-            cr_pos_half = np.real(fractional_matrix_power(cov_ref_reg, 0.5))
-
-            X_centered = X - mu_source
-            X_transformed = X_centered @ cs_neg_half @ cr_pos_half + mu_source
-            return X_transformed
-
-        # Compute reference statistics from pooled source data
-        all_source_features = _build_feature_matrix(ds_source, variables)
-        valid_rows = ~np.any(np.isnan(all_source_features), axis=1)
-        all_source_valid = all_source_features[valid_rows]
-        cov_ref = np.cov(all_source_valid, rowvar=False)
-
-        # Compute per-device statistics from source
-        source_devices = _separate_devices(ds_source)
-        device_stats = {}
-        for device, ds_device in source_devices.items():
-            X_device = _build_feature_matrix(ds_device, variables)
-            valid = ~np.any(np.isnan(X_device), axis=1)
-            X_valid = X_device[valid]
-            if len(X_valid) >= MIN_CORAL_SAMPLES:
-                device_stats[device] = {
-                    "mean": np.mean(X_valid, axis=0),
-                    "cov": np.cov(X_valid, rowvar=False),
-                }
-
-        def _apply_coral_to_ds(
-            ds: xr.Dataset,
-            device_stats: dict,
-            cov_ref: np.ndarray,
-        ) -> xr.Dataset:
-            """Apply CORAL transformation to a dataset, writing results with the configured suffix."""
-            ds_norm = ds.copy()
-            # Initialize coral variables with raw values
-            for var in variables:
-                ds_norm[f"{var}{suffix}"] = ds_norm[var].copy()
-
-            source_vals = ds.coords["ds_source"].values
-            # Handle scalar ds_source (single-device dataset)
-            if np.ndim(source_vals) == 0:
-                devices_in_ds = [str(source_vals)]
-            else:
-                devices_in_ds = np.unique(source_vals)
-
-            for device in devices_in_ds:
-                if device not in device_stats:
-                    logger.warning(
-                        "Device {} not in source stats, skipping CORAL for it",
-                        device,
-                    )
-                    continue
-
-                # Determine which shots belong to this device
-                if np.ndim(source_vals) == 0:
-                    # Scalar ds_source: all shots belong to this single device
-                    ds_device = ds
-                    is_single_device = True
-                else:
-                    mask_xr = ds.coords["ds_source"] == device
-                    ds_device = ds.where(mask_xr, drop=True)
-                    device_indices = np.where(np.atleast_1d(mask_xr.values))[0]
-                    is_single_device = False
-
-                # Build feature matrix for this device in the dataset
-                X_device = _build_feature_matrix(ds_device, variables)
-
-                # Handle NaNs: transform valid rows, leave NaNs in place
-                valid = ~np.any(np.isnan(X_device), axis=1)
-                X_transformed = X_device.copy()
-                if valid.sum() > 0:
-                    X_transformed[valid] = _coral_transform(
-                        X_device[valid],
-                        device_stats[device]["mean"],
-                        device_stats[device]["cov"],
-                        cov_ref,
-                    )
-
-                # Write back transformed values per variable
-                device_shape = ds_device[variables[0]].shape
-                for j, var in enumerate(variables):
-                    col = X_transformed[:, j].reshape(device_shape)
-                    if is_single_device:
-                        # All shots are this device, just assign directly
-                        ds_norm[f"{var}{suffix}"].values = col
-                    else:
-                        full_vals = ds_norm[f"{var}{suffix}"].values.copy()
-                        for idx_out, idx_in in enumerate(device_indices):
-                            full_vals[idx_in] = col[idx_out]
-                        ds_norm[f"{var}{suffix}"].values = full_vals
-
-            return ds_norm
-
-        ds_source_norm = _apply_coral_to_ds(ds_source, device_stats, cov_ref)
-
-        if ds_target is not None:
-            ds_target_norm = _apply_coral_to_ds(ds_target, device_stats, cov_ref)
-        else:
-            ds_target_norm = None
-
-        return ds_source_norm, ds_target_norm
-
-    def _physics_coral_normalization(ds_source: xr.Dataset, ds_target: xr.Dataset | None):
-        # CORAL alignment in the dimensionless physics space, mirroring
-        # modules.normalization.PhysicsCoralNormalizer (plus beta, viz-only)
-        ds_source, ds_target = _physics_normalization(ds_source, ds_target)
-        physics_vars = [
-            "Ip_MA",
-            "q_star",
-            "epsilon",
-            "aB0",
-            "kappa",
-            "f_G",
-            "surface_power_density",
-            "beta",
-        ]
-        return _coral_normalization(ds_source, ds_target, variables=physics_vars, suffix="_pcoral")
+    def _add_physics_vars(ds: xr.Dataset) -> None:
+        phys = _physics_matrix(ds)
+        reference = _reference(ds)
+        for j, name in enumerate(PHYSICS_FEATURE_NAMES):
+            # Ip_MA and kappa slots are identity mappings, the raw vars already exist
+            if name in NORM_INPUT_VARS:
+                continue
+            ds[name] = (reference.dims, np.asarray(phys[:, j], dtype=float).reshape(reference.shape))
+        # beta needs the stored energy, which is the predicted state rather than
+        # a model input, so it is a visualization-only extra
+        epsilon = ds["a_minor"] / ds["R0"]
+        avg_pressure = (2.0 / 3.0) * (ds["Wtot_MJ"] * 1e6) / calc_plasma_volume(ds["R0"], epsilon, ds["kappa"])
+        ds["beta"] = 100 * avg_pressure / ((ds["B0"] ** 2) / (2 * mu_0))
 
     if method == "raw":
         return ds_source, ds_target
-    elif method == "physics":
-        return _physics_normalization(ds_source, ds_target)
-    elif method == "z_score":
-        return _z_score_normalization(ds_source, ds_target)
-    elif method == "coral":
-        return _coral_normalization(ds_source, ds_target)
-    elif method == "physics-coral":
-        return _physics_coral_normalization(ds_source, ds_target)
-    else:
-        raise ValueError(f"Unknown normalization method: {method}")
+    if method == "physics":
+        for ds in datasets:
+            _add_physics_vars(ds)
+        return ds_source, ds_target
+
+    # Stat-bearing methods key per-device statistics on an integer index built
+    # locally from the ds_source coordinate (the modules use the global
+    # config.ds_source_to_idx, but any consistent indexing gives the same stats)
+    registry: dict[str, int] = {}
+    for ds in datasets:
+        for device in np.atleast_1d(ds.coords["ds_source"].values):
+            registry.setdefault(str(device), len(registry))
+
+    def _source_idx_for(ds: xr.Dataset) -> np.ndarray:
+        idx_da = xr.apply_ufunc(np.vectorize(lambda d: registry[str(d)]), ds.coords["ds_source"])
+        return np.asarray(idx_da.broadcast_like(_reference(ds)).values).ravel().astype(int)
+
+    if method == "z_score":
+        z_score_vars = (*NORM_INPUT_VARS, "Wtot_MJ")
+        means, stds = fit_z_score_stats(_feature_matrix_for(ds_source, z_score_vars), _source_idx_for(ds_source), len(registry))
+        for ds in datasets:
+            matrix = apply_z_score(jnp.asarray(_feature_matrix_for(ds, z_score_vars)), _source_idx_for(ds), means, stds)
+            _write_features(ds, np.asarray(matrix), z_score_vars, "_z")
+        return ds_source, ds_target
+
+    def _coral_normalization(variables: tuple[str, ...], suffix: str, matrix_fn) -> None:
+        # Devices below MIN_CORAL_SAMPLES (or absent from ds_source) keep the
+        # identity transform, so their features pass through raw. Rows with any
+        # NaN feature come out all-NaN (the joint transform needs complete rows).
+        stats = fit_coral_stats(matrix_fn(ds_source), _source_idx_for(ds_source), len(registry))
+        means, transforms = identity_coral_stats(len(registry), len(variables)) if stats is None else stats
+        batched_apply = jax.vmap(apply_coral, in_axes=(0, 0, None, None))
+        for ds in datasets:
+            matrix = batched_apply(jnp.asarray(matrix_fn(ds)), jnp.asarray(_source_idx_for(ds)), means, transforms)
+            _write_features(ds, np.asarray(matrix), variables, suffix)
+
+    if method == "coral":
+        _coral_normalization(NORM_INPUT_VARS, "_coral", lambda ds: _feature_matrix_for(ds, NORM_INPUT_VARS))
+        return ds_source, ds_target
+    if method == "physics-coral":
+        _coral_normalization(PHYSICS_FEATURE_NAMES, "_pcoral", _physics_matrix)
+        return ds_source, ds_target
+
+    raise ValueError(f"Unknown normalization method: {method}")
 
 
 def get_train_val_datasets(
