@@ -569,6 +569,17 @@ export WANDB_MODE=offline
 export OPENBLAS_NUM_THREADS=1
 export OMP_NUM_THREADS=1
 
+# Compile XLA GPU programs serially. Parallel compilation threads can deadlock
+# under the 4-cpu cgroup, stalling the job during initial compilation.
+export XLA_FLAGS="${{XLA_FLAGS:+$XLA_FLAGS }}--xla_gpu_force_compilation_parallelism=1"
+
+# The driver may run with JAX_PLATFORMS=cpu, which leaks in via --export=ALL.
+# Pin this GPU job to cuda. Listing platforms explicitly makes jax raise if cuda
+# fails to init, so a broken GPU env fails loudly instead of training on cpu.
+# cpu stays second in the list only so host-side helpers like jax.devices("cpu")
+# keep working. All compute defaults to cuda.
+export JAX_PLATFORMS=cuda,cpu
+
 {sys.executable} {script_path}
 exit_code=$?
 rm -f {script_path}
@@ -666,6 +677,17 @@ Path({str(study_config_path)!r}).unlink()
 export OPENBLAS_NUM_THREADS=1
 export OMP_NUM_THREADS=1
 
+# Compile XLA GPU programs serially. Parallel compilation threads can deadlock
+# under the 4-cpu cgroup, stalling the job during initial compilation.
+export XLA_FLAGS="${{XLA_FLAGS:+$XLA_FLAGS }}--xla_gpu_force_compilation_parallelism=1"
+
+# The driver may run with JAX_PLATFORMS=cpu, which leaks in via --export=ALL.
+# Pin this GPU job to cuda. Listing platforms explicitly makes jax raise if cuda
+# fails to init, so a broken GPU env fails loudly instead of training on cpu.
+# cpu stays second in the list only so host-side helpers like jax.devices("cpu")
+# keep working. All compute defaults to cuda.
+export JAX_PLATFORMS=cuda,cpu
+
 {sys.executable} {script_path}
 exit_code=$?
 rm -f {script_path}
@@ -753,6 +775,11 @@ export MPLBACKEND=Agg
 # eigvals is tiny so single-threaded costs nothing.
 export OPENBLAS_NUM_THREADS=1
 export OMP_NUM_THREADS=1
+
+# Analysis is cpu-only. Pin jax so behavior is identical regardless of driver env
+# and cuda plugin init is skipped on cpu partitions.
+export JAX_PLATFORMS=cpu
+
 {sys.executable} {script_path}
 exit_code=$?
 rm -f {script_path}

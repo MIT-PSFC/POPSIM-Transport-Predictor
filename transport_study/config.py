@@ -9,7 +9,6 @@ import tomllib
 from pathlib import Path
 from types import MappingProxyType
 
-import jax
 import numpy as np
 import toml
 from loguru import logger
@@ -213,7 +212,3 @@ def reset_config() -> None:
     _ConfigProxy._cfg = None
     _ConfigProxy.initialized = False
     logger.critical("GLOBAL CONFIG RESET!!! THIS SHOULD ONLY HAPPEN IN TESTS. DO NOT CALL THIS IN PRODUCTION CODE.")
-
-
-if jax.devices()[0].platform not in ["gpu", "tpu", "cuda"]:
-    logger.warning("JAX could not find GPU/TPU/CUDA, is your environment set correctly?")

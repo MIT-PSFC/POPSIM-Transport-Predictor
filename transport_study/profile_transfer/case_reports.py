@@ -366,6 +366,15 @@ def torax_relaxation_report(study, metrics_ds: xr.Dataset, figure_dir: Path):
     time_s = float(ts_metrics.time[best_record])
     eval_time_idx = int(ts_metrics.eval_time_idx[best_record])
 
+    transport_model = case.model_type.removeprefix("torax-")
+    plot_path = Path(figure_dir) / "torax" / f"relaxation_{case}_shot{shot}_t{time_s:.3f}.png"
+    # Skip the module restore and TORAX solve when the figure for this exact
+    # case and timeslice is already on disk. If new results shift the best
+    # case or timeslice the path changes and the figure regenerates
+    if plot_path.exists():
+        logger.info(f"TORAX relaxation figure already exists at {plot_path}, skipping")
+        return
+
     # The raw device dataset carries the scalar input vars the module needs.
     # load_eval_dataset keeps the same time_idx indexing (rows are never dropped)
     timeslice = xr.open_dataset(config.dataset_paths[device]).sel({EPISODE_DIM: shot}).isel({TIME_DIM: eval_time_idx})
@@ -387,8 +396,6 @@ def torax_relaxation_report(study, metrics_ds: xr.Dataset, figure_dir: Path):
         return
     logger.info(f"TORAX relaxation recorded {len(steps)} states (initial + {len(steps) - 1} steps)")
 
-    transport_model = case.model_type.removeprefix("torax-")
-    plot_path = Path(figure_dir) / "torax" / f"relaxation_{case}_shot{shot}_t{time_s:.3f}.png"
     plot_relaxation(
         steps,
         coeffs,
