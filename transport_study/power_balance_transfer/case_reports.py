@@ -41,6 +41,15 @@ STAGE_SHADE_COLORS = {
 AUX_SHADE_COLOR = "#ffb347"
 
 
+def _result_signal(result_ds: xr.Dataset) -> str:
+    """Base name of the predicted signal in a result file, e.g. Wtot_MJ for the
+    full power balance cases or P_oh_MW / P_rad_MW for the submodule cases."""
+    for name in result_ds.data_vars:
+        if str(name).endswith("_targ"):
+            return str(name)[: -len("_targ")]
+    raise KeyError(f"No *_targ variable in result file, found {list(result_ds.data_vars)}")
+
+
 def _stage_spans(times: np.ndarray, mask: np.ndarray) -> list[tuple[float, float]]:
     """(start, end) time spans of the contiguous True runs of mask."""
     spans: list[tuple[float, float]] = []
@@ -63,13 +72,16 @@ def _shot_page(
 ) -> plt.Figure:
     """Two-panel trajectory page for one holdout shot.
 
-    Top: measured vs predicted Wtot over time with the shot stages shaded.
+    Top: measured vs predicted signal (Wtot, or the submodule power) over time
+    with the shot stages shaded.
     Bottom: per-timeslice absolute and relative error with aux-heated spans.
     """
+    signal = _result_signal(result_ds)
+    unit = signal.rsplit("_", 1)[-1]
     shot_res = result_ds.sel({EPISODE_DIM: shot})
     res_time = shot_res["time"].values
-    targ = shot_res["Wtot_MJ_targ"].values
-    pred = shot_res["Wtot_MJ_pred"].values
+    targ = shot_res[f"{signal}_targ"].values
+    pred = shot_res[f"{signal}_pred"].values
     valid = np.isfinite(res_time) & np.isfinite(targ)
 
     rec = np.flatnonzero(ts_metrics.shot == shot)
@@ -83,10 +95,10 @@ def _shot_page(
     style_axis(ax_traj, TICK_FONTSIZE)
     ax_traj.plot(res_time[valid], targ[valid], color="white", linewidth=2, linestyle="--", label="Measured")
     ax_traj.plot(res_time[valid], pred[valid], color="#0095ff", linewidth=2, label="Predicted")
-    ax_traj.set_ylabel(r"$W_{tot}$ [MJ]", color=TEXT_COLOR, fontsize=LABEL_FONTSIZE)
+    ax_traj.set_ylabel(f"{signal.rsplit('_', 1)[0]} [{unit}]", color=TEXT_COLOR, fontsize=LABEL_FONTSIZE)
 
     style_axis(ax_err, TICK_FONTSIZE)
-    ax_err.plot(rec_time, ts_metrics.err_abs[rec], color="#0095ff", linewidth=1.5, label="Abs error [MJ]")
+    ax_err.plot(rec_time, ts_metrics.err_abs[rec], color="#0095ff", linewidth=1.5, label=f"Abs error [{unit}]")
     ax_err.plot(rec_time, ts_metrics.err_rel[rec], color="#ff60ec", linewidth=1.5, label="Rel error")
     ax_err.set_ylabel("Error", color=TEXT_COLOR, fontsize=LABEL_FONTSIZE)
     ax_err.set_xlabel("Time [s]", color=TEXT_COLOR, fontsize=LABEL_FONTSIZE)
@@ -130,7 +142,7 @@ def _shot_page(
     duration = float(rec_time[-1] - rec_time[0]) if len(rec_time) > 1 else 0.0
     fig.suptitle(
         f"{title_prefix}shot {shot} ({device})\n"
-        f"time-avg rel err={avg_rel:.3f}  time-avg abs err={avg_abs:.3f} MJ  "
+        f"time-avg rel err={avg_rel:.3f}  time-avg abs err={avg_abs:.3f} {unit}  "
         f"{len(rec)} timeslices over {duration:.2f} s",
         color=TEXT_COLOR,
         fontsize=TITLE_FONTSIZE,
