@@ -532,6 +532,11 @@ class Study:
         set, F_x its configured fraction). Typically the target device is
         weighted most heavily. Weights are scaled so the mean per-sample weight
         over the training set is 1, keeping the loss magnitude comparable across cases
+
+        When config.dataset_fractions is not set, the target fraction defaults
+        to min(0.5, sqrt(N_target / N_total)) with the remainder split evenly
+        among the sources, so few-shot cases still get a strong boost above
+        their natural share but the boost fades as target shots accumulate.
         """
         target = config.target_device
 
@@ -545,17 +550,31 @@ class Study:
         # num_target_shots == 0: no target samples in training, so the target
         # device gets no weight entry and the sources split the full budget
 
+        total_shots = sum(shot_counts.values())
         if config.dataset_fractions:
             dataset_fractions = {device: config.dataset_fractions[device] for device in shot_counts}
         else:
-            logger.info("Dataset fractions not provided in config. Using 50% for target and dividing remaining 50% evenly among sources.")
             num_sources = len(case.training_data.sources)
-            dataset_fractions = {device: 0.5 if device == target else 0.5 / num_sources for device in shot_counts}
+            if target in shot_counts:
+                # A fixed 50 percent target budget overweights the few target
+                # shots at intermediate N and drags the fit toward the low
+                # end of the target performance distribution, so scale the
+                # boost down as target shots accumulate
+                target_fraction = min(0.5, math.sqrt(shot_counts[target] / total_shots))
+                dataset_fractions = {
+                    device: target_fraction if device == target else (1 - target_fraction) / num_sources for device in shot_counts
+                }
+                logger.info(
+                    f"Dataset fractions not provided in config. Target fraction {target_fraction:.3f} "
+                    f"(sqrt-scaled, {shot_counts[target]} of {total_shots} training shots), remainder split evenly among sources."
+                )
+            else:
+                logger.info("Dataset fractions not provided in config. No target shots in training, dividing budget evenly among sources.")
+                dataset_fractions = dict.fromkeys(shot_counts, 1 / num_sources)
 
         # Renormalize over the devices actually present in this case's training set
         # (configured fractions may cover devices this case does not use)
         total_fraction = sum(dataset_fractions.values())
-        total_shots = sum(shot_counts.values())
         dataset_weights = {}
         for device, N_x in shot_counts.items():
             F_x = dataset_fractions[device] / total_fraction
