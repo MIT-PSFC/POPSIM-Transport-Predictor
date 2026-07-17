@@ -557,8 +557,10 @@ Path({str(study_config_path)!r}).unlink()
 #SBATCH --open-mode=append
 #SBATCH --requeue
 
-# Resubmitted attempts share this log path, mark where each one starts
+# Resubmitted attempts share this log path, mark where each one starts.
+# SLURM_JOB_GPUS is the physical index on the node, the uuid names the exact card for bad-hardware reports.
 echo "=== $(date) job $SLURM_JOB_ID ({job_name}) start ==="
+echo "=== node $SLURMD_NODENAME gpu ${{SLURM_JOB_GPUS:-$CUDA_VISIBLE_DEVICES}} $(nvidia-smi --query-gpu=name,uuid --format=csv,noheader 2>/dev/null || echo nvidia-smi unavailable) ==="
 
 # Save results to netcdf only; no need to sync wandb runs online from batch jobs
 export WANDB_MODE=offline
@@ -671,6 +673,10 @@ Path({str(study_config_path)!r}).unlink()
 #SBATCH --error={log_path}
 #SBATCH --requeue
 
+# SLURM_JOB_GPUS is the physical index on the node, the uuid names the exact card for bad-hardware reports.
+echo "=== $(date) job $SLURM_JOB_ID ({job_name}) start ==="
+echo "=== node $SLURMD_NODENAME gpu ${{SLURM_JOB_GPUS:-$CUDA_VISIBLE_DEVICES}} $(nvidia-smi --query-gpu=name,uuid --format=csv,noheader 2>/dev/null || echo nvidia-smi unavailable) ==="
+
 # Single-thread host BLAS/OpenMP. Reservoir init runs np.linalg.eigvals whose
 # OpenBLAS threadpool can deadlock nondeterministically under core contention.
 # eigvals is tiny so single-threaded costs nothing.
@@ -767,7 +773,7 @@ Path({study_config_path!r}).unlink()
 #SBATCH --open-mode=append
 
 # Resubmitted attempts share this log path, mark where each one starts
-echo "=== $(date) job $SLURM_JOB_ID ({job_name}) start ==="
+echo "=== $(date) job $SLURM_JOB_ID ({job_name}) start on $SLURMD_NODENAME ==="
 
 export MPLBACKEND=Agg
 # Single-thread host BLAS/OpenMP. Reservoir init runs np.linalg.eigvals whose
