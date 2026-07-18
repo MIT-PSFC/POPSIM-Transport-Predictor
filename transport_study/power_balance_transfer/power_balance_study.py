@@ -56,6 +56,21 @@ SUBMODULE_MODEL_TYPES = ("p_oh", "p_rad")
 
 VALID_DATA_NORMALIZATIONS = ("raw", "physics", "z_score", "coral", "physics-coral")
 
+# Per-submodule train settings shared with the transport study, which trains
+# the same p_oh/p_rad prereq cases for its power balance submodule
+SCALAR_SUBMODULE_SETTINGS = {
+    "p_oh": {
+        "train_run_builder": "transport_study.modules.power_balance.p_oh.trb.OhmicPowerTRB",
+        "target_vars": ["P_oh_MW", "ds_source_idx"],
+        "max_val": 16,  # Maximum ohmic power in MW
+    },
+    "p_rad": {
+        "train_run_builder": "transport_study.modules.power_balance.p_rad.trb.RadiatedPowerTRB",
+        "target_vars": ["P_rad_MW", "ds_source_idx"],
+        "max_val": 16,  # Maximum radiated power in MW
+    },
+}
+
 
 class PowerBalanceStudy(Study):
     SWEEP_CONFIG_DIR = Path(PACKAGE_ROOT) / "power_balance_transfer" / "sweep_configs"
@@ -270,18 +285,7 @@ class PowerBalanceStudy(Study):
     def _model_train_spec(self, case: Case, dataloader_config_base: dict) -> ModelTrainSpec:
         trb = "transport_study.modules.power_balance.trb.PowerBalanceTRB"
         if case.model_type in SUBMODULE_MODEL_TYPES:
-            submodule_settings = {
-                "p_oh": {
-                    "train_run_builder": "transport_study.modules.power_balance.p_oh.trb.OhmicPowerTRB",
-                    "target_vars": ["P_oh_MW", "ds_source_idx"],
-                    "max_val": 16,  # Maximum ohmic power in MW
-                },
-                "p_rad": {
-                    "train_run_builder": "transport_study.modules.power_balance.p_rad.trb.RadiatedPowerTRB",
-                    "target_vars": ["P_rad_MW", "ds_source_idx"],
-                    "max_val": 16,  # Maximum radiated power in MW
-                },
-            }[case.model_type]
+            submodule_settings = SCALAR_SUBMODULE_SETTINGS[case.model_type]
             return ModelTrainSpec(
                 train_run_builder=submodule_settings["train_run_builder"],
                 dataloader_config={

@@ -622,8 +622,13 @@ class ProfilePredictorTRB(TrainRunBuilder):
                 squeeze_dims = [d for d, n in da.sizes.items() if n == 1 and d not in protected_dims]
                 if squeeze_dims:
                     da = da.squeeze(dim=squeeze_dims, drop=True)
-                if TIME_DIM + "_input" in da.dims:
-                    da = da.rename({TIME_DIM + "_input": TIME_DIM})
+                # Time-dependent dataloaders suffix every input-side dim (the
+                # transport study reuses this suite): rename them back
+                # (time_idx_input -> time_idx, rho_input -> rho) so targets and
+                # predictions share one grid. No-op for time-independent evals.
+                renames = {d: d.removesuffix("_input") for d in da.dims if isinstance(d, str) and d.endswith("_input")}
+                if renames:
+                    da = da.rename(renames)
                 return da
 
             def _get_first_present(ds: xr.Dataset, candidates: list[str]) -> xr.DataArray:
@@ -631,6 +636,19 @@ class ProfilePredictorTRB(TrainRunBuilder):
                     if name in ds.data_vars:
                         return ds[name]
                 raise KeyError(f"None of the candidate output vars were found: {candidates}")
+
+            def _ensure_rho_dim(pred: xr.DataArray, targ: xr.DataArray) -> xr.DataArray:
+                # Time-dependent stepper outputs are bare arrays whose profile
+                # axis gets a generic auto-generated dim name (the transport
+                # study reuses this suite). Identify it as the one dim the
+                # target does not have and rename it, so the error math never
+                # silently outer-broadcasts pred rho against targ rho
+                if "rho" in pred.dims:
+                    return pred
+                extra = [d for d in pred.dims if d not in targ.dims]
+                if len(extra) != 1 or pred.sizes[extra[0]] != targ.sizes["rho"]:
+                    raise ValueError(f"Cannot identify the profile axis of the prediction, dims {pred.dims} vs target {targ.dims}")
+                return pred.rename({extra[0]: "rho"}).assign_coords(rho=targ["rho"].values)
 
             # Targets from input dataset
             ne_targ = _unstack_and_rename_time(eval_data.input_ds["ne20_rho"])
@@ -647,8 +665,8 @@ class ProfilePredictorTRB(TrainRunBuilder):
                 eval_data.output_ds,
                 ["te", "output.te", "output.profile_predictor_output.te"],
             )
-            ne_pred = _unstack_and_rename_time(ne_pred_raw)
-            te_pred = _unstack_and_rename_time(te_pred_raw)
+            ne_pred = _ensure_rho_dim(_unstack_and_rename_time(ne_pred_raw), ne_targ)
+            te_pred = _ensure_rho_dim(_unstack_and_rename_time(te_pred_raw), te_targ)
 
             # Per-point profile errors
             ne_error_abs_profile = xr.apply_ufunc(np.abs, ne_pred - ne_targ)

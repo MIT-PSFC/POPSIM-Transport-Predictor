@@ -5,12 +5,15 @@ import equinox as eqx
 import jax
 import jax.numpy as jnp
 import numpy as np
+import xarray as xr
 from jaxtyping import Array, ArrayLike, PyTree
 from popsim import TimeDepModule, discrete_no_save_field
 from popsim.cfspopcon_jax.current_drive import calc_f_shaping, calc_q_star
 from popsim.cfspopcon_jax.geometry import calc_plasma_volume
 from popsim.math_utils import safe_log
+from popsim.ml.envs import ModuleTrainingEnv
 from popsim.ml.rtd_mlp import Activation, RtdMLP
+from popsim.simulate import StepperType
 from scipy.constants import epsilon_0, eV, mu_0
 from torax import ToraxConfig
 from torax import experimental as torax_experimental
@@ -19,7 +22,7 @@ from torax._src.orchestration.step_function import SimulationStepFn
 from torax._src.torax_pydantic import torax_pydantic
 
 from transport_study.modules.normalization import CoralFeatureNormalizer
-from transport_study.modules.power_balance.module import PowerBalance
+from transport_study.modules.power_balance.module import PowerBalance, PowerBalanceEnv
 
 # Namespace import: the profile predictor also names its input dataclass
 # Inputs, and a from-import alias makes ruff and isort fight over sorting
@@ -928,3 +931,133 @@ class TransportPredictorToraxSimState(TransportPredictorToraxBase):
         state_out = TransportPredictorToraxSimState.State(sim_state=final_state, post_processed=final_post)
         output = Output(ne=ne_now, te=te_now, rho=rho, debug_info=debug_info)
         return state_out, output
+
+
+class TransportPredictorEnv(ModuleTrainingEnv):
+    """Training environment shared by every transport predictor architecture.
+
+    State seeding uses the measured signals at the segment start: the
+    dataloader's state_init_vars carry the t0 slice of the profiles, the
+    stored energy, and (for the TORAX sim-state variant) every scalar input,
+    so create_state never has to slice the time axis itself.
+    """
+
+    module: TransportPredictor
+    domain_adaptation: str = eqx.field(static=True, default="unset")
+    # Sciml submodule names ("power_balance", "profile_predictor") excluded
+    # from the trainable selection
+    freeze_submodules: list[str] = eqx.field(static=True, default_factory=list)
+    # Every architecture carries discrete state, so SIMPLE_EULER is required
+    stepper: StepperType = eqx.field(static=True, default=StepperType.SIMPLE_EULER)
+
+    def create_state(self, observations: dict[str, ArrayLike], inputs: dict[str, ArrayLike]):
+        # asarray: eager callers hand numpy-backed xr data, and the modules
+        # index the carried state with jax-only ops (.at)
+        ne0 = jnp.asarray(observations["ne20_rho"].data)
+        te0 = jnp.asarray(observations["Te_keV_rho"].data)
+
+        if isinstance(self.module, TransportPredictorTransformer):
+            # Fill the whole history buffer with the measured initial profile,
+            # as if the plasma had been sitting at that profile forever
+            row = jnp.concatenate([ne0, te0])
+            profiles = jnp.tile(row[jnp.newaxis, :], (self.module.history_len, 1))
+            return TransportPredictorTransformer.State(profiles=profiles)
+
+        if isinstance(self.module, TransportPredictorSciML):
+            return PowerBalance.State(Wtot_MJ=observations["Wtot_MJ"].data)
+
+        if isinstance(self.module, TransportPredictorTorax):
+            return TransportPredictorTorax.State(ne=ne0, te=te0)
+
+        if isinstance(self.module, TransportPredictorToraxSimState):
+            # Build a full TORAX initial state from the measured profiles,
+            # mirroring the per-step initial-condition flow of
+            # TransportPredictorTorax.__call__ (edge points pinned to the NN
+            # Dirichlet BCs so the solver never sees an LCFS discontinuity)
+            module = self.module
+            inputs0 = self.create_inputs(observations)
+            rho = jnp.array(module.rhogrid)
+            Wtot_MJ = wtot_from_profiles(ne0, te0, rho, inputs0.volume_approx)
+            coeffs = module._nn_coefficients(inputs0, Wtot_MJ)
+            te_ic = te0.at[-1].set(jnp.squeeze(coeffs["T_e_right_bc"]))
+            ne_ic = ne0.at[-1].set(jnp.squeeze(coeffs["n_e_right_bc"]))
+            provider, geo_provider = module._build_provider_and_geo(inputs0, coeffs, ne_ic=ne_ic, te_ic=te_ic)
+            initial_state, initial_post = torax_experimental.get_initial_state_and_post_processed_outputs(
+                step_fn=module.step_fn,
+                runtime_params_overrides=provider,
+                geometry_overrides=geo_provider,
+            )
+            return TransportPredictorToraxSimState.State(sim_state=initial_state, post_processed=initial_post)
+
+        raise ValueError(f"Unknown transport predictor module type: {type(self.module)}")
+
+    @staticmethod
+    def create_inputs(inputs: dict[str, ArrayLike]):
+        # Top-level module inputs are always in physical units,
+        # normalization happens inside the modules
+        if isinstance(inputs, xr.Dataset):
+            inputs = {var: inputs[var].data for var in inputs.data_vars}
+        return Inputs(
+            Ip_MA=inputs["Ip_MA"],
+            B0=inputs["B0"],
+            ne20_line_avg=inputs["ne20_line_avg"],
+            R0=inputs["R0"],
+            a_minor=inputs["a_minor"],
+            kappa=inputs["kappa"],
+            delta_top=inputs["delta_top"],
+            delta_bot=inputs["delta_bot"],
+            P_aux_MW=inputs["P_aux_MW"],
+            ds_source_idx=inputs["ds_source_idx"],
+        )
+
+    def get_trainable(self):
+        """Trainable leaves for the optimizer partition.
+
+        Selects NN leaves explicitly, never whole modules: normalizer
+        statistics are ordinary array leaves on every module and must stay
+        frozen (a broad eqx.filter over a module would silently train them).
+        The sciml power balance selection is delegated to PowerBalanceEnv so
+        the two studies can never drift apart on what counts as trainable.
+        """
+        if self.domain_adaptation == "transfer":
+            last_layer_leaves = []
+            if isinstance(self.module, TransportPredictorTransformer):
+                last_layer_leaves += [
+                    self.module.head.layers[-1].weight,
+                    self.module.head.layers[-1].bias,
+                ]
+            if isinstance(self.module, TransportPredictorToraxBase):
+                for nn in (self.module.nn_transport, self.module.nn_sources, self.module.nn_edge):
+                    last_layer_leaves += [nn.layers[-1].weight, nn.layers[-1].bias]
+            if isinstance(self.module, TransportPredictorSciML):
+                if "power_balance" not in self.freeze_submodules:
+                    pb_env = PowerBalanceEnv(
+                        module=self.module.power_balance,
+                        domain_adaptation="transfer",
+                        freeze_submodules=[],
+                    )
+                    last_layer_leaves += pb_env.get_trainable()
+                if "profile_predictor" not in self.freeze_submodules:
+                    nn = self.module.profile_predictor.nn
+                    last_layer_leaves += [nn.layers[-1].weight, nn.layers[-1].bias]
+            return last_layer_leaves
+
+        trainable_leaves = {}
+        if isinstance(self.module, TransportPredictorTransformer):
+            for name in ("feature_embed", "profile_embed", "attention", "head"):
+                trainable_leaves[name] = eqx.filter(getattr(self.module, name), eqx.is_inexact_array)
+        elif isinstance(self.module, TransportPredictorToraxBase):
+            for name in ("nn_transport", "nn_sources", "nn_edge"):
+                trainable_leaves[name] = eqx.filter(getattr(self.module, name), eqx.is_inexact_array)
+        elif isinstance(self.module, TransportPredictorSciML):
+            if "power_balance" not in self.freeze_submodules:
+                pb_env = PowerBalanceEnv(
+                    module=self.module.power_balance,
+                    domain_adaptation=self.domain_adaptation,
+                    freeze_submodules=[],
+                )
+                trainable_leaves["power_balance"] = pb_env.get_trainable()
+            if "profile_predictor" not in self.freeze_submodules:
+                trainable_leaves["profile_predictor"] = eqx.filter(self.module.profile_predictor.nn, eqx.is_inexact_array)
+
+        return trainable_leaves

@@ -1,0 +1,42 @@
+method: bayes
+metric:
+  name: "val/loss.mean"
+  goal: "minimize"
+early_terminate:
+  type: hyperband
+  min_iter: 2
+  eta: 3
+# The transport sciml model has no NN of its own, its power_balance and
+# profile submodules are restored from their own tuned cases. Sweep only
+# training dynamics.
+parameters:
+  optimizer_config:
+    parameters:
+      lr0:
+        distribution: log_uniform_values
+        min: 1.0e-5
+        max: 1.0e-2
+      lrf:
+        distribution: log_uniform_values
+        min: 1.0e-7
+        max: 1.0e-4
+      weight_decay:
+        distribution: log_uniform_values
+        min: 1.0e-6
+        max: 0.1
+      transition_frac:
+        distribution: log_uniform_values
+        min: 0.03
+        max: 3.0
+      decay_rate:
+        distribution: uniform
+        min: 0.5
+        max: 0.999
+  loss_config:
+    parameters:
+      # Safe to sweep, the sweep metric val/loss.mean is the delta-free
+      # validation loss (TransportPredictorTRB.get_val_loss_fn)
+      huber_delta:
+        distribution: log_uniform_values
+        min: 0.01
+        max: 1.0

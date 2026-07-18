@@ -1,0 +1,60 @@
+method: bayes
+metric:
+  name: "val/loss.mean"
+  goal: "minimize"
+early_terminate:
+  type: hyperband
+  min_iter: 2
+  eta: 3
+parameters:
+  model_init_config:
+    parameters:
+      nn_width:
+        values: [32, 64, 128]
+      nn_depth:
+        values: [2, 3, 4, 5, 6]
+      n_shapes:
+        values: [3, 4, 5, 6]
+      softmax_temp:
+        distribution: log_uniform_values
+        min: 0.1
+        max: 2.0
+  optimizer_config:
+    parameters:
+      lr0:
+        distribution: log_uniform_values
+        min: 1.0e-5
+        max: 1.0e-2
+      lrf:
+        distribution: log_uniform_values
+        min: 1.0e-7
+        max: 1.0e-4
+      weight_decay:
+        distribution: log_uniform_values
+        min: 1.0e-6
+        max: 0.1
+      # Learning-rate decay time constant as a fraction of the run's total
+      # optimizer steps (steps_per_epoch * max_epochs), resolved to
+      # transition_steps at train time. Horizon-invariant: the tuned schedule
+      # transfers to runs with different epoch budgets or batch sizes.
+      transition_frac:
+        distribution: log_uniform_values
+        min: 0.03
+        max: 3.0
+      decay_rate:
+        distribution: uniform
+        min: 0.5
+        max: 0.999
+  loss_config:
+    parameters:
+      # Deltas act on peak-normalized profiles, so they read as fractional errors.
+      # Sweeping them is safe because the sweep metric val/loss.mean is the
+      # delta-free validation loss (trb.get_val_loss_fn)
+      huber_delta:
+        distribution: log_uniform_values
+        min: 0.01
+        max: 1.0
+      huber_delta_grad:
+        distribution: log_uniform_values
+        min: 0.1
+        max: 10.0

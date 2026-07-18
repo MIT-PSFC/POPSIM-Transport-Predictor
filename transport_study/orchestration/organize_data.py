@@ -76,6 +76,20 @@ REQUIRED_SIGNALS_POWER_BALANCE = [
 ]
 INPUT_POWER_SIGNALS = ["P_ECRH_MW", "P_NBI_MW", "P_ICRF_MW", "P_LH_MW"]
 
+
+def _add_aux_power(ds: xr.Dataset) -> xr.Dataset:
+    """Zero-fill missing per-system aux power signals and sum them to P_aux_MW.
+
+    Some devices lack entire heating systems (and the sample datasets lack all
+    of them), the submodule TRBs still expect the per-system names to exist.
+    """
+    for signal in INPUT_POWER_SIGNALS:
+        if signal not in ds:
+            ds[signal] = xr.zeros_like(ds["Ip_MA"])
+    ds["P_aux_MW"] = ds["P_NBI_MW"] + ds["P_ECRH_MW"] + ds["P_ICRF_MW"] + ds["P_LH_MW"]
+    return ds
+
+
 # Profile channels that carry GP-fit gradient and error-bar companions.
 # For each base signal <v> the companions are <v>_grad, <v>_error and
 # <v>_grad_error. An error of 0 is the sentinel for "no rigorous error
@@ -124,6 +138,30 @@ REQUIRED_SIGNALS_PROFILE_TRANSFER = [
     # Extra
     "time",  # Data variable holding per-shot time values, the var selection below would drop it and the dataloader consumes it as the time coordinate
     "Wtot_MJ",  # Not strictly necessary but used for performance extrapolation
+]
+
+# Union of the profile and power balance needs, minus betan: the transport
+# modules derive every beta quantity from the evolving stored-energy state
+# instead of a measured betan (see modules/transport_predictor/module.py).
+# P_aux_MW is computed from the per-system signals by _add_aux_power.
+REQUIRED_SIGNALS_TRANSPORT_TRANSFER = [
+    # Targets and their companions
+    *PROFILE_BASE_SIGNALS,
+    *PROFILE_GRAD_SIGNALS,
+    *PROFILE_ERROR_SIGNALS,
+    "fresh_profiles",  # Kept as data (not a filter) so downstream losses or metrics can mask stale forward-filled profiles
+    # Inputs
+    "Ip_MA",
+    "B0",
+    "ne20_line_avg",
+    "R0",
+    "a_minor",
+    "kappa",
+    "delta_top",
+    "delta_bot",
+    # Extra
+    "time",  # Data variable holding per-shot time values, promoted to the time coordinate downstream
+    "Wtot_MJ",  # Seeds the sciml stored-energy state and the normalizer fit, also used for performance extrapolation
 ]
 
 
@@ -308,12 +346,7 @@ def get_ds(
 
         # Additional signals and duplicates for slight renames between submodules
         # This is for the individual submodule training to work, since when they're running on their own they expect these names.
-        for signal in INPUT_POWER_SIGNALS:
-            if signal not in ds:
-                ds[signal] = xr.zeros_like(ds["Ip_MA"])
-
-        # Calculate aux power and absorbed power
-        ds["P_aux_MW"] = ds["P_NBI_MW"] + ds["P_ECRH_MW"] + ds["P_ICRF_MW"] + ds["P_LH_MW"]
+        ds = _add_aux_power(ds)
 
         # Some device datasets carry multi-element numpy arrays in variable
         # attrs (e.g. a 'validity' time range). Attrs become static jit
@@ -330,10 +363,44 @@ def get_ds(
 
         return ds
 
+    def _transport_transfer(ds: xr.Dataset) -> xr.Dataset:
+        ds = add_missing_profile_companions(ds)
+        ds = _add_aux_power(ds)
+        ds = ds[[*REQUIRED_SIGNALS_TRANSPORT_TRANSFER, *INPUT_POWER_SIGNALS, "P_aux_MW"]]
+
+        # Unlike the profile branch there is NO fresh-profile filter here: the
+        # time-dependent rollouts need contiguous segments, so the stale
+        # (forward-filled) profile timeslices stay in as targets and
+        # fresh_profiles rides along as data for masking downstream
+        ds = ds.interp(rho=RHO_GRID, kwargs={"fill_value": "extrapolate"})
+
+        # Linear extrapolation at the grid edges can push error bars slightly
+        # negative, error bars are widths so clamp them
+        for err_sig in PROFILE_ERROR_SIGNALS:
+            ds[err_sig] = ds[err_sig].clip(min=0.0)
+
+        # Shape variables so the sciml profile submodule skeleton can run its
+        # PCA / k-means initial guess on this dataset (ProfilePredictorTRB.model_init)
+        ds["Te_shape"] = ds["Te_keV_rho"] / ds["Te_keV_rho"].integrate("rho")
+        ds["ne_shape"] = ds["ne20_rho"] / ds["ne20_rho"].integrate("rho")
+
+        # Same attr-stripping rationale as the power balance branch: array-valued
+        # attrs become static jit metadata and break the treedef equality check
+        for var in ds.variables:
+            ds[var].attrs = {}
+
+        # Strict 1 kHz grid with NaN at missing times so the train dataloader's
+        # drop_segment nan_handling only keeps contiguous segments
+        ds = reindex_to_uniform_timebase(ds)
+
+        return ds
+
     if study_type == "profile_transfer":
         ds = _profile_transfer(ds)
     elif study_type == "power_balance_transfer":
         ds = _power_balance(ds)
+    elif study_type == "transport_transfer":
+        ds = _transport_transfer(ds)
     else:
         raise ValueError(f"Unknown study type: {study_type}")
 

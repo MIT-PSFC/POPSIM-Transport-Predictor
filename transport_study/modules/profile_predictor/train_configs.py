@@ -128,6 +128,100 @@ TORAX_TRANSPORT_BLOCKS = {
     },
 }
 
+# TORAX config skeleton shared by the torax-backed profile predictor and, with
+# a one-step numerics override, the torax-backed transport predictor, whose
+# builder lives in the transport_predictor train_configs module. The
+# "transport" block is filled per transport model from TORAX_TRANSPORT_BLOCKS.
+TORAX_CONFIG_BASE: dict[str, Any] = {
+    "profile_conditions": {
+        "Ip": 9999,  # Overridden by dataloader input
+        # Edge BCs predicted by NN as fractions of te_approx and ne20_line_avg.
+        "T_i_right_bc": 0.2,  # [keV] Predicted by NN
+        "T_e_right_bc": 0.2,  # [keV] Predicted by NN
+        "n_e_right_bc": 0.5e20,  # [m^-3] Predicted by NN
+        # Placeholder initial profiles; overridden per sample with
+        # parabolic inits scaled to te_approx / ne20_line_avg and
+        # continuous with the NN edge BCs (see _build_provider_and_geo)
+        "T_i": {0: {0: 0.3, 1: 0.2}},
+        "T_e": {0: {0: 0.3, 1: 0.2}},
+        "n_e": {0: {0: 1e20, 1: 0.5e20}},
+        "normalize_n_e_to_nbar": False,
+        # Initialize psi from Ip and geometry via the current_profile_nu formula.
+        # Same as the legacy fallback for circular geometry, but explicit to
+        # silence the TORAX deprecation warning.
+        "initial_psi_mode": "j",
+    },
+    "numerics": {
+        "t_initial": 0.0,
+        "t_final": 0.1,  # Give it ~100 ms to relax, on order of energy confinement time
+        # Linear theta solver is implicit / unconditionally stable, so we
+        # can take large fixed steps to reach steady state cheaply
+        "fixed_dt": 2e-2,
+        "min_dt": 1e-3,
+        # dt never changes with the fixed time-step calculator, so the
+        # adaptive retry loop is pure overhead (1.4x, bit-identical results)
+        "adaptive_dt": False,
+        "evolve_ion_heat": True,
+        "evolve_electron_heat": True,
+        "evolve_current": True,
+        "evolve_density": True,
+    },
+    "plasma_composition": {
+        "main_ion": {"D": 1.0},  # Assuming DD and minor impurities
+        "Z_eff": 1.1,
+    },
+    "geometry": {
+        "geometry_type": "circular",
+        "R_major": 9999,  # Overridden by dataloader input
+        "a_minor": 3000,  # Overridden by dataloader input (must be less than R_major)
+        "B_0": 9999,  # Overridden by dataloader input
+        "elongation_LCFS": 9999,  # Overridden by dataloader input
+        # Internal solver mesh, up from the TORAX default of 25 to
+        # halve the piecewise-linear gradient staircase in the output
+        # interpolation. The 51-point output rhogrid shared by all
+        # model families is unaffected.
+        "n_rho": 50,
+    },
+    # "transport" block filled per transport model from TORAX_TRANSPORT_BLOCKS
+    "sources": {
+        "ei_exchange": {},
+        "bremsstrahlung": {},
+        "cyclotron_radiation": {},
+        "ohmic": {},
+        "gas_puff": {"S_total": 9999},  # Predicted by NN
+        # NN-inferred auxiliary heating. All entries except
+        # absorption_fraction are per-sample overridden by the
+        # sources network (absorption is fixed, degenerate with
+        # P_total). Placeholders only need to pass pydantic validation
+        "generic_heat": {
+            "P_total": 1.0e6,  # Predicted by NN
+            "gaussian_location": 0.3,  # Predicted by NN
+            "gaussian_width": 0.25,  # Predicted by NN
+            "electron_heat_fraction": 0.6,  # Predicted by NN
+            "absorption_fraction": 0.9,
+        },
+        "generic_current": {},
+    },
+    "solver": {
+        # Gradient-dependent transport (CGM is stiff, BgB chi depends on the
+        # evolving gradients); the Pereverzev-Corrigan terms keep the linear
+        # theta solver stable at large fixed steps. Harmless for the
+        # constant model.
+        "use_pereverzev": True,
+        "use_predictor_corrector": True,
+        # Picard iterations run n_corrector_steps + 1 times with no early exit.
+        # TORAX default of 10 is overkill at 10ms dt, but the 20ms
+        # dt above needs headroom: benchmarked on the cgm base case,
+        # 8 matched baseline val loss per epoch at 3.2x overall speedup,
+        # while 4 was 5.3x but converged to visibly worse loss per epoch.
+        "n_corrector_steps": 8,
+    },
+    "time_step_calculator": {"calculator_type": "fixed"},
+    "neoclassical": {},
+    "pedestal": {},
+}
+
+
 _PROFILE_PREDICTOR_TORAX_CONFIG_BASE: dict[str, Any] = {
     "project": "profile_predictor_torax",
     "train_run_builder": ProfilePredictorTRB,
@@ -152,94 +246,9 @@ _PROFILE_PREDICTOR_TORAX_CONFIG_BASE: dict[str, Any] = {
         "model_type": "torax-cgm",  # Overridden per transport model by the builder below
         "nn_depth": 2,
         "nn_width": 16,
-        "torax_config": {
-            "profile_conditions": {
-                "Ip": 9999,  # Overridden by dataloader input
-                # Edge BCs predicted by NN as fractions of te_approx and ne20_line_avg.
-                "T_i_right_bc": 0.2,  # [keV] Predicted by NN
-                "T_e_right_bc": 0.2,  # [keV] Predicted by NN
-                "n_e_right_bc": 0.5e20,  # [m^-3] Predicted by NN
-                # Placeholder initial profiles; overridden per sample with
-                # parabolic inits scaled to te_approx / ne20_line_avg and
-                # continuous with the NN edge BCs (see _build_provider_and_geo)
-                "T_i": {0: {0: 0.3, 1: 0.2}},
-                "T_e": {0: {0: 0.3, 1: 0.2}},
-                "n_e": {0: {0: 1e20, 1: 0.5e20}},
-                "normalize_n_e_to_nbar": False,
-                # Initialize psi from Ip and geometry via the current_profile_nu formula.
-                # Same as the legacy fallback for circular geometry, but explicit to
-                # silence the TORAX deprecation warning.
-                "initial_psi_mode": "j",
-            },
-            "numerics": {
-                "t_initial": 0.0,
-                "t_final": 0.1,  # Give it ~100 ms to relax, on order of energy confinement time
-                # Linear theta solver is implicit / unconditionally stable, so we
-                # can take large fixed steps to reach steady state cheaply
-                "fixed_dt": 2e-2,
-                "min_dt": 1e-3,
-                # dt never changes with the fixed time-step calculator, so the
-                # adaptive retry loop is pure overhead (1.4x, bit-identical results)
-                "adaptive_dt": False,
-                "evolve_ion_heat": True,
-                "evolve_electron_heat": True,
-                "evolve_current": True,
-                "evolve_density": True,
-            },
-            "plasma_composition": {
-                "main_ion": {"D": 1.0},  # Assuming DD and minor impurities
-                "Z_eff": 1.1,
-            },
-            "geometry": {
-                "geometry_type": "circular",
-                "R_major": 9999,  # Overridden by dataloader input
-                "a_minor": 3000,  # Overridden by dataloader input (must be less than R_major)
-                "B_0": 9999,  # Overridden by dataloader input
-                "elongation_LCFS": 9999,  # Overridden by dataloader input
-                # Internal solver mesh, up from the TORAX default of 25 to
-                # halve the piecewise-linear gradient staircase in the output
-                # interpolation. The 51-point output rhogrid shared by all
-                # model families is unaffected.
-                "n_rho": 50,
-            },
-            # "transport" block filled per transport model from TORAX_TRANSPORT_BLOCKS
-            "sources": {
-                "ei_exchange": {},
-                "bremsstrahlung": {},
-                "cyclotron_radiation": {},
-                "ohmic": {},
-                "gas_puff": {"S_total": 9999},  # Predicted by NN
-                # NN-inferred auxiliary heating. All entries except
-                # absorption_fraction are per-sample overridden by the
-                # sources network (absorption is fixed, degenerate with
-                # P_total). Placeholders only need to pass pydantic validation
-                "generic_heat": {
-                    "P_total": 1.0e6,  # Predicted by NN
-                    "gaussian_location": 0.3,  # Predicted by NN
-                    "gaussian_width": 0.25,  # Predicted by NN
-                    "electron_heat_fraction": 0.6,  # Predicted by NN
-                    "absorption_fraction": 0.9,
-                },
-                "generic_current": {},
-            },
-            "solver": {
-                # Gradient-dependent transport (CGM is stiff, BgB chi depends on the
-                # evolving gradients); the Pereverzev-Corrigan terms keep the linear
-                # theta solver stable at large fixed steps. Harmless for the
-                # constant model.
-                "use_pereverzev": True,
-                "use_predictor_corrector": True,
-                # Picard iterations run n_corrector_steps + 1 times with no early exit.
-                # TORAX default of 10 is overkill at 10ms dt, but the 20ms
-                # dt above needs headroom: benchmarked on the cgm base case,
-                # 8 matched baseline val loss per epoch at 3.2x overall speedup,
-                # while 4 was 5.3x but converged to visibly worse loss per epoch.
-                "n_corrector_steps": 8,
-            },
-            "time_step_calculator": {"calculator_type": "fixed"},
-            "neoclassical": {},
-            "pedestal": {},
-        },
+        # The builder deep-copies the whole config, so the shared skeleton
+        # reference here is never mutated
+        "torax_config": TORAX_CONFIG_BASE,
         "prng_seed": 42,
         # Per-sample geometry builder: "circular" or "miller" (shaped,
         # uses delta_top/delta_bot with delta ~ rho_norm**delta_exponent)

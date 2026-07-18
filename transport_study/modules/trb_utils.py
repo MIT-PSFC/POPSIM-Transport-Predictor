@@ -5,9 +5,20 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import xarray as xr
+from loguru import logger
+from popsim.ml import DataLoader
+from popsim.ml.dataloading import make_dataloaders
 from popsim.ml.eval import EvalData, EvaluationSuite, batched_model_eval_and_loss
+from popsim.ml.preprocess_utils import mask_to_largest_group_mask
 
-from transport_study import TIME_DIM
+from transport_study import EPISODE_DIM, TIME_COORD, TIME_DIM
+from transport_study.config import config
+from transport_study.orchestration.organize_data import (
+    TrainingData,
+    get_train_test_datasets,
+    get_train_val_datasets,
+    get_transfer_pretrain_datasets,
+)
 
 
 def trapezoid_dropna(y, x):
@@ -82,3 +93,183 @@ def make_loss_eval_suite(loss_fn) -> EvaluationSuite:
         }
 
     return {"loss": eval_fn}
+
+
+def mask_to_largest_contiguous_segment(ds: xr.Dataset, training_vars: list[str]) -> xr.Dataset:
+    """Keep only each episode's longest contiguous run of non-NaN training vars.
+
+    Everything outside that run (including the time coordinate) is set to NaN,
+    which the dataloader treats as leading/trailing padding. Uses POPSIM's
+    mask_to_largest_group_mask rather than force_drop_nans because the latter's
+    ds.where() would broadcast per-shot vars (performance etc.) against time.
+    """
+
+    def _var_nan(da: xr.DataArray) -> xr.DataArray:
+        extra_dims = [d for d in da.dims if d not in (EPISODE_DIM, TIME_DIM)]
+        return da.isnull().any(dim=extra_dims) if extra_dims else da.isnull()
+
+    nan_mask = _var_nan(ds[training_vars[0]])
+    for var in training_vars[1:]:
+        nan_mask = nan_mask | _var_nan(ds[var])
+    keep = mask_to_largest_group_mask(~nan_mask, EPISODE_DIM, TIME_DIM)
+
+    out = ds.copy()
+    for name, da in ds.data_vars.items():
+        if TIME_DIM in da.dims:
+            out[name] = da.where(keep)
+    if TIME_DIM in ds[TIME_COORD].dims:
+        out[TIME_COORD] = ds[TIME_COORD].where(keep)
+    return out
+
+
+def get_time_dep_dataloaders(
+    dataloader_config: dict,
+    study_type: str,
+) -> tuple[xr.Dataset, DataLoader, DataLoader, DataLoader]:
+    """Dataset and dataloaders shared by the time-dependent (state-carrying) TRBs.
+
+    Used by the power balance and transport predictor TrainRunBuilders, which
+    differ only in the study_type their datasets are prepared with.
+
+    For both standard learning and transfer learning, we essentially have two datasets.
+    For standard learning, it's the standard train/val for hyperparameter tuning. No test is needed, so we can just return None.
+    For transfer learning, we have the training dataset composed of all historic data and a small amount of new data,
+    and the test dataset composed of a set amount of new data that is held out of training.
+    We are not doing hyperparameter tuning for transfer learning.
+
+    Also, slightly different from the POPSIM version, we're just returning the validation dataset.
+    """
+
+    training_data = dataloader_config["training_data"]
+
+    if isinstance(training_data, dict):  # when the config is passed from WandB, it's a dict
+        training_data = TrainingData(**training_data)
+
+    normalizer_fit_ds = None
+    if dataloader_config.get("domain_adaptation") == "transfer_pretrain":
+        logger.info("Using transfer pretrain dataloader (trains on historic data, normalizer fit on historic + target shots)")
+        ds_train, normalizer_fit_ds, ds_val = get_transfer_pretrain_datasets(
+            training_data=training_data,
+            num_target_shots=dataloader_config["num_target_shots"],
+            target_test_set_size=dataloader_config.get("target_test_set_size", None),
+            study_type=study_type,
+        )
+    elif dataloader_config.get("domain_adaptation") is None:
+        logger.info("Using standard learning dataloader")
+        if not training_data.exnihilo:
+            ds_train, ds_val = get_train_val_datasets(
+                training_data=training_data,
+                study_type=study_type,
+            )
+        else:
+            ds_train, ds_val = get_train_test_datasets(
+                training_data=training_data,
+                domain_adaptation=None,
+                num_target_shots=dataloader_config["num_target_shots"],
+                target_test_set_size=dataloader_config.get("target_test_set_size", None),
+                study_type=study_type,
+            )
+            # Double check there's no source (non-target) data anywhere in here
+            non_target = set(config.dataset_paths.keys()) - {config.target_device}
+            if any((ds_train["ds_source"] == src).any() for src in non_target):
+                raise ValueError(
+                    "Historic data found in training set for exnihilo training_data option. Please check the dataset construction logic."
+                )
+    else:
+        logger.info(f"Using transfer learning dataloader with domain adaptation {dataloader_config['domain_adaptation']}")
+        ds_train, ds_val = get_train_test_datasets(
+            training_data=training_data,
+            domain_adaptation=dataloader_config["domain_adaptation"],
+            num_target_shots=dataloader_config["num_target_shots"],
+            target_test_set_size=dataloader_config.get("target_test_set_size", None),
+            study_type=study_type,
+        )
+
+    # Drop time_idx as a shared coordinate - it has duplicate values across shots and
+    # causes groupby("shot") to fail when reassembling. The dataloader uses "time" instead.
+    ds_train = ds_train.drop_vars(TIME_DIM, errors="ignore")
+    ds_val = ds_val.drop_vars(TIME_DIM, errors="ignore")
+
+    # The modules take ds_source_idx as an input (it selects per-device
+    # normalization stats), but it is stored per shot. Broadcast it against
+    # time so the dataloader can slice and segment it like the other inputs
+    input_vars = list(dataloader_config["input_vars"])
+    if "ds_source_idx" not in input_vars:
+        input_vars.append("ds_source_idx")
+    for ds in (ds_train, ds_val):
+        # Float dtype so the dataloader can NaN-pad it like the other inputs
+        ds["ds_source_idx"] = ds["ds_source_idx"].broadcast_like(ds["Ip_MA"]).astype(ds["Ip_MA"].dtype)
+
+    if "state_vars" in dataloader_config.keys():
+        # Validation samples are whole episodes, so a mid-shot time gap
+        # (NaN slices after the uniform-timebase reindex) would either be
+        # stitched over, handing the Euler stepper a huge dt, or drop the
+        # whole episode under drop_segment. Keep only each episode's
+        # longest contiguous non-NaN run so val simulates a single
+        # gap-free window
+        val_vars = sorted(
+            v
+            for v in {
+                *input_vars,
+                *dataloader_config["target_vars"],
+                *dataloader_config["state_vars"],
+                *(dataloader_config.get("extra_vars") or []),
+            }
+            if v in ds_val
+        )
+        ds_val = mask_to_largest_contiguous_segment(ds_val, val_vars)
+
+        segment_length = [
+            dataloader_config.get("segment_length_train", None),
+            dataloader_config.get("segment_length_val", None),
+        ]
+        segment_overlap = [
+            dataloader_config.get("segment_overlap_train", 0) or 0,
+            dataloader_config.get("segment_overlap_val", 0) or 0,
+        ]
+    else:
+        # Segments only apply to time-dependent (state-carrying) dataloaders
+        segment_length = None
+        segment_overlap = 0
+
+    train_dl, val_dl = make_dataloaders(
+        datasets=(ds_train, ds_val),
+        time_coord=TIME_COORD,
+        episode_coord=EPISODE_DIM,
+        input_vars=input_vars,
+        target_vars=dataloader_config["target_vars"],
+        extra_vars=dataloader_config.get("extra_vars", None),
+        state_init_vars=dataloader_config.get("state_vars", None),
+        batch_size=dataloader_config.get("batch_size", None),
+        segment_length=segment_length,
+        segment_overlap=segment_overlap,
+        shuffle=[True, False],
+        convert_xr_to_jnp=False,  # Needed to keep the coords for calculating loss
+        # The datasets are reindexed to a uniform 1 kHz grid with NaN at
+        # missing times (organize_data.reindex_to_uniform_timebase), so
+        # drop_segment discards train segments spanning a time gap and the
+        # Euler stepper never sees dt larger than the nominal timebase.
+        # Val episodes were already masked to their longest contiguous
+        # run above, drop_slice_any there only clears the leading and
+        # trailing padding.
+        nan_handling=["drop_segment", "drop_slice_any"],
+        # Keep every batch the same shape so the jitted train step never
+        # retraces on a ragged final batch (whose static xr metadata is not
+        # comparable across calls). Train drops the ragged tail (reshuffled
+        # every epoch, so no data is permanently lost), val pads it and
+        # consumers trim the duplicates.
+        drop_last=[True, False],
+        pad_last=[False, True],
+    )
+    # Transfer pretrain fits the normalizer on more data than it trains on
+    # (historic + target shots). model_init reads this attribute off the
+    # train dataloader, every other case fits on train_dl.ds itself
+    # Yes I know this looks stupid but it's a fairly simlple way to pass the extra dataset
+    # to the model_init without changing everything else
+    if normalizer_fit_ds is not None:
+        train_dl.normalizer_fit_ds = normalizer_fit_ds
+    # Running test evaluation on the validation set, since we don't need a dedicated test set
+    # In the no domain adaptation case, we are hyperparameter tuning on all historic data, pick the best one and test on it
+    # In the domain adaptation case, we are training on all historic data + some new data, and testing on the rest of the new data
+    # No hyperparameter tuning is happening, so we treat the validation set as the test set and just return it for evaluation after training
+    return ds_val, train_dl, val_dl, val_dl

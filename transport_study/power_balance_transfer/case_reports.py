@@ -151,9 +151,14 @@ def _shot_page(
     return fig
 
 
-def best_worst_pdf(result_ds: xr.Dataset, ts_metrics: CaseTimesliceMetrics, pdf_path: Path):
+def best_worst_pdf(result_ds: xr.Dataset, ts_metrics: CaseTimesliceMetrics, pdf_path: Path, page_fn=None):
     """One PDF per case: the N_BEST_WORST best pages then the N_BEST_WORST
-    worst pages, holdout shots ranked by time-averaged relative error."""
+    worst pages, holdout shots ranked by time-averaged relative error.
+
+    page_fn renders one shot's page (defaults to this study's Wtot trajectory
+    page); the transport study passes its profile-evolution page instead."""
+    if page_fn is None:
+        page_fn = _shot_page
     shots, _avg_abs, avg_rel, _n_ts = shot_time_averaged_errors(ts_metrics)
     finite = np.flatnonzero(np.isfinite(avg_rel))
     if len(finite) == 0:
@@ -166,11 +171,11 @@ def best_worst_pdf(result_ds: xr.Dataset, ts_metrics: CaseTimesliceMetrics, pdf_
     pdf_path.parent.mkdir(parents=True, exist_ok=True)
     with PdfPages(pdf_path) as pdf:
         for rank, shot_idx in enumerate(best, start=1):
-            fig = _shot_page(result_ds, ts_metrics, shots[shot_idx], title_prefix=f"BEST #{rank} - ")
+            fig = page_fn(result_ds, ts_metrics, shots[shot_idx], title_prefix=f"BEST #{rank} - ")
             pdf.savefig(fig, facecolor=fig.get_facecolor())
             plt.close(fig)
         for rank, shot_idx in enumerate(worst, start=1):
-            fig = _shot_page(result_ds, ts_metrics, shots[shot_idx], title_prefix=f"WORST #{rank} - ")
+            fig = page_fn(result_ds, ts_metrics, shots[shot_idx], title_prefix=f"WORST #{rank} - ")
             pdf.savefig(fig, facecolor=fig.get_facecolor())
             plt.close(fig)
     logger.info(f"Saved best/worst shot PDF to {pdf_path}")
