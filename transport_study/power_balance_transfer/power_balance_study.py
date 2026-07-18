@@ -85,7 +85,7 @@ class PowerBalanceStudy(Study):
         num_target_shots_options: tuple[int, ...] = Field(default_factory=lambda: (0, 1, 3, 10, 32, -1))
         # Hyperparameter tuning case configuration
         # (hyperparam_domain_adaptation and hyperparam_num_target_shots live on CaseGridConfig)
-        hyperparam_data_normalization: str = "physics-coral"
+        hyperparam_data_normalization: str = "physics"
         hyperparam_freeze_submodules: bool = True
 
         COMPAT_HYPERPARAM_FIELDS = (
