@@ -248,7 +248,10 @@ class PowerBalanceStudy(Study):
             # Hyperparameters
             "segment_length_train": 100,
             "segment_overlap_train": 50,
-            "batch_size": 8192,
+            # 4096 measured 42 GB on the worst case
+            # (transformer at sweep max, d_model 64, history_len 50, these 100-step segments)
+            # Memory scales linearly with batch and segment_length_train so revisit this cap if segment_length_train grows.
+            "batch_size": 4096,
             # Part of validation, should be left alone during hyperparameter tuning
             "segment_length_val": None,
             "segment_overlap_val": 0,
