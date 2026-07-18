@@ -17,20 +17,31 @@ def checkpoint_to_profile_case(checkpoint_dir: Path | str) -> ProfileStudy.Case:
     """Parse a case directory name back into a ProfileStudy.Case.
 
     Mirrors ProfileStudy.Case.__str__:
-    case.{model_type}.td_{td}.freeze_{f}[.geom_{g}]                   source-trained, no adaptation
-    case.{model_type}.td_{td}.freeze_{f}[.geom_{g}].targ_{n}          exnihilo
-    case.{model_type}.td_{td}.freeze_{f}[.geom_{g}].targ_{n}.da_{da}  domain adaptation
+    case.{model_type}.td_{td}[.norm_{n}].freeze_{f}[.geom_{g}]                   source-trained, no adaptation
+    case.{model_type}.td_{td}[.norm_{n}].freeze_{f}[.geom_{g}].targ_{n}          exnihilo
+    case.{model_type}.td_{td}[.norm_{n}].freeze_{f}[.geom_{g}].targ_{n}.da_{da}  domain adaptation
 
-    geom_{g} is only present when geometry_builder != "circular"
-    (the suppressed default, see Study.Case.STR_TOKEN_FIELDS),
-    so its position is optional rather than fixed.
+    norm_{n} is only present when data_normalization != "physics-coral" and
+    geom_{g} only when geometry_builder != "circular" (the suppressed
+    defaults, see Study.Case.STR_TOKEN_FIELDS), so their positions are
+    optional rather than fixed.
     """
     case_name = Path(checkpoint_dir).name
     pieces = case_name.split(".")
-    if len(pieces) < 4 or pieces[0] != "case" or not pieces[2].startswith("td_") or not pieces[3].startswith("freeze_"):
+    if len(pieces) < 4 or pieces[0] != "case" or not pieces[2].startswith("td_"):
         raise ValueError(f"Unexpected case name format: {case_name}")
 
-    idx = 4
+    idx = 3
+    data_normalization = "physics-coral"
+    if idx < len(pieces) and pieces[idx].startswith("norm_"):
+        data_normalization = pieces[idx].removeprefix("norm_")
+        idx += 1
+
+    if idx >= len(pieces) or not pieces[idx].startswith("freeze_"):
+        raise ValueError(f"Unexpected case name format: {case_name}")
+    freeze_shapes = pieces[idx].removeprefix("freeze_") == "True"
+    idx += 1
+
     geometry_builder = "circular"
     if idx < len(pieces) and pieces[idx].startswith("geom_"):
         geometry_builder = pieces[idx].removeprefix("geom_")
@@ -51,8 +62,9 @@ def checkpoint_to_profile_case(checkpoint_dir: Path | str) -> ProfileStudy.Case:
     return ProfileStudy.Case(
         model_type=pieces[1],
         training_data=pieces[2].removeprefix("td_"),
+        data_normalization=data_normalization,
         domain_adaptation=domain_adaptation,
-        freeze_shapes=pieces[3].removeprefix("freeze_") == "True",
+        freeze_shapes=freeze_shapes,
         num_target_shots=num_target_shots,
         geometry_builder=geometry_builder,
     )

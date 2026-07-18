@@ -16,7 +16,11 @@ from popsim.ml.eval import EvalData, EvaluationSuite
 
 from transport_study import EPISODE_DIM, TIME_COORD, TIME_DIM
 from transport_study.config import config
-from transport_study.modules.normalization import CoralFeatureNormalizer
+from transport_study.modules.normalization import (
+    CoralFeatureNormalizer,
+    FeatureNormalizer,
+    ZScoreFeatureNormalizer,
+)
 from transport_study.modules.profile_predictor.module import (
     N_NN_INPUTS,
     Inputs,
@@ -65,8 +69,8 @@ def resolve_relaxation_overrides(model_init_config: dict) -> dict:
     return overrides
 
 
-def _fit_nn_input_normalizer(train_ds: xr.Dataset, n_devices: int) -> CoralFeatureNormalizer:
-    """Fit the per-device CORAL stage on the 10 dimensionless nn_inputs.
+def _fit_nn_input_normalizer(train_ds: xr.Dataset, n_devices: int, data_normalization: str) -> FeatureNormalizer:
+    """Fit the per-device stat stage (CORAL or z-score) on the 10 dimensionless nn_inputs.
 
     Evaluates the Inputs properties over the flattened training data
     (rows with incomplete features or an unattributable device index are
@@ -93,7 +97,8 @@ def _fit_nn_input_normalizer(train_ds: xr.Dataset, n_devices: int) -> CoralFeatu
     )
     features = np.asarray(inputs.nn_inputs).T  # (N, N_NN_INPUTS)
     attributed = ~np.isnan(source_idx)
-    return CoralFeatureNormalizer.fit_from_features(features[attributed], source_idx[attributed].astype(int), n_devices)
+    normalizer_cls = ZScoreFeatureNormalizer if data_normalization == "physics-zscore" else CoralFeatureNormalizer
+    return normalizer_cls.fit_from_features(features[attributed], source_idx[attributed].astype(int), n_devices)
 
 
 class ProfilePredictorTRB(TrainRunBuilder):
@@ -215,19 +220,23 @@ class ProfilePredictorTRB(TrainRunBuilder):
         Instantiate and return your model given a training DataLoader
         and a model config dict.
         """
-        # CORAL stage on the dimensionless nn_inputs. Fitted from the training
-        # data, or left at identity when the physics inputs are used as-is or
-        # a transfer checkpoint will overwrite the buffers anyway.
+        # Stat stage (CORAL or z-score) on the dimensionless nn_inputs. Fitted
+        # from the training data, or left at identity when the physics inputs
+        # are used as-is or a transfer checkpoint will overwrite the buffers
+        # anyway (the identity class must still match the checkpoint's pytree).
         # transfer_pretrain dataloaders carry a combined historic + target
         # fit dataset as an attribute (see get_dataloaders)
         data_normalization = model_init_config.get("data_normalization", "physics-coral")
-        if data_normalization not in ("physics", "physics-coral"):
+        if data_normalization not in ("physics", "physics-coral", "physics-zscore"):
             raise ValueError(f"Unknown profile data normalization method: {data_normalization}")
         n_devices = len(config.ds_source_to_idx)
-        if data_normalization == "physics-coral" and not model_init_config.get("transfer_checkpoint"):
-            normalizer = _fit_nn_input_normalizer(getattr(train_dl, "normalizer_fit_ds", train_dl.ds), n_devices)
+        if data_normalization == "physics":
+            normalizer: FeatureNormalizer = CoralFeatureNormalizer.identity(n_devices, N_NN_INPUTS)
+        elif model_init_config.get("transfer_checkpoint"):
+            identity_cls = ZScoreFeatureNormalizer if data_normalization == "physics-zscore" else CoralFeatureNormalizer
+            normalizer = identity_cls.identity(n_devices, N_NN_INPUTS)
         else:
-            normalizer = CoralFeatureNormalizer.identity(n_devices, N_NN_INPUTS)
+            normalizer = _fit_nn_input_normalizer(getattr(train_dl, "normalizer_fit_ds", train_dl.ds), n_devices, data_normalization)
 
         if model_init_config["model_type"] in ["shape_init_pca", "shape_init_kmeans"]:
             te_shape_var = model_init_config["te_shape_var"]

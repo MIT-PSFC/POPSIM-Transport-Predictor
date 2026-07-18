@@ -17,7 +17,7 @@ from torax._src.geometry import geometry_provider as geometry_provider_lib
 from torax._src.orchestration.step_function import SimulationStepFn
 from torax._src.torax_pydantic import torax_pydantic
 
-from transport_study.modules.normalization import CoralFeatureNormalizer
+from transport_study.modules.normalization import FeatureNormalizer
 from transport_study.modules.profile_predictor.module import (
     Inputs,
     Outputs,
@@ -500,7 +500,7 @@ class ProfilePredictorTorax(TimeIndepModule):
     nn_sources: RtdMLP
     nn_edge: RtdMLP
     # Per-device CORAL stage over the 10 nn_inputs
-    normalizer: CoralFeatureNormalizer
+    normalizer: FeatureNormalizer
 
     step_fn: SimulationStepFn = eqx.field(static=True)
 
@@ -517,7 +517,7 @@ class ProfilePredictorTorax(TimeIndepModule):
         rhogrid: tuple,
         torax_config: ToraxConfig | dict,
         key: jax.random.PRNGKey,
-        normalizer: CoralFeatureNormalizer,
+        normalizer: FeatureNormalizer,
         transport_model: str = "cgm",
         geometry_builder: str = "circular",
         delta_exponent: float = 2.0,
@@ -1055,7 +1055,7 @@ class ProfilePredictorTorax(TimeIndepModule):
         nn_width: int,
         nn_depth: int,
         prng_seed: int,
-        normalizer: CoralFeatureNormalizer,
+        normalizer: FeatureNormalizer,
         transport_model: str = "cgm",
         geometry_builder: str = "circular",
         delta_exponent: float = 2.0,

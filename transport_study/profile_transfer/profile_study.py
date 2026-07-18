@@ -34,6 +34,7 @@ from transport_study.profile_transfer.case_reports import (
 )
 from transport_study.profile_transfer.data_visualization import DataVisualization
 from transport_study.profile_transfer.plotting import (
+    data_normalization_comparison,
     domain_adaptation_comparison,
     freeze_shapes_comparison,
     model_comparison,
@@ -50,6 +51,15 @@ MODEL_TYPES_WITHOUT_SHAPES = ("unstructured_nn", "reservoir", "torax-constant", 
 # (see modules/profile_predictor/torax_module.py). Only meaningful for
 # torax-* model types, every other model type is pinned to "circular".
 VALID_GEOMETRY_BUILDERS = ("circular", "miller")
+
+# Input normalization applied to the 10 dimensionless nn_inputs. The physics
+# transform is built into the feature set itself, so unlike power balance
+# there is no raw / z_score of physical units, only stat stages on top:
+# - physics: use the dimensionless parameters as-is
+# - physics-coral: per-device CORAL alignment fitted on them
+# - physics-zscore: per-device z-score fitted on them (mean/std only, no
+#   covariance alignment)
+VALID_DATA_NORMALIZATIONS = ("physics", "physics-coral", "physics-zscore")
 
 # The physical inputs every profile-predictor model consumes
 PROFILE_INPUT_VARS = [
@@ -74,6 +84,7 @@ class ProfileStudy(Study):
     CASE_AXIS_FIELDS = (
         "model_types",
         "training_datasets",
+        "data_normalization_methods",
         "domain_adaptation_methods",
         "freeze_shapes_options",
         "geometry_builders",
@@ -93,20 +104,18 @@ class ProfileStudy(Study):
         # by every other model type (see VALID_GEOMETRY_BUILDERS)
         geometry_builders: tuple[str, ...] = Field(default_factory=lambda: ("circular",))
         num_target_shots_options: tuple[int, ...] = Field(default_factory=lambda: (0, 1, 10, -1))
-        # Input normalization applied to the 10 dimensionless nn_inputs, one
-        # setting for the whole study run (not a case axis, so it never
-        # appears in case names):
-        # - physics: use the dimensionless parameters as-is
-        # - physics-coral: per-device CORAL alignment fitted on them
-        data_normalization: str = "physics-coral"
+        # Input normalization case axis over the 10 dimensionless nn_inputs
+        # (see VALID_DATA_NORMALIZATIONS). The default "physics-coral" is
+        # suppressed from case names, so single-method studies keep the
+        # pre-axis case naming
+        data_normalization_methods: tuple[str, ...] = Field(default_factory=lambda: ("physics-coral",))
         # Hyperparameter tuning case configuration
         # (hyperparam_domain_adaptation and hyperparam_num_target_shots live on CaseGridConfig)
+        hyperparam_data_normalization: str = "physics-coral"
         hyperparam_freeze_shapes: bool = True
 
-        # data_normalization changes model semantics under unchanged case
-        # names, so the config lock must catch reruns with a different value
         COMPAT_HYPERPARAM_FIELDS = (
-            "data_normalization",
+            "hyperparam_data_normalization",
             "hyperparam_domain_adaptation",
             "hyperparam_freeze_shapes",
             "hyperparam_num_target_shots",
@@ -129,12 +138,13 @@ class ProfileStudy(Study):
                     raise ValueError(f"Invalid geometry builder: {gb}. Must be one of {VALID_GEOMETRY_BUILDERS}.")
             return v
 
-        @field_validator("data_normalization")
+        @field_validator("data_normalization_methods", "hyperparam_data_normalization")
         @classmethod
-        def _validate_data_normalization(cls, v: str) -> str:
-            valid = ("physics", "physics-coral")
-            if v not in valid:
-                raise ValueError(f"Invalid data normalization method: {v}. Must be one of {valid}.")
+        def _validate_data_normalization(cls, v):
+            methods = (v,) if isinstance(v, str) else v
+            for dn in methods:
+                if dn not in VALID_DATA_NORMALIZATIONS:
+                    raise ValueError(f"Invalid data normalization method: {dn}. Must be one of {VALID_DATA_NORMALIZATIONS}.")
             return v
 
     @dataclass
@@ -153,11 +163,18 @@ class ProfileStudy(Study):
         - cmod_tcv: C-Mod + TCV
         - exnihilo: No historic training data
 
+        data_normalization: The stat stage applied to the 10 dimensionless nn_inputs,
+        implemented as a frozen POPSIM module fitted from training data only
+        (transport_study/modules/normalization.py, see VALID_DATA_NORMALIZATIONS).
+        - physics: the dimensionless parameters as-is
+        - physics-coral: per-device CORAL alignment fitted on them
+        - physics-zscore: per-device z-score fitted on them
+
         domain_adaptation: The method for domain adaptation between source and target devices.
         - none: No domain adaptation, train and test on the same device(s). This is used for hyperparameter tuning and as a baseline for comparison, answering the question "what is the best possible performance we could expect if we had a bunch of data?"
         - mixing: Add a small amount of highly-weighted target data during training
         - transfer: Train on source data, freeze all but the last layers of the model, and fine-tune on a small amount of target data
-        - transfer_pretrain: The pretrain half of a transfer case under physics-coral normalization, never a case-grid axis value (see Study.Case.transfer_pretrain_case). Trains on historic data only with the CORAL stage fitted on historic + the transfer case's target shots
+        - transfer_pretrain: The pretrain half of a transfer case under stat normalization (physics-coral or physics-zscore), never a case-grid axis value (see Study.Case.transfer_pretrain_case). Trains on historic data only with the stat stage fitted on historic + the transfer case's target shots
 
         freeze_shapes:
         - some profile predictors first use PCA to identify dominant shapes. these shapes may be frozen or modified during module training
@@ -170,25 +187,37 @@ class ProfileStudy(Study):
         num_target_shots: The number of shots included in the training data from the target dataset, or -1 to include all shots (including all shots in training is cheating, but again answers the question of what is the best possible performance).
         """
 
+        data_normalization: str
         freeze_shapes: bool
         geometry_builder: str
 
         VALID_MODEL_TYPES = (*MODEL_TYPES_WITH_SHAPES, *MODEL_TYPES_WITHOUT_SHAPES)
-        # geometry_builder's default ("circular") is suppressed from the case
-        # name, so pre-existing circular-only studies keep identical case names
-        STR_TOKEN_FIELDS = (("freeze_", "freeze_shapes"), ("geom_", "geometry_builder", "circular"))
+        # data_normalization's default ("physics-coral") and geometry_builder's
+        # default ("circular") are suppressed from the case name, so
+        # pre-existing physics-coral circular-only studies keep identical case names
+        STR_TOKEN_FIELDS = (
+            ("norm_", "data_normalization", "physics-coral"),
+            ("freeze_", "freeze_shapes"),
+            ("geom_", "geometry_builder", "circular"),
+        )
         # geometry_builder is deliberately NOT a hyperparam field (like model_type):
         # it stays untouched by _hyperparam_field_values, so miller cases get their
         # own hyperparameter sweep and tuned config (keyed by their own geom_miller
-        # case string) instead of inheriting circular's tuned hyperparameters
-        HYPERPARAM_FIELDS = ("domain_adaptation", "freeze_shapes", "num_target_shots")
+        # case string) instead of inheriting circular's tuned hyperparameters.
+        # data_normalization IS one (like power balance): every method inherits
+        # the tuned config from the hyperparam_data_normalization sweep
+        HYPERPARAM_FIELDS = ("data_normalization", "domain_adaptation", "freeze_shapes", "num_target_shots")
 
         # The dataclass decorator would null an inherited __hash__
         __hash__ = Study.Case.__hash__
 
         def _normalization_method(self) -> str | None:
-            # One study-wide setting, not a case axis
-            return config.data_normalization
+            return self.data_normalization
+
+        def _validate(self):
+            super()._validate()
+            if self.data_normalization not in VALID_DATA_NORMALIZATIONS:
+                raise ValueError(f"Unknown data normalization method: {self.data_normalization}")
 
         def __init__(
             self,
@@ -198,7 +227,9 @@ class ProfileStudy(Study):
             freeze_shapes: bool,
             num_target_shots: int,
             geometry_builder: str = "circular",
+            data_normalization: str = "physics-coral",
         ):
+            self.data_normalization = data_normalization
             self.freeze_shapes = freeze_shapes
             self.geometry_builder = geometry_builder
             self._init_common(model_type, training_data, domain_adaptation, num_target_shots)
@@ -209,6 +240,7 @@ class ProfileStudy(Study):
         for (
             model_type,
             training_dataset,
+            data_normalization,
             domain_adaptation,
             freeze_shapes,
             geometry_builder,
@@ -216,6 +248,7 @@ class ProfileStudy(Study):
         ) in product(
             config.model_types,
             config.training_datasets,
+            config.data_normalization_methods,
             config.domain_adaptation_methods,
             config.freeze_shapes_options,
             config.geometry_builders,
@@ -235,6 +268,7 @@ class ProfileStudy(Study):
             case = self.Case(
                 model_type=model_type,
                 training_data=training_dataset,
+                data_normalization=data_normalization,
                 domain_adaptation=domain_adaptation,
                 freeze_shapes=freeze_shapes,
                 num_target_shots=num_target_shots,
@@ -307,7 +341,7 @@ class ProfileStudy(Study):
                 },
                 model_init_config={
                     "model_type": case.model_type,
-                    "data_normalization": config.data_normalization,
+                    "data_normalization": case.data_normalization,
                     "domain_adaptation": case.domain_adaptation,
                     "freeze_shapes": case.freeze_shapes,
                     "te_shape_var": "Te_shape",
@@ -326,7 +360,7 @@ class ProfileStudy(Study):
                 dataloader_config={"input_vars": PROFILE_INPUT_VARS, **dataloader_config_base},
                 model_init_config={
                     "model_type": case.model_type,
-                    "data_normalization": config.data_normalization,
+                    "data_normalization": case.data_normalization,
                     "domain_adaptation": case.domain_adaptation,
                     "nn_depth": 2,
                     "nn_width": 16,
@@ -340,7 +374,7 @@ class ProfileStudy(Study):
                 dataloader_config={"input_vars": PROFILE_INPUT_VARS, **dataloader_config_base},
                 model_init_config={
                     "model_type": case.model_type,
-                    "data_normalization": config.data_normalization,
+                    "data_normalization": case.data_normalization,
                     "domain_adaptation": case.domain_adaptation,
                     "reservoir_size": 128,  # Fixed random reservoir state dimension
                     "spectral_radius": 0.9,  # Contraction factor of the recurrent weights
@@ -359,7 +393,7 @@ class ProfileStudy(Study):
                 dataloader_config={"input_vars": PROFILE_INPUT_VARS, **dataloader_config_base},
                 model_init_config={
                     "model_type": case.model_type,
-                    "data_normalization": config.data_normalization,
+                    "data_normalization": case.data_normalization,
                     "domain_adaptation": case.domain_adaptation,
                     "freeze_shapes": case.freeze_shapes,
                     "nn_depth": 2,
@@ -408,6 +442,7 @@ class ProfileStudy(Study):
         "case_idx",
         "model_type",
         "training_data",
+        "data_normalization",
         "domain_adaptation",
         "freeze_shapes",
         "geometry_builder",
@@ -519,6 +554,9 @@ class ProfileStudy(Study):
 
         logger.opt(colors=True).info("<bold><magenta>DOMAIN ADAPTATION COMPARISON</magenta></bold>")
         domain_adaptation_comparison(metrics_ds, self.figure_dir)
+
+        logger.opt(colors=True).info("<bold><magenta>DATA NORMALIZATION COMPARISON</magenta></bold>")
+        data_normalization_comparison(metrics_ds, self.figure_dir)
 
         logger.opt(colors=True).info("<bold><magenta>TORAX-SPECIFIC ANALYSIS</magenta></bold>")
         torax_relaxation_report(self, metrics_ds, self.figure_dir)

@@ -63,7 +63,10 @@ MIN_CORAL_SAMPLES = 8
 # Their transfer cases pretrain through a dedicated transfer_pretrain prereq
 # case whose stats are fitted on the combined historic + target data and
 # inherited via the checkpoint restore (see Study.Case.transfer_pretrain_case)
-STAT_NORMALIZATIONS = ("z_score", "coral", "physics-coral")
+# physics-zscore is profile-transfer only (a z-score stage on the profile
+# predictor's dimensionless nn_inputs, see CoralFeatureNormalizer /
+# ZScoreFeatureNormalizer), it is not a power-balance InputNormalizer method
+STAT_NORMALIZATIONS = ("z_score", "coral", "physics-coral", "physics-zscore")
 
 
 class InputNormalizer(TimeIndepModule):
@@ -405,6 +408,39 @@ class CoralFeatureNormalizer(TimeIndepModule):
             return cls.identity(n_devices, features.shape[1])
         means, transforms = stats
         return cls(means=means, transforms=transforms)
+
+
+class ZScoreFeatureNormalizer(TimeIndepModule):
+    """Generic per-device z-score stage over an arbitrary feature vector.
+
+    The z-score counterpart of CoralFeatureNormalizer, used by the profile
+    predictor under the physics-zscore method: per-feature mean/std only, no
+    covariance alignment, and features come out centered (z-scoring does not
+    re-add the device mean the way CORAL does). Same frozen-buffer semantics:
+    the stats checkpoint with the model and are never in a trainable
+    selection.
+    """
+
+    means: jnp.ndarray
+    stds: jnp.ndarray
+
+    def __call__(self, vec: jnp.ndarray, ds_source_idx: ArrayLike) -> jnp.ndarray:
+        return apply_z_score(vec, ds_source_idx, self.means, self.stds)
+
+    @classmethod
+    def identity(cls, n_devices: int, n_features: int) -> ZScoreFeatureNormalizer:
+        return cls(means=jnp.zeros((n_devices, n_features)), stds=jnp.ones((n_devices, n_features)))
+
+    @classmethod
+    def fit_from_features(cls, features: np.ndarray, source_idx: np.ndarray, n_devices: int) -> ZScoreFeatureNormalizer:
+        means, stds = fit_z_score_stats(features, source_idx, n_devices)
+        return cls(means=means, stds=stds)
+
+
+# Either per-device stat stage a profile predictor module can hold. The two
+# classes have different pytree structures, so a study must keep one method
+# for its whole lifetime (data_normalization is config-lock guarded)
+FeatureNormalizer = CoralFeatureNormalizer | ZScoreFeatureNormalizer
 
 
 def _feature_matrix(ds: xr.Dataset) -> tuple[np.ndarray, np.ndarray]:

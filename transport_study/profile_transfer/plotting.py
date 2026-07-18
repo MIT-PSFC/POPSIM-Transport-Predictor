@@ -5,8 +5,8 @@ All figures share one layout: a grid with one row per performance metric
 (rampup, flattop, flattop ohmic, flattop aux, rampdown, all), with the number
 of target-device shots included in training on a semilog x axis. Each family
 draws one line per member of the comparison (model type, training dataset,
-domain adaptation method, or freeze_shapes difference) and one figure per
-combination of the remaining case dimensions.
+data normalization, domain adaptation method, or freeze_shapes difference)
+and one figure per combination of the remaining case dimensions.
 
 The num_target_shots = -1 sentinel (all target shots in training, the cheating
 reference) has no x position: it is drawn as a dashed horizontal line in the
@@ -55,6 +55,18 @@ DA_COLORS = {
     "mixing": "#ad2cfe",
     "transfer": "#00ff5e",
     "transfer_pretrain": "#00a33c",
+}
+
+NORM_COLORS = {
+    "physics": "#8dff36",
+    "physics-coral": "#ffb52e",
+    "physics-zscore": "#0095ff",
+}
+
+NORM_LABELS = {
+    "physics": "Physics",
+    "physics-coral": "Physics CORAL",
+    "physics-zscore": "Physics z-score",
 }
 
 DA_LABELS = {
@@ -222,71 +234,77 @@ def _check_metrics_ds(metrics_ds: xr.Dataset, family: str) -> bool:
 
 
 def model_comparison(metrics_ds: xr.Dataset, figure_dir: Path):
-    """One line per model type, one figure per (training_data, domain_adaptation, freeze_shapes)."""
+    """One line per model type, one figure per (training_data, data_normalization, domain_adaptation, freeze_shapes)."""
     if not _check_metrics_ds(metrics_ds, "model comparison"):
         return
     out_dir = Path(figure_dir) / "comparison" / "model_comparison"
     for td in _coord_values(metrics_ds, "training_data"):
-        for da in _coord_values(metrics_ds, "domain_adaptation"):
-            for freeze in _coord_values(metrics_ds, "freeze_shapes"):
-                sub = _mask_select(
-                    metrics_ds,
-                    (metrics_ds["training_data"] == td) & (metrics_ds["domain_adaptation"] == da) & (metrics_ds["freeze_shapes"] == freeze),
-                )
-                if sub.sizes.get("case_idx", 0) == 0:
-                    continue
-                fig, axes = _grid_figure()
-                drew = False
-                for model_type in _coord_values(sub, "model_type"):
-                    model_sub = _mask_select(sub, sub["model_type"] == model_type)
-                    color = MODEL_COLORS.get(model_type, "white")
-                    label = MODEL_LABELS.get(model_type, model_type)
-                    for row, metric in enumerate(METRIC_NAMES):
-                        for col, stage in enumerate(STAGE_AGG_NAMES):
-                            drew |= _plot_series(axes[row, col], model_sub, stage, metric, color, label)
-                if not drew:
-                    plt.close(fig)
-                    continue
-                title = f"Model comparison - train: {td} / DA: {da} / freeze shapes: {freeze}"
-                _finalize_grid(fig, axes, sub, title, out_dir / f"td_{td}.da_{da}.freeze_{freeze}.png")
+        for dn in _coord_values(metrics_ds, "data_normalization"):
+            for da in _coord_values(metrics_ds, "domain_adaptation"):
+                for freeze in _coord_values(metrics_ds, "freeze_shapes"):
+                    sub = _mask_select(
+                        metrics_ds,
+                        (metrics_ds["training_data"] == td)
+                        & (metrics_ds["data_normalization"] == dn)
+                        & (metrics_ds["domain_adaptation"] == da)
+                        & (metrics_ds["freeze_shapes"] == freeze),
+                    )
+                    if sub.sizes.get("case_idx", 0) == 0:
+                        continue
+                    fig, axes = _grid_figure()
+                    drew = False
+                    for model_type in _coord_values(sub, "model_type"):
+                        model_sub = _mask_select(sub, sub["model_type"] == model_type)
+                        color = MODEL_COLORS.get(model_type, "white")
+                        label = MODEL_LABELS.get(model_type, model_type)
+                        for row, metric in enumerate(METRIC_NAMES):
+                            for col, stage in enumerate(STAGE_AGG_NAMES):
+                                drew |= _plot_series(axes[row, col], model_sub, stage, metric, color, label)
+                    if not drew:
+                        plt.close(fig)
+                        continue
+                    title = f"Model comparison - train: {td} / norm: {NORM_LABELS.get(dn, dn)} / DA: {da} / freeze shapes: {freeze}"
+                    _finalize_grid(fig, axes, sub, title, out_dir / f"td_{td}.norm_{dn}.da_{da}.freeze_{freeze}.png")
     logger.info(f"Saved model comparison figures to {out_dir}")
 
 
 def training_dataset_comparison(metrics_ds: xr.Dataset, figure_dir: Path):
-    """One line per training dataset, one figure per (model_type, domain_adaptation, freeze_shapes)."""
+    """One line per training dataset, one figure per (model_type, data_normalization, domain_adaptation, freeze_shapes)."""
     if not _check_metrics_ds(metrics_ds, "training dataset comparison"):
         return
     out_dir = Path(figure_dir) / "comparison" / "training_dataset_comparison"
     td_colors = _training_data_colors(_coord_values(metrics_ds, "training_data"))
     for model_type in _coord_values(metrics_ds, "model_type"):
-        for da in _coord_values(metrics_ds, "domain_adaptation"):
-            for freeze in _coord_values(metrics_ds, "freeze_shapes"):
-                sub = _mask_select(
-                    metrics_ds,
-                    (metrics_ds["model_type"] == model_type)
-                    & (metrics_ds["domain_adaptation"] == da)
-                    & (metrics_ds["freeze_shapes"] == freeze),
-                )
-                if sub.sizes.get("case_idx", 0) == 0:
-                    continue
-                fig, axes = _grid_figure()
-                drew = False
-                for td in _coord_values(sub, "training_data"):
-                    td_sub = _mask_select(sub, sub["training_data"] == td)
-                    for row, metric in enumerate(METRIC_NAMES):
-                        for col, stage in enumerate(STAGE_AGG_NAMES):
-                            drew |= _plot_series(axes[row, col], td_sub, stage, metric, td_colors[td], str(td))
-                if not drew:
-                    plt.close(fig)
-                    continue
-                model_label = MODEL_LABELS.get(model_type, model_type)
-                title = f"Training dataset comparison - {model_label} / DA: {da} / freeze shapes: {freeze}"
-                _finalize_grid(fig, axes, sub, title, out_dir / f"{model_type}.da_{da}.freeze_{freeze}.png")
+        for dn in _coord_values(metrics_ds, "data_normalization"):
+            for da in _coord_values(metrics_ds, "domain_adaptation"):
+                for freeze in _coord_values(metrics_ds, "freeze_shapes"):
+                    sub = _mask_select(
+                        metrics_ds,
+                        (metrics_ds["model_type"] == model_type)
+                        & (metrics_ds["data_normalization"] == dn)
+                        & (metrics_ds["domain_adaptation"] == da)
+                        & (metrics_ds["freeze_shapes"] == freeze),
+                    )
+                    if sub.sizes.get("case_idx", 0) == 0:
+                        continue
+                    fig, axes = _grid_figure()
+                    drew = False
+                    for td in _coord_values(sub, "training_data"):
+                        td_sub = _mask_select(sub, sub["training_data"] == td)
+                        for row, metric in enumerate(METRIC_NAMES):
+                            for col, stage in enumerate(STAGE_AGG_NAMES):
+                                drew |= _plot_series(axes[row, col], td_sub, stage, metric, td_colors[td], str(td))
+                    if not drew:
+                        plt.close(fig)
+                        continue
+                    model_label = MODEL_LABELS.get(model_type, model_type)
+                    title = f"Training dataset comparison - {model_label} / norm: {NORM_LABELS.get(dn, dn)} / DA: {da} / freeze shapes: {freeze}"
+                    _finalize_grid(fig, axes, sub, title, out_dir / f"{model_type}.norm_{dn}.da_{da}.freeze_{freeze}.png")
     logger.info(f"Saved training dataset comparison figures to {out_dir}")
 
 
 def domain_adaptation_comparison(metrics_ds: xr.Dataset, figure_dir: Path):
-    """One line per domain adaptation method, one figure per (model_type, training_data, freeze_shapes).
+    """One line per domain adaptation method, one figure per (model_type, training_data, data_normalization, freeze_shapes).
 
     The no-adaptation baseline only exists at num_target_shots = 0 for
     non-exnihilo training data, so it typically shows up as a single point
@@ -297,31 +315,69 @@ def domain_adaptation_comparison(metrics_ds: xr.Dataset, figure_dir: Path):
     out_dir = Path(figure_dir) / "comparison" / "domain_adaptation_comparison"
     for model_type in _coord_values(metrics_ds, "model_type"):
         for td in _coord_values(metrics_ds, "training_data"):
-            for freeze in _coord_values(metrics_ds, "freeze_shapes"):
-                sub = _mask_select(
-                    metrics_ds,
-                    (metrics_ds["model_type"] == model_type)
-                    & (metrics_ds["training_data"] == td)
-                    & (metrics_ds["freeze_shapes"] == freeze),
-                )
-                if sub.sizes.get("case_idx", 0) == 0:
-                    continue
-                fig, axes = _grid_figure()
-                drew = False
-                for da in _coord_values(sub, "domain_adaptation"):
-                    da_sub = _mask_select(sub, sub["domain_adaptation"] == da)
-                    color = DA_COLORS.get(da, "white")
-                    label = DA_LABELS.get(da, da)
-                    for row, metric in enumerate(METRIC_NAMES):
-                        for col, stage in enumerate(STAGE_AGG_NAMES):
-                            drew |= _plot_series(axes[row, col], da_sub, stage, metric, color, label)
-                if not drew:
-                    plt.close(fig)
-                    continue
-                model_label = MODEL_LABELS.get(model_type, model_type)
-                title = f"Domain adaptation comparison - {model_label} / train: {td} / freeze shapes: {freeze}"
-                _finalize_grid(fig, axes, sub, title, out_dir / f"{model_type}.td_{td}.freeze_{freeze}.png")
+            for dn in _coord_values(metrics_ds, "data_normalization"):
+                for freeze in _coord_values(metrics_ds, "freeze_shapes"):
+                    sub = _mask_select(
+                        metrics_ds,
+                        (metrics_ds["model_type"] == model_type)
+                        & (metrics_ds["training_data"] == td)
+                        & (metrics_ds["data_normalization"] == dn)
+                        & (metrics_ds["freeze_shapes"] == freeze),
+                    )
+                    if sub.sizes.get("case_idx", 0) == 0:
+                        continue
+                    fig, axes = _grid_figure()
+                    drew = False
+                    for da in _coord_values(sub, "domain_adaptation"):
+                        da_sub = _mask_select(sub, sub["domain_adaptation"] == da)
+                        color = DA_COLORS.get(da, "white")
+                        label = DA_LABELS.get(da, da)
+                        for row, metric in enumerate(METRIC_NAMES):
+                            for col, stage in enumerate(STAGE_AGG_NAMES):
+                                drew |= _plot_series(axes[row, col], da_sub, stage, metric, color, label)
+                    if not drew:
+                        plt.close(fig)
+                        continue
+                    model_label = MODEL_LABELS.get(model_type, model_type)
+                    title = f"Domain adaptation comparison - {model_label} / train: {td} / norm: {NORM_LABELS.get(dn, dn)} / freeze shapes: {freeze}"
+                    _finalize_grid(fig, axes, sub, title, out_dir / f"{model_type}.td_{td}.norm_{dn}.freeze_{freeze}.png")
     logger.info(f"Saved domain adaptation comparison figures to {out_dir}")
+
+
+def data_normalization_comparison(metrics_ds: xr.Dataset, figure_dir: Path):
+    """One line per data normalization method, one figure per (model_type, training_data, domain_adaptation, freeze_shapes)."""
+    if not _check_metrics_ds(metrics_ds, "data normalization comparison"):
+        return
+    out_dir = Path(figure_dir) / "comparison" / "data_normalization_comparison"
+    for model_type in _coord_values(metrics_ds, "model_type"):
+        for td in _coord_values(metrics_ds, "training_data"):
+            for da in _coord_values(metrics_ds, "domain_adaptation"):
+                for freeze in _coord_values(metrics_ds, "freeze_shapes"):
+                    sub = _mask_select(
+                        metrics_ds,
+                        (metrics_ds["model_type"] == model_type)
+                        & (metrics_ds["training_data"] == td)
+                        & (metrics_ds["domain_adaptation"] == da)
+                        & (metrics_ds["freeze_shapes"] == freeze),
+                    )
+                    if sub.sizes.get("case_idx", 0) == 0:
+                        continue
+                    fig, axes = _grid_figure()
+                    drew = False
+                    for dn in _coord_values(sub, "data_normalization"):
+                        dn_sub = _mask_select(sub, sub["data_normalization"] == dn)
+                        color = NORM_COLORS.get(dn, "white")
+                        label = NORM_LABELS.get(dn, dn)
+                        for row, metric in enumerate(METRIC_NAMES):
+                            for col, stage in enumerate(STAGE_AGG_NAMES):
+                                drew |= _plot_series(axes[row, col], dn_sub, stage, metric, color, label)
+                    if not drew:
+                        plt.close(fig)
+                        continue
+                    model_label = MODEL_LABELS.get(model_type, model_type)
+                    title = f"Data normalization comparison - {model_label} / train: {td} / DA: {da} / freeze shapes: {freeze}"
+                    _finalize_grid(fig, axes, sub, title, out_dir / f"{model_type}.td_{td}.da_{da}.freeze_{freeze}.png")
+    logger.info(f"Saved data normalization comparison figures to {out_dir}")
 
 
 def freeze_shapes_comparison(metrics_ds: xr.Dataset, figure_dir: Path):
@@ -339,52 +395,60 @@ def freeze_shapes_comparison(metrics_ds: xr.Dataset, figure_dir: Path):
         if model_type not in MODELS_WITH_SHAPES:
             continue
         model_sub = _mask_select(metrics_ds, metrics_ds["model_type"] == model_type)
+        norms = _coord_values(model_sub, "data_normalization")
         fig, axes = _grid_figure()
         drew = False
         for td in _coord_values(model_sub, "training_data"):
-            for da in _coord_values(model_sub, "domain_adaptation"):
-                combo_mask = (model_sub["training_data"] == td) & (model_sub["domain_adaptation"] == da)
-                frozen = _mask_select(model_sub, combo_mask & model_sub["freeze_shapes"])
-                unfrozen = _mask_select(model_sub, combo_mask & ~model_sub["freeze_shapes"])
-                if frozen.sizes.get("case_idx", 0) == 0 or unfrozen.sizes.get("case_idx", 0) == 0:
-                    continue
+            for dn in norms:
+                for da in _coord_values(model_sub, "domain_adaptation"):
+                    combo_mask = (
+                        (model_sub["training_data"] == td)
+                        & (model_sub["data_normalization"] == dn)
+                        & (model_sub["domain_adaptation"] == da)
+                    )
+                    frozen = _mask_select(model_sub, combo_mask & model_sub["freeze_shapes"])
+                    unfrozen = _mask_select(model_sub, combo_mask & ~model_sub["freeze_shapes"])
+                    if frozen.sizes.get("case_idx", 0) == 0 or unfrozen.sizes.get("case_idx", 0) == 0:
+                        continue
 
-                frozen_shots = np.atleast_1d(frozen["num_target_shots"].values)
-                unfrozen_shots = np.atleast_1d(unfrozen["num_target_shots"].values)
-                shared = sorted(set(frozen_shots.tolist()) & set(unfrozen_shots.tolist()))
-                shared_line = [s for s in shared if s >= 0]
+                    frozen_shots = np.atleast_1d(frozen["num_target_shots"].values)
+                    unfrozen_shots = np.atleast_1d(unfrozen["num_target_shots"].values)
+                    shared = sorted(set(frozen_shots.tolist()) & set(unfrozen_shots.tolist()))
+                    shared_line = [s for s in shared if s >= 0]
 
-                color = td_colors[td]
-                linestyle = da_linestyles.get(da, "-")
-                label = f"{td} / {DA_LABELS.get(da, da)}"
+                    color = td_colors[td]
+                    linestyle = da_linestyles.get(da, "-")
+                    label = f"{td} / {DA_LABELS.get(da, da)}"
+                    if len(norms) > 1:
+                        label = f"{label} / {NORM_LABELS.get(dn, dn)}"
 
-                for row, metric in enumerate(METRIC_NAMES):
-                    for col, stage in enumerate(STAGE_AGG_NAMES):
-                        ax = axes[row, col]
-                        frozen_means = np.atleast_1d(frozen.sel(stage=stage)[f"{metric}_mean"].values).astype(float)
-                        unfrozen_means = np.atleast_1d(unfrozen.sel(stage=stage)[f"{metric}_mean"].values).astype(float)
-                        frozen_by_shot = dict(zip(frozen_shots.tolist(), frozen_means.tolist(), strict=True))
-                        unfrozen_by_shot = dict(zip(unfrozen_shots.tolist(), unfrozen_means.tolist(), strict=True))
+                    for row, metric in enumerate(METRIC_NAMES):
+                        for col, stage in enumerate(STAGE_AGG_NAMES):
+                            ax = axes[row, col]
+                            frozen_means = np.atleast_1d(frozen.sel(stage=stage)[f"{metric}_mean"].values).astype(float)
+                            unfrozen_means = np.atleast_1d(unfrozen.sel(stage=stage)[f"{metric}_mean"].values).astype(float)
+                            frozen_by_shot = dict(zip(frozen_shots.tolist(), frozen_means.tolist(), strict=True))
+                            unfrozen_by_shot = dict(zip(unfrozen_shots.tolist(), unfrozen_means.tolist(), strict=True))
 
-                        if shared_line:
-                            diffs = np.array([_freeze_diff(frozen_by_shot, unfrozen_by_shot, s) for s in shared_line])
-                            if np.isfinite(diffs).any():
-                                ax.plot(
-                                    shared_line,
-                                    diffs,
-                                    color=color,
-                                    linestyle=linestyle,
-                                    linewidth=1.6,
-                                    marker="o",
-                                    markersize=4,
-                                    label=label,
-                                )
-                                drew = True
-                        if -1 in shared:
-                            ref = _freeze_diff(frozen_by_shot, unfrozen_by_shot, -1)
-                            if np.isfinite(ref):
-                                ax.axhline(ref, color=color, linestyle="--", linewidth=1.2, alpha=0.6)
-                                drew = True
+                            if shared_line:
+                                diffs = np.array([_freeze_diff(frozen_by_shot, unfrozen_by_shot, s) for s in shared_line])
+                                if np.isfinite(diffs).any():
+                                    ax.plot(
+                                        shared_line,
+                                        diffs,
+                                        color=color,
+                                        linestyle=linestyle,
+                                        linewidth=1.6,
+                                        marker="o",
+                                        markersize=4,
+                                        label=label,
+                                    )
+                                    drew = True
+                            if -1 in shared:
+                                ref = _freeze_diff(frozen_by_shot, unfrozen_by_shot, -1)
+                                if np.isfinite(ref):
+                                    ax.axhline(ref, color=color, linestyle="--", linewidth=1.2, alpha=0.6)
+                                    drew = True
 
         if not drew:
             plt.close(fig)

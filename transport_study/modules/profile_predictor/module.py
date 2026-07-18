@@ -17,7 +17,7 @@ from popsim.math_utils import safe_log
 from popsim.ml.rtd_mlp import Activation, RtdMLP
 from scipy.constants import epsilon_0, eV, mu_0
 
-from transport_study.modules.normalization import CoralFeatureNormalizer
+from transport_study.modules.normalization import FeatureNormalizer
 
 
 class ProfileShape(TimeIndepModule):
@@ -338,10 +338,10 @@ class ProfilePredictor(TimeIndepModule):
     rhogrid: tuple = eqx.field(static=True)  # The rho grid on which the profiles are evaluated
 
     nn: RtdMLP
-    # Per-device CORAL stage over the 10 dimensionless nn_inputs
-    # Identity buffers when data_normalization is 'physics', fitted from training data for 'physics-coral'
+    # Per-device stat stage over the 10 dimensionless nn_inputs
+    # Identity CORAL buffers when data_normalization is 'physics', fitted CORAL for 'physics-coral', fitted z-score for 'physics-zscore'
     # Frozen like every normalizer, the trainable getters never include it
-    normalizer: CoralFeatureNormalizer
+    normalizer: FeatureNormalizer
 
 
 class ProfilePredictorShapeInit(ProfilePredictor):
@@ -362,7 +362,7 @@ class ProfilePredictorShapeInit(ProfilePredictor):
         shape_type: ShapeType,
         rhogrid: tuple,
         key: jax.random.PRNGKey,
-        normalizer: CoralFeatureNormalizer,
+        normalizer: FeatureNormalizer,
     ):
         self.te_shapes = te_shapes
         self.ne_shapes = ne_shapes
@@ -447,7 +447,7 @@ class ProfilePredictorShapeInit(ProfilePredictor):
         shape_type: ShapeType,
         softmax_temp: float,
         prng_seed: int,
-        normalizer: CoralFeatureNormalizer,
+        normalizer: FeatureNormalizer,
     ) -> "ProfilePredictor":
         rhogrid_jax = jnp.array(rhogrid)
         rhogrid_tuple = tuple(rhogrid.tolist())
@@ -493,7 +493,7 @@ class ProfilePredictorReservoir(ProfilePredictor):
         reservoir_size: int,
         rhogrid: tuple,
         key: jax.random.PRNGKey,
-        normalizer: CoralFeatureNormalizer,
+        normalizer: FeatureNormalizer,
         spectral_radius: float = 0.9,
         input_scaling: float = 0.5,
         leak_rate: float = 1.0,
@@ -570,7 +570,7 @@ class ProfilePredictorUnstructuredNN(ProfilePredictor):
         nn_depth: int,
         rhogrid: tuple,
         key: jax.random.PRNGKey,
-        normalizer: CoralFeatureNormalizer,
+        normalizer: FeatureNormalizer,
     ):
         rhogrid_tuple = tuple(rhogrid.tolist()) if hasattr(rhogrid, "tolist") else tuple(rhogrid)
         self.normalizer = normalizer

@@ -35,7 +35,15 @@ _STAGE_METRICS = ("value", "grad", "combined")
 # reduced to a per-case median
 _SHOT_ERROR_VARS = ("err_abs_shot", "err_rel_shot")
 
-CASE_FIELD_ORDER = ("model_type", "training_data", "domain_adaptation", "freeze_shapes", "geometry_builder", "num_target_shots")
+CASE_FIELD_ORDER = (
+    "model_type",
+    "training_data",
+    "data_normalization",
+    "domain_adaptation",
+    "freeze_shapes",
+    "geometry_builder",
+    "num_target_shots",
+)
 
 SPEC = ComparisonTableSpec(
     axis_names=CASE_FIELD_ORDER,
@@ -44,6 +52,7 @@ SPEC = ComparisonTableSpec(
     field_tokens={
         "model_type": "{}",
         "training_data": "td_{}",
+        "data_normalization": "norm_{}",
         "domain_adaptation": "da_{}",
         "freeze_shapes": "freeze_{}",
         "geometry_builder": "geom_{}",

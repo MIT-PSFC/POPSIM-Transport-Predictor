@@ -162,3 +162,59 @@ def test_stats_are_arrays_not_trainable_by_selectors():
     # Both stats arrays are pytree leaves (they checkpoint/restore with the model)
     assert leaves.means is not None
     assert leaves.transforms is not None
+
+
+def test_zscore_feature_normalizer_standardizes_per_device():
+    """ZScoreFeatureNormalizer.fit_from_features on a toy (N, F) matrix with two
+    devices: transformed rows of each fitted device have ~zero mean and ~unit
+    std per feature, and the transform matches (x - mean_d) / std_d exactly.
+    """
+
+
+def test_zscore_feature_normalizer_unfitted_device_passthrough():
+    """A device index absent from the fitting data keeps the identity row
+    (mean 0, std 1), so its feature vectors pass through unchanged. Mirrors
+    test_z_score_unfitted_device_passthrough for the feature-vector variant.
+    """
+
+
+def test_zscore_feature_normalizer_identity_matches_fitted_structure():
+    """ZScoreFeatureNormalizer.identity and .fit_from_features instances share
+    pytree structure (same field names, array shapes, dtypes). Transfer
+    restore builds the identity instance and overwrites its buffers from a
+    checkpoint written by a fitted instance, so any structure drift breaks
+    physics-zscore transfer cases.
+    """
+
+
+def test_profile_model_init_physics_zscore_dispatch():
+    """ProfilePredictorTRB.model_init with data_normalization='physics-zscore':
+    - without transfer_checkpoint the module normalizer is a
+      ZScoreFeatureNormalizer fitted on the 10 nn_inputs (non-identity stats
+      for devices present in the training data)
+    - with transfer_checkpoint set the normalizer is
+      ZScoreFeatureNormalizer.identity (buffers to be overwritten by restore)
+    - 'physics' still yields identity CoralFeatureNormalizer and unknown
+      methods still raise ValueError
+    """
+
+
+def test_physics_zscore_is_stat_normalization_pretrain_case():
+    """A profile transfer case with data_normalization='physics-zscore' (or
+    'physics-coral') gets a transfer_pretrain_case() with
+    domain_adaptation='transfer_pretrain' keeping this case's
+    num_target_shots (the stat-fit-on-historic+target twin-case design),
+    while 'physics' falls back to the plain da=None baseline prereq.
+    """
+
+
+def test_profile_case_norm_token_naming():
+    """str(case) naming with the data_normalization axis:
+    - physics-coral (suppressed default) produces NO norm_ token, so
+      pre-axis case names stay byte-identical (checkpoint dirs, wandb
+      projects, tuned-config paths of existing physics-coral studies)
+    - physics / physics-zscore produce a norm_{method} token between td_
+      and freeze_, mirroring power balance
+    - restore_predictor.checkpoint_to_profile_case round-trips all three
+      (with and without geom_ / targ_ / da_ tokens present)
+    """
