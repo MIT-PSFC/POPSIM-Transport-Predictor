@@ -130,6 +130,8 @@ class TransportStudy(Study):
         # it never appears in case names):
         # - physics: use the dimensionless features as-is
         # - physics-coral: per-device CORAL alignment fitted on them
+        # - physics-zscore: per-device z-score fitted on them (mean/std only,
+        #   no covariance alignment)
         data_normalization: str = "physics-coral"
         # Hyperparameter tuning case configuration
         # (hyperparam_domain_adaptation and hyperparam_num_target_shots live on CaseGridConfig)
@@ -183,7 +185,7 @@ class TransportStudy(Study):
         @field_validator("data_normalization")
         @classmethod
         def _validate_data_normalization(cls, v: str) -> str:
-            valid = ("physics", "physics-coral")
+            valid = ("physics", "physics-coral", "physics-zscore")
             if v not in valid:
                 raise ValueError(f"Invalid data normalization method: {v}. Must be one of {valid}.")
             return v
@@ -225,7 +227,7 @@ class TransportStudy(Study):
         - none: No domain adaptation, train and test on the same device(s). This is used for hyperparameter tuning and as a baseline for comparison, answering the question "what is the best possible performance we could expect if we had a bunch of data?"
         - mixing: Add a small amount of highly-weighted target data during training
         - transfer: Train on source data, freeze all but the last layers of the model, and fine-tune on a small amount of target data
-        - transfer_pretrain: The pretrain half of a transfer case under physics-coral normalization, never a case-grid axis value (see Study.Case.transfer_pretrain_case). Trains on historic data only with the CORAL stage fitted on historic + the transfer case's target shots
+        - transfer_pretrain: The pretrain half of a transfer case under a stat normalization (physics-coral / physics-zscore), never a case-grid axis value (see Study.Case.transfer_pretrain_case). Trains on historic data only with the stat stage fitted on historic + the transfer case's target shots
 
         freeze_submodules: Whether to freeze the power_balance / profile
         submodules of the sciml model during training. Only meaningful for

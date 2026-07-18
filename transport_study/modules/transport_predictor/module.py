@@ -21,7 +21,7 @@ from torax._src.geometry import geometry_provider as geometry_provider_lib
 from torax._src.orchestration.step_function import SimulationStepFn
 from torax._src.torax_pydantic import torax_pydantic
 
-from transport_study.modules.normalization import CoralFeatureNormalizer
+from transport_study.modules.normalization import FeatureNormalizer
 from transport_study.modules.power_balance.module import PowerBalance, PowerBalanceEnv
 
 # Namespace import: the profile predictor also names its input dataclass
@@ -265,9 +265,9 @@ class TransportPredictorTransformer(TransportPredictor):
     profile currently stored for time t.
     """
 
-    # Per-device CORAL stage over the 11 transport_nn_inputs
+    # Per-device stat stage (CORAL or z-score) over the 11 transport_nn_inputs
     # Frozen like every normalizer, the trainable getters never include it
-    normalizer: CoralFeatureNormalizer
+    normalizer: FeatureNormalizer
     feature_embed: eqx.nn.Linear
     profile_embed: eqx.nn.Linear
     attention: eqx.nn.MultiheadAttention
@@ -338,7 +338,7 @@ class TransportPredictorTransformer(TransportPredictor):
         nn_width: int,
         nn_depth: int,
         rhogrid: Array,
-        normalizer: CoralFeatureNormalizer,
+        normalizer: FeatureNormalizer,
         prng_seed: int = 42,
     ) -> "TransportPredictorTransformer":
         key_feat, key_prof, key_attn, key_head = jax.random.split(jax.random.PRNGKey(prng_seed), 4)
@@ -450,8 +450,8 @@ class TransportPredictorToraxBase(TransportPredictor):
     nn_transport: RtdMLP
     nn_sources: RtdMLP
     nn_edge: RtdMLP
-    # Per-device CORAL stage over the 11 transport_nn_inputs
-    normalizer: CoralFeatureNormalizer
+    # Per-device stat stage (CORAL or z-score) over the 11 transport_nn_inputs
+    normalizer: FeatureNormalizer
 
     step_fn: SimulationStepFn = eqx.field(static=True)
 
@@ -468,7 +468,7 @@ class TransportPredictorToraxBase(TransportPredictor):
         rhogrid: tuple,
         torax_config: ToraxConfig | dict,
         key: jax.random.PRNGKey,
-        normalizer: CoralFeatureNormalizer,
+        normalizer: FeatureNormalizer,
         sim_dt: float,
         transport_model: str = "cgm",
         geometry_builder: str = "circular",
@@ -551,7 +551,7 @@ class TransportPredictorToraxBase(TransportPredictor):
         nn_width: int,
         nn_depth: int,
         prng_seed: int,
-        normalizer: CoralFeatureNormalizer,
+        normalizer: FeatureNormalizer,
         sim_dt: float,
         transport_model: str = "cgm",
         geometry_builder: str = "circular",

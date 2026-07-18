@@ -12,7 +12,11 @@ from popsim.ml.checkpointing import create_default_checkpoint_manager, restore_m
 from popsim.ml.eval import EvaluationSuite
 
 from transport_study.config import config
-from transport_study.modules.normalization import CoralFeatureNormalizer
+from transport_study.modules.normalization import (
+    CoralFeatureNormalizer,
+    FeatureNormalizer,
+    ZScoreFeatureNormalizer,
+)
 from transport_study.modules.power_balance.trb import PowerBalanceTRB
 from transport_study.modules.profile_predictor.trb import ProfilePredictorTRB
 from transport_study.modules.transport_predictor.module import (
@@ -32,8 +36,8 @@ from transport_study.modules.trb_utils import (
 STUDY_TYPE = "transport_transfer"
 
 
-def _fit_transport_input_normalizer(train_ds: xr.Dataset, n_devices: int) -> CoralFeatureNormalizer:
-    """Fit the per-device CORAL stage on the 11 transport_nn_inputs.
+def _fit_transport_input_normalizer(train_ds: xr.Dataset, n_devices: int, data_normalization: str) -> FeatureNormalizer:
+    """Fit the per-device stat stage (CORAL or z-score) on the 11 transport_nn_inputs.
 
     Evaluates the module's own feature math over the flattened training data,
     with the beta-derived entries computed from the MEASURED stored energy
@@ -60,7 +64,8 @@ def _fit_transport_input_normalizer(train_ds: xr.Dataset, n_devices: int) -> Cor
     )
     features = np.asarray(inputs.transport_nn_inputs(col("Wtot_MJ"))).T  # (N, N_TRANSPORT_NN_INPUTS)
     attributed = ~np.isnan(source_idx)
-    return CoralFeatureNormalizer.fit_from_features(features[attributed], source_idx[attributed].astype(int), n_devices)
+    normalizer_cls = ZScoreFeatureNormalizer if data_normalization == "physics-zscore" else CoralFeatureNormalizer
+    return normalizer_cls.fit_from_features(features[attributed], source_idx[attributed].astype(int), n_devices)
 
 
 def _submodule_config_dict(submodule_config: TrainConfig | dict) -> dict:
@@ -85,21 +90,27 @@ class TransportPredictorTRB(TrainRunBuilder):
 
         def _build_module(train_dl: DataLoader, model_init_config: dict) -> Any:
             model_type = model_init_config["model_type"]
-            # CORAL stage on the 11 transport features. Fitted from the
-            # training data, or left at identity when the physics features are
-            # used as-is or a transfer checkpoint will overwrite the buffers
-            # anyway (a CORAL fit on a handful of target shots is
-            # ill-conditioned, the restored stats are the correct ones).
-            # transfer_pretrain dataloaders carry a combined historic + target
-            # fit dataset as an attribute (see get_time_dep_dataloaders)
+            # Stat stage (CORAL or z-score) on the 11 transport features.
+            # Fitted from the training data, or left at identity when the
+            # physics features are used as-is or a transfer checkpoint will
+            # overwrite the buffers anyway (a stat fit on a handful of target
+            # shots is ill-conditioned, the restored stats are the correct
+            # ones; the identity class must still match the checkpoint's
+            # pytree). transfer_pretrain dataloaders carry a combined historic
+            # + target fit dataset as an attribute (see get_time_dep_dataloaders)
             data_normalization = model_init_config.get("data_normalization", "physics-coral")
-            if data_normalization not in ("physics", "physics-coral"):
+            if data_normalization not in ("physics", "physics-coral", "physics-zscore"):
                 raise ValueError(f"Unknown transport data normalization method: {data_normalization}")
             n_devices = len(config.ds_source_to_idx)
-            if data_normalization == "physics-coral" and not model_init_config.get("transfer_checkpoint"):
-                normalizer = _fit_transport_input_normalizer(getattr(train_dl, "normalizer_fit_ds", train_dl.ds), n_devices)
+            if data_normalization == "physics":
+                normalizer: FeatureNormalizer = CoralFeatureNormalizer.identity(n_devices, N_TRANSPORT_NN_INPUTS)
+            elif model_init_config.get("transfer_checkpoint"):
+                identity_cls = ZScoreFeatureNormalizer if data_normalization == "physics-zscore" else CoralFeatureNormalizer
+                normalizer = identity_cls.identity(n_devices, N_TRANSPORT_NN_INPUTS)
             else:
-                normalizer = CoralFeatureNormalizer.identity(n_devices, N_TRANSPORT_NN_INPUTS)
+                normalizer = _fit_transport_input_normalizer(
+                    getattr(train_dl, "normalizer_fit_ds", train_dl.ds), n_devices, data_normalization
+                )
 
             if model_type == "sciml":
                 # Submodule skeletons come from their own TRBs, then their
