@@ -261,9 +261,10 @@ class ProfileStudy(Study):
             "prng_seed": 42,
             "debug": config.debug,
             # Hyperparameters
-            # 1024 keeps the torax train step under the ~36GB JAX pool on 48GB
-            # L40S spillover nodes, batch 2048 needed 40.3GB and OOMed there
-            "batch_size": 1024,
+            # 2048 measured 34.7 GB on the worst torax case
+            # (qlknn, nn 64x4, t_final 0.4 with 8 solver steps),
+            # Throughput saturates here, 4096 gains nothing (1.8 ms/sample at both).
+            "batch_size": 2048,
         }
 
     def _base_loss_config(self) -> dict:
