@@ -480,11 +480,6 @@ run_study = PowerBalanceStudy.run_study
 
 
 if __name__ == "__main__":
-    import os
-
-    # Orchestrator does no GPU compute. Default jax to cpu so it can run on cpu
-    # nodes. Submitted GPU jobs override this in their sbatch scripts.
-    os.environ.setdefault("JAX_PLATFORMS", "cpu")
     fire.Fire(
         {
             "run_study": run_study,
