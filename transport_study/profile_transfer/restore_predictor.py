@@ -17,35 +17,33 @@ def checkpoint_to_profile_case(checkpoint_dir: Path | str) -> ProfileStudy.Case:
     """Parse a case directory name back into a ProfileStudy.Case.
 
     Mirrors ProfileStudy.Case.__str__:
-    case.{model_type}.td_{td}[.norm_{n}].freeze_{f}[.geom_{g}]                   source-trained, no adaptation
-    case.{model_type}.td_{td}[.norm_{n}].freeze_{f}[.geom_{g}].targ_{n}          exnihilo
-    case.{model_type}.td_{td}[.norm_{n}].freeze_{f}[.geom_{g}].targ_{n}.da_{da}  domain adaptation
+    case.{model_type}.td_{td}.norm_{n}.freeze_{f}.geom_{g}                   source-trained, no adaptation
+    case.{model_type}.td_{td}.norm_{n}.freeze_{f}.geom_{g}.targ_{n}          exnihilo
+    case.{model_type}.td_{td}.norm_{n}.freeze_{f}.geom_{g}.targ_{n}.da_{da}  domain adaptation
 
-    norm_{n} is only present when data_normalization != "physics-coral" and
-    geom_{g} only when geometry_builder != "circular" (the suppressed
-    defaults, see Study.Case.STR_TOKEN_FIELDS), so their positions are
-    optional rather than fixed.
+    No case-name token is suppressed (see Study.Case.STR_TOKEN_FIELDS), so
+    norm_/freeze_/geom_ are all mandatory and fixed in position.
     """
     case_name = Path(checkpoint_dir).name
     pieces = case_name.split(".")
-    if len(pieces) < 4 or pieces[0] != "case" or not pieces[2].startswith("td_"):
+    if len(pieces) < 6 or pieces[0] != "case" or not pieces[2].startswith("td_"):
         raise ValueError(f"Unexpected case name format: {case_name}")
 
     idx = 3
-    data_normalization = "physics-coral"
-    if idx < len(pieces) and pieces[idx].startswith("norm_"):
-        data_normalization = pieces[idx].removeprefix("norm_")
-        idx += 1
+    if not pieces[idx].startswith("norm_"):
+        raise ValueError(f"Unexpected case name format: {case_name}")
+    data_normalization = pieces[idx].removeprefix("norm_")
+    idx += 1
 
-    if idx >= len(pieces) or not pieces[idx].startswith("freeze_"):
+    if not pieces[idx].startswith("freeze_"):
         raise ValueError(f"Unexpected case name format: {case_name}")
     freeze_shapes = pieces[idx].removeprefix("freeze_") == "True"
     idx += 1
 
-    geometry_builder = "circular"
-    if idx < len(pieces) and pieces[idx].startswith("geom_"):
-        geometry_builder = pieces[idx].removeprefix("geom_")
-        idx += 1
+    if not pieces[idx].startswith("geom_"):
+        raise ValueError(f"Unexpected case name format: {case_name}")
+    geometry_builder = pieces[idx].removeprefix("geom_")
+    idx += 1
 
     num_target_shots = HYPERPARAM_TARGET_SHOTS
     domain_adaptation = None

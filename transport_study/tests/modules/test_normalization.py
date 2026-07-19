@@ -228,11 +228,9 @@ def test_physics_zscore_is_stat_normalization_pretrain_case():
 
 def test_profile_case_norm_token_naming():
     """str(case) naming with the data_normalization axis:
-    - physics-coral (suppressed default) produces NO norm_ token, so
-      pre-axis case names stay byte-identical (checkpoint dirs, wandb
-      projects, tuned-config paths of existing physics-coral studies)
-    - physics / physics-zscore produce a norm_{method} token between td_
-      and freeze_, mirroring power balance
+    - every method (physics, physics-coral, physics-zscore) produces its own
+      norm_{method} token between td_ and freeze_, data_normalization is not
+      suppressed from the case name (unlike geometry_builder's "circular")
     - restore_predictor.checkpoint_to_profile_case round-trips all three
       (with and without geom_ / targ_ / da_ tokens present)
     """

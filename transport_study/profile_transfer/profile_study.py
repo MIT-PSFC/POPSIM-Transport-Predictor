@@ -104,14 +104,11 @@ class ProfileStudy(Study):
         # by every other model type (see VALID_GEOMETRY_BUILDERS)
         geometry_builders: tuple[str, ...] = Field(default_factory=lambda: ("circular",))
         num_target_shots_options: tuple[int, ...] = Field(default_factory=lambda: (0, 1, 10, -1))
-        # Input normalization case axis over the 10 dimensionless nn_inputs
-        # (see VALID_DATA_NORMALIZATIONS). The default "physics-coral" is
-        # suppressed from case names, so single-method studies keep the
-        # pre-axis case naming
-        data_normalization_methods: tuple[str, ...] = Field(default_factory=lambda: ("physics-coral",))
+        # Input normalization case axis over the 10 dimensionless nn_inputs (see VALID_DATA_NORMALIZATIONS)
+        data_normalization_methods: tuple[str, ...] = Field(default_factory=lambda: ("physics",))
         # Hyperparameter tuning case configuration
         # (hyperparam_domain_adaptation and hyperparam_num_target_shots live on CaseGridConfig)
-        hyperparam_data_normalization: str = "physics-coral"
+        hyperparam_data_normalization: str = "physics"
         hyperparam_freeze_shapes: bool = True
 
         COMPAT_HYPERPARAM_FIELDS = (
@@ -193,13 +190,10 @@ class ProfileStudy(Study):
         geometry_builder: str
 
         VALID_MODEL_TYPES = (*MODEL_TYPES_WITH_SHAPES, *MODEL_TYPES_WITHOUT_SHAPES)
-        # data_normalization's default ("physics-coral") and geometry_builder's
-        # default ("circular") are suppressed from the case name, so
-        # pre-existing physics-coral circular-only studies keep identical case names
         STR_TOKEN_FIELDS = (
-            ("norm_", "data_normalization", "physics-coral"),
+            ("norm_", "data_normalization"),
             ("freeze_", "freeze_shapes"),
-            ("geom_", "geometry_builder", "circular"),
+            ("geom_", "geometry_builder"),
         )
         # geometry_builder is deliberately NOT a hyperparam field (like model_type):
         # it stays untouched by _hyperparam_field_values, so miller cases get their
@@ -228,7 +222,7 @@ class ProfileStudy(Study):
             freeze_shapes: bool,
             num_target_shots: int,
             geometry_builder: str = "circular",
-            data_normalization: str = "physics-coral",
+            data_normalization: str = "physics",
         ):
             self.data_normalization = data_normalization
             self.freeze_shapes = freeze_shapes
