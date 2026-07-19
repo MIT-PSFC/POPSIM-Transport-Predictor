@@ -214,7 +214,7 @@ def test_study_cmod_to_cmod_no_tuning(model_type):
             "exnihilo",
             "cmod-low",
         ],
-        domain_adaptation_methods=[None, "mixing", "transfer"],
+        domain_adaptation_methods=[None, "weighted", "transfer"],
         num_target_shots_options=[0, 1, -1],
         # max_ds_size truncates the target device to 20 shots, so the test set
         # holdout must leave some train candidates for the num_target_shots=1 case
@@ -266,7 +266,7 @@ def test_study_cmod_to_cmod_with_tuning(model_type):
             "exnihilo",
             "cmod-low",
         ],
-        domain_adaptation_methods=[None, "mixing", "transfer"],
+        domain_adaptation_methods=[None, "weighted", "transfer"],
         num_target_shots_options=[0, -1],
         target_test_set_size=10,
     )
@@ -314,7 +314,7 @@ def test_study_cmod_to_mast(model_type):
             "exnihilo",
             "cmod-low_cmod-high",
         ],
-        domain_adaptation_methods=[None, "mixing", "transfer"],
+        domain_adaptation_methods=[None, "weighted", "transfer"],
         num_target_shots_options=[0, 1, -1],
         target_test_set_size=10,
     )

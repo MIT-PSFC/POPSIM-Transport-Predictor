@@ -54,7 +54,7 @@ class TestCmodToCmod:
                 "cmod-low1",
                 "cmod-low1_cmod-low2",
             ],
-            domain_adaptation_methods=[None, "mixing", "transfer"],
+            domain_adaptation_methods=[None, "weighted", "transfer"],
             num_target_shots_options=[0, 1, 10, -1],
             target_test_set_size=60,
         )

@@ -41,7 +41,7 @@ def _make_config(study_name: str, **overrides) -> PowerBalanceStudy.Config:
         model_types=("sciml", "unstructured_nn"),
         training_datasets=("cmod-low1", "cmod-low1_cmod-low2"),
         data_normalization_methods=("coral",),
-        domain_adaptation_methods=(None, "mixing", "transfer"),
+        domain_adaptation_methods=(None, "weighted", "addition", "transfer"),
         freeze_submodules_options=(True,),
         num_target_shots_options=(0, 3),
         target_test_set_size=4,
@@ -160,7 +160,7 @@ def test_power_balance_transfer_cases():
                 )
             if case.model_type in ("sciml", "scaling_law"):
                 expected_prereqs += _submodule_prereqs(case)
-        elif case.domain_adaptation in ("mixing", None, "transfer_pretrain"):
+        elif case.domain_adaptation in ("weighted", "addition", None, "transfer_pretrain"):
             expected_prereqs = [_hyperparam_case(case.model_type)]
             if case.model_type in ("sciml", "scaling_law"):
                 expected_prereqs += _submodule_prereqs(case)
@@ -194,14 +194,14 @@ def test_compatible_configs(tmp_path):
     assert cfg1.is_compatible(reloaded)
 
 
-def test_mix_device_weight():
-    """Train a single p_oh case with mixing domain adaptation to exercise device weighting."""
+def test_weighted_device_weight():
+    """Train a single p_oh case with weighted domain adaptation to exercise device weighting."""
     study = PowerBalanceStudy(
         _make_config(
-            "test_mix_device_weight",
+            "test_weighted_device_weight",
             model_types=("sciml",),
             training_datasets=("cmod-low1_cmod-low2",),
-            domain_adaptation_methods=("mixing",),
+            domain_adaptation_methods=("weighted",),
             num_target_shots_options=(3,),
         )
     )
@@ -210,12 +210,12 @@ def test_mix_device_weight():
         model_type="p_oh",
         training_data="cmod-low1_cmod-low2",
         data_normalization="coral",
-        domain_adaptation="mixing",
+        domain_adaptation="weighted",
         freeze_submodules=True,
         num_target_shots=3,
     )
 
-    weights = study._make_mixing_device_weights(case_p_oh)
+    weights = study._make_weighted_device_weights(case_p_oh)
     assert set(weights) == {"cmod-low1", "cmod-low2", "cmod-high"}
     assert all(w > 0 for w in weights.values())
     # Target gets the largest per-sample weight (few shots, half the budget)
@@ -223,6 +223,72 @@ def test_mix_device_weight():
 
     study.launch_train(case_p_oh)
     assert study.result_path(case_p_oh).exists()
+
+
+def test_addition_no_device_weights():
+    """An 'addition' case adds target shots as normal samples without loss weighting.
+
+    make_train_config for a domain_adaptation='addition' case must NOT put a
+    'device_weights' entry in loss_config (and neither in
+    val_eval_suite_config['loss_config']), while an otherwise identical
+    'weighted' case does. get_train_test_datasets must return identical
+    train/test datasets for 'weighted' and 'addition' (same shots, same
+    values), since the two methods differ only in the loss weighting.
+    """
+    import xarray as xr
+
+    from transport_study.config import config
+    from transport_study.orchestration.organize_data import get_train_test_datasets
+
+    study = PowerBalanceStudy(
+        _make_config(
+            "test_addition_no_device_weights",
+            model_types=("unstructured_nn",),
+            training_datasets=("cmod-low1_cmod-low2",),
+            domain_adaptation_methods=("weighted", "addition"),
+            num_target_shots_options=(3,),
+        )
+    )
+
+    def _case(domain_adaptation):
+        return PowerBalanceStudy.Case(
+            model_type="unstructured_nn",
+            training_data="cmod-low1_cmod-low2",
+            data_normalization="coral",
+            domain_adaptation=domain_adaptation,
+            freeze_submodules=True,
+            num_target_shots=3,
+        )
+
+    case_weighted = _case("weighted")
+    case_addition = _case("addition")
+
+    train_config_weighted = study.make_train_config(case_weighted)
+    train_config_addition = study.make_train_config(case_addition)
+
+    assert "device_weights" in train_config_weighted.loss_config
+    assert "device_weights" in train_config_weighted.val_eval_suite_config["loss_config"]
+    assert "device_weights" not in train_config_addition.loss_config
+    assert "device_weights" not in train_config_addition.val_eval_suite_config["loss_config"]
+
+    # The weighted case weights every training device, target included
+    weights = train_config_weighted.loss_config["device_weights"]
+    assert set(weights) == {"cmod-low1", "cmod-low2", "cmod-high"}
+
+    # Identical datasets: the methods differ only in the loss weighting
+    def _datasets(case):
+        return get_train_test_datasets(
+            case.training_data,
+            domain_adaptation=case.domain_adaptation,
+            num_target_shots=case.num_target_shots,
+            target_test_set_size=config.target_test_set_size,
+            study_type=PowerBalanceStudy.STUDY_TYPE,
+        )
+
+    train_ds_weighted, test_ds_weighted = _datasets(case_weighted)
+    train_ds_addition, test_ds_addition = _datasets(case_addition)
+    xr.testing.assert_identical(train_ds_weighted, train_ds_addition)
+    xr.testing.assert_identical(test_ds_weighted, test_ds_addition)
 
 
 def test_transformer_training():
@@ -494,7 +560,7 @@ def test_collect_results():
             "test_collect_results",
             model_types=("sciml",),
             training_datasets=("cmod-low1_cmod-low2",),
-            domain_adaptation_methods=("mixing",),
+            domain_adaptation_methods=("addition",),
             num_target_shots_options=(3,),
         )
     )

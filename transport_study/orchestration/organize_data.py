@@ -721,9 +721,11 @@ def get_train_test_datasets(
 ):
     """
     Split dataset into training and test sets for the target learning case.
-    If domain adaptation is 'mixing', makes a combined training set of historic data and target
-    device shots. If domain adaptation is 'transfer' or training_data.exnihilo is True, removes
-    all historic data from the training set, leaving only the target device shots.
+    If domain adaptation is 'weighted' or 'addition', makes a combined training set of historic
+    data and target device shots (the two methods share this dataset, 'weighted' additionally
+    gets per-device loss weights injected in make_train_config). If domain adaptation is
+    'transfer' or training_data.exnihilo is True, removes all historic data from the training
+    set, leaving only the target device shots.
     The number of target shots included in training is specified by `num_target_shots`.
 
     The test set is always the same set of target device shots.

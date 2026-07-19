@@ -148,7 +148,7 @@ class TestGetTrainTestDatasets:
         td = TrainingData(sources_unsorted=["cmod-low1", "cmod-low2"])
         train_ds, test_ds = get_train_test_datasets(
             td,
-            domain_adaptation="mixing",
+            domain_adaptation="addition",
             num_target_shots=2,
             target_test_set_size=5,
             study_type="power_balance_transfer",
@@ -173,7 +173,7 @@ class TestGetTrainTestDatasets:
         td = TrainingData(sources_unsorted=["cmod-low1"])
         _, test_ds = get_train_test_datasets(
             td,
-            domain_adaptation="mixing",
+            domain_adaptation="addition",
             num_target_shots=2,
             target_test_set_size=0,
             study_type="power_balance_transfer",

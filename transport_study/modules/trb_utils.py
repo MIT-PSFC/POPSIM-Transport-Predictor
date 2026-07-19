@@ -133,7 +133,7 @@ def resolve_case_datasets(
       historic + target dataset for the normalizer fit
     - None with historic data: standard train/val split for hyperparameter tuning
     - None with exnihilo: target-only training set (verified to hold no source data)
-    - mixing / transfer: historic + target training set, target test set as val
+    - weighted / addition / transfer: historic + target training set, target test set as val
 
     Every branch returns the validation set as the test set: checkpoint
     selection and final evaluation share it (no separate test split, slightly

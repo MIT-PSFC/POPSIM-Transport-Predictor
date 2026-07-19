@@ -405,7 +405,7 @@ class DataVisualizationBase:
                 # as one distinct target dataset against the source training data.
                 train_ds, test_ds = get_train_test_datasets(
                     training_data=_td(sources),
-                    domain_adaptation="mixing",
+                    domain_adaptation="addition",
                     num_target_shots=0,
                     target_test_set_size=config.target_test_set_size,
                     study_type=cls.STUDY_TYPE,

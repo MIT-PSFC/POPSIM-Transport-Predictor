@@ -78,14 +78,16 @@ NORM_LABELS = {
 
 DA_COLORS = {
     "none": "#c0c0c0",
-    "mixing": "#ad2cfe",
+    "weighted": "#ad2cfe",
+    "addition": "#ff2ea6",
     "transfer": "#00ff5e",
     "transfer_pretrain": "#00a33c",
 }
 
 DA_LABELS = {
     "none": "No adaptation",
-    "mixing": "Mixing",
+    "weighted": "Weighted",
+    "addition": "Addition",
     "transfer": "Transfer",
     "transfer_pretrain": "Transfer pretrain",
 }

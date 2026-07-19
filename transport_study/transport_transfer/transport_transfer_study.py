@@ -225,7 +225,8 @@ class TransportStudy(Study):
 
         domain_adaptation: The method for domain adaptation between source and target devices.
         - none: No domain adaptation, train and test on the same device(s). This is used for hyperparameter tuning and as a baseline for comparison, answering the question "what is the best possible performance we could expect if we had a bunch of data?"
-        - mixing: Add a small amount of highly-weighted target data during training
+        - weighted: Add a small amount of highly-weighted target data during training
+        - addition: Add target shots to the training set as normal samples, no weighting
         - transfer: Train on source data, freeze all but the last layers of the model, and fine-tune on a small amount of target data
         - transfer_pretrain: The pretrain half of a transfer case under a stat normalization (physics-coral / physics-zscore), never a case-grid axis value (see Study.Case.transfer_pretrain_case). Trains on historic data only with the stat stage fitted on historic + the transfer case's target shots
 

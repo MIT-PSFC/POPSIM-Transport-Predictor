@@ -99,12 +99,12 @@ class CaseGridConfig(StudyConfig):
     )
     # Case-grid axes shared by every study of this shape
     training_datasets: tuple[TrainingData, ...]
-    domain_adaptation_methods: tuple[str | None, ...] = Field(default_factory=lambda: (None, "mixing", "transfer"))
+    domain_adaptation_methods: tuple[str | None, ...] = Field(default_factory=lambda: (None, "weighted", "addition", "transfer"))
     target_test_set_size: int
     # Hyperparameter tuning case axes shared by every study of this shape
     hyperparam_domain_adaptation: str | None = None
     hyperparam_num_target_shots: int = HYPERPARAM_TARGET_SHOTS
-    # Optional dict of dataset fractions to use during domain adaptation, only used if domain_adaptation includes "mixing"
+    # Optional dict of dataset fractions to use during domain adaptation, only used if domain_adaptation includes "weighted"
     dataset_fractions: dict[str, float] = Field(default_factory=dict)
 
     # Study-specific hyperparam field names checked by is_compatible, set per subclass
@@ -130,7 +130,7 @@ class CaseGridConfig(StudyConfig):
     @field_validator("domain_adaptation_methods")
     @classmethod
     def _validate_domain_adaptation(cls, v: tuple[str | None, ...]) -> tuple[str | None, ...]:
-        valid = {None, "mixing", "transfer"}
+        valid = {None, "weighted", "addition", "transfer"}
         converted = tuple(None if da == "none" else da for da in v)
         for da in converted:
             if da not in valid:
@@ -248,7 +248,7 @@ class Study:
 
         model_type: str
         training_data: TrainingData
-        # None, mixing, transfer, or transfer_pretrain
+        # None, weighted, addition, transfer, or transfer_pretrain
         # (transfer_pretrain is never a case-grid axis value, it arises only as the
         # pretrain prereq of a stat-normalized transfer case, see transfer_pretrain_case)
         domain_adaptation: str | None
@@ -522,12 +522,12 @@ class Study:
     #############
     # EXECUTION #
     #############
-    def _make_mixing_device_weights(self, case: Case) -> dict[str, float]:
-        """Loss weights per device for mixing domain adaptation.
+    def _make_weighted_device_weights(self, case: Case) -> dict[str, float]:
+        """Loss weights per device for weighted domain adaptation.
 
         Mirrors the actual training-set composition of get_train_test_datasets:
         every loaded shot of each source device in case.training_data (the
-        historic train and val splits are both concatenated into the mixing
+        historic train and val splits are both concatenated into the combined
         training set) plus case.num_target_shots target shots.
         Shot counts come from get_loaded_shot_count, so max_ds_size truncation
         and study-type filtering are accounted for.
@@ -620,7 +620,7 @@ class Study:
     def make_train_config(self, case: Case) -> TrainConfig:
         """Make the TrainConfig for a given case.
 
-        Builds the shared scaffold (dataloader/loss/optimizer bases, mixing
+        Builds the shared scaffold (dataloader/loss/optimizer bases, weighted
         device weights, transfer checkpoint wiring, tuned-config merge,
         transfer LR scaling) around the per-model-type pieces supplied by
         the _model_train_spec hook.
@@ -628,14 +628,16 @@ class Study:
         dataloader_config_base = self._base_dataloader_config(case)
         loss_config = self._base_loss_config()
         optimizer_config = self._base_optimizer_config()
-        if case.domain_adaptation == "mixing":
+        if case.domain_adaptation == "weighted":
             # Loss function reads these from loss_config as "device_weights".
             # val_eval_suite_config references the same dict, so validation
-            # loss is weighted consistently with training
-            loss_config["device_weights"] = self._make_mixing_device_weights(case)
+            # loss is weighted consistently with training.
+            # "addition" adds the same target shots but as normal samples,
+            # so it deliberately gets no device_weights entry
+            loss_config["device_weights"] = self._make_weighted_device_weights(case)
 
-        # Mixing with no target shots runs to max_epochs, early stopping disabled
-        patience = None if case.domain_adaptation == "mixing" and case.num_target_shots == 0 else config.patience
+        # Weighted / addition with no target shots runs to max_epochs, early stopping disabled
+        patience = None if case.domain_adaptation in ("weighted", "addition") and case.num_target_shots == 0 else config.patience
 
         spec = self._model_train_spec(case, dataloader_config_base)
         train_config_base = TrainConfig(
@@ -672,7 +674,7 @@ class Study:
         """Merge swept hyperparameters from the case's tuned config, when one exists.
 
         Only the TUNED_* keys come from the tuned dataloader/loss configs, so
-        case-specific entries (e.g. mixing device_weights) stay intact. The
+        case-specific entries (e.g. weighted device_weights) stay intact. The
         optimizer_config is replaced entirely.
         """
         tuned_config_path = self.tuned_config_path(case)
@@ -729,7 +731,8 @@ class Study:
         """Given a case, check if the required data for that case is available."""
         required = set(case.training_data.sources)
         if case.training_data.exnihilo or case.domain_adaptation in (
-            "mixing",
+            "weighted",
+            "addition",
             "transfer",
         ):
             required.add(config.target_device)
@@ -1275,6 +1278,8 @@ class Study:
         If you have access to data from other tokamaks (e.g. DIII-D), create a source dataset using the scripts in `transport_study/datasets/`
         and provide the path when running this script.
         If a dataset is not provided for a tokamak, figures which require that data will be skipped.
+
+        *"I hardly lifted a finger" - Engi B*
 
         Parameters
         ----------
