@@ -418,17 +418,21 @@ class Study:
         """Given a case, return the wandb project name to use for that case"""
         return f"{self.name}.{case}"
 
+    # Job names end with the study name so concurrently running studies with
+    # identical case grids never collide in squeue name matching
+    # (in-flight checks, watchdog cancels)
+
     def sweep_job_name(self, case: Case) -> str:
-        return f"sweep_{case}"
+        return f"sweep_{case}.{self.name}"
 
     def agent_job_name(self, case: Case) -> str:
-        return f"agent_{case}"
+        return f"agent_{case}.{self.name}"
 
     def train_job_name(self, case: Case) -> str:
-        return f"train_{case}"
+        return f"train_{case}.{self.name}"
 
     def analysis_job_name(self, case: Case) -> str:
-        return f"analysis_{case}"
+        return f"analysis_{case}.{self.name}"
 
     def check_prereq_satisfied(self, case: Case) -> bool:
         """Check if the prerequisites for this case have been satisfied by looking for the existence of the result path"""
