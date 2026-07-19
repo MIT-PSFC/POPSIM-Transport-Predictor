@@ -122,24 +122,34 @@ def mask_to_largest_contiguous_segment(ds: xr.Dataset, training_vars: list[str])
     return out
 
 
-def get_time_dep_dataloaders(
+def resolve_case_datasets(
     dataloader_config: dict,
     study_type: str,
-) -> tuple[xr.Dataset, DataLoader, DataLoader, DataLoader]:
-    """Dataset and dataloaders shared by the time-dependent (state-carrying) TRBs.
+) -> tuple[xr.Dataset, xr.Dataset, list[str], xr.Dataset | None]:
+    """Select and prepare the train/val datasets for a case, shared by every study TRB.
 
-    Used by the power balance and transport predictor TrainRunBuilders, which
-    differ only in the study_type their datasets are prepared with.
+    Selection by domain_adaptation:
+    - transfer_pretrain: train on historic data only, plus a combined
+      historic + target dataset for the normalizer fit
+    - None with historic data: standard train/val split for hyperparameter tuning
+    - None with exnihilo: target-only training set (verified to hold no source data)
+    - mixing / transfer: historic + target training set, target test set as val
 
-    For both standard learning and transfer learning, we essentially have two datasets.
-    For standard learning, it's the standard train/val for hyperparameter tuning. No test is needed, so we can just return None.
-    For transfer learning, we have the training dataset composed of all historic data and a small amount of new data,
-    and the test dataset composed of a set amount of new data that is held out of training.
-    We are not doing hyperparameter tuning for transfer learning.
+    Every branch returns the validation set as the test set: checkpoint
+    selection and final evaluation share it (no separate test split, slightly
+    optimistic but consistent across cases).
 
-    Also, slightly different from the POPSIM version, we're just returning the validation dataset.
+    Preparation applied to both datasets:
+    - drop the time_idx coordinate (duplicate values across shots break
+      groupby("shot") on reassembly, the dataloader uses "time" instead)
+    - broadcast the per-shot ds_source_idx against time as a float so the
+      dataloader can slice, segment, and NaN-pad it like the other inputs,
+      and append it to input_vars (the modules consume it to select
+      per-device normalization stats)
+
+    Returns (ds_train, ds_val, input_vars, normalizer_fit_ds), the last one
+    None except for transfer_pretrain.
     """
-
     training_data = dataloader_config["training_data"]
 
     if isinstance(training_data, dict):  # when the config is passed from WandB, it's a dict
@@ -185,20 +195,28 @@ def get_time_dep_dataloaders(
             study_type=study_type,
         )
 
-    # Drop time_idx as a shared coordinate - it has duplicate values across shots and
-    # causes groupby("shot") to fail when reassembling. The dataloader uses "time" instead.
     ds_train = ds_train.drop_vars(TIME_DIM, errors="ignore")
     ds_val = ds_val.drop_vars(TIME_DIM, errors="ignore")
 
-    # The modules take ds_source_idx as an input (it selects per-device
-    # normalization stats), but it is stored per shot. Broadcast it against
-    # time so the dataloader can slice and segment it like the other inputs
     input_vars = list(dataloader_config["input_vars"])
     if "ds_source_idx" not in input_vars:
         input_vars.append("ds_source_idx")
     for ds in (ds_train, ds_val):
-        # Float dtype so the dataloader can NaN-pad it like the other inputs
         ds["ds_source_idx"] = ds["ds_source_idx"].broadcast_like(ds["Ip_MA"]).astype(ds["Ip_MA"].dtype)
+
+    return ds_train, ds_val, input_vars, normalizer_fit_ds
+
+
+def get_time_dep_dataloaders(
+    dataloader_config: dict,
+    study_type: str,
+) -> tuple[xr.Dataset, DataLoader, DataLoader, DataLoader]:
+    """Dataset and dataloaders shared by the time-dependent (state-carrying) TRBs.
+
+    Used by the power balance and transport predictor TrainRunBuilders, which
+    differ only in the study_type their datasets are prepared with.
+    """
+    ds_train, ds_val, input_vars, normalizer_fit_ds = resolve_case_datasets(dataloader_config, study_type)
 
     if "state_vars" in dataloader_config.keys():
         # Validation samples are whole episodes, so a mid-shot time gap
@@ -264,12 +282,7 @@ def get_time_dep_dataloaders(
     # Transfer pretrain fits the normalizer on more data than it trains on
     # (historic + target shots). model_init reads this attribute off the
     # train dataloader, every other case fits on train_dl.ds itself
-    # Yes I know this looks stupid but it's a fairly simlple way to pass the extra dataset
-    # to the model_init without changing everything else
     if normalizer_fit_ds is not None:
         train_dl.normalizer_fit_ds = normalizer_fit_ds
-    # Running test evaluation on the validation set, since we don't need a dedicated test set
-    # In the no domain adaptation case, we are hyperparameter tuning on all historic data, pick the best one and test on it
-    # In the domain adaptation case, we are training on all historic data + some new data, and testing on the rest of the new data
-    # No hyperparameter tuning is happening, so we treat the validation set as the test set and just return it for evaluation after training
+    # The validation set doubles as the test set (see resolve_case_datasets)
     return ds_val, train_dl, val_dl, val_dl

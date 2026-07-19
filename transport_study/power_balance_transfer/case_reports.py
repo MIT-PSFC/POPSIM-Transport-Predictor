@@ -50,7 +50,7 @@ def _result_signal(result_ds: xr.Dataset) -> str:
     raise KeyError(f"No *_targ variable in result file, found {list(result_ds.data_vars)}")
 
 
-def _stage_spans(times: np.ndarray, mask: np.ndarray) -> list[tuple[float, float]]:
+def stage_spans(times: np.ndarray, mask: np.ndarray) -> list[tuple[float, float]]:
     """(start, end) time spans of the contiguous True runs of mask."""
     spans: list[tuple[float, float]] = []
     idxs = np.flatnonzero(mask)
@@ -106,13 +106,13 @@ def _shot_page(
     # Stage shading on both panels, aux-heated spans on the error panel only
     stage_handles = []
     for stage, color in STAGE_SHADE_COLORS.items():
-        spans = _stage_spans(rec_time, ts_metrics.stage[rec] == stage)
+        spans = stage_spans(rec_time, ts_metrics.stage[rec] == stage)
         for start, end in spans:
             ax_traj.axvspan(start, end, color=color, alpha=0.10, linewidth=0, zorder=0)
             ax_err.axvspan(start, end, color=color, alpha=0.10, linewidth=0, zorder=0)
         if spans:
             stage_handles.append(Patch(facecolor=color, alpha=0.35, label=stage))
-    aux_spans = _stage_spans(rec_time, ts_metrics.aux_heated[rec])
+    aux_spans = stage_spans(rec_time, ts_metrics.aux_heated[rec])
     for start, end in aux_spans:
         ax_err.axvspan(start, end, ymin=0.0, ymax=0.05, color=AUX_SHADE_COLOR, alpha=0.6, linewidth=0, zorder=0)
     if aux_spans:
@@ -189,11 +189,11 @@ def generate_case_reports(study, figure_dir: Path):
         generate_case_report(study, case, figure_dir)
 
 
-def _case_report_dir(figure_dir: Path, case) -> Path:
+def case_report_dir(figure_dir: Path, case) -> Path:
     return Path(figure_dir) / "case_reports" / str(case)
 
 
-def _case_report_done(case_dir: Path) -> bool:
+def case_report_done(case_dir: Path) -> bool:
     return (case_dir / "best_worst_shots.pdf").exists()
 
 
@@ -203,8 +203,8 @@ def generate_case_report(study, case, figure_dir: Path):
     result_path = study.result_path(case)
     if not result_path.exists():
         return
-    case_dir = _case_report_dir(figure_dir, case)
-    if _case_report_done(case_dir):
+    case_dir = case_report_dir(figure_dir, case)
+    if case_report_done(case_dir):
         logger.info(f"Case report already exists for {case}, skipping")
         return
 
@@ -226,4 +226,4 @@ def analysis_case_done(study, case, figure_dir: Path) -> bool:
     case_metrics = xr.load_dataset(cache_path)
     if not case_metrics.data_vars:
         return True
-    return _case_report_done(_case_report_dir(figure_dir, case))
+    return case_report_done(case_report_dir(figure_dir, case))

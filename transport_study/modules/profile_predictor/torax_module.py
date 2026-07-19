@@ -54,7 +54,7 @@ TORAX_TRANSPORT_MODEL_NAMES = {
 }
 
 
-def _build_circular_geometry_jax(
+def build_circular_geometry_jax(
     R_major: jax.Array,
     a_minor: jax.Array,
     B_0: jax.Array,
@@ -194,7 +194,7 @@ def _build_circular_geometry_jax(
 _MILLER_NTHETA = 64
 
 
-def _build_miller_geometry_jax(
+def build_miller_geometry_jax(
     R_major: jax.Array,
     a_minor: jax.Array,
     B_0: jax.Array,
@@ -405,7 +405,7 @@ _TE_CLAMP_KEV = (0.005, 30.0, 0.005, 4.0)
 _NE_CLAMP_M3 = (1e17, 1e21, 1e17, 5e19)
 
 
-def _clamp_core_profiles(state):
+def clamp_core_profiles(state):
     """Return state with T_e, T_i, n_e cell values soft-clamped to physical range.
 
     Applied to the state carried between solver steps, before the next step_fn
@@ -457,7 +457,7 @@ def _run_loop_jit_with_geo(
             runtime_params_overrides=runtime_params_overrides,
             geo_overrides=geo_provider,
         )
-        current_state = _clamp_core_profiles(current_state)
+        current_state = clamp_core_profiles(current_state)
         cp = current_state.core_profiles
         if debug:
             jax.debug.print(
@@ -866,7 +866,7 @@ class ProfilePredictorTorax(TimeIndepModule):
         torax_mesh = torax_pydantic.Grid1D(face_centers=face_centers_np)
         rho_hires_norm_np = np.array(self._rho_hires_norm)
         if self.geometry_builder == "miller":
-            geo = _build_miller_geometry_jax(
+            geo = build_miller_geometry_jax(
                 R_major=inputs.R0,
                 a_minor=inputs.a_minor,
                 B_0=inputs.B0,
@@ -878,7 +878,7 @@ class ProfilePredictorTorax(TimeIndepModule):
                 delta_exponent=self.delta_exponent,
             )
         else:
-            geo = _build_circular_geometry_jax(
+            geo = build_circular_geometry_jax(
                 R_major=inputs.R0,
                 a_minor=inputs.a_minor,
                 B_0=inputs.B0,
@@ -1041,7 +1041,7 @@ class ProfilePredictorTorax(TimeIndepModule):
             )
             # Same clamp as the training loop so the recorded trajectory
             # matches what __call__ actually simulates
-            state = _clamp_core_profiles(state)
+            state = clamp_core_profiles(state)
             steps.append(record(state))
 
         coeffs_out = {name: float(np.asarray(value).squeeze()) for name, value in coeffs.items()}

@@ -18,10 +18,10 @@ from threadpoolctl import threadpool_limits
 
 from transport_study import PACKAGE_ROOT
 from transport_study.datasets.gp_fitting.dispatcher import (
+    BatchState,
     ClusterFitConfig,
     ClusterFitDispatcher,
     PartitionSpec,
-    _BatchState,
     batch_id,
     parse_partition_specs,
     plan_batches,
@@ -29,11 +29,11 @@ from transport_study.datasets.gp_fitting.dispatcher import (
 from transport_study.datasets.gp_fitting.fit_worker import (
     ShotFitInput,
     ShotFitOutput,
-    _data_envelope,
-    _fit_variable,
-    _nonphysical_peak,
+    data_envelope,
     fit_batch,
+    fit_variable,
     main,
+    nonphysical_peak,
     pack_fit_batch,
     pack_fit_results,
     read_batch_shots,
@@ -77,13 +77,13 @@ def test_data_envelope_includes_nearest_neighbors():
     x = np.array([0.5, 0.72, 0.90, 1.0])
     y = np.array([3.5, 3.0, 0.2, 0.05])
     e = np.array([0.1, 0.1, 0.05, 0.02])
-    assert _data_envelope(x, y, e, 0.84) >= 3.0
+    assert data_envelope(x, y, e, 0.84) >= 3.0
 
     x_nan = np.full(3, np.nan)
     y_nan = np.full(3, np.nan)
     e_nan = np.full(3, np.nan)
 
-    assert np.isnan(_data_envelope(x_nan, y_nan, e_nan, 0.9))
+    assert np.isnan(data_envelope(x_nan, y_nan, e_nan, 0.9))
 
 
 def test_nonphysical_peak():
@@ -93,28 +93,28 @@ def test_nonphysical_peak():
     # Monotonic core-peaked profile tracking its data: healthy.
     mono = np.clip(9.0 * (1 - rho / 1.15), 0, None)
     x, y, e = _tracking_data(rho_ch, mono, rho)
-    assert _nonphysical_peak(mono, rho, x, y, e) is None
+    assert nonphysical_peak(mono, rho, x, y, e) is None
 
     # Flat profile whose global max lands in the edge region by noise
     # the margin keeps it
     flat = np.full_like(rho, 2.7)
     flat[(rho > 0.9) & (rho < 0.96)] = 2.75
     x, y, e = _tracking_data(rho_ch, flat, rho)
-    assert _nonphysical_peak(flat, rho, x, y, e) is None
+    assert nonphysical_peak(flat, rho, x, y, e) is None
 
     # Data-supported hollow profile (ramp-up ne): off-axis bump 1.5x the core
     # but the scatter shows the same shape, so it is real physics.
     hollow = 1.0 + 0.6 * np.exp(-(((rho - 0.6) / 0.2) ** 2))
     hollow[rho > 1.0] = 0.1
     x, y, e = _tracking_data(rho_ch, hollow, rho)
-    assert _nonphysical_peak(hollow, rho, x, y, e) is None
+    assert nonphysical_peak(hollow, rho, x, y, e) is None
 
     # Edge bump above the whole interior: flagged at the bump even when the
     # scatter supports it (miscalibrated edge channels).
     edge_spike = np.clip(8.0 * (1 - rho / 1.0), 0, None)
     edge_spike[(rho > 0.92) & (rho < 0.99)] = 14.0
     x, y, e = _tracking_data(rho_ch, edge_spike, rho)
-    peak = _nonphysical_peak(edge_spike, rho, x, y, e)
+    peak = nonphysical_peak(edge_spike, rho, x, y, e)
     assert peak is not None and 0.9 <= peak <= 1.0
 
     # Sub-core ringing: a 6 keV spike under an 8 keV core passes the edge rule
@@ -122,7 +122,7 @@ def test_nonphysical_peak():
     ring = np.clip(8.0 * (1 - rho / 0.9), 0.05, None)
     ring[(rho > 0.92) & (rho < 0.99)] = 6.0
     x, y, e = _tracking_data(rho_ch, np.clip(8.0 * (1 - rho / 0.9), 0.05, None), rho)
-    peak = _nonphysical_peak(ring, rho, x, y, e)
+    peak = nonphysical_peak(ring, rho, x, y, e)
     assert peak is not None and 0.9 <= peak <= 1.0
 
     # Steep pedestal interpolated across a data gap stays healthy: the fit at
@@ -130,11 +130,11 @@ def test_nonphysical_peak():
     ped = 3.0 * (1 - np.tanh((rho - 0.85) / 0.06)) / 2 + 0.05
     gap_ch = np.array([0.1, 0.3, 0.5, 0.72, 0.95, 1.02])
     x, y, e = _tracking_data(gap_ch, ped, rho)
-    assert _nonphysical_peak(ped, rho, x, y, e) is None
+    assert nonphysical_peak(ped, rho, x, y, e) is None
 
     # All-NaN slice is not flagged (nothing to cull).
     nan_data = np.full(5, np.nan)
-    assert _nonphysical_peak(np.full_like(rho, np.nan), rho, nan_data, nan_data, nan_data) is None
+    assert nonphysical_peak(np.full_like(rho, np.nan), rho, nan_data, nan_data, nan_data) is None
 
 
 def test_fit_variable_repairs_then_culls(monkeypatch):
@@ -165,7 +165,7 @@ def test_fit_variable_repairs_then_culls(monkeypatch):
         return out, band, np.gradient(out, rho), band, hyps
 
     monkeypatch.setattr(fit_worker, "gp_profile", fake_gp_profile)
-    y_out, _, _, _, _, status = _fit_variable(x, y, err, rho, 3, False, True, None, None)
+    y_out, _, _, _, _, status = fit_variable(x, y, err, rho, 3, False, True, None, None)
     assert status == "repaired"
     assert calls["n"] == 2
     assert np.nanmax(y_out) <= 8.5
@@ -177,7 +177,7 @@ def test_fit_variable_repairs_then_culls(monkeypatch):
         "gp_profile",
         lambda *a, **k: (spiked, band, np.gradient(spiked, rho), band, hyps),
     )
-    y_out, _, _, _, _, status = _fit_variable(x, y, err, rho, 3, False, True, None, None)
+    y_out, _, _, _, _, status = fit_variable(x, y, err, rho, 3, False, True, None, None)
     assert status == "culled"
     assert y_out is None
 
@@ -755,7 +755,7 @@ def test_dispatcher_adopts_suffixed_job_on_restart(tmp_path, monkeypatch):
 
 def test_run_summary_lists_failed_shots(tmp_path):
     batches = [
-        _BatchState(
+        BatchState(
             bid="aaaa",
             shots=[1, 2],
             input_path=tmp_path / "batch_aaaa.npz",
@@ -765,7 +765,7 @@ def test_run_summary_lists_failed_shots(tmp_path):
             failed=True,
             fail_reason="job 42 ended in state TIMEOUT",
         ),
-        _BatchState(
+        BatchState(
             bid="bbbb",
             shots=[3],
             input_path=tmp_path / "batch_bbbb.npz",
@@ -822,7 +822,7 @@ GP_FIT_PLOT_DIR = PACKAGE_ROOT / "tests" / "test_outputs" / "gp_fitting"
 
 # mkgp's optimizer draws its random restarts from the global numpy RNG. Seed it
 # so these spot-check fits and the plots they save are reproducible run to run.
-# blue: this pins one realization and hides the run-to-run restart variability
+# this pins one realization and hides the run-to-run restart variability
 # that is itself a failure mode of the unseeded production fit.
 GP_FIT_SEED = 0
 
@@ -986,13 +986,13 @@ class TestGPFitMAST:
         try:
             from transport_study.datasets.mast.mast_dataset import (
                 MASTDataWorkflow,
-                _check_required_signals,
+                check_required_signals,
                 config,
             )
         except ImportError as e:
             pytest.skip(f"MAST workflow deps unavailable: {e}")
         try:
-            reachable = _check_required_signals(self.SHOT, config["data_sources"])
+            reachable = check_required_signals(self.SHOT, config["data_sources"])
         except Exception:
             reachable = False
         if not reachable:

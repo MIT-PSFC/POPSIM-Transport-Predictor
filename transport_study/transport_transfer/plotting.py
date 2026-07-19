@@ -28,12 +28,12 @@ from transport_study.power_balance_transfer.plotting import (
     DA_LABELS,
     DOMAIN_NAMES,
     METRIC_NAMES,
-    _check_results_ds,
-    _coord_values,
-    _finalize_grid,
-    _grid_figure,
-    _mask_select,
-    _plot_series,
+    check_results_ds,
+    coord_values,
+    finalize_grid,
+    grid_figure,
+    mask_select,
+    plot_series,
 )
 
 MODEL_COLORS = {
@@ -74,7 +74,7 @@ _FIELD_TOKENS = {
 
 
 def _model_types(ds: xr.Dataset) -> list:
-    return [mt for mt in _coord_values(ds, "model_type") if mt not in SUBMODULE_MODEL_TYPES]
+    return [mt for mt in coord_values(ds, "model_type") if mt not in SUBMODULE_MODEL_TYPES]
 
 
 def _field_mask(ds: xr.Dataset, field: str, value) -> np.ndarray:
@@ -99,39 +99,39 @@ def _comparison_figures(
 ):
     """One line per series_field value, one figure per combination of the
     remaining grid fields (submodule model types excluded throughout)."""
-    if not _check_results_ds(results_ds, family):
+    if not check_results_ds(results_ds, family):
         return
     out_dir = Path(figure_dir) / "comparison" / family
     fixed_fields = [f for f in _GRID_FIELDS if f != series_field]
     fixed_values = []
     for field in fixed_fields:
-        values = _model_types(results_ds) if field == "model_type" else _coord_values(results_ds, field)
+        values = _model_types(results_ds) if field == "model_type" else coord_values(results_ds, field)
         fixed_values.append(values)
 
     for combo in product(*fixed_values):
         mask = np.ones(results_ds.sizes["case_idx"], dtype=bool)
         for field, value in zip(fixed_fields, combo, strict=True):
             mask = mask & _field_mask(results_ds, field, value)
-        sub = _mask_select(results_ds, mask)
+        sub = mask_select(results_ds, mask)
         if sub.sizes.get("case_idx", 0) == 0:
             continue
-        fig, axes = _grid_figure()
+        fig, axes = grid_figure()
         drew = False
         for series_value in series_values:
-            if series_value not in _coord_values(sub, series_field):
+            if series_value not in coord_values(sub, series_field):
                 continue
-            series_sub = _mask_select(sub, _field_mask(sub, series_field, series_value))
+            series_sub = mask_select(sub, _field_mask(sub, series_field, series_value))
             color = series_colors.get(series_value, "white")
             label = series_labels.get(series_value, str(series_value))
             for row, metric in enumerate(METRIC_NAMES):
                 for col, domain in enumerate(DOMAIN_NAMES):
-                    drew |= _plot_series(axes[row, col], series_sub, metric, domain, color, label)
+                    drew |= plot_series(axes[row, col], series_sub, metric, domain, color, label)
         if not drew:
             plt.close(fig)
             continue
         fixed_desc = " / ".join(f"{field}: {value}" for field, value in zip(fixed_fields, combo, strict=True))
         filename = ".".join(_FIELD_TOKENS[field].format(value) for field, value in zip(fixed_fields, combo, strict=True))
-        _finalize_grid(fig, axes, sub, f"{title_prefix} - {fixed_desc}", out_dir / f"{filename}.png")
+        finalize_grid(fig, axes, sub, f"{title_prefix} - {fixed_desc}", out_dir / f"{filename}.png")
     logger.info(f"Saved {family} figures to {out_dir}")
 
 
@@ -154,7 +154,7 @@ def training_dataset_comparison(results_ds: xr.Dataset, figure_dir: Path):
     if not results_ds.data_vars:
         logger.warning("No collected results available, skipping training dataset comparison figures")
         return
-    training_datasets = _coord_values(results_ds, "training_data")
+    training_datasets = coord_values(results_ds, "training_data")
     cmap = plt.colormaps["tab10"].resampled(max(len(training_datasets), 1))
     td_colors = {td: cmap(i) for i, td in enumerate(training_datasets)}
     _comparison_figures(

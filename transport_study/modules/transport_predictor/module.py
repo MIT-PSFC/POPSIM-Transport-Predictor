@@ -35,9 +35,9 @@ from transport_study.modules.profile_predictor.torax_module import (
     TAU_REF_S,
     TORAX_TRANSPORT_MODEL_NAMES,
     TRANSPORT_COEFFICIENT_NAMES,
-    _build_circular_geometry_jax,
-    _build_miller_geometry_jax,
-    _clamp_core_profiles,
+    build_circular_geometry_jax,
+    build_miller_geometry_jax,
+    clamp_core_profiles,
 )
 
 # Positivity floor for the profile outputs, ne [1e20 m^-3] and te [keV]
@@ -711,7 +711,7 @@ class TransportPredictorToraxBase(TransportPredictor):
         torax_mesh = torax_pydantic.Grid1D(face_centers=face_centers_np)
         rho_hires_norm_np = np.array(self._rho_hires_norm)
         if self.geometry_builder == "miller":
-            geo = _build_miller_geometry_jax(
+            geo = build_miller_geometry_jax(
                 R_major=inputs.R0,
                 a_minor=inputs.a_minor,
                 B_0=inputs.B0,
@@ -723,7 +723,7 @@ class TransportPredictorToraxBase(TransportPredictor):
                 delta_exponent=self.delta_exponent,
             )
         else:
-            geo = _build_circular_geometry_jax(
+            geo = build_circular_geometry_jax(
                 R_major=inputs.R0,
                 a_minor=inputs.a_minor,
                 B_0=inputs.B0,
@@ -794,7 +794,7 @@ class TransportPredictorToraxBase(TransportPredictor):
         Direct step_fn call, no relaxation loop: sim_dt is the fixed solver
         dt, enforced at init. The evolved core profiles are clamped before
         they are carried into the next call, same per-step clamp as the
-        ProfilePredictorTorax relaxation loop (see _clamp_core_profiles for
+        ProfilePredictorTorax relaxation loop (see clamp_core_profiles for
         the NaN rationale).
 
         The step is wrapped in jax.checkpoint: reverse-mode AD through an
@@ -816,7 +816,7 @@ class TransportPredictorToraxBase(TransportPredictor):
                 runtime_params_overrides=provider,
                 geo_overrides=geo_provider,
             )
-            return _clamp_core_profiles(next_state), next_post
+            return clamp_core_profiles(next_state), next_post
 
         return jax.checkpoint(step, prevent_cse=False)(sim_state, post_processed)
 

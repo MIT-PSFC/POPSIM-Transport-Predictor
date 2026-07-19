@@ -79,7 +79,7 @@ def checkpoint_to_profile_config(checkpoint_dir: Path | str) -> TrainConfig:
         raise FileNotFoundError(f"Tuned config not found for profile predictor case {case} at path {tuned_config_path}")
     profile_predictor_config = TrainConfig.load(tuned_config_path)
     # Make sure the checkpoint_dir in the config matches the one we're trying to restore from
-    profile_predictor_config = profile_predictor_config.model_copy(update={"checkpoint_dir": checkpoint_dir})
+    profile_predictor_config = profile_predictor_config.model_copy(update={"checkpoint_dir": str(checkpoint_dir)})
     return profile_predictor_config
 
 
@@ -102,10 +102,7 @@ def restore_profile_predictor(
     return profile_predictor
 
 
-def restore_profile_predictor_from_checkpoint(checkpoint_dir: Path | str):
+def restore_profile_predictor_from_checkpoint(checkpoint_dir: Path | str) -> ProfilePredictor:
     """Restore the profile predictor from the given checkpoint directory"""
-    profile_predictor_config = checkpoint_to_profile_config(checkpoint_dir)
-    config_dict = profile_predictor_config.model_dump()
-    config_dict["checkpoint_dir"] = checkpoint_dir
-    profile_predictor = restore_profile_predictor(config_dict)
-    return profile_predictor
+    # checkpoint_to_profile_config already points checkpoint_dir at the target
+    return restore_profile_predictor(checkpoint_to_profile_config(checkpoint_dir))

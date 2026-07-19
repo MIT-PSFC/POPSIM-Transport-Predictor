@@ -19,6 +19,7 @@ from popsim.ml.launch import (
     _get_train_run_builder_class,
     launch_agent,
     launch_train,
+    resolve_transition_frac,
 )
 from popsim.ml.train_config import load_dict
 from pydantic import Field, field_validator, model_validator
@@ -1204,7 +1205,10 @@ class Study:
             _, train_dl, _val_dl, test_dl = train_run_builder.get_dataloaders(training_config.dataloader_config)
         model = train_run_builder.model_init(train_dl, training_config.model_init_config)
         loss_fn = train_run_builder.get_loss_fn(training_config.loss_config)
-        opt = train_run_builder.get_optimizer(training_config.optimizer_config)
+        # Tuned configs sweep transition_frac, which launch_train resolves to
+        # transition_steps before get_optimizer, so mirror that here
+        optimizer_config = resolve_transition_frac(training_config.optimizer_config, len(train_dl), training_config.max_epochs)
+        opt = train_run_builder.get_optimizer(optimizer_config)
         trainer = Trainer(
             model=model,
             loss_fn=loss_fn,

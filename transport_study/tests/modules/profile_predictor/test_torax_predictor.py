@@ -16,7 +16,7 @@ from transport_study.modules.profile_predictor.train_configs import (
     PROFILE_PREDICTOR_TORAX_CONFIGS,
 )
 from transport_study.orchestration.organize_data import PROFILE_TARGET_VARS
-from transport_study.profile_transfer.plot_torax_evolution import _valid_timesteps
+from transport_study.profile_transfer.plot_torax_evolution import valid_timesteps
 
 
 @pytest.mark.parametrize("transport_model", ["constant", "cgm", "gyrobohm", "qlknn"])
@@ -101,7 +101,7 @@ def _first_valid_timeslice(sample_name: str) -> xr.Dataset:
     ds = xr.open_dataset(PACKAGE_ROOT / "datasets" / "sample" / sample_name)
     for shot in ds["shot"].values:
         shot_ds = ds.sel(shot=shot)
-        valid = _valid_timesteps(shot_ds)
+        valid = valid_timesteps(shot_ds)
         if len(valid) > 0:
             timeslice = shot_ds.isel(time_idx=int(valid[0]))
             # Raw sample files lack the device index organize_data adds

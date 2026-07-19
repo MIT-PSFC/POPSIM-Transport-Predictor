@@ -15,9 +15,7 @@ from loguru import logger
 from pydantic import BaseModel, ConfigDict, Field, field_serializer, model_validator
 
 # 80/20 between train/val
-# 80/20 between train+val/test
 TRAIN_VAL_SPLIT = (0.8, 0.2)
-TRAIN_VAL_TEST_SPLIT = (0.64, 0.16, 0.2)
 
 # Uniform normalized-minor-radius grid the profile transfer workflow puts every
 # dataset on and every profile predictor family predicts on

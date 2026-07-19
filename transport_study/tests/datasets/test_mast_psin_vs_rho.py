@@ -38,11 +38,11 @@ pytestmark = pytest.mark.slow
 def _store_reachable() -> bool:
     try:
         from transport_study.datasets.mast.mast_dataset import (
-            _check_required_signals,
+            check_required_signals,
             config,
         )
 
-        return _check_required_signals(SHOT, config["data_sources"])
+        return check_required_signals(SHOT, config["data_sources"])
     except Exception:
         return False
 

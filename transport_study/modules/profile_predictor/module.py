@@ -503,7 +503,7 @@ class ProfilePredictorReservoir(ProfilePredictor):
         self.normalizer = normalizer
 
         key_in, key_res, key_bias, key_out = jax.random.split(key, 4)
-        self.w_in = input_scaling * jax.random.uniform(key_in, (reservoir_size, 10), minval=-1.0, maxval=1.0)
+        self.w_in = input_scaling * jax.random.uniform(key_in, (reservoir_size, N_NN_INPUTS), minval=-1.0, maxval=1.0)
         w_res = jax.random.normal(key_res, (reservoir_size, reservoir_size))
         # Rescale recurrent weights to the requested spectral radius so the state
         # update is contracting (echo state property). Done with numpy at init time
@@ -577,7 +577,7 @@ class ProfilePredictorUnstructuredNN(ProfilePredictor):
 
         key, subkey = jax.random.split(key)
         self.nn = RtdMLP(
-            in_size=10,
+            in_size=N_NN_INPUTS,
             out_size=(len(rhogrid_tuple) * 2) + 2,  # +2 for the correction factors
             width_size=nn_width,
             depth=nn_depth,

@@ -307,7 +307,7 @@ class D3DDataWorkflow(DataWorkflow):
         ds["P_rad_MW"] = ds["p_rad"] / 1e6
         ds["P_NBI_MW"] = ds["p_nbi"] / 1e6
         ds["P_ECRH_MW"] = ds["p_ech"] / 1e6
-        ds["P_ICRF_MW"] = xr.zeros_like(ds["Ip_MA"])  # blue: fast wave unused in these campaigns
+        ds["P_ICRF_MW"] = xr.zeros_like(ds["Ip_MA"])  # fast wave unused in these campaigns
         ds["P_LH_MW"] = xr.zeros_like(ds["Ip_MA"])  # DIII-D has no LHCD
         # kappa passes through
 
@@ -320,7 +320,7 @@ class D3DDataWorkflow(DataWorkflow):
 
         # PROFILE PREDICTOR TRAINING
         ds["betan"] = ds["betanf"]  # Already unitless
-        ds["ne20_edge"] = ds["dssneped"] / 10  # blue: assumes 10^19 m^-3, verified vs ne20_psi(0.9)
+        ds["ne20_edge"] = ds["dssneped"] / 10  # assumes 10^19 m^-3, verified vs ne20_psi(0.9)
         ds["delta_top"] = ds["tritop"]
         ds["delta_bot"] = ds["tribot"]
 
@@ -328,7 +328,7 @@ class D3DDataWorkflow(DataWorkflow):
         ds["Ip_MA_prog"] = np.abs(ds["ip_prog"]) / 1e6  # Convert A to MA
         ds["B0_prog"] = np.abs(ds["bttbt"])
         ds["betan_prog"] = ds["bmtpwrtar"]
-        ds["ne20_edge_prog"] = ds["dstdenp"] / 10  # blue: same unit assumption as dssneped
+        ds["ne20_edge_prog"] = ds["dstdenp"] / 10  # same unit assumption as dssneped
         ds["R0_prog"] = ds["idtrp"]
         ds["gapin_prog"] = ds["ieeseg07"]
         ds["rxbot"] = ds["rxpt1"]

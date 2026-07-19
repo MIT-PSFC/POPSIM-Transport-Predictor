@@ -63,7 +63,7 @@ SPEC = ComparisonTableSpec(
 )
 
 
-def _case_stats_frame(results_ds: xr.Dataset, metrics_ds: xr.Dataset) -> pd.DataFrame:
+def case_stats_frame(results_ds: xr.Dataset, metrics_ds: xr.Dataset) -> pd.DataFrame:
     """One row per case: case-grid coords, integral error medians from the
     collected results, and per-stage time-averaged errors from the collected
     metrics (NaN for cases without valid metrics)."""
@@ -86,7 +86,7 @@ def write_comparison_tables(results_ds: xr.Dataset, metrics_ds: xr.Dataset, figu
     if not results_ds.data_vars or "case_idx" not in results_ds.dims:
         logger.warning("No collected results available, skipping comparison tables")
         return
-    df = _case_stats_frame(results_ds, metrics_ds)
+    df = case_stats_frame(results_ds, metrics_ds)
     if df.empty:
         logger.warning("No main-model cases in the collected results, skipping comparison tables")
         return

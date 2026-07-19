@@ -48,7 +48,7 @@ _REQUIRED_ZARR_VARS = [
 ]
 
 
-def _check_required_signals(shot: int, cfg) -> bool:
+def check_required_signals(shot: int, cfg) -> bool:
     """Return True if all required zarr variables exist in the level2 store.
 
     Uses fs.ls() on each variable prefix rather than checking for a specific
@@ -582,7 +582,7 @@ class MASTDataWorkflow(DataWorkflow):
                 ds_staging["ts_rho"].values,
             )
 
-        if not _check_required_signals(shot, self.level2_cfg):
+        if not check_required_signals(shot, self.level2_cfg):
             return None
 
         dt = _open_level2(shot, self.level2_cfg)

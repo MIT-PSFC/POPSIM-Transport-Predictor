@@ -373,7 +373,7 @@ class _LocalBackend:
 
 
 @dataclass
-class _BatchState:
+class BatchState:
     bid: str
     shots: list[int]
     input_path: Path
@@ -457,9 +457,9 @@ class ClusterFitDispatcher:
             self.config.shots_per_batch,
         )
 
-        batches: list[_BatchState] = []
+        batches: list[BatchState] = []
         for bid, shots in plan.items():
-            state = _BatchState(
+            state = BatchState(
                 bid=bid,
                 shots=shots,
                 input_path=self.input_path(bid),
@@ -517,7 +517,7 @@ class ClusterFitDispatcher:
         self.batches_dir.mkdir(parents=True, exist_ok=True)
 
     # ------------------------------------------------------------------
-    def _run_jobs(self, batches: list[_BatchState]) -> None:
+    def _run_jobs(self, batches: list[BatchState]) -> None:
         todo = [b for b in batches if not b.done]
         if not todo:
             return
@@ -556,7 +556,7 @@ class ClusterFitDispatcher:
             )
             time.sleep(self.config.poll_interval_s)
 
-    def _submit_ready(self, todo: list[_BatchState]) -> None:
+    def _submit_ready(self, todo: list[BatchState]) -> None:
         active = [b for b in todo if b.job_id is not None and not b.done and not b.failed]
         budget = self.config.max_concurrent_jobs - len(active)
         for state in todo:
@@ -567,7 +567,7 @@ class ClusterFitDispatcher:
             state.job_id = self._submit_batch(state)
             budget -= 1
 
-    def _adopt_queued_job(self, state: _BatchState, queued: dict[str, int]) -> None:
+    def _adopt_queued_job(self, state: BatchState, queued: dict[str, int]) -> None:
         """Adopt a queued job from a previous run instead of resubmitting.
 
         Job names carry an attempt suffix (-a{n}); the highest attempt wins
@@ -595,7 +595,7 @@ class ClusterFitDispatcher:
             except Exception as e:
                 logger.warning(f"Batch {state.bid}: failed to cancel stale job {stale_id}: {e}")
 
-    def _render_script(self, state: _BatchState, part: PartitionSpec) -> str:
+    def _render_script(self, state: BatchState, part: PartitionSpec) -> str:
         workdir = self.config.remote_workdir
         lines = [
             "#!/bin/bash",
@@ -627,7 +627,7 @@ class ClusterFitDispatcher:
         ]
         return "\n".join(lines)
 
-    def _submit_batch(self, state: _BatchState) -> int:
+    def _submit_batch(self, state: BatchState) -> int:
         workdir = self.config.remote_workdir
         self.backend.push_file(state.input_path, workdir)
 
@@ -642,7 +642,7 @@ class ClusterFitDispatcher:
         )
         return job_id
 
-    def _poll_finished(self, todo: list[_BatchState]) -> None:
+    def _poll_finished(self, todo: list[BatchState]) -> None:
         active = [b for b in todo if b.job_id is not None and not b.done and not b.failed]
         if not active:
             return
@@ -692,7 +692,7 @@ class ClusterFitDispatcher:
                 else:
                     logger.warning(f"Batch {state.bid}: job {state.job_id} state {slurm_state}, no output yet")
 
-    def _check_pending_timeout(self, state: _BatchState) -> None:
+    def _check_pending_timeout(self, state: BatchState) -> None:
         """Cancel a job stuck PENDING too long and move it to the next partition.
 
         Stops hopping after one full cycle through the partition list:
@@ -723,7 +723,7 @@ class ClusterFitDispatcher:
         if state.pending_hops >= len(self.config.partitions):
             logger.warning(f"Batch {state.bid}: tried every partition for pending fallback, will wait in queue from now on")
 
-    def _handle_failure(self, state: _BatchState, reason: str) -> None:
+    def _handle_failure(self, state: BatchState, reason: str) -> None:
         """Retry a failed batch on the next partition, or give up past max_retries."""
         state.failures += 1
         part = self.config.partitions[state.partition_idx]
@@ -742,7 +742,7 @@ class ClusterFitDispatcher:
     # ------------------------------------------------------------------
     def _collect_results(
         self,
-        batches: list[_BatchState],
+        batches: list[BatchState],
         shot_inputs: dict[int, ShotFitInput],
     ) -> dict[int, ShotFitOutput | None]:
         results: dict[int, ShotFitOutput | None] = dict.fromkeys(shot_inputs)
@@ -764,7 +764,7 @@ class ClusterFitDispatcher:
 
     @staticmethod
     def _run_summary(
-        batches: list[_BatchState],
+        batches: list[BatchState],
         results: dict[int, ShotFitOutput | None],
     ) -> str:
         """Reconciliation report: every requested shot is accounted for."""

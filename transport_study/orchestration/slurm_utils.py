@@ -5,6 +5,7 @@ import re
 import subprocess
 import sys
 import tempfile
+from collections.abc import Callable
 from pathlib import Path
 
 import yaml
@@ -12,6 +13,36 @@ from loguru import logger
 from popsim.ml import TrainConfig
 
 from transport_study.config import config
+
+# Environment shared by every GPU sbatch script (training and sweep agents).
+# Not an f-string: the shell parameter expansions must land literally
+GPU_JOB_ENV = """\
+# Single-thread host BLAS/OpenMP. Reservoir init runs np.linalg.eigvals whose
+# OpenBLAS threadpool can deadlock nondeterministically under core contention.
+# eigvals is tiny so single-threaded costs nothing.
+export OPENBLAS_NUM_THREADS=1
+export OMP_NUM_THREADS=1
+
+# Compile XLA GPU programs serially. Parallel compilation threads can deadlock
+# under the 4-cpu cgroup, stalling the job during initial compilation.
+export XLA_FLAGS="${XLA_FLAGS:+$XLA_FLAGS }--xla_gpu_force_compilation_parallelism=1"
+
+# The driver may run with JAX_PLATFORMS=cpu, which leaks in via --export=ALL.
+# Pin this GPU job to cuda. Listing platforms explicitly makes jax raise if cuda
+# fails to init, so a broken GPU env fails loudly instead of training on cpu.
+# cpu stays second in the list only so host-side helpers like jax.devices("cpu")
+# keep working. All compute defaults to cuda.
+export JAX_PLATFORMS=cuda,cpu
+
+# One preallocated XLA pool at 80% of VRAM
+# Keep preallocation on: growth-mode allocation fragments the pool,
+# and a batch-2048 TORAX transport grad step needs a single ~36 GB contiguous temp buffer,
+# which fragmentation OOMs even on an idle 80 GB card.
+# 80% still leaves the CUDA context and library kernel images (~0.7 GB measured)
+# room outside the pool.
+export XLA_PYTHON_CLIENT_PREALLOCATE=true
+export XLA_PYTHON_CLIENT_MEM_FRACTION=0.80
+"""
 
 
 def _importable_module(cls: type) -> str:
@@ -481,6 +512,76 @@ def _gpu_exclude_directive(partition: str) -> str:
     return f"\n#SBATCH --exclude={exclude_nodes}" if exclude_nodes else ""
 
 
+GRES_UNAVAILABLE_ERROR = "Requested node configuration is not available"
+
+
+@functools.cache
+def partition_gpu_type_counts(partition: str) -> tuple[tuple[str, int], ...]:
+    """(gpu_type, total GPU count) pairs in the partition, most plentiful first.
+
+    Cached per partition, the hardware inventory is static. Empty if sinfo fails.
+    """
+    result = subprocess.run(
+        ["sinfo", "-p", partition, "-N", "--noheader", "-o", "%G"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        logger.warning(f"sinfo failed while listing GPU types for {partition}: {result.stderr}")
+        return ()
+    counts: dict[str, int] = {}
+    for line in result.stdout.splitlines():
+        for gpu_type, count in re.findall(r"gpu:([\w.]+):(\d+)", line):
+            counts[gpu_type.lower()] = counts.get(gpu_type.lower(), 0) + int(count)
+    return tuple(sorted(counts.items(), key=lambda item: -item[1]))
+
+
+def _gres_fragments(partition: str) -> list[str]:
+    """Candidate values for the #SBATCH --gres line of a one-GPU job, in order.
+
+    First the untyped request plus the exclude list keeping the job on
+    config.gpu_types cards. Since July 2026 some partitions (mit_preemptable,
+    mit_normal_gpu) reject untyped gpu requests aimed at a100/h100/h200 nodes
+    with "Requested node configuration is not available" while typed requests
+    for the same cards still work, so each allowed type present in the
+    partition follows as a typed fallback, most plentiful first. A typed
+    request pins the card type by itself, no exclude list needed.
+    """
+    fragments = [f"gpu:1{_gpu_exclude_directive(partition)}"]
+    if config.gpu_types:
+        allowed = {t.lower() for t in config.gpu_types}
+        for gpu_type, _ in partition_gpu_type_counts(partition):
+            if gpu_type in allowed:
+                fragments.append(f"gpu:{gpu_type}:1")
+    return fragments
+
+
+def _sbatch_gpu_job(build_script: Callable[[str], str], job_name: str, partition: str, kind: str) -> None:
+    """Submit build_script(gres_fragment) via sbatch, falling back to typed gres.
+
+    Only the "Requested node configuration is not available" rejection moves
+    on to the next gres fragment, any other sbatch failure is final.
+    """
+    result = None
+    for gres_fragment in _gres_fragments(partition):
+        result = subprocess.run(
+            ["sbatch"],
+            input=build_script(gres_fragment),
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode == 0:
+            logger.info(f"Submitted {kind} job {job_name}: {result.stdout.strip()}")
+            return
+        if GRES_UNAVAILABLE_ERROR not in result.stderr:
+            break
+        logger.info(f"{partition} rejected gres request {gres_fragment.splitlines()[0]!r} for {job_name}, trying next GPU type")
+    if result is not None:
+        logger.error(f"sbatch failed for job {job_name}: {result.stderr}")
+
+
 def clamp_time_for_partition(partition: str, train_config: TrainConfig) -> tuple[str, TrainConfig]:
     """sbatch --time and in-job wall budget fitted to the partition's MaxTime.
 
@@ -580,12 +681,13 @@ Path({str(study_config_path)!r}).unlink()
         script_path = f.name
     log_path = log_dir / f"{job_name}.log"
 
-    sbatch_script = f"""\
+    def build_script(gres_fragment: str) -> str:
+        return f"""\
 #!/bin/bash
 #SBATCH --job-name={job_name}
 #SBATCH --partition={partition}
 #SBATCH --time={time_limit}
-#SBATCH --gres=gpu:1{_gpu_exclude_directive(partition)}
+#SBATCH --gres={gres_fragment}
 #SBATCH --mem=120G
 #SBATCH --cpus-per-task=4
 #SBATCH --export=ALL
@@ -602,49 +704,14 @@ echo "=== node $SLURMD_NODENAME gpu ${{SLURM_JOB_GPUS:-$CUDA_VISIBLE_DEVICES}} $
 # Save results to netcdf only; no need to sync wandb runs online from batch jobs
 export WANDB_MODE=offline
 
-# Single-thread host BLAS/OpenMP. Reservoir init runs np.linalg.eigvals whose
-# OpenBLAS threadpool can deadlock nondeterministically under core contention.
-# eigvals is tiny so single-threaded costs nothing.
-export OPENBLAS_NUM_THREADS=1
-export OMP_NUM_THREADS=1
-
-# Compile XLA GPU programs serially. Parallel compilation threads can deadlock
-# under the 4-cpu cgroup, stalling the job during initial compilation.
-export XLA_FLAGS="${{XLA_FLAGS:+$XLA_FLAGS }}--xla_gpu_force_compilation_parallelism=1"
-
-# The driver may run with JAX_PLATFORMS=cpu, which leaks in via --export=ALL.
-# Pin this GPU job to cuda. Listing platforms explicitly makes jax raise if cuda
-# fails to init, so a broken GPU env fails loudly instead of training on cpu.
-# cpu stays second in the list only so host-side helpers like jax.devices("cpu")
-# keep working. All compute defaults to cuda.
-export JAX_PLATFORMS=cuda,cpu
-
-# One preallocated XLA pool at 80% of VRAM
-# Keep preallocation on: growth-mode allocation fragments the pool,
-# and a batch-2048 TORAX transport grad step needs a single ~36 GB contiguous temp buffer,
-# which fragmentation OOMs even on an idle 80 GB card.
-# 80% still leaves the CUDA context and library kernel images (~0.7 GB measured)
-# room outside the pool.
-export XLA_PYTHON_CLIENT_PREALLOCATE=true
-export XLA_PYTHON_CLIENT_MEM_FRACTION=0.80
-
+{GPU_JOB_ENV}
 {sys.executable} {script_path}
 exit_code=$?
 rm -f {script_path}
 exit $exit_code
 """
 
-    result = subprocess.run(
-        ["sbatch"],
-        input=sbatch_script,
-        check=False,
-        capture_output=True,
-        text=True,
-    )
-    if result.returncode != 0:
-        logger.error(f"sbatch failed for job {job_name}: {result.stderr}")
-    else:
-        logger.info(f"Submitted training job {job_name}: {result.stdout.strip()}")
+    _sbatch_gpu_job(build_script, job_name, partition, "training")
 
 
 def launch_agent_parallel(
@@ -706,12 +773,13 @@ Path({str(study_config_path)!r}).unlink()
     with open(script_path, "w") as f:
         f.write(py_script)
 
-    sbatch_script = f"""\
+    def build_script(gres_fragment: str) -> str:
+        return f"""\
 #!/bin/bash
 #SBATCH --job-name={job_name}
 #SBATCH --partition={partition}
 #SBATCH --time={time_limit}
-#SBATCH --gres=gpu:1{_gpu_exclude_directive(partition)}
+#SBATCH --gres={gres_fragment}
 #SBATCH --mem=120G
 #SBATCH --cpus-per-task=4
 #SBATCH --export=ALL
@@ -723,49 +791,14 @@ Path({str(study_config_path)!r}).unlink()
 echo "=== $(date) job $SLURM_JOB_ID ({job_name}) start ==="
 echo "=== node $SLURMD_NODENAME gpu ${{SLURM_JOB_GPUS:-$CUDA_VISIBLE_DEVICES}} $(nvidia-smi --query-gpu=name,uuid --format=csv,noheader 2>/dev/null || echo nvidia-smi unavailable) ==="
 
-# Single-thread host BLAS/OpenMP. Reservoir init runs np.linalg.eigvals whose
-# OpenBLAS threadpool can deadlock nondeterministically under core contention.
-# eigvals is tiny so single-threaded costs nothing.
-export OPENBLAS_NUM_THREADS=1
-export OMP_NUM_THREADS=1
-
-# Compile XLA GPU programs serially. Parallel compilation threads can deadlock
-# under the 4-cpu cgroup, stalling the job during initial compilation.
-export XLA_FLAGS="${{XLA_FLAGS:+$XLA_FLAGS }}--xla_gpu_force_compilation_parallelism=1"
-
-# The driver may run with JAX_PLATFORMS=cpu, which leaks in via --export=ALL.
-# Pin this GPU job to cuda. Listing platforms explicitly makes jax raise if cuda
-# fails to init, so a broken GPU env fails loudly instead of training on cpu.
-# cpu stays second in the list only so host-side helpers like jax.devices("cpu")
-# keep working. All compute defaults to cuda.
-export JAX_PLATFORMS=cuda,cpu
-
-# One preallocated XLA pool at 80% of VRAM
-# Keep preallocation on: growth-mode allocation fragments the pool,
-# and a batch-2048 TORAX transport grad step needs a single ~36 GB contiguous temp buffer,
-# which fragmentation OOMs even on an idle 80 GB card.
-# 80% still leaves the CUDA context and library kernel images (~0.7 GB measured)
-# room outside the pool.
-export XLA_PYTHON_CLIENT_PREALLOCATE=true
-export XLA_PYTHON_CLIENT_MEM_FRACTION=0.80
-
+{GPU_JOB_ENV}
 {sys.executable} {script_path}
 exit_code=$?
 rm -f {script_path}
 exit $exit_code
 """
 
-    result = subprocess.run(
-        ["sbatch"],
-        input=sbatch_script,
-        check=False,
-        capture_output=True,
-        text=True,
-    )
-    if result.returncode != 0:
-        logger.error(f"sbatch failed for job {job_name}: {result.stderr}")
-    else:
-        logger.info(f"Submitted agent job {job_name}: {result.stdout.strip()}")
+    _sbatch_gpu_job(build_script, job_name, partition, "agent")
 
 
 def launch_case_analysis_parallel(study, case) -> None:

@@ -29,11 +29,11 @@ from transport_study.power_balance_transfer.case_reports import (  # noqa: F401 
     STAGE_SHADE_COLORS,
     TICK_FONTSIZE,
     TITLE_FONTSIZE,
-    _case_report_dir,
-    _case_report_done,
-    _stage_spans,
     analysis_case_done,
     best_worst_pdf,
+    case_report_dir,
+    case_report_done,
+    stage_spans,
 )
 from transport_study.transport_transfer.study_metrics import (
     CaseTimesliceMetrics,
@@ -108,13 +108,13 @@ def _shot_page(
     # Stage shading and aux-heated spans on the error panels
     stage_handles = []
     for stage, color in STAGE_SHADE_COLORS.items():
-        spans = _stage_spans(rec_time, ts_metrics.stage[rec] == stage)
+        spans = stage_spans(rec_time, ts_metrics.stage[rec] == stage)
         for start, end in spans:
             axes[2, 0].axvspan(start, end, color=color, alpha=0.10, linewidth=0, zorder=0)
             axes[2, 1].axvspan(start, end, color=color, alpha=0.10, linewidth=0, zorder=0)
         if spans:
             stage_handles.append(Patch(facecolor=color, alpha=0.35, label=stage))
-    aux_spans = _stage_spans(rec_time, ts_metrics.aux_heated[rec])
+    aux_spans = stage_spans(rec_time, ts_metrics.aux_heated[rec])
     for start, end in aux_spans:
         axes[2, 0].axvspan(start, end, ymin=0.0, ymax=0.05, color=AUX_SHADE_COLOR, alpha=0.6, linewidth=0, zorder=0)
     if aux_spans:
@@ -159,8 +159,8 @@ def generate_case_report(study, case, figure_dir: Path):
     result_path = study.result_path(case)
     if not result_path.exists():
         return
-    case_dir = _case_report_dir(figure_dir, case)
-    if _case_report_done(case_dir):
+    case_dir = case_report_dir(figure_dir, case)
+    if case_report_done(case_dir):
         logger.info(f"Case report already exists for {case}, skipping")
         return
 

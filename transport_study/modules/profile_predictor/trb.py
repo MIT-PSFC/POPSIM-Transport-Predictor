@@ -34,13 +34,9 @@ from transport_study.modules.profile_predictor.module import (
 from transport_study.modules.profile_predictor.torax_module import ProfilePredictorTorax
 from transport_study.modules.trb_utils import (
     integrate_error_over_time,
+    make_exponential_adamw,
     make_loss_eval_suite,
-)
-from transport_study.orchestration.organize_data import (
-    TrainingData,
-    get_train_test_datasets,
-    get_train_val_datasets,
-    get_transfer_pretrain_datasets,
+    resolve_case_datasets,
 )
 
 
@@ -110,88 +106,21 @@ class ProfilePredictorTRB(TrainRunBuilder):
     def get_dataloaders(
         dataloader_config: dict,
     ) -> tuple[xr.Dataset, DataLoader, DataLoader, DataLoader]:
+        """Dataset and dataloaders for profile predictor training.
+
+        Dataset selection and preparation is the shared
+        trb_utils.resolve_case_datasets, this only builds the
+        time-independent dataloaders on top.
         """
-        Get the dataset and dataloaders for training.
-
-        For both standard learning and transfer learning, we essentially have two datasets.
-        For standard learning, it's the standard train/val for hyperparameter tuning. No test is needed, so we can just return None.
-        For transfer learning, we have the training dataset composed of all historic data and a small amount of new data,
-        and the test dataset composed of a set amount of new data that is held out of training.
-        We are not doing hyperparameter tuning for transfer learning.
-
-        Also, slightly different from the POPSIM version, we're just returning the validation dataset.
-        """
-
-        training_data = dataloader_config["training_data"]
-
-        if isinstance(training_data, dict):  # when the config is passed from WandB, it's a dict
-            training_data = TrainingData(**training_data)
-
-        normalizer_fit_ds = None
-        if dataloader_config.get("domain_adaptation") == "transfer_pretrain":
-            logger.info("Using transfer pretrain dataloader (trains on historic data, normalizer fit on historic + target shots)")
-            ds_train, normalizer_fit_ds, ds_val = get_transfer_pretrain_datasets(
-                training_data=training_data,
-                num_target_shots=dataloader_config["num_target_shots"],
-                target_test_set_size=dataloader_config.get("target_test_set_size", None),
-                study_type="profile_transfer",
-            )
-        elif dataloader_config.get("domain_adaptation") is None:
-            logger.info("Using standard learning dataloader")
-            if not training_data.exnihilo:
-                ds_train, ds_val = get_train_val_datasets(
-                    training_data=training_data,
-                    study_type="profile_transfer",
-                )
-            else:
-                ds_train, ds_val = get_train_test_datasets(
-                    training_data=training_data,
-                    domain_adaptation=None,
-                    num_target_shots=dataloader_config["num_target_shots"],
-                    target_test_set_size=dataloader_config.get("target_test_set_size", None),
-                    study_type="profile_transfer",
-                )
-                # Double check there's no source (non-target) data anywhere in here
-                non_target = set(config.dataset_paths.keys()) - {config.target_device}
-                if any((ds_train["ds_source"] == src).any() for src in non_target):
-                    raise ValueError(
-                        "Historic data found in training set for exnihilo training_data option. Please check the dataset construction logic."
-                    )
-        else:
-            logger.info(f"Using transfer learning dataloader with domain adaptation {dataloader_config['domain_adaptation']}")
-            ds_train, ds_val = get_train_test_datasets(
-                training_data=training_data,
-                domain_adaptation=dataloader_config["domain_adaptation"],
-                num_target_shots=dataloader_config["num_target_shots"],
-                target_test_set_size=dataloader_config.get("target_test_set_size", None),
-                study_type="profile_transfer",
-            )
-
-        # Drop time_idx as a shared coordinate — it has duplicate values across shots and
-        # causes groupby("shot") to fail when reassembling. The dataloader uses "time" instead.
-        ds_train = ds_train.drop_vars(TIME_DIM, errors="ignore")
-        ds_val = ds_val.drop_vars(TIME_DIM, errors="ignore")
-
-        # The modules take ds_source_idx as an input
-        # (it selects per-device normalization stats), but it is stored per shot.
-        # Broadcast it against time so the dataloader can slice it like the other inputs
-        input_vars = list(dataloader_config["input_vars"])
-        if "ds_source_idx" not in input_vars:
-            input_vars.append("ds_source_idx")
-        for ds in (ds_train, ds_val):
-            # Float dtype so the dataloader can NaN-pad it like the other inputs
-            ds["ds_source_idx"] = ds["ds_source_idx"].broadcast_like(ds["Ip_MA"]).astype(ds["Ip_MA"].dtype)
-
-        target_vars = dataloader_config["target_vars"]
-        extra_vars = dataloader_config.get("extra_vars", None)
+        ds_train, ds_val, input_vars, normalizer_fit_ds = resolve_case_datasets(dataloader_config, "profile_transfer")
 
         train_dl, val_dl = make_dataloaders(
             datasets=(ds_train, ds_val),
             time_coord=TIME_COORD,
             episode_coord=EPISODE_DIM,
             input_vars=input_vars,
-            target_vars=target_vars,
-            extra_vars=extra_vars,
+            target_vars=dataloader_config["target_vars"],
+            extra_vars=dataloader_config.get("extra_vars", None),
             batch_size=dataloader_config.get("batch_size", None),
             shuffle=[True, False],
             convert_xr_to_jnp=False,  # Needed to keep the coords for calculating loss
@@ -205,13 +134,9 @@ class ProfilePredictorTRB(TrainRunBuilder):
         # Transfer pretrain fits the normalizer on more data than it trains on
         # (historic + target shots). model_init reads this attribute off the
         # train dataloader, every other case fits on train_dl.ds itself
-        # TODO(ZanderKeith): This is stupid
         if normalizer_fit_ds is not None:
             train_dl.normalizer_fit_ds = normalizer_fit_ds
-        # Running test evaluation on the validation set, since we don't need a dedicated test set
-        # In the no domain adaptation case, we are hyperparameter tuning on all historic data, pick the best one and test on it
-        # In the domain adaptation case, we are training on all historic data + some new data, and testing on the rest of the new data
-        # No hyperparameter tuning is happening, so we treat the validation set as the test set and just return it for evaluation after training
+        # The validation set doubles as the test set (see resolve_case_datasets)
         return ds_val, train_dl, val_dl, val_dl
 
     @staticmethod
@@ -428,8 +353,8 @@ class ProfilePredictorTRB(TrainRunBuilder):
             return outside + within_error_weight * inside
 
         def _sigma_from_targ(targ, var, scale):
-            # Error-bar target var, normalized like the profiles. Missing var
-            # (older configs / tests) is the same as the 0 sentinel
+            # Error-bar target var, normalized like the profiles. An absent
+            # var behaves like the 0 sentinel (zero-width error bar)
             if var in targ:
                 return targ[var].data / scale
             return 0.0
@@ -546,17 +471,12 @@ class ProfilePredictorTRB(TrainRunBuilder):
 
     @staticmethod
     def get_optimizer(config: dict) -> optax.GradientTransformation:
-        schedule = optax.exponential_decay(
-            init_value=config["lr0"],
-            transition_steps=config["transition_steps"],
-            decay_rate=config["decay_rate"],
-            end_value=config["lrf"],
-        )
-        opt = optax.chain(
+        # Standard AdamW plus a global-norm cap: the differentiated TORAX
+        # solve can spike gradients and NaN a run without it
+        return optax.chain(
             optax.clip_by_global_norm(config.get("grad_clip_max_norm", 1.0)),
-            optax.adamw(learning_rate=schedule, weight_decay=config["weight_decay"]),
+            make_exponential_adamw(config),
         )
-        return opt
 
     @staticmethod
     def get_trainable_getter(model_init_config: dict) -> Callable[[Any], Any] | None:

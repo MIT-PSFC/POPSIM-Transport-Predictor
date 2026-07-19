@@ -282,11 +282,11 @@ def generate_case_reports(study, figure_dir: Path):
         generate_case_report(study, case, figure_dir)
 
 
-def _case_report_dir(figure_dir: Path, case) -> Path:
+def case_report_dir(figure_dir: Path, case) -> Path:
     return Path(figure_dir) / "case_reports" / str(case)
 
 
-def _case_report_done(case_dir: Path) -> bool:
+def case_report_done(case_dir: Path) -> bool:
     return (case_dir / "best_worst_timeslices.pdf").exists() and any(case_dir.glob("shot_*_evolution.gif"))
 
 
@@ -296,8 +296,8 @@ def generate_case_report(study, case, figure_dir: Path):
     result_path = study.result_path(case)
     if not result_path.exists():
         return
-    case_dir = _case_report_dir(figure_dir, case)
-    if _case_report_done(case_dir):
+    case_dir = case_report_dir(figure_dir, case)
+    if case_report_done(case_dir):
         logger.info(f"Case report already exists for {case}, skipping")
         return
 
@@ -321,7 +321,7 @@ def analysis_case_done(study, case, figure_dir: Path) -> bool:
     case_metrics = xr.load_dataset(cache_path)
     if not case_metrics.data_vars:
         return True
-    return _case_report_done(_case_report_dir(figure_dir, case))
+    return case_report_done(case_report_dir(figure_dir, case))
 
 
 def torax_relaxation_report(study, metrics_ds: xr.Dataset, figure_dir: Path):

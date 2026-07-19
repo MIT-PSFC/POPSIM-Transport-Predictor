@@ -54,7 +54,7 @@ INPUT_VARS = [
 ]
 
 
-def _valid_timesteps(shot_ds: xr.Dataset) -> np.ndarray:
+def valid_timesteps(shot_ds: xr.Dataset) -> np.ndarray:
     """Timesteps where all inputs are finite and the target profiles are freshly measured."""
     valid = np.ones(shot_ds.sizes["time_idx"], dtype=bool)
     for var in INPUT_VARS:
@@ -72,7 +72,7 @@ def _load_timeslice(dataset: str | Path, shot: int, timestep: int, ds_source_idx
     ds = xr.open_dataset(ds_path)
     shot_ds = ds.sel(shot=shot)
 
-    valid = _valid_timesteps(shot_ds)
+    valid = valid_timesteps(shot_ds)
     if timestep not in valid:
         if len(valid) == 0:
             raise ValueError(f"Shot {shot} has no timestep with finite inputs and fresh target profiles")

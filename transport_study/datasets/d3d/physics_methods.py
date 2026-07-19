@@ -124,7 +124,7 @@ def _rho_of_psi_n(psi_n_grid: np.ndarray, times: np.ndarray, efit_dict: dict) ->
         if not r_lcfs > r_axis:
             continue
         r_of_psi_n = np.interp(psi_n_grid, psi_out, r_out)
-        # blue: clip tiny negatives at psi_n ~ 0 caused by the parabola-refined axis
+        # clip tiny negatives at psi_n ~ 0 caused by the parabola-refined axis
         rho[i] = np.clip((r_of_psi_n - r_axis) / (r_lcfs - r_axis), 0.0, None)
     return rho
 
@@ -132,7 +132,7 @@ def _rho_of_psi_n(psi_n_grid: np.ndarray, times: np.ndarray, efit_dict: dict) ->
 def _gradient_and_error(vals: np.ndarray, errs: np.ndarray, x: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     """Numerical gradient along the last axis with propagated error."""
     grad = np.gradient(vals, x, axis=1)
-    # blue: central difference error propagation, endpoints copy their neighbor.
+    # central difference error propagation, endpoints copy their neighbor.
     # No point covariance available from IDA, unlike the GP fits on C-Mod/MAST.
     grad_err = np.full_like(vals, np.nan)
     grad_err[:, 1:-1] = np.sqrt(errs[:, 2:] ** 2 + errs[:, :-2] ** 2) / (x[2:] - x[:-2])
@@ -181,7 +181,7 @@ class D3DDatasetMethods:
                 params.logger.warning("pedestal node {node} missing", node=node)
                 out[col] = np.full(len(params.times), np.nan)
         if not np.isfinite(out["betanf"]).any():
-            # blue: efsbetan is the rt-EFIT beta_n, close enough when the pedestal calc is missing
+            # efsbetan is the rt-EFIT beta_n, close enough when the pedestal calc is missing
             try:
                 sig, t = params.get_data_with_dims(f"ptdata('efsbetan', {params.shot_id})")
                 out["betanf"] = interp1(t / 1e3, sig, params.times)
