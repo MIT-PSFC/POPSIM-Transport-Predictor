@@ -326,7 +326,7 @@ def _combined_raw_dataset(study_type: str) -> tuple[xr.Dataset, str]:
     for device in _all_devices():
         ds, episode_coord = get_ds(device, study_type=study_type)
         ds = add_performance(ds, episode_coord)
-        # Profile-transfer datasets have no aux-power signal, but z_score/coral
+        # Profile-transfer datasets have no aux-power signal, but zscore/coral
         # normalization iterate over it unconditionally. Zero-fill so they run
         # (a no-op for power-balance datasets, which always carry P_aux_MW).
         if "P_aux_MW" not in ds:
@@ -428,7 +428,8 @@ class DataVisualizationBase:
         save_dir = Path(figure_dir) / "data_visualization" / "domain_overlap"
         colors = _device_colors()
 
-        methods = ["raw", "physics", "z_score", "coral", "physics-coral"]
+        # Each study plots exactly the methods its VAR_GROUPS declares
+        methods = list(cls.VAR_GROUPS)
         if all((save_dir / f"domain_overlap_{method}.png").exists() for method in methods):
             return
 

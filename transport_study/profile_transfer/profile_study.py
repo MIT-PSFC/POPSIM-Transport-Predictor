@@ -54,7 +54,7 @@ VALID_GEOMETRY_BUILDERS = ("circular", "miller")
 
 # Input normalization applied to the 10 dimensionless nn_inputs. The physics
 # transform is built into the feature set itself, so unlike power balance
-# there is no raw / z_score of physical units, only stat stages on top:
+# there is no raw / zscore of physical units, only stat stages on top:
 # - physics: use the dimensionless parameters as-is
 # - physics-coral: per-device CORAL alignment fitted on them
 # - physics-zscore: per-device z-score fitted on them (mean/std only, no

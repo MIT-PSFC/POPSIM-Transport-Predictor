@@ -54,7 +54,7 @@ MODEL_TYPES_WITHOUT_SUBMODULES = ("unstructured_nn", "transformer")
 # Submodule pseudo-model-types, they appear as prereq cases of the structured models
 SUBMODULE_MODEL_TYPES = ("p_oh", "p_rad")
 
-VALID_DATA_NORMALIZATIONS = ("raw", "physics", "z_score", "coral", "physics-coral")
+VALID_DATA_NORMALIZATIONS = ("raw", "physics", "zscore", "coral", "physics-coral", "physics-zscore")
 
 # Per-submodule train settings shared with the transport study, which trains
 # the same p_oh/p_rad prereq cases for its power balance submodule
@@ -148,9 +148,10 @@ class PowerBalanceStudy(Study):
         as a POPSIM module configured from the training data only (transport_study/modules/normalization.py).
         - raw: No normalization, Ip, Wtot, etc. are in their original units
         - physics: Convert to typical dimensionless parameters like q_star, f_G, etc.
-        - z_score: Within each device, normalize each variable to zero mean and unit variance.
+        - zscore: Within each device, normalize each variable to zero mean and unit variance.
         - coral: Use the CORAL method to align covariances of source and target domains (https://arxiv.org/abs/1612.01939)
         - physics-coral: The physics parameters followed by CORAL alignment fitted on them.
+        - physics-zscore: The physics parameters followed by a per-device z-score fitted on them.
 
         domain_adaptation: The method for domain adaptation between source and target devices.
         - none: No domain adaptation, train and test on the same device(s). This is used for hyperparameter tuning and as a baseline for comparison, answering the question "what is the best possible performance we could expect if we had a bunch of data?"

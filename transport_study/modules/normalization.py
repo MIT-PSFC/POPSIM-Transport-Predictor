@@ -3,8 +3,9 @@
 Each normalizer maps the 7 physical power-balance inputs
 (Ip_MA, B0, R0, a_minor, kappa, ne20_line_avg, P_aux_MW) to 7 NN-ready
 features. Dimensionality is maintained so no new information is provided.
-Stats-bearing methods (z_score, coral) are fitted from TRAINING data only, at
-model_init time, and store their statistics as frozen buffers on the module.
+Stats-bearing methods (zscore, coral, and their physics- variants) are fitted
+from TRAINING data only, at model_init time, and store their statistics as
+frozen buffers on the module.
 The arrays live in the pytree (so they checkpoint and restore with the model,
 which is what carries source-fitted stats through transfer learning), but the
 trainable selectors never include them so they are never updated by the
@@ -13,11 +14,13 @@ optimizer.
 Methods:
 - raw: identity, features are the physical values
 - physics: dimensionless / device-invariant combinations computed in-graph
-- z_score: per-device zero mean and unit variance
+- zscore: per-device zero mean and unit variance
 - coral: per-device covariance alignment to the pooled training covariance
   (https://arxiv.org/abs/1612.01939)
 - physics-coral: the physics transform followed by CORAL alignment fitted in
   the dimensionless physics feature space
+- physics-zscore: the physics transform followed by a per-device z-score
+  fitted in the dimensionless physics feature space
 
 organize_data.normalize_domain (data visualization) is a thin wrapper around
 the fit/apply helpers in this file, so the visualized feature spaces are the
@@ -63,10 +66,11 @@ MIN_CORAL_SAMPLES = 8
 # Their transfer cases pretrain through a dedicated transfer_pretrain prereq
 # case whose stats are fitted on the combined historic + target data and
 # inherited via the checkpoint restore (see Study.Case.transfer_pretrain_case)
-# physics-zscore is profile-transfer only (a z-score stage on the profile
-# predictor's dimensionless nn_inputs, see CoralFeatureNormalizer /
-# ZScoreFeatureNormalizer), it is not a power-balance InputNormalizer method
-STAT_NORMALIZATIONS = ("z_score", "coral", "physics-coral", "physics-zscore")
+# physics-zscore doubles as the profile/transport feature-stage method (a
+# z-score over the predictor's dimensionless nn_inputs, see
+# ZScoreFeatureNormalizer) and as the power-balance InputNormalizer
+# method PhysicsZScoreNormalizer
+STAT_NORMALIZATIONS = ("zscore", "coral", "physics-coral", "physics-zscore")
 
 
 class InputNormalizer(TimeIndepModule):
@@ -382,6 +386,36 @@ class PhysicsCoralNormalizer(InputNormalizer):
         return cls(means=means, transforms=transforms)
 
 
+class PhysicsZScoreNormalizer(InputNormalizer):
+    """The physics transform followed by a per-device z-score in physics space.
+
+    The mean/std statistics are fitted on the physics-transformed training
+    features, so the standardization removes the per-device offset and scale
+    of the dimensionless parameters rather than the raw inputs. Features come
+    out centered (z-scoring does not re-add the device mean the way CORAL
+    does). Buffer shapes match ZScoreNormalizer.
+    """
+
+    means: jnp.ndarray
+    stds: jnp.ndarray
+
+    def _normalize_vec(self, vec: jnp.ndarray, ds_source_idx: ArrayLike) -> jnp.ndarray:
+        phys = physics_feature_vec(vec)
+        return apply_z_score(phys, ds_source_idx, self.means, self.stds)
+
+    @classmethod
+    def identity(cls, n_devices: int) -> PhysicsZScoreNormalizer:
+        return cls(means=jnp.zeros((n_devices, N_FEATURES)), stds=jnp.ones((n_devices, N_FEATURES)))
+
+    @classmethod
+    def fit(cls, ds: xr.Dataset, n_devices: int) -> PhysicsZScoreNormalizer:
+        """Fit per-device mean/std in the physics feature space."""
+        features, source_idx = _feature_matrix(ds)
+        phys_rows = np.asarray(jax.vmap(physics_feature_vec)(jnp.asarray(features)))
+        means, stds = fit_z_score_stats(phys_rows, source_idx, n_devices)
+        return cls(means=means, stds=stds)
+
+
 class CoralFeatureNormalizer(TimeIndepModule):
     """Generic per-device CORAL stage over an arbitrary feature vector.
 
@@ -469,10 +503,12 @@ def make_normalizer(
         return RawNormalizer()
     if method == "physics":
         return PhysicsNormalizer()
-    if method == "z_score":
+    if method == "zscore":
         return ZScoreNormalizer.identity(n_devices) if train_ds is None else ZScoreNormalizer.fit(train_ds, n_devices)
     if method == "coral":
         return CoralNormalizer.identity(n_devices) if train_ds is None else CoralNormalizer.fit(train_ds, n_devices)
     if method == "physics-coral":
         return PhysicsCoralNormalizer.identity(n_devices) if train_ds is None else PhysicsCoralNormalizer.fit(train_ds, n_devices)
+    if method == "physics-zscore":
+        return PhysicsZScoreNormalizer.identity(n_devices) if train_ds is None else PhysicsZScoreNormalizer.fit(train_ds, n_devices)
     raise ValueError(f"Unknown normalization method: {method}")

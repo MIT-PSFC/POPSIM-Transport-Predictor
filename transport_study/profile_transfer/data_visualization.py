@@ -24,7 +24,7 @@ class DataVisualization(DataVisualizationBase):
             ["f_G", "aB0"],
             ["beta", "kappa"],
         ],
-        "z_score": [
+        "zscore": [
             ["Ip_MA_z", "Wtot_MJ_z"],
             ["R0_z", "a_minor_z"],
             ["ne20_line_avg_z", "B0_z"],
@@ -41,5 +41,11 @@ class DataVisualization(DataVisualizationBase):
             ["q_star_pcoral", "epsilon_pcoral"],
             ["f_G_pcoral", "aB0_pcoral"],
             ["q_star_pcoral", "aB0_pcoral"],
+        ],
+        "physics-zscore": [
+            ["Ip_MA_pz", "kappa_pz"],
+            ["q_star_pz", "epsilon_pz"],
+            ["f_G_pz", "aB0_pz"],
+            ["q_star_pz", "aB0_pz"],
         ],
     }

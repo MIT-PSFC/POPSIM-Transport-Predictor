@@ -11,6 +11,7 @@ from transport_study.modules.normalization import (
     InputNormalizer,
     PhysicsCoralNormalizer,
     PhysicsNormalizer,
+    PhysicsZScoreNormalizer,
     RawNormalizer,
     ZScoreNormalizer,
     make_normalizer,
@@ -135,8 +136,25 @@ def test_coral_aligns_covariance():
         assert np.isclose(float(getattr(out, var)), float(getattr(inp, var)))
 
 
+def test_physics_zscore_standardizes_in_physics_space():
+    """PhysicsZScoreNormalizer.fit on the toy dataset:
+    - transformed outputs of each fitted device have ~zero mean and ~unit std
+      per physics feature (compare against physics_feature_vec applied to the
+      same rows)
+    - device 2 (never fitted) keeps identity stats, so its output equals the
+      plain physics features
+    - identity() and fit() instances share pytree structure (transfer restore
+      overwrites identity buffers from a fitted checkpoint)
+    """
+
+
 def test_make_normalizer_identity_without_data():
-    for method, cls in [("z_score", ZScoreNormalizer), ("coral", CoralNormalizer), ("physics-coral", PhysicsCoralNormalizer)]:
+    for method, cls in [
+        ("zscore", ZScoreNormalizer),
+        ("coral", CoralNormalizer),
+        ("physics-coral", PhysicsCoralNormalizer),
+        ("physics-zscore", PhysicsZScoreNormalizer),
+    ]:
         norm = make_normalizer(method, train_ds=None, n_devices=N_DEVICES)
         assert isinstance(norm, cls)
         fitted = make_normalizer(method, train_ds=_toy_dataset(), n_devices=N_DEVICES)

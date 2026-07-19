@@ -495,9 +495,10 @@ def normalize_domain(
     Methods:
         - "raw": No normalization, Ip, Wtot, etc. are in their original units
         - "physics": The module's dimensionless features (q_star, epsilon, aB0, f_G, surface_power_density) plus beta as a visualization-only extra
-        - "z_score": Within each device, normalize each variable to zero mean and unit variance. Variable gets a `_z` suffix after normalization. Wtot_MJ is a visualization-only extra column (harmless, z-scoring is per-variable)
+        - "zscore": Within each device, normalize each variable to zero mean and unit variance. Variable gets a `_z` suffix after normalization. Wtot_MJ is a visualization-only extra column (harmless, z-scoring is per-variable)
         - "coral": Use the CORAL method to align covariances of various devices over exactly the model's 7 input vars. Variable gets a `_coral` suffix after normalization.
         - "physics-coral": CORAL alignment over the 7 physics features. Variable gets a `_pcoral` suffix (a `_coral` suffix would collide with the raw coral vars).
+        - "physics-zscore": Per-device z-score over the 7 physics features. Variable gets a `_pz` suffix.
 
     Args:
         ds_source: The source dataset (e.g. historic data)
@@ -567,12 +568,19 @@ def normalize_domain(
         idx_da = xr.apply_ufunc(np.vectorize(lambda d: registry[str(d)]), ds.coords["ds_source"])
         return np.asarray(idx_da.broadcast_like(_reference(ds)).values).ravel().astype(int)
 
-    if method == "z_score":
-        z_score_vars = (*NORM_INPUT_VARS, "Wtot_MJ")
-        means, stds = fit_z_score_stats(_feature_matrix_for(ds_source, z_score_vars), _source_idx_for(ds_source), len(registry))
+    if method == "zscore":
+        zscore_vars = (*NORM_INPUT_VARS, "Wtot_MJ")
+        means, stds = fit_z_score_stats(_feature_matrix_for(ds_source, zscore_vars), _source_idx_for(ds_source), len(registry))
         for ds in datasets:
-            matrix = apply_z_score(jnp.asarray(_feature_matrix_for(ds, z_score_vars)), _source_idx_for(ds), means, stds)
-            _write_features(ds, np.asarray(matrix), z_score_vars, "_z")
+            matrix = apply_z_score(jnp.asarray(_feature_matrix_for(ds, zscore_vars)), _source_idx_for(ds), means, stds)
+            _write_features(ds, np.asarray(matrix), zscore_vars, "_z")
+        return ds_source, ds_target
+
+    if method == "physics-zscore":
+        means, stds = fit_z_score_stats(_physics_matrix(ds_source), _source_idx_for(ds_source), len(registry))
+        for ds in datasets:
+            matrix = apply_z_score(jnp.asarray(_physics_matrix(ds)), _source_idx_for(ds), means, stds)
+            _write_features(ds, np.asarray(matrix), PHYSICS_FEATURE_NAMES, "_pz")
         return ds_source, ds_target
 
     def _coral_normalization(variables: tuple[str, ...], suffix: str, matrix_fn) -> None:

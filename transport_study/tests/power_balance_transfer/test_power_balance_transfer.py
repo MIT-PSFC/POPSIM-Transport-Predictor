@@ -141,7 +141,7 @@ def test_power_balance_transfer_cases():
             expected_prereqs = _submodule_prereqs(case)
         elif case.domain_adaptation == "transfer":
             expected_prereqs = [_hyperparam_case(case.model_type)]
-            if case.data_normalization in ("z_score", "coral", "physics-coral"):
+            if case.data_normalization in ("zscore", "coral", "physics-coral", "physics-zscore"):
                 # Stat-based normalizations pretrain through a dedicated twin
                 # case that fits the normalizer on historic + this case's
                 # target shots (same num_target_shots)

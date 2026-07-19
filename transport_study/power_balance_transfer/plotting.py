@@ -63,17 +63,19 @@ MODEL_LABELS = {
 NORM_COLORS = {
     "raw": "#ff4d4d",
     "physics": "#8dff36",
-    "z_score": "#0095ff",
+    "zscore": "#0095ff",
     "coral": "#ff60ec",
     "physics-coral": "#ffb52e",
+    "physics-zscore": "#40e0d0",
 }
 
 NORM_LABELS = {
     "raw": "Raw",
     "physics": "Physics",
-    "z_score": "Z-score",
+    "zscore": "Z-score",
     "coral": "CORAL",
     "physics-coral": "Physics CORAL",
+    "physics-zscore": "Physics z-score",
 }
 
 DA_COLORS = {

@@ -309,7 +309,7 @@ class Study:
         def transfer_pretrain_case(self) -> Study.Case:
             """The pretrain prereq case this transfer case fine-tunes from.
 
-            Stat-based normalizations (z_score, coral, physics-coral) must fit their per-device
+            Stat-based normalizations (zscore, coral, physics-coral, physics-zscore) must fit their per-device
             statistics on the combined historic + target data of THIS case
             (a shared source-only pretrain would leave the target device's stats at identity),
             so their pretrain is a dedicated transfer_pretrain twin keeping this case's num_target_shots.
