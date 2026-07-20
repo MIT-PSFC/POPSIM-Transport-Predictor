@@ -158,7 +158,7 @@ class PowerBalanceStudy(Study):
         - weighted: Add a small amount of highly-weighted target data during training
         - addition: Add target shots to the training set as normal samples, no weighting
         - transfer: Train on source data, freeze all but the last layers of the model, and fine-tune on a small amount of target data
-        - transfer_pretrain: The pretrain half of a stat-normalized transfer case, never a case-grid axis value (see Study.Case.transfer_pretrain_case). Trains on historic data only, with the normalizer fitted on historic + the transfer case's target shots so the fine-tune case inherits target-aware statistics through the checkpoint restore
+        - transfer_pretrain: The pretrain half of a transfer case, never a case-grid axis value (see Study.Case.transfer_pretrain_case). Trains on historic data only with checkpoint selection on the target test set. Stat normalizations fit the normalizer on historic + the transfer case's target shots so the fine-tune case inherits target-aware statistics through the checkpoint restore, stateless ones (raw / physics) share one twin at 0 target shots
 
         freeze_submodules: Whether to freeze the p_oh/p_rad submodules of the model during training.
         The P_oh and P_rad signals are hard to quantify, we might want to let them drift from the original targets to better match Wtot_MJ

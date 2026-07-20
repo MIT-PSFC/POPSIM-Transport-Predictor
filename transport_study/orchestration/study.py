@@ -271,7 +271,7 @@ class Study:
         training_data: TrainingData
         # None, weighted, addition, transfer, or transfer_pretrain
         # (transfer_pretrain is never a case-grid axis value, it arises only as the
-        # pretrain prereq of a stat-normalized transfer case, see transfer_pretrain_case)
+        # pretrain prereq of a transfer case, see transfer_pretrain_case)
         domain_adaptation: str | None
         num_target_shots: int  # Target shots included in training, or -1 for all (HYPERPARAM_TARGET_SHOTS when domain_adaptation is None)
         # Cases this one depends on, run first (None when independent)
@@ -330,16 +330,21 @@ class Study:
         def transfer_pretrain_case(self) -> Study.Case:
             """The pretrain prereq case this transfer case fine-tunes from.
 
+            Every transfer case pretrains through a dedicated transfer_pretrain
+            twin: it trains on historic data only, with checkpoint selection on
+            the target test set like every other domain-adaptation case.
+
             Stat-based normalizations (zscore, coral, physics-coral, physics-zscore) must fit their per-device
             statistics on the combined historic + target data of THIS case
             (a shared source-only pretrain would leave the target device's stats at identity),
-            so their pretrain is a dedicated transfer_pretrain twin keeping this case's num_target_shots.
-            It trains on historic data only but fits the normalizer on historic + target shots.
-            The stateless normalizations (raw, physics) share the plain baseline case.
+            so their twin keeps this case's num_target_shots and fits the
+            normalizer on historic + target shots. The stateless
+            normalizations (raw, physics) have nothing to fit, so all their
+            transfer cases share one twin at HYPERPARAM_TARGET_SHOTS.
             """
             if self._normalization_method() in STAT_NORMALIZATIONS:
                 return self._replace(domain_adaptation="transfer_pretrain")
-            return self._replace(domain_adaptation=None, num_target_shots=HYPERPARAM_TARGET_SHOTS)
+            return self._replace(domain_adaptation="transfer_pretrain", num_target_shots=HYPERPARAM_TARGET_SHOTS)
 
         def _replace(self, **changes) -> Study.Case:
             """Rebuild through the real constructor with some fields changed, so validation and prereqs stay consistent."""
@@ -365,7 +370,17 @@ class Study:
         def is_impossible(self) -> bool:
             """Some cases don't make sense to run. Mark those cases as impossible and raise an error if we try to run them."""
             # Can't do transfer learning or training from nothing with 0 target shots.
-            if (self.domain_adaptation in ("transfer", "transfer_pretrain") or self.training_data.exnihilo) and self.num_target_shots == 0:
+            if (self.domain_adaptation == "transfer" or self.training_data.exnihilo) and self.num_target_shots == 0:
+                return True
+
+            # A stat-normalized pretrain twin exists to fit target-aware statistics,
+            # so with 0 target shots it is meaningless. Stateless-normalization twins
+            # fit nothing and canonically run at HYPERPARAM_TARGET_SHOTS (see transfer_pretrain_case)
+            if (
+                self.domain_adaptation == "transfer_pretrain"
+                and self.num_target_shots == 0
+                and self._normalization_method() in STAT_NORMALIZATIONS
+            ):
                 return True
 
             # exnihilo means training from nothing - no source domain to adapt from
