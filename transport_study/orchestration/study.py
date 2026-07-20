@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import math
 import os
 import shutil
@@ -72,8 +73,13 @@ ORCHESTRATION_POLL_INTERVAL_S = 20
 # Result files can lag job exit by ~1 min on NFS, so wait this long after a case leaves the queue before relaunching it
 RELAUNCH_GRACE_S = 180
 
-# Tuned learning rates were swept for from-scratch training and are too hot for fine-tuning, scale the schedule down
-TRANSFER_LR_FACTOR = 0.1
+# Tuned learning rates were swept for from-scratch training. Fine-tuning scales
+# the schedule by a step budget instead of a fixed factor: keep lr x total_steps
+# at roughly lr0 x max_epochs, so a step-starved finetune (batch_size larger
+# than the finetune dataset, 1 optimizer step per epoch) runs at the full tuned
+# LR while a step-rich one cools toward this floor (the previous fixed transfer
+# factor, so no case ever finetunes colder than the old behavior). See _scale_transfer_lr
+TRANSFER_LR_FLOOR = 0.1
 
 # A training job is considered stuck once it has run at least this long with no progress (e.g. OpenBLAS or XLA compile-pool deadlocks)
 WATCHDOG_MIN_AGE_S = 80 * 60
@@ -615,19 +621,61 @@ class Study:
             }
         )
 
-    @staticmethod
-    def _scale_transfer_lr(train_config: TrainConfig) -> TrainConfig:
-        """Cool the learning-rate schedule for fine-tuning from a pretrained checkpoint.
+    def _transfer_steps_per_epoch(self, train_config: TrainConfig) -> int:
+        """Optimizer steps per epoch of the finetune train dataloader, measured from the data.
+
+        Builds the train dataloader exactly as popsim launch will (same TRB
+        resolution including the data_train_run_builder override), so the
+        count reflects segmentation, NaN culling, and drop_last rather than
+        an estimate from shot counts. Cached per dataloader config because
+        building the dataloaders loads the datasets (relaunches and freeze
+        twins share a config, so they share a cache entry).
+        """
+        dataloader_config = train_config.dataloader_config
+        builder = dataloader_config.get("data_train_run_builder") or train_config.train_run_builder
+        cache_key = json.dumps([str(builder), dataloader_config], sort_keys=True, default=str)
+        if cache_key not in self._transfer_steps_cache:
+            train_run_builder = _get_train_run_builder_class(builder)
+            _, train_dl, _, _ = train_run_builder.get_dataloaders(dataloader_config)
+            self._transfer_steps_cache[cache_key] = max(1, len(train_dl))
+        return self._transfer_steps_cache[cache_key]
+
+    def _scale_transfer_lr(self, train_config: TrainConfig) -> TrainConfig:
+        """Step-budget the learning-rate schedule for fine-tuning from a pretrained checkpoint.
+
+        Tuned learning rates were swept for from-scratch training. A fixed
+        cooling factor starves a step-poor finetune: with batch_size larger
+        than the finetune dataset there is 1 optimizer step per epoch and
+        max_epochs steps total, so a 0.1 factor leaves the pretrained model
+        essentially unmoved. Budget rule: keep lr x total_steps at roughly
+        lr0 x max_epochs, i.e. scale = max_epochs / total_steps with
+        total_steps measured from the actual train dataloader, clipped to
+        [TRANSFER_LR_FLOOR, 1.0].
+
+        The schedule is also flattened (lrf = lr0, which optax
+        exponential_decay clamps to a constant) so the whole step budget is
+        spent at working LR - best-checkpoint selection and early stopping
+        already guard against overshoot. Yes I know this is cheating since
+        in a live case you woudln't know when to stop, but it's a fair
+        comparison to the other cases which also use early stopping.
 
         Applied after the tuned-config merge so the swept optimizer_config
-        cannot overwrite it (see TRANSFER_LR_FACTOR).
+        cannot overwrite it.
         """
+        steps_per_epoch = self._transfer_steps_per_epoch(train_config)
+        total_steps = steps_per_epoch * train_config.max_epochs
+        scale = min(1.0, max(TRANSFER_LR_FLOOR, train_config.max_epochs / total_steps))
+        logger.info(
+            f"Transfer LR scale {scale:.3g} from step budget "
+            f"({steps_per_epoch} steps/epoch x {train_config.max_epochs} epochs = {total_steps} steps)"
+        )
+        lr0_finetune = train_config.optimizer_config["lr0"] * scale
         return train_config.model_copy(
             update={
                 "optimizer_config": {
                     **train_config.optimizer_config,
-                    "lr0": train_config.optimizer_config["lr0"] * TRANSFER_LR_FACTOR,
-                    "lrf": train_config.optimizer_config["lrf"] * TRANSFER_LR_FACTOR,
+                    "lr0": lr0_finetune,
+                    "lrf": lr0_finetune,
                 }
             }
         )
@@ -677,9 +725,10 @@ class Study:
 
         train_config = self._apply_tuned_config(case, train_config_base)
 
-        # Fine-tuning from a pretrained checkpoint needs a cooler learning rate
-        # than training from scratch (see TRANSFER_LR_FACTOR). Applied after the
-        # tuned-config merge so the swept optimizer_config cannot overwrite it
+        # Fine-tuning from a pretrained checkpoint gets a step-budgeted flat
+        # learning rate instead of the swept schedule (see _scale_transfer_lr).
+        # Applied after the tuned-config merge so the swept optimizer_config
+        # cannot overwrite it
         if case.domain_adaptation == "transfer":
             train_config = self._scale_transfer_lr(train_config)
 
@@ -1374,6 +1423,9 @@ class Study:
         # Latest-checkpoint epoch per case as of its last launch. A relaunch whose
         # checkpoint advanced past this is a resume making progress, not a failure
         self.train_attempt_epochs: dict[str, int | None] = {}
+        # Measured steps-per-epoch per transfer dataloader config, so repeated
+        # make_train_config calls do not rebuild dataloaders (see _transfer_steps_per_epoch)
+        self._transfer_steps_cache: dict[str, int] = {}
 
         self.working_dir = Path(config.working_dir_base) / self.name
         self.model_dir = self.working_dir / "models"
