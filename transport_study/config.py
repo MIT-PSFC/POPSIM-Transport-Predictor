@@ -47,6 +47,14 @@ def _env_gpu_types() -> tuple[str, ...]:
     return tuple(t.strip().lower() for t in raw.split(",") if t.strip())
 
 
+def _env_exclude_nodes() -> tuple[str, ...]:
+    """Parse PTPS_EXCLUDE_NODES, a comma-separated list of SLURM node names
+    GPU jobs must avoid, e.g. a node with a GPU that faults on startup
+    """
+    raw = os.environ.get("PTPS_EXCLUDE_NODES", "")
+    return tuple(n.strip() for n in raw.split(",") if n.strip())
+
+
 # Main config for environment variables
 class StudyConfig(BaseModel):
     # Shared between all studies
@@ -90,6 +98,12 @@ class StudyConfig(BaseModel):
     # The default keeps float64 TORAX training off cards with slow fp64
     # pipelines (l40s, a40, l4, rtx_pro_6000). Empty disables the exclusion
     gpu_types: tuple[str, ...] = Field(default_factory=_env_gpu_types)
+    # SLURM node names GPU jobs must never land on, e.g. a node with a GPU
+    # that faults every job at startup. Unlike the gpu_types exclusion this
+    # applies to every gres request, typed fallbacks included. Note sbatch has
+    # no SBATCH_EXCLUDE environment variable, so an in-script #SBATCH
+    # --exclude line is the only way to pass this through. Empty disables it
+    exclude_nodes: tuple[str, ...] = Field(default_factory=_env_exclude_nodes)
     # Overflow partitions for GPU jobs once `partition` has no idle GPUs beyond
     # buffer_gpus, tried in order. Jobs submitted there can be preempted
     # (requeued) at any time, so training relies on resume-from-checkpoint.

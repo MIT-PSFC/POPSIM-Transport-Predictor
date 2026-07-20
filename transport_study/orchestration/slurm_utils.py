@@ -504,12 +504,22 @@ def gpu_type_exclude_nodes(partition: str, allowed_gpu_types: tuple[str, ...]) -
     return ",".join(sorted(nodes))
 
 
-def _gpu_exclude_directive(partition: str) -> str:
-    """The #SBATCH --exclude line keeping the job on config.gpu_types cards, or ""."""
-    if not config.gpu_types:
+def _gpu_exclude_directive(partition: str, typed: bool = False) -> str:
+    """The #SBATCH --exclude line for a GPU job, or "".
+
+    Combines the config.gpu_types card allowlist (untyped requests only, a
+    typed request pins the card type by itself) with config.exclude_nodes,
+    which applies to every request: a known-bad node must stay excluded even
+    after the gres fallback switches to a typed request.
+    """
+    nodes: set[str] = set(config.exclude_nodes)
+    if not typed and config.gpu_types:
+        type_nodes = gpu_type_exclude_nodes(partition, tuple(config.gpu_types))
+        if type_nodes:
+            nodes.update(type_nodes.split(","))
+    if not nodes:
         return ""
-    exclude_nodes = gpu_type_exclude_nodes(partition, tuple(config.gpu_types))
-    return f"\n#SBATCH --exclude={exclude_nodes}" if exclude_nodes else ""
+    return f"\n#SBATCH --exclude={','.join(sorted(nodes))}"
 
 
 GRES_UNAVAILABLE_ERROR = "Requested node configuration is not available"
@@ -546,14 +556,15 @@ def _gres_fragments(partition: str) -> list[str]:
     with "Requested node configuration is not available" while typed requests
     for the same cards still work, so each allowed type present in the
     partition follows as a typed fallback, most plentiful first. A typed
-    request pins the card type by itself, no exclude list needed.
+    request pins the card type by itself, so its exclude list only carries
+    config.exclude_nodes.
     """
     fragments = [f"gpu:1{_gpu_exclude_directive(partition)}"]
     if config.gpu_types:
         allowed = {t.lower() for t in config.gpu_types}
         for gpu_type, _ in partition_gpu_type_counts(partition):
             if gpu_type in allowed:
-                fragments.append(f"gpu:{gpu_type}:1")
+                fragments.append(f"gpu:{gpu_type}:1{_gpu_exclude_directive(partition, typed=True)}")
     return fragments
 
 
