@@ -344,32 +344,52 @@ def count_user_jobs() -> int:
     return len(result.stdout.strip().split("\n")) if result.stdout.strip() else 0
 
 
-@functools.cache
+_partition_info_cache: dict[str, dict[str, str]] = {}
+
+
 def _partition_info(partition: str) -> dict[str, str]:
     """key=value fields from scontrol show partition. Partition limits are
-    static for the lifetime of a study run, so results are cached."""
+    static for the lifetime of a study run, so successful lookups are cached.
+    Failures are NOT cached: a transient scontrol failure cached here would
+    silently disable QOS-capped spillover for the process lifetime."""
+    if partition in _partition_info_cache:
+        return _partition_info_cache[partition]
     result = subprocess.run(
         ["scontrol", "show", "partition", partition],
         check=False,
         capture_output=True,
         text=True,
     )
-    if result.returncode != 0:
+    if result.returncode != 0 or not result.stdout.strip():
         logger.warning(f"scontrol show partition {partition} failed: {result.stderr}")
         return {}
-    return dict(token.split("=", 1) for token in result.stdout.split() if "=" in token)
+    info = dict(token.split("=", 1) for token in result.stdout.split() if "=" in token)
+    _partition_info_cache[partition] = info
+    return info
 
 
-@functools.cache
+_partition_user_gpu_cap_cache: dict[str, int | None] = {}
+
+
 def partition_user_gpu_cap(partition: str) -> int | None:
     """Per-user GPU cap on a partition (its QOS MaxTRESPU gres/gpu), None if uncapped.
 
     E.g. mit_preemptable's QOS allows 4 running GPUs per user, mit_normal_gpu's
     allows 2. Submitting more jobs than this just parks them pending on the QOS
     limit, so the spillover logic treats it as that partition's submission cap.
+    Only resolved lookups are cached. On a transient scontrol/sacctmgr failure
+    this returns None UNcached: None means "uncapped", which routes
+    spillover_slots to the idle-minus-pending estimate (~0 on busy public
+    partitions), so a cached failure would silently disable spillover.
     """
-    qos = _partition_info(partition).get("QoS")
+    if partition in _partition_user_gpu_cap_cache:
+        return _partition_user_gpu_cap_cache[partition]
+    info = _partition_info(partition)
+    if not info:
+        return None
+    qos = info.get("QoS")
     if qos in (None, "N/A"):
+        _partition_user_gpu_cap_cache[partition] = None
         return None
     result = subprocess.run(
         ["sacctmgr", "-nP", "show", "qos", qos, "format=MaxTRESPU"],
@@ -380,8 +400,13 @@ def partition_user_gpu_cap(partition: str) -> int | None:
     if result.returncode != 0:
         logger.warning(f"sacctmgr show qos {qos} failed: {result.stderr}")
         return None
+    if not result.stdout.strip():
+        logger.warning(f"sacctmgr show qos {qos} returned no output, not caching")
+        return None
     match = re.search(r"gres/gpu=(\d+)", result.stdout)
-    return int(match.group(1)) if match else None
+    cap = int(match.group(1)) if match else None
+    _partition_user_gpu_cap_cache[partition] = cap
+    return cap
 
 
 def parse_slurm_time_s(time_str: str | None) -> int | None:
