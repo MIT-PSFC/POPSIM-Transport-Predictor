@@ -611,13 +611,16 @@ class TransportPredictorToraxBase(TransportPredictor):
             }
         elif self.transport_model == "gyrobohm":
             # Bounds: bohm and gyrobohm multipliers exp(-3) to exp(3),
-            # D_face_c1 and D_face_c2 0.1 to 5, V_face_coeff -1 to 1
+            # D_face_c1 and D_face_c2 0.1 to 5, V_face_coeff -4 to 1 with the
+            # sigmoid bias putting a random init at the TORAX default -0.1
+            # (widened from -1 to 1 after the 2026-07 knob-fit ceiling probe,
+            # see ProfilePredictorTorax)
             return {
                 "chi_bohm_multiplier": jnp.exp(3.0 * jnp.tanh(nn_transport_out[0:1])),
                 "chi_gyrobohm_multiplier": jnp.exp(3.0 * jnp.tanh(nn_transport_out[1:2])),
                 "D_face_c1": 0.1 + 4.9 * jax.nn.sigmoid(nn_transport_out[2:3]),
                 "D_face_c2": 0.1 + 4.9 * jax.nn.sigmoid(nn_transport_out[3:4]),
-                "V_face_coeff": jnp.tanh(nn_transport_out[4:5]),
+                "V_face_coeff": 1.0 - 5.0 * jax.nn.sigmoid(nn_transport_out[4:5] - 1.25),
             }
         else:  # qlknn
             #   ITG_flux_ratio_correction: ~0.08 - 12 around 1
@@ -636,14 +639,18 @@ class TransportPredictorToraxBase(TransportPredictor):
         # NOT here: it is the measured P_aux_MW input, wired directly to
         # generic_heat.P_total in _build_provider_and_geo.
         # Source network outputs, per SOURCE_SHAPE_COEFFICIENT_NAMES:
-        #   S_total: 0 - inf via softplus (x 1e21 in the provider)
+        #   S_total: 0 - inf, softplus multiple of the device fueling scale
+        #     particle_inventory / TAU_REF_S (x 1e21 in the provider), same
+        #     device-transferable reparameterization as ProfilePredictorTorax
         #   gaussian_location: 0 - 0.8 (deposition center in rho_norm)
         #   gaussian_width: 0.05 - 0.4 (deposition width in rho_norm)
         #   electron_heat_fraction: 0.2 - 0.8 (both channels keep NN gradient)
         nn_inputs = self.normalizer(inputs.transport_nn_inputs(Wtot_MJ), inputs.ds_source_idx)
         coeffs = self._transport_coefficients(self.nn_transport(nn_inputs))
         nn_sources_out = self.nn_sources(nn_inputs)
-        coeffs["S_total"] = jax.nn.softplus(nn_sources_out[0:1])
+        # Particle inventory in 1e21 electrons: ne20_line_avg * volume * 0.1
+        inventory = 0.1 * inputs.ne20_line_avg * inputs.volume_approx
+        coeffs["S_total"] = jax.nn.softplus(nn_sources_out[0:1]) * inventory / TAU_REF_S
         coeffs["gaussian_location"] = 0.8 * jax.nn.sigmoid(nn_sources_out[1:2])
         coeffs["gaussian_width"] = 0.05 + 0.35 * jax.nn.sigmoid(nn_sources_out[2:3])
         coeffs["electron_heat_fraction"] = 0.2 + 0.6 * jax.nn.sigmoid(nn_sources_out[3:4])
@@ -653,7 +660,9 @@ class TransportPredictorToraxBase(TransportPredictor):
         # comments there), with the temperature scale from the state-implied
         # stored energy instead of a measured betan
         nn_edge_out = self.nn_edge(nn_inputs)
-        coeffs["n_e_right_bc"] = (0.05 + 0.9 * jax.nn.sigmoid(nn_edge_out[0:1])) * inputs.ne20_line_avg  # [1e20 m^-3]
+        # Floor lowered 0.05 -> 0.01 with the profile predictor (ceiling probe
+        # railed the old floor on 88% of MAST samples)
+        coeffs["n_e_right_bc"] = (0.01 + 0.94 * jax.nn.sigmoid(nn_edge_out[0:1])) * inputs.ne20_line_avg  # [1e20 m^-3]
         te_scale = jnp.clip(inputs.te_approx_from_wtot(Wtot_MJ), 0.05, 5.0)
         coeffs["T_e_right_bc"] = 0.02 + jax.nn.sigmoid(nn_edge_out[1:2] - 5.0) * te_scale  # [keV]
         return coeffs

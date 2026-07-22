@@ -41,8 +41,9 @@ SOURCE_COEFFICIENT_NAMES = (
     "electron_heat_fraction",
 )
 
-# Reference confinement time [s] anchoring the NN aux-heating scale:
+# Reference confinement time [s] anchoring the NN aux-heating and fueling scales:
 # P_aux_total is a bounded fraction of w_approx / TAU_REF
+# S_total a softplus multiple of particle_inventory / TAU_REF
 TAU_REF_S = 0.05
 
 # TORAX transport.model_name expected in the torax_config for each transport model
@@ -103,8 +104,7 @@ def build_circular_geometry_jax(
     g2 = g1 / R_major**2
     g2_face = g1_face / R_major**2
     # Clamp 1 - (rho/R)^2 away from zero, the large-aspect-ratio formulas
-    # below blow up as local epsilon -> 1 (MAST edge epsilon reaches 0.78
-    # nominally, noisy per-sample a_minor/R0 can push it further)
+    # below blow up as local epsilon -> 1 (MAST edge epsilon reaches 0.78 nominally, noisy per-sample a_minor/R0 can push it further)
     g3 = 1.0 / (R_major**2 * jnp.clip(1.0 - (rho / R_major) ** 2, 0.05, None) ** 1.5)
     g3_face = 1.0 / (R_major**2 * jnp.clip(1.0 - (rho_face / R_major) ** 2, 0.05, None) ** 1.5)
 
@@ -651,13 +651,14 @@ class ProfilePredictorTorax(TimeIndepModule):
             #     exp(-3) - exp(3), ~0.05 - 20, log-uniform around 1
             #   D_face_c1: 0.1 - 5  (diffusivity weighting at the axis, TORAX default 1.0)
             #   D_face_c2: 0.1 - 5  (diffusivity weighting at the edge, TORAX default 0.3)
-            #   V_face_coeff: -1 - 1 (convectivity / diffusivity ratio, TORAX default -0.1)
+            #   V_face_coeff: -4 - 1 (convectivity / diffusivity ratio, TORAX
+            #     default -0.1). The sigmoid bias puts a random init at the TORAX default
             return {
                 "chi_bohm_multiplier": jnp.exp(3.0 * jnp.tanh(nn_transport_out[0:1])),
                 "chi_gyrobohm_multiplier": jnp.exp(3.0 * jnp.tanh(nn_transport_out[1:2])),
                 "D_face_c1": 0.1 + 4.9 * jax.nn.sigmoid(nn_transport_out[2:3]),
                 "D_face_c2": 0.1 + 4.9 * jax.nn.sigmoid(nn_transport_out[3:4]),
-                "V_face_coeff": jnp.tanh(nn_transport_out[4:5]),
+                "V_face_coeff": 1.0 - 5.0 * jax.nn.sigmoid(nn_transport_out[4:5] - 1.25),
             }
         else:  # qlknn
             # Free parameters of the QLKNN surrogate. TORAX computes ITG/TEM/ETG
@@ -684,7 +685,11 @@ class ProfilePredictorTorax(TimeIndepModule):
         # sources from neural networks, bounded to physical ranges so the
         # TORAX solver stays stable during training.
         # Source network outputs are ordered per SOURCE_COEFFICIENT_NAMES:
-        #   S_total: 0 - inf via softplus (x 1e21 below)
+        #   S_total: 0 - inf, softplus multiple of the device fueling scale
+        #     particle_inventory / TAU_REF_S (x 1e21 below). S_total was the
+        #     only knob in absolute units (P_aux scales with w_approx, edge
+        #     BCs with ne20_line_avg / te_approx), so a fueling magnitude
+        #     learned on the source device could not transfer across machine sizes.
         #   P_aux_total: 0 - 4x the w_approx / TAU_REF_S power scale [MW].
         #     The heating magnitude is NN-inferred (betan encodes the stored
         #     energy the heating sustains) rather than a measured input, so
@@ -697,17 +702,18 @@ class ProfilePredictorTorax(TimeIndepModule):
         nn_inputs = self.normalizer(inputs.nn_inputs, inputs.ds_source_idx)
         coeffs = self._transport_coefficients(self.nn_transport(nn_inputs))
         nn_sources_out = self.nn_sources(nn_inputs)
-        S_total = jax.nn.softplus(nn_sources_out[0:1])
+        # Particle inventory in 1e21 electrons: ne20_line_avg * volume * 0.1
+        inventory = 0.1 * inputs.ne20_line_avg * inputs.volume_approx
+        S_total = jax.nn.softplus(nn_sources_out[0:1]) * inventory / TAU_REF_S
         p_aux_total = 4.0 * jax.nn.sigmoid(nn_sources_out[1:2] - 2.0) * inputs.w_approx / TAU_REF_S
         gaussian_location = 0.8 * jax.nn.sigmoid(nn_sources_out[2:3])
         gaussian_width = 0.05 + 0.35 * jax.nn.sigmoid(nn_sources_out[3:4])
         electron_heat_fraction = 0.2 + 0.6 * jax.nn.sigmoid(nn_sources_out[4:5])
 
         # Edge boundary conditions as NN-predicted fractions:
-        #   n_e_right_bc = fraction in (0.05, 0.95) * line-averaged density
+        #   n_e_right_bc = fraction in (0.01, 0.95) * line-averaged density
         #   T_e_right_bc = 20 eV + fraction * clipped te_approx (beta-derived
-        #                  temperature guess, same scaling trick as the
-        #                  shape-init predictors)
+        #                  temperature guess, same scaling trick as the shape-init predictors)
         # A fixed edge density BC above the target profile acts as an infinite
         # particle source, so the BC must scale with the requested density.
         # Both BCs are floored: a near-vacuum edge ill-conditions the density
@@ -722,7 +728,7 @@ class ProfilePredictorTorax(TimeIndepModule):
         # itself, which keeps the critical gradient model subcritical
         # (chi = chi_min) and kills the gradient to the transport network.
         nn_edge_out = self.nn_edge(nn_inputs)
-        ne_right_bc = (0.05 + 0.9 * jax.nn.sigmoid(nn_edge_out[0:1])) * inputs.ne20_line_avg
+        ne_right_bc = (0.01 + 0.94 * jax.nn.sigmoid(nn_edge_out[0:1])) * inputs.ne20_line_avg
         te_scale = jnp.clip(inputs.te_approx, 0.05, 5.0)
         te_right_bc = 0.02 + jax.nn.sigmoid(nn_edge_out[1:2] - 5.0) * te_scale
 
