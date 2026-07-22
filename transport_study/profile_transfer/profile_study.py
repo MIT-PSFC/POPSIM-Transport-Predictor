@@ -37,6 +37,7 @@ from transport_study.profile_transfer.plotting import (
     data_normalization_comparison,
     domain_adaptation_comparison,
     freeze_shapes_comparison,
+    geometry_builder_comparison,
     model_comparison,
     training_dataset_comparison,
 )
@@ -553,6 +554,7 @@ class ProfileStudy(Study):
         data_normalization_comparison(metrics_ds, self.figure_dir)
 
         logger.opt(colors=True).info("<bold><magenta>TORAX-SPECIFIC ANALYSIS</magenta></bold>")
+        geometry_builder_comparison(metrics_ds, self.figure_dir)
         torax_relaxation_report(self, metrics_ds, self.figure_dir)
 
         # One markdown table per case axis and combination of the other axes
