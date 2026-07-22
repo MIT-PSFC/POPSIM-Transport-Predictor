@@ -37,6 +37,7 @@ from transport_study.orchestration.slurm_utils import (
     cancel_job,
     count_idle_gpus,
     count_running_jobs,
+    get_pending_job_pending_s,
     get_running_job_elapsed_s,
     get_running_job_names,
     launch_agent_parallel,
@@ -89,6 +90,11 @@ WATCHDOG_STALL_S = 60 * 60
 
 # wandb heartbeats every ~30s during a live run, so 10 min of silence on a "running" run is already well past any legitimate gap
 AGENT_HEARTBEAT_STALL_S = 10 * 60
+
+# A job parked PENDING on a busy spillover partition can sit in the queue indefinitely. After
+# this long, cancel it so the orchestration loop re-queues it (pick_partition then re-decides
+# placement). Jobs pending on the primary partition are exempt and keep their queue position
+WATCHDOG_PENDING_S = 30 * 60
 
 
 def configure_jax_platforms(enable_parallelism: bool) -> None:
@@ -901,6 +907,48 @@ class Study:
             )
             cancel_job(job_name)
 
+    def _kill_long_pending_jobs(self, cases: list[Case]):
+        """Cancel jobs stuck PENDING on a spillover partition longer than WATCHDOG_PENDING_S.
+
+        A job submitted when a spillover partition looked free can pend
+        indefinitely once other users grab the capacity. Cancelling it hands
+        the case back to the normal launch path, where pick_partition
+        re-decides placement. The primary partition is deliberately exempt:
+        jobs there keep their queue position (and accrued age priority)
+        instead of cycling to the back every 30 min. A cancelled pending job
+        never started training, so its launch attempt is refunded, otherwise a
+        busy partition alone could burn MAX_TRAIN_ATTEMPTS and abort the study
+        without a single actual training failure. Agent jobs need no refund,
+        launch_sweep tops agents back up to the remaining trial count on its own.
+        """
+        spillover = ",".join(p for p in config.spillover_partitions if p and p != config.partition)
+        if not spillover:
+            return
+        pending = get_pending_job_pending_s(partition=spillover)
+        if not pending:
+            return
+        for case in cases:
+            job_names = [self.train_job_name(case)]
+            if case.is_hyperparam_case():
+                job_names.append(self.agent_job_name(case))
+            for job_name in job_names:
+                pending_s = pending.get(job_name)
+                if pending_s is None or pending_s < WATCHDOG_PENDING_S:
+                    continue
+                logger.warning(
+                    f"Job {job_name} has been pending {pending_s}s on a spillover partition, "
+                    f"cancelling so the orchestration loop can re-queue it.\nCase:\t{case}"
+                )
+                # Scoped to the spillover partitions so a same-named job
+                # pending on the primary partition can never be caught
+                cancel_job(job_name, partition=spillover, state="PENDING")
+                # scancel --state=PENDING is a no-op if the job started since
+                # the squeue snapshot, so at worst this refund is one attempt
+                # too generous and the case gets one extra retry
+                if job_name == self.train_job_name(case):
+                    attempts = self.train_attempts.get(str(case), 0)
+                    self.train_attempts[str(case)] = max(attempts - 1, 0)
+
     def run_unfinished_cases(self, skip_tuning: bool, enable_parallelism: bool):
         """Loop until every runnable case has a result file.
 
@@ -929,6 +977,7 @@ class Study:
                     continue
                 self._kill_stuck_jobs(unfinished)
                 self._kill_stuck_agents(unfinished)
+                self._kill_long_pending_jobs(unfinished)
             else:
                 running_job_names = set()
 

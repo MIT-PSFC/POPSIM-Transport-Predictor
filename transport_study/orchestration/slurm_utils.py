@@ -208,11 +208,61 @@ def get_running_job_elapsed_s(partition: str | None = None) -> dict[str, int] | 
     return elapsed
 
 
-def cancel_job(job_name: str, partition: str | None = None) -> None:
-    """Cancel this user's running job(s) with the given name.
+def get_pending_job_pending_s(partition: str | None = None) -> dict[str, int] | None:
+    """Seconds spent in the PENDING state for this user's pending jobs, keyed by job name.
 
-    Used by the stuck-job watchdog to kill a deadlocked training job so the
-    orchestration loop's normal relaunch path can resubmit it fresh.
+    Uses the squeue -O PendingTime field (no %-format code exists for it),
+    which reports seconds pending directly instead of requiring submit-time
+    parsing. Returns None when squeue fails, so callers can tell "no pending
+    jobs" apart from "scheduler unreachable" (mirrors get_running_job_names).
+    Duplicate job names (e.g. multiple agent jobs) keep the largest value.
+    Defaults to the primary plus spillover partitions.
+    """
+    if partition is None:
+        partition = query_partitions()
+    result = subprocess.run(
+        [
+            "squeue",
+            "-p",
+            partition,
+            "-u",
+            getpass.getuser(),
+            "--state=PENDING",
+            "--noheader",
+            # Wide Name field because case names run long and -O truncates at
+            # the given width. PendingTime first so the name is the tail token.
+            "-O",
+            "PendingTime:20,Name:512",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        logger.critical(f"squeue failed: {result.stderr}")
+        return None
+    pending: dict[str, int] = {}
+    for line in result.stdout.splitlines():
+        if not line.strip():
+            continue
+        # PendingTime has no internal whitespace, so the token before the
+        # first space is the pending seconds and the rest is the job name
+        time_str, _, name = line.strip().partition(" ")
+        name = name.strip()
+        if not name or not time_str.isdigit():
+            continue
+        pending[name] = max(int(time_str), pending.get(name, 0))
+    return pending
+
+
+def cancel_job(job_name: str, partition: str | None = None, state: str = "RUNNING") -> None:
+    """Cancel this user's job(s) with the given name in the given state.
+
+    Used by the stuck-job watchdogs: RUNNING for deadlocked training jobs,
+    PENDING for jobs parked too long on a busy partition. Either way the
+    orchestration loop's normal relaunch path can resubmit the case fresh.
+    Pinning the state keeps the cancel from racing a legitimate job in the
+    other state under the same name.
     """
     if partition is None:
         partition = query_partitions()
@@ -229,7 +279,7 @@ def cancel_job(job_name: str, partition: str | None = None) -> None:
                 getpass.getuser(),
                 "-n",
                 job_name,
-                "--state=RUNNING",
+                f"--state={state}",
             ],
             check=False,
             capture_output=True,
