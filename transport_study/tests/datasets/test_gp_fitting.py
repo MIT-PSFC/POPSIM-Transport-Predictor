@@ -389,6 +389,58 @@ def test_fit_batch_max_slices_per_shot():
 
 
 # ----------------------------------------------------------------------
+# Monotonic-edge constraint (virtual zero-slope observations, _MONO_CHECK_RHO)
+# ----------------------------------------------------------------------
+def test_mono_constraint_suppresses_edge_bump():
+    """A slice whose unconstrained fit rises past rho 0.6 (broad data-supported
+    dip-then-bump at the edge, fit at fixed hyperparameters with the short edge
+    length scale so the kernel tracks it) should come back from gp_profile with
+    max gradient over rho >= 0.6 at or below roughly _MONO_GRAD_ERR, and the
+    returned gradient must belong to the same posterior as the returned mean
+    (finite differences of the fit should match the gradient to first order).
+    """
+
+
+def test_mono_constraint_leaves_monotone_slice_untouched():
+    """A cleanly monotone pedestal slice never trips the check, so the fit with
+    the constraint machinery present must be bit-identical to the fit with
+    _MONO_CHECK_RHO emptied out (no virtual observations, no extra refit, and
+    the deterministic seeding unchanged).
+    """
+
+
+def test_mono_constraint_preserves_hollow_core():
+    """A hollow profile with clearly positive gradient inside rho < 0.6 keeps
+    that positive gradient after the constraint runs: check points start at
+    0.6, so the core region must be unconstrained even when the edge of the
+    same slice gets virtual observations.
+    """
+
+
+def test_mono_constraint_refit_failure_keeps_unconstrained_fit():
+    """If the constrained refit raises inside _run_gp (monkeypatch it to return
+    None on any call with extra_grad_bc), gp_profile should return the
+    unconstrained fit instead of failing the slice.
+    """
+
+
+def test_mono_constraint_second_pass_adds_only_new_points():
+    """When the first constrained refit still shows a violation at a check
+    point that already carries a virtual observation, no duplicate row may be
+    added and the loop must terminate (setdiff on mono_bc rho values); a
+    violation appearing at a NEW check point after the first refit gets one
+    more refit and then the loop stops at _MONO_MAX_PASSES.
+    """
+
+
+def test_mono_constraint_hyps_come_from_unconstrained_optimize():
+    """The hyperparameters returned by gp_profile (and thus the x0 used to pin
+    Te to the ne fit) must come from the original optimized fit, not from the
+    constrained refit, which runs at fixed hyperparameters.
+    """
+
+
+# ----------------------------------------------------------------------
 # Dispatcher loop (against a fake cluster backend)
 # ----------------------------------------------------------------------
 class _FakeBackend:

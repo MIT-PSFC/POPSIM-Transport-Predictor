@@ -68,6 +68,25 @@ _HYP_BOUNDS = np.array([[1.0e-2, 0.4, 0.2, 0.05, 0.95], [2.0e1, 0.9, 0.5, 0.2, 1
 # The axis gradient uses a small positive error (mkgp needs a positive diagonal entry to stay invertible)
 _VALUE_BC = np.array([[1.1, 0.0, 0.01], [1.2, 0.0, 0.01], [1.3, 0.0, 0.01], [1.4, 0.0, 0.01]])
 _GRAD_BC = np.array([[0.0, 0.0, 0.01], [1.1, 0.0, 0.1], [1.2, 0.0, 0.1], [1.3, 0.0, 0.1], [1.4, 0.0, 0.1]])
+# Monotonic-edge constraint (virtual zero-slope observations). Te and ne fall
+# monotonically toward the edge, but the GP can ring up into a small bump
+# around rho ~1.0, in the gap between the outermost channel and the value BCs
+# at 1.1+ where the short edge length scale wiggles freely (nonphysical_peak
+# only catches bumps that beat the whole interior by _EDGE_MARGIN, so a small
+# pedestal-top bump passes). After each fit, gp_profile checks the posterior
+# gradient on _MONO_CHECK_RHO. Wherever it exceeds _MONO_GRAD_TOL, a virtual
+# gradient observation (rho, 0.0, _MONO_GRAD_ERR) is added and the slice is
+# refit at the same hyperparameters, up to _MONO_MAX_PASSES times (a refit can
+# push the bump sideways into still-unconstrained neighbors, the next pass
+# catches it there). Observations are added only where the constraint is
+# violated, so real negative gradients (the pedestal) are never flattened and
+# the core (rho < 0.6, where hollow ne profiles are physical) is never
+# checked. A bump becomes a plateau, the constraint holds at the check points
+# only. Tolerance and error are in scale_per_slice-normalized units like every other constant here.
+_MONO_CHECK_RHO = np.concatenate([np.linspace(0.6, 0.85, 6), np.linspace(0.9, 1.09, 20)])
+_MONO_GRAD_TOL = 0.01
+_MONO_GRAD_ERR = 0.05
+_MONO_MAX_PASSES = 3
 # Error kernel (heteroscedastic noise model): a squared-exponential GP is fit to
 # the input error bars themselves (mkgp's HSGP path, make_HSGP_errors). This
 # does two things: the main fit sees smoothed error bars instead of raw ones,
@@ -353,7 +372,7 @@ def nonphysical_peak(y, x_star, data_x, data_y, data_err) -> float | None:
     return worst_rho
 
 
-def _run_gp(data_X, data_y, err_y, x_eval, hyperparams=None, optimize=True, pin_x0=None):
+def _run_gp(data_X, data_y, err_y, x_eval, hyperparams=None, optimize=True, pin_x0=None, extra_grad_bc=None):
     """Set up the GP with edge BCs and fit. Returns the GaussianProcess or None.
 
     With optimize=True and hyperparams=None the hyperparameters are tuned (8 random
@@ -363,6 +382,9 @@ def _run_gp(data_X, data_y, err_y, x_eval, hyperparams=None, optimize=True, pin_
     pin_x0 narrows the x0 (pedestal location) bounds to a tight window around the
     given value, so bound enforcement holds the pedestal there (used to tie the
     Te pedestal location to the ne fit).
+
+    extra_grad_bc appends (rho, value, error) rows to the standard _GRAD_BC set
+    (the monotonic-edge virtual observations, see _MONO_CHECK_RHO).
 
     The restarts are seeded from the fit's own input data (_deterministic_seed),
     so the result only depends on (data_X, data_y, err_y), never on multiprocessing
@@ -380,6 +402,7 @@ def _run_gp(data_X, data_y, err_y, x_eval, hyperparams=None, optimize=True, pin_
     xdata = np.concatenate([data_X, _VALUE_BC[:, 0]])
     ydata = np.concatenate([data_y, _VALUE_BC[:, 1]])
     yerr = np.concatenate([err_y, _VALUE_BC[:, 2]])
+    grad_bc = _GRAD_BC if extra_grad_bc is None else np.vstack([_GRAD_BC, extra_grad_bc])
 
     do_optimize = optimize and hyperparams is None
     n_attempts = (1 + _MAX_HYP_RETRIES) if do_optimize else 1
@@ -404,9 +427,9 @@ def _run_gp(data_X, data_y, err_y, x_eval, hyperparams=None, optimize=True, pin_
             xdata=xdata,
             ydata=ydata,
             yerr=yerr,
-            dxdata=_GRAD_BC[:, 0],
-            dydata=_GRAD_BC[:, 1],
-            dyerr=_GRAD_BC[:, 2],
+            dxdata=grad_bc[:, 0],
+            dydata=grad_bc[:, 1],
+            dyerr=grad_bc[:, 2],
         )
         gp.set_search_parameters(epsilon=1.0e-2)
         # Seed even on the predict-only path: the error-kernel fit inside
@@ -625,6 +648,10 @@ def gp_profile(
     the slice's own shape, and remaining outliers are judged against that fit
     rather than a generic un-tuned reference (see _remove_outliers) before the
     real optimize on the cleaned data.
+
+    After the fit, positive posterior gradients on the edge check grid are
+    suppressed by virtual zero-slope observations and a refit at fixed
+    hyperparameters (see _MONO_CHECK_RHO).
     """
     cleaned = _clean_inputs(data_X, data_y, err_y)
     if cleaned is None:
@@ -636,23 +663,58 @@ def gp_profile(
         rough_hyps = _rough_hyperparameters(data_X, data_y, err_y)
         data_X, data_y, err_y = _remove_outliers(data_X, data_y, err_y, ref_hyperparams=rough_hyps)
 
+    # Predict on X_star plus the edge check grid in one pass, so the
+    # monotonicity check below reads the posterior gradient without a second
+    # GPRFit. The check points are sliced off before returning.
+    x_out = np.asarray(X_star, dtype=float).ravel()
+    n_out = x_out.size
+    x_eval = np.concatenate([x_out, _MONO_CHECK_RHO])
     gp = _run_gp(
         data_X,
         data_y,
         err_y,
-        X_star,
+        x_eval,
         hyperparams=hyperparams,
         optimize=optimize_hyperparams,
         pin_x0=pin_x0,
     )
     if gp is None:
         return None, None, None, None, None
+    hyps_out = np.asarray(gp.get_gp_kernel_details()[1], dtype=float)
+
+    # Monotonic-edge repair (see the _MONO_CHECK_RHO block comment): pin the
+    # slope to zero wherever the fit rises on the check grid and refit at the
+    # fitted hyperparameters, so the pedestal-top bump flattens while
+    # everything the constraint does not touch stays put. A failed refit keeps
+    # the unconstrained fit rather than losing the slice.
+    mono_bc = np.empty((0, 3))
+    for _ in range(_MONO_MAX_PASSES):
+        drv_check = np.asarray(gp.get_gp_drv_mean(), dtype=float).ravel()[n_out:]
+        viol = np.isfinite(drv_check) & (drv_check > _MONO_GRAD_TOL)
+        new_rho = np.setdiff1d(_MONO_CHECK_RHO[viol], mono_bc[:, 0])
+        if new_rho.size == 0:
+            break
+        new_rows = np.column_stack([new_rho, np.zeros_like(new_rho), np.full_like(new_rho, _MONO_GRAD_ERR)])
+        mono_bc = np.vstack([mono_bc, new_rows])
+        gp_mono = _run_gp(
+            data_X,
+            data_y,
+            err_y,
+            x_eval,
+            hyperparams=hyps_out,
+            optimize=False,
+            pin_x0=pin_x0,
+            extra_grad_bc=mono_bc,
+        )
+        if gp_mono is None:
+            break
+        gp = gp_mono
 
     # Te/ne are physical (positive) quantities but the GP posterior is Gaussian
     # with unbounded support, so the mean can dip slightly negative past the
     # separatrix where the value BC pulls it to zero. Clip the mean at 0
     # downstream should read the band as truncated at 0 likewise.
-    y_star = np.maximum(gp.get_gp_mean(), 0.0)
+    y_star = np.maximum(np.asarray(gp.get_gp_mean(), dtype=float).ravel()[:n_out], 0.0)
     # Predictive std (includes observation noise), not the latent-function std.
     # With few, high-error core channels the latent band collapses to a
     # misleadingly tight interval - it conditions on the fitted amplitude being
@@ -662,11 +724,12 @@ def gp_profile(
     # bars instead of a constant RMS.
     # The derivative std stays latent (the gradient is never directly observed,
     # so folding in point noise there is not meaningful).
-    std_y_star = gp.get_gp_std(noise_flag=True)
-    hyps_out = np.asarray(gp.get_gp_kernel_details()[1], dtype=float)
+    std_y_star = np.asarray(gp.get_gp_std(noise_flag=True), dtype=float).ravel()[:n_out]
     if not calc_gradient:
         return y_star, std_y_star, None, None, hyps_out
-    return y_star, std_y_star, gp.get_gp_drv_mean(), gp.get_gp_drv_std(noise_flag=False), hyps_out
+    grad = np.asarray(gp.get_gp_drv_mean(), dtype=float).ravel()[:n_out]
+    grad_std = np.asarray(gp.get_gp_drv_std(noise_flag=False), dtype=float).ravel()[:n_out]
+    return y_star, std_y_star, grad, grad_std, hyps_out
 
 
 # ----------------------------------------------------------------------
