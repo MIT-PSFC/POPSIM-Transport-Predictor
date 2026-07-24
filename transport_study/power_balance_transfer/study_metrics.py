@@ -26,7 +26,7 @@ from transport_study import EPISODE_DIM
 from transport_study.config import config
 from transport_study.orchestration.organize_data import INPUT_POWER_SIGNALS
 from transport_study.orchestration.stages import STAGE_AGG_NAMES, segment_stages
-from transport_study.orchestration.study import Study
+from transport_study.orchestration.study import PAD_TIME_STEP_S, Study
 
 # Joined dataset timeslice must be within this of the result timeslice.
 # Timebases are 1 kHz, so anything beyond half a sample is a bad join
@@ -72,7 +72,8 @@ def load_stage_dataset(device: str) -> xr.Dataset:
 @dataclass
 class CaseTimesliceMetrics:
     """Long-form per-timeslice metrics for one case, one record per valid test
-    timeslice (finite time and relative error, joined to the device dataset)."""
+    timeslice (finite time and relative error, clock-advancing rather than a
+    padded repeat of the shot's final timeslice, joined to the device dataset)."""
 
     shot: np.ndarray
     ds_source: np.ndarray
@@ -120,6 +121,11 @@ def compute_case_timeslice_metrics(result_ds: xr.Dataset) -> CaseTimesliceMetric
         err_abs = shot_res["error_abs_ts"].values
         err_rel = shot_res["error_rel_ts"].values
         valid = np.isfinite(res_time) & np.isfinite(err_rel)
+        # The rollout batches pad every shot to a common length by repeating its
+        # final timeslice with a clamped time value (not NaN). Keep only rows that
+        # advance the shot clock, otherwise the shot-end error is counted hundreds
+        # of times in the stage aggregates and time averages
+        valid[1:] &= np.diff(res_time) > PAD_TIME_STEP_S
         result_idxs = np.flatnonzero(valid)
         if len(result_idxs) == 0:
             continue

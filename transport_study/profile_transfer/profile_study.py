@@ -448,7 +448,9 @@ class ProfileStudy(Study):
         """Collect per-shot test errors from all finished cases into one tidy (long-form) dataset.
 
         Each row is one (case, shot) pair so individual shots where a model struggles can be
-        inspected directly (e.g. sort by ``err_abs_shot`` within a ``model_type`` group).
+        inspected directly (e.g. sort by ``err_abs_ts_mean`` within a ``model_type`` group).
+        Rank shots by the ``_ts_mean`` variables, not the ``_shot`` integrals: the integrals
+        scale with shot duration, so sorting on them mostly sorts by shot length.
 
         Dims: record (flat index over all case x shot pairs)
         Coords (along record):
@@ -457,6 +459,7 @@ class ProfileStudy(Study):
         - shot (device shot id), ds_source (which dataset the shot came from)
         Data variables (along record):
         - err_abs_shot / err_rel_shot: time-integrated combined (ne+Te) error for the shot
+          (duration-weighted, longer shots score larger at equal instantaneous error)
         - ne_err_abs_shot / te_err_abs_shot / ne_err_rel_shot / te_err_rel_shot: per-channel
           time-integrated errors (see which channel drives a bad shot)
         - err_abs_ts_max / err_rel_ts_max: worst single timeslice in the shot

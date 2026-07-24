@@ -25,7 +25,7 @@ from popsim.ml.launch import (
 from popsim.ml.train_config import load_dict
 from pydantic import Field, field_validator, model_validator
 
-from transport_study import PACKAGE_ROOT
+from transport_study import PACKAGE_ROOT, TIME_DIM
 from transport_study.config import StudyConfig, config, env_dataset_paths, load_config
 from transport_study.modules.normalization import STAT_NORMALIZATIONS
 from transport_study.orchestration.organize_data import (
@@ -95,6 +95,22 @@ AGENT_HEARTBEAT_STALL_S = 10 * 60
 # this long, cancel it so the orchestration loop re-queues it (pick_partition then re-decides
 # placement). Jobs pending on the primary partition are exempt and keep their queue position
 WATCHDOG_PENDING_S = 30 * 60
+
+# The time-dep rollout batches pad every shot to a common length by repeating its
+# final timeslice with a clamped time value (not NaN). A real timeslice advances the
+# shot clock by the 1 kHz sample period, a padded repeat by at most float jitter
+# (~1e-13 s observed), so anything below this threshold is padding
+PAD_TIME_STEP_S = 1e-6
+
+
+def real_timeslice_mask(time_2d: xr.DataArray, time_dim: str = TIME_DIM) -> xr.DataArray:
+    """True where a timeslice advances its shot's clock, False on the padded tail.
+
+    The first timeslice of each shot is always real. Timeslices whose own time
+    is NaN are masked out.
+    """
+    prev = time_2d.shift({time_dim: 1})
+    return time_2d.notnull() & (prev.isnull() | ((time_2d - prev) > PAD_TIME_STEP_S))
 
 
 def configure_jax_platforms(enable_parallelism: bool) -> None:
@@ -1285,11 +1301,19 @@ class Study:
         (error_{abs,rel}_{shot,ts}) and emits err_E_D_S scalars where E is
         'abs' or 'rel', D is 'shot' or 'ts', and S is one of mean, std, med,
         p25, p75, min, max.
+
+        The per-timeslice stats only count timeslices that advance the shot
+        clock: the padded rollout tail repeats each shot's final timeslice
+        (roughly 40 percent of the array entries in practice), which would
+        otherwise weight the per-ts stats heavily toward shot-end error. The
+        per-shot integrals need no masking because the padded repeats have
+        near-zero dt and contribute nothing to the trapezoid.
         """
         err_abs_shot = ds["error_abs_shot"]
         err_rel_shot = ds["error_rel_shot"]
-        err_abs_ts = ds["error_abs_ts"]
-        err_rel_ts = ds["error_rel_ts"]
+        real = real_timeslice_mask(ds["time"])
+        err_abs_ts = ds["error_abs_ts"].where(real)
+        err_rel_ts = ds["error_rel_ts"].where(real)
 
         return xr.Dataset(
             {
