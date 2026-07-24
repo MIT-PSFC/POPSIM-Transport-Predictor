@@ -614,6 +614,7 @@ class _FakeBackend:
         fail_first_attempts: dict[str, int] | None = None,
         pending_partitions: set[str] | None = None,
         release_pending_after: int | None = None,
+        cancel_leaves_job_queued: bool = False,
     ):
         self.remote_dir = Path(remote_dir)
         self.remote_dir.mkdir(parents=True, exist_ok=True)
@@ -621,11 +622,14 @@ class _FakeBackend:
         self.fail_first_attempts = fail_first_attempts or {}
         self.pending_partitions = pending_partitions or set()
         self.release_pending_after = release_pending_after
+        # Models a job that will not die (e.g. wedged in COMPLETING): scancel is
+        # accepted but the job stays in the queue
+        self.cancel_leaves_job_queued = cancel_leaves_job_queued
         self.submitted_names: list[str] = []
         self.submissions: list[tuple[str, str, str | None]] = []  # (name, partition, constraint)
         self.cancelled_ids: list[int] = []
         self._states: dict[int, str] = {}
-        self._queued: dict[str, int] = {}
+        self._queued: list[tuple[str, int]] = []  # (name, job_id), duplicate names allowed
         self._job_paths: dict[int, tuple[Path, Path]] = {}  # job_id -> (in, out)
         self._pending_polls: dict[int, int] = {}
         self._next_id = 100
@@ -690,6 +694,9 @@ class _FakeBackend:
     def ensure_dir(self, path: str) -> None:
         pass
 
+    def queued_jobs(self) -> list[tuple[str, int]]:
+        return list(self._queued)
+
     def queued_job_names(self) -> dict[str, int]:
         return dict(self._queued)
 
@@ -706,6 +713,8 @@ class _FakeBackend:
     def cancel(self, job_id: int) -> None:
         self.cancelled_ids.append(job_id)
         self._states[job_id] = "CANCELLED"
+        if not self.cancel_leaves_job_queued:
+            self._queued = [entry for entry in self._queued if entry[1] != job_id]
 
     def remove_glob(self, remote_dir: str, pattern: str) -> None:
         for p in self.remote_dir.glob(pattern):
@@ -719,6 +728,7 @@ def _make_dispatcher(
     fail_first_attempts=None,
     pending_partitions=None,
     release_pending_after=None,
+    cancel_leaves_job_queued=False,
     **config_overrides,
 ):
     fake = _FakeBackend(
@@ -727,6 +737,7 @@ def _make_dispatcher(
         fail_first_attempts,
         pending_partitions,
         release_pending_after,
+        cancel_leaves_job_queued,
     )
     monkeypatch.setattr(ClusterFitDispatcher, "_create_backend", staticmethod(lambda config: fake))
     config_kwargs = dict(
@@ -796,13 +807,44 @@ def test_dispatcher_clean_cancels_jobs_and_removes_batches(tmp_path, monkeypatch
     assert len(list(fake.remote_dir.glob("batch_*.npz"))) > 0
 
     # A stale job for this device should be cancelled; another device's job left alone
-    fake._queued = {"gpfit-cmod-stale00000-a1": 555, "gpfit-mast-other000000-a1": 777}
+    fake._queued = [("gpfit-cmod-stale00000-a1", 555), ("gpfit-mast-other000000-a1", 777)]
 
     dispatcher.clean()
 
     assert fake.cancelled_ids == [555]
     assert list(batches_dir.glob("batch_*.npz")) == []
     assert list(fake.remote_dir.glob("batch_*.npz")) == []
+
+
+def test_dispatcher_clean_cancels_every_duplicate_named_job(tmp_path, monkeypatch):
+    """Two runs can each submit attempt 1 of the same batch, so the queue can
+    hold two jobs with one name. Cancelling by name would leave one alive to
+    write its output after the files are deleted."""
+    dispatcher, fake = _make_dispatcher(tmp_path, monkeypatch)
+    fake._queued = [("gpfit-cmod-aaaaaaaaaa-a1", 111), ("gpfit-cmod-aaaaaaaaaa-a1", 222)]
+
+    dispatcher.clean()
+
+    assert sorted(fake.cancelled_ids) == [111, 222]
+
+
+def test_dispatcher_clean_waits_for_cancelled_jobs_before_deleting(tmp_path, monkeypatch):
+    """A job that outlives the delete would write a stale batch_*_out.npz for
+    the next run to adopt, so clean must fail loudly rather than delete while
+    one is still queued."""
+    from transport_study.datasets.gp_fitting import dispatcher as dispatcher_mod
+
+    monkeypatch.setattr(dispatcher_mod, "_CLEAN_DRAIN_TIMEOUT_S", 0.05)
+    monkeypatch.setattr(dispatcher_mod, "_CLEAN_DRAIN_POLL_S", 0.01)
+    dispatcher, fake = _make_dispatcher(tmp_path, monkeypatch, cancel_leaves_job_queued=True)
+    (fake.remote_dir / "batch_deadbeef00_out.npz").write_bytes(b"stale")
+    fake._queued = [("gpfit-cmod-deadbeef00-a1", 555)]
+
+    with pytest.raises(RuntimeError, match="still queued"):
+        dispatcher.clean()
+
+    assert fake.cancelled_ids == [555]
+    assert (fake.remote_dir / "batch_deadbeef00_out.npz").exists(), "deleted while a job could still overwrite it"
 
 
 def test_dispatcher_clean_removes_orphaned_remote_outputs(tmp_path, monkeypatch):
@@ -820,6 +862,16 @@ def test_dispatcher_clean_removes_orphaned_remote_outputs(tmp_path, monkeypatch)
     dispatcher.clean()
 
     assert list(fake.remote_dir.glob("batch_*.npz")) == []
+
+
+def test_dispatcher_clean_removes_partial_writes(tmp_path, monkeypatch):
+    """A worker killed mid-write leaves batch_<bid>_out.npz.tmp behind."""
+    dispatcher, fake = _make_dispatcher(tmp_path, monkeypatch)
+    (fake.remote_dir / "batch_deadbeef00_out.npz.tmp").write_bytes(b"partial")
+
+    dispatcher.clean()
+
+    assert list(fake.remote_dir.glob("batch_*")) == []
 
 
 # ----------------------------------------------------------------------
@@ -934,7 +986,7 @@ def test_dispatcher_adopts_suffixed_job_on_restart(tmp_path, monkeypatch):
     )
     # A previous run left attempt 2 in the queue (plus a stale attempt 1);
     # once polled, the pending job completes and writes its output.
-    fake._queued = {f"gpfit-cmod-{bid}-a1": 444, f"gpfit-cmod-{bid}-a2": 555}
+    fake._queued = [(f"gpfit-cmod-{bid}-a1", 444), (f"gpfit-cmod-{bid}-a2", 555)]
     fake._states = {444: "PENDING", 555: "PENDING"}
     staging_input = tmp_path / "staging" / "batches" / f"batch_{bid}.npz"
     fake._job_paths = {

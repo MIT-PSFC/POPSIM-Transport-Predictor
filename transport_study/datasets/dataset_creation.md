@@ -49,6 +49,9 @@ workflows run fully serially, so the datasets remain reproducible (for anyone pa
    rebuilding raw files (after a fitting change, say) re-downloads from the source. `--clean` additionally
    cancels in-flight jobs and clears batch files on both ends. Without it, an existing `batch_*_out.npz`
    (local or remote) is adopted as a finished result and the shot keeps its OLD fit.
+   `--clean` waits (up to 2 minutes) for the cancelled jobs to actually leave the queue before deleting,
+   since a job that outlives the delete writes its output afterwards and the next run adopts it. If a job
+   is wedged and will not die, clean raises instead of deleting: clear the queue by hand and rerun.
 
 One-time setup per cluster:
 

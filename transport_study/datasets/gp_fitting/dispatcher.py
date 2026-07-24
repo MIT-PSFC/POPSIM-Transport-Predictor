@@ -55,6 +55,10 @@ _MAX_OUTPUT_PULL_POLLS = 3
 # polls to tolerate a job in an unrecognized/unknown state (e.g. it vanished
 # from the queue) before treating the attempt as failed
 _MAX_UNKNOWN_POLLS = 5
+# how long clean() waits for cancelled jobs to actually leave the queue before
+# it deletes their batch files (see _wait_for_jobs_to_drain)
+_CLEAN_DRAIN_TIMEOUT_S = 120.0
+_CLEAN_DRAIN_POLL_S = 5.0
 
 # SLURM states that mean the job will never produce output
 _TERMINAL_FAILURE_STATES = {
@@ -227,7 +231,33 @@ def _srunx_rsync_logs_disabled():
         logger.enable("srunx.sync.rsync")
 
 
-class _SSHBackend:
+class _SlurmJobControl:
+    """Queue inspection and cancellation, shared by both backends.
+
+    Both wrap an srunx client (SSH or local), so only the file transfer differs.
+    """
+
+    def queued_jobs(self) -> list[tuple[str, int]]:
+        """(name, job id) for every queued/running job of this user.
+
+        A list, not a name-keyed dict: two jobs can carry the same name (two
+        runs each submitting attempt 1 of the same batch), and clean() has to
+        cancel both.
+        """
+        return [(j.name, j.job_id) for j in self._client.queue(user=self._username) if j.job_id]
+
+    def queued_job_names(self) -> dict[str, int]:
+        """Names of this user's queued/running jobs -> job id."""
+        return dict(self.queued_jobs())
+
+    def job_states(self, job_ids: list[int]) -> dict[int, str]:
+        return {jid: snap.status for jid, snap in self._client.queue_by_ids(job_ids).items()}
+
+    def cancel(self, job_id: int) -> None:
+        self._client.cancel(job_id)
+
+
+class _SSHBackend(_SlurmJobControl):
     """File transfer and job control on a remote cluster via srunx."""
 
     def __init__(self, config: ClusterFitConfig):
@@ -297,16 +327,6 @@ class _SSHBackend:
         if result.returncode != 0:
             raise RuntimeError(f"Failed to create remote dir {path}: {result.stderr.strip()}")
 
-    def queued_job_names(self) -> dict[str, int]:
-        """Names of this user's queued/running jobs -> job id."""
-        return {j.name: j.job_id for j in self._client.queue(user=self._username) if j.job_id}
-
-    def job_states(self, job_ids: list[int]) -> dict[int, str]:
-        return {jid: snap.status for jid, snap in self._client.queue_by_ids(job_ids).items()}
-
-    def cancel(self, job_id: int) -> None:
-        self._client.cancel(job_id)
-
     def remove_glob(self, remote_dir: str, pattern: str) -> None:
         """Delete remote files matching pattern via ssh (the remote shell expands the glob)."""
         result = self._rsync._ssh_run(f"rm -f -- {shlex.quote(remote_dir)}/{pattern}")
@@ -314,7 +334,7 @@ class _SSHBackend:
             raise RuntimeError(f"Failed to remove remote files {remote_dir}/{pattern}: {result.stderr.strip()}")
 
 
-class _LocalBackend:
+class _LocalBackend(_SlurmJobControl):
     """Job control when already running on the target cluster (shared FS)."""
 
     def __init__(self, config: ClusterFitConfig):
@@ -357,15 +377,6 @@ class _LocalBackend:
 
     def ensure_dir(self, path: str) -> None:
         Path(path).mkdir(parents=True, exist_ok=True)
-
-    def queued_job_names(self) -> dict[str, int]:
-        return {j.name: j.job_id for j in self._client.queue(user=self._username) if j.job_id}
-
-    def job_states(self, job_ids: list[int]) -> dict[int, str]:
-        return {jid: snap.status for jid, snap in self._client.queue_by_ids(job_ids).items()}
-
-    def cancel(self, job_id: int) -> None:
-        self._client.cancel(job_id)
 
     def remove_glob(self, remote_dir: str, pattern: str) -> None:
         for p in Path(remote_dir).glob(pattern):
@@ -497,7 +508,7 @@ class ClusterFitDispatcher:
         leftover batch outputs on the cluster.
         """
         prefix = f"{self.config.job_name_prefix}-{self.device}-"
-        for name, job_id in self.backend.queued_job_names().items():
+        for name, job_id in self.backend.queued_jobs():
             if not name.startswith(prefix):
                 continue
             logger.info(f"Clean: cancelling job {name} (id {job_id})")
@@ -506,15 +517,44 @@ class ClusterFitDispatcher:
             except Exception as e:
                 logger.warning(f"Clean: failed to cancel job {name} (id {job_id}): {e}")
 
+        self._wait_for_jobs_to_drain(prefix)
+
         # Remove by remote glob, not by mirroring the local batch listing:
         # remote files with no local counterpart (e.g. outputs from a run
         # whose staging was already cleaned) would otherwise survive and be
-        # adopted as pre-existing results by the next run. Raises on failure
-        # so a clean that did not actually clean stops the run.
-        self.backend.remove_glob(self.config.remote_workdir, "batch_*.npz")
+        # adopted as pre-existing results by the next run. The trailing * also
+        # takes the .npz.tmp a killed worker leaves behind mid-write. Raises on
+        # failure so a clean that did not actually clean stops the run.
+        self.backend.remove_glob(self.config.remote_workdir, "batch_*.npz*")
         if self.batches_dir.exists():
             shutil.rmtree(self.batches_dir)
         self.batches_dir.mkdir(parents=True, exist_ok=True)
+
+    def _wait_for_jobs_to_drain(self, prefix: str) -> None:
+        """Block until no job named with prefix is left in the queue.
+
+        scancel returns as soon as it is issued, but SLURM only SIGTERMs (then
+        SIGKILLs) the job some time later. Deleting the batch files before the
+        job is really gone lets it write batch_<bid>_out.npz AFTER the delete,
+        and the next run pulls that file back and adopts the OLD fit - silently,
+        which is the exact failure clean exists to prevent. Raises rather than
+        deleting anyway: a stuck job (e.g. wedged in COMPLETING) needs a human,
+        and proceeding would quietly reuse stale fits.
+        """
+        deadline = time.monotonic() + _CLEAN_DRAIN_TIMEOUT_S
+        while True:
+            remaining = [(name, job_id) for name, job_id in self.backend.queued_jobs() if name.startswith(prefix)]
+            if not remaining:
+                return
+            if time.monotonic() >= deadline:
+                listed = ", ".join(f"{name} (id {job_id})" for name, job_id in remaining)
+                raise RuntimeError(
+                    f"Clean: {len(remaining)} {prefix}* jobs still queued {_CLEAN_DRAIN_TIMEOUT_S:.0f}s after cancelling: {listed}. "
+                    "Not removing batch files - a job that outlives the delete would leave a stale output for the next run to adopt. "
+                    "Wait for the queue to clear (or scancel them by hand) and rerun."
+                )
+            logger.info(f"Clean: waiting for {len(remaining)} cancelled jobs to leave the queue")
+            time.sleep(_CLEAN_DRAIN_POLL_S)
 
     # ------------------------------------------------------------------
     def _run_jobs(self, batches: list[BatchState]) -> None:
