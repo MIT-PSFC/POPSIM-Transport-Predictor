@@ -645,20 +645,19 @@ class ProfilePredictorTorax(TimeIndepModule):
             # chi terms are computed by TORAX from the evolving state and geometry,
             # the NN learns one log-scale multiplier per term, applied to both
             # species, since the model already fixes the ion/electron split
-            # (chi_i_B = 2 * chi_e_B, chi_i_gB = 0.5 * chi_e_gB). The coeff
-            # prefactors stay at the TORAX defaults (8e-5, 5e-6).
+            # (chi_i_B = 2 * chi_e_B, chi_i_gB = 0.5 * chi_e_gB). The coeff prefactors stay at the TORAX defaults (8e-5, 5e-6).
             #   chi_bohm_multiplier and chi_gyrobohm_multiplier:
             #     exp(-3) - exp(3), ~0.05 - 20, log-uniform around 1
-            #   D_face_c1: 0.1 - 5  (diffusivity weighting at the axis, TORAX default 1.0)
-            #   D_face_c2: 0.1 - 5  (diffusivity weighting at the edge, TORAX default 0.3)
-            #   V_face_coeff: -4 - 1 (convectivity / diffusivity ratio, TORAX
-            #     default -0.1). The sigmoid bias puts a random init at the TORAX default
+            #   D_face_c1: 0.01 - 5  (diffusivity weighting at the axis, TORAX default 1.0)
+            #   D_face_c2: 0.01 - 5  (diffusivity weighting at the edge, TORAX default 0.3)
+            #   V_face_coeff: -4 - 2 (convectivity / diffusivity ratio, TORAX default -0.1).
+            #     The sigmoid bias puts a random init at the TORAX default
             return {
                 "chi_bohm_multiplier": jnp.exp(3.0 * jnp.tanh(nn_transport_out[0:1])),
                 "chi_gyrobohm_multiplier": jnp.exp(3.0 * jnp.tanh(nn_transport_out[1:2])),
-                "D_face_c1": 0.1 + 4.9 * jax.nn.sigmoid(nn_transport_out[2:3]),
-                "D_face_c2": 0.1 + 4.9 * jax.nn.sigmoid(nn_transport_out[3:4]),
-                "V_face_coeff": 1.0 - 5.0 * jax.nn.sigmoid(nn_transport_out[4:5] - 1.25),
+                "D_face_c1": 0.01 + 4.99 * jax.nn.sigmoid(nn_transport_out[2:3]),
+                "D_face_c2": 0.01 + 4.99 * jax.nn.sigmoid(nn_transport_out[3:4]),
+                "V_face_coeff": 2.0 - 6.0 * jax.nn.sigmoid(nn_transport_out[4:5] - 0.62),
             }
         else:  # qlknn
             # Free parameters of the QLKNN surrogate. TORAX computes ITG/TEM/ETG
@@ -697,8 +696,8 @@ class ProfilePredictorTorax(TimeIndepModule):
         #     The -2 bias makes random-init heating small, starting the solver near
         #     the ohmic-only behavior (same trick as the edge-Te bias below).
         #   gaussian_location: 0 - 0.8 (deposition center in rho_norm)
-        #   gaussian_width: 0.05 - 0.4 (deposition width in rho_norm)
-        #   electron_heat_fraction: 0.2 - 0.8 (both channels keep NN gradient)
+        #   gaussian_width: 0.02 - 0.4 (deposition width in rho_norm)
+        #   electron_heat_fraction: 0.2 - 0.95 (amount of aux heating going to electrons)
         nn_inputs = self.normalizer(inputs.nn_inputs, inputs.ds_source_idx)
         coeffs = self._transport_coefficients(self.nn_transport(nn_inputs))
         nn_sources_out = self.nn_sources(nn_inputs)
@@ -707,8 +706,8 @@ class ProfilePredictorTorax(TimeIndepModule):
         S_total = jax.nn.softplus(nn_sources_out[0:1]) * inventory / TAU_REF_S
         p_aux_total = 4.0 * jax.nn.sigmoid(nn_sources_out[1:2] - 2.0) * inputs.w_approx / TAU_REF_S
         gaussian_location = 0.8 * jax.nn.sigmoid(nn_sources_out[2:3])
-        gaussian_width = 0.05 + 0.35 * jax.nn.sigmoid(nn_sources_out[3:4])
-        electron_heat_fraction = 0.2 + 0.6 * jax.nn.sigmoid(nn_sources_out[4:5])
+        gaussian_width = 0.02 + 0.38 * jax.nn.sigmoid(nn_sources_out[3:4])
+        electron_heat_fraction = 0.2 + 0.75 * jax.nn.sigmoid(nn_sources_out[4:5] - 0.4)
 
         # Edge boundary conditions as NN-predicted fractions:
         #   n_e_right_bc = fraction in (0.01, 0.95) * line-averaged density
