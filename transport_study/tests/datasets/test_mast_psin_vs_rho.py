@@ -73,10 +73,10 @@ def test_psin_vs_rho_fit_comparison(workflow):
     import matplotlib.pyplot as plt
     from matplotlib.backends.backend_pdf import PdfPages
 
-    fit_input = workflow._prepare_shot(SHOT)
+    fit_input = workflow.prepare_shot(SHOT)
     assert fit_input is not None, f"Shot {SHOT} failed validation/retrieval"
 
-    ds_staging = xr.load_dataset(workflow._staging_path(SHOT))
+    ds_staging = xr.load_dataset(workflow.staging_path(SHOT))
     ts_time = ds_staging["ts_time"].values
     psi_n_all = ds_staging["ts_psi_n"].values
 

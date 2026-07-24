@@ -15,6 +15,47 @@ from transport_study.datasets.plotting import (
 
 GC_INTERVAL = 40  # Every 40 shots force garbage collection
 
+# GP-fit profile outputs: the values plus their error-bar and gradient companions.
+# A timeslice culled during processing must have all of them NaNed together, or
+# downstream sees an error bar for a profile that is not there.
+PROFILE_FIT_VARS = (
+    "Te_keV_rho",
+    "Te_keV_rho_error",
+    "Te_keV_rho_grad",
+    "Te_keV_rho_grad_error",
+    "ne20_rho",
+    "ne20_rho_error",
+    "ne20_rho_grad",
+    "ne20_rho_grad_error",
+)
+
+# Variables every raw per-shot file carries, in a fixed order
+# (see the device workflows' standardize_signal_names)
+RAW_DATASET_VARS = (
+    # POWER BALANCE
+    "Wtot_MJ",
+    "P_oh_MW",
+    "P_rad_MW",
+    "P_ICRF_MW",
+    "P_LH_MW",
+    "P_NBI_MW",
+    "P_ECRH_MW",
+    # PROFILE PREDICTOR TRAINING
+    *PROFILE_FIT_VARS,
+    "Ip_MA",
+    "B0",
+    "betan",
+    "ne20_line_avg",
+    "R0",
+    "kappa",
+    "a_minor",
+    "delta_top",
+    "delta_bot",
+    # OTHER
+    "beta_p",
+    "ne20_edge",
+)
+
 
 class DataWorkflow(ABC):
     """Class that handles organization of data processing steps
@@ -122,7 +163,7 @@ class DataWorkflow(ABC):
         and have standardized signal names
         """
 
-    def _prepare_shot(self, shot: int):
+    def prepare_shot(self, shot: int):
         """Download and validate source data for one shot, returning a ShotFitInput.
 
         Implemented by workflows that support distributed GP fitting (C-Mod, MAST).
@@ -131,7 +172,7 @@ class DataWorkflow(ABC):
         """
         raise NotImplementedError(f"{self.ds_name} workflow does not support distributed GP fitting")
 
-    def _assemble_shot(self, shot: int, fit_output) -> bool:
+    def assemble_shot(self, shot: int, fit_output) -> bool:
         """Combine staged source data with GP fit results into the raw data file.
 
         Returns True if the raw file was written. Implemented by workflows that
@@ -186,7 +227,7 @@ class DataWorkflow(ABC):
                 continue
             if i > 0 and i % GC_INTERVAL == 0:
                 gc.collect()  # Source datasets can pin a lot of memory
-            fit_input = self._prepare_shot(shot)
+            fit_input = self.prepare_shot(shot)
             if fit_input is None:
                 continue
             pending[shot] = fit_input
@@ -209,7 +250,7 @@ class DataWorkflow(ABC):
             if fit_output is None:
                 logger.warning(f"No fit results for shot {shot} (batch failed); staging kept for retry")
                 continue
-            if self._assemble_shot(shot, fit_output):
+            if self.assemble_shot(shot, fit_output):
                 n_assembled += 1
 
         logger.info(f"Assembled {n_assembled}/{len(pending)} shots. Finished making raw data files.")

@@ -34,13 +34,10 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
-# Limit BLAS threads before numpy loads so slice-level multiprocessing
-# (fit_batch num_workers) does not oversubscribe cores.
-# mkgp is single-threaded numpy/scipy
-# one thread per worker is the right default.
-# setdefault keeps any explicit override.
-# Effective only when this module is the program entry point
-# (the cluster `python fit_worker.py` path), does nothing otherwise
+# Limit BLAS threads before numpy loads so slice-level multiprocessing (fit_batch num_workers) does not oversubscribe cores
+# mkgp is single-threaded, so one thread per worker is right
+# Only effective when this module is the program entry point (the cluster `python fit_worker.py` path)
+# Callers that import it must pin the threads themselves (see threadpool_limits use in the device workflows)
 os.environ.setdefault("OMP_NUM_THREADS", "1")
 os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
 os.environ.setdefault("MKL_NUM_THREADS", "1")
@@ -69,24 +66,24 @@ _HYP_BOUNDS = np.array([[1.0e-2, 0.4, 0.2, 0.05, 0.95], [2.0e1, 0.9, 0.5, 0.2, 1
 _VALUE_BC = np.array([[1.1, 0.0, 0.01], [1.2, 0.0, 0.01], [1.3, 0.0, 0.01], [1.4, 0.0, 0.01]])
 _GRAD_BC = np.array([[0.0, 0.0, 0.01], [1.1, 0.0, 0.1], [1.2, 0.0, 0.1], [1.3, 0.0, 0.1], [1.4, 0.0, 0.1]])
 # Monotonic-edge constraint (virtual zero-slope observations). Te and ne fall
-# monotonically toward the edge, but the GP can ring up into a small bump
-# around rho ~1.0, in the gap between the outermost channel and the value BCs
-# at 1.1+ where the short edge length scale wiggles freely (nonphysical_peak
-# only catches bumps that beat the whole interior by _EDGE_MARGIN, so a small
-# pedestal-top bump passes). After each fit, gp_profile checks the posterior
-# gradient on _MONO_CHECK_RHO. Wherever it exceeds _MONO_GRAD_TOL, a virtual
-# gradient observation (rho, 0.0, _MONO_GRAD_ERR) is added and the slice is
-# refit at the same hyperparameters, up to _MONO_MAX_PASSES times (a refit can
-# push the bump sideways into still-unconstrained neighbors, the next pass
-# catches it there). Observations are added only where the constraint is
-# violated, so real negative gradients (the pedestal) are never flattened and
-# the core (rho < 0.6, where hollow ne profiles are physical) is never
-# checked. A bump becomes a plateau, the constraint holds at the check points
-# only. Tolerance and error are in scale_per_slice-normalized units like every other constant here.
-_MONO_CHECK_RHO = np.concatenate([np.linspace(0.6, 0.85, 6), np.linspace(0.9, 1.09, 20)])
-_MONO_GRAD_TOL = 0.01
-_MONO_GRAD_ERR = 0.05
-_MONO_MAX_PASSES = 3
+# monotonically toward the edge, but the GP can ring up into a small bump around
+# rho ~1.0, between the outermost channel and the value BCs at 1.1+ where the
+# short edge length scale wiggles freely (nonphysical_peak only catches bumps
+# beating the whole interior by _EDGE_MARGIN, so a pedestal-top bump passes).
+# gp_profile checks the posterior gradient on MONO_CHECK_RHO and, wherever it
+# exceeds MONO_GRAD_TOL, adds a virtual gradient observation (rho, 0,
+# MONO_GRAD_ERR) and refits at the same hyperparameters, up to MONO_MAX_PASSES
+# times (a refit can push the bump sideways into an unconstrained neighbor).
+# Observations are added only where violated, so the pedestal's real negative
+# gradient is never flattened, and the core (rho < 0.6, where hollow ne is
+# physical) is never checked. The constraint is soft (MONO_GRAD_ERR is the
+# virtual observation's error bar), so a sharp bump flattens toward a plateau
+# rather than to exactly zero slope. Tolerance and error are in
+# scale_per_slice-normalized units, like every other constant here.
+MONO_CHECK_RHO = np.concatenate([np.linspace(0.6, 0.85, 6), np.linspace(0.9, 1.09, 20)])
+MONO_GRAD_TOL = 0.01
+MONO_GRAD_ERR = 0.05
+MONO_MAX_PASSES = 3
 # Error kernel (heteroscedastic noise model): a squared-exponential GP is fit to
 # the input error bars themselves (mkgp's HSGP path, make_HSGP_errors). This
 # does two things: the main fit sees smoothed error bars instead of raw ones,
@@ -196,36 +193,22 @@ def _pinned_hyperparams(hyps: np.ndarray) -> bool:
     """True if the optimizer pushed a hyperparameter to (not just near) its bound,
     in a way a differently-seeded restart could plausibly escape.
 
-    Bound enforcement (_build_kernel) exists so a bad restart can't wander into
-    the degenerate collapse mkgp is otherwise prone to (see the mkgp-bounds-not-
-    enforced writeup); one of these hyperparameters still sitting at that bound
-    after optimization means the search ran out of room in that basin rather
-    than converging inside the physical range. _run_gp retries from a different
-    restart when this happens instead of accepting the degenerate fit.
+    Bound enforcement (_build_kernel) keeps a bad restart out of the degenerate
+    collapse mkgp is prone to (amplitude -> 0, edge scale -> infinity). A
+    hyperparameter still sitting at that bound after optimization means the
+    search ran out of room rather than converging, so _run_gp retries from a
+    different restart.
 
-    Two edges are excluded because a different restart provably re-lands on
-    the same edge, making a retry pure waste rather than a chance to escape:
-    - x0 (pedestal location): its bounds - the base physical pedestal window
-      in _HYP_BOUNDS, or the narrower pin_x0 window tying Te to ne - are
-      already tight by design, not slack search room.
-    - l2's ceiling: once x0 is held near the edge, the region beyond it often
-      has no independent short-scale structure left to fit, so mkgp is happy
-      pushing l2 as long/smooth as the box allows - not a collapse.
-    Confirmed by profiling a real shot: x0 pinned in 10/10 sampled slices and
-    l2's ceiling in half of them, every one re-landing on the same edge across
-    all _MAX_HYP_RETRIES attempts, tripling fit time for zero change in
-    outcome. var, l1, lw, and l2's floor still trigger retries: those bounds
-    guard the genuine degenerate collapse (amplitude -> 0, edge scale ->
-    infinity) that _build_kernel's enforcement exists to prevent, where a bad
-    restart really can land somewhere better.
+    Two edges are excluded because a retry provably re-lands on them (measured
+    on a real shot: x0 pinned in 10/10 sampled slices, l2's ceiling in half,
+    every retry re-landing, tripling fit time for no change):
+    - x0 (pedestal location): its bounds are tight by design, not slack.
+    - l2's ceiling: with x0 held near the edge there is often no short-scale
+      structure left beyond it, so a long, smooth l2 is the right answer.
 
-    The margin itself is measured in log10 space, matching how restarts are
-    drawn (uniform in log10 - see _HYP_BOUNDS). var and lw span 2-3 decades,
-    so a margin taken as a fraction of the raw range is huge in log terms: a
-    var of 0.2755 against bounds [0.01, 20] falls inside a linear 2% margin
-    (~0.4) while actually sitting at 44% of the way up the log-uniform range,
-    nowhere near either wall - a converged interior optimum mislabeled as
-    pinned, burning a retry that only ever re-finds the same interior point.
+    The margin is measured in log10 space, matching how restarts are drawn.
+    var and lw span 2-3 decades, so a fraction of the raw range is huge in log
+    terms and would flag converged interior optima as pinned.
     """
     lo, hi = _HYP_BOUNDS[0], _HYP_BOUNDS[1]
     log_lo, log_hi, log_hyps = np.log10(lo), np.log10(hi), np.log10(hyps)
@@ -384,7 +367,7 @@ def _run_gp(data_X, data_y, err_y, x_eval, hyperparams=None, optimize=True, pin_
     Te pedestal location to the ne fit).
 
     extra_grad_bc appends (rho, value, error) rows to the standard _GRAD_BC set
-    (the monotonic-edge virtual observations, see _MONO_CHECK_RHO).
+    (the monotonic-edge virtual observations, see MONO_CHECK_RHO).
 
     The restarts are seeded from the fit's own input data (_deterministic_seed),
     so the result only depends on (data_X, data_y, err_y), never on multiprocessing
@@ -527,25 +510,20 @@ def _remove_outliers(data_X, data_y, err_y, sigma=3.0, sigma_corr=2.0, max_drop_
     """Drop points whose leave-one-out standardized residual exceeds sigma and
     that no immediate rho-neighbor corroborates, worst first, one at a time.
 
-    Judging each point by its LOO residual (_loo_standardized_residuals) - the
-    prediction from every other point, never from itself - is what makes this
-    robust: a bad channel cannot pull the reference toward itself to hide, so it
-    stands out as the single largest residual. But one bad point also inflates
-    its neighbors' residuals (they are still predicted using it), so flagging
-    every point over sigma in one pass over-drops - it removes the offender and
-    the good neighbors it swamped together. Instead this drops only the single
-    worst point, recomputes the LOO residuals on what remains, and repeats:
-    once the offender is gone its neighbors fall back below sigma and are kept.
+    Judging each point by its LOO residual (_loo_standardized_residuals) is what
+    makes this robust: a bad channel cannot pull the reference toward itself to
+    hide. But one bad point also inflates its neighbors' residuals, so flagging
+    everything over sigma in one pass over-drops. Dropping only the single worst
+    point and recomputing lets the swamped neighbors fall back below sigma.
 
     The LOO reference is a single smooth kernel, so a genuinely steep, high core
-    (few points, dropping fast to a long low edge) reads as a run of large
-    residuals and the plain rule culls the whole core, collapsing the fit to the
-    edge data. The corroboration gate (_locally_corroborated) fixes that: the
-    worst over-sigma point is only dropped if it also disagrees with both its
-    immediate rho-neighbors, so consistently-high core points protect each other
-    while an isolated spike (no agreeing neighbor) is still removed. When the
-    worst point is corroborated the next-worst uncorroborated point is taken
-    instead; if every remaining over-sigma point is corroborated, stop.
+    reads as a run of large residuals and the plain rule culls the whole core.
+    The corroboration gate (_locally_corroborated) fixes that: the worst
+    over-sigma point is dropped only if it also disagrees with both immediate
+    rho-neighbors, so consistently-high core points protect each other while an
+    isolated spike is still removed. When the worst point is corroborated the
+    next-worst uncorroborated one is taken instead; if every remaining
+    over-sigma point is corroborated, stop.
 
     ref_hyperparams sets the LOO kernel length scales (the slice's own
     rough-optimized shape from gp_profile's first pass); falls back to the
@@ -651,7 +629,8 @@ def gp_profile(
 
     After the fit, positive posterior gradients on the edge check grid are
     suppressed by virtual zero-slope observations and a refit at fixed
-    hyperparameters (see _MONO_CHECK_RHO).
+    hyperparameters (see MONO_CHECK_RHO). The returned hyperparameters are
+    always the original fit's, since the refit runs at fixed hyperparameters.
     """
     cleaned = _clean_inputs(data_X, data_y, err_y)
     if cleaned is None:
@@ -668,7 +647,7 @@ def gp_profile(
     # GPRFit. The check points are sliced off before returning.
     x_out = np.asarray(X_star, dtype=float).ravel()
     n_out = x_out.size
-    x_eval = np.concatenate([x_out, _MONO_CHECK_RHO])
+    x_eval = np.concatenate([x_out, MONO_CHECK_RHO])
     gp = _run_gp(
         data_X,
         data_y,
@@ -682,19 +661,19 @@ def gp_profile(
         return None, None, None, None, None
     hyps_out = np.asarray(gp.get_gp_kernel_details()[1], dtype=float)
 
-    # Monotonic-edge repair (see the _MONO_CHECK_RHO block comment): pin the
+    # Monotonic-edge repair (see the MONO_CHECK_RHO block comment): pin the
     # slope to zero wherever the fit rises on the check grid and refit at the
     # fitted hyperparameters, so the pedestal-top bump flattens while
     # everything the constraint does not touch stays put. A failed refit keeps
     # the unconstrained fit rather than losing the slice.
     mono_bc = np.empty((0, 3))
-    for _ in range(_MONO_MAX_PASSES):
+    for _ in range(MONO_MAX_PASSES):
         drv_check = np.asarray(gp.get_gp_drv_mean(), dtype=float).ravel()[n_out:]
-        viol = np.isfinite(drv_check) & (drv_check > _MONO_GRAD_TOL)
-        new_rho = np.setdiff1d(_MONO_CHECK_RHO[viol], mono_bc[:, 0])
+        viol = np.isfinite(drv_check) & (drv_check > MONO_GRAD_TOL)
+        new_rho = np.setdiff1d(MONO_CHECK_RHO[viol], mono_bc[:, 0])
         if new_rho.size == 0:
             break
-        new_rows = np.column_stack([new_rho, np.zeros_like(new_rho), np.full_like(new_rho, _MONO_GRAD_ERR)])
+        new_rows = np.column_stack([new_rho, np.zeros_like(new_rho), np.full_like(new_rho, MONO_GRAD_ERR)])
         mono_bc = np.vstack([mono_bc, new_rows])
         gp_mono = _run_gp(
             data_X,

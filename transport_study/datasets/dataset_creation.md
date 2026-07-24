@@ -45,7 +45,10 @@ workflows run fully serially, so the datasets remain reproducible (for anyone pa
    with the self-contained `gp_fitting/fit_worker.py`, and fit by one CPU job per batch. Jobs have deterministic
    names (`gpfit-<device>-<batch-hash>`) so a restarted workflow adopts in-flight jobs instead of resubmitting.
 3. Assemble (local): results are pulled back and combined with the staged data into the same raw netCDF files
-   the serial workflow produces.
+   the serial workflow produces. The staged source data for a shot is deleted once its raw file exists, so
+   rebuilding raw files (after a fitting change, say) re-downloads from the source. `--clean` additionally
+   cancels in-flight jobs and clears batch files on both ends. Without it, an existing `batch_*_out.npz`
+   (local or remote) is adopted as a finished result and the shot keeps its OLD fit.
 
 One-time setup per cluster:
 

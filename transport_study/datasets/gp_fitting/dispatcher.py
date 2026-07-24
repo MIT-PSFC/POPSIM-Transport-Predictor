@@ -570,15 +570,12 @@ class ClusterFitDispatcher:
     def _adopt_queued_job(self, state: BatchState, queued: dict[str, int]) -> None:
         """Adopt a queued job from a previous run instead of resubmitting.
 
-        Job names carry an attempt suffix (-a{n}); the highest attempt wins
-        and lower-attempt stragglers are cancelled. A bare job_base_name
-        (submitted by pre-retry code) counts as attempt 1.
+        Job names carry an attempt suffix (-a{n})
+        The highest attempt wins and lower-attempt stragglers are cancelled.
         """
         candidates: list[tuple[int, int]] = []  # (attempt, job_id)
         for name, job_id in queued.items():
-            if name == state.job_base_name:
-                candidates.append((1, job_id))
-            elif name.startswith(f"{state.job_base_name}-a"):
+            if name.startswith(f"{state.job_base_name}-a"):
                 suffix = name.removeprefix(f"{state.job_base_name}-a")
                 if suffix.isdigit():
                     candidates.append((int(suffix), job_id))

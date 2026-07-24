@@ -25,8 +25,13 @@ from transport_study.datasets.gp_fitting.fit_worker import (
     ShotFitOutput,
     fit_batch,
 )
-from transport_study.datasets.plotting import fit_mean_ylim
-from transport_study.datasets.workflow import GC_INTERVAL, DataWorkflow
+from transport_study.datasets.plotting import ts_fit_pdf
+from transport_study.datasets.workflow import (
+    GC_INTERVAL,
+    PROFILE_FIT_VARS,
+    RAW_DATASET_VARS,
+    DataWorkflow,
+)
 
 DEFAULT_SHOTLIST_FILE = Path(PACKAGE_ROOT) / "datasets" / "mast" / "mast_shotlist"
 
@@ -558,10 +563,10 @@ class MASTDataWorkflow(DataWorkflow):
         return fit_input
 
     # ------------------------------------------------------------------
-    def _staging_path(self, shot: int) -> Path:
+    def staging_path(self, shot: int) -> Path:
         return self.fit_staging_dir / f"{shot}_staging.nc"
 
-    def _prepare_shot(self, shot: int) -> ShotFitInput | None:  # noqa: PLR0911 - one early return per validation failure
+    def prepare_shot(self, shot: int) -> ShotFitInput | None:  # noqa: PLR0911 - one early return per validation failure
         """Retrieve and stage source data for one shot, returning GP fit inputs.
 
         Reads the 0D signals and raw Thomson channel data from the MAST S3
@@ -569,7 +574,7 @@ class MASTDataWorkflow(DataWorkflow):
         (and the later assembly step) don't hit S3 again. Returns None if the
         shot has no valid data.
         """
-        staging_path = self._staging_path(shot)
+        staging_path = self.staging_path(shot)
         self.fit_staging_dir.mkdir(parents=True, exist_ok=True)
 
         if staging_path.exists():
@@ -638,9 +643,9 @@ class MASTDataWorkflow(DataWorkflow):
         return self._checked_fit_input(shot, te_eV, ne_m3, rho_ts)
 
     # ------------------------------------------------------------------
-    def _assemble_shot(self, shot: int, fit_output: ShotFitOutput) -> bool:
+    def assemble_shot(self, shot: int, fit_output: ShotFitOutput) -> bool:
         """Combine staged source data and GP fit results into the raw data file."""
-        staging_path = self._staging_path(shot)
+        staging_path = self.staging_path(shot)
         ds_path = Path(self.raw_data_dir) / f"{shot}.nc"
 
         ds_staging = xr.load_dataset(staging_path)
@@ -702,15 +707,7 @@ class MASTDataWorkflow(DataWorkflow):
 
         # Only make fit diagnostic plots for shots that are kept
         try:
-            self._debug_plot_profiles(
-                shot,
-                ts_time,
-                te_eV / 1e3,
-                ne_m3 / 1e20,
-                rho_ts,
-                fit_output,
-                self.debug_plot_dir,
-            )
+            self.debug_plot_profiles(shot, ts_time, te_eV, ne_m3, rho_ts, fit_output, self.debug_plot_dir)
         except Exception as e:
             logger.error(f"Failed to make TS fit diagnostic plot for shot {shot}: {e}")
 
@@ -719,148 +716,39 @@ class MASTDataWorkflow(DataWorkflow):
         return True
 
     # ------------------------------------------------------------------
-    def _debug_plot_profiles(
+    def debug_plot_profiles(
         self,
         shot: int,
         ts_time: np.ndarray,
-        te_keV: np.ndarray,
-        ne_20: np.ndarray,
+        te_eV: np.ndarray,
+        ne_m3: np.ndarray,
         rho_ts: np.ndarray,
         fit_output: ShotFitOutput,
         debug_plot_dir: Path | str | None = None,
     ) -> None:
-        """Save a PDF of raw TS points (with error bars) vs GP fit for sampled measurement times.
+        """Save the TS-fit diagnostic PDF for one shot (see plotting.ts_fit_pdf).
 
-        One page per sampled time, 2x2 panels: Te (top left) and ne (top
-        right) with the GP fit mean and +-1 sigma predictive band; the GP
-        gradients d/drho with their +-1 sigma bands below each profile.
-        MAST has a single Thomson system, so there is no core/edge channel
-        split. Fitted hyperparameters [var, l1, l2, lw, x0] are annotated on
-        the profile panels.
+        The channel arrays are the raw staged ones; they go through
+        _extract_fit_input so the plotted points and error bars are exactly what
+        the fit consumed. MAST has a single Thomson system, so there is no
+        core/edge channel split.
         """
-        import matplotlib
-
-        matplotlib.use("Agg")
-        import matplotlib.pyplot as plt
-        from matplotlib.backends.backend_pdf import PdfPages
-
         if debug_plot_dir is None:
             debug_plot_dir = self.data_assembly_dir / self.ds_name / "ts_fit_plots"
-        debug_plot_dir = Path(debug_plot_dir)
-        debug_plot_dir.mkdir(parents=True, exist_ok=True)
-        pdf_path = debug_plot_dir / f"{shot}_ts_gp_fit.pdf"
+        pdf_path = Path(debug_plot_dir) / f"{shot}_ts_gp_fit.pdf"
 
-        # Only page over slices where the fit produced a real profile. Times
-        # outside the plasma have no valid TS channels, so the fit returns
-        # all-NaN and the panels come out blank.
-        has_fit = np.isfinite(fit_output.te_fit).any(axis=-1) | np.isfinite(fit_output.ne_fit).any(axis=-1)
-        live = np.flatnonzero(has_fit)
-        step = max(1, len(live) // 20)
-        t_indices = live[::step]
-
-        # Consistent y-limits across every page: 0 to a little over the largest
-        # GP fit mean anywhere in this shot's fits.
-        te_ylim = fit_mean_ylim(fit_output.te_fit, fallback=5.0)
-        ne_ylim = fit_mean_ylim(fit_output.ne_fit, fallback=1.8)
-
-        with PdfPages(pdf_path) as pdf:
-            for i_time in t_indices:
-                fig, axes = plt.subplots(2, 2, figsize=(12, 10))
-                for ax, data_y, gp_y, gp_err, label, unit, hyps_arr, ylim in [
-                    (
-                        axes[0, 0],
-                        te_keV[i_time, :],
-                        fit_output.te_fit[i_time, :],
-                        fit_output.te_std[i_time, :],
-                        "Te",
-                        "[keV]",
-                        fit_output.te_hyps,
-                        te_ylim,
-                    ),
-                    (
-                        axes[0, 1],
-                        ne_20[i_time, :],
-                        fit_output.ne_fit[i_time, :],
-                        fit_output.ne_std[i_time, :],
-                        "ne",
-                        "[1e20 m^-3]",
-                        fit_output.ne_hyps,
-                        ne_ylim,
-                    ),
-                ]:
-                    rho_raw = rho_ts[i_time, :]
-                    valid = np.isfinite(rho_raw) & np.isfinite(data_y)
-                    # Synthetic errors, matching what is used in _make_profile_dataset
-                    err_y = np.where(0.1 * np.abs(data_y) < 0.01, 0.01, 0.1 * np.abs(data_y))
-                    if valid.any():
-                        ax.errorbar(
-                            rho_raw[valid],
-                            data_y[valid],
-                            yerr=err_y[valid],
-                            fmt="o",
-                            ms=4,
-                            color="tab:blue",
-                            label="raw TS",
-                            zorder=3,
-                        )
-                    gp_valid = np.isfinite(gp_y)
-                    if gp_valid.any():
-                        ax.plot(self.gp_fit_rho[gp_valid], gp_y[gp_valid], color="black", label="GP fit")
-                        ax.fill_between(
-                            self.gp_fit_rho[gp_valid],
-                            (gp_y - gp_err)[gp_valid],
-                            (gp_y + gp_err)[gp_valid],
-                            color="black",
-                            alpha=0.2,
-                            label="GP +-1 sigma",
-                        )
-                    ax.set_xlabel("rho")
-                    ax.set_ylabel(f"{label} {unit}")
-                    ax.set_ylim(bottom=0, top=ylim)
-                    ax.set_title(f"shot {shot}  t={ts_time[i_time]:.3f} s  n_valid={valid.sum()}")
-                    ax.grid(alpha=0.3)
-                    ax.legend(fontsize=8)
-                    if i_time < len(hyps_arr) and np.isfinite(hyps_arr[i_time]).all():
-                        var, l1, l2, lw, x0 = hyps_arr[i_time]
-                        ax.text(
-                            0.98,
-                            0.98,
-                            f"var={var:.2f}  l1={l1:.2f}  l2={l2:.2f}\nlw={lw:.2f}  x0={x0:.2f}",
-                            transform=ax.transAxes,
-                            ha="right",
-                            va="top",
-                            fontsize=7,
-                            family="monospace",
-                        )
-
-                for ax, grad_y, grad_err, label in [
-                    (axes[1, 0], fit_output.te_grad[i_time, :], fit_output.te_grad_std[i_time, :], "dTe/drho [keV]"),
-                    (axes[1, 1], fit_output.ne_grad[i_time, :], fit_output.ne_grad_std[i_time, :], "dne/drho [1e20 m^-3]"),
-                ]:
-                    grad_valid = np.isfinite(grad_y)
-                    if grad_valid.any():
-                        ax.plot(self.gp_fit_rho[grad_valid], grad_y[grad_valid], color="black", label="GP gradient")
-                        ax.fill_between(
-                            self.gp_fit_rho[grad_valid],
-                            (grad_y - grad_err)[grad_valid],
-                            (grad_y + grad_err)[grad_valid],
-                            color="black",
-                            alpha=0.2,
-                            label="GP +-1 sigma",
-                        )
-                    ax.axhline(0.0, color="gray", lw=0.8, alpha=0.5)
-                    ax.set_xlabel("rho")
-                    ax.set_ylabel(label)
-                    ax.set_title(f"shot {shot}  t={ts_time[i_time]:.3f} s")
-                    ax.grid(alpha=0.3)
-                    if ax.get_legend_handles_labels()[0]:
-                        ax.legend(fontsize=8)
-
-                fig.tight_layout()
-                pdf.savefig(fig)
-                plt.close(fig)
-
-        logger.info(f"Saved TS fit diagnostic plot to {pdf_path}")
+        fit_input = self._extract_fit_input(te_eV, ne_m3, rho_ts)
+        n_pages = ts_fit_pdf(
+            pdf_path,
+            shot,
+            ts_time,
+            fit_input.x,
+            {"te": (fit_input.te_y, fit_input.te_err), "ne": (fit_input.ne_y, fit_input.ne_err)},
+            fit_output,
+            self.gp_fit_rho,
+        )
+        if n_pages:
+            logger.info(f"Saved TS fit diagnostic plot ({n_pages} slices) to {pdf_path}")
 
     # ------------------------------------------------------------------
     def make_raw_data_files(self, debug_plot_dir: Path | str | None = None):
@@ -895,7 +783,7 @@ class MASTDataWorkflow(DataWorkflow):
                 continue
 
             # Retrieve and stage source data
-            fit_input = self._prepare_shot(shot)
+            fit_input = self.prepare_shot(shot)
             if fit_input is None:
                 continue
 
@@ -914,7 +802,7 @@ class MASTDataWorkflow(DataWorkflow):
                     num_workers=self.fit_workers,
                 )
 
-            if self._assemble_shot(shot, outputs[shot]):
+            if self.assemble_shot(shot, outputs[shot]):
                 processed_shots += 1
 
         logger.info("Finished making MAST raw data files.")
@@ -944,63 +832,19 @@ class MASTDataWorkflow(DataWorkflow):
         ds["delta_top"] = ds["tritop"]
         ds["delta_bot"] = ds["tribot"]
 
-        if "ne20_rho" in ds and "rho" in ds.coords:
-            ds["ne20_edge"] = ds["ne20_rho"].sel(rho=0.9, method="nearest")
-        else:
-            ds["ne20_edge"] = xr.zeros_like(ds["Ip_MA"])
+        # MAST has no edge interferometry, take the density from rho=0.9
+        ds["ne20_edge"] = ds["ne20_rho"].sel(rho=0.9, method="nearest")
 
         # Expose time as a data variable (needed by organize_data profile pipeline)
         if TIME_COORD in ds.coords and TIME_COORD not in ds.data_vars:
             ds = ds.reset_coords([TIME_COORD])
 
-        # Same set of variables as the C-Mod workflow, plus 'time' which the
-        # organize_data profile pipeline needs as a data variable
-        kept_vars = {
-            # POWER BALANCE
-            "Wtot_MJ",
-            "P_oh_MW",
-            "P_rad_MW",
-            "P_ICRF_MW",
-            "P_LH_MW",
-            "P_NBI_MW",
-            "P_ECRH_MW",
-            # PROFILE PREDICTOR TRAINING
-            "Te_keV_rho",
-            "Te_keV_rho_error",
-            "Te_keV_rho_grad",
-            "Te_keV_rho_grad_error",
-            "ne20_rho",
-            "ne20_rho_error",
-            "ne20_rho_grad",
-            "ne20_rho_grad_error",
-            "Ip_MA",
-            "B0",
-            "betan",
-            "ne20_line_avg",
-            "R0",
-            "kappa",
-            "a_minor",
-            "delta_top",
-            "delta_bot",
-            # OTHER
-            "beta_p",
-            "ne20_edge",
-            "time",
-        }
-
-        # Every shot must provide the full variable set: a shot with missing variables
-        # (e.g. a stale raw file from an older pipeline version) cannot be appended to
-        # the zarr store without corrupting it, so exclude it here instead.
-        missing = kept_vars - set(ds.data_vars)
-        if missing:
-            shot_id = ds["shot"].item() if "shot" in ds else "unknown"
-            logger.warning(f"Shot {shot_id}: missing expected variables {sorted(missing)}, excluding (stale raw file?)")
-            return None
-
         if self.has_all_nan_signal(ds, ["Te_keV_rho", "ne20_rho", "Ip_MA"]):
             return None
 
-        ds = ds[list(kept_vars)]
+        # Same variables as every other device, plus 'time' which the
+        # organize_data profile pipeline needs as a data variable
+        ds = ds[[*RAW_DATASET_VARS, TIME_COORD]]
 
         return self.standardize_dim_names(ds)
 
@@ -1009,33 +853,27 @@ class MASTDataWorkflow(DataWorkflow):
         """Cull bad GP-fitted profiles and fill ne20_edge from profile."""
         # Greenwald fraction for the fGW range filter
         # n_GW = Ip/(pi a^2) in 1e20 m^-3 with Ip in MA.
-        if all(v in ds for v in ("ne20_line_avg", "Ip_MA", "a_minor")):
-            ds["fGW"] = ds["ne20_line_avg"] / (ds["Ip_MA"] / (np.pi * ds["a_minor"] ** 2))
+        ds["fGW"] = ds["ne20_line_avg"] / (ds["Ip_MA"] / (np.pi * ds["a_minor"] ** 2))
 
         # NaN out timeslices where the fit went negative inside rho < 1.0
-        if "ne20_rho" in ds and "Te_keV_rho" in ds:
-            negative_profile_mask = (ds["ne20_rho"].where(ds["rho"] < 1.0) < 0).any(dim="rho") | (
-                ds["Te_keV_rho"].where(ds["rho"] < 1.0) < 0
-            ).any(dim="rho")
-            n_culled = negative_profile_mask.sum().item()
-            if n_culled > 0:
-                shot_id = ds["shot"].item() if "shot" in ds else "unknown"
-                logger.info(f"Shot {shot_id}: culling {n_culled} timeslices with negative profile fits")
-            ds["ne20_rho"] = ds["ne20_rho"].where(~negative_profile_mask)
-            ds["Te_keV_rho"] = ds["Te_keV_rho"].where(~negative_profile_mask)
+        negative_profile_mask = (ds["ne20_rho"].where(ds["rho"] < 1.0) < 0).any(dim="rho") | (
+            ds["Te_keV_rho"].where(ds["rho"] < 1.0) < 0
+        ).any(dim="rho")
+        n_culled = negative_profile_mask.sum().item()
+        if n_culled > 0:
+            shot_id = ds["shot"].item() if "shot" in ds else "unknown"
+            logger.info(f"Shot {shot_id}: culling {n_culled} timeslices with negative profile fits")
+        for var in PROFILE_FIT_VARS:
+            ds[var] = ds[var].where(~negative_profile_mask)
 
-        if "ne20_edge" in ds and "ne20_rho" in ds and "rho" in ds["ne20_rho"].dims:
-            ne_edge_from_profile = ds["ne20_rho"].sel(rho=0.9, method="nearest")
-            ds["ne20_edge"] = ds["ne20_edge"].where(
-                ds["ne20_edge"].notnull() & (ds["ne20_edge"] > 0.001),
-                ne_edge_from_profile,
-            )
+        # ne20_edge comes from the profile (see standardize_signal_names), so
+        # re-read it here to pick up the culling above
+        ds["ne20_edge"] = ds["ne20_rho"].sel(rho=0.9, method="nearest")
 
         # Scalar core temperature so filter_config can range-check it: filter_ds
         # broadcasts masks over every dim of the variable, so the 3D Te_keV_rho
         # cannot go in filter_config directly.
-        if "Te_keV_rho" in ds and "rho" in ds["Te_keV_rho"].dims:
-            ds["Te_keV_core"] = ds["Te_keV_rho"].sel(rho=0, method="nearest")
+        ds["Te_keV_core"] = ds["Te_keV_rho"].sel(rho=0, method="nearest")
 
         # Raw files store time as a data var on (time_idx,) only. filter_ds's
         # where() then broadcasts it against the (time_idx, shot) valid mask,

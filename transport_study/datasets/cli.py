@@ -73,7 +73,6 @@ class DatasetCLI:
         max_num_shots: int | None = None,
         mode: str | None = "raw",
         clean: bool | None = False,
-        skip_profiles: bool | None = False,
         fit_workers: int = 1,
         cluster_profile: str | None = None,
         cluster_partitions: str | None = None,
@@ -104,7 +103,6 @@ class DatasetCLI:
             shotlist_file=shotlist_file,
             data_assembly_dir=data_assembly_dir,
             max_num_shots=max_num_shots,
-            skip_profiles=skip_profiles,
             cluster_config=cluster_config,
             fit_workers=fit_workers,
         )

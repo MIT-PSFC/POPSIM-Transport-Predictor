@@ -837,3 +837,128 @@ def fit_mean_ylim(fit_mean: np.ndarray, fallback: float, pad: float = 1.05) -> f
     if not np.isfinite(hi) or hi <= 0:
         return fallback
     return hi * pad
+
+
+# Panel labels for the TS fit diagnostic, keyed by the fit_output variable prefix
+_TS_FIT_PANELS = (
+    ("te", "Te [keV]", "dTe/drho [keV]", 5.0),
+    ("ne", "ne [1e20 m^-3]", "dne/drho [1e20 m^-3]", 1.8),
+)
+
+
+def ts_fit_pdf(
+    pdf_path: Path | str,
+    shot: int,
+    ts_time: np.ndarray,
+    rho_ch: np.ndarray,
+    channel_data: dict[str, tuple[np.ndarray, np.ndarray]],
+    fit_output,
+    rho_fit: np.ndarray,
+    channel_groups: list[tuple[np.ndarray, str, str]] | None = None,
+    max_pages: int = 20,
+) -> int:
+    """Save a PDF comparing the GP fits to the raw TS measurements for one shot.
+
+    One page per sampled measurement time, 2x2 panels: Te (top left) and ne (top
+    right) with the channel data, GP fit mean and +-1 sigma predictive band, then
+    the GP gradients d/drho with their +-1 sigma bands below. Fitted
+    hyperparameters [var, l1, l2, lw, x0] are annotated on the profile panels.
+
+    Parameters
+    ----------
+    ts_time : (n_t,) measurement times [s]
+    rho_ch : (n_t, n_ch) channel rho locations, NaN where invalid
+    channel_data : {"te": (y, err), "ne": (y, err)}, each (n_t, n_ch), in the
+        same units the fit consumed (Te [keV], ne [1e20 m^-3])
+    fit_output : ShotFitOutput whose rows align with ts_time
+    rho_fit : (n_x,) rho grid the fits were predicted on
+    channel_groups : optional (mask (n_ch,), color, label) triples to split the
+        channels by diagnostic (C-Mod core vs edge Thomson); one blue "raw TS"
+        group when None.
+
+    Returns the number of pages written; a shot with no fitted slice writes no
+    file at all.
+    """
+    import matplotlib
+
+    matplotlib.use("Agg")
+
+    pdf_path = Path(pdf_path)
+    pdf_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Only page over slices where the fit produced a real profile. Times outside
+    # the plasma have no valid TS channels, so the fit is all-NaN and the panels
+    # come out blank.
+    has_fit = np.isfinite(fit_output.te_fit).any(axis=-1) | np.isfinite(fit_output.ne_fit).any(axis=-1)
+    live = np.flatnonzero(has_fit)[:: max(1, np.count_nonzero(has_fit) // max_pages)]
+
+    n_ch = rho_ch.shape[1]
+    groups = channel_groups if channel_groups is not None else [(np.ones(n_ch, dtype=bool), "tab:blue", "raw TS")]
+    ylims = {var: fit_mean_ylim(getattr(fit_output, f"{var}_fit"), fallback=fallback) for var, _, _, fallback in _TS_FIT_PANELS}
+
+    with PdfPages(pdf_path) as pdf:
+        for i_time in live:
+            fig, axes = plt.subplots(2, 2, figsize=(12, 10))
+            title = f"shot {shot}  t={ts_time[i_time]:.3f} s"
+            for i_var, (var, label, grad_label, _) in enumerate(_TS_FIT_PANELS):
+                data_y, err_y = (arr[i_time, :] for arr in channel_data[var])
+                rho_at_t = rho_ch[i_time, :]
+
+                ax = axes[0, i_var]
+                for mask, color, name in groups:
+                    valid = mask & np.isfinite(rho_at_t) & np.isfinite(data_y) & np.isfinite(err_y)
+                    if valid.any():
+                        ax.errorbar(rho_at_t[valid], data_y[valid], yerr=err_y[valid], fmt="o", ms=4, color=color, label=name, zorder=3)
+                _plot_fit_band(
+                    ax, rho_fit, getattr(fit_output, f"{var}_fit")[i_time, :], getattr(fit_output, f"{var}_std")[i_time, :], "GP fit"
+                )
+                ax.set_ylim(bottom=0, top=ylims[var])
+                _style_ts_panel(ax, label, title)
+                hyps = getattr(fit_output, f"{var}_hyps")[i_time]
+                if np.isfinite(hyps).all():
+                    var_h, l1, l2, lw, x0 = hyps
+                    ax.text(
+                        0.98,
+                        0.98,
+                        f"var={var_h:.2f}  l1={l1:.2f}  l2={l2:.2f}\nlw={lw:.2f}  x0={x0:.2f}",
+                        transform=ax.transAxes,
+                        ha="right",
+                        va="top",
+                        fontsize=7,
+                        family="monospace",
+                    )
+
+                ax = axes[1, i_var]
+                _plot_fit_band(
+                    ax,
+                    rho_fit,
+                    getattr(fit_output, f"{var}_grad")[i_time, :],
+                    getattr(fit_output, f"{var}_grad_std")[i_time, :],
+                    "GP gradient",
+                )
+                ax.axhline(0.0, color="gray", lw=0.8, alpha=0.5)
+                _style_ts_panel(ax, grad_label, title)
+
+            fig.tight_layout()
+            pdf.savefig(fig)
+            plt.close(fig)
+
+    return len(live)
+
+
+def _plot_fit_band(ax, x: np.ndarray, y: np.ndarray, err: np.ndarray, label: str) -> None:
+    """Fit mean plus its +-1 sigma band, over the finite part of the grid."""
+    valid = np.isfinite(y)
+    if not valid.any():
+        return
+    ax.plot(x[valid], y[valid], color="black", label=label)
+    ax.fill_between(x[valid], (y - err)[valid], (y + err)[valid], color="black", alpha=0.2, label="GP +-1 sigma")
+
+
+def _style_ts_panel(ax, ylabel: str, title: str) -> None:
+    ax.set_xlabel("rho")
+    ax.set_ylabel(ylabel)
+    ax.set_title(title)
+    ax.grid(alpha=0.3)
+    if ax.get_legend_handles_labels()[0]:
+        ax.legend(fontsize=8)

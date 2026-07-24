@@ -1,7 +1,7 @@
 """Tests for the GP fitting batch format, worker, and dispatcher logic.
 
 The real cluster interaction (srunx submission, rsync) needs a cluster, so the
-dispatcher loop is exercised against a fake backend; everything else here runs
+dispatcher loop is exercised against a fake backend. Everything else here runs
 exactly the code the cluster path uses: the npz round-trip, deterministic batch
 planning for restart safety, and the fitting math the worker executes.
 """
@@ -32,6 +32,7 @@ from transport_study.datasets.gp_fitting.fit_worker import (
     data_envelope,
     fit_batch,
     fit_variable,
+    gp_profile,
     main,
     nonphysical_peak,
     pack_fit_batch,
@@ -71,7 +72,7 @@ def _tracking_data(rho_ch, fit, rho_fit, rel_err=0.1):
 
 
 def test_data_envelope_includes_nearest_neighbors():
-    # A gap between channels at 0.72 and 0.90: envelope at rho 0.84 must stillt (the zero-margin rule culled these).
+    # A gap between channels at 0.72 and 0.90: envelope at rho 0.84 must still include the nearest neighbors (the zero-margin rule culled these).
     # see the high inner neighbor so pedestal interpolation never reads as
     # overshoot.
     x = np.array([0.5, 0.72, 0.90, 1.0])
@@ -389,55 +390,200 @@ def test_fit_batch_max_slices_per_shot():
 
 
 # ----------------------------------------------------------------------
-# Monotonic-edge constraint (virtual zero-slope observations, _MONO_CHECK_RHO)
+# Monotonic-edge constraint (virtual zero-slope observations, MONO_CHECK_RHO)
 # ----------------------------------------------------------------------
+MONO_X_STAR = np.linspace(0.0, 1.1, 56)
+MONO_CH = np.linspace(0.02, 1.05, 22)
+
+
+def _edge_bump_slice():
+    """Pedestal with a data-supported bump on its shoulder, tight error bars so
+    the short edge length scale of FIXED_HYPERPARAMS tracks it."""
+    base = 1.0 * (1 - np.tanh((MONO_CH - 0.75) / 0.06)) / 2 + 0.05
+    y = base + 0.30 * np.exp(-(((MONO_CH - 0.95) / 0.04) ** 2))
+    return MONO_CH, y, np.full_like(y, 0.01)
+
+
+@contextmanager
+def _mono_check_rho(values):
+    """Temporarily swap the constraint's check grid (empty disables it)."""
+    from transport_study.datasets.gp_fitting import fit_worker
+
+    saved = fit_worker.MONO_CHECK_RHO
+    fit_worker.MONO_CHECK_RHO = np.asarray(values, dtype=float)
+    try:
+        yield
+    finally:
+        fit_worker.MONO_CHECK_RHO = saved
+
+
+def _fit(x, y, err, **kwargs):
+    return gp_profile(x, y, err, MONO_X_STAR, calc_gradient=True, **kwargs)
+
+
 def test_mono_constraint_suppresses_edge_bump():
-    """A slice whose unconstrained fit rises past rho 0.6 (broad data-supported
-    dip-then-bump at the edge, fit at fixed hyperparameters with the short edge
-    length scale so the kernel tracks it) should come back from gp_profile with
-    max gradient over rho >= 0.6 at or below roughly _MONO_GRAD_ERR, and the
-    returned gradient must belong to the same posterior as the returned mean
-    (finite differences of the fit should match the gradient to first order).
+    """A slice whose unconstrained fit rises past rho 0.6 comes back flattened.
+
+    The constraint is soft (the virtual observations carry MONO_GRAD_ERR as
+    their error bar), so the bump becomes a plateau rather than exactly zero
+    slope: what is pinned down here is that the constrained fit cuts the edge
+    gradient by most of its value and leaves no rise the unconstrained fit did
+    not already have.
     """
+    x, y, err = _edge_bump_slice()
+    with threadpool_limits(1):
+        with _mono_check_rho([]):
+            free_mean, _, free_grad, _, _ = _fit(x, y, err, hyperparams=FIXED_HYPERPARAMS, optimize_hyperparams=False)
+        mean, _, grad, _, _ = _fit(x, y, err, hyperparams=FIXED_HYPERPARAMS, optimize_hyperparams=False)
+
+    edge = MONO_X_STAR >= 0.6
+    assert np.nanmax(free_grad[edge]) > 0.5, "test data does not produce a rising edge without the constraint"
+    assert np.nanmax(grad[edge]) < 0.4 * np.nanmax(free_grad[edge])
+    # The bump itself is gone from the mean, not just from the gradient
+    shoulder = (MONO_X_STAR >= 0.85) & (MONO_X_STAR <= 1.0)
+    assert np.max(np.diff(mean[shoulder])) < np.max(np.diff(free_mean[shoulder]))
+    # The returned gradient belongs to the same posterior as the returned mean
+    fd = np.gradient(mean, MONO_X_STAR)
+    interior = (MONO_X_STAR > 0.05) & (MONO_X_STAR < 1.05)
+    assert np.nanmax(np.abs(fd[interior] - grad[interior])) < 0.1 * np.nanmax(np.abs(grad[interior]))
 
 
 def test_mono_constraint_leaves_monotone_slice_untouched():
-    """A cleanly monotone pedestal slice never trips the check, so the fit with
-    the constraint machinery present must be bit-identical to the fit with
-    _MONO_CHECK_RHO emptied out (no virtual observations, no extra refit, and
-    the deterministic seeding unchanged).
-    """
+    """A cleanly monotone pedestal never trips the check, so the fit must be
+    bit-identical to one with the check grid emptied out (no virtual
+    observations, no extra refit, unchanged deterministic seeding)."""
+    y = 1.0 * (1 - np.tanh((MONO_CH - 0.9) / 0.08)) / 2 + 0.05
+    err = np.full_like(y, 0.02)
+    with threadpool_limits(1):
+        mean, std, grad, grad_std, hyps = _fit(MONO_CH, y, err, hyperparams=FIXED_HYPERPARAMS, optimize_hyperparams=False)
+        with _mono_check_rho([]):
+            free = _fit(MONO_CH, y, err, hyperparams=FIXED_HYPERPARAMS, optimize_hyperparams=False)
+
+    for got, expected in zip((mean, std, grad, grad_std, hyps), free, strict=True):
+        np.testing.assert_array_equal(got, expected)
 
 
 def test_mono_constraint_preserves_hollow_core():
-    """A hollow profile with clearly positive gradient inside rho < 0.6 keeps
-    that positive gradient after the constraint runs: check points start at
-    0.6, so the core region must be unconstrained even when the edge of the
-    same slice gets virtual observations.
-    """
+    """A hollow profile keeps its positive core gradient: the check grid starts
+    at rho 0.6, so the core is never constrained even when the same slice picks
+    up virtual observations further out."""
+    y = np.where(MONO_CH > 1.0, 0.05, 0.6 + 0.5 * np.exp(-(((MONO_CH - 0.4) / 0.2) ** 2)))
+    err = np.full_like(y, 0.03)
+    with threadpool_limits(1):
+        mean, _, grad, _, _ = _fit(MONO_CH, y, err, hyperparams=FIXED_HYPERPARAMS, optimize_hyperparams=False)
+        with _mono_check_rho([]):
+            free_mean, _, free_grad, _, _ = _fit(MONO_CH, y, err, hyperparams=FIXED_HYPERPARAMS, optimize_hyperparams=False)
+
+    core = MONO_X_STAR < 0.5
+    assert np.nanmax(free_grad[core]) > 0.1, "test data has no hollow core to preserve"
+    np.testing.assert_allclose(grad[core], free_grad[core], atol=0.02)
+    np.testing.assert_allclose(mean[core], free_mean[core], atol=0.01)
 
 
-def test_mono_constraint_refit_failure_keeps_unconstrained_fit():
-    """If the constrained refit raises inside _run_gp (monkeypatch it to return
-    None on any call with extra_grad_bc), gp_profile should return the
-    unconstrained fit instead of failing the slice.
-    """
+def test_mono_constraint_refit_failure_keeps_unconstrained_fit(monkeypatch):
+    """A constrained refit that fails inside _run_gp leaves the unconstrained
+    fit standing instead of losing the slice."""
+    from transport_study.datasets.gp_fitting import fit_worker
+
+    x, y, err = _edge_bump_slice()
+    with threadpool_limits(1):
+        expected = _fit(x, y, err, hyperparams=FIXED_HYPERPARAMS, optimize_hyperparams=False)
+
+        real_run_gp = fit_worker._run_gp
+
+        def failing_refit(*args, extra_grad_bc=None, **kwargs):
+            if extra_grad_bc is not None:
+                return None
+            return real_run_gp(*args, **kwargs)
+
+        monkeypatch.setattr(fit_worker, "_run_gp", failing_refit)
+        got = _fit(x, y, err, hyperparams=FIXED_HYPERPARAMS, optimize_hyperparams=False)
+
+    assert got[0] is not None
+    with _mono_check_rho([]):
+        with threadpool_limits(1):
+            monkeypatch.undo()
+            free = _fit(x, y, err, hyperparams=FIXED_HYPERPARAMS, optimize_hyperparams=False)
+    # Failed refit -> the unconstrained fit, not the one the constraint produced
+    np.testing.assert_array_equal(got[0], free[0])
+    assert not np.array_equal(got[0], expected[0])
 
 
-def test_mono_constraint_second_pass_adds_only_new_points():
-    """When the first constrained refit still shows a violation at a check
-    point that already carries a virtual observation, no duplicate row may be
-    added and the loop must terminate (setdiff on mono_bc rho values); a
-    violation appearing at a NEW check point after the first refit gets one
-    more refit and then the loop stops at _MONO_MAX_PASSES.
-    """
+def test_mono_constraint_second_pass_adds_only_new_points(monkeypatch):
+    """Virtual observations accumulate without duplicates and the loop is
+    bounded: a violation that persists at an already-constrained point adds
+    nothing and stops the loop, while one at a new point earns another pass."""
+    from transport_study.datasets.gp_fitting import fit_worker
+
+    check_rho = np.array([0.7, 0.8, 0.9])
+    n_out = MONO_X_STAR.size
+    calls = []
+
+    class FakeGP:
+        """Reports a violation at 0.7 on the first fit, then at 0.7 and 0.8."""
+
+        def __init__(self, n_calls):
+            self.n_calls = n_calls
+
+        def get_gp_drv_mean(self):
+            drv = np.zeros(n_out + check_rho.size)
+            drv[n_out + 0] = 1.0  # 0.7 always violates
+            if self.n_calls >= 1:
+                drv[n_out + 1] = 1.0  # 0.8 starts violating after the first refit
+            return drv
+
+        def get_gp_mean(self):
+            return np.zeros(n_out + check_rho.size)
+
+        def get_gp_std(self, noise_flag=True):
+            return np.zeros(n_out + check_rho.size)
+
+        def get_gp_drv_std(self, noise_flag=False):
+            return np.zeros(n_out + check_rho.size)
+
+        def get_gp_kernel_details(self):
+            return None, FIXED_HYPERPARAMS
+
+    def fake_run_gp(*args, extra_grad_bc=None, **kwargs):
+        calls.append(None if extra_grad_bc is None else np.array(extra_grad_bc))
+        return FakeGP(len(calls) - 1)
+
+    monkeypatch.setattr(fit_worker, "_run_gp", fake_run_gp)
+    with _mono_check_rho(check_rho):
+        _fit(np.array([0.1, 0.5, 0.9]), np.array([1.0, 0.8, 0.1]), np.array([0.1, 0.1, 0.1]), hyperparams=FIXED_HYPERPARAMS)
+
+    # First call is the unconstrained fit, then one refit per newly violated point
+    assert len(calls) == 3
+    assert calls[0] is None
+    np.testing.assert_allclose(calls[1][:, 0], [0.7])
+    np.testing.assert_allclose(calls[2][:, 0], [0.7, 0.8])  # 0.7 not duplicated
+    assert (calls[2][:, 1] == 0.0).all()
+    assert (calls[2][:, 2] == fit_worker.MONO_GRAD_ERR).all()
 
 
 def test_mono_constraint_hyps_come_from_unconstrained_optimize():
-    """The hyperparameters returned by gp_profile (and thus the x0 used to pin
-    Te to the ne fit) must come from the original optimized fit, not from the
-    constrained refit, which runs at fixed hyperparameters.
-    """
+    """The returned hyperparameters (whose x0 pins Te to the ne fit) come from
+    the original optimized fit, since the refit runs at fixed hyperparameters."""
+    from transport_study.datasets.gp_fitting import fit_worker
+
+    seen = []
+    real_run_gp = fit_worker._run_gp
+
+    def recording_run_gp(*args, **kwargs):
+        gp = real_run_gp(*args, **kwargs)
+        if gp is not None:
+            seen.append((kwargs.get("extra_grad_bc"), np.asarray(gp.get_gp_kernel_details()[1], dtype=float)))
+        return gp
+
+    x, y, err = _edge_bump_slice()
+    with threadpool_limits(1):
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(fit_worker, "_run_gp", recording_run_gp)
+            _, _, _, _, hyps = _fit(x, y, err, hyperparams=FIXED_HYPERPARAMS, optimize_hyperparams=False)
+
+    unconstrained = [h for bc, h in seen if bc is None]
+    assert unconstrained, "no unconstrained fit was recorded"
+    np.testing.assert_array_equal(hyps, unconstrained[0])
 
 
 # ----------------------------------------------------------------------
@@ -887,7 +1033,7 @@ def _spawn_for_disruption_py():
     reproduces with no fitting code at all, and persists with output capture
     disabled, so it isn't a captured-stdout pipe issue - it's a fork-inherited
     lock). "spawn" starts each worker from a fresh interpreter instead of forking,
-    which sidesteps the inherited-lock deadlock; only the C-Mod _prepare_shot call
+    which sidesteps the inherited-lock deadlock. Only the C-Mod prepare_shot call
     goes through disruption_py's SQL/MDSplus retrieval, so this is scoped tightly
     around that rather than changed for the whole test session (MAST retrieval and
     fit_worker's own slice-level multiprocessing.Pool are unaffected either way).
@@ -936,14 +1082,14 @@ CMOD_SPOT_CHECK = [
 class TestGPFitCMOD:
     """Spot check the GP fitting on select C-Mod shots and timesteps.
 
-    Pulls Thomson + EFIT through the same _prepare_shot codepath the cmod CLI
+    Pulls Thomson + EFIT through the same prepare_shot codepath the cmod CLI
     uses (so TS channels get mapped onto rho), fits one TS measurement time per
     test case with the production GP path, and writes a diagnostic PDF to
     tests/test_outputs/gp_fitting/{shot}_t{time}/ for eyeballing. Parametrized
     one timestep at a time (rather than bundling a shot's timesteps into one
     test) so a single slice can be run, debugged, or inspected in isolation.
     The plots show the exact (floored, unit-converted) channel data the fit
-    consumed. Requires local C-Mod MDSplus access; skips otherwise.
+    consumed. Requires local C-Mod MDSplus access. Skips otherwise.
     """
 
     SPOT_CHECK = CMOD_SPOT_CHECK
@@ -970,17 +1116,17 @@ class TestGPFitCMOD:
         import xarray as xr
 
         try:
-            # _prepare_shot stages source data to netCDF and returns early from
+            # prepare_shot stages source data to netCDF and returns early from
             # that cache on repeat calls, so re-calling it for each of a shot's
             # timestep cases only hits MDSplus once per shot, not once per case.
             with _spawn_for_disruption_py():
-                fit_input = workflow._prepare_shot(shot)
+                fit_input = workflow.prepare_shot(shot)
         except Exception as e:
             pytest.skip(f"C-Mod data unreachable for shot {shot}: {e}")
         if fit_input is None:
             pytest.skip(f"C-Mod shot {shot} returned no fittable data (data access?)")
 
-        thomson_path, _ = workflow._staging_paths(shot)
+        thomson_path, _ = workflow.staging_paths(shot)
         ds_thomson = xr.load_dataset(thomson_path)
         times = ds_thomson.squeeze("shot", drop=True)["time"].values
         idx = _nearest_indices(times, [t])[0]
@@ -1004,18 +1150,11 @@ class TestGPFitCMOD:
         assert np.isfinite(out.te_fit[0]).any(), f"shot {shot} t={t}: Te fit all NaN"
         assert np.isfinite(out.ne_fit[0]).any(), f"shot {shot} t={t}: ne fit all NaN"
 
-        # One directory per (shot, time) case: _debug_plot_profiles always names
+        # One directory per (shot, time) case: debug_plot_profiles always names
         # its file "{shot}_ts_gp_fit.pdf", so separate cases for the same shot
         # would otherwise overwrite each other's output.
         plot_dir = GP_FIT_PLOT_DIR / f"{shot}_t{t:.3f}"
-        ds_profiles = workflow._profiles_dataset_from_fit(shot, times[[idx]], out)
-        workflow._debug_plot_profiles(
-            shot,
-            ds_thomson.isel(time=[idx]),
-            ds_profiles,
-            debug_plot_dir=plot_dir,
-            fit_output=out,
-        )
+        workflow.debug_plot_profiles(shot, ds_thomson.isel(time=[idx]), out, debug_plot_dir=plot_dir)
         assert (plot_dir / f"{shot}_ts_gp_fit.pdf").exists()
 
 
@@ -1024,10 +1163,10 @@ class TestGPFitMAST:
     """Spot check the GP fitting on a MAST shot, one timestep at a time.
 
     Mirrors TestGPFitCMOD against the open-access MAST S3 store (shot 30284),
-    using the mast CLI's _prepare_shot codepath. Each test case fits one of the
+    using the mast CLI's prepare_shot codepath. Each test case fits one of the
     best-covered TS slices (ranked by valid-channel count) and writes a
     diagnostic PDF to tests/test_outputs/gp_fitting/{shot}_t{time}/. Requires
-    network access to the MAST store; skips otherwise.
+    network access to the MAST store. Skips otherwise.
     """
 
     SHOT = 30284
@@ -1064,13 +1203,13 @@ class TestGPFitMAST:
         """rank=0 is the best-covered TS slice, rank=1 the next best, etc."""
         import xarray as xr
 
-        # _prepare_shot stages to netCDF and returns early from that cache on
+        # prepare_shot stages to netCDF and returns early from that cache on
         # repeat calls, so re-calling it per rank only hits S3 once per class.
-        fit_input = workflow._prepare_shot(self.SHOT)
+        fit_input = workflow.prepare_shot(self.SHOT)
         if fit_input is None:
             pytest.skip(f"MAST shot {self.SHOT} returned no fittable data")
 
-        ds_staging = xr.load_dataset(workflow._staging_path(self.SHOT))
+        ds_staging = xr.load_dataset(workflow.staging_path(self.SHOT))
         ts_time = ds_staging["ts_time"].values
         te_eV = ds_staging["ts_te_eV"].values
         ne_m3 = ds_staging["ts_ne_m3"].values
@@ -1094,17 +1233,9 @@ class TestGPFitMAST:
         assert np.isfinite(out.te_fit[0]).any(), f"slice {i}: Te fit all NaN"
         assert np.isfinite(out.ne_fit[0]).any(), f"slice {i}: ne fit all NaN"
 
-        # One directory per rank: _debug_plot_profiles always names its file
+        # One directory per rank: debug_plot_profiles always names its file
         # "{shot}_ts_gp_fit.pdf", so separate cases would otherwise clobber
         # each other's output.
         plot_dir = GP_FIT_PLOT_DIR / f"{self.SHOT}_t{ts_time[i]:.3f}"
-        workflow._debug_plot_profiles(
-            self.SHOT,
-            ts_time[[i]],
-            te_eV[[i]] / 1e3,
-            ne_m3[[i]] / 1e20,
-            rho_ts[[i]],
-            out,
-            plot_dir,
-        )
+        workflow.debug_plot_profiles(self.SHOT, ts_time[[i]], te_eV[[i]], ne_m3[[i]], rho_ts[[i]], out, plot_dir)
         assert (plot_dir / f"{self.SHOT}_ts_gp_fit.pdf").exists()

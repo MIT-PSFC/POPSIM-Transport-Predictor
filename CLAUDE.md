@@ -37,7 +37,8 @@ python -m transport_study.datasets.cli [args]
 ```
 Device raw data (MDSPlus/files)
     -> datasets/ workflows (per-device)
-        - Gaussian process profile fitting (gptools submodule)
+        - Gaussian process profile fitting (mkgp, in datasets/gp_fitting/,
+          optionally dispatched to a SLURM cluster)
         - Standardize signal names, 1 kHz uniform timebase
         - Output: xarray Dataset (dims: shot, time_idx, psi_n)
     -> organize_data.py
@@ -69,6 +70,8 @@ CRITICAL: `str(case)` names checkpoint dirs, result files, tuned-config paths, w
 
 **DataWorkflow** (`datasets/workflow.py`): Abstract base for device-specific data acquisition. Each device (cmod/, d3d/, tcv/, mast/) implements this interface and outputs xarray Datasets in a standardized schema. The base provides `standardize_dim_names` (rename to POPSIM's `shot`/`time_idx`/`time` conventions), `has_all_nan_signal` (skip-shot check), and a default `device_specific_culling` (cull when either profile is all NaN; mast and tcv override it). Only the raw per-shot files are strictly uniform at 1 kHz - filtering drops interior timeslices, so processed datasets can have mid-shot dt gaps (`organize_data.reindex_to_uniform_timebase` puts them back on the canonical grid with NaNs).
 
+The GP-fitting devices (C-Mod, MAST) implement the distributed-fitting interface the base's `make_raw_data_files_distributed` drives: `prepare_shot` (download + stage source data, idempotent, returns a `ShotFitInput`) and `assemble_shot` (staged data + fit results -> raw netCDF, then delete the staging). Staging is per-shot under `<ds_name>/fit_staging/` and is deleted once a shot's raw file exists, so refitting an already-assembled shot means re-pulling from MDSplus/S3; the fit inputs themselves survive in `fit_staging/batches/batch_*.npz`. `workflow.RAW_DATASET_VARS` fixes the variable set (and order) of every raw file, and `PROFILE_FIT_VARS` is the profile block - values plus their error-bar and gradient companions, which `device_specific_processing` must NaN together when it culls a timeslice. `plotting.ts_fit_pdf` is the shared TS-fit-vs-GP diagnostic PDF both devices write per assembled shot (C-Mod passes core/edge channel groups, MAST has a single Thomson system).
+
 **Input normalization as POPSIM modules** (`modules/normalization.py`): the power-balance models take the same 7 physical inputs (`Ip_MA, B0, R0, a_minor, kappa, ne20_line_avg, P_aux_MW`) plus `ds_source_idx`. Each model owns an `InputNormalizer` (`raw` identity / `physics` dimensionless / `zscore` per-device / `coral` per-device covariance alignment / `physics-coral` and `physics-zscore` stat stages fitted in the physics feature space), fitted from TRAINING data only at model_init and stored as frozen buffers (they checkpoint with the model but are never trainable - trainable selectors pick `module.nn` leaves explicitly). `organize_data.normalize_domain` implements the same math on whole datasets for data visualization only. `organize_data.add_missing_profile_companions` fills gradient / error-bar companions for datasets that lack them (TCV produces no GP-fit gradients); it is live TCV support, not legacy handling.
 
 **Data visualization** (`orchestration/data_visualization.py`): `DataVisualizationBase` holds the shared performance-extrapolation and domain-overlap plotting; each study's `data_visualization.py` is a thin subclass setting `STUDY_TYPE` and `VAR_GROUPS` (variable pairs per normalization method). Shared dark-theme figure styling (colors, `style_axis`) lives in `transport_study/plot_style.py`.
@@ -79,7 +82,7 @@ CRITICAL: `str(case)` names checkpoint dirs, result files, tuned-config paths, w
 
 ### Module Directory Map
 
-- `transport_study/datasets/` - Per-device data acquisition (cmod/, d3d/, tcv/, mast/), CLI, bundled sample datasets in `sample/`
+- `transport_study/datasets/` - Per-device data acquisition (cmod/, d3d/, tcv/, mast/), CLI, workflow.py (DataWorkflow base + raw-file variable sets), plotting.py (dataset reports + the shared TS-fit diagnostic), gp_fitting/ (self-contained mkgp `fit_worker.py` plus the SLURM `dispatcher.py`), bundled sample datasets in `sample/`
 - `transport_study/modules/normalization.py` - InputNormalizer POPSIM modules (raw/physics/zscore/coral/physics-coral/physics-zscore)
 - `transport_study/modules/trb_utils.py` - Helpers shared by every TrainRunBuilder (dataset selection, error integration, optimizer, val eval suite)
 - `transport_study/modules/profile_predictor/` - Te/ne profiles over `rho` (shape-init, unstructured NN, reservoir, TORAX-backed model types in `torax_module.py`)

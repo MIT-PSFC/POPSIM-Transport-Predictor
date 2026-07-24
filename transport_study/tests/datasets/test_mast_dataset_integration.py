@@ -58,7 +58,7 @@ def workflow(tmp_path_factory):
 @pytest.fixture(scope="module")
 def fit_input(workflow):
     workflow.raw_data_dir.mkdir(parents=True, exist_ok=True)
-    fit_input = workflow._prepare_shot(SHOT)
+    fit_input = workflow.prepare_shot(SHOT)
     assert fit_input is not None, f"Shot {SHOT} failed validation/retrieval"
     return fit_input
 
@@ -110,7 +110,7 @@ def test_shot_30284_workflow_produces_profiles(fit_input, workflow):
     n_fitted = int(np.sum(np.isfinite(out.te_fit).all(axis=1)))
     assert n_fitted > 0, f"Shot {SHOT}: GP fit produced no profiles"
 
-    assert workflow._assemble_shot(SHOT, out), f"Shot {SHOT}: assembly failed"
+    assert workflow.assemble_shot(SHOT, out), f"Shot {SHOT}: assembly failed"
 
     raw_path = workflow.raw_data_dir / f"{SHOT}.nc"
     assert raw_path.exists()
