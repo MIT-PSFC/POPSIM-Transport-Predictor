@@ -9,10 +9,13 @@ Tokamak plasma transport prediction study using POPSIM ML framework. Trains mode
 ## Commands
 
 ```bash
-# Run tests
+# Run tests (fast suite by default, ~1 min: addopts deselects -m slow)
 uv run pytest
 uv run pytest transport_study/tests/power_balance_transfer/  # single study
 uv run pytest transport_study/tests/modules/test_normalization.py
+uv run pytest -m slow      # training / TORAX / figures / real device data, GPU node, serial
+uv run pytest -m ""        # everything
+# Study tests need the PTPS_* env vars from .vscode/launch.json
 
 # Linting / formatting
 uv run ruff format transport_study/
@@ -64,7 +67,7 @@ The `Study` base provides everything generic; subclasses only declare what diffe
 - `_run_analysis` follows the same shape in both studies: with parallelism, per-case analysis (stage metrics + case report) fans out as one SLURM CPU job per case via `orchestration/case_analysis.run_case_analysis_parallel(study)`. The per-study pieces are declared as ClassVars `ANALYSIS_METRICS_MODULE` / `ANALYSIS_REPORTS_MODULE` (dotted paths; the metrics module exports `compute_and_save_case_metrics`, the reports module `generate_case_report` + `analysis_case_done`), which the driver and `slurm_utils.launch_case_analysis_parallel` resolve. Then the driver runs `collect_metrics` (per-case `case_metrics.nc` caches combined into `collected_metrics.nc`, stages from `orchestration/stages.segment_stages`), comparison figures, serial-fallback case reports, and per-axis comparison tables (both studies: each study's tables.py declares a ComparisonTableSpec plus its per-case stats frame, the shared grouping/markdown/csv writer lives in orchestration/tables.py). Power balance per-shot errors in result files are raw time integrals (long shots score worse); its study_metrics/case_reports rank shots by TIME-AVERAGED error instead.
 - Other subclass ClassVars: `SWEEP_CONFIG_DIR`, `STUDY_TYPE`, `DATA_VISUALIZATION`, `CASE_AXIS_FIELDS` (config axis names logged at init).
 
-CRITICAL: `str(case)` names checkpoint dirs, result files, tuned-config paths, wandb projects, and SLURM job names - byte-level drift orphans existing runs. `restore_predictor.checkpoint_to_profile_case` parses case-directory names back into Cases and must stay in sync with `__str__`. No pinned naming tests exist in the tracked suite (candidates live in the untracked `tests_to_go_over/`).
+CRITICAL: `str(case)` names checkpoint dirs, result files, tuned-config paths, wandb projects, and SLURM job names - byte-level drift orphans existing runs. `restore_predictor.checkpoint_to_profile_case` parses case-directory names back into Cases and must stay in sync with `__str__`. Each study's `tests/<study>/test_*_case_naming.py` pins the literal case strings (transport's are still stubs).
 
 **TRB pattern and shared helpers** (`modules/trb_utils.py`, `modules/power_balance/scalar_power_trb.py`): TrainRunBuilders share `trapezoid_dropna` / `integrate_error_over_time` (per-shot NaN-safe time integrals of error), `make_exponential_adamw` (the standard optimizer), `make_loss_eval_suite` (validation loss mean + a <=100-point subsampled loss vector for wandb; creates a fresh jitted closure per suite so eqx.filter_jit caches never collide across cases), `resolve_case_datasets` (per-case dataset selection and prep shared by EVERY study TRB, incl. the transfer_pretrain normalizer-fit dataset passed via `train_dl.normalizer_fit_ds`), and `get_time_dep_dataloaders` + `mask_to_largest_contiguous_segment` (the segment-based time-dependent dataloader construction on top of it, parameterized only by study_type; the power balance and transport TRBs both delegate to it, the profile TRB builds its time-independent dataloaders on `resolve_case_datasets` directly). `ScalarPowerTRB` is the shared base for the p_oh/p_rad predictors - `OhmicPowerTRB` / `RadiatedPowerTRB` are subclasses that only set `SIGNAL` and `MODULE_CLS` ClassVars; sweep configs reference them by their original dotted paths. `TransportPredictorTRB` reuses `ProfilePredictorTRB.get_test_eval_suite` as-is (its study_results handles the time-dep dim suffixing and emits the per-channel and combined error variables), and the transport analysis modules (`transport_transfer/study_metrics.py`) re-export the power balance stage-metric machinery wholesale.
 
@@ -93,6 +96,7 @@ The GP-fitting devices (C-Mod, MAST) implement the distributed-fitting interface
 - `transport_study/profile_transfer/` - Profile prediction cross-device study (profile_study.py, sweep_configs/, metrics, reports, tables.py (per-axis comparison table spec), restore_predictor.py)
 - `transport_study/power_balance_transfer/` - Power balance cross-device study (power_balance_study.py, sweep_configs/, data_visualization.py, study_metrics.py (stage-resolved time-averaged errors), case_reports.py (best/worst holdout-shot PDFs), tables.py (per-axis comparison table spec))
 - `transport_study/transport_transfer/` - Profile evolution cross-device study (transport_transfer_study.py, sweep_configs/ incl. the power_balance/profile/p_oh/p_rad pseudo-model-type yamls, data_visualization.py, study_metrics.py (re-exports the power balance stage metrics), case_reports.py (profile-evolution best/worst shot PDFs via the shared best_worst_pdf page_fn hook), tables.py, plotting.py)
+- `transport_study/tests/` - Mirrors the package layout (datasets/, modules/, orchestration/, one dir per study). Every dir is a package (`__init__.py`), so test basenames may repeat and shared helpers are importable. `stubs.py` holds the StubStudy/StubCase the orchestration tests drive; `conftest.py` resets the global config around every test and exposes the `make_stub_study` factory. See the Tests section below.
 - `transport_study/modules/profile_trajectory/`, `transport_study/trajectory_optimization/` - OUT OF SCOPE, do not extend
 - `submodules/popsim-public/` - Core ML framework (TimeDep/TimeIndep modules, trainer, envs, checkpointing)
 - `submodules/torax/` - Google TORAX transport model integration
@@ -109,3 +113,15 @@ The GP-fitting devices (C-Mod, MAST) implement the distributed-fitting interface
 ### Data Schema
 
 xarray Datasets with dims `(shot, time_idx, psi_n)`. Power balance signals: `Wtot_MJ`, `Ip_MA`, `B0`, `R0`, `kappa`, `a_minor`, `ne20_line_avg`, `P_oh_MW`, `P_rad_MW`, auxiliary power inputs (`P_NBI_MW` etc., summed to `P_aux_MW` in organize_data). Raw per-device profile data is on `psi_n`; the profile-transfer workflow resamples to a uniform `rho` grid, so profile signals there are `Te_keV_rho`, `ne20_rho`, `Te_shape`, `ne_shape` plus geometry. The transport-transfer prep is the union (rho-grid profiles AND the scalar inputs incl. `P_aux_MW`, minus betan), keeps the forward-filled profile timeslices (contiguous segments matter more than freshness for rollouts; `fresh_profiles` rides along as data), and reindexes to the uniform timebase. Saved as NetCDF.
+
+### Tests
+
+`uv run pytest` runs the fast suite only: `addopts = -m 'not slow'` in pyproject. The `slow` marker covers anything that trains a model, runs a TORAX relaxation, renders comparison figures, or needs real device data (C-Mod MDSplus, the MAST S3 store). Run those with `-m slow` on a GPU node, one suite at a time - concurrent suites OOM the node GPU. Study tests also need the `PTPS_*` env vars from `.vscode/launch.json`; without them they fail with misleading shot-count errors.
+
+Organization rules the suite follows:
+
+- Tests mirror the package layout. Cross-study behavior is tested once in `tests/orchestration/`, not once per study: `test_study_config.py` (config-lock and TOML round trip, parametrized over all three studies), `test_sweep_configs.py` (every sweep yaml of every study, driven off `Case.VALID_MODEL_TYPES`), `test_tables.py` (the generic comparison-table writer), `test_stages.py` (stage segmentation). Per-study files cover only what actually differs - case naming, the case grid, per-study table specs and plotting.
+- Orchestration tests drive `StubStudy`/`StubCase` from `tests/stubs.py` via the `make_stub_study` fixture rather than building a real case grid. `stubs.py` doubles as the ANALYSIS_REPORTS_MODULE for the parallel-analysis driver test.
+- `tests/modules/profile_predictor/conftest.py` provides `make_torax_module` and `sample_timeslices`; TORAX-backed tests must use them instead of re-deriving module kwargs (the bundled sample files predate `ds_source_idx`, which the fixture fills in).
+- Test modules never import an underscore-prefixed name from the package. When a test needs to reach production internals, either the symbol is public or the test goes through the public path.
+- Bodies blocked out as docstring-only stubs are deliberate: they mark coverage to be written by hand, not failures. Current stub files: `tests/orchestration/test_configure_jax_platforms.py`, `test_padded_tail_masking.py`, `test_pending_watchdog.py`, `test_transfer_lr_budget.py`, `test_transfer_pretrain_twin.py`; `tests/profile_transfer/test_plotting_geometry.py`; `tests/modules/profile_predictor/test_torax_knob_ranges.py`; `tests/datasets/test_workflow_duration_checks.py`, `test_workflow_energy_cull.py`; the whole `tests/transport_transfer/` directory; plus individual stubs in `tests/modules/test_normalization.py`.

@@ -65,9 +65,12 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.pytest.ini_options]
-testpaths = ["transport_study"]
+testpaths = ["transport_study/tests"]
+# Slow tests (model training, TORAX relaxation, figure generation, real device
+# data) are opt-in: run them with `-m slow` or `-m ""`, and on a GPU node
+addopts = "-m 'not slow'"
 markers = [
-    "slow: tests that take more than a few seconds (deselect with -m 'not slow')",
+    "slow: trains models, runs TORAX, generates figures, or needs real device data",
 ]
 filterwarnings = [
     "ignore::DeprecationWarning:equinox", # TODO(ZanderKeith): after updating POPSIM to work with JAX 10, revisit this warning.
