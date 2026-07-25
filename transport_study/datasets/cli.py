@@ -8,7 +8,10 @@ from loguru import logger
 
 from transport_study.datasets.cmod.cmod_dataset import CModDataWorkflow
 from transport_study.datasets.d3d.d3d_dataset import D3DDataWorkflow
-from transport_study.datasets.mast.mast_dataset import MASTDataWorkflow
+from transport_study.datasets.mast.mast_dataset import (
+    DEFAULT_PREPARE_WORKERS,
+    MASTDataWorkflow,
+)
 from transport_study.datasets.tcv.tcv_dataset import TCVDataWorkflow
 
 
@@ -137,6 +140,7 @@ class DatasetCLI:
         mode: str | None = "raw",
         clean: bool | None = False,
         fit_workers: int = 1,
+        prepare_workers: int = DEFAULT_PREPARE_WORKERS,
         cluster_profile: str | None = None,
         cluster_partitions: str | None = None,
         cluster_remote_workdir: str | None = None,
@@ -168,6 +172,7 @@ class DatasetCLI:
             max_num_shots=max_num_shots,
             cluster_config=cluster_config,
             fit_workers=fit_workers,
+            prepare_workers=prepare_workers,
         )
 
         self._execute(workflow, mode, clean)

@@ -40,7 +40,9 @@ dataset assembly local (the cluster has no access to the C-Mod data source). Wit
 workflows run fully serially, so the datasets remain reproducible (for anyone patient enough).
 
 1. Prepare (local): download and validate each shot, cache the source data in `<ds_name>/fit_staging/`, and
-   extract the Thomson channel arrays that the fit needs.
+   extract the Thomson channel arrays that the fit needs. MAST staging is threaded (`--prepare_workers`,
+   default 8) since every read is an S3 round trip. C-Mod stays serial because disruption_py's MDSplus
+   connections are not thread-safe.
 2. Fit (cluster): shots are packed into one npz per batch (avoids many-small-file transfers), uploaded together
    with the self-contained `gp_fitting/fit_worker.py`, and fit by one CPU job per batch. Jobs have deterministic
    names (`gpfit-<device>-<batch-hash>`) so a restarted workflow adopts in-flight jobs instead of resubmitting.

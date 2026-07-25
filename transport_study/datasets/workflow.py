@@ -1,4 +1,7 @@
+import gc
+import threading
 from abc import ABC, abstractmethod
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import numpy as np
@@ -14,6 +17,25 @@ from transport_study.datasets.plotting import (
 )
 
 GC_INTERVAL = 40  # Every 40 shots force garbage collection
+
+# The HDF5 library netCDF4 bundles is not built thread safe: concurrent calls
+# into it from the prepare_shot thread pool corrupt its internal state and
+# segfault the process (seen in H5SL__insert_common). Every netCDF read/write
+# reached from a staging thread goes through this lock.
+NETCDF_LOCK = threading.Lock()
+
+
+def write_netcdf(ds: xr.Dataset, path: Path) -> None:
+    """Write a dataset to netCDF, serialized against other threads."""
+    with NETCDF_LOCK:
+        ds.to_netcdf(path)
+
+
+def load_netcdf(path: Path) -> xr.Dataset:
+    """Read a netCDF file fully into memory, serialized against other threads."""
+    with NETCDF_LOCK:
+        return xr.load_dataset(path)
+
 
 # GP-fit profile outputs: the values plus their error-bar and gradient companions.
 # A timeslice culled during processing must have all of them NaNed together, or
@@ -88,6 +110,7 @@ class DataWorkflow(ABC):
         min_shot_duration: float = 0.5,
         cluster_config=None,
         fit_workers: int = 1,
+        prepare_workers: int = 1,
     ):
         """
         Parameters
@@ -108,6 +131,10 @@ class DataWorkflow(ABC):
             (see datasets/gp_fitting/dispatcher.py). If None, fitting runs in-process.
         fit_workers : int
             Number of local processes for in-process GP fitting (serial mode only).
+        prepare_workers : int
+            Threads used to stage source data (see _stage_shots). Only raise it
+            for sources that tolerate concurrent reads: MAST reads public S3 and
+            does, disruption_py's MDSplus connections do not.
         """
 
         self.ds_name = ds_name
@@ -123,6 +150,7 @@ class DataWorkflow(ABC):
         self.min_shot_duration = min_shot_duration
         self.cluster_config = cluster_config
         self.fit_workers = fit_workers
+        self.prepare_workers = prepare_workers
 
         # Signals that flag a transient event (UFO, minor disruption). Subclasses
         # set this to {signal: max_value}; see filter_ds / _transient_cutoff_time.
@@ -195,6 +223,68 @@ class DataWorkflow(ABC):
         dispatcher = ClusterFitDispatcher(self.cluster_config, self.ds_name, self.fit_staging_dir)
         dispatcher.clean()
 
+    def _stage_shots(self, target: int) -> tuple[int, dict]:
+        """Stage source data for shots that have no raw file yet, in shotlist order.
+
+        Returns (raw files already present, {shot: ShotFitInput}), the two
+        together capped at target. Shots whose source data is missing or invalid
+        (prepare_shot returns None) are skipped and do not count toward it, so
+        the loop keeps going until target shots are actually in hand.
+
+        With prepare_workers > 1 the staging runs in a thread pool. It is
+        dominated by source-read latency (S3 round trips for MAST), so threads
+        help despite the GIL. Only as many shots as are still needed are ever
+        submitted, so the selected set matches the serial order exactly.
+        """
+        n_existing = 0
+        pending: dict[int, object] = {}
+        workers = max(1, self.prepare_workers)
+        shots = iter(self.shotlist)
+        n_seen = 0
+
+        while n_existing + len(pending) < target:
+            batch: list[int] = []
+            exhausted = False
+            while len(batch) < min(workers, target - n_existing - len(pending)):
+                shot = next(shots, None)
+                if shot is None:
+                    exhausted = True
+                    break
+                n_seen += 1
+                if n_seen % GC_INTERVAL == 0:
+                    gc.collect()  # Source datasets can pin a lot of memory
+                if (self.raw_data_dir / f"{shot}.nc").exists():
+                    n_existing += 1
+                    continue
+                batch.append(shot)
+
+            pending.update({shot: fit_input for shot, fit_input in self._stage_batch(batch, workers) if fit_input is not None})
+            if exhausted:
+                break
+
+        return n_existing, pending
+
+    def _stage_batch(self, shots: list[int], workers: int) -> list[tuple[int, object]]:
+        """prepare_shot over a batch of shots, in shot order, one thread each.
+
+        A shot that raises is logged and dropped rather than killing a staging
+        run that may already be hours in.
+        """
+        if not shots:
+            return []
+
+        def stage(shot: int):
+            try:
+                return self.prepare_shot(shot)
+            except Exception as e:
+                logger.warning(f"Failed to stage source data for shot {shot}: {e}")
+                return None
+
+        if workers == 1 or len(shots) == 1:
+            return [(shot, stage(shot)) for shot in shots]
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            return list(zip(shots, pool.map(stage, shots), strict=True))
+
     def make_raw_data_files_distributed(self):
         """Create raw data files with GP fitting dispatched to a SLURM cluster.
 
@@ -206,8 +296,6 @@ class DataWorkflow(ABC):
         3. Assemble: combine staged data and fitted profiles into one raw
            netCDF per shot, identical to the serial workflow's output.
         """
-        import gc
-
         from transport_study.datasets.gp_fitting.dispatcher import ClusterFitDispatcher
 
         if self.cluster_config is None:
@@ -217,20 +305,7 @@ class DataWorkflow(ABC):
         self.fit_staging_dir.mkdir(parents=True, exist_ok=True)
 
         target = self.max_num_shots if self.max_num_shots is not None else len(self.shotlist)
-        n_existing = 0
-        pending = {}
-        for i, shot in enumerate(self.shotlist):
-            if n_existing + len(pending) >= target:
-                break
-            if (self.raw_data_dir / f"{shot}.nc").exists():
-                n_existing += 1
-                continue
-            if i > 0 and i % GC_INTERVAL == 0:
-                gc.collect()  # Source datasets can pin a lot of memory
-            fit_input = self.prepare_shot(shot)
-            if fit_input is None:
-                continue
-            pending[shot] = fit_input
+        n_existing, pending = self._stage_shots(target)
 
         logger.info(f"{n_existing} raw files already exist, {len(pending)} shots need GP fitting")
         if not pending:

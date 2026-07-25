@@ -31,11 +31,19 @@ from transport_study.datasets.workflow import (
     PROFILE_FIT_VARS,
     RAW_DATASET_VARS,
     DataWorkflow,
+    load_netcdf,
+    write_netcdf,
 )
 
 DEFAULT_SHOTLIST_FILE = Path(PACKAGE_ROOT) / "datasets" / "mast" / "mast_shotlist"
 
 config = Dynaconf(settings_files=[Path(PACKAGE_ROOT) / "datasets/mast/config.toml"])
+
+# Threads used to stage shots. Every source read is an S3 round trip to the
+# public STFC ECHO store (latency, not bandwidth or CPU), so staging scales
+# almost linearly with this until the store starts throttling. Serial staging
+# of 844 shots took 10.5 hours.
+DEFAULT_PREPARE_WORKERS = 8
 
 
 def _make_fs(endpoint_url: str) -> "s3fs.S3FileSystem":  # noqa: F821
@@ -239,6 +247,7 @@ class MASTDataWorkflow(DataWorkflow):
         max_num_shots: int | None = None,
         cluster_config=None,
         fit_workers: int = 1,
+        prepare_workers: int = DEFAULT_PREPARE_WORKERS,
     ):
         self.config = config
         ds_cfg = self.config["data_sources"]
@@ -263,6 +272,7 @@ class MASTDataWorkflow(DataWorkflow):
             min_shot_duration=self.config["shot_filters"]["min_duration"],
             cluster_config=cluster_config,
             fit_workers=fit_workers,
+            prepare_workers=prepare_workers,
         )
 
         self.filter_config = {
@@ -579,7 +589,7 @@ class MASTDataWorkflow(DataWorkflow):
 
         if staging_path.exists():
             logger.info(f"Using staged source data for shot {shot}")
-            ds_staging = xr.load_dataset(staging_path)
+            ds_staging = load_netcdf(staging_path)
             return self._checked_fit_input(
                 shot,
                 ds_staging["ts_te_eV"].values,
@@ -638,7 +648,7 @@ class MASTDataWorkflow(DataWorkflow):
                 "ts_time": ts_time,
             },
         )
-        ds_staging.to_netcdf(staging_path)
+        write_netcdf(ds_staging, staging_path)
 
         return self._checked_fit_input(shot, te_eV, ne_m3, rho_ts)
 

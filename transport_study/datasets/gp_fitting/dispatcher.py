@@ -8,7 +8,10 @@ the result files back.
 Two backends:
 - "ssh": submit to a remote cluster through an srunx SSH profile (set up once
   with `srunx ssh profile add <name> --ssh-host <host>`). Used for C-Mod,
-  where the cluster has no access to the source data.
+  where the cluster has no access to the source data. Both the file transfers
+  and the SLURM commands run over subprocess ssh, using the options from
+  ~/.ssh/config - see _ShellJobControl for why srunx's own SLURM client is
+  not used.
 - "local": running on the cluster itself (e.g. MAST fitting on Engaging);
   files are copied on the shared filesystem and sbatch runs locally.
 
@@ -23,6 +26,7 @@ around).
 import hashlib
 import shlex
 import shutil
+import subprocess
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -216,6 +220,24 @@ def plan_batches(
     return batches
 
 
+def _ssh_config_user(dest: str) -> str:
+    """Username ssh would use for dest, from ~/.ssh/config.
+
+    rsync's srunx client leaves username empty for --ssh-host profiles (the
+    User line lives in ssh_config, not the profile), and an empty user makes
+    the squeue calls scan every user's jobs. `ssh -G` resolves the config the
+    same way the real connection does, without opening one.
+    """
+    if "@" in dest:
+        return dest.split("@", 1)[0]
+    result = subprocess.run(["ssh", "-G", dest], capture_output=True, text=True, check=False)
+    for line in result.stdout.splitlines():
+        key, _, value = line.partition(" ")
+        if key == "user":
+            return value.strip()
+    return ""
+
+
 @contextmanager
 def _srunx_rsync_logs_disabled():
     """Silence srunx's per-call rsync warning.
@@ -232,9 +254,10 @@ def _srunx_rsync_logs_disabled():
 
 
 class _SlurmJobControl:
-    """Queue inspection and cancellation, shared by both backends.
+    """Queue inspection and cancellation through an srunx client.
 
-    Both wrap an srunx client (SSH or local), so only the file transfer differs.
+    Used by the local backend, where srunx shells out to sbatch/squeue directly.
+    The ssh backend uses _ShellJobControl instead.
     """
 
     def queued_jobs(self) -> list[tuple[str, int]]:
@@ -257,11 +280,101 @@ class _SlurmJobControl:
         self._client.cancel(job_id)
 
 
-class _SSHBackend(_SlurmJobControl):
-    """File transfer and job control on a remote cluster via srunx."""
+class _ShellJobControl:
+    """Queue inspection, cancellation and submission over subprocess ssh.
+
+    srunx's own SLURM client speaks paramiko, which cannot get through a login
+    node that requires publickey AND keyboard-interactive (2FA): pubkey passes,
+    the 2FA prompt goes unanswered, and the connection dies with
+    "Authentication timeout". rsync's ssh reuses the ControlMaster socket from
+    ~/.ssh/config, so an already-authenticated session carries every command
+    without a second 2FA round. Running the SLURM commands through the same
+    _ssh_run keeps job control alive exactly as long as file transfer is.
+
+    Job state resolution mirrors srunx: squeue for active jobs, sacct for jobs
+    that have left the queue, scontrol as the last resort when slurmdbd is
+    unreachable. Jobs found in none of the three are omitted, which the caller
+    reads as UNKNOWN.
+    """
+
+    def _ssh(self, cmd: str, *, stdin: str | None = None):
+        return self._rsync._ssh_run(cmd, stdin=stdin)
+
+    def submit_script(self, script: str, job_name: str) -> int:
+        # The script is piped in and written remotely rather than passed as an
+        # argument: it is multi-line shell, and a copy on the cluster is what
+        # you need to debug a job that misbehaved.
+        remote_script = f"{self._workdir}/{job_name}.sh"
+        quoted = shlex.quote(remote_script)
+        result = self._ssh(f"cat > {quoted} && sbatch --parsable {quoted}", stdin=script)
+        if result.returncode != 0:
+            raise RuntimeError(f"sbatch failed for {job_name}: {result.stderr.strip()}")
+        return int(result.stdout.strip().splitlines()[-1].split(";")[0])
+
+    def queued_jobs(self) -> list[tuple[str, int]]:
+        """(name, job id) for every queued/running job of this user.
+
+        A list, not a name-keyed dict: two jobs can carry the same name (two
+        runs each submitting attempt 1 of the same batch), and clean() has to
+        cancel both.
+        """
+        user_arg = f"-u {shlex.quote(self._username)} " if self._username else ""
+        result = self._ssh(f"squeue {user_arg}-h -o {shlex.quote('%i|%j')}")
+        if result.returncode != 0:
+            raise RuntimeError(f"squeue failed: {result.stderr.strip()}")
+        jobs = []
+        for line in result.stdout.splitlines():
+            jid, _, name = line.strip().partition("|")
+            if jid.isdigit() and name:
+                jobs.append((name, int(jid)))
+        return jobs
+
+    def queued_job_names(self) -> dict[str, int]:
+        """Names of this user's queued/running jobs -> job id."""
+        return dict(self.queued_jobs())
+
+    def job_states(self, job_ids: list[int]) -> dict[int, str]:
+        if not job_ids:
+            return {}
+        id_arg = ",".join(str(i) for i in job_ids)
+        states: dict[int, str] = {}
+
+        result = self._ssh(f"squeue --jobs {id_arg} -h -o {shlex.quote('%i|%T')} 2>/dev/null || true")
+        for line in result.stdout.splitlines():
+            jid, _, st = line.strip().partition("|")
+            if jid.isdigit() and st:
+                states[int(jid)] = st
+
+        missing = [j for j in job_ids if j not in states]
+        if missing:
+            # sacct reports per-step rows (12345.batch, 12345.extern) and
+            # decorates some states ("CANCELLED by 1234"); keep the job row and
+            # the bare state so it matches _TERMINAL_FAILURE_STATES.
+            sacct_ids = ",".join(str(i) for i in missing)
+            result = self._ssh(f"sacct -j {sacct_ids} -n -P -o JobID,State 2>/dev/null || true")
+            for line in result.stdout.splitlines():
+                jid, _, st = line.strip().partition("|")
+                if jid.isdigit() and st:
+                    states[int(jid)] = st.split()[0]
+
+        missing = [j for j in job_ids if j not in states]
+        for jid in missing:
+            result = self._ssh(f"scontrol show job {jid} 2>/dev/null | tr ' ' '\\n' | grep '^JobState=' || true")
+            st = result.stdout.strip().partition("=")[2]
+            if st:
+                states[jid] = st
+        return states
+
+    def cancel(self, job_id: int) -> None:
+        result = self._ssh(f"scancel {int(job_id)}")
+        if result.returncode != 0:
+            raise RuntimeError(f"scancel {job_id} failed: {result.stderr.strip()}")
+
+
+class _SSHBackend(_ShellJobControl):
+    """File transfer and job control on a remote cluster over ssh."""
 
     def __init__(self, config: ClusterFitConfig):
-        from srunx.slurm.clients.ssh import SlurmSSHClient
         from srunx.ssh.core.config import ConfigManager
         from srunx.sync.mount_helpers import build_rsync_client
 
@@ -270,18 +383,16 @@ class _SSHBackend(_SlurmJobControl):
             raise ValueError(
                 f"srunx SSH profile '{config.profile}' not found. Create it with: srunx ssh profile add {config.profile} --ssh-host <host>"
             )
-        self._client = SlurmSSHClient(profile_name=config.profile)
-        # connection_spec carries the username resolved from ~/.ssh/config,
-        # which profile.username lacks for --ssh-host profiles
-        self._username = self._client.connection_spec.username
+        # build_rsync_client delegates to ~/.ssh/config for --ssh-host
+        # profiles, where profile.hostname/username are empty
+        self._rsync = build_rsync_client(profile)
+        self._workdir = config.remote_workdir
+        self._username = self._rsync.username or _ssh_config_user(self._rsync._ssh_dest())
         if not self._username:
             logger.warning(
                 f"No username resolved for profile '{config.profile}' (no User line in ~/.ssh/config?); "
                 "job adoption will scan all users' queued jobs"
             )
-        # build_rsync_client delegates to ~/.ssh/config for --ssh-host
-        # profiles, where profile.hostname/username are empty
-        self._rsync = build_rsync_client(profile)
         # srunx detects --mkpath from the local rsync only, but on push the
         # flag reaches the remote rsync, which may be too old for it
         # (e.g. Engaging has 3.1.3). Disable it to force srunx's ssh mkdir -p
@@ -318,9 +429,6 @@ class _SSHBackend(_SlurmJobControl):
                 )
                 time.sleep(_TRANSFER_RETRY_DELAY_S)
         return False
-
-    def submit_script(self, script: str, job_name: str) -> int:
-        return int(self._client.submit_job(script, job_name=job_name)["job_id"])
 
     def ensure_dir(self, path: str) -> None:
         result = self._rsync._ssh_run(f"mkdir -p {shlex.quote(path)}")

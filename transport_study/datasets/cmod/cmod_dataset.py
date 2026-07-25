@@ -30,6 +30,8 @@ from transport_study.datasets.workflow import (
     PROFILE_FIT_VARS,
     RAW_DATASET_VARS,
     DataWorkflow,
+    load_netcdf,
+    write_netcdf,
 )
 
 DEFAULT_SHOTLIST_FILE = PACKAGE_ROOT / "datasets" / "cmod" / "cmod_shotlist"
@@ -305,7 +307,7 @@ class CModDataWorkflow(DataWorkflow):
 
         if thomson_path.exists() and efit_path.exists():
             logger.info(f"Using staged source data for shot {shot}")
-            ds_thomson = xr.load_dataset(thomson_path)
+            ds_thomson = load_netcdf(thomson_path)
             return self._checked_fit_input(shot, ds_thomson)
 
         # Get EFIT and 0D data
@@ -321,8 +323,8 @@ class CModDataWorkflow(DataWorkflow):
             logger.warning(f"Skipping shot {shot} since no Thomson data was retrieved")
             return None
 
-        ds_efit.to_netcdf(efit_path)
-        ds_thomson.to_netcdf(thomson_path)
+        write_netcdf(ds_efit, efit_path)
+        write_netcdf(ds_thomson, thomson_path)
         return self._checked_fit_input(shot, ds_thomson)
 
     def assemble_shot(self, shot: int, fit_output: ShotFitOutput) -> bool:
