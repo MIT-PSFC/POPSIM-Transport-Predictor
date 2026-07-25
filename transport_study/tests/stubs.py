@@ -43,6 +43,9 @@ class StubCase:
     def is_hyperparam_case(self) -> bool:
         return False
 
+    def is_impossible(self) -> bool:
+        return False
+
     def __str__(self):
         return self.name
 

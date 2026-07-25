@@ -739,18 +739,19 @@ from pathlib import Path
 from loguru import logger
 from popsim.ml import TrainConfig
 from popsim.ml.launch import launch_train
+from transport_study.orchestration.topk_results import compute_topk_study_results
 {_config_reload_script(study_config_path)}
 with open({config_path!r}) as f:
     train_config = TrainConfig(**yaml.safe_load(f))
 
-_, _, _, _, result_dict = launch_train(train_config)
+trainer, _, _, test_dl, result_dict = launch_train(train_config)
 if result_dict is None:
     # Trainer hit its wall-clock budget and saved the latest checkpoint. Exit
     # cleanly with no result file, the orchestrator resubmits and the next job
     # resumes from that checkpoint.
     logger.info("Training stopped at the wall-clock budget before finishing, resubmitted job will resume.")
 else:
-    ds = result_dict["test/study_results"]
+    ds = compute_topk_study_results(trainer, test_dl, train_config, result_dict)
     result_path = Path({str(result_path)!r})
     result_path.parent.mkdir(parents=True, exist_ok=True)
     # Write to a temp name then rename so a partially written file is never

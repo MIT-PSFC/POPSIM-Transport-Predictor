@@ -17,7 +17,7 @@ import yaml
 from loguru import logger
 from popsim.ml import DataLoader, TrainConfig, Trainer
 from popsim.ml.launch import (
-    _get_train_run_builder_class,
+    get_train_run_builder_class,
     launch_agent,
     launch_train,
     resolve_transition_frac,
@@ -46,6 +46,7 @@ from transport_study.orchestration.slurm_utils import (
     spillover_budget,
     spillover_slots,
 )
+from transport_study.orchestration.topk_results import compute_topk_study_results
 from transport_study.orchestration.wandb_utils import (
     get_best_train_config,
     get_completed_runs,
@@ -149,6 +150,12 @@ class CaseGridConfig(StudyConfig):
     hyperparam_num_target_shots: int = HYPERPARAM_TARGET_SHOTS
     # Optional dict of dataset fractions to use during domain adaptation, only used if domain_adaptation includes "weighted"
     dataset_fractions: dict[str, float] = Field(default_factory=dict)
+    # How many best-by-val-loss checkpoints each production training run keeps.
+    # Final results average the test metrics over all of them, so the report
+    # is robust to the val-loss argmin flipping between near-tied epochs under
+    # GPU float noise, and the per-checkpoint spread quantifies that noise.
+    # Sweeps always keep 1. Must be >= 1 (1 only computes best-checkpoint test metrics)
+    num_result_checkpoints: int = Field(default=10, ge=1)
 
     # Study-specific hyperparam field names checked by is_compatible, set per subclass
     COMPAT_HYPERPARAM_FIELDS: ClassVar[tuple[str, ...]] = ()
@@ -166,6 +173,7 @@ class CaseGridConfig(StudyConfig):
             "target_device",
             "target_test_set_size",
             "dataset_fractions",
+            "num_result_checkpoints",
             *self.COMPAT_HYPERPARAM_FIELDS,
         )
         return all(getattr(self, name) == getattr(cfg, name) for name in names)
@@ -672,7 +680,7 @@ class Study:
         builder = dataloader_config.get("data_train_run_builder") or train_config.train_run_builder
         cache_key = json.dumps([str(builder), dataloader_config], sort_keys=True, default=str)
         if cache_key not in self._transfer_steps_cache:
-            train_run_builder = _get_train_run_builder_class(builder)
+            train_run_builder = get_train_run_builder_class(builder)
             _, train_dl, _, _ = train_run_builder.get_dataloaders(dataloader_config)
             self._transfer_steps_cache[cache_key] = max(1, len(train_dl))
         return self._transfer_steps_cache[cache_key]
@@ -1171,6 +1179,9 @@ class Study:
                 "max_epochs": min(config.max_epochs, config.hyperparam_max_epochs),
                 "resume": False,
                 "max_wall_seconds": float(config.train_wall_budget_s),
+                # Sweep trials are compared on val loss only, no need to keep
+                # the top-K checkpoints production runs retain for results
+                "checkpoint_max_to_keep": 1,
             }
         )
         wandb_project_name = self.wandb_project_name(case)
@@ -1259,10 +1270,13 @@ class Study:
         train_config = self.make_train_config(case)
         # Real training runs resume from the latest checkpoint if one exists and
         # stop cleanly at the wall-clock budget so the next launch can continue.
+        # They keep the top num_result_checkpoints checkpoints, whose test
+        # metrics the final result averages (see orchestration/topk_results.py)
         train_config = train_config.model_copy(
             update={
                 "resume": True,
                 "max_wall_seconds": float(config.train_wall_budget_s),
+                "checkpoint_max_to_keep": config.num_result_checkpoints,
             }
         )
         result_path = self.result_path(case)
@@ -1278,11 +1292,11 @@ class Study:
             )
         else:
             logger.info("Launching training serially")
-            _, _, _, _, result_dict = launch_train(train_config)
+            trainer, _, _, test_dl, result_dict = launch_train(train_config)
             if result_dict is None:
                 logger.info("Training stopped at the wall-clock budget before finishing, relaunch to resume from the latest checkpoint.")
                 return
-            ds = result_dict["test/study_results"]
+            ds = compute_topk_study_results(trainer, test_dl, train_config, result_dict)
             result_path.parent.mkdir(parents=True, exist_ok=True)
             # Write to a temp name then rename so a partially written file is
             # never visible at the result path, whose existence marks the case done
@@ -1355,10 +1369,10 @@ class Study:
         if not self.result_path(case).exists():
             logger.warning(f"Result file for case\n{case}\nnot found at\n{self.result_path(case)}\nTraining may be incomplete!")
         training_config = self.make_train_config(case)
-        train_run_builder = _get_train_run_builder_class(training_config.train_run_builder)
+        train_run_builder = get_train_run_builder_class(training_config.train_run_builder)
         # If this is a submodule, use the dataloader construction logic from the main module. Fallback to using the submodule's own logic otherwise.
         if training_config.dataloader_config.get("data_train_run_builder"):
-            data_train_run_builder = _get_train_run_builder_class(training_config.dataloader_config["data_train_run_builder"])
+            data_train_run_builder = get_train_run_builder_class(training_config.dataloader_config["data_train_run_builder"])
             _, train_dl, _val_dl, test_dl = data_train_run_builder.get_dataloaders(training_config.dataloader_config)
         else:
             _, train_dl, _val_dl, test_dl = train_run_builder.get_dataloaders(training_config.dataloader_config)
