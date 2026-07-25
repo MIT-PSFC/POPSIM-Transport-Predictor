@@ -824,7 +824,7 @@ class ProfilePredictorTorax(TimeIndepModule):
 
         # Temperature core anchor: edge BC + ~2x te_approx.
         # Scaling the init with te_approx starts the relaxation near the expected equilibrium
-        # (a flat 0.3 keV start is several keV short on high-performance C-Mod samples,
+        # (a flat 0.3 keV start is several keV short on high-temperature C-Mod samples,
         # so most of the few fixed steps get burned on the transient).
         # The clip keeps a 0.3 keV floor where te_approx is small or unreliable.
         # Core = edge + positive keeps the initial state strictly decreasing and continuous with the BC for any NN output

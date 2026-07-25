@@ -8,7 +8,7 @@ from transport_study import EPISODE_DIM, PACKAGE_ROOT, TIME_COORD, TIME_DIM
 from transport_study.config import StudyConfig, load_config
 from transport_study.orchestration.organize_data import (
     TrainingData,
-    add_performance,
+    add_hazard,
     get_ds,
     get_train_test_datasets,
     get_train_val_datasets,
@@ -73,20 +73,20 @@ class TestGetDs:
         assert ds.sizes[EPISODE_DIM] <= MAX_DS_SIZE
 
 
-class TestAddPerformance:
+class TestAddHazard:
     @pytest.mark.parametrize("study_type", ["profile_transfer", "power_balance_transfer"])
-    def test_add_performance_adds_variables(self, sample_dataset_config, study_type):
+    def test_add_hazard_adds_variables(self, sample_dataset_config, study_type):
         ds, episode_coord = get_ds("cmod-low1", study_type)
-        result = add_performance(ds, episode_coord)
-        assert "performance" in result
+        result = add_hazard(ds, episode_coord)
+        assert "hazard" in result
         assert "Ip_MA_p95" in result
         assert "Wtot_MJ_p95" in result
-        assert result["performance"].dims == (episode_coord,)
+        assert result["hazard"].dims == (episode_coord,)
 
-    def test_add_performance_nonnegative(self, sample_dataset_config):
+    def test_add_hazard_nonnegative(self, sample_dataset_config):
         ds, episode_coord = get_ds("cmod-high", "power_balance_transfer")
-        result = add_performance(ds, episode_coord)
-        valid = result["performance"].values
+        result = add_hazard(ds, episode_coord)
+        valid = result["hazard"].values
         assert all(v >= 0 for v in valid if not np.isnan(v))
 
 
@@ -134,8 +134,8 @@ class TestGetTrainValDatasets:
             train_shots = set(train_subset[EPISODE_DIM].values)
             val_shots = set(val_subset[EPISODE_DIM].values)
             assert train_shots.isdisjoint(val_shots)
-            # Validation shots have the higher performance metric within each source
-            assert val_subset["performance"].values.min() >= train_subset["performance"].values.max()
+            # Validation shots have the higher hazard metric within each source
+            assert val_subset["hazard"].values.min() >= train_subset["hazard"].values.max()
 
     def test_get_train_val_datasets_empty_sources_raises(self, sample_dataset_config):
         td = TrainingData(sources_unsorted=[])
@@ -166,8 +166,8 @@ class TestGetTrainTestDatasets:
         test_shots = set(test_ds[EPISODE_DIM].values)
         assert train_shots.isdisjoint(test_shots)
 
-        # The test set holds the highest-performance target shots
-        assert test_ds["performance"].values.min() >= train_target["performance"].values.max()
+        # The test set holds the highest-hazard target shots
+        assert test_ds["hazard"].values.min() >= train_target["hazard"].values.max()
 
     def test_get_train_test_datasets_zero_test_size_keeps_test_empty(self, sample_dataset_config):
         td = TrainingData(sources_unsorted=["cmod-low1"])

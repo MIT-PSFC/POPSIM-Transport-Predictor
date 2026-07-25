@@ -14,7 +14,7 @@ def _make_ds(times, wtot, ip):
         data_vars={
             "Wtot_MJ": ((EPISODE_DIM, TIME_DIM), np.asarray(wtot, dtype=np.float32)),
             "Ip_MA": ((EPISODE_DIM, TIME_DIM), np.asarray(ip, dtype=np.float32)),
-            "performance": ((EPISODE_DIM,), np.arange(len(wtot), dtype=np.float32)),
+            "hazard": ((EPISODE_DIM,), np.arange(len(wtot), dtype=np.float32)),
         },
         coords={
             EPISODE_DIM: np.arange(len(wtot)),
@@ -66,5 +66,5 @@ def test_per_shot_vars_keep_their_dims():
     ip = [[1.0, nan, 1.0]]
     ds = mask_to_largest_contiguous_segment(_make_ds(times, wtot, ip), ["Wtot_MJ", "Ip_MA"])
     # force_drop_nans-style ds.where would broadcast this to (shot, time)
-    assert ds["performance"].dims == (EPISODE_DIM,)
-    assert np.allclose(ds["performance"].values, [0.0])
+    assert ds["hazard"].dims == (EPISODE_DIM,)
+    assert np.allclose(ds["hazard"].values, [0.0])

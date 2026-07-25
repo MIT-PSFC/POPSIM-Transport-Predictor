@@ -12,7 +12,7 @@ from scipy.spatial import ConvexHull
 from transport_study.config import config
 from transport_study.orchestration.organize_data import (
     TrainingData,
-    add_performance,
+    add_hazard,
     concat_with_nan_padding,
     get_ds,
     get_train_test_datasets,
@@ -67,7 +67,7 @@ def _td(devices: list[str]) -> TrainingData:
     return TrainingData(sources_unsorted=list(devices))
 
 
-def performance_extrapolation_plot(
+def hazard_extrapolation_plot(
     save_path: Path | str,
     ds_list: list[xr.Dataset],
     ds_type_list: list[str],
@@ -76,10 +76,10 @@ def performance_extrapolation_plot(
     y_var: str = "Wtot_MJ",
 ):
     """
-    Scatter each shot in x_var-y_var (performance) space.
+    Scatter each shot in x_var-y_var (hazard) space.
 
     Color encodes the data source device, marker encodes the dataset split
-    (train/val/test). Uses the per-shot p95 values added by `add_performance`.
+    (train/val/test). Uses the per-shot p95 values added by `add_hazard`.
 
     Args:
         save_path: Path to save the generated figure.
@@ -152,7 +152,7 @@ def performance_extrapolation_plot(
     ax.set_xlabel(x_var, fontsize=LABEL_FONTSIZE, color=TEXT_COLOR)
     ax.set_ylabel(y_var, fontsize=LABEL_FONTSIZE, color=TEXT_COLOR)
     ax.set_title(
-        f"Performance Extrapolation in {x_var}-{y_var} Space",
+        f"Hazard Extrapolation in {x_var}-{y_var} Space",
         fontsize=TITLE_FONTSIZE,
         color=TEXT_COLOR,
     )
@@ -320,12 +320,12 @@ def domain_plot(
 
 def _combined_raw_dataset(study_type: str) -> tuple[xr.Dataset, str]:
     """Concatenate every device (sources + target) into one dataset with a per-shot
-    ds_source coordinate and performance/p95 metrics added."""
+    ds_source coordinate and hazard/p95 metrics added."""
     datasets = []
     episode_coord = None
     for device in _all_devices():
         ds, episode_coord = get_ds(device, study_type=study_type)
-        ds = add_performance(ds, episode_coord)
+        ds = add_hazard(ds, episode_coord)
         # Profile-transfer datasets have no aux-power signal, but zscore/coral
         # normalization iterate over it unconditionally. Zero-fill so they run
         # (a no-op for power-balance datasets, which always carry P_aux_MW).
@@ -355,8 +355,8 @@ class DataVisualizationBase:
     VAR_GROUPS: ClassVar[dict[str, list[list[str]]]]
 
     @classmethod
-    def performance_extrapolation(cls, figure_dir: Path | str):
-        """Plot where each dataset lands in performance (Ip_MA-Wtot_MJ) space.
+    def hazard_extrapolation(cls, figure_dir: Path | str):
+        """Plot where each dataset lands in hazard (Ip_MA-Wtot_MJ) space.
 
         Generates:
         1. One plot per source device (train/val).
@@ -364,18 +364,18 @@ class DataVisualizationBase:
         3. One plot putting the target device (test split) in context of all source
            devices (train split), if a target dataset is available.
         """
-        save_dir = Path(figure_dir) / "data_visualization" / "performance_extrapolation"
+        save_dir = Path(figure_dir) / "data_visualization" / "hazard_extrapolation"
         colors = _device_colors()
         sources = _source_devices()
         target = config.target_device
 
         # 1. Each source device on its own.
         for source in sources:
-            fig_path = save_dir / f"{source}_performance_extrapolation.png"
+            fig_path = save_dir / f"{source}_hazard_extrapolation.png"
             if fig_path.exists():
                 continue
             train_ds, val_ds = get_train_val_datasets(training_data=_td([source]), study_type=cls.STUDY_TYPE)
-            performance_extrapolation_plot(
+            hazard_extrapolation_plot(
                 save_path=fig_path,
                 ds_list=[train_ds, val_ds],
                 ds_type_list=["train", "val"],
@@ -384,10 +384,10 @@ class DataVisualizationBase:
 
         # 2. All source devices combined.
         if len(sources) > 1:
-            fig_path = save_dir / f"{'_'.join(sources)}_performance_extrapolation.png"
+            fig_path = save_dir / f"{'_'.join(sources)}_hazard_extrapolation.png"
             if not fig_path.exists():
                 train_ds, val_ds = get_train_val_datasets(training_data=_td(sources), study_type=cls.STUDY_TYPE)
-                performance_extrapolation_plot(
+                hazard_extrapolation_plot(
                     save_path=fig_path,
                     ds_list=[train_ds, val_ds],
                     ds_type_list=["train", "val"],
@@ -397,9 +397,9 @@ class DataVisualizationBase:
         # 3. Target device (test set) in context of all source training data.
         if target and config.dataset_paths.get(target):
             if not sources:
-                logger.warning("No source devices available, skipping target-in-context performance plot.")
+                logger.warning("No source devices available, skipping target-in-context hazard plot.")
                 return
-            fig_path = save_dir / f"target_{target}_in_context_performance_extrapolation.png"
+            fig_path = save_dir / f"target_{target}_in_context_hazard_extrapolation.png"
             if not fig_path.exists():
                 # num_target_shots=0 keeps the target purely in the test split so it reads
                 # as one distinct target dataset against the source training data.
@@ -410,7 +410,7 @@ class DataVisualizationBase:
                     target_test_set_size=config.target_test_set_size,
                     study_type=cls.STUDY_TYPE,
                 )
-                performance_extrapolation_plot(
+                hazard_extrapolation_plot(
                     save_path=fig_path,
                     ds_list=[train_ds, test_ds],
                     ds_type_list=["train", "test"],
@@ -421,7 +421,7 @@ class DataVisualizationBase:
     def domain_overlap(cls, figure_dir: Path | str):
         """Show how the input parameter space of every device overlaps, per normalization.
 
-        Unlike performance extrapolation (where extrapolation is unavoidable in real
+        Unlike hazard extrapolation (where extrapolation is unavoidable in real
         units), here more overlap is better - normalization should align the devices
         for transfer learning.
         """

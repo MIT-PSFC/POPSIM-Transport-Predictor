@@ -621,7 +621,7 @@ class Study:
             if target in shot_counts:
                 # A fixed 50 percent target budget overweights the few target
                 # shots at intermediate N and drags the fit toward the low
-                # end of the target performance distribution, so scale the
+                # end of the target hazard distribution, so scale the
                 # boost down as target shots accumulate
                 target_fraction = min(0.5, math.sqrt(shot_counts[target] / total_shots))
                 dataset_fractions = {
@@ -1407,7 +1407,7 @@ class Study:
         raise NotImplementedError
 
     def _visualize_data(self):
-        self.DATA_VISUALIZATION.performance_extrapolation(self.figure_dir)
+        self.DATA_VISUALIZATION.hazard_extrapolation(self.figure_dir)
         self.DATA_VISUALIZATION.domain_overlap(self.figure_dir)
 
     @classmethod

@@ -137,7 +137,7 @@ REQUIRED_SIGNALS_PROFILE_TRANSFER = [
     "delta_bot",
     # Extra
     "time",  # Data variable holding per-shot time values, the var selection below would drop it and the dataloader consumes it as the time coordinate
-    "Wtot_MJ",  # Not strictly necessary but used for performance extrapolation
+    "Wtot_MJ",  # Not strictly necessary but used for hazard extrapolation
 ]
 
 # Union of the profile and power balance needs, minus betan: the transport
@@ -161,7 +161,7 @@ REQUIRED_SIGNALS_TRANSPORT_TRANSFER = [
     "delta_bot",
     # Extra
     "time",  # Data variable holding per-shot time values, promoted to the time coordinate downstream
-    "Wtot_MJ",  # Seeds the sciml stored-energy state and the normalizer fit, also used for performance extrapolation
+    "Wtot_MJ",  # Seeds the sciml stored-energy state and the normalizer fit, also used for hazard extrapolation
 ]
 
 
@@ -412,17 +412,18 @@ def get_ds(
     return ds, EPISODE_DIM
 
 
-def add_performance(
+def add_hazard(
     ds: xr.Dataset,
     episode_coord: str,
 ) -> xr.Dataset:
     """
-    Add performance metric to dataset
-    We are saying performance is 95th percentile of (Wtot_MJ^2 + Ip_MA^2)**0.5 along a shot
+    Add hazard metric to dataset
+    We are saying hazard is 95th percentile of (Wtot_MJ^2 + Ip_MA^2)**0.5 along a shot,
+    indicating shots are more dangerous with more stored energy and plasma current
     Ignoring nans in the calculation
 
     Also stores the specific Ip_MA and Wtot_MJ values at the time point where the
-    performance metric reaches its 95th percentile for plotting in parameter space
+    hazard metric reaches its 95th percentile for plotting in parameter space
     """
 
     max_Wtot = float(ds["Wtot_MJ"].max().values)
@@ -430,14 +431,14 @@ def add_performance(
     Wtot_scale = 1.0 / max_Wtot if max_Wtot != 0 else 1.0
     Ip_scale = 1.0 / max_Ip if max_Ip != 0 else 1.0
 
-    # Calculate performance at each time step (once for all shots)
-    perf_timeseries = ds.eval(f"(({Wtot_scale} * Wtot_MJ)**2 + ({Ip_scale} * Ip_MA)**2)**0.5")
+    # Calculate hazard at each time step (once for all shots)
+    hazard_timeseries = ds.eval(f"(({Wtot_scale} * Wtot_MJ)**2 + ({Ip_scale} * Ip_MA)**2)**0.5")
 
     # Get the 95th percentile value per shot
     if TIME_DIM in ds.dims:
-        ds["performance"] = perf_timeseries.quantile(0.95, dim=TIME_DIM, skipna=True)
+        ds["hazard"] = hazard_timeseries.quantile(0.95, dim=TIME_DIM, skipna=True)
     else:
-        ds["performance"] = perf_timeseries.quantile(0.95, dim=TIME_COORD, skipna=True)
+        ds["hazard"] = hazard_timeseries.quantile(0.95, dim=TIME_COORD, skipna=True)
 
     n_shots = ds.sizes[episode_coord]
 
@@ -446,22 +447,22 @@ def add_performance(
     Wtot_MJ_p95 = np.full(n_shots, np.nan)
 
     # For each shot, find the time index closest to 95th percentile
-    perf_ts_data = perf_timeseries.values  # shape: (n_shots, n_time)
-    p95_vals = ds["performance"].values  # shape: (n_shots,)
+    hazard_ts_data = hazard_timeseries.values  # shape: (n_shots, n_time)
+    p95_vals = ds["hazard"].values  # shape: (n_shots,)
     Ip_MA_data = ds["Ip_MA"].values
     Wtot_MJ_data = ds["Wtot_MJ"].values
 
     for i in range(n_shots):
-        # Get performance timeseries for this shot
-        perf_shot = perf_ts_data[i]
+        # Get hazard timeseries for this shot
+        hazard_shot = hazard_ts_data[i]
         p95_val = p95_vals[i]
 
         # Find valid (non-NaN) indices
-        valid_mask = ~np.isnan(perf_shot)
+        valid_mask = ~np.isnan(hazard_shot)
 
         if valid_mask.sum() > 0 and not np.isnan(p95_val):
-            # Find index where performance is closest to p95
-            abs_diff = np.abs(perf_shot - p95_val)
+            # Find index where hazard is closest to p95
+            abs_diff = np.abs(hazard_shot - p95_val)
             abs_diff[~valid_mask] = np.inf  # Ignore NaN positions
             idx_p95 = np.argmin(abs_diff)
 
@@ -502,7 +503,7 @@ def normalize_domain(
 
     Args:
         ds_source: The source dataset (e.g. historic data)
-        ds_target: The target dataset (e.g. DIII-D high-performance shots)
+        ds_target: The target dataset (e.g. DIII-D high-hazard shots)
         method: The normalization method to apply
 
     Returns:
@@ -612,7 +613,7 @@ def get_train_val_datasets(
     Split dataset into training and validation sets based on the specified training data case.
 
     The reason why we only have train and val sets here is because our true test set is the
-    high-performance target device shots, handled separately.
+    high-hazard target device shots, handled separately.
     That means all historic source data can be used for training and validation.
     """
     ds_sources: dict[str, tuple] = {}
@@ -620,13 +621,13 @@ def get_train_val_datasets(
 
     for source in training_data.sources:
         ds, episode_coord = get_ds(source, study_type)
-        ds = add_performance(ds, episode_coord)
+        ds = add_hazard(ds, episode_coord)
         train_src, val_src = split_dataset_by_fracs(
             ds,
             fracs=TRAIN_VAL_SPLIT,
             dim=episode_coord,
             seed=42,
-            sortby="performance",
+            sortby="hazard",
         )
         src_idx = config.ds_source_to_idx[source]
         train_src["ds_source_idx"] = (
@@ -677,7 +678,7 @@ def _split_target_shots(
 ):
     """Load the target device and split it into training shots and the held-out test set.
 
-    The test set is the target_test_set_size highest-performance shots
+    The test set is the target_test_set_size highest-hazard shots
     The training shots are the first num_target_shots of the remaining pool
     (or every shot for -1, the cheating upper-bound reference).
     Returns (train_ds_target, test_ds, episode_coord).
@@ -687,13 +688,13 @@ def _split_target_shots(
         raise ValueError("config.target_device must be set before transfer learning")
 
     ds_target, episode_coord = get_ds(target, study_type=study_type)
-    ds_target = add_performance(ds_target, episode_coord)
+    ds_target = add_hazard(ds_target, episode_coord)
     ds_target["ds_source_idx"] = (
         episode_coord,
         np.full(ds_target.sizes[episode_coord], config.ds_source_to_idx[target]),
     )
     ds_target = ds_target.assign_coords(ds_source=target)
-    sorted_shots = np.argsort(ds_target["performance"].values)
+    sorted_shots = np.argsort(ds_target["hazard"].values)
 
     test_shot_pool = sorted_shots[-target_test_set_size:] if target_test_set_size else sorted_shots[:0]
     test_ds = ds_target.isel({episode_coord: test_shot_pool})
@@ -703,7 +704,7 @@ def _split_target_shots(
         train_ds_target = ds_target.isel({episode_coord: sorted_shots})
     else:
         # Exclude the held-out test shots before selecting training shots so the two pools
-        # never overlap (otherwise a large num_target_shots would leak high-performance test
+        # never overlap (otherwise a large num_target_shots would leak high-hazard test
         # shots into training)
         train_candidate_pool = sorted_shots[:-target_test_set_size] if target_test_set_size else sorted_shots
         if num_target_shots > len(train_candidate_pool):

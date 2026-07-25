@@ -101,7 +101,7 @@ def mask_to_largest_contiguous_segment(ds: xr.Dataset, training_vars: list[str])
     Everything outside that run (including the time coordinate) is set to NaN,
     which the dataloader treats as leading/trailing padding. Uses POPSIM's
     mask_to_largest_group_mask rather than force_drop_nans because the latter's
-    ds.where() would broadcast per-shot vars (performance etc.) against time.
+    ds.where() would broadcast per-shot vars (hazard etc.) against time.
     """
 
     def _var_nan(da: xr.DataArray) -> xr.DataArray:
