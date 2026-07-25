@@ -514,10 +514,9 @@ class PowerBalanceTransformer(PowerBalance):
     plus a learned per-slot position embedding to key/value tokens, attend
     (causal by construction, the buffer only ever contains current and past
     predictions), then a residual connection and an MLP head produce a
-    bounded Wtot_MJ_dot. Unlike the transport transformer's profile rows,
-    scalar Wtot tokens are indistinguishable beyond their value, so without
-    the position embedding attention would be permutation-invariant over the
-    history and unable to read trends.
+    bounded Wtot_MJ_dot. Scalar Wtot tokens are indistinguishable beyond
+    their value, so without the position embedding attention would be
+    permutation-invariant over the history and unable to read trends
     """
 
     normalizer: InputNormalizer

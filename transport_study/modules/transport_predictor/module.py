@@ -328,13 +328,18 @@ class TransportPredictorTransformer(TransportPredictor):
     under a SIMPLE_EULER stepper. no_save keeps the buffer out of the recorded
     simulation output.
 
-    Each step: derive the stored energy implied by the current buffered
-    profile (there is no measured betan), embed the normalized transport
-    features to a query token, attend over the embedded profile history
-    (causal by construction, the buffer only ever contains current and past
-    profiles), then a residual connection and an MLP head produce the next
-    profile, which is rolled into the buffer. The reported Output is the
-    profile currently stored for time t.
+    Each step
+    1: derive the stored energy implied by the current buffered profile (there is no measured betan)
+    2: embed the normalized transport features of the CURRENT timestep to a query token
+    (only predicted profiles are kept as history, never past input features)
+    3: embed each buffered profile plus a learned per-slot position embedding to key/value tokens
+    4: attend (causal by construction, the buffer only ever contains current and past profiles)
+    5: then a residual connection and an MLP head produce the next profile
+    6: which is rolled into the buffer
+    Without the position embedding attention is permutation-invariant over the history,
+    so the model could not tell the most recent profile from the least recent
+    (and the t0-seeded buffer holds identical rows, where values alone carry no ordering at all)
+    The reported Output is the profile currently stored for time t
     """
 
     # Per-device stat stage (CORAL or z-score) over the 11 transport_nn_inputs
@@ -342,6 +347,7 @@ class TransportPredictorTransformer(TransportPredictor):
     normalizer: FeatureNormalizer
     feature_embed: eqx.nn.Linear
     profile_embed: eqx.nn.Linear
+    pos_embed: Array
     attention: eqx.nn.MultiheadAttention
     head: eqx.nn.MLP
     rhogrid: tuple = eqx.field(static=True)
@@ -376,7 +382,7 @@ class TransportPredictorTransformer(TransportPredictor):
                 jnp.broadcast_to(te_scale, (n_rho,)),
             ]
         )
-        tokens = jax.vmap(self.profile_embed)(state.profiles / row_scale)
+        tokens = jax.vmap(self.profile_embed)(state.profiles / row_scale) + self.pos_embed
 
         attn_out = self.attention(query[jnp.newaxis, :], tokens, tokens)[0]
         latent = query + attn_out
@@ -413,12 +419,15 @@ class TransportPredictorTransformer(TransportPredictor):
         normalizer: FeatureNormalizer,
         prng_seed: int = 42,
     ) -> "TransportPredictorTransformer":
-        key_feat, key_prof, key_attn, key_head = jax.random.split(jax.random.PRNGKey(prng_seed), 4)
+        key_feat, key_prof, key_pos, key_attn, key_head = jax.random.split(jax.random.PRNGKey(prng_seed), 5)
         # Coerce to tuple: arrays in static fields break pytree metadata equality
         rhogrid_tuple = tuple(np.asarray(rhogrid).tolist())
         n_rho = len(rhogrid_tuple)
         feature_embed = eqx.nn.Linear(N_TRANSPORT_NN_INPUTS, d_model, key=key_feat)
         profile_embed = eqx.nn.Linear(2 * n_rho, d_model, key=key_prof)
+        # Small random init breaks slot symmetry when the buffer holds a
+        # constant history (the seeded state at t0)
+        pos_embed = 0.02 * jax.random.normal(key_pos, (history_len, d_model))
         attention = eqx.nn.MultiheadAttention(num_heads=num_heads, query_size=d_model, key=key_attn)
         head = eqx.nn.MLP(
             in_size=d_model,
@@ -431,6 +440,7 @@ class TransportPredictorTransformer(TransportPredictor):
             normalizer=normalizer,
             feature_embed=feature_embed,
             profile_embed=profile_embed,
+            pos_embed=pos_embed,
             attention=attention,
             head=head,
             rhogrid=rhogrid_tuple,
@@ -1137,7 +1147,7 @@ class TransportPredictorEnv(ModuleTrainingEnv):
 
         trainable_leaves = {}
         if isinstance(self.module, TransportPredictorTransformer):
-            for name in ("feature_embed", "profile_embed", "attention", "head"):
+            for name in ("feature_embed", "profile_embed", "pos_embed", "attention", "head"):
                 trainable_leaves[name] = eqx.filter(getattr(self.module, name), eqx.is_inexact_array)
         elif isinstance(self.module, TransportPredictorToraxBase):
             for name in ("nn_transport", "nn_sources", "nn_edge"):

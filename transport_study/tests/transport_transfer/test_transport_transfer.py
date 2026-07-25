@@ -58,7 +58,22 @@ def test_env_get_trainable_selections():
     """get_trainable never includes normalizer statistics; for transfer it
     returns only last-layer leaves (transformer head, the three torax MLPs,
     sciml taue/profile last layers); for sciml with freeze_submodules both
-    submodules drop out of the selection entirely."""
+    submodules drop out of the selection entirely; for the transformer at
+    da=none the selection is exactly feature_embed, profile_embed, pos_embed,
+    attention and head."""
+
+
+def test_transformer_position_embedding_orders_history():
+    """The transformer output must change when the profile history buffer is
+    reversed (position embedding breaks permutation invariance), and
+    pos_embed has shape (history_len, d_model) with a small nonzero init so
+    the t0-seeded constant buffer still yields slot-distinguishable tokens."""
+
+
+def test_transformer_history_holds_profiles_only():
+    """The rolling State buffer contains only predicted ne/te profile rows,
+    (history_len, 2 n_rho): past input features are never stored, only the
+    current timestep's features form the attention query."""
 
 
 def test_loss_fn_shapes_and_weighting():
