@@ -190,9 +190,11 @@ TORAX_CONFIG_BASE: dict[str, Any] = {
         "ohmic": {},
         "gas_puff": {"S_total": 9999},  # Predicted by NN
         # NN-inferred auxiliary heating. All entries except
-        # absorption_fraction are per-sample overridden by the
-        # sources network (absorption is fixed, degenerate with
-        # P_total). Placeholders only need to pass pydantic validation
+        # absorption_fraction are per-sample overridden by the profile
+        # module's sources network (absorption is fixed there, degenerate
+        # with the NN-predicted P_total. The transport module overrides
+        # absorption_fraction per sample too, since its P_total is the
+        # measured input). Placeholders only need to pass pydantic validation
         "generic_heat": {
             "P_total": 1.0e6,  # Predicted by NN
             "gaussian_location": 0.3,  # Predicted by NN

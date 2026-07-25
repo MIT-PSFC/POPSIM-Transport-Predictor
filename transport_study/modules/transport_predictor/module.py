@@ -84,12 +84,14 @@ TRANSPORT_NN_INPUT_SOURCE_VARS = (
 # Coefficients predicted by the transport predictor sources network, in the
 # order of the network outputs. Unlike ProfilePredictorTorax there is no
 # P_aux_total entry: the auxiliary heating magnitude is a measured input here,
-# the NN only predicts the deposition shape and the particle fueling.
+# the NN only predicts the deposition shape, the particle fueling, and the
+# absorbed fraction of the injected power.
 SOURCE_SHAPE_COEFFICIENT_NAMES = (
     "S_total",
     "gaussian_location",
     "gaussian_width",
     "electron_heat_fraction",
+    "absorption_fraction",
 )
 
 
@@ -521,7 +523,8 @@ class TransportPredictorToraxBase(TransportPredictor):
     steady-state relaxation estimator which has to infer the auxiliary
     heating magnitude with a NN, while here P_aux is an input fed
     straight to the generic_heat source, and the sources network only
-    predicts the deposition shape and the particle fueling.
+    predicts the deposition shape, the particle fueling, and the
+    density-dependent absorbed fraction of the injected power.
     Every beta-derived feature comes from the stored energy implied
     by the profile state, there is no input betan.
 
@@ -733,7 +736,8 @@ class TransportPredictorToraxBase(TransportPredictor):
         # conditions from neural networks, bounded to physical ranges so the
         # TORAX solver stays stable during training. The heating MAGNITUDE is
         # NOT here: it is the measured P_aux_MW input, wired directly to
-        # generic_heat.P_total in _build_provider_and_geo.
+        # generic_heat.P_total in _build_provider_and_geo (the NN-predicted
+        # absorption_fraction below scales it into absorbed power).
         # Source network outputs, per SOURCE_SHAPE_COEFFICIENT_NAMES:
         #   S_total: 0 - inf, softplus multiple of the device fueling scale
         #     particle_inventory / TAU_REF_S (x 1e21 in the provider), same
@@ -743,6 +747,9 @@ class TransportPredictorToraxBase(TransportPredictor):
         #   electron_heat_fraction: 0.2 - 0.95 (ceiling raised with the
         #     profile predictor, ST NBI heating is electron-dominated. The
         #     sigmoid bias keeps the random init balanced at 0.5)
+        #   absorption_fraction: 1 - exp(-ne20_line_avg * softplus), the
+        #     absorption grows linearly with line density when optically thin
+        #     and saturates smoothly toward 1, with the NN predicting the opacity per unit density.
         nn_inputs = self.normalizer(inputs.transport_nn_inputs(Wtot_MJ), inputs.ds_source_idx)
         coeffs = self._transport_coefficients(self.nn_transport(nn_inputs))
         nn_sources_out = self.nn_sources(nn_inputs)
@@ -752,6 +759,7 @@ class TransportPredictorToraxBase(TransportPredictor):
         coeffs["gaussian_location"] = 0.8 * jax.nn.sigmoid(nn_sources_out[1:2])
         coeffs["gaussian_width"] = 0.02 + 0.38 * jax.nn.sigmoid(nn_sources_out[2:3])
         coeffs["electron_heat_fraction"] = 0.2 + 0.75 * jax.nn.sigmoid(nn_sources_out[3:4] - 0.4)
+        coeffs["absorption_fraction"] = 1.0 - jnp.exp(-inputs.ne20_line_avg * jax.nn.softplus(nn_sources_out[4:5]))
 
         # Edge boundary conditions as NN-predicted fractions, same floors and
         # negative temperature bias as ProfilePredictorTorax (see the rationale
@@ -782,8 +790,10 @@ class TransportPredictorToraxBase(TransportPredictor):
             value=jnp.atleast_1d(inputs.Ip_MA * 1e6),
         )
         S_total_update = torax_experimental.TimeVaryingScalarUpdate(value=coeffs["S_total"] * 1e21)
-        # Measured auxiliary heating, absorption_fraction stays at its config value
+        # Measured auxiliary heating; the NN-predicted absorption_fraction
+        # scales it into absorbed power inside TORAX
         p_aux_update = torax_experimental.TimeVaryingScalarUpdate(value=jnp.atleast_1d(inputs.P_aux_MW * 1e6))
+        absorption_fraction_update = torax_experimental.TimeVaryingScalarUpdate(value=coeffs["absorption_fraction"])
         gaussian_location_update = torax_experimental.TimeVaryingScalarUpdate(value=coeffs["gaussian_location"])
         gaussian_width_update = torax_experimental.TimeVaryingScalarUpdate(value=coeffs["gaussian_width"])
         electron_heat_fraction_update = torax_experimental.TimeVaryingScalarUpdate(value=coeffs["electron_heat_fraction"])
@@ -798,6 +808,7 @@ class TransportPredictorToraxBase(TransportPredictor):
             "profile_conditions.T_i_right_bc": te_right_bc_update,
             "sources.gas_puff.S_total": S_total_update,
             "sources.generic_heat.P_total": p_aux_update,
+            "sources.generic_heat.absorption_fraction": absorption_fraction_update,
             "sources.generic_heat.gaussian_location": gaussian_location_update,
             "sources.generic_heat.gaussian_width": gaussian_width_update,
             "sources.generic_heat.electron_heat_fraction": electron_heat_fraction_update,

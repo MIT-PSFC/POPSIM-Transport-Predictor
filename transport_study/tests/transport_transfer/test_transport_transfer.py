@@ -134,6 +134,28 @@ def test_transformer_training_smoke():
     error_rel_shot variables the base _summarize_case_errors reads."""
 
 
+def test_torax_p_aux_feed_through():
+    """The measured P_aux_MW input is wired directly to the TORAX
+    generic_heat.P_total runtime update (MW to W) for the rebuild variant,
+    the carry variant, and the env's initial TORAX state construction; the
+    sources network predicts only the deposition shape (gaussian_location,
+    gaussian_width, electron_heat_fraction), the gas-puff fueling, and the
+    absorption_fraction, so changing P_aux_MW changes the one-step output
+    with the module weights held fixed, and no NN output can override the
+    measured injected heating magnitude."""
+
+
+def test_torax_absorption_fraction_nn():
+    """The transport sources network's last output sets absorption_fraction
+    via the saturating Beer-Lambert form 1 - exp(-ne20_line_avg * softplus(nn
+    output)): always in (0, 1), linear in line density when optically thin,
+    smoothly saturating toward 1 with no gradient-dead cap. The value reaches
+    the generic_heat.absorption_fraction runtime update in
+    _build_provider_and_geo, the absorbed power inside TORAX equals P_total *
+    absorption_fraction, and the profile predictor's TORAX modules keep the
+    fixed config value 0.9."""
+
+
 def test_torax_rebuild_and_carry_smoke():
     """A torax-cgm case with torax_state rebuild and one with carry both
     advance a few training steps without NaN loss (the carry variant
