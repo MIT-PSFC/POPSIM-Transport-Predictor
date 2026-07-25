@@ -72,9 +72,8 @@ def _tracking_data(rho_ch, fit, rho_fit, rel_err=0.1):
 
 
 def test_data_envelope_includes_nearest_neighbors():
-    # A gap between channels at 0.72 and 0.90: envelope at rho 0.84 must still include the nearest neighbors (the zero-margin rule culled these).
-    # see the high inner neighbor so pedestal interpolation never reads as
-    # overshoot.
+    # Across a channel gap the envelope must still see the high inner neighbor,
+    # so pedestal interpolation never reads as overshoot
     x = np.array([0.5, 0.72, 0.90, 1.0])
     y = np.array([3.5, 3.0, 0.2, 0.05])
     e = np.array([0.1, 0.1, 0.05, 0.02])
@@ -158,21 +157,21 @@ def test_fit_variable_repairs_then_culls(monkeypatch):
     band = np.full_like(rho, 0.3)
     hyps = np.array([2.0, 0.8, 0.3, 0.1, 0.95])
 
-    calls = {"n": 0}  # This is so stupid but needed to make the fit worker get its stuff
+    # Nonphysical on the first fit, healthy on the refit
+    calls = []
 
     def fake_gp_profile(data_X, data_y, err_y, X_star, **kwargs):
-        calls["n"] += 1
-        out = spiked if calls["n"] == 1 else clean
+        calls.append(None)
+        out = spiked if len(calls) == 1 else clean
         return out, band, np.gradient(out, rho), band, hyps
 
     monkeypatch.setattr(fit_worker, "gp_profile", fake_gp_profile)
     y_out, _, _, _, _, status = fit_variable(x, y, err, rho, 3, False, True, None, None)
     assert status == "repaired"
-    assert calls["n"] == 2
+    assert len(calls) == 2
     assert np.nanmax(y_out) <= 8.5
 
-    # Always-spiked fit: repair does not help, slice is culled.
-    calls["n"] = 0
+    # Always-spiked fit: repair does not help, slice is culled
     monkeypatch.setattr(
         fit_worker,
         "gp_profile",
@@ -481,7 +480,7 @@ def test_mono_constraint_preserves_hollow_core():
 
 
 def test_mono_constraint_refit_failure_keeps_unconstrained_fit(monkeypatch):
-    """A constrained refit that fails inside _run_gp leaves the unconstrained
+    """A constrained refit that fails inside run_gp leaves the unconstrained
     fit standing instead of losing the slice."""
     from transport_study.datasets.gp_fitting import fit_worker
 
@@ -489,14 +488,14 @@ def test_mono_constraint_refit_failure_keeps_unconstrained_fit(monkeypatch):
     with threadpool_limits(1):
         expected = _fit(x, y, err, hyperparams=FIXED_HYPERPARAMS, optimize_hyperparams=False)
 
-        real_run_gp = fit_worker._run_gp
+        real_run_gp = fit_worker.run_gp
 
         def failing_refit(*args, extra_grad_bc=None, **kwargs):
             if extra_grad_bc is not None:
                 return None
             return real_run_gp(*args, **kwargs)
 
-        monkeypatch.setattr(fit_worker, "_run_gp", failing_refit)
+        monkeypatch.setattr(fit_worker, "run_gp", failing_refit)
         got = _fit(x, y, err, hyperparams=FIXED_HYPERPARAMS, optimize_hyperparams=False)
 
     assert got[0] is not None
@@ -548,7 +547,7 @@ def test_mono_constraint_second_pass_adds_only_new_points(monkeypatch):
         calls.append(None if extra_grad_bc is None else np.array(extra_grad_bc))
         return FakeGP(len(calls) - 1)
 
-    monkeypatch.setattr(fit_worker, "_run_gp", fake_run_gp)
+    monkeypatch.setattr(fit_worker, "run_gp", fake_run_gp)
     with _mono_check_rho(check_rho):
         _fit(np.array([0.1, 0.5, 0.9]), np.array([1.0, 0.8, 0.1]), np.array([0.1, 0.1, 0.1]), hyperparams=FIXED_HYPERPARAMS)
 
@@ -567,7 +566,7 @@ def test_mono_constraint_hyps_come_from_unconstrained_optimize():
     from transport_study.datasets.gp_fitting import fit_worker
 
     seen = []
-    real_run_gp = fit_worker._run_gp
+    real_run_gp = fit_worker.run_gp
 
     def recording_run_gp(*args, **kwargs):
         gp = real_run_gp(*args, **kwargs)
@@ -578,7 +577,7 @@ def test_mono_constraint_hyps_come_from_unconstrained_optimize():
     x, y, err = _edge_bump_slice()
     with threadpool_limits(1):
         with pytest.MonkeyPatch.context() as mp:
-            mp.setattr(fit_worker, "_run_gp", recording_run_gp)
+            mp.setattr(fit_worker, "run_gp", recording_run_gp)
             _, _, _, _, hyps = _fit(x, y, err, hyperparams=FIXED_HYPERPARAMS, optimize_hyperparams=False)
 
     unconstrained = [h for bc, h in seen if bc is None]
@@ -834,8 +833,8 @@ def test_dispatcher_clean_waits_for_cancelled_jobs_before_deleting(tmp_path, mon
     one is still queued."""
     from transport_study.datasets.gp_fitting import dispatcher as dispatcher_mod
 
-    monkeypatch.setattr(dispatcher_mod, "_CLEAN_DRAIN_TIMEOUT_S", 0.05)
-    monkeypatch.setattr(dispatcher_mod, "_CLEAN_DRAIN_POLL_S", 0.01)
+    monkeypatch.setattr(dispatcher_mod, "CLEAN_DRAIN_TIMEOUT_S", 0.05)
+    monkeypatch.setattr(dispatcher_mod, "CLEAN_DRAIN_POLL_S", 0.01)
     dispatcher, fake = _make_dispatcher(tmp_path, monkeypatch, cancel_leaves_job_queued=True)
     (fake.remote_dir / "batch_deadbeef00_out.npz").write_bytes(b"stale")
     fake._queued = [("gpfit-cmod-deadbeef00-a1", 555)]
@@ -1070,25 +1069,21 @@ def test_worker_main_end_to_end(tmp_path):
 # One PDF per shot lands here for manual eyeballing of fit quality.
 GP_FIT_PLOT_DIR = PACKAGE_ROOT / "tests" / "test_outputs" / "gp_fitting"
 
-# mkgp's optimizer draws its random restarts from the global numpy RNG. Seed it
-# so these spot-check fits and the plots they save are reproducible run to run.
-# this pins one realization and hides the run-to-run restart variability
-# that is itself a failure mode of the unseeded production fit.
+# mkgp's optimizer draws its random restarts from the global numpy RNG, so seed
+# it to make the saved plots reproducible. This pins one realization, hiding
+# the restart variability that is itself a failure mode of the unseeded fit.
 GP_FIT_SEED = 0
 
 
 @contextmanager
 def _spawn_for_disruption_py():
-    """disruption_py's get_shots_data always builds a multiprocessing.Pool, even
-    for num_processes=1. Pool() forks by default, and forking while pytest holds
-    internal logging/thread locks deadlocks the child forever at 0% CPU (verified:
-    reproduces with no fitting code at all, and persists with output capture
-    disabled, so it isn't a captured-stdout pipe issue - it's a fork-inherited
-    lock). "spawn" starts each worker from a fresh interpreter instead of forking,
-    which sidesteps the inherited-lock deadlock. Only the C-Mod prepare_shot call
-    goes through disruption_py's SQL/MDSplus retrieval, so this is scoped tightly
-    around that rather than changed for the whole test session (MAST retrieval and
-    fit_worker's own slice-level multiprocessing.Pool are unaffected either way).
+    """Switch multiprocessing to spawn around disruption_py retrieval.
+
+    disruption_py always builds a multiprocessing.Pool, which forks by default,
+    and a fork inheriting pytest's logging/thread locks deadlocks the child at
+    0% CPU forever. Spawn starts each worker from a fresh interpreter instead.
+    Scoped to the C-Mod prepare_shot call rather than the whole session, since
+    only that path goes through disruption_py.
     """
     orig = multiprocessing.get_start_method(allow_none=True)
     multiprocessing.set_start_method("spawn", force=True)
@@ -1184,12 +1179,9 @@ class TestGPFitCMOD:
         idx = _nearest_indices(times, [t])[0]
 
         np.random.seed(GP_FIT_SEED)
-        # By the time this test module is collected, numpy/OpenBLAS is already
-        # loaded (pytest plugins, other test modules), so fit_worker's own
-        # OPENBLAS_NUM_THREADS=1 setdefault came too late and OpenBLAS would
-        # otherwise spin up one thread per core. These per-slice fit matrices
-        # are tiny (tens of points), so that's pure thread overhead - it turned
-        # a ~30s/slice fit into something that didn't finish in 15+ minutes.
+        # OpenBLAS is already loaded by collection time, so fit_worker's own
+        # OPENBLAS_NUM_THREADS=1 setdefault comes too late. These fit matrices
+        # are tiny, so one thread per core is pure overhead (30 s/slice -> 15+ min)
         with threadpool_limits(1):
             out = fit_batch(
                 {shot: _slice_input(fit_input, [idx])},

@@ -168,7 +168,7 @@ def _build_kernel(hyperparams: np.ndarray | None = None) -> Gibbs_Kernel:
     gradient-ascent optimizer never clamps to kbounds, so without this the
     hyperparameters can wander out of the physical region into the degenerate
     "all noise" fit (amplitude -> 0, edge length scale -> inf, profile pulled to
-    ~0). Enforcement also lets _run_gp pin the pedestal location by narrowing the
+    ~0). Enforcement also lets run_gp pin the pedestal location by narrowing the
     x0 bounds. set_kernel/__copy__ both preserve the enforce flag.
     """
     hyps = _HYP_START if hyperparams is None else np.asarray(hyperparams, dtype=float)
@@ -196,7 +196,7 @@ def _pinned_hyperparams(hyps: np.ndarray) -> bool:
     Bound enforcement (_build_kernel) keeps a bad restart out of the degenerate
     collapse mkgp is prone to (amplitude -> 0, edge scale -> infinity). A
     hyperparameter still sitting at that bound after optimization means the
-    search ran out of room rather than converging, so _run_gp retries from a
+    search ran out of room rather than converging, so run_gp retries from a
     different restart.
 
     Two edges are excluded because a retry provably re-lands on them (measured
@@ -355,7 +355,7 @@ def nonphysical_peak(y, x_star, data_x, data_y, data_err) -> float | None:
     return worst_rho
 
 
-def _run_gp(data_X, data_y, err_y, x_eval, hyperparams=None, optimize=True, pin_x0=None, extra_grad_bc=None):
+def run_gp(data_X, data_y, err_y, x_eval, hyperparams=None, optimize=True, pin_x0=None, extra_grad_bc=None):
     """Set up the GP with edge BCs and fit. Returns the GaussianProcess or None.
 
     With optimize=True and hyperparams=None the hyperparameters are tuned (8 random
@@ -570,7 +570,7 @@ def _rough_hyperparameters(data_X, data_y, err_y) -> np.ndarray | None:
     see _remove_outliers's ref_hyperparams. Not returned to callers as a real
     fit result.
     """
-    gp = _run_gp(data_X, data_y, err_y, data_X, optimize=True)
+    gp = run_gp(data_X, data_y, err_y, data_X, optimize=True)
     if gp is None:
         return None
     return np.asarray(gp.get_gp_kernel_details()[1], dtype=float)
@@ -596,7 +596,7 @@ def fit_gp_hyperparameters(
     data_X, data_y, err_y = _remove_local_outliers(data_X, data_y, err_y)
     rough_hyps = _rough_hyperparameters(data_X, data_y, err_y)
     data_X, data_y, err_y = _remove_outliers(data_X, data_y, err_y, ref_hyperparams=rough_hyps)
-    gp = _run_gp(data_X, data_y, err_y, np.asarray(data_X, dtype=float), optimize=True)
+    gp = run_gp(data_X, data_y, err_y, np.asarray(data_X, dtype=float), optimize=True)
     if gp is None:
         return None
     return np.asarray(gp.get_gp_kernel_details()[1], dtype=float)
@@ -648,7 +648,7 @@ def gp_profile(
     x_out = np.asarray(X_star, dtype=float).ravel()
     n_out = x_out.size
     x_eval = np.concatenate([x_out, MONO_CHECK_RHO])
-    gp = _run_gp(
+    gp = run_gp(
         data_X,
         data_y,
         err_y,
@@ -675,7 +675,7 @@ def gp_profile(
             break
         new_rows = np.column_stack([new_rho, np.zeros_like(new_rho), np.full_like(new_rho, MONO_GRAD_ERR)])
         mono_bc = np.vstack([mono_bc, new_rows])
-        gp_mono = _run_gp(
+        gp_mono = run_gp(
             data_X,
             data_y,
             err_y,
@@ -699,7 +699,7 @@ def gp_profile(
     # misleadingly tight interval - it conditions on the fitted amplitude being
     # exactly right and ignores the measurement scatter. noise_flag=True widens
     # the band where the data is noisy; the noise term is rho-varying because
-    # _run_gp fits an error kernel (HSGP), so the band tracks the local error
+    # run_gp fits an error kernel (HSGP), so the band tracks the local error
     # bars instead of a constant RMS.
     # The derivative std stays latent (the gradient is never directly observed,
     # so folding in point noise there is not meaningful).

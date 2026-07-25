@@ -61,8 +61,8 @@ _MAX_OUTPUT_PULL_POLLS = 3
 _MAX_UNKNOWN_POLLS = 5
 # how long clean() waits for cancelled jobs to actually leave the queue before
 # it deletes their batch files (see _wait_for_jobs_to_drain)
-_CLEAN_DRAIN_TIMEOUT_S = 120.0
-_CLEAN_DRAIN_POLL_S = 5.0
+CLEAN_DRAIN_TIMEOUT_S = 120.0
+CLEAN_DRAIN_POLL_S = 5.0
 
 # SLURM states that mean the job will never produce output
 _TERMINAL_FAILURE_STATES = {
@@ -649,7 +649,7 @@ class ClusterFitDispatcher:
         deleting anyway: a stuck job (e.g. wedged in COMPLETING) needs a human,
         and proceeding would quietly reuse stale fits.
         """
-        deadline = time.monotonic() + _CLEAN_DRAIN_TIMEOUT_S
+        deadline = time.monotonic() + CLEAN_DRAIN_TIMEOUT_S
         while True:
             remaining = [(name, job_id) for name, job_id in self.backend.queued_jobs() if name.startswith(prefix)]
             if not remaining:
@@ -657,12 +657,12 @@ class ClusterFitDispatcher:
             if time.monotonic() >= deadline:
                 listed = ", ".join(f"{name} (id {job_id})" for name, job_id in remaining)
                 raise RuntimeError(
-                    f"Clean: {len(remaining)} {prefix}* jobs still queued {_CLEAN_DRAIN_TIMEOUT_S:.0f}s after cancelling: {listed}. "
+                    f"Clean: {len(remaining)} {prefix}* jobs still queued {CLEAN_DRAIN_TIMEOUT_S:.0f}s after cancelling: {listed}. "
                     "Not removing batch files - a job that outlives the delete would leave a stale output for the next run to adopt. "
                     "Wait for the queue to clear (or scancel them by hand) and rerun."
                 )
             logger.info(f"Clean: waiting for {len(remaining)} cancelled jobs to leave the queue")
-            time.sleep(_CLEAN_DRAIN_POLL_S)
+            time.sleep(CLEAN_DRAIN_POLL_S)
 
     # ------------------------------------------------------------------
     def _run_jobs(self, batches: list[BatchState]) -> None:
