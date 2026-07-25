@@ -43,6 +43,14 @@ from transport_study.modules.profile_predictor.torax_module import (
 # Positivity floor for the profile outputs, ne [1e20 m^-3] and te [keV]
 MIN_PROFILE = 1e-3
 
+# Floors applied to profiles used to seed a TORAX state. The GP-fit profiles
+# clamp to exactly 0 over several edge points on rampdown timeslices, and
+# zero-temperature cells NaN the TORAX solve regardless of the predicted
+# coefficients (2026-07-24 attribution probe). 0.02 keV still left one NaN
+# sample, these values gave 0/256
+TE_SEED_FLOOR_KEV = 0.05
+NE_SEED_FLOOR_20 = 0.02
+
 # Floor on the stored energy when used as a denominator or feature scale
 MIN_W_MJ = 1e-3
 
@@ -862,13 +870,17 @@ class TransportPredictorTorax(TransportPredictorToraxBase):
 
     def __call__(self, state: "TransportPredictorTorax.State", inputs: Inputs) -> tuple:
         rho = jnp.array(self.rhogrid)
-        Wtot_MJ = wtot_from_profiles(state.ne, state.te, rho, inputs.volume_approx)
+        # Floor the carried profiles before they seed a TORAX state: measured
+        # seeds can contain exact-zero te points (see TE_SEED_FLOOR_KEV)
+        ne_state = jnp.maximum(state.ne, NE_SEED_FLOOR_20)
+        te_state = jnp.maximum(state.te, TE_SEED_FLOOR_KEV)
+        Wtot_MJ = wtot_from_profiles(ne_state, te_state, rho, inputs.volume_approx)
         coeffs = self._nn_coefficients(inputs, Wtot_MJ)
 
         # Initial condition from the stored profiles, edge point pinned to the NN Dirichlet BC
         # a discontinuity at the LCFS NaNs the solver under the critical gradient model
-        te_ic = state.te.at[-1].set(jnp.squeeze(coeffs["T_e_right_bc"]))
-        ne_ic = state.ne.at[-1].set(jnp.squeeze(coeffs["n_e_right_bc"]))
+        te_ic = te_state.at[-1].set(jnp.squeeze(coeffs["T_e_right_bc"]))
+        ne_ic = ne_state.at[-1].set(jnp.squeeze(coeffs["n_e_right_bc"]))
         provider, geo_provider = self._build_provider_and_geo(inputs, coeffs, ne_ic=ne_ic, te_ic=te_ic)
 
         initial_state, initial_post = torax_experimental.get_initial_state_and_post_processed_outputs(
@@ -976,16 +988,24 @@ class TransportPredictorEnv(ModuleTrainingEnv):
             return PowerBalance.State(Wtot_MJ=observations["Wtot_MJ"].data)
 
         if isinstance(self.module, TransportPredictorTorax):
-            return TransportPredictorTorax.State(ne=ne0, te=te0)
+            # Seed floors: measured rampdown profiles can hold exact-zero te
+            # points which NaN the TORAX solve (see TE_SEED_FLOOR_KEV)
+            return TransportPredictorTorax.State(
+                ne=jnp.maximum(ne0, NE_SEED_FLOOR_20),
+                te=jnp.maximum(te0, TE_SEED_FLOOR_KEV),
+            )
 
         if isinstance(self.module, TransportPredictorToraxSimState):
             # Build a full TORAX initial state from the measured profiles,
             # mirroring the per-step initial-condition flow of
             # TransportPredictorTorax.__call__ (edge points pinned to the NN
-            # Dirichlet BCs so the solver never sees an LCFS discontinuity)
+            # Dirichlet BCs so the solver never sees an LCFS discontinuity,
+            # seeds floored against exact-zero te points in the measurements)
             module = self.module
             inputs0 = self.create_inputs(observations)
             rho = jnp.array(module.rhogrid)
+            ne0 = jnp.maximum(ne0, NE_SEED_FLOOR_20)
+            te0 = jnp.maximum(te0, TE_SEED_FLOOR_KEV)
             Wtot_MJ = wtot_from_profiles(ne0, te0, rho, inputs0.volume_approx)
             coeffs = module._nn_coefficients(inputs0, Wtot_MJ)
             te_ic = te0.at[-1].set(jnp.squeeze(coeffs["T_e_right_bc"]))
