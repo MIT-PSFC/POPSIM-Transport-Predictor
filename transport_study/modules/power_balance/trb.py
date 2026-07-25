@@ -27,11 +27,19 @@ from transport_study.modules.trb_utils import (  # noqa: F401 re-exported, histo
     get_time_dep_dataloaders,
     integrate_error_over_time,
     make_exponential_adamw,
+    make_grouped_exponential_adamw,
     make_loss_eval_suite,
     mask_to_largest_contiguous_segment,
 )
 
 STUDY_TYPE = "power_balance_transfer"
+
+# Anchor terms in the training loss, keyed by measured target signal:
+# (Output attribute holding the model's own prediction, loss_config key for the weight)
+ANCHOR_SIGNALS = {
+    "P_oh_MW": ("P_oh_MW_pred", "anchor_weight_p_oh"),
+    "P_rad_MW": ("P_rad_MW_pred", "anchor_weight_p_rad"),
+}
 
 
 class PowerBalanceTRB(TrainRunBuilder):
@@ -178,17 +186,33 @@ class PowerBalanceTRB(TrainRunBuilder):
         return env
 
     @staticmethod
-    def _make_wtot_loss_fn(loss_config: dict, use_huber: bool) -> IntegralLoss:
+    def _make_wtot_loss_fn(loss_config: dict, use_huber: bool, include_anchors: bool = False) -> IntegralLoss:
         """Device-weighted loss on Wtot_MJ_pred, wrapped for time integration.
 
         use_huber selects the training loss (huber, with the swept
         huber_delta) or the delta-free validation loss (plain absolute error),
         so the sweep metric val/loss.mean cannot be gamed by shrinking delta.
+
+        include_anchors adds the ANCHOR_SIGNALS terms pulling the submodule
+        predictions toward the measured signals, weighted by the
+        anchor_weight_* loss_config keys. Training loss only: validation stays
+        pure Wtot so the sweep metric is comparable across model types. The
+        terms drop out at trace time for model types whose target_vars do not
+        carry the measured signals (mlp, transformer).
+
+        Anchor errors are plain absolute error, not huber.
+        huber_delta is swept on the MJ-scale Wtot residuals and is meaningless for the MW-scale powers,
+        and the anchors are not worth a second delta hyperparameter
         """
         if "device_weights" not in loss_config:
             device_weights = dict.fromkeys(config.dataset_paths, 1.0)
         else:
             device_weights = loss_config["device_weights"]
+
+        anchor_weights = {}
+        if include_anchors:
+            for signal, (_, weight_key) in ANCHOR_SIGNALS.items():
+                anchor_weights[signal] = loss_config.get(weight_key, 0.0)
 
         def loss_fn(pred, targ):
             if use_huber:
@@ -214,13 +238,22 @@ class PowerBalanceTRB(TrainRunBuilder):
             while sample_weights.ndim < errors.ndim:
                 sample_weights = sample_weights[..., None]
 
-            return jnp.mean(sample_weights * errors)
+            loss = jnp.mean(sample_weights * errors)
+
+            for signal, anchor_weight in anchor_weights.items():
+                if anchor_weight <= 0.0 or signal not in targ:
+                    continue
+                pred_attr = ANCHOR_SIGNALS[signal][0]
+                anchor_errors = jnp.abs(getattr(pred, pred_attr) - targ[signal].data)
+                loss = loss + anchor_weight * jnp.mean(sample_weights * anchor_errors)
+
+            return loss
 
         return IntegralLoss(loss_fn)
 
     @staticmethod
     def get_loss_fn(loss_config: dict) -> Callable[[Any, Any], jnp.ndarray]:
-        return PowerBalanceTRB._make_wtot_loss_fn(loss_config, use_huber=True)
+        return PowerBalanceTRB._make_wtot_loss_fn(loss_config, use_huber=True, include_anchors=True)
 
     @staticmethod
     def get_val_loss_fn(loss_config: dict) -> Callable[[Any, Any], jnp.ndarray]:
@@ -235,7 +268,7 @@ class PowerBalanceTRB(TrainRunBuilder):
 
     @staticmethod
     def get_optimizer(config: dict) -> optax.GradientTransformation:
-        return make_exponential_adamw(config)
+        return make_grouped_exponential_adamw(config)
 
     @staticmethod
     def get_test_eval_suite(config) -> EvaluationSuite:

@@ -274,9 +274,25 @@ class PowerBalanceStudy(Study):
             "segment_overlap_val": 0,
         }
 
+    def _base_optimizer_config(self) -> dict:
+        return {
+            **super()._base_optimizer_config(),
+            # The p_oh/p_rad submodules train at a reduced rate relative to
+            # the taue network so joint training does not pull them far from
+            # their pretrained behavior. No-op for model types without
+            # submodules (no matching pytree paths)
+            "submodule_lr_factors": {"p_oh_predictor": 0.1, "p_rad_predictor": 0.1},
+        }
+
     def _base_loss_config(self) -> dict:
         return {
             "huber_delta": 0.5,
+            # Anchor terms keeping the p_oh/p_rad submodule predictions close
+            # to the measured signals while the whole module trains on Wtot.
+            # Training loss only, and a no-op for model types without
+            # submodules (their target_vars carry no P_oh_MW / P_rad_MW)
+            "anchor_weight_p_oh": 0.1,
+            "anchor_weight_p_rad": 0.1,
         }
 
     def _make_submodule_config(self, case: Case, submodule_type: str) -> TrainConfig:
@@ -313,10 +329,11 @@ class PowerBalanceStudy(Study):
                 train_run_builder=trb,
                 dataloader_config={
                     "input_vars": POWER_BALANCE_INPUT_VARS,
-                    "target_vars": ["Wtot_MJ", "ds_source_idx"],
+                    # The measured powers are targets so the training loss can
+                    # anchor the submodule predictions to them (anchor_weight_*
+                    # in the loss config)
+                    "target_vars": ["Wtot_MJ", "P_oh_MW", "P_rad_MW", "ds_source_idx"],
                     "state_vars": ["Wtot_MJ"],
-                    # Bring these along for comparison / device weighting
-                    "extra_vars": ["P_oh_MW", "P_rad_MW"],
                     **dataloader_config_base,
                 },
                 model_init_config={

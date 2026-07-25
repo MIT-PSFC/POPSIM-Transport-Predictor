@@ -1,6 +1,7 @@
 """Shared helpers for the study TrainRunBuilders."""
 
 import equinox as eqx
+import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
@@ -51,6 +52,46 @@ def make_exponential_adamw(optimizer_config: dict) -> optax.GradientTransformati
         end_value=optimizer_config["lrf"],
     )
     return optax.adamw(learning_rate=schedule, weight_decay=optimizer_config["weight_decay"])
+
+
+def make_grouped_exponential_adamw(optimizer_config: dict) -> optax.GradientTransformation:
+    """AdamW where selected submodules run a scaled copy of the exponential schedule.
+
+    optimizer_config["submodule_lr_factors"] maps a module attribute name
+    (e.g. "p_oh_predictor") to a multiplier on lr0/lrf. Any trainable leaf
+    whose pytree path contains that attribute follows the scaled schedule,
+    everything else the base one. Labeling is by pytree path, so it works both
+    for the full-module partition and for the transfer-mode last-layer
+    partition (frozen leaves are None in the trainable pytree and are never
+    labeled). Without the key (or with all factors 1.0) this is exactly
+    make_exponential_adamw.
+    """
+    factors = optimizer_config.get("submodule_lr_factors") or {}
+    factors = {name: factor for name, factor in factors.items() if factor != 1.0}
+    if not factors:
+        return make_exponential_adamw(optimizer_config)
+
+    def scaled_config(factor: float) -> dict:
+        cfg = dict(optimizer_config)
+        cfg["lr0"] = cfg["lr0"] * factor
+        cfg["lrf"] = cfg["lrf"] * factor
+        return cfg
+
+    transforms = {"base": make_exponential_adamw(optimizer_config)}
+    for name, factor in factors.items():
+        transforms[name] = make_exponential_adamw(scaled_config(factor))
+
+    def label_params(params):
+        def label(path, _leaf):
+            for name in factors:
+                # GetAttrKey carries .name, DictKey carries .key
+                if any(name in (getattr(key, "name", None), getattr(key, "key", None)) for key in path):
+                    return name
+            return "base"
+
+        return jax.tree_util.tree_map_with_path(label, params)
+
+    return optax.multi_transform(transforms, label_params)
 
 
 def make_loss_eval_suite(loss_fn) -> EvaluationSuite:

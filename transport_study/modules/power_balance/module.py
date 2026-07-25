@@ -263,6 +263,10 @@ class PowerBalance(TimeDepModule):
         Wtot_MJ_pred: float
         P_cond_MW: float
         taue_predictor_output: TauePredictorOutputs
+        # Submodule predictions, exposed so the training loss can anchor them
+        # to the measured signals. NaN for model types without submodules.
+        P_oh_MW_pred: float = float("nan")
+        P_rad_MW_pred: float = float("nan")
 
     @staticmethod
     def positive_wtot(wtot_mj: ArrayLike) -> ArrayLike:
@@ -346,6 +350,8 @@ class PowerBalanceScalingLaw(PowerBalance):
             Wtot_MJ_pred=Wtot_MJ,
             P_cond_MW=P_cond_MW,
             taue_predictor_output=taue_predictor_output,
+            P_oh_MW_pred=P_oh_MW,
+            P_rad_MW_pred=P_rad_MW,
         )
         return state_dot, output
 
@@ -425,6 +431,8 @@ class PowerBalanceSciML(PowerBalance):
             Wtot_MJ_pred=Wtot_MJ,
             P_cond_MW=P_cond_MW,
             taue_predictor_output=taue_predictor_output,
+            P_oh_MW_pred=P_oh_MW,
+            P_rad_MW_pred=P_rad_MW,
         )
         return state_dot, output
 
