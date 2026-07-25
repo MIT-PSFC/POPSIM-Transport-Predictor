@@ -92,9 +92,10 @@ def _fit_nn_input_normalizer(train_ds: xr.Dataset, n_devices: int, data_normaliz
         rho=jnp.zeros(1),  # Unused by nn_inputs
     )
     features = np.asarray(inputs.nn_inputs).T  # (N, N_NN_INPUTS)
+    shot_idx = np.asarray(train_ds["shot"].broadcast_like(reference).values).ravel()
     attributed = ~np.isnan(source_idx)
     normalizer_cls = ZScoreFeatureNormalizer if data_normalization == "physics-zscore" else CoralFeatureNormalizer
-    return normalizer_cls.fit_from_features(features[attributed], source_idx[attributed].astype(int), n_devices)
+    return normalizer_cls.fit_from_features(features[attributed], source_idx[attributed].astype(int), n_devices, shot_idx[attributed])
 
 
 class ProfilePredictorTRB(TrainRunBuilder):

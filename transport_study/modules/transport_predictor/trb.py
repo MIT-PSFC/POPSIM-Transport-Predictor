@@ -63,9 +63,10 @@ def _fit_transport_input_normalizer(train_ds: xr.Dataset, n_devices: int, data_n
         ds_source_idx=source_idx,
     )
     features = np.asarray(inputs.transport_nn_inputs(col("Wtot_MJ"))).T  # (N, N_TRANSPORT_NN_INPUTS)
+    shot_idx = np.asarray(train_ds["shot"].broadcast_like(reference).values).ravel()
     attributed = ~np.isnan(source_idx)
     normalizer_cls = ZScoreFeatureNormalizer if data_normalization == "physics-zscore" else CoralFeatureNormalizer
-    return normalizer_cls.fit_from_features(features[attributed], source_idx[attributed].astype(int), n_devices)
+    return normalizer_cls.fit_from_features(features[attributed], source_idx[attributed].astype(int), n_devices, shot_idx[attributed])
 
 
 def _submodule_config_dict(submodule_config: TrainConfig | dict) -> dict:

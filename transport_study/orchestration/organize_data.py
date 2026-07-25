@@ -584,11 +584,14 @@ def normalize_domain(
             _write_features(ds, np.asarray(matrix), PHYSICS_FEATURE_NAMES, "_pz")
         return ds_source, ds_target
 
+    def _shot_idx_for(ds: xr.Dataset) -> np.ndarray:
+        return np.asarray(ds.coords["shot"].broadcast_like(_reference(ds)).values).ravel()
+
     def _coral_normalization(variables: tuple[str, ...], suffix: str, matrix_fn) -> None:
-        # Devices below MIN_CORAL_SAMPLES (or absent from ds_source) keep the
+        # Devices below MIN_CORAL_SHOTS (or absent from ds_source) keep the
         # identity transform, so their features pass through raw. Rows with any
         # NaN feature come out all-NaN (the joint transform needs complete rows).
-        stats = fit_coral_stats(matrix_fn(ds_source), _source_idx_for(ds_source), len(registry))
+        stats = fit_coral_stats(matrix_fn(ds_source), _source_idx_for(ds_source), len(registry), _shot_idx_for(ds_source))
         means, transforms = identity_coral_stats(len(registry), len(variables)) if stats is None else stats
         batched_apply = jax.vmap(apply_coral, in_axes=(0, 0, None, None))
         for ds in datasets:

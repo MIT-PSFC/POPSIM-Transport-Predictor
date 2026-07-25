@@ -43,7 +43,6 @@ if TYPE_CHECKING:
 from popsim.cfspopcon_jax.current_drive import calc_f_shaping, calc_q_star
 from popsim.cfspopcon_jax.geometry import calc_plasma_surface_area
 from popsim.module_base import TimeIndepModule
-from scipy.linalg import fractional_matrix_power
 
 NORM_INPUT_VARS = (
     "Ip_MA",
@@ -56,11 +55,21 @@ NORM_INPUT_VARS = (
 )
 N_FEATURES = len(NORM_INPUT_VARS)
 
-# Regularization for covariance matrix roots
-CORAL_REG = 1e-6
-# A device needs at least this many complete samples for a meaningful
-# covariance, below it the device keeps the identity transform
-MIN_CORAL_SAMPLES = 8
+# A feature whose within-device spread is below this fraction of the pooled
+# spread is treated as constant for that device
+# whitening it would amplify measurement noise by more than 1/frac,
+# so it keeps the identity slot in the transform
+CORAL_DEGENERATE_STD_FRAC = 0.05
+# Eigenvalue floor for the device covariance in pooled-std units, guards
+# non-axis-aligned degeneracy (collinear features) the same way
+# caps the whitening gain of any direction at 1/CORAL_DEGENERATE_STD_FRAC
+CORAL_EIGVAL_FLOOR = CORAL_DEGENERATE_STD_FRAC**2
+# A device needs at least this many distinct shots for a meaningful
+# covariance, below it the device keeps the identity transform.
+# While a single shot has many individual samples, they are extremely
+# correlated and do not provide a meaningful covariance estimate.
+# That is why we gate on shot count instead of sample count.
+MIN_CORAL_SHOTS = 8
 
 # Methods whose per-device statistics are fitted from data
 # Their transfer cases pretrain through a dedicated transfer_pretrain prereq
@@ -269,7 +278,7 @@ class ZScoreNormalizer(InputNormalizer):
     @classmethod
     def fit(cls, ds: xr.Dataset, n_devices: int) -> ZScoreNormalizer:
         """Fit per-device mean/std over exactly the 7 input vars."""
-        features, source_idx = _feature_matrix(ds)
+        features, source_idx, _ = _feature_matrix(ds)
         means, stds = fit_z_score_stats(features, source_idx, n_devices)
         return cls(means=means, stds=stds)
 
@@ -282,36 +291,76 @@ def identity_coral_stats(n_devices: int, n_features: int) -> tuple[jnp.ndarray, 
     )
 
 
-def fit_coral_stats(features: np.ndarray, source_idx: np.ndarray, n_devices: int) -> tuple[jnp.ndarray, jnp.ndarray] | None:
+def _sym_matrix_power(mat: np.ndarray, power: float, eigval_floor: float) -> np.ndarray:
+    """Symmetric matrix power via eigh with an eigenvalue floor.
+
+    The floor bounds the gain of negative powers on near-singular matrices
+    (and clips roundoff-negative eigenvalues for positive powers).
+    """
+    eigvals, eigvecs = np.linalg.eigh(mat)
+    eigvals = np.maximum(eigvals, eigval_floor)
+    return (eigvecs * eigvals**power) @ eigvecs.T
+
+
+def fit_coral_stats(
+    features: np.ndarray, source_idx: np.ndarray, n_devices: int, shot_idx: np.ndarray
+) -> tuple[jnp.ndarray, jnp.ndarray] | None:
     """Per-device CORAL statistics from an (N, F) feature matrix.
 
     For device d the transform is: center with the device mean, whiten with
     C_d^{-1/2}, re-color with C_ref^{1/2} (C_ref the pooled covariance over
     all fitting data), then re-add the device mean. Only rows complete in all
-    F features contribute (covariances need complete rows). Devices with fewer
-    than MIN_CORAL_SAMPLES complete rows keep the identity transform. Returns
-    None when the whole pooled set is below MIN_CORAL_SAMPLES.
+    F features contribute (covariances need complete rows).
+
+    Guards against singular device covariances (per-device near-constant
+    features like B0 and geometry would otherwise be whitened with gains of
+    O(1000), turning measurement noise into the dominant NN input):
+    - features whose within-device std is below CORAL_DEGENERATE_STD_FRAC of
+      the pooled std keep the identity slot (zero cross terms, the feature
+      passes through raw like the zscore std 0 guard)
+    - the live-feature covariances are fitted in pooled-std units where
+      CORAL_EIGVAL_FLOOR bounds the whitening gain of any remaining
+      near-degenerate direction
+
+    shot_idx attributes each row to a shot. Devices with fewer than
+    MIN_CORAL_SHOTS distinct shots among their complete rows keep the
+    identity transform. Returns None when the whole pooled set is below
+    MIN_CORAL_SHOTS.
     """
     n_features = features.shape[1]
     valid = ~np.any(np.isnan(features), axis=1)
     pooled = features[valid]
-    if len(pooled) < MIN_CORAL_SAMPLES:
-        logger.warning(f"CORAL fit got only {len(pooled)} complete samples, using identity transforms")
+    n_pooled_shots = len(np.unique(shot_idx[valid]))
+    if n_pooled_shots < MIN_CORAL_SHOTS:
+        logger.warning(f"CORAL fit got only {n_pooled_shots} complete shots, using identity transforms")
         return None
-    cov_ref = np.cov(pooled, rowvar=False)
-    cr_pos_half = np.real(fractional_matrix_power(cov_ref + CORAL_REG * np.eye(n_features), 0.5))
+    pooled_std = np.std(pooled, axis=0)
+    scale = np.where(pooled_std > 0, pooled_std, 1.0)
+    cov_ref = np.cov(pooled / scale, rowvar=False)
 
     means = np.zeros((n_devices, n_features))
     transforms = np.tile(np.eye(n_features), (n_devices, 1, 1))
     for device_val in np.unique(source_idx[valid]):
         device = int(device_val)
-        rows = features[valid & (source_idx == device)]
-        if len(rows) < MIN_CORAL_SAMPLES:
+        device_rows = valid & (source_idx == device)
+        rows = features[device_rows]
+        n_device_shots = len(np.unique(shot_idx[device_rows]))
+        if n_device_shots < MIN_CORAL_SHOTS:
+            logger.warning(f"CORAL fit for device {device} got only {n_device_shots} complete shots, keeping identity")
             continue
-        cov_device = np.cov(rows, rowvar=False)
-        cd_neg_half = np.real(fractional_matrix_power(cov_device + CORAL_REG * np.eye(n_features), -0.5))
         means[device] = np.mean(rows, axis=0)
-        transforms[device] = cd_neg_half @ cr_pos_half
+        live = np.std(rows, axis=0) > CORAL_DEGENERATE_STD_FRAC * pooled_std
+        if not live.any():
+            logger.warning(f"CORAL fit for device {device} found no non-degenerate features, keeping identity")
+            continue
+        cov_device = np.atleast_2d(np.cov(rows[:, live] / scale[live], rowvar=False))
+        cd_neg_half = _sym_matrix_power(cov_device, -0.5, eigval_floor=CORAL_EIGVAL_FLOOR)
+        cr_pos_half = _sym_matrix_power(np.atleast_2d(cov_ref[np.ix_(live, live)]), 0.5, eigval_floor=0.0)
+        # Compose back to raw units: transform rows/cols carry the per-feature
+        # scale so apply_coral stays a single (vec - mean) @ T + mean. The
+        # degenerate slots keep the initial identity rows/cols untouched
+        block = (cd_neg_half @ cr_pos_half) * scale[live][None, :] / scale[live][:, None]
+        transforms[device][np.ix_(live, live)] = block
     return jnp.asarray(means), jnp.asarray(transforms)
 
 
@@ -345,8 +394,8 @@ class CoralNormalizer(InputNormalizer):
     @classmethod
     def fit(cls, ds: xr.Dataset, n_devices: int) -> CoralNormalizer:
         """Fit per-device CORAL transforms over exactly the 7 input vars."""
-        features, source_idx = _feature_matrix(ds)
-        stats = fit_coral_stats(features, source_idx, n_devices)
+        features, source_idx, shot_idx = _feature_matrix(ds)
+        stats = fit_coral_stats(features, source_idx, n_devices, shot_idx)
         if stats is None:
             return cls.identity(n_devices)
         means, transforms = stats
@@ -377,9 +426,9 @@ class PhysicsCoralNormalizer(InputNormalizer):
     @classmethod
     def fit(cls, ds: xr.Dataset, n_devices: int) -> PhysicsCoralNormalizer:
         """Fit per-device CORAL transforms in the physics feature space."""
-        features, source_idx = _feature_matrix(ds)
+        features, source_idx, shot_idx = _feature_matrix(ds)
         phys_rows = np.asarray(jax.vmap(physics_feature_vec)(jnp.asarray(features)))
-        stats = fit_coral_stats(phys_rows, source_idx, n_devices)
+        stats = fit_coral_stats(phys_rows, source_idx, n_devices, shot_idx)
         if stats is None:
             return cls.identity(n_devices)
         means, transforms = stats
@@ -410,7 +459,7 @@ class PhysicsZScoreNormalizer(InputNormalizer):
     @classmethod
     def fit(cls, ds: xr.Dataset, n_devices: int) -> PhysicsZScoreNormalizer:
         """Fit per-device mean/std in the physics feature space."""
-        features, source_idx = _feature_matrix(ds)
+        features, source_idx, _ = _feature_matrix(ds)
         phys_rows = np.asarray(jax.vmap(physics_feature_vec)(jnp.asarray(features)))
         means, stds = fit_z_score_stats(phys_rows, source_idx, n_devices)
         return cls(means=means, stds=stds)
@@ -436,8 +485,10 @@ class CoralFeatureNormalizer(TimeIndepModule):
         return cls(means=means, transforms=transforms)
 
     @classmethod
-    def fit_from_features(cls, features: np.ndarray, source_idx: np.ndarray, n_devices: int) -> CoralFeatureNormalizer:
-        stats = fit_coral_stats(features, source_idx, n_devices)
+    def fit_from_features(
+        cls, features: np.ndarray, source_idx: np.ndarray, n_devices: int, shot_idx: np.ndarray
+    ) -> CoralFeatureNormalizer:
+        stats = fit_coral_stats(features, source_idx, n_devices, shot_idx)
         if stats is None:
             return cls.identity(n_devices, features.shape[1])
         means, transforms = stats
@@ -466,7 +517,12 @@ class ZScoreFeatureNormalizer(TimeIndepModule):
         return cls(means=jnp.zeros((n_devices, n_features)), stds=jnp.ones((n_devices, n_features)))
 
     @classmethod
-    def fit_from_features(cls, features: np.ndarray, source_idx: np.ndarray, n_devices: int) -> ZScoreFeatureNormalizer:
+    def fit_from_features(
+        cls, features: np.ndarray, source_idx: np.ndarray, n_devices: int, shot_idx: np.ndarray
+    ) -> ZScoreFeatureNormalizer:
+        # shot_idx is unused (z-scoring has no covariance to gate on), the
+        # signature matches CoralFeatureNormalizer so TRBs can dispatch on the class
+        del shot_idx
         means, stds = fit_z_score_stats(features, source_idx, n_devices)
         return cls(means=means, stds=stds)
 
@@ -477,15 +533,16 @@ class ZScoreFeatureNormalizer(TimeIndepModule):
 FeatureNormalizer = CoralFeatureNormalizer | ZScoreFeatureNormalizer
 
 
-def _feature_matrix(ds: xr.Dataset) -> tuple[np.ndarray, np.ndarray]:
-    """Flatten the 7 input vars to an (N, 7) matrix plus the matching (N,) device index."""
+def _feature_matrix(ds: xr.Dataset) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Flatten the 7 input vars to an (N, 7) matrix plus the matching (N,) device and shot indices."""
     reference = ds[NORM_INPUT_VARS[0]]
     columns = [np.asarray(ds[var].broadcast_like(reference).values, dtype=float).ravel() for var in NORM_INPUT_VARS]
     source_idx = np.asarray(ds["ds_source_idx"].broadcast_like(reference).values, dtype=float).ravel()
+    shot_idx = np.asarray(ds["shot"].broadcast_like(reference).values).ravel()
     # NaN device indices (from NaN-padded concatenation) can't be attributed to a device
     features = np.column_stack(columns)
     attributed = ~np.isnan(source_idx)
-    return features[attributed], source_idx[attributed].astype(int)
+    return features[attributed], source_idx[attributed].astype(int), shot_idx[attributed]
 
 
 def make_normalizer(
