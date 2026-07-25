@@ -101,6 +101,34 @@ class DataWorkflow(ABC):
     fit_min_points = 1
     fit_scale_per_slice = False
 
+    # Seconds of data cut from the end of the Ip record (see filter_ds).
+    # Set per device since the same margin can land in completely different plasma states
+    # C-Mod cuts Ip sooner after disruption, MAST keeps recording all the way through
+    end_margin_s = 0.05
+
+    # A transient_filter_config signal has to cross its threshold on
+    # transient_persistence_slices timeslices inside a window of
+    # transient_persistence_window_slices before it counts as an event. Counting
+    # crossings in a window rather than requiring them consecutive matters:
+    # C-Mod 1160503009's UFO holds P_rad above 2.5 MW for 10 ms but dips 0.03 MW
+    # under it midway. See _transient_cutoff_time.
+    transient_persistence_slices = 5
+    transient_persistence_window_slices = 10
+
+    # A GP-fitted density profile is inconsistent with the interferometer when
+    # mean_{rho<=1}(ne20_rho) / ne20_line_avg falls outside this range.
+    ne_fit_ratio_bounds = (0.7, 1.4)
+
+    # Smallest physical profile value ([keV] for Te_keV_rho, [1e20 m^-3] for
+    # ne20_rho) and the open rho interval it is enforced over; see mask_bad_profile_fits.
+    profile_floor_value = 0.001
+    profile_floor_rho_range = (0.0, 1.0)
+
+    # Furthest a profile is carried forward to bridge a hole made by
+    # mask_bad_profile_fits. One C-Mod Thomson block is ~20 slices and one MAST
+    # block ~4, so this bridges a single culled block and no more.
+    profile_ffill_limit_slices = 25
+
     def __init__(
         self,
         ds_name: str,
@@ -535,12 +563,22 @@ class DataWorkflow(ABC):
 
         These signals flag transient events (UFO, minor disruption) that break
         the pre-shot prediction we're after, so once one crosses its threshold
-        the shot is no longer usable. Returns None if nothing crosses (or no
-        config). filter_ds drops data from 10ms before this time to end of shot.
+        the shot is no longer usable. A crossing only counts once the signal has
+        crossed on transient_persistence_slices timeslices inside a window of
+        transient_persistence_window_slices: C-Mod's P_oh_MW is a numerically
+        differentiated quantity carrying 0.33 MW of 1 ms noise, so isolated
+        samples past 5 MW are noise rather than events, and treating them as
+        events truncated 43% of C-Mod shots at mid-flattop (a median of 3 slices
+        over threshold, none of which survive an 11 ms median filter). Returns
+        the time of the first crossing inside the first qualifying window, or
+        None if nothing qualifies (or no config). filter_ds drops data from 10ms
+        before this time to end of shot.
         """
         if not self.transient_filter_config:
             return None
 
+        n_persist = max(1, int(self.transient_persistence_slices))
+        window = max(n_persist, int(self.transient_persistence_window_slices))
         cutoff_idx = None
         for var, threshold in self.transient_filter_config.items():
             if var not in shot_ds:
@@ -550,19 +588,27 @@ class DataWorkflow(ABC):
             reduce_dims = [dim for dim in exceed.dims if dim != TIME_DIM]
             if reduce_dims:
                 exceed = exceed.any(dim=reduce_dims)
-            exceed_idxs = np.where(exceed.values)[0]
-            if exceed_idxs.size:
-                cutoff_idx = exceed_idxs[0] if cutoff_idx is None else min(cutoff_idx, exceed_idxs[0])
+            exceed_vals = np.asarray(exceed.values).reshape(-1).astype(int)
+            if exceed_vals.size < window:
+                continue
+            # Crossings per window: entry i counts the window starting at slice i
+            crossings = np.convolve(exceed_vals, np.ones(window, dtype=int), mode="valid")
+            qualifying = np.where(crossings >= n_persist)[0]
+            if not qualifying.size:
+                continue
+            start = int(qualifying[0])
+            first_crossing = start + int(np.argmax(exceed_vals[start : start + window] > 0))
+            cutoff_idx = first_crossing if cutoff_idx is None else min(cutoff_idx, first_crossing)
 
         return None if cutoff_idx is None else float(shot_ds.time[cutoff_idx])
 
     def filter_ds(self, shot_ds: xr.Dataset) -> xr.Dataset:
         """Apply filtering steps based on device config"""
 
-        # Cut all data 50ms before Ip_MA is NAN to avoid including obviously disruptive data
+        # Cut all data end_margin_s before Ip_MA is NAN to avoid including obviously disruptive data
         valid_time = shot_ds["Ip_MA"].notnull().any(dim=EPISODE_DIM)
         last_valid_idx = int(np.where(valid_time.values)[0][-1])
-        valid_mask = shot_ds.time <= shot_ds.time[last_valid_idx] - 0.05
+        valid_mask = shot_ds.time <= shot_ds.time[last_valid_idx] - self.end_margin_s
 
         # Drop everything from 10ms before the first transient event to end of shot
         cutoff_time = self._transient_cutoff_time(shot_ds)
@@ -596,6 +642,72 @@ class DataWorkflow(ABC):
                     )
 
         shot_ds = shot_ds.where(valid_mask, drop=True)
+        return shot_ds
+
+    def mask_bad_profile_fits(self, shot_ds: xr.Dataset) -> xr.Dataset:
+        """NaN GP-fit profiles that disagree with the interferometer or collapse to zero.
+
+        Two checks, applied to every PROFILE_FIT_VARS variable together:
+
+        1. `ne_fit_ratio = mean_{rho<=1}(ne20_rho) / ne20_line_avg`. The fit and
+           the interferometer normally agree to about 1% (device medians 1.01
+           and 1.02), so a ratio outside ne_fit_ratio_bounds means the Thomson
+           density channels disagree with each other and the fit split the
+           difference (C-Mod 1160527001 sits at 0.69, with core points spanning
+           0.19 to 1.05e20 at the same rho). The GP error bars do not widen in
+           this case, so no uncertainty threshold catches this class.
+        2. Either profile falling below profile_floor_value anywhere inside
+           profile_floor_rho_range (open interval), i.e. a fit that collapsed to
+           zero inside the plasma.
+
+        The ratio is kept as `ne_fit_ratio` for auditing and re-thresholding
+        without another rebuild. It describes the fit as it arrived, so it is
+        deliberately not filled along with the profiles below.
+
+        Holes punched by these checks are forward filled - the raw files are
+        already ffilled from Thomson times onto the 1 kHz grid at assembly, so
+        this only restores what the check removed, and it keeps a culled Thomson
+        block from splitting the shot into two shorter segments. The fill is
+        capped at profile_ffill_limit_slices so a shot whose fits are bad
+        throughout ends up with holes rather than one stale profile smeared over
+        the whole discharge. Slices that had no profile to begin with stay empty,
+        and process_fn's fresh_profiles then marks the filled slices stale.
+
+        Call from device_specific_processing before any signal derived from the
+        profiles (ne20_edge, Te_keV_core) is re-read.
+        """
+        shot_id = shot_ds["shot"].item() if "shot" in shot_ds else "unknown"
+        rho_vals = np.asarray(shot_ds["rho"].values, dtype=float)
+        in_plasma = rho_vals[rho_vals <= 1.0]
+        if in_plasma.size < 2:
+            logger.warning(f"Shot {shot_id}: rho grid has no interior span, skipping profile fit checks")
+            return shot_ds
+
+        ne_fit_mean = shot_ds["ne20_rho"].sel(rho=slice(None, 1.0)).integrate("rho") / float(in_plasma[-1] - in_plasma[0])
+        shot_ds["ne_fit_ratio"] = ne_fit_mean / shot_ds["ne20_line_avg"]
+        ratio_min, ratio_max = self.ne_fit_ratio_bounds
+        inconsistent = (shot_ds["ne_fit_ratio"] < ratio_min) | (shot_ds["ne_fit_ratio"] > ratio_max)
+
+        rho_lo, rho_hi = self.profile_floor_rho_range
+        interior = (shot_ds["rho"] > rho_lo) & (shot_ds["rho"] < rho_hi)
+        floor = self.profile_floor_value
+        collapsed = (shot_ds["ne20_rho"].where(interior) < floor).any(dim="rho") | (shot_ds["Te_keV_rho"].where(interior) < floor).any(
+            dim="rho"
+        )
+
+        bad_profile = inconsistent | collapsed
+        n_bad = int(bad_profile.sum())
+        if n_bad:
+            logger.info(
+                f"Shot {shot_id}: masking {n_bad} timeslices with bad profile fits "
+                f"({int(inconsistent.sum())} inconsistent with the interferometer, {int(collapsed.sum())} collapsed to zero)"
+            )
+
+        had_profile = shot_ds["ne20_rho"].notnull().any(dim="rho")
+        for var in PROFILE_FIT_VARS:
+            filled = shot_ds[var].where(~bad_profile).ffill(TIME_DIM, limit=self.profile_ffill_limit_slices)
+            shot_ds[var] = filled.where(had_profile)
+
         return shot_ds
 
     def _debug_plots(self, shot_ds: xr.Dataset):

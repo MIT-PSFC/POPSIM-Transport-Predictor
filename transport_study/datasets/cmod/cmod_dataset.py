@@ -118,10 +118,12 @@ class CModDataWorkflow(DataWorkflow):
         )
 
         self.filter_config = {
-            "Wtot_MJ": {"min": 0.002, "max": 2},
+            # EFIT wmhd at < 3 kJ is noise on a device whose median stored energy is 30 kJ
+            "Wtot_MJ": {"min": 0.003, "max": 2},
             "ne20_line_avg": {"min": 0.01, "max": 4},
             "betan": {"min": 0, "max": 1.5},
         }
+        self.end_margin_s = 0.02
         # Shots from run day with UFO
         self.shot_blacklist = {
             1160503001,
@@ -132,8 +134,7 @@ class CModDataWorkflow(DataWorkflow):
         }
         self.individual_filter_config = None
         # {signal: max_value}: once any of these exceeds its threshold the shot is
-        # cut from 10ms before to the end (transient event, see filter_ds). Set
-        # thresholds per signal, e.g. {"P_rad_MW": 5.0}.
+        # cut from 10ms before to the end (transient event, see filter_ds)
         self.transient_filter_config = {
             "P_oh_MW": 5.0,  # Shot 1160503009 at t=0.7 has a UFO
             "P_rad_MW": 2.5,
@@ -571,5 +572,12 @@ class CModDataWorkflow(DataWorkflow):
             )
         for var in PROFILE_FIT_VARS:
             ds[var] = ds[var].where(valid_profile_mask)
+
+        # Interferometer-consistency and zero-collapse checks, shared with MAST
+        ds = self.mask_bad_profile_fits(ds)
+
+        # ne20_edge comes from the profile (see standardize_signal_names), so
+        # re-read it here to pick up the culling above
+        ds["ne20_edge"] = ds["ne20_rho"].sel(rho=0.9, method="nearest")
 
         return ds

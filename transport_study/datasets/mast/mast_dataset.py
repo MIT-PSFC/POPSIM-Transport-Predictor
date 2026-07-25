@@ -286,10 +286,13 @@ class MASTDataWorkflow(DataWorkflow):
             "beta_p": {"min": 0.01, "max": 10},
             "Ip_MA": {"min": 0.21, "max": 1.5},
         }
+        # MAST's Ip record runs through the current quench (median dIp/dt over the
+        # last 20 ms is -7.6 MA/s), so using a small Ip cutoff results in still
+        # including disruption transients. Must be longer than C-Mod's 20ms cutoff.
+        self.end_margin_s = 0.08
         self.individual_filter_config = None
         # {signal: max_value}: once any of these exceeds its threshold the shot is
-        # cut from 10ms before to the end (transient event, see filter_ds). Set
-        # thresholds per signal, e.g. {"P_rad_MW": 5.0}.
+        # cut from 10ms before to the end (transient event, see filter_ds)
         self.transient_filter_config = {
             "P_rad_MW": 3,  # Just vibes
             "P_oh_MW": 5,  # Shot 29153 at t ~3.8s
@@ -875,6 +878,9 @@ class MASTDataWorkflow(DataWorkflow):
             logger.info(f"Shot {shot_id}: culling {n_culled} timeslices with negative profile fits")
         for var in PROFILE_FIT_VARS:
             ds[var] = ds[var].where(~negative_profile_mask)
+
+        # Interferometer-consistency and zero-collapse checks, shared with C-Mod
+        ds = self.mask_bad_profile_fits(ds)
 
         # ne20_edge comes from the profile (see standardize_signal_names), so
         # re-read it here to pick up the culling above

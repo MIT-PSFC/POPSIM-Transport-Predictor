@@ -117,8 +117,9 @@ def test_cmod_process_fn_labels_one_fresh_slice_per_measurement(cmod_workflow):
     fresh = processed["fresh_profiles"].isel(shot=0).values
     time = processed["time"].values
     fresh_times = np.round(time[fresh == 1] * 1000).astype(int)
-    # filter_ds trims the last 50 ms, and block 3 was culled
-    expected = [b * TS_BLOCK for b in range(N_BLOCKS) if b != 3 and b * TS_BLOCK <= N_T - 51]
+    # filter_ds trims end_margin_s off the end of the Ip record, and block 3 was culled
+    last_idx = N_T - 1 - round(cmod_workflow.end_margin_s * 1e3)
+    expected = [b * TS_BLOCK for b in range(N_BLOCKS) if b != 3 and b * TS_BLOCK <= last_idx]
     np.testing.assert_array_equal(fresh_times, expected)
 
 
