@@ -277,8 +277,12 @@ class PowerBalanceStudy(Study):
             **super()._base_optimizer_config(),
             # The p_oh/p_rad submodules train at a reduced rate relative to
             # the taue network so joint training does not pull them far from
-            # their pretrained behavior. No-op for model types without
-            # submodules (no matching pytree paths)
+            # their pretrained behavior. In transfer finetunes this stacks
+            # with the step-budgeted transfer LR on purpose: the submodules
+            # already ran their own pretrain + finetune prereq chain, so the
+            # joint finetune lets their last layers drift only at 0.1x the
+            # transfer LR.
+            # No-op for model types without submodules (no matching pytree paths)
             "submodule_lr_factors": {"p_oh_predictor": 0.1, "p_rad_predictor": 0.1},
         }
 
