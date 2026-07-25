@@ -64,6 +64,18 @@ TRANSPORT_INPUT_VARS = [
 # Predicted profile channels (the loss and test eval compare against these)
 TRANSPORT_PROFILE_TARGETS = ["ne20_rho", "Te_keV_rho"]
 
+# Everything the transport loss reads from the target side: the profiles,
+# their error-bar companions (softening the validation loss residual), the
+# freshness flag masking both losses to timeslices with a fresh profile
+# measurement, and the device label for per-device weighting
+TRANSPORT_TARGET_VARS = [
+    *TRANSPORT_PROFILE_TARGETS,
+    "ne20_rho_error",
+    "Te_keV_rho_error",
+    "fresh_profiles",
+    "ds_source_idx",
+]
+
 # Everything the env may need to seed a state at the segment start: the
 # measured profiles (transformer buffer / torax initial condition), the stored
 # energy (sciml power balance state), and every scalar input plus the device
@@ -403,6 +415,9 @@ class TransportStudy(Study):
             # and power balance losses ignore these keys
             "gradient_weight": 0.1,
             "huber_delta_grad": 1.0,
+            # Down-weighting of the residual inside the GP-fit error bars,
+            # validation loss only. Read by both the transport loss and the
+            # profile submodule cases
             "within_error_weight": 0.01,
             # Anchor terms keeping the sciml submodule predictions close to
             # the measured signals while the whole module trains on the
@@ -448,10 +463,8 @@ class TransportStudy(Study):
         """Dataloader config shared by every top-level transport model type."""
         return {
             "input_vars": TRANSPORT_INPUT_VARS,
-            "target_vars": [*TRANSPORT_PROFILE_TARGETS, "ds_source_idx"],
+            "target_vars": TRANSPORT_TARGET_VARS,
             "state_vars": TRANSPORT_STATE_VARS,
-            # Freshness flag rides along for loss masking / metrics downstream
-            "extra_vars": ["fresh_profiles"],
             **dataloader_config_base,
         }
 
@@ -557,11 +570,10 @@ class TransportStudy(Study):
                     # so the training loss can anchor the submodule
                     # predictions to them (anchor_weight_* in the loss config)
                     "target_vars": [
-                        *TRANSPORT_PROFILE_TARGETS,
+                        *TRANSPORT_TARGET_VARS,
                         "Wtot_MJ",
                         "P_oh_MW",
                         "P_rad_MW",
-                        "ds_source_idx",
                     ],
                 },
                 model_init_config={

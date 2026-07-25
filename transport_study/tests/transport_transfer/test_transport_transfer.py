@@ -36,11 +36,13 @@ def test_make_train_config_sciml_submodule_wiring():
     each with checkpoint_dir pointing at that prereq case's trained model dir,
     restore_submodules True, and the power_balance submodule config itself
     nesting p_oh/p_rad submodule configs (recursion through
-    _make_submodule_config reaches depth two). The sciml dataloader
-    target_vars carry Wtot_MJ/P_oh_MW/P_rad_MW for the anchor terms while the
-    transformer and torax target_vars stay profiles-only, the loss config
-    carries the anchor_weight_wtot/_p_oh/_p_rad keys, and the optimizer
-    config carries submodule_lr_factors for the power_balance subtree."""
+    _make_submodule_config reaches depth two). Every transport model type's
+    target_vars carry the profile error-bar companions and fresh_profiles
+    (TRANSPORT_TARGET_VARS, read by the loss), the sciml target_vars
+    additionally carry Wtot_MJ/P_oh_MW/P_rad_MW for the anchor terms, the
+    loss config carries the anchor_weight_wtot/_p_oh/_p_rad keys, and the
+    optimizer config carries submodule_lr_factors for the power_balance
+    subtree."""
 
 
 def test_loss_fn_sciml_anchor_terms():
@@ -49,7 +51,9 @@ def test_loss_fn_sciml_anchor_terms():
     Wtot_MJ/P_oh_MW/P_rad_MW targets, scaled by anchor_weight_wtot/_p_oh/
     _p_rad and the per-device sample weights; a term drops out when its
     weight is zero or its signal is absent from the targets (transformer and
-    torax target_vars), and the validation loss stays pure profile error."""
+    torax target_vars), the anchors are exempt from the fresh_profiles mask
+    (their signals are measured at every timeslice), and the validation loss
+    stays pure profile error."""
 
 
 def test_optimizer_grouped_lr_and_clip():
@@ -102,9 +106,25 @@ def test_transformer_history_holds_profiles_only():
 def test_loss_fn_shapes_and_weighting():
     """The transport loss peak-normalizes each channel per timeslice, applies
     the huber delta on the normalized residual, weights samples by device via
-    ds_source_idx, and returns a scalar; the validation variant is delta-free
-    absolute error and both handle a (time, rho) prediction against xr-backed
-    targets."""
+    ds_source_idx, masks the profile terms by fresh_profiles, and returns a
+    scalar; the validation variant is delta-free error-bar-softened absolute
+    error and both handle a (time, rho) prediction against xr-backed
+    targets. The fresh-mask cases are implemented in test_loss_fn.py."""
+
+
+def test_val_loss_error_bar_softening_only():
+    """The validation loss down-weights the part of the residual inside the
+    ne20_rho_error/Te_keV_rho_error bars by within_error_weight while the
+    part beyond the bar keeps full weight, the training loss ignores the
+    error bars entirely, and an absent or zero error var reduces the
+    validation loss to the plain absolute error (the 0 sentinel means a
+    zero-width bar)."""
+
+
+def test_huber_delta_train_loss_only():
+    """The swept huber_delta changes the training loss but never the
+    validation loss (delta-free absolute error), so the sweep metric
+    val/loss.mean cannot be gamed by shrinking delta."""
 
 
 def test_transformer_training_smoke():

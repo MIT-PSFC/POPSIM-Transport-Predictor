@@ -178,12 +178,24 @@ class TransportPredictorTRB(TrainRunBuilder):
         Profiles are peak-normalized per timeslice (scale from the target
         only, floored) so the two channels and all devices are commensurate
         and the huber delta reads as a fractional error, same convention as
-        the profile study loss. No gradient or error-bar terms: the transport
-        Output carries profile values only.
+        the profile study loss.
 
-        use_huber selects the training loss (huber, with the swept
-        huber_delta) or the delta-free validation loss (plain absolute error),
-        so the sweep metric val/loss.mean cannot be gamed by shrinking delta.
+        Both losses count only timeslices with a fresh profile measurement:
+        the profile residual is masked by the fresh_profiles target var, so
+        forward-filled (stale) profile slices steer neither training nor
+        checkpoint selection. The anchor terms are exempt, their measured
+        signals exist at every timeslice.
+
+        use_huber selects the training loss (huber on the raw residual, with
+        the swept huber_delta) or the validation loss (delta-free absolute
+        error, softened inside the GP-fit error bars). Same split as the
+        profile study: the sweep metric val/loss.mean cannot be gamed by
+        shrinking delta, and checkpoint selection does not chase fit noise
+        the measurement cannot distinguish (within_error_weight down-weights
+        the part of the residual inside the <v>_error bars, a 0 error is the
+        sentinel for a zero-width bar and an absent error var behaves the
+        same). The training loss never reads the error bars, its robustness
+        to fit noise comes from the huber delta alone.
 
         include_anchors adds the ANCHOR_SIGNALS terms pulling the sciml
         submodule predictions (the power balance's Wtot plus its own p_oh and
@@ -208,6 +220,43 @@ class TransportPredictorTRB(TrainRunBuilder):
             for signal, (_, weight_key) in ANCHOR_SIGNALS.items():
                 anchor_weights[signal] = loss_config.get(weight_key, 0.0)
 
+        if use_huber:
+            huber_delta = loss_config["huber_delta"]
+
+            def value_err(residual):
+                return optax.huber_loss(residual, delta=huber_delta)
+
+            def _residual(pred, targ, sigma):
+                # Training residual: plain distance to the GP fit mean, the
+                # error bars do not soften it
+                return jnp.abs(pred - targ)
+        else:
+
+            def value_err(residual):
+                return residual
+
+            # Down-weighting of the residual inside the measurement error bar
+            within_error_weight = loss_config.get("within_error_weight", ProfilePredictorTRB.WITHIN_ERROR_WEIGHT)
+
+            def _residual(pred, targ, sigma):
+                # Piecewise-linear shrink of the residual, same as the profile
+                # study validation loss: full weight on the part beyond the
+                # error bar, within_error_weight on the part inside it. sigma
+                # is clamped at 0 so a degenerate negative error bar cannot
+                # inflate the residual
+                abs_residual = jnp.abs(pred - targ)
+                sigma = jnp.maximum(sigma, 0.0)
+                outside = jnp.maximum(abs_residual - sigma, 0.0)
+                inside = jnp.minimum(abs_residual, sigma)
+                return outside + within_error_weight * inside
+
+        def _sigma_from_targ(targ, var, scale):
+            # Error-bar target var, normalized like the profiles. An absent
+            # var behaves like the 0 sentinel (zero-width error bar)
+            if var in targ:
+                return targ[var].data / scale
+            return 0.0
+
         def loss_fn(pred, targ):
             ne_targ = targ["ne20_rho"].data
             te_targ = targ["Te_keV_rho"].data
@@ -216,14 +265,11 @@ class TransportPredictorTRB(TrainRunBuilder):
             ne_scale = jnp.maximum(jnp.max(jnp.abs(ne_targ), axis=-1, keepdims=True), floor)
             te_scale = jnp.maximum(jnp.max(jnp.abs(te_targ), axis=-1, keepdims=True), floor)
 
-            ne_resid = (pred.ne - ne_targ) / ne_scale
-            te_resid = (pred.te - te_targ) / te_scale
-            if use_huber:
-                ne_err = optax.huber_loss(ne_resid, delta=loss_config["huber_delta"])
-                te_err = optax.huber_loss(te_resid, delta=loss_config["huber_delta"])
-            else:
-                ne_err = jnp.abs(ne_resid)
-                te_err = jnp.abs(te_resid)
+            ne_sigma = _sigma_from_targ(targ, "ne20_rho_error", ne_scale)
+            te_sigma = _sigma_from_targ(targ, "Te_keV_rho_error", te_scale)
+
+            ne_err = value_err(_residual(pred.ne / ne_scale, ne_targ / ne_scale, ne_sigma))
+            te_err = value_err(_residual(pred.te / te_scale, te_targ / te_scale, te_sigma))
 
             # Build per-sample weights from device labels
             ds_source_idx = targ["ds_source_idx"].data
@@ -235,15 +281,18 @@ class TransportPredictorTRB(TrainRunBuilder):
                     sample_weights,
                 )
 
-            # Broadcast sample weights across the rho axis
-            profile_weights = sample_weights
+            # Freshness mask: only timeslices with a fresh profile measurement
+            # contribute to the profile terms, forward-filled slices are zeroed
+            profile_weights = sample_weights * targ["fresh_profiles"].data
+            # Broadcast across the rho axis
             while profile_weights.ndim < ne_err.ndim:
                 profile_weights = profile_weights[..., None]
 
             loss = 0.5 * (jnp.mean(profile_weights * ne_err) + jnp.mean(profile_weights * te_err))
 
-            # Anchor terms are scalar signals, so they take the unbroadcast
-            # per-sample weights
+            # Anchor terms are scalar signals measured at every timeslice, so
+            # they take the unbroadcast per-sample weights without the
+            # freshness mask (freshness only applies to the profiles)
             for signal, anchor_weight in anchor_weights.items():
                 if anchor_weight <= 0.0 or signal not in targ:
                     continue
