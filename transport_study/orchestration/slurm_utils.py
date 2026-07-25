@@ -45,7 +45,7 @@ export XLA_PYTHON_CLIENT_MEM_FRACTION=0.80
 """
 
 
-def _importable_module(cls: type) -> str:
+def importable_module(cls: type) -> str:
     """Return a dotted module path a subprocess can import ``cls`` from.
 
     When the study is launched as a script (e.g. ``python .../profile_study.py``)
@@ -85,7 +85,7 @@ def _config_reload_script(study_config_path: Path) -> str:
     cls = config.get_subclass()
     top_name = cls.__qualname__.split(".")[0]
     code_str = (
-        f"from {_importable_module(cls)} import {top_name}\n"
+        f"from {importable_module(cls)} import {top_name}\n"
         "from transport_study.config import load_config\n"
         f"study_config = {cls.__qualname__}.from_toml(Path({str(study_config_path)!r}))\n"
         "load_config(study_config)\n"
@@ -916,7 +916,7 @@ def launch_case_analysis_parallel(study, case) -> None:
     study_cls = type(study)
     py_script = f"""\
 from pathlib import Path
-from {_importable_module(study_cls)} import {study_cls.__name__}
+from {importable_module(study_cls)} import {study_cls.__name__}
 from {study_cls.ANALYSIS_REPORTS_MODULE} import generate_case_report
 from {study_cls.ANALYSIS_METRICS_MODULE} import compute_and_save_case_metrics
 
