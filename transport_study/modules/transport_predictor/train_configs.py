@@ -30,7 +30,7 @@ def make_transport_torax_config(transport_model: str) -> dict:
             "adaptive_dt": False,
         }
     )
-    # The base's 8 Picard corrector iterations were benchmarked for 20 ms
-    # relaxation steps. A 1 ms step is far less stiff, so this is a natural
-    # knob to lower if torax training throughput becomes the bottleneck
+    # The base already uses the minimum 1 Picard corrector iteration
+    # (benchmarked: corrector count does not change converged loss), and a
+    # 1 ms step is far less stiff than the base's 20 ms relaxation anyway
     return torax_config

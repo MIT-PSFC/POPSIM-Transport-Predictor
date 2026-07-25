@@ -210,11 +210,10 @@ TORAX_CONFIG_BASE: dict[str, Any] = {
         "use_pereverzev": True,
         "use_predictor_corrector": True,
         # Picard iterations run n_corrector_steps + 1 times with no early exit.
-        # TORAX default of 10 is overkill at 10ms dt, but the 20ms
-        # dt above needs headroom: benchmarked on the cgm base case,
-        # 8 matched baseline val loss per epoch at 3.2x overall speedup,
-        # while 4 was 5.3x but converged to visibly worse loss per epoch.
-        "n_corrector_steps": 8,
+        # Benchmarked at the 20ms dt above: 1/2/4/8 corrector steps all
+        # converge to mean-best val losses within the seed spread, so extra
+        # iterations buy nothing. 1 is the minimum TORAX accepts
+        "n_corrector_steps": 1,
     },
     "time_step_calculator": {"calculator_type": "fixed"},
     "neoclassical": {},
