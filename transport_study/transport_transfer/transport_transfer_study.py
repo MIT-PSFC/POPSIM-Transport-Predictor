@@ -403,7 +403,17 @@ class TransportStudy(Study):
             # and power balance losses ignore these keys
             "gradient_weight": 0.1,
             "huber_delta_grad": 1.0,
-            "within_error_weight": 0.25,
+            "within_error_weight": 0.01,
+            # Anchor terms keeping the sciml submodule predictions close to
+            # the measured signals while the whole module trains on the
+            # profiles: the power balance's Wtot plus its own p_oh/p_rad
+            # submodules. Training loss only, and a no-op for model types
+            # whose target_vars lack the measured signals (only the sciml
+            # case carries them). The power balance submodule prereq case
+            # also reads anchor_weight_p_oh/_p_rad through PowerBalanceTRB
+            "anchor_weight_wtot": 0.1,
+            "anchor_weight_p_oh": 0.1,
+            "anchor_weight_p_rad": 0.1,
         }
 
     def _base_optimizer_config(self) -> dict:
@@ -412,6 +422,21 @@ class TransportStudy(Study):
             # Cap on global L2 gradient norm per update, guards against rare
             # gradient spikes from the differentiated TORAX solve NaN-ing a run
             "grad_clip_max_norm": 1.0,
+            # During joint sciml training the restored power balance submodule
+            # (including its own p_oh/p_rad submodules underneath) trains at a
+            # reduced rate so profile-loss gradients do not pull the
+            # stored-energy dynamics far from their pretrained behavior. The
+            # profile predictor is the part being adapted, it keeps the full
+            # schedule. Labeling is by pytree path, so this also applies to
+            # the transfer-mode last-layer partition and is a no-op for model
+            # types without a power_balance attribute. The power_balance
+            # prereq case reuses this config through PowerBalanceTRB, where
+            # only its p_oh_predictor/p_rad_predictor paths match
+            "submodule_lr_factors": {
+                "power_balance": 0.1,
+                "p_oh_predictor": 0.1,
+                "p_rad_predictor": 0.1,
+            },
         }
 
     def _make_submodule_config(self, case: Case, submodule_type: str) -> TrainConfig:
@@ -464,10 +489,12 @@ class TransportStudy(Study):
                 train_run_builder=pb_trb,
                 dataloader_config={
                     "input_vars": POWER_BALANCE_INPUT_VARS,
-                    "target_vars": ["Wtot_MJ", "ds_source_idx"],
+                    # The measured powers are targets so the training loss can
+                    # anchor the p_oh/p_rad submodule predictions to them
+                    # (anchor_weight_* in the loss config), matching the power
+                    # balance study's structured cases
+                    "target_vars": ["Wtot_MJ", "P_oh_MW", "P_rad_MW", "ds_source_idx"],
                     "state_vars": ["Wtot_MJ"],
-                    # Bring these along for comparison / device weighting
-                    "extra_vars": ["P_oh_MW", "P_rad_MW"],
                     **dataloader_config_base,
                     # Scalar-signal training is cheap, match the power balance study
                     "batch_size": 4096,
@@ -524,7 +551,19 @@ class TransportStudy(Study):
         elif case.model_type == "sciml":
             return ModelTrainSpec(
                 train_run_builder=trb,
-                dataloader_config=self._transport_dataloader_config(dataloader_config_base),
+                dataloader_config={
+                    **self._transport_dataloader_config(dataloader_config_base),
+                    # The measured stored energy and powers are extra targets
+                    # so the training loss can anchor the submodule
+                    # predictions to them (anchor_weight_* in the loss config)
+                    "target_vars": [
+                        *TRANSPORT_PROFILE_TARGETS,
+                        "Wtot_MJ",
+                        "P_oh_MW",
+                        "P_rad_MW",
+                        "ds_source_idx",
+                    ],
+                },
                 model_init_config={
                     "model_type": case.model_type,
                     "data_normalization": config.data_normalization,

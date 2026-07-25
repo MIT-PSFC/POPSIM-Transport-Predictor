@@ -289,6 +289,11 @@ class Output:
     ne: Array  # Electron density profile on rho [1e20 m^-3]
     te: Array  # Electron temperature profile on rho [keV]
     rho: Array  # The rho grid the profiles are evaluated on
+    # Submodule predictions surfaced for the sciml anchor terms in the
+    # training loss (see TransportPredictorTRB), NaN for the other model types
+    Wtot_MJ_pred: float = float("nan")
+    P_oh_MW_pred: float = float("nan")
+    P_rad_MW_pred: float = float("nan")
     debug_info: dict | None = None
 
 
@@ -458,6 +463,10 @@ class TransportPredictorSciML(TransportPredictor):
     stored-energy estimate) and fed to the profile predictor, so profile-loss
     gradients flow into the power balance networks and the profiles follow
     the predicted dynamics.
+
+    The Output surfaces the power balance's Wtot / P_oh / P_rad predictions
+    so the training loss can anchor them to the measured signals while the
+    whole module trains on the profiles (see TransportPredictorTRB).
     """
 
     power_balance: PowerBalance
@@ -488,13 +497,20 @@ class TransportPredictorSciML(TransportPredictor):
         # stepper output stacking
         ne, te, debug_info = self.positive_profiles(pp_output.ne.data, pp_output.te.data)
         debug_info.update(
-            Wtot_MJ_pred=Wtot_MJ,
             P_cond_MW=pb_output.P_cond_MW,
             taue_pred=pb_output.taue_predictor_output.taue_pred,
             betan_used=betan_used,
         )
 
-        output = Output(ne=ne, te=te, rho=rho, debug_info=debug_info)
+        output = Output(
+            ne=ne,
+            te=te,
+            rho=rho,
+            Wtot_MJ_pred=Wtot_MJ,
+            P_oh_MW_pred=pb_output.P_oh_MW_pred,
+            P_rad_MW_pred=pb_output.P_rad_MW_pred,
+            debug_info=debug_info,
+        )
         return pb_state_dot, output
 
 

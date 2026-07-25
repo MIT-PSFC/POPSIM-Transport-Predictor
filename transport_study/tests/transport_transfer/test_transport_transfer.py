@@ -13,6 +13,7 @@ def test_get_ds_transport_transfer():
     """get_ds(source, "transport_transfer") returns a dataset that keeps the
     profile signals interpolated onto the shared RHO_GRID, computes P_aux_MW
     from the zero-filled per-system aux power signals, retains Wtot_MJ,
+    P_oh_MW/P_rad_MW (anchor targets for the sciml training loss),
     delta_top/delta_bot, fresh_profiles, and the Te_shape/ne_shape variables,
     clips the profile error signals at zero, and is reindexed to the uniform
     1 kHz timebase (mid-shot gaps become NaN slices). Also belongs as a
@@ -35,7 +36,29 @@ def test_make_train_config_sciml_submodule_wiring():
     each with checkpoint_dir pointing at that prereq case's trained model dir,
     restore_submodules True, and the power_balance submodule config itself
     nesting p_oh/p_rad submodule configs (recursion through
-    _make_submodule_config reaches depth two)."""
+    _make_submodule_config reaches depth two). The sciml dataloader
+    target_vars carry Wtot_MJ/P_oh_MW/P_rad_MW for the anchor terms while the
+    transformer and torax target_vars stay profiles-only, the loss config
+    carries the anchor_weight_wtot/_p_oh/_p_rad keys, and the optimizer
+    config carries submodule_lr_factors for the power_balance subtree."""
+
+
+def test_loss_fn_sciml_anchor_terms():
+    """The training loss adds plain absolute-error anchor terms pulling the
+    Output's Wtot_MJ_pred/P_oh_MW_pred/P_rad_MW_pred toward the measured
+    Wtot_MJ/P_oh_MW/P_rad_MW targets, scaled by anchor_weight_wtot/_p_oh/
+    _p_rad and the per-device sample weights; a term drops out when its
+    weight is zero or its signal is absent from the targets (transformer and
+    torax target_vars), and the validation loss stays pure profile error."""
+
+
+def test_optimizer_grouped_lr_and_clip():
+    """TransportPredictorTRB.get_optimizer applies the global-norm clip and,
+    with submodule_lr_factors set, runs every trainable leaf whose pytree
+    path contains power_balance (including its nested p_oh/p_rad submodules)
+    at the scaled schedule while profile_predictor leaves keep the full
+    learning rate, for both the da=none and the transfer last-layer
+    partitions; without factors it reduces to the plain clipped AdamW."""
 
 
 def test_make_train_config_transfer_lr_scaling():

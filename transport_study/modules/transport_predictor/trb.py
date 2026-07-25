@@ -24,10 +24,19 @@ from transport_study.modules.transport_predictor.module import (
 )
 from transport_study.modules.trb_utils import (
     get_time_dep_dataloaders,
+    make_grouped_exponential_adamw,
     make_loss_eval_suite,
 )
 
 STUDY_TYPE = "transport_transfer"
+
+# Anchor terms in the sciml training loss, keyed by measured target signal:
+# (Output attribute holding the model's own prediction, loss_config key for the weight)
+ANCHOR_SIGNALS = {
+    "Wtot_MJ": ("Wtot_MJ_pred", "anchor_weight_wtot"),
+    "P_oh_MW": ("P_oh_MW_pred", "anchor_weight_p_oh"),
+    "P_rad_MW": ("P_rad_MW_pred", "anchor_weight_p_rad"),
+}
 
 
 def _submodule_config_dict(submodule_config: TrainConfig | dict) -> dict:
@@ -163,7 +172,7 @@ class TransportPredictorTRB(TrainRunBuilder):
         return env
 
     @staticmethod
-    def _make_profile_loss_fn(loss_config: dict, use_huber: bool) -> IntegralLoss:
+    def _make_profile_loss_fn(loss_config: dict, use_huber: bool, include_anchors: bool = False) -> IntegralLoss:
         """Device-weighted loss on the predicted ne/te profiles, wrapped for time integration.
 
         Profiles are peak-normalized per timeslice (scale from the target
@@ -175,11 +184,29 @@ class TransportPredictorTRB(TrainRunBuilder):
         use_huber selects the training loss (huber, with the swept
         huber_delta) or the delta-free validation loss (plain absolute error),
         so the sweep metric val/loss.mean cannot be gamed by shrinking delta.
+
+        include_anchors adds the ANCHOR_SIGNALS terms pulling the sciml
+        submodule predictions (the power balance's Wtot plus its own p_oh and
+        p_rad submodules) toward the measured signals, weighted by the
+        anchor_weight_* loss_config keys. Training loss only: validation stays
+        pure profile error so the sweep metric is comparable across model
+        types. The terms drop out at trace time for model types whose
+        target_vars do not carry the measured signals (transformer, torax-*).
+
+        Anchor errors are plain absolute error, not huber.
+        huber_delta is swept on the peak-normalized profile residuals and is
+        meaningless for the MJ / MW scale anchor signals,
+        and the anchors are not worth a second delta hyperparameter
         """
         if "device_weights" not in loss_config:
             device_weights = dict.fromkeys(config.dataset_paths, 1.0)
         else:
             device_weights = loss_config["device_weights"]
+
+        anchor_weights = {}
+        if include_anchors:
+            for signal, (_, weight_key) in ANCHOR_SIGNALS.items():
+                anchor_weights[signal] = loss_config.get(weight_key, 0.0)
 
         def loss_fn(pred, targ):
             ne_targ = targ["ne20_rho"].data
@@ -209,16 +236,28 @@ class TransportPredictorTRB(TrainRunBuilder):
                 )
 
             # Broadcast sample weights across the rho axis
-            while sample_weights.ndim < ne_err.ndim:
-                sample_weights = sample_weights[..., None]
+            profile_weights = sample_weights
+            while profile_weights.ndim < ne_err.ndim:
+                profile_weights = profile_weights[..., None]
 
-            return 0.5 * (jnp.mean(sample_weights * ne_err) + jnp.mean(sample_weights * te_err))
+            loss = 0.5 * (jnp.mean(profile_weights * ne_err) + jnp.mean(profile_weights * te_err))
+
+            # Anchor terms are scalar signals, so they take the unbroadcast
+            # per-sample weights
+            for signal, anchor_weight in anchor_weights.items():
+                if anchor_weight <= 0.0 or signal not in targ:
+                    continue
+                pred_attr = ANCHOR_SIGNALS[signal][0]
+                anchor_errors = jnp.abs(getattr(pred, pred_attr) - targ[signal].data)
+                loss = loss + anchor_weight * jnp.mean(sample_weights * anchor_errors)
+
+            return loss
 
         return IntegralLoss(loss_fn)
 
     @staticmethod
     def get_loss_fn(loss_config: dict) -> Callable[[Any, Any], jnp.ndarray]:
-        return TransportPredictorTRB._make_profile_loss_fn(loss_config, use_huber=True)
+        return TransportPredictorTRB._make_profile_loss_fn(loss_config, use_huber=True, include_anchors=True)
 
     @staticmethod
     def get_val_loss_fn(loss_config: dict) -> Callable[[Any, Any], jnp.ndarray]:
@@ -233,9 +272,16 @@ class TransportPredictorTRB(TrainRunBuilder):
 
     @staticmethod
     def get_optimizer(optimizer_config: dict) -> optax.GradientTransformation:
-        # Same clipped AdamW as the profile study: the differentiated TORAX
-        # solve can spike gradients and NaN a run without the global-norm cap
-        return ProfilePredictorTRB.get_optimizer(optimizer_config)
+        # Global-norm cap as in the profile study (the differentiated TORAX
+        # solve can spike gradients and NaN a run without it), on top of the
+        # power balance study's grouped schedule: submodule_lr_factors runs
+        # the sciml power_balance subtree at a reduced learning rate while
+        # the profile predictor keeps the full one (pytree-path labeling, a
+        # no-op for model types without a matching path)
+        return optax.chain(
+            optax.clip_by_global_norm(optimizer_config.get("grad_clip_max_norm", 1.0)),
+            make_grouped_exponential_adamw(optimizer_config),
+        )
 
     @staticmethod
     def get_test_eval_suite(suite_config) -> EvaluationSuite:

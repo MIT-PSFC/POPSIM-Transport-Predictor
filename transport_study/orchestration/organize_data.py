@@ -170,7 +170,9 @@ REQUIRED_SIGNALS_TRANSPORT_TRANSFER = [
     "delta_bot",
     # Extra
     "time",  # Data variable holding per-shot time values, promoted to the time coordinate downstream
-    "Wtot_MJ",  # Seeds the sciml stored-energy state and the normalizer fit, also used for hazard extrapolation
+    "Wtot_MJ",  # Seeds the sciml stored-energy state and the normalizer fit, also used for hazard extrapolation and as an anchor target in the sciml training loss
+    "P_oh_MW",  # Anchor target for the sciml training loss
+    "P_rad_MW",  # Anchor target for the sciml training loss
 ]
 
 
