@@ -312,9 +312,10 @@ class ProfileStudy(Study):
             "gradient_weight": 0.1,
             "huber_delta_grad": 1.0,
             # Residual inside the GP-fit error bar is down-weighted by this
-            # factor: predictions are still pulled toward the fit mean, but
-            # landing within the error bars costs much less than missing them
-            "within_error_weight": 0.25,
+            # factor in the VALIDATION loss only (the training loss uses the
+            # raw residual): checkpoint selection is still pulled toward the
+            # fit mean, but landing within the error bars costs much less
+            "within_error_weight": 0.1,
         }
 
     def _base_optimizer_config(self) -> dict:

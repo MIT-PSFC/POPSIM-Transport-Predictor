@@ -274,8 +274,7 @@ class ProfilePredictorTRB(TrainRunBuilder):
     GRAD_LOSS_RHO_MAX = 0.9
 
     # Default down-weighting of the residual inside the measurement error bar
-    # The prediction is still pulled toward the GP fit mean inside the bar,
-    # just this much less hard than outside it (loss_config key "within_error_weight")
+    # VALIDATION loss only (the training loss uses the raw residual)
     WITHIN_ERROR_WEIGHT = 0.25
 
     @staticmethod
@@ -290,15 +289,17 @@ class ProfilePredictorTRB(TrainRunBuilder):
         the profile peak.
 
         Measurement error bars (<v>_error / <v>_grad_error target vars, from
-        the GP profile fits) soften the residual: the part of the residual
-        inside the error bar is down-weighted by within_error_weight, the part
-        beyond it is penalized at full weight. The prediction is therefore
-        still pulled toward the GP fit mean everywhere, but landing inside the
-        error bars costs significantly less than missing them. An error of 0
-        is the sentinel for "no rigorous error quantification" and gives a
-        zero-width bar, which reduces to the plain residual loss.
-        When the error / gradient target vars are absent entirely the
-        loss falls back to zero-width error bars and finite-difference
+        the GP profile fits) soften the VALIDATION residual only: the part of
+        the residual inside the error bar is down-weighted by
+        within_error_weight, the part beyond it is penalized at full weight, so
+        the validation metric still pulls toward the GP fit mean everywhere but
+        landing inside the error bars costs significantly less than missing
+        them. The training loss uses the raw residual, its robustness to fit
+        noise comes from the huber deltas alone. An error of 0 is the sentinel
+        for "no rigorous error quantification" and gives a zero-width bar,
+        which reduces to the plain residual loss. When the error / gradient
+        target vars are absent entirely the validation loss falls back to
+        zero-width error bars, and both losses fall back to finite-difference
         gradient targets.
 
         use_huber=True builds the training loss with the swept huber_delta /
@@ -318,9 +319,6 @@ class ProfilePredictorTRB(TrainRunBuilder):
         # depend on dTe/drho and dne/drho rather than the values themselves.
         gradient_weight = loss_config.get("gradient_weight", 0.0)
 
-        # Down-weighting of the residual inside the measurement error bar
-        within_error_weight = loss_config.get("within_error_weight", ProfilePredictorTRB.WITHIN_ERROR_WEIGHT)
-
         if use_huber:
             # Normalized gradients are still larger than normalized values
             # (a peak-normalized pedestal can have d/drho of order 10), so the
@@ -333,6 +331,11 @@ class ProfilePredictorTRB(TrainRunBuilder):
 
             def grad_err(excess):
                 return optax.huber_loss(excess, delta=huber_delta_grad)
+
+            def _residual(pred, targ, sigma):
+                # Training residual: plain distance to the GP fit mean, the
+                # error bars do not soften it
+                return jnp.abs(pred - targ)
         else:
 
             def value_err(excess):
@@ -340,18 +343,21 @@ class ProfilePredictorTRB(TrainRunBuilder):
 
             grad_err = value_err
 
-        def _error_softened_residual(pred, targ, sigma):
-            # Piecewise-linear shrink of the residual: full weight on the part
-            # beyond the error bar, within_error_weight on the part inside it.
-            # Continuous and monotone in |residual|, so the pull toward the GP
-            # fit mean never vanishes, it just weakens inside the bar. sigma is
-            # clamped at 0 so a degenerate negative error bar cannot inflate
-            # the residual
-            abs_residual = jnp.abs(pred - targ)
-            sigma = jnp.maximum(sigma, 0.0)
-            outside = jnp.maximum(abs_residual - sigma, 0.0)
-            inside = jnp.minimum(abs_residual, sigma)
-            return outside + within_error_weight * inside
+            # Down-weighting of the residual inside the measurement error bar
+            within_error_weight = loss_config.get("within_error_weight", ProfilePredictorTRB.WITHIN_ERROR_WEIGHT)
+
+            def _residual(pred, targ, sigma):
+                # Piecewise-linear shrink of the residual: full weight on the
+                # part beyond the error bar, within_error_weight on the part
+                # inside it. Continuous and monotone in |residual|, so the pull
+                # toward the GP fit mean never vanishes, it just weakens inside
+                # the bar. sigma is clamped at 0 so a degenerate negative error
+                # bar cannot inflate the residual
+                abs_residual = jnp.abs(pred - targ)
+                sigma = jnp.maximum(sigma, 0.0)
+                outside = jnp.maximum(abs_residual - sigma, 0.0)
+                inside = jnp.minimum(abs_residual, sigma)
+                return outside + within_error_weight * inside
 
         def _sigma_from_targ(targ, var, scale):
             # Error-bar target var, normalized like the profiles. An absent
@@ -374,8 +380,8 @@ class ProfilePredictorTRB(TrainRunBuilder):
             ne_sigma = _sigma_from_targ(targ, "ne20_rho_error", ne_scale)
             te_sigma = _sigma_from_targ(targ, "Te_keV_rho_error", te_scale)
 
-            ne_err = value_err(_error_softened_residual(pred.ne.data / ne_scale, ne_targ / ne_scale, ne_sigma))
-            te_err = value_err(_error_softened_residual(pred.te.data / te_scale, te_targ / te_scale, te_sigma))
+            ne_err = value_err(_residual(pred.ne.data / ne_scale, ne_targ / ne_scale, ne_sigma))
+            te_err = value_err(_residual(pred.te.data / te_scale, te_targ / te_scale, te_sigma))
 
             # Build per-sample device weight
             ds_source_idx = targ["ds_source_idx"].data
@@ -432,8 +438,8 @@ class ProfilePredictorTRB(TrainRunBuilder):
                 if not isinstance(te_grad_sigma, float):
                     te_grad_sigma = _to_mid(te_grad_sigma)
 
-                ne_grad_err = sample_weights * grad_err(_error_softened_residual(ne_grad_pred, ne_grad_targ, ne_grad_sigma))
-                te_grad_err = sample_weights * grad_err(_error_softened_residual(te_grad_pred, te_grad_targ, te_grad_sigma))
+                ne_grad_err = sample_weights * grad_err(_residual(ne_grad_pred, ne_grad_targ, ne_grad_sigma))
+                te_grad_err = sample_weights * grad_err(_residual(te_grad_pred, te_grad_targ, te_grad_sigma))
 
                 # Gradient loss only counts for rho below GRAD_LOSS_RHO_MAX,
                 # the measured gradients beyond it are unreliable
@@ -450,23 +456,28 @@ class ProfilePredictorTRB(TrainRunBuilder):
 
     @staticmethod
     def get_loss_fn(loss_config: dict) -> Callable[[Any, Any], jnp.ndarray]:
-        """Training loss: huber on peak-normalized profiles.
+        """Training loss: huber on the raw peak-normalized residual.
 
-        huber_delta and huber_delta_grad are swept hyperparameters, so this loss
-        must only be used for training. Validation uses get_val_loss_fn, which
-        is delta-free, so the sweep metric stays comparable across delta values.
+        No error-bar softening: robustness to GP-fit noise comes from the huber
+        deltas alone. huber_delta and huber_delta_grad are swept
+        hyperparameters, so this loss must only be used for training.
+        Validation uses get_val_loss_fn, which is delta-free, so the sweep
+        metric stays comparable across delta values.
         """
         return ProfilePredictorTRB._make_profile_loss_fn(loss_config, use_huber=True)
 
     @staticmethod
     def get_val_loss_fn(loss_config: dict) -> Callable[[Any, Any], jnp.ndarray]:
-        """Validation loss: plain absolute error on peak-normalized profiles.
+        """Validation loss: error-bar-softened absolute error on peak-normalized profiles.
 
         Shares device_weights and gradient_weight with the training loss so
         validation weights samples consistently, but reads no huber deltas:
         the sweep metric val/loss.mean must not depend on the swept deltas or
         the sweep would drive them to their minimum to shrink the reported
-        number instead of improving predictions.
+        number instead of improving predictions. Unlike the training loss it
+        down-weights the residual inside the GP-fit error bars
+        (within_error_weight), so checkpoint selection does not chase fit
+        noise the measurement cannot distinguish.
         """
         return ProfilePredictorTRB._make_profile_loss_fn(loss_config, use_huber=False)
 
