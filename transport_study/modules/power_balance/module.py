@@ -15,6 +15,9 @@ from transport_study.modules.power_balance.p_rad.module import RadiatedPower
 
 MIN_TAUE = 0.001  # Default minimum reasonable value for tau_e [s]
 MAX_TAUE = 0.8  # Maximum reasonable value for tau_e [s]
+# Floor smoothing width of the scaling-law tau_e clamp [s], kept narrow so
+# physically common low tau_e (20-50 ms) passes through undistorted
+TAUE_CLAMP_MIN_WIDTH = 0.001
 # Sharpness of the sigmoid L-H mode blend in the scaling law
 # a hard jnp.where switch would zero the gradient of the P_LH threshold coefficients
 LH_BLEND_SHARPNESS = 8.0
@@ -166,9 +169,13 @@ class ScalingLawPredictor(eqx.Module):
         lh_weight = jax.nn.sigmoid(LH_BLEND_SHARPNESS * (P_abs_MW / p_thresh - 1.0))
         taue = (1.0 - lh_weight) * taue_lmode + lh_weight * taue_hmode
 
-        # Softmax output
-        width = BOUND_CLAMP_WIDTH_FRAC * (self.max_taue - self.min_taue)
-        bounded = smooth_clamp(taue, self.min_taue, self.max_taue, width, width)
+        # The clamp input here is the PHYSICAL scaling-law tau_e, so the floor
+        # smoothing must stay narrow: device tau_e commonly sits at 20-50 ms,
+        # which a range-fraction min width would distort by tens of percent.
+        # (BoundedNNPredictor keeps symmetric widths, its clamp input is a raw
+        # NN output with no physical meaning.)
+        width_max = BOUND_CLAMP_WIDTH_FRAC * (self.max_taue - self.min_taue)
+        bounded = smooth_clamp(taue, self.min_taue, self.max_taue, TAUE_CLAMP_MIN_WIDTH, width_max)
         taue_pred = bounded.squeeze()
 
         out = TauePredictorOutputs(
