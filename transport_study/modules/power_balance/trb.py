@@ -116,8 +116,6 @@ class PowerBalanceTRB(TrainRunBuilder):
                     nn_width=model_init_config["nn_width"],
                     nn_depth=model_init_config["nn_depth"],
                     normalizer=normalizer,
-                    min_val=model_init_config.get("min_val", None),
-                    max_val=model_init_config.get("max_val", None),
                     prng_seed=model_init_config.get("prng_seed", 42),
                 )
             elif model_type == "transformer":
@@ -128,8 +126,6 @@ class PowerBalanceTRB(TrainRunBuilder):
                     nn_width=model_init_config["nn_width"],
                     nn_depth=model_init_config["nn_depth"],
                     normalizer=normalizer,
-                    min_val=model_init_config.get("min_val", None),
-                    max_val=model_init_config.get("max_val", None),
                     prng_seed=model_init_config.get("prng_seed", 42),
                 )
             else:

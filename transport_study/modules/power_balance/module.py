@@ -5,7 +5,7 @@ import jax.numpy as jnp
 import xarray as xr
 from jaxtyping import Array, ArrayLike
 from popsim import TimeDepModule, discrete_no_save_field
-from popsim.math_utils import soft_clip
+from popsim.math_utils import smooth_clamp
 from popsim.ml.envs import ModuleTrainingEnv
 from popsim.simulate import StepperType
 
@@ -14,13 +14,17 @@ from transport_study.modules.power_balance.p_oh.module import OhmicPower
 from transport_study.modules.power_balance.p_rad.module import RadiatedPower
 
 MIN_TAUE = 0.001  # Default minimum reasonable value for tau_e [s]
-MAX_TAUE = 0.3  # Maximum reasonable value for tau_e [s]
+MAX_TAUE = 0.8  # Maximum reasonable value for tau_e [s]
 # Sharpness of the sigmoid L-H mode blend in the scaling law
 # a hard jnp.where switch would zero the gradient of the P_LH threshold coefficients
-LH_BLEND_SHARPNESS = 10.0
-MIN_POWER = -20  # Minimum reasonable value for power (dW/dt) [MW]
-MAX_POWER = 20  # Maximum reasonable value for power (dW/dt) [MW]
+LH_BLEND_SHARPNESS = 8.0
+MIN_POWER = -32  # Minimum reasonable value for conducted power (dW/dt) [MW]
+MAX_POWER = 32  # Maximum reasonable value for conducted power (dW/dt) [MW]
 MIN_WTOT_MJ = 0.001  # Floor for predicted stored energy [MJ], keeps Wtot strictly positive
+# Smoothing width of every smooth_clamp bound, as a fraction of the bound range.
+# smooth_clamp is identity inside (min+width, max-width) and its gradient tail
+# decays as exp(-overshoot/width), staying alive ~10x further out than tanh soft_clip
+BOUND_CLAMP_WIDTH_FRAC = 0.1
 
 
 @chex.dataclass
@@ -51,7 +55,8 @@ class BoundedNNPredictor(eqx.Module):
     def __call__(self, inp: "Inputs") -> TauePredictorOutputs:
         arr = jnp.array([inp.Ip_MA, inp.B0, inp.R0, inp.a_minor, inp.kappa, inp.ne20, inp.P_aux_MW])
         nn_out = self.nn(arr)
-        bounded_out = soft_clip(nn_out, self.min_val, self.max_val, sharpness=1).squeeze()
+        width = BOUND_CLAMP_WIDTH_FRAC * (self.max_val - self.min_val)
+        bounded_out = smooth_clamp(nn_out, self.min_val, self.max_val, width, width).squeeze()
 
         output = TauePredictorOutputs(
             taue_pred=bounded_out,
@@ -162,7 +167,8 @@ class ScalingLawPredictor(eqx.Module):
         taue = (1.0 - lh_weight) * taue_lmode + lh_weight * taue_hmode
 
         # Softmax output
-        bounded = soft_clip(taue, self.min_taue, self.max_taue, sharpness=1)
+        width = BOUND_CLAMP_WIDTH_FRAC * (self.max_taue - self.min_taue)
+        bounded = smooth_clamp(taue, self.min_taue, self.max_taue, width, width)
         taue_pred = bounded.squeeze()
 
         out = TauePredictorOutputs(
@@ -279,10 +285,20 @@ class PowerBalance(TimeDepModule):
         return jnp.maximum(wtot_mj, MIN_WTOT_MJ)
 
     @staticmethod
-    def guard_wtot_dot(wtot_mj: ArrayLike, wtot_mj_dot: ArrayLike) -> ArrayLike:
-        """Block further decrease once the integrated state is at the floor,
-        so the raw state cannot run away to large negative values."""
-        return jnp.where(wtot_mj <= MIN_WTOT_MJ, jnp.maximum(wtot_mj_dot, 0.0), wtot_mj_dot)
+    def bound_wtot_dot(wtot_mj: ArrayLike, wtot_mj_dot: ArrayLike) -> ArrayLike:
+        """The single dW/dt path every model type routes through.
+
+        Smooth-clamps the raw dW/dt to [MIN_POWER, MAX_POWER] (identity in
+        the interior, only the edges smooth), then blocks further decrease
+        once the integrated state is at the Wtot floor so the raw state
+        cannot run away to large negative values.
+        The clamp is the same physical prior for all model types: the
+        structured models can otherwise emit unbounded dW/dt (P_cond at
+        the tau_e floor, the unbounded softplus P_oh/P_rad submodules).
+        """
+        width = BOUND_CLAMP_WIDTH_FRAC * (MAX_POWER - MIN_POWER)
+        bounded = smooth_clamp(wtot_mj_dot, MIN_POWER, MAX_POWER, width, width)
+        return jnp.where(wtot_mj <= MIN_WTOT_MJ, jnp.maximum(bounded, 0.0), bounded)
 
 
 class PowerBalanceScalingLaw(PowerBalance):
@@ -343,7 +359,7 @@ class PowerBalanceScalingLaw(PowerBalance):
 
         P_abs_MW = inputs.P_aux_MW + P_oh_MW
 
-        Wtot_MJ_dot = self.guard_wtot_dot(state.Wtot_MJ, P_abs_MW - P_cond_MW - P_rad_MW)
+        Wtot_MJ_dot = self.bound_wtot_dot(state.Wtot_MJ, P_abs_MW - P_cond_MW - P_rad_MW)
 
         state_dot = PowerBalance.State(Wtot_MJ=Wtot_MJ_dot)
         output = PowerBalance.Output(
@@ -424,7 +440,7 @@ class PowerBalanceSciML(PowerBalance):
 
         P_abs_MW = inputs.P_aux_MW + P_oh_MW
 
-        Wtot_MJ_dot = self.guard_wtot_dot(state.Wtot_MJ, P_abs_MW - P_cond_MW - P_rad_MW)
+        Wtot_MJ_dot = self.bound_wtot_dot(state.Wtot_MJ, P_abs_MW - P_cond_MW - P_rad_MW)
 
         state_dot = PowerBalance.State(Wtot_MJ=Wtot_MJ_dot)
         output = PowerBalance.Output(
@@ -440,14 +456,11 @@ class PowerBalanceSciML(PowerBalance):
 class PowerBalanceUnstructuredNN(PowerBalance):
     nn: eqx.Module
     normalizer: InputNormalizer
-    min_val: float = eqx.field(static=True)
-    max_val: float = eqx.field(static=True)
 
     def __call__(self, state: PowerBalance.State, inputs: PowerBalance.Inputs) -> tuple[PowerBalance.State, PowerBalance.Output]:
         features = self.normalizer(inputs.to_normalizer_inputs())
         nn_out = self.nn(features.to_vec())
-        Wtot_MJ_dot = soft_clip(nn_out, self.min_val, self.max_val, sharpness=1).squeeze()
-        Wtot_MJ_dot = self.guard_wtot_dot(state.Wtot_MJ, Wtot_MJ_dot)
+        Wtot_MJ_dot = self.bound_wtot_dot(state.Wtot_MJ, nn_out.squeeze())
 
         state_dot = PowerBalance.State(Wtot_MJ=Wtot_MJ_dot)
         output = PowerBalance.Output(
@@ -466,8 +479,6 @@ class PowerBalanceUnstructuredNN(PowerBalance):
         nn_width: int,
         nn_depth: int,
         normalizer: InputNormalizer,
-        min_val: float | None = None,
-        max_val: float | None = None,
         prng_seed: int = 42,
     ) -> "PowerBalanceUnstructuredNN":
         nn = eqx.nn.MLP(
@@ -477,9 +488,7 @@ class PowerBalanceUnstructuredNN(PowerBalance):
             depth=nn_depth,
             key=jax.random.PRNGKey(prng_seed),
         )
-        min_val = MIN_POWER if min_val is None else min_val
-        max_val = MAX_POWER if max_val is None else max_val
-        return cls(nn=nn, normalizer=normalizer, min_val=min_val, max_val=max_val)
+        return cls(nn=nn, normalizer=normalizer)
 
 
 class PowerBalanceTransformer(PowerBalance):
@@ -505,8 +514,6 @@ class PowerBalanceTransformer(PowerBalance):
     head: eqx.nn.MLP
     history_len: int = eqx.field(static=True)
     d_model: int = eqx.field(static=True)
-    min_val: float = eqx.field(static=True)
-    max_val: float = eqx.field(static=True)
 
     @chex.dataclass
     class State:
@@ -523,8 +530,7 @@ class PowerBalanceTransformer(PowerBalance):
         attn_out = self.attention(token[None, :], new_history, new_history)[0]
         latent = token + attn_out
         nn_out = self.head(latent)
-        Wtot_MJ_dot = soft_clip(nn_out, self.min_val, self.max_val, sharpness=1).squeeze()
-        Wtot_MJ_dot = self.guard_wtot_dot(state.Wtot_MJ, Wtot_MJ_dot)
+        Wtot_MJ_dot = self.bound_wtot_dot(state.Wtot_MJ, nn_out.squeeze())
 
         state_out = PowerBalanceTransformer.State(Wtot_MJ=Wtot_MJ_dot, history=new_history)
         output = PowerBalance.Output(
@@ -543,8 +549,6 @@ class PowerBalanceTransformer(PowerBalance):
         nn_width: int,
         nn_depth: int,
         normalizer: InputNormalizer,
-        min_val: float | None = None,
-        max_val: float | None = None,
         prng_seed: int = 42,
     ) -> "PowerBalanceTransformer":
         key_embed, key_attn, key_head = jax.random.split(jax.random.PRNGKey(prng_seed), 3)
@@ -557,8 +561,6 @@ class PowerBalanceTransformer(PowerBalance):
             depth=nn_depth,
             key=key_head,
         )
-        min_val = MIN_POWER if min_val is None else min_val
-        max_val = MAX_POWER if max_val is None else max_val
         return cls(
             normalizer=normalizer,
             feature_embed=feature_embed,
@@ -566,8 +568,6 @@ class PowerBalanceTransformer(PowerBalance):
             head=head,
             history_len=history_len,
             d_model=d_model,
-            min_val=min_val,
-            max_val=max_val,
         )
 
 
