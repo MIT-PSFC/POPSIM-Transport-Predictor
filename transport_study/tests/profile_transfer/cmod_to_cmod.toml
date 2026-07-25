@@ -11,7 +11,7 @@ cmod-high = "/path/to/cmod.nc"
 cmod-low1 = "/path/to/mast.nc"
 
 [study_cases]
-model_types = ["unstructured_nn"]
+model_types = ["mlp"]
 training_datasets = ["exnihilo", "cmod-low1"]
 num_target_shots_options = [0, 2]
 domain_adaptation_methods = ["transfer"]

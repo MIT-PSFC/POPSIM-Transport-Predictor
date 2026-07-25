@@ -30,9 +30,9 @@ TICK_FONTSIZE = 9
 LEGEND_FONTSIZE = 10
 
 MODEL_COLORS = {
-    "shape_init_pca": "#0095ff",
-    "shape_init_kmeans": "#00d5ff",
-    "unstructured_nn": "#ff4d4d",
+    "shape-init-pca": "#0095ff",
+    "shape-init-kmeans": "#00d5ff",
+    "mlp": "#ff4d4d",
     "reservoir": "#ffb347",
     "torax-constant": "#8dff36",
     "torax-cgm": "#2fbf71",
@@ -41,9 +41,9 @@ MODEL_COLORS = {
 }
 
 MODEL_LABELS = {
-    "shape_init_pca": "Shape init (PCA)",
-    "shape_init_kmeans": "Shape init (k-means)",
-    "unstructured_nn": "Unstructured NN",
+    "shape-init-pca": "Shape init (PCA)",
+    "shape-init-kmeans": "Shape init (k-means)",
+    "mlp": "MLP",
     "reservoir": "Reservoir",
     "torax-constant": "TORAX constant",
     "torax-cgm": "TORAX CGM",
@@ -108,7 +108,7 @@ STAGE_LABELS = {
 DIVERGED_THRESHOLD = 1e3
 
 # Model families with shape bases that can be frozen or trained
-MODELS_WITH_SHAPES = ("shape_init_pca", "shape_init_kmeans", "torax-constant", "torax-cgm", "torax-gyrobohm", "torax-qlknn")
+MODELS_WITH_SHAPES = ("shape-init-pca", "shape-init-kmeans", "torax-constant", "torax-cgm", "torax-gyrobohm", "torax-qlknn")
 
 
 def _training_data_colors(training_datasets: list[str]) -> dict[str, tuple]:

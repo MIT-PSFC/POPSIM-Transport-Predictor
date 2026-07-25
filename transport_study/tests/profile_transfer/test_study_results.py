@@ -40,9 +40,9 @@ class TestCmodToCmod:
             epochs_per_val=1,
             patience=2,
             model_types=[
-                "shape_init_pca",
-                "shape_init_kmeans",
-                "unstructured_nn",
+                "shape-init-pca",
+                "shape-init-kmeans",
+                "mlp",
                 "reservoir",
                 "torax-constant",
                 "torax-cgm",

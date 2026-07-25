@@ -45,8 +45,8 @@ from transport_study.profile_transfer.study_metrics import collect_metrics
 from transport_study.profile_transfer.tables import write_comparison_tables
 
 # Model families: the shape-init predictors have freezable shape bases, the rest do not
-MODEL_TYPES_WITH_SHAPES = ("shape_init_pca", "shape_init_kmeans")
-MODEL_TYPES_WITHOUT_SHAPES = ("unstructured_nn", "reservoir", "torax-constant", "torax-cgm", "torax-gyrobohm", "torax-qlknn")
+MODEL_TYPES_WITH_SHAPES = ("shape-init-pca", "shape-init-kmeans")
+MODEL_TYPES_WITHOUT_SHAPES = ("mlp", "reservoir", "torax-constant", "torax-cgm", "torax-gyrobohm", "torax-qlknn")
 
 # Per-sample geometry builders the torax model types can be benchmarked with
 # (see modules/profile_predictor/torax_module.py). Only meaningful for
@@ -99,7 +99,7 @@ class ProfileStudy(Study):
     ##################
     class Config(CaseGridConfig):
         # The different cases being compared in this study
-        model_types: tuple[str, ...] = Field(default_factory=lambda: ("shape_init_pca", "shape_init_kmeans", "unstructured_nn"))
+        model_types: tuple[str, ...] = Field(default_factory=lambda: ("shape-init-pca", "shape-init-kmeans", "mlp"))
         freeze_shapes_options: tuple[bool, ...] = Field(default_factory=lambda: (True,))
         # Per-sample geometry builders to compare for torax-* model types, ignored
         # by every other model type (see VALID_GEOMETRY_BUILDERS)
@@ -149,8 +149,8 @@ class ProfileStudy(Study):
     class Case(Study.Case):
         """
         model_type: The type of profile_predictor model to use
-        - shape_init: Use principal component analysis to determine dominant shapes
-        - unstructured_nn: a single neural network directly predicts profiles at certain points
+        - shape-init-pca / shape-init-kmeans: B-spline shape bases (PCA or k-means initialized) weighted by an NN
+        - mlp: a single neural network directly predicts profiles at certain points
         - torax-constant / torax-cgm / torax-gyrobohm / torax-qlknn: TORAX simulation with
           NN-predicted parameters for the constant, critical gradient, Bohm-GyroBohm,
           or QLKNN surrogate transport model
@@ -351,7 +351,7 @@ class ProfileStudy(Study):
                     "prng_seed": 42,
                 },
             )
-        elif case.model_type == "unstructured_nn":
+        elif case.model_type == "mlp":
             return ModelTrainSpec(
                 train_run_builder=trb,
                 dataloader_config={"input_vars": PROFILE_INPUT_VARS, **dataloader_config_base},

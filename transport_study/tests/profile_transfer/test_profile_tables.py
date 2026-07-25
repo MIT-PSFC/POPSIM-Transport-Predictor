@@ -21,7 +21,7 @@ FIXED_CASE_FIELDS = {
     "geometry_builder": "circular",
     "num_target_shots": 0,
 }
-MODEL_TYPES = ["shape_init_pca", "unstructured_nn"]
+MODEL_TYPES = ["shape-init-pca", "mlp"]
 SHOTS = [101, 102, 103]
 
 

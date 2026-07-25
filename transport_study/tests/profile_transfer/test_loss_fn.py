@@ -35,7 +35,7 @@ def study_config(tmp_path) -> ProfileStudy.Config:
             "cmod-high": PACKAGE_ROOT / "datasets" / "sample" / "cmod-high.nc",
         },
         target_device="cmod-high",
-        model_types=("unstructured_nn",),
+        model_types=("mlp",),
         training_datasets=("cmod-low",),
         target_test_set_size=60,
     )

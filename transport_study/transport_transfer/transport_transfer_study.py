@@ -88,7 +88,7 @@ VALID_TORAX_STATES = ("rebuild", "carry")
 # structured ones, so profile-loss gradients flow into physical parameters)
 VALID_POWER_BALANCE_MODEL_TYPES = ("sciml-taue-nn", "sciml-taue-scalinglaw")
 # Profile predictor variants allowed as the sciml profile submodule
-VALID_PROFILE_MODEL_TYPES = ("shape_init_pca", "shape_init_kmeans", "unstructured_nn")
+VALID_PROFILE_MODEL_TYPES = ("shape-init-pca", "shape-init-kmeans", "mlp")
 
 
 class TransportStudy(Study):
@@ -144,7 +144,7 @@ class TransportStudy(Study):
         # Whether the power balance prereq case freezes ITS p_oh/p_rad
         # submodules during training (the power balance study default)
         power_balance_freeze_submodules: bool = True
-        profile_model_type: str = "shape_init_pca"
+        profile_model_type: str = "shape-init-pca"
 
         COMPAT_HYPERPARAM_FIELDS = (
             "data_normalization",
@@ -587,7 +587,7 @@ class TransportStudy(Study):
             updates["d_model"] = tuned_config.model_init_config["d_model"]
             updates["num_heads"] = tuned_config.model_init_config["num_heads"]
             updates["history_len"] = tuned_config.model_init_config["history_len"]
-        if case.model_type == "profile" and config.profile_model_type in ("shape_init_pca", "shape_init_kmeans"):
+        if case.model_type == "profile" and config.profile_model_type in ("shape-init-pca", "shape-init-kmeans"):
             updates["n_shapes"] = tuned_config.model_init_config["n_shapes"]
             updates["softmax_temp"] = tuned_config.model_init_config["softmax_temp"]
         return updates

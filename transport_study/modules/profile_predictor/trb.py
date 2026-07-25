@@ -164,14 +164,14 @@ class ProfilePredictorTRB(TrainRunBuilder):
         else:
             normalizer = _fit_nn_input_normalizer(getattr(train_dl, "normalizer_fit_ds", train_dl.ds), n_devices, data_normalization)
 
-        if model_init_config["model_type"] in ["shape_init_pca", "shape_init_kmeans"]:
+        if model_init_config["model_type"] in ["shape-init-pca", "shape-init-kmeans"]:
             te_shape_var = model_init_config["te_shape_var"]
             ne_shape_var = model_init_config["ne_shape_var"]
             n_shapes = model_init_config["n_shapes"]
 
-            if model_init_config["model_type"] == "shape_init_pca":
+            if model_init_config["model_type"] == "shape-init-pca":
                 shape_type = ShapeType.PCA_LIKE
-            elif model_init_config["model_type"] == "shape_init_kmeans":
+            elif model_init_config["model_type"] == "shape-init-kmeans":
                 shape_type = ShapeType.CONVEX_COMBINATION
 
             module = ProfilePredictorShapeInit.init(
@@ -206,7 +206,7 @@ class ProfilePredictorTRB(TrainRunBuilder):
                     module,
                     (te_shapes, ne_shapes),
                 )
-        elif model_init_config["model_type"] == "unstructured_nn":
+        elif model_init_config["model_type"] == "mlp":
             module = ProfilePredictorUnstructuredNN(
                 nn_width=model_init_config["nn_width"],
                 nn_depth=model_init_config["nn_depth"],
@@ -512,9 +512,9 @@ class ProfilePredictorTRB(TrainRunBuilder):
             ids_of_nn_leaves = [id(x) for x in jax.tree.leaves((module.nn_transport, module.nn_sources, module.nn_edge))]
             return [x for x in jax.tree.leaves(module) if id(x) in ids_of_nn_leaves]
 
-        if model_init_config["model_type"] in ["shape_init_pca", "shape_init_kmeans"]:
+        if model_init_config["model_type"] in ["shape-init-pca", "shape-init-kmeans"]:
             return get_trainable_shape_init
-        elif model_init_config["model_type"] in ["unstructured_nn", "reservoir"]:
+        elif model_init_config["model_type"] in ["mlp", "reservoir"]:
             # For the reservoir, only the readout (module.nn) is trainable, the
             # fixed random reservoir weights stay frozen
             return get_trainable_nn

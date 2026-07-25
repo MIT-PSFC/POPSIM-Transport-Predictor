@@ -34,7 +34,7 @@ def loaded_config():
 
 def _case(**overrides):
     kwargs = {
-        "model_type": "shape_init_pca",
+        "model_type": "shape-init-pca",
         "training_data": "cmod-low1",
         "domain_adaptation": None,
         "freeze_shapes": True,
@@ -45,12 +45,12 @@ def _case(**overrides):
 
 
 def test_source_trained_case_name(loaded_config):
-    assert str(_case()) == "case.shape_init_pca.td_cmod-low1.norm_physics.freeze_True.geom_circular"
+    assert str(_case()) == "case.shape-init-pca.td_cmod-low1.norm_physics.freeze_True.geom_circular"
 
 
 def test_exnihilo_case_name(loaded_config):
-    case = _case(model_type="unstructured_nn", training_data="exnihilo", num_target_shots=7)
-    assert str(case) == "case.unstructured_nn.td_exnihilo.norm_physics.freeze_True.geom_circular.targ_7"
+    case = _case(model_type="mlp", training_data="exnihilo", num_target_shots=7)
+    assert str(case) == "case.mlp.td_exnihilo.norm_physics.freeze_True.geom_circular.targ_7"
 
 
 def test_domain_adaptation_case_name(loaded_config):
@@ -72,7 +72,7 @@ def test_weighted_case_name(loaded_config):
     "overrides",
     [
         {},
-        {"model_type": "unstructured_nn", "training_data": "exnihilo", "num_target_shots": 7},
+        {"model_type": "mlp", "training_data": "exnihilo", "num_target_shots": 7},
         {"model_type": "torax-cgm", "domain_adaptation": "transfer", "num_target_shots": 3},
     ],
 )

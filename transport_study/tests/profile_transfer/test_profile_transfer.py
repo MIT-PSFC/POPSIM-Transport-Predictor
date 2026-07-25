@@ -54,9 +54,9 @@ def _run_every_case(study: ProfileStudy, skip_tuning: bool):
 @pytest.mark.parametrize(
     "model_type",
     [
-        "shape_init_pca",
-        "shape_init_kmeans",
-        "unstructured_nn",
+        "shape-init-pca",
+        "shape-init-kmeans",
+        "mlp",
         "torax-constant",
         "torax-cgm",
         "torax-gyrobohm",
@@ -89,7 +89,7 @@ def test_study_cmod_to_cmod_with_tuning():
     cfg = _make_config(
         "test_study_cmod_to_cmod_tuned",
         "cmod_to_cmod_with_tuning",
-        model_types=["unstructured_nn"],
+        model_types=["mlp"],
         num_target_shots_options=[0, -1],
     )
     study = ProfileStudy(cfg)
@@ -117,7 +117,7 @@ def test_study_cmod_to_mast():
             "mast": SAMPLE_DIR / "mast-high.nc",
         },
         target_device="mast",
-        model_types=["unstructured_nn"],
+        model_types=["mlp"],
         training_datasets=["exnihilo", "cmod-low_cmod-high"],
     )
     study = ProfileStudy(cfg)
