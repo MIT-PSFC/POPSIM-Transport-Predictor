@@ -49,19 +49,6 @@ class ScalarPowerTRB(TrainRunBuilder):
         and a model config dict.
         """
 
-        # If max_val is not set, find the device with the largest median target power
-        # in the training data and set max_val to 2x that median value.
-        if model_init_config["max_val"] is None:
-            if train_dl.ds["ds_source"].size < 2:
-                median = train_dl.ds[cls.SIGNAL].median().item()
-            else:
-                device_medians = []
-                for device in np.unique(train_dl.ds["ds_source"].values):
-                    device_median = train_dl.ds.where(train_dl.ds["ds_source"] == device, drop=True)[cls.SIGNAL].median().item()
-                    device_medians.append(device_median)
-                median = max(device_medians)
-            model_init_config["max_val"] = 2 * median
-
         # Fit normalization stats from the training data only, skipping the
         # fit when a transfer checkpoint will overwrite the module anyway.
         # transfer_pretrain dataloaders carry the combined historic + target
@@ -77,8 +64,6 @@ class ScalarPowerTRB(TrainRunBuilder):
             out_size=model_init_config["out_size"],
             nn_width=model_init_config["nn_width"],
             nn_depth=model_init_config["nn_depth"],
-            min_val=model_init_config["min_val"],
-            max_val=model_init_config["max_val"],
             prng_seed=model_init_config["prng_seed"],
             normalizer=normalizer,
         )

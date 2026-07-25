@@ -2,7 +2,6 @@ import chex
 import equinox as eqx
 import jax
 import jax.numpy as jnp
-from popsim.math_utils import soft_clip
 from popsim.module_base import TimeIndepModule
 
 from transport_study.modules.normalization import InputNormalizer
@@ -10,7 +9,11 @@ from transport_study.modules.normalization import InputNormalizer
 
 class OhmicPower(TimeIndepModule):
     """Model that predicts ohmic heating power from plasma parameters.
-    Essentially Ip * network, bounded within some min/max values.
+
+    P_oh = |Ip| * softplus(network), i.e. the network predicts a positive
+    loop voltage. Positive by construction with no upper bound: a hard
+    ceiling saturates its gradient at the rail, which left railed
+    predictions unrecoverable during transfer fine-tuning.
 
     Consumes PHYSICAL inputs and normalizes them internally with its own
     normalizer, so its NN weights and normalization statistics always travel
@@ -20,8 +23,6 @@ class OhmicPower(TimeIndepModule):
 
     nn: eqx.Module
     normalizer: InputNormalizer
-    min_val: float = eqx.field(static=True)
-    max_val: float = eqx.field(static=True)
 
     # Physical inputs plus the device index selecting per-device normalization stats
     Inputs = InputNormalizer.Inputs
@@ -38,10 +39,10 @@ class OhmicPower(TimeIndepModule):
 
         features = self.normalizer(inputs)
         nn_out = self.nn(features.to_vec())
-        bounded_out = soft_clip(jnp.abs(inputs.Ip_MA * nn_out), self.min_val, self.max_val, sharpness=8).squeeze()
+        p_oh = (jnp.abs(inputs.Ip_MA) * jax.nn.softplus(nn_out)).squeeze()
 
         output = OhmicPower.Output(
-            P_oh_MW_pred=bounded_out,
+            P_oh_MW_pred=p_oh,
             debug_info={
                 "nn_out": nn_out.squeeze(),
             },
@@ -56,8 +57,6 @@ class OhmicPower(TimeIndepModule):
         out_size: int,
         nn_width: int,
         nn_depth: int,
-        min_val: float,
-        max_val: float,
         prng_seed: int,
         normalizer: InputNormalizer,
     ) -> "OhmicPower":
@@ -68,4 +67,4 @@ class OhmicPower(TimeIndepModule):
             depth=nn_depth,
             key=jax.random.PRNGKey(prng_seed),
         )
-        return cls(nn=nn, normalizer=normalizer, min_val=min_val, max_val=max_val)
+        return cls(nn=nn, normalizer=normalizer)

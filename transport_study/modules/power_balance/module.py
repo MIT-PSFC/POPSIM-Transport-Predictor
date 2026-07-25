@@ -51,7 +51,7 @@ class BoundedNNPredictor(eqx.Module):
     def __call__(self, inp: "Inputs") -> TauePredictorOutputs:
         arr = jnp.array([inp.Ip_MA, inp.B0, inp.R0, inp.a_minor, inp.kappa, inp.ne20, inp.P_aux_MW])
         nn_out = self.nn(arr)
-        bounded_out = soft_clip(nn_out, self.min_val, self.max_val, sharpness=2).squeeze()
+        bounded_out = soft_clip(nn_out, self.min_val, self.max_val, sharpness=1).squeeze()
 
         output = TauePredictorOutputs(
             taue_pred=bounded_out,
@@ -162,7 +162,7 @@ class ScalingLawPredictor(eqx.Module):
         taue = (1.0 - lh_weight) * taue_lmode + lh_weight * taue_hmode
 
         # Softmax output
-        bounded = soft_clip(taue, self.min_taue, self.max_taue, sharpness=10)
+        bounded = soft_clip(taue, self.min_taue, self.max_taue, sharpness=1)
         taue_pred = bounded.squeeze()
 
         out = TauePredictorOutputs(
@@ -446,7 +446,7 @@ class PowerBalanceUnstructuredNN(PowerBalance):
     def __call__(self, state: PowerBalance.State, inputs: PowerBalance.Inputs) -> tuple[PowerBalance.State, PowerBalance.Output]:
         features = self.normalizer(inputs.to_normalizer_inputs())
         nn_out = self.nn(features.to_vec())
-        Wtot_MJ_dot = soft_clip(nn_out, self.min_val, self.max_val, sharpness=6).squeeze()
+        Wtot_MJ_dot = soft_clip(nn_out, self.min_val, self.max_val, sharpness=1).squeeze()
         Wtot_MJ_dot = self.guard_wtot_dot(state.Wtot_MJ, Wtot_MJ_dot)
 
         state_dot = PowerBalance.State(Wtot_MJ=Wtot_MJ_dot)
@@ -523,7 +523,7 @@ class PowerBalanceTransformer(PowerBalance):
         attn_out = self.attention(token[None, :], new_history, new_history)[0]
         latent = token + attn_out
         nn_out = self.head(latent)
-        Wtot_MJ_dot = soft_clip(nn_out, self.min_val, self.max_val, sharpness=6).squeeze()
+        Wtot_MJ_dot = soft_clip(nn_out, self.min_val, self.max_val, sharpness=1).squeeze()
         Wtot_MJ_dot = self.guard_wtot_dot(state.Wtot_MJ, Wtot_MJ_dot)
 
         state_out = PowerBalanceTransformer.State(Wtot_MJ=Wtot_MJ_dot, history=new_history)

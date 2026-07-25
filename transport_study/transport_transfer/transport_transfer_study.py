@@ -450,8 +450,6 @@ class TransportStudy(Study):
                 model_init_config={
                     "nn_depth": 2,
                     "nn_width": 16,
-                    "min_val": 0,  # Minimum power in MW
-                    "max_val": submodule_settings["max_val"],
                     "prng_seed": 42,
                     "in_size": 7,
                     "out_size": 1,

@@ -2,7 +2,6 @@ import chex
 import equinox as eqx
 import jax
 import jax.numpy as jnp
-from popsim.math_utils import soft_clip
 from popsim.module_base import TimeIndepModule
 
 from transport_study.modules.normalization import InputNormalizer
@@ -10,7 +9,11 @@ from transport_study.modules.normalization import InputNormalizer
 
 class RadiatedPower(TimeIndepModule):
     """Model that predicts radiated power from plasma parameters.
-    Essentially ne20 * network, bounded within some min/max values.
+
+    P_rad = ne20 * softplus(network), i.e. the network predicts a positive
+    per-density radiation factor. Positive by construction with no upper
+    bound: a hard ceiling saturates its gradient at the rail, which left
+    railed predictions unrecoverable during transfer fine-tuning.
 
     Consumes PHYSICAL inputs and normalizes them internally with its own
     normalizer, so its NN weights and normalization statistics always travel
@@ -20,8 +23,6 @@ class RadiatedPower(TimeIndepModule):
 
     nn: eqx.Module
     normalizer: InputNormalizer
-    min_val: float = eqx.field(static=True)
-    max_val: float = eqx.field(static=True)
 
     # Physical inputs plus the device index selecting per-device normalization stats
     Inputs = InputNormalizer.Inputs
@@ -38,10 +39,10 @@ class RadiatedPower(TimeIndepModule):
 
         features = self.normalizer(inputs)
         nn_out = self.nn(features.to_vec())
-        bounded_out = soft_clip(jnp.abs(inputs.ne20_line_avg * nn_out), self.min_val, self.max_val, sharpness=8).squeeze()
+        p_rad = (jnp.abs(inputs.ne20_line_avg) * jax.nn.softplus(nn_out)).squeeze()
 
         output = RadiatedPower.Output(
-            P_rad_MW_pred=bounded_out,
+            P_rad_MW_pred=p_rad,
             debug_info={
                 "nn_out": nn_out.squeeze(),
             },
@@ -56,8 +57,6 @@ class RadiatedPower(TimeIndepModule):
         out_size: int,
         nn_width: int,
         nn_depth: int,
-        min_val: float,
-        max_val: float,
         prng_seed: int,
         normalizer: InputNormalizer,
     ) -> "RadiatedPower":
@@ -68,4 +67,4 @@ class RadiatedPower(TimeIndepModule):
             depth=nn_depth,
             key=jax.random.PRNGKey(prng_seed),
         )
-        return cls(nn=nn, normalizer=normalizer, min_val=min_val, max_val=max_val)
+        return cls(nn=nn, normalizer=normalizer)

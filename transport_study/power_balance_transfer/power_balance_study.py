@@ -62,12 +62,10 @@ SCALAR_SUBMODULE_SETTINGS = {
     "p_oh": {
         "train_run_builder": "transport_study.modules.power_balance.p_oh.trb.OhmicPowerTRB",
         "target_vars": ["P_oh_MW", "ds_source_idx"],
-        "max_val": 16,  # Maximum ohmic power in MW
     },
     "p_rad": {
         "train_run_builder": "transport_study.modules.power_balance.p_rad.trb.RadiatedPowerTRB",
         "target_vars": ["P_rad_MW", "ds_source_idx"],
-        "max_val": 16,  # Maximum radiated power in MW
     },
 }
 
@@ -315,8 +313,6 @@ class PowerBalanceStudy(Study):
                 model_init_config={
                     "nn_depth": 2,
                     "nn_width": 16,
-                    "min_val": 0,  # Minimum power in MW
-                    "max_val": submodule_settings["max_val"],
                     "prng_seed": 42,
                     "in_size": 7,
                     "out_size": 1,

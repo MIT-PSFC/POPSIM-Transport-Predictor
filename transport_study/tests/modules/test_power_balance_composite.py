@@ -159,12 +159,8 @@ def _scalar_inputs() -> PowerBalance.Inputs:
 
 
 def _make_submodules() -> tuple[OhmicPower, RadiatedPower]:
-    p_oh = OhmicPower.init(
-        in_size=7, out_size=1, nn_width=4, nn_depth=1, min_val=0, max_val=16, prng_seed=1, normalizer=make_normalizer("raw", None, 1)
-    )
-    p_rad = RadiatedPower.init(
-        in_size=7, out_size=1, nn_width=4, nn_depth=1, min_val=0, max_val=16, prng_seed=2, normalizer=make_normalizer("raw", None, 1)
-    )
+    p_oh = OhmicPower.init(in_size=7, out_size=1, nn_width=4, nn_depth=1, prng_seed=1, normalizer=make_normalizer("raw", None, 1))
+    p_rad = RadiatedPower.init(in_size=7, out_size=1, nn_width=4, nn_depth=1, prng_seed=2, normalizer=make_normalizer("raw", None, 1))
     return p_oh, p_rad
 
 
