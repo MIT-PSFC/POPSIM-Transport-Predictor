@@ -142,7 +142,7 @@ def build_circular(R_major, a_minor, B_0, kappa):
 @pytest.mark.parametrize(
     "R_major,a_minor,kappa",
     [
-        (6.2, 0.62, 1.0),  # conventional aspect ratio, circular
+        (1, 0.3, 1.0),  # conventional aspect ratio, circular
         (6.2, 0.62, 1.7),  # conventional aspect ratio, elongated
         (0.85, 0.6, 1.7),  # MAST-like spherical tokamak
     ],
@@ -164,8 +164,8 @@ def test_miller_circular_limit_metrics_small_epsilon():
     # At small inverse aspect ratio (0.1) and kappa = 1 the circular
     # builder's large-aspect-ratio metric approximations are accurate to
     # O(epsilon^2) ~ 1%, so the Miller quadrature must land within 2%
-    circ = build_circular(6.2, 0.62, 2.5, 1.0)
-    miller = build_miller(6.2, 0.62, 2.5, 1.0, 0.0, 0.0)
+    circ = build_circular(1, 0.3, 2.5, 1.0)
+    miller = build_miller(1, 0.3, 2.5, 1.0, 0.0, 0.0)
     for field in APPROX_FIELDS:
         np.testing.assert_allclose(
             np.asarray(getattr(miller, field)),

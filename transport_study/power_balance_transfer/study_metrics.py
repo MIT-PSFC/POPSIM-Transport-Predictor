@@ -221,7 +221,7 @@ def case_metrics_path(study: Study, case) -> Path:
     return study.result_path(case).parent / CASE_METRICS_FILENAME
 
 
-def _aggregate_case_metrics(ts_metrics: CaseTimesliceMetrics) -> xr.Dataset:
+def aggregate_case_metrics(ts_metrics: CaseTimesliceMetrics) -> xr.Dataset:
     """Reduce one case's per-timeslice errors to per-stage statistics.
 
     Dims: stage (STAGE_AGG_NAMES). Data variables <metric>_<stat> for metric in
@@ -275,7 +275,7 @@ def compute_and_save_case_metrics(study, case) -> xr.Dataset:
         logger.warning(f"No valid test timeslices for case {case}, caching empty metrics marker")
         case_ds = xr.Dataset()
     else:
-        case_ds = _aggregate_case_metrics(ts_metrics)
+        case_ds = aggregate_case_metrics(ts_metrics)
         logger.info(f"Computed stage-resolved metrics for case {case} ({len(ts_metrics)} timeslices)")
 
     cache_path.parent.mkdir(parents=True, exist_ok=True)
