@@ -195,7 +195,7 @@ def test_structured_outputs_carry_submodule_predictions():
     transformer = PowerBalanceTransformer.init(
         d_model=8, num_heads=2, history_len=4, nn_width=4, nn_depth=1, normalizer=make_normalizer("raw", None, 1)
     )
-    transformer_state = PowerBalanceTransformer.State(Wtot_MJ=jnp.asarray(0.1), history=jnp.zeros((4, 8)))
+    transformer_state = PowerBalanceTransformer.State(Wtot_MJ=jnp.asarray(0.1), history=jnp.full((4,), 0.1))
     _, output = transformer(transformer_state, inputs)
     assert np.isnan(float(output.P_oh_MW_pred))
     assert np.isnan(float(output.P_rad_MW_pred))

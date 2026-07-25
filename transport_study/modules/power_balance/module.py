@@ -494,22 +494,29 @@ class PowerBalanceUnstructuredNN(PowerBalance):
 class PowerBalanceTransformer(PowerBalance):
     """Purely data-driven dW/dt predictor with recurrent causal attention.
 
-    A rolling buffer of the last history_len embedded input tokens is carried
+    A rolling buffer of the last history_len predicted Wtot values is carried
     in the module State as a DISCRETE field
     the simple-Euler stepper integrates only continuous state (Wtot_MJ)
     and passes discrete fields through as the next state directly
     (see popsim.simulate._single_step and popsim.modules.delay.DelayBuffer for the pattern),
     so the buffer update is an exact discrete shift
-    no_save keeps the (K, d) buffer out of the recorded simulation output.
+    no_save keeps the (history_len,) buffer out of the recorded simulation output.
 
-    Each step: embed the normalized 7-vector to a token, roll it into the
-    history, attend with the current token as query over the history
-    (causal by construction, the buffer only ever contains current and past tokens),
-    then a residual connection and an MLP head produce a bounded Wtot_MJ_dot.
+    Each step: shift the current (floored) Wtot state into the buffer, embed
+    the normalized 7-vector to a query token, embed each buffered Wtot value
+    plus a learned per-slot position embedding to key/value tokens, attend
+    (causal by construction, the buffer only ever contains current and past
+    predictions), then a residual connection and an MLP head produce a
+    bounded Wtot_MJ_dot. Unlike the transport transformer's profile rows,
+    scalar Wtot tokens are indistinguishable beyond their value, so without
+    the position embedding attention would be permutation-invariant over the
+    history and unable to read trends.
     """
 
     normalizer: InputNormalizer
     feature_embed: eqx.nn.Linear
+    wtot_embed: eqx.nn.Linear
+    pos_embed: Array
     attention: eqx.nn.MultiheadAttention
     head: eqx.nn.MLP
     history_len: int = eqx.field(static=True)
@@ -518,23 +525,26 @@ class PowerBalanceTransformer(PowerBalance):
     @chex.dataclass
     class State:
         Wtot_MJ: float
-        history: Array = discrete_no_save_field(default=None)  # (history_len, d_model)
+        # (history_len,) past predicted Wtot_MJ values, most recent last
+        history: Array = discrete_no_save_field(default=None)
 
     def __call__(self, state: "PowerBalanceTransformer.State", inputs: PowerBalance.Inputs) -> tuple:
         features = self.normalizer(inputs.to_normalizer_inputs())
-        token = self.feature_embed(features.to_vec())
+        query = self.feature_embed(features.to_vec())
 
-        # Shift the buffer by one and insert the newest token at the end
-        new_history = jnp.concatenate([state.history[1:], token[None, :]], axis=0)
+        # Shift the buffer by one and insert the current predicted Wtot at the end
+        wtot_now = self.positive_wtot(state.Wtot_MJ)
+        new_history = jnp.concatenate([state.history[1:], wtot_now[None]])
 
-        attn_out = self.attention(token[None, :], new_history, new_history)[0]
-        latent = token + attn_out
+        tokens = jax.vmap(self.wtot_embed)(new_history[:, None]) + self.pos_embed
+        attn_out = self.attention(query[None, :], tokens, tokens)[0]
+        latent = query + attn_out
         nn_out = self.head(latent)
         Wtot_MJ_dot = self.bound_wtot_dot(state.Wtot_MJ, nn_out.squeeze())
 
         state_out = PowerBalanceTransformer.State(Wtot_MJ=Wtot_MJ_dot, history=new_history)
         output = PowerBalance.Output(
-            Wtot_MJ_pred=self.positive_wtot(state.Wtot_MJ),
+            Wtot_MJ_pred=wtot_now,
             P_cond_MW=jnp.nan,  # Not predicted in this model
             taue_predictor_output=TauePredictorOutputs(taue_pred=jnp.nan, debug_info={"nn_out": nn_out.squeeze()}),
         )
@@ -551,8 +561,12 @@ class PowerBalanceTransformer(PowerBalance):
         normalizer: InputNormalizer,
         prng_seed: int = 42,
     ) -> "PowerBalanceTransformer":
-        key_embed, key_attn, key_head = jax.random.split(jax.random.PRNGKey(prng_seed), 3)
+        key_embed, key_wtot, key_pos, key_attn, key_head = jax.random.split(jax.random.PRNGKey(prng_seed), 5)
         feature_embed = eqx.nn.Linear(7, d_model, key=key_embed)
+        wtot_embed = eqx.nn.Linear(1, d_model, key=key_wtot)
+        # Small random init breaks slot symmetry when the buffer holds a
+        # constant history (the seeded state at t0)
+        pos_embed = 0.02 * jax.random.normal(key_pos, (history_len, d_model))
         attention = eqx.nn.MultiheadAttention(num_heads=num_heads, query_size=d_model, key=key_attn)
         head = eqx.nn.MLP(
             in_size=d_model,
@@ -564,6 +578,8 @@ class PowerBalanceTransformer(PowerBalance):
         return cls(
             normalizer=normalizer,
             feature_embed=feature_embed,
+            wtot_embed=wtot_embed,
+            pos_embed=pos_embed,
             attention=attention,
             head=head,
             history_len=history_len,
@@ -580,7 +596,10 @@ class PowerBalanceEnv(ModuleTrainingEnv):
     def create_state(self, observations: dict[str, ArrayLike], inputs: dict[str, ArrayLike]):
         Wtot_MJ = observations["Wtot_MJ"].data
         if isinstance(self.module, PowerBalanceTransformer):
-            history = jnp.zeros((self.module.history_len, self.module.d_model))
+            # Seed the Wtot history with the measured t0 value tiled, a
+            # constant history rather than a fake all-zero one
+            Wtot_MJ = jnp.asarray(Wtot_MJ)
+            history = jnp.broadcast_to(Wtot_MJ[..., None], (*Wtot_MJ.shape, self.module.history_len))
             return PowerBalanceTransformer.State(Wtot_MJ=Wtot_MJ, history=history)
         return PowerBalance.State(Wtot_MJ=Wtot_MJ)
 
@@ -658,6 +677,8 @@ class PowerBalanceEnv(ModuleTrainingEnv):
             trainable_leaves["nn"] = eqx.filter(self.module.nn, eqx.is_inexact_array)
         elif isinstance(self.module, PowerBalanceTransformer):
             trainable_leaves["feature_embed"] = eqx.filter(self.module.feature_embed, eqx.is_inexact_array)
+            trainable_leaves["wtot_embed"] = eqx.filter(self.module.wtot_embed, eqx.is_inexact_array)
+            trainable_leaves["pos_embed"] = self.module.pos_embed
             trainable_leaves["attention"] = eqx.filter(self.module.attention, eqx.is_inexact_array)
             trainable_leaves["head"] = eqx.filter(self.module.head, eqx.is_inexact_array)
 
