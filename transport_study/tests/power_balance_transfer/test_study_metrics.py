@@ -129,7 +129,7 @@ def test_best_worst_pdf(tmp_path, result_ds, ts_metrics):
 def collected_datasets() -> tuple[xr.Dataset, xr.Dataset]:
     """Synthetic collected_results.nc / collected_metrics.nc pair sharing
     case_idx, with a p_oh submodule case and one case missing from metrics."""
-    model_types = ["sciml", "transformer", "p_oh"]
+    model_types = ["sciml-taue-nn", "transformer", "p_oh"]
     normalizations = ["raw", "coral"]
     shots_options = [0, 3, -1]
 
@@ -182,7 +182,7 @@ def test_write_comparison_tables(tmp_path, collected_datasets):
 
     # A model_type table lists both main models and every column
     model_table = next(iter((tables_dir / "model_type").glob("*.md"))).read_text()
-    assert "sciml" in model_table
+    assert "sciml-taue-nn" in model_table
     assert "transformer" in model_table
     assert "rel err (time avg)" in model_table
     assert "flattop ohmic" in model_table

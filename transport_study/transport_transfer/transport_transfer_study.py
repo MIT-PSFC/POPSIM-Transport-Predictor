@@ -86,7 +86,7 @@ VALID_TORAX_STATES = ("rebuild", "carry")
 
 # Power balance variants allowed as the sciml stored-energy submodule (the
 # structured ones, so profile-loss gradients flow into physical parameters)
-VALID_POWER_BALANCE_MODEL_TYPES = ("sciml", "scaling_law")
+VALID_POWER_BALANCE_MODEL_TYPES = ("sciml-taue-nn", "sciml-taue-scalinglaw")
 # Profile predictor variants allowed as the sciml profile submodule
 VALID_PROFILE_MODEL_TYPES = ("shape_init_pca", "shape_init_kmeans", "unstructured_nn")
 
@@ -139,7 +139,7 @@ class TransportStudy(Study):
         # Which variants back the sciml prereq submodules. Study-wide settings
         # rather than case axes; they change model semantics under unchanged
         # case names, so they are part of the config lock below
-        power_balance_model_type: str = "sciml"
+        power_balance_model_type: str = "sciml-taue-nn"
         power_balance_data_normalization: str = "physics"
         # Whether the power balance prereq case freezes ITS p_oh/p_rad
         # submodules during training (the power balance study default)

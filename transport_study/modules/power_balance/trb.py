@@ -66,7 +66,7 @@ class PowerBalanceTRB(TrainRunBuilder):
             else:
                 fit_ds = getattr(train_dl, "normalizer_fit_ds", train_dl.ds)
             normalizer = make_normalizer(model_init_config["data_normalization"], fit_ds, n_devices)
-            if model_type in ["scaling_law", "sciml"]:
+            if model_type in ["sciml-taue-scalinglaw", "sciml-taue-nn"]:
                 p_oh_config = model_init_config["submodules"]["p_oh_predictor"]
                 if isinstance(p_oh_config, TrainConfig):
                     p_oh_config = p_oh_config.model_dump()
@@ -81,14 +81,14 @@ class PowerBalanceTRB(TrainRunBuilder):
                     p_rad_manager = create_default_checkpoint_manager(p_rad_config["checkpoint_dir"])
                     p_rad_predictor = restore_model(p_rad_manager, p_rad_predictor)
 
-            if model_type == "scaling_law":
+            if model_type == "sciml-taue-scalinglaw":
                 module = PowerBalanceScalingLaw.init(
                     p_oh_predictor=p_oh_predictor,
                     p_rad_predictor=p_rad_predictor,
                     min_taue=model_init_config.get("min_taue", None),
                     max_taue=model_init_config.get("max_taue", None),
                 )
-            elif model_type == "sciml":
+            elif model_type == "sciml-taue-nn":
                 module = PowerBalanceSciML.init(
                     p_oh_predictor=p_oh_predictor,
                     p_rad_predictor=p_rad_predictor,
@@ -101,7 +101,7 @@ class PowerBalanceTRB(TrainRunBuilder):
                     max_taue=model_init_config.get("max_taue", None),
                     prng_seed=model_init_config.get("prng_seed", 42),
                 )
-            elif model_type == "unstructured_nn":
+            elif model_type == "mlp":
                 module = PowerBalanceUnstructuredNN.init(
                     in_size=model_init_config["in_size"],
                     out_size=model_init_config["out_size"],
@@ -146,7 +146,7 @@ class PowerBalanceTRB(TrainRunBuilder):
             transfer_manager = create_default_checkpoint_manager(model_init_config["transfer_checkpoint"])
             env = restore_model(transfer_manager, env)
             # Restoring the whole env overwrote the freshly restored submodule weights, restore them again from their own checkpoints
-            if model_init_config["model_type"] in ["scaling_law", "sciml"]:
+            if model_init_config["model_type"] in ["sciml-taue-scalinglaw", "sciml-taue-nn"]:
                 p_oh_config = model_init_config["submodules"]["p_oh_predictor"]
                 if isinstance(p_oh_config, TrainConfig):
                     p_oh_config = p_oh_config.model_dump()

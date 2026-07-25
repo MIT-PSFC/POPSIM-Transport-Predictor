@@ -16,7 +16,7 @@ from transport_study.power_balance_transfer.plotting import (
 def results_ds() -> xr.Dataset:
     """Synthetic collected_results.nc matching PowerBalanceStudy.collect_results:
     one row per case along case_idx with the case-grid coords and err_E_D_S vars."""
-    model_types = ["scaling_law", "sciml", "unstructured_nn", "transformer", "p_oh"]
+    model_types = ["sciml-taue-scalinglaw", "sciml-taue-nn", "mlp", "transformer", "p_oh"]
     training_datasets = ["cmod", "exnihilo"]
     normalizations = ["raw", "coral"]
     adaptations = ["none", "weighted", "addition", "transfer"]

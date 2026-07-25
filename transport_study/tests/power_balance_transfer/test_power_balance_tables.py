@@ -17,7 +17,7 @@ def _results_ds() -> xr.Dataset:
     # files where every case shares the single configured value.
     coords = {
         "case_idx": [0, 1, 2],
-        "model_type": ("case_idx", np.array(["sciml", "scaling_law", "p_oh"])),
+        "model_type": ("case_idx", np.array(["sciml-taue-nn", "sciml-taue-scalinglaw", "p_oh"])),
         "training_data": ("case_idx", np.array(["cmod"] * 3)),
         "data_normalization": ("case_idx", np.array(["physics"] * 3)),
         "domain_adaptation": ("case_idx", np.array(["none"] * 3)),
@@ -44,7 +44,7 @@ def _metrics_ds() -> xr.Dataset:
 
 def test_case_stats_frame_excludes_submodules_and_merges_metrics():
     df = case_stats_frame(_results_ds(), _metrics_ds())
-    assert set(df["model_type"]) == {"sciml", "scaling_law"}
+    assert set(df["model_type"]) == {"sciml-taue-nn", "sciml-taue-scalinglaw"}
     # The scalar freeze_submodules coord is broadcast back to a column
     assert (df["freeze_submodules"] == "none").all()
     df = df.set_index("case_idx")
@@ -63,15 +63,15 @@ def test_write_comparison_tables(tmp_path):
 
     table_path = tmp_path / "tables" / "model_type" / "td_cmod.norm_physics.da_none.freeze_none.targ_0.md"
     content = table_path.read_text()
-    assert "| sciml |" in content
-    assert "| scaling_law |" in content
+    assert "| sciml-taue-nn |" in content
+    assert "| sciml-taue-scalinglaw |" in content
 
 
 def test_missing_metrics_render_as_dash(tmp_path):
     write_comparison_tables(_results_ds(), xr.Dataset(), tmp_path)
     table_path = tmp_path / "tables" / "model_type" / "td_cmod.norm_physics.da_none.freeze_none.targ_0.md"
     content = table_path.read_text()
-    assert "| sciml | - |" in content
+    assert "| sciml-taue-nn | - |" in content
 
 
 def test_empty_results_skip(tmp_path):

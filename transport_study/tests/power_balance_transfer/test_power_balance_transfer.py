@@ -42,7 +42,7 @@ def _make_config(study_name: str, **overrides) -> PowerBalanceStudy.Config:
         max_epochs=2,
         epochs_per_val=1,
         patience=2,
-        model_types=("sciml", "unstructured_nn"),
+        model_types=("sciml-taue-nn", "mlp"),
         training_datasets=("cmod-low1", "cmod-low1_cmod-low2"),
         data_normalization_methods=("coral",),
         domain_adaptation_methods=(None, "weighted", "addition", "transfer"),
@@ -80,7 +80,7 @@ def test_power_balance_transfer_cases():
     study = PowerBalanceStudy(
         _make_config(
             "xfer_test",
-            model_types=("sciml", "unstructured_nn", "transformer"),
+            model_types=("sciml-taue-nn", "mlp", "transformer"),
             data_normalization_methods=("raw", "coral"),
             freeze_submodules_options=(True, False),
             num_target_shots_options=(0, -1),
@@ -107,7 +107,7 @@ def test_power_balance_transfer_cases():
 
     # Models without submodules only get one freeze variant
     for case in study.cases:
-        if case.model_type in ("unstructured_nn", "transformer"):
+        if case.model_type in ("mlp", "transformer"):
             assert case.freeze_submodules == config.hyperparam_freeze_submodules
 
     # No impossible cases survive
@@ -130,7 +130,7 @@ def test_power_balance_transfer_cases():
     # For every case, check the prereqs match the hand-derived expectation
     for case in study.cases:
         if case.is_hyperparam_case():
-            if case.model_type in ("p_oh", "p_rad", "unstructured_nn", "transformer"):
+            if case.model_type in ("p_oh", "p_rad", "mlp", "transformer"):
                 assert case.prereqs is None, f"Hyperparameter case {case} should have no prereqs, has {case.prereqs}"
                 continue
             expected_prereqs = _submodule_prereqs(case)
@@ -148,11 +148,11 @@ def test_power_balance_transfer_cases():
                 num_target_shots=case.num_target_shots if case.data_normalization in STAT_NORMALIZATIONS else HYPERPARAM_TARGET_SHOTS,
             )
             expected_prereqs = [_hyperparam_case(study, case.model_type), twin]
-            if case.model_type in ("sciml", "scaling_law"):
+            if case.model_type in ("sciml-taue-nn", "sciml-taue-scalinglaw"):
                 expected_prereqs += _submodule_prereqs(case)
         elif case.domain_adaptation in ("weighted", "addition", None, "transfer_pretrain"):
             expected_prereqs = [_hyperparam_case(study, case.model_type)]
-            if case.model_type in ("sciml", "scaling_law"):
+            if case.model_type in ("sciml-taue-nn", "sciml-taue-scalinglaw"):
                 expected_prereqs += _submodule_prereqs(case)
         else:
             continue
@@ -171,7 +171,7 @@ def test_weighted_device_weight():
     study = PowerBalanceStudy(
         _make_config(
             "test_weighted_device_weight",
-            model_types=("sciml",),
+            model_types=("sciml-taue-nn",),
             training_datasets=("cmod-low1_cmod-low2",),
             domain_adaptation_methods=("weighted",),
             num_target_shots_options=(3,),
@@ -210,7 +210,7 @@ def test_addition_no_device_weights():
     study = PowerBalanceStudy(
         _make_config(
             "test_addition_no_device_weights",
-            model_types=("unstructured_nn",),
+            model_types=("mlp",),
             training_datasets=("cmod-low1_cmod-low2",),
             domain_adaptation_methods=("weighted", "addition"),
             num_target_shots_options=(3,),
@@ -219,7 +219,7 @@ def test_addition_no_device_weights():
 
     def _case(domain_adaptation):
         return PowerBalanceStudy.Case(
-            model_type="unstructured_nn",
+            model_type="mlp",
             training_data="cmod-low1_cmod-low2",
             data_normalization="coral",
             domain_adaptation=domain_adaptation,
@@ -302,7 +302,7 @@ def test_submodule_freezing():
     study = PowerBalanceStudy(
         _make_config(
             "test_submodule_freezing",
-            model_types=("sciml",),
+            model_types=("sciml-taue-nn",),
             training_datasets=("cmod-low1_cmod-low2",),
             domain_adaptation_methods=(None,),
             freeze_submodules_options=(True, False),
@@ -322,8 +322,8 @@ def test_submodule_freezing():
 
     case_p_oh = _case("p_oh", True)
     case_p_rad = _case("p_rad", True)
-    case_frozen = _case("sciml", True)
-    case_unfrozen = _case("sciml", False)
+    case_frozen = _case("sciml-taue-nn", True)
+    case_unfrozen = _case("sciml-taue-nn", False)
 
     for case in [case_p_oh, case_p_rad, case_frozen, case_unfrozen]:
         if not study.result_path(case).exists():
@@ -366,7 +366,7 @@ def test_transfer_weights():
     study = PowerBalanceStudy(
         _make_config(
             "test_transfer_weights",
-            model_types=("unstructured_nn",),
+            model_types=("mlp",),
             training_datasets=("cmod-low1_cmod-low2",),
             domain_adaptation_methods=("transfer",),
             num_target_shots_options=(3,),
@@ -374,7 +374,7 @@ def test_transfer_weights():
     )
 
     case_transfer = PowerBalanceStudy.Case(
-        model_type="unstructured_nn",
+        model_type="mlp",
         training_data="cmod-low1_cmod-low2",
         data_normalization="coral",
         domain_adaptation="transfer",
@@ -433,7 +433,7 @@ def test_transfer_weights_submodules(freeze_submodules):
     study = PowerBalanceStudy(
         _make_config(
             f"test_transfer_weights_submodules_{freeze_submodules}",
-            model_types=("sciml",),
+            model_types=("sciml-taue-nn",),
             training_datasets=("cmod-low1_cmod-low2",),
             domain_adaptation_methods=("transfer",),
             freeze_submodules_options=(freeze_submodules,),
@@ -453,7 +453,7 @@ def test_transfer_weights_submodules(freeze_submodules):
 
     case_p_oh_transfer = _case("p_oh", "transfer", True)
     case_p_rad_transfer = _case("p_rad", "transfer", True)
-    case_sciml_transfer = _case("sciml", "transfer", freeze_submodules)
+    case_sciml_transfer = _case("sciml-taue-nn", "transfer", freeze_submodules)
     case_p_oh_pretrain = case_p_oh_transfer._replace(domain_adaptation="transfer_pretrain")
     case_p_rad_pretrain = case_p_rad_transfer._replace(domain_adaptation="transfer_pretrain")
     case_sciml_pretrain = case_sciml_transfer._replace(domain_adaptation="transfer_pretrain")
@@ -528,7 +528,7 @@ def test_collect_results():
     study = PowerBalanceStudy(
         _make_config(
             "test_collect_results",
-            model_types=("sciml",),
+            model_types=("sciml-taue-nn",),
             training_datasets=("cmod-low1_cmod-low2",),
             domain_adaptation_methods=("addition",),
             num_target_shots_options=(3,),

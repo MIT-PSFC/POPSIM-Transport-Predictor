@@ -48,9 +48,9 @@ POWER_BALANCE_INPUT_VARS = [
 ]
 
 # Model types with p_oh/p_rad submodules (the SciML-style structured models)
-MODEL_TYPES_WITH_SUBMODULES = ("scaling_law", "sciml")
+MODEL_TYPES_WITH_SUBMODULES = ("sciml-taue-scalinglaw", "sciml-taue-nn")
 # Purely data-driven model types, no submodules so nothing to freeze
-MODEL_TYPES_WITHOUT_SUBMODULES = ("unstructured_nn", "transformer")
+MODEL_TYPES_WITHOUT_SUBMODULES = ("mlp", "transformer")
 # Submodule pseudo-model-types, they appear as prereq cases of the structured models
 SUBMODULE_MODEL_TYPES = ("p_oh", "p_rad")
 
@@ -94,7 +94,7 @@ class PowerBalanceStudy(Study):
     ##################
     class Config(CaseGridConfig):
         # The different cases being compared in this study
-        model_types: tuple[str, ...] = Field(default_factory=lambda: ("scaling_law", "sciml", "unstructured_nn", "transformer"))
+        model_types: tuple[str, ...] = Field(default_factory=lambda: ("sciml-taue-scalinglaw", "sciml-taue-nn", "mlp", "transformer"))
         data_normalization_methods: tuple[str, ...] = Field(default_factory=lambda: VALID_DATA_NORMALIZATIONS)
         freeze_submodules_options: tuple[bool, ...] = Field(default_factory=lambda: (True,))
         num_target_shots_options: tuple[int, ...] = Field(default_factory=lambda: (0, 1, 3, 10, 32, -1))
@@ -132,11 +132,11 @@ class PowerBalanceStudy(Study):
     class Case(Study.Case):
         """
         model_type: The type of power_balance model to use.
-        - scaling_law: H89, H98, and P_LH scaling laws to predict tau_e
-        - sciml: neural network predicts tau_e, and we do the power balance calculation
-        - unstructured_nn: a simple MLP directly predicts stored energy evolution
+        - sciml-taue-scalinglaw: H89, H98, and P_LH scaling laws to predict tau_e
+        - sciml-taue-nn: neural network predicts tau_e, and we do the power balance calculation
+        - mlp: a simple MLP directly predicts stored energy evolution
         - transformer: recurrent causal attention over past inputs directly predicts stored energy evolution
-        - p_oh / p_rad: submodule predictors, appear only as prereq cases of scaling_law and sciml
+        - p_oh / p_rad: submodule predictors, appear only as prereq cases of sciml-taue-scalinglaw and sciml-taue-nn
 
         training_data: The dataset(s) used for training
         - cmod: C-Mod only
@@ -336,7 +336,7 @@ class PowerBalanceStudy(Study):
                     "restore_submodules": True,  # Always restoring pre-trained submodules in this study
                 },
             )
-        elif case.model_type == "unstructured_nn":
+        elif case.model_type == "mlp":
             return ModelTrainSpec(
                 train_run_builder=trb,
                 dataloader_config={
@@ -383,9 +383,9 @@ class PowerBalanceStudy(Study):
             raise ValueError(f"Unknown model type: {case.model_type}")
 
     def _tuned_model_init_updates(self, case: Case, tuned_config: TrainConfig) -> dict:
-        # The scaling law has no NN of its own (its submodules carry their own tuned configs)
+        # sciml-taue-scalinglaw has no NN of its own (its submodules carry their own tuned configs)
         updates = {}
-        if case.model_type in [*SUBMODULE_MODEL_TYPES, "unstructured_nn", "sciml", "transformer"]:
+        if case.model_type in [*SUBMODULE_MODEL_TYPES, "mlp", "sciml-taue-nn", "transformer"]:
             updates["nn_depth"] = tuned_config.model_init_config["nn_depth"]
             updates["nn_width"] = tuned_config.model_init_config["nn_width"]
         if case.model_type == "transformer":

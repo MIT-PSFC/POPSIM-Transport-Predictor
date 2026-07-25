@@ -47,16 +47,16 @@ DOMAIN_LABELS = {
 }
 
 MODEL_COLORS = {
-    "scaling_law": "#8dff36",
-    "sciml": "#0095ff",
-    "unstructured_nn": "#ff4d4d",
+    "sciml-taue-scalinglaw": "#8dff36",
+    "sciml-taue-nn": "#0095ff",
+    "mlp": "#ff4d4d",
     "transformer": "#ffb347",
 }
 
 MODEL_LABELS = {
-    "scaling_law": "Scaling law",
-    "sciml": "SciML",
-    "unstructured_nn": "Unstructured NN",
+    "sciml-taue-scalinglaw": "SciML (tau_e scaling law)",
+    "sciml-taue-nn": "SciML (tau_e NN)",
+    "mlp": "MLP",
     "transformer": "Transformer",
 }
 

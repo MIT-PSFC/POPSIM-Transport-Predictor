@@ -30,7 +30,7 @@ def loaded_config():
 
 def _case(**overrides):
     kwargs = {
-        "model_type": "sciml",
+        "model_type": "sciml-taue-nn",
         "training_data": "cmod-low1",
         "data_normalization": "coral",
         "domain_adaptation": None,
@@ -42,17 +42,17 @@ def _case(**overrides):
 
 
 def test_source_trained_case_name(loaded_config):
-    assert str(_case()) == "case.sciml.td_cmod-low1.norm_coral.freeze_True"
+    assert str(_case()) == "case.sciml-taue-nn.td_cmod-low1.norm_coral.freeze_True"
 
 
 def test_exnihilo_case_name(loaded_config):
-    case = _case(model_type="unstructured_nn", training_data="exnihilo", data_normalization="raw", num_target_shots=5)
-    assert str(case) == "case.unstructured_nn.td_exnihilo.norm_raw.freeze_True.targ_5"
+    case = _case(model_type="mlp", training_data="exnihilo", data_normalization="raw", num_target_shots=5)
+    assert str(case) == "case.mlp.td_exnihilo.norm_raw.freeze_True.targ_5"
 
 
 def test_domain_adaptation_case_name(loaded_config):
     case = _case(domain_adaptation="transfer", num_target_shots=3)
-    assert str(case) == "case.sciml.td_cmod-low1.norm_coral.freeze_True.targ_3.da_transfer"
+    assert str(case) == "case.sciml-taue-nn.td_cmod-low1.norm_coral.freeze_True.targ_3.da_transfer"
 
 
 def test_cases_are_hashable_and_set_stable(loaded_config):

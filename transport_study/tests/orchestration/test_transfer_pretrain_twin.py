@@ -63,9 +63,9 @@ def test_zero_shot_pretrain_datasets():
 
 
 def test_submodule_twins_follow_parent():
-    """A sciml / scaling_law twin has p_oh / p_rad twin prereqs at the same n.
+    """A sciml-taue-nn / sciml-taue-scalinglaw twin has p_oh / p_rad twin prereqs at the same n.
 
-    For a physics sciml transfer case the twin's prereqs must include
+    For a physics sciml-taue-nn transfer case the twin's prereqs must include
     p_oh / p_rad cases with da = transfer_pretrain and targ_0, pinned to the
     hyperparam freeze value.
     """
