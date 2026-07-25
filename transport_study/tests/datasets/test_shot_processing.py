@@ -75,6 +75,46 @@ def test_cmod_process_fn_labels_one_fresh_slice_per_measurement(cmod_workflow):
     np.testing.assert_array_equal(fresh_times, expected)
 
 
+def test_fresh_labels_survive_a_mid_shot_filter_gap(cmod_workflow):
+    """A forward-filled slice left over after filter_ds punches a mid-shot hole
+    must stay stale.
+
+    process_fn labels fresh_profiles BEFORE filter_ds, and filter_ds drops whole
+    timeslices (`where(..., drop=True)`), so the record it returns is compacted.
+    The diff-based labelling only reads as stale on a compacted record because
+    the labels were already attached: the first slice surviving a gap that ate a
+    measurement carries a NEW profile relative to the last slice before the gap,
+    so relabelling after the drop would call it fresh even though it is a
+    forward-filled copy. This pins that ordering. The profile study trains on
+    fresh_profiles == 1 alone, so a mislabel there feeds it a stale profile
+    against current inputs.
+    """
+    gap_block = 10
+    gap = slice(gap_block * TS_BLOCK - 5, gap_block * TS_BLOCK + 5)  # eats the block's measurement slice
+    betan = np.full((1, N_T), 0.8)
+    betan[0, gap] = 2.0  # over the C-Mod filter_config max, so filter_ds drops the slices
+    cmod_workflow.raw_data_dir.mkdir(parents=True, exist_ok=True)
+    raw_shot(betan=betan).to_netcdf(cmod_workflow.raw_data_dir / f"{SHOT}.nc")
+
+    processed = cmod_workflow.process_fn(SHOT)
+
+    assert processed is not None, "the gap should punch a hole, not cull the shot"
+    time_ms = np.round(processed["time"].values * 1000).astype(int)
+    ne = processed["ne20_rho"].isel(shot=0).values
+    fresh = processed["fresh_profiles"].isel(shot=0).values
+
+    i_gap = int(np.flatnonzero(time_ms == gap_block * TS_BLOCK + 5)[0])
+    assert time_ms[i_gap - 1] == gap_block * TS_BLOCK - 6, "the gap slices should have been dropped"
+    # The setup only bites if the surviving slice really does carry a new profile
+    assert not np.array_equal(ne[i_gap], ne[i_gap - 1]), "gap did not span a measurement, test is not exercising anything"
+    assert fresh[i_gap] == 0, "forward-filled slice after a filter gap was labelled fresh"
+
+    # The measurement whose own slice was dropped is gone, every other block keeps its one fresh slice
+    last_idx = N_T - 1 - round(cmod_workflow.end_margin_s * 1e3)
+    expected = [b * TS_BLOCK for b in range(N_BLOCKS) if b != gap_block and b * TS_BLOCK <= last_idx]
+    np.testing.assert_array_equal(time_ms[fresh == 1], expected)
+
+
 def test_cmod_process_fn_culls_shot_with_impossible_stored_energy(cmod_workflow):
     """Stored energy the input power cannot account for means a broken power
     record (energy_sanity_cull), so the whole shot goes."""
