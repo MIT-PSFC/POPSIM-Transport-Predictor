@@ -1,24 +1,18 @@
-import jax
 import numpy as np
 import pytest
-import xarray as xr
 from popsim.ml import TrainConfig
 from popsim.ml.launch import launch_train
 
 from transport_study import PACKAGE_ROOT
 from transport_study.config import StudyConfig, load_config
-from transport_study.modules.normalization import CoralFeatureNormalizer
-from transport_study.modules.profile_predictor.module import N_NN_INPUTS
-from transport_study.modules.profile_predictor.torax_module import (
-    ProfilePredictorTorax,
-)
 from transport_study.modules.profile_predictor.train_configs import (
     PROFILE_PREDICTOR_TORAX_CONFIGS,
 )
+from transport_study.modules.profile_predictor.trb import resolve_relaxation_overrides
 from transport_study.orchestration.organize_data import PROFILE_TARGET_VARS
-from transport_study.profile_transfer.plot_torax_evolution import valid_timesteps
 
 
+@pytest.mark.slow
 @pytest.mark.parametrize("transport_model", ["constant", "cgm", "gyrobohm", "qlknn"])
 def test_torax_predictor(transport_model):
     config = StudyConfig(
@@ -58,6 +52,7 @@ def test_torax_predictor(transport_model):
 
 # cgm and qlknn are the models whose training blew up on MAST samples with
 # the circular geometry, so they are the smoke coverage for the miller builder
+@pytest.mark.slow
 @pytest.mark.parametrize("transport_model", ["cgm", "qlknn"])
 def test_torax_predictor_mast_miller(transport_model):
     config = StudyConfig(
@@ -97,37 +92,12 @@ def test_torax_predictor_mast_miller(transport_model):
     _trainer, _train_dl, _val_dl, _test_dl, _ = launch_train(train_config)
 
 
-def _first_valid_timeslice(sample_name: str) -> xr.Dataset:
-    ds = xr.open_dataset(PACKAGE_ROOT / "datasets" / "sample" / sample_name)
-    for shot in ds["shot"].values:
-        shot_ds = ds.sel(shot=shot)
-        valid = valid_timesteps(shot_ds)
-        if len(valid) > 0:
-            timeslice = shot_ds.isel(time_idx=int(valid[0]))
-            # Raw sample files lack the device index organize_data adds
-            timeslice["ds_source_idx"] = 0.0
-            return timeslice
-    raise ValueError(f"No valid timeslice in {sample_name}")
-
-
-def _make_module(transport_model: str) -> ProfilePredictorTorax:
-    model_cfg = PROFILE_PREDICTOR_TORAX_CONFIGS[transport_model]["model_init_config"]
-    return ProfilePredictorTorax(
-        nn_width=model_cfg["nn_width"],
-        nn_depth=model_cfg["nn_depth"],
-        rhogrid=tuple(np.linspace(0.0, 1.0, 51).tolist()),
-        torax_config=model_cfg["torax_config"],
-        key=jax.random.PRNGKey(42),
-        normalizer=CoralFeatureNormalizer.identity(1, N_NN_INPUTS),
-        transport_model=transport_model,
-    )
-
-
-def test_torax_heat_source_response():
+@pytest.mark.slow
+def test_torax_heat_source_response(make_torax_module, sample_timeslices):
     # Pins the generic_heat wiring end to end: prescribing more auxiliary
     # power through the NN-controlled source must heat the relaxed profile
-    module = _make_module("cgm")
-    timeslice = _first_valid_timeslice("cmod-high.nc")
+    module = make_torax_module("cgm")
+    timeslice = sample_timeslices("cmod-high.nc")[0]
 
     steps_cold, coeffs_cold = module.evolve(timeslice, prescribed={"P_aux_total": 0.0})
     steps_hot, coeffs_hot = module.evolve(timeslice, prescribed={"P_aux_total": 10.0})
@@ -144,9 +114,10 @@ def test_torax_heat_source_response():
     assert te_hot > te_cold * 1.05
 
 
-def test_torax_output_hits_edge_bc_and_smooth_init():
-    module = _make_module("cgm")
-    timeslice = _first_valid_timeslice("cmod-high.nc")
+@pytest.mark.slow
+def test_torax_output_hits_edge_bc_and_smooth_init(make_torax_module, sample_timeslices):
+    module = make_torax_module("cgm")
+    timeslice = sample_timeslices("cmod-high.nc")[0]
 
     # The 51-point output must pass through the exact Dirichlet edge BC at
     # rho = 1 instead of flat-holding the outermost cell value
@@ -164,10 +135,6 @@ def test_torax_output_hits_edge_bc_and_smooth_init():
 
 
 def test_resolve_relaxation_overrides():
-    from transport_study.modules.profile_predictor.trb import (
-        resolve_relaxation_overrides,
-    )
-
     # Nothing set: no overrides, torax_config numerics stay authoritative
     assert resolve_relaxation_overrides({}) == {}
     assert resolve_relaxation_overrides({"t_final": None, "fixed_dt": None, "n_solver_steps": None}) == {}
@@ -193,28 +160,8 @@ def test_resolve_relaxation_overrides():
         resolve_relaxation_overrides({"n_solver_steps": 5})
 
 
-def test_torax_max_steps_from_n_solver_steps():
+def test_torax_max_steps_from_n_solver_steps(make_torax_module):
     # The module derives max_steps = ceil(t_final / fixed_dt) + 1, so an
     # n_solver_steps override must bound the scan length to n_solver_steps + 1
-    from transport_study.modules.profile_predictor.trb import (
-        resolve_relaxation_overrides,
-    )
-
-    model_cfg = PROFILE_PREDICTOR_TORAX_CONFIGS["cgm"]["model_init_config"]
-    torax_config = {
-        **model_cfg["torax_config"],
-        "numerics": {
-            **model_cfg["torax_config"]["numerics"],
-            **resolve_relaxation_overrides({"t_final": 0.4, "n_solver_steps": 10}),
-        },
-    }
-    module = ProfilePredictorTorax(
-        nn_width=model_cfg["nn_width"],
-        nn_depth=model_cfg["nn_depth"],
-        rhogrid=tuple(np.linspace(0.0, 1.0, 51).tolist()),
-        torax_config=torax_config,
-        key=jax.random.PRNGKey(42),
-        normalizer=CoralFeatureNormalizer.identity(1, N_NN_INPUTS),
-        transport_model="cgm",
-    )
+    module = make_torax_module("cgm", numerics_overrides=resolve_relaxation_overrides({"t_final": 0.4, "n_solver_steps": 10}))
     assert module.max_steps == 11
