@@ -52,6 +52,7 @@ def results_ds() -> xr.Dataset:
     return ds
 
 
+@pytest.mark.slow
 @pytest.mark.parametrize(
     ("comparison_fn", "family"),
     [

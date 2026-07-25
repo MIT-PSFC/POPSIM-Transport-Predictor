@@ -14,7 +14,7 @@ from transport_study.power_balance_transfer import study_metrics
 from transport_study.power_balance_transfer.case_reports import best_worst_pdf
 from transport_study.power_balance_transfer.study_metrics import (
     STAGE_AGG_NAMES,
-    _aggregate_case_metrics,
+    aggregate_case_metrics,
     compute_case_timeslice_metrics,
     shot_time_averaged_errors,
 )
@@ -94,7 +94,7 @@ def test_compute_case_timeslice_metrics(ts_metrics):
 
 
 def test_aggregate_case_metrics(ts_metrics):
-    case_ds = _aggregate_case_metrics(ts_metrics)
+    case_ds = aggregate_case_metrics(ts_metrics)
 
     assert list(case_ds["stage"].values) == list(STAGE_AGG_NAMES)
     counts = case_ds["abs_count"].values

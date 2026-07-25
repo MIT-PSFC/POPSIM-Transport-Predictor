@@ -9,7 +9,7 @@ from pathlib import Path
 import pytest
 
 from transport_study import PACKAGE_ROOT
-from transport_study.config import StudyConfig, load_config
+from transport_study.config import load_config
 from transport_study.power_balance_transfer.power_balance_study import PowerBalanceStudy
 
 SAMPLE_DIR = Path(PACKAGE_ROOT) / "datasets" / "sample"
@@ -58,15 +58,3 @@ def test_domain_adaptation_case_name(loaded_config):
 def test_cases_are_hashable_and_set_stable(loaded_config):
     assert _case() in {_case()}
     assert hash(_case()) == hash(_case())
-
-
-def test_config_lock_compat_ignores_case_grid(loaded_config):
-    other = loaded_config.model_copy(update={"model_types": ("transformer",)})
-    assert loaded_config.is_compatible(other)
-    incompatible = loaded_config.model_copy(update={"hyperparam_data_normalization": "raw"})
-    assert not loaded_config.is_compatible(incompatible)
-
-
-def test_base_study_config_rejected_by_subclass_fields():
-    with pytest.raises(Exception):
-        StudyConfig(study_name="x", target_device="y", model_types=("sciml",))

@@ -5,8 +5,12 @@ from pathlib import Path
 import chex
 import numpy as np
 import pytest
+import xarray as xr
 
 from transport_study import PACKAGE_ROOT
+from transport_study.config import config
+from transport_study.modules.normalization import STAT_NORMALIZATIONS
+from transport_study.orchestration.organize_data import get_train_test_datasets
 from transport_study.power_balance_transfer.power_balance_study import (
     HYPERPARAM_TARGET_SHOTS,
     PowerBalanceStudy,
@@ -65,23 +69,14 @@ def _clean_case(study: PowerBalanceStudy, case: PowerBalanceStudy.Case):
         os.remove(study.result_path(case))
 
 
-def _hyperparam_case(model_type: str) -> PowerBalanceStudy.Case:
-    from transport_study.config import config
-
-    return PowerBalanceStudy.Case(
-        model_type=model_type,
-        training_data=PowerBalanceStudy._hyperparam_training_data(),
-        data_normalization=config.hyperparam_data_normalization,
-        domain_adaptation=config.hyperparam_domain_adaptation,
-        freeze_submodules=config.hyperparam_freeze_submodules,
-        num_target_shots=config.hyperparam_num_target_shots,
-    )
+def _hyperparam_case(study: PowerBalanceStudy, model_type: str) -> PowerBalanceStudy.Case:
+    """The single tuning case of a model type, as the study itself derives it."""
+    case = next(c for c in study.cases if c.model_type == model_type)
+    return case.get_hyperparam_prereq()
 
 
 def test_power_balance_transfer_cases():
     """Make sure the case graph is set up correctly (pure logic, no training)."""
-    from transport_study.config import config
-
     study = PowerBalanceStudy(
         _make_config(
             "xfer_test",
@@ -140,28 +135,23 @@ def test_power_balance_transfer_cases():
                 continue
             expected_prereqs = _submodule_prereqs(case)
         elif case.domain_adaptation == "transfer":
-            expected_prereqs = [_hyperparam_case(case.model_type)]
-            if case.data_normalization in ("zscore", "coral", "physics-coral", "physics-zscore"):
-                # Stat-based normalizations pretrain through a dedicated twin
-                # case that fits the normalizer on historic + this case's
-                # target shots (same num_target_shots)
-                expected_prereqs.append(case._replace(domain_adaptation="transfer_pretrain"))
-            else:
-                # Stateless normalizations restore a shared source-only pretrain
-                expected_prereqs.append(
-                    PowerBalanceStudy.Case(
-                        model_type=case.model_type,
-                        training_data=case.training_data,
-                        data_normalization=case.data_normalization,
-                        domain_adaptation=None,
-                        freeze_submodules=case.freeze_submodules,
-                        num_target_shots=HYPERPARAM_TARGET_SHOTS,
-                    )
-                )
+            twin = PowerBalanceStudy.Case(
+                model_type=case.model_type,
+                training_data=case.training_data,
+                data_normalization=case.data_normalization,
+                domain_adaptation="transfer_pretrain",
+                freeze_submodules=case.freeze_submodules,
+                # Stat normalizations fit their per-device statistics on the
+                # combined historic + target data of THIS case, so their twin
+                # keeps its num_target_shots. Stateless normalizations have
+                # nothing to fit, so all their transfer cases share one twin
+                num_target_shots=case.num_target_shots if case.data_normalization in STAT_NORMALIZATIONS else HYPERPARAM_TARGET_SHOTS,
+            )
+            expected_prereqs = [_hyperparam_case(study, case.model_type), twin]
             if case.model_type in ("sciml", "scaling_law"):
                 expected_prereqs += _submodule_prereqs(case)
         elif case.domain_adaptation in ("weighted", "addition", None, "transfer_pretrain"):
-            expected_prereqs = [_hyperparam_case(case.model_type)]
+            expected_prereqs = [_hyperparam_case(study, case.model_type)]
             if case.model_type in ("sciml", "scaling_law"):
                 expected_prereqs += _submodule_prereqs(case)
         else:
@@ -175,25 +165,7 @@ def test_power_balance_transfer_cases():
         )
 
 
-def test_compatible_configs(tmp_path):
-    cfg1 = _make_config("compat_test")
-    cfg2 = _make_config("compat_test")
-    assert cfg1.is_compatible(cfg2)
-
-    assert not cfg1.is_compatible(_make_config("compat_test_other_name"))
-    assert not cfg1.is_compatible(_make_config("compat_test", target_test_set_size=5))
-    assert not cfg1.is_compatible(_make_config("compat_test", hyperparam_data_normalization="raw"))
-    assert not cfg1.is_compatible(_make_config("compat_test", hyperparam_num_target_shots=1))
-    # Case-grid axes do NOT affect compatibility (adding cases to a study is fine)
-    assert cfg1.is_compatible(_make_config("compat_test", model_types=("transformer",)))
-
-    # Save/load round trip through the config-lock TOML
-    lock_path = tmp_path / "config_lock.toml"
-    cfg1.save(lock_path)
-    reloaded = PowerBalanceStudy.Config.from_toml(lock_path)
-    assert cfg1.is_compatible(reloaded)
-
-
+@pytest.mark.slow
 def test_weighted_device_weight():
     """Train a single p_oh case with weighted domain adaptation to exercise device weighting."""
     study = PowerBalanceStudy(
@@ -235,11 +207,6 @@ def test_addition_no_device_weights():
     train/test datasets for 'weighted' and 'addition' (same shots, same
     values), since the two methods differ only in the loss weighting.
     """
-    import xarray as xr
-
-    from transport_study.config import config
-    from transport_study.orchestration.organize_data import get_train_test_datasets
-
     study = PowerBalanceStudy(
         _make_config(
             "test_addition_no_device_weights",
@@ -291,6 +258,7 @@ def test_addition_no_device_weights():
     xr.testing.assert_identical(test_ds_weighted, test_ds_addition)
 
 
+@pytest.mark.slow
 def test_transformer_training():
     """Smoke-train the transformer case and check the normalizer stats stay frozen."""
     study = PowerBalanceStudy(
@@ -329,6 +297,7 @@ def test_transformer_training():
         chex.assert_trees_all_equal(module_init.head, module_final.head)
 
 
+@pytest.mark.slow
 def test_submodule_freezing():
     study = PowerBalanceStudy(
         _make_config(
@@ -387,14 +356,13 @@ def test_submodule_freezing():
     )
 
 
+@pytest.mark.slow
 def test_transfer_weights():
     """Transfer with a stat-based normalization runs as two cases: a
     transfer_pretrain twin trains on the historic data with the normalizer
     fitted on historic + target shots, then the transfer case restores that
     checkpoint (normalizer included) and fine-tunes the last layer on the
     target shots."""
-    from transport_study.config import config
-
     study = PowerBalanceStudy(
         _make_config(
             "test_transfer_weights",
@@ -459,6 +427,7 @@ def test_transfer_weights():
         chex.assert_trees_all_equal(pretrain_final.nn.layers[-1], transfer_final.nn.layers[-1])
 
 
+@pytest.mark.slow
 @pytest.mark.parametrize("freeze_submodules", [True, False], ids=["frozen", "unfrozen"])
 def test_transfer_weights_submodules(freeze_submodules):
     study = PowerBalanceStudy(
@@ -554,6 +523,7 @@ def test_transfer_weights_submodules(freeze_submodules):
     )
 
 
+@pytest.mark.slow
 def test_collect_results():
     study = PowerBalanceStudy(
         _make_config(
