@@ -16,19 +16,13 @@ from popsim.ml.eval import EvalData, EvaluationSuite
 
 from transport_study import EPISODE_DIM, TIME_COORD, TIME_DIM
 from transport_study.config import config
-from transport_study.modules.normalization import (
-    CoralFeatureNormalizer,
-    FeatureNormalizer,
-    ZScoreFeatureNormalizer,
-)
 from transport_study.modules.profile_predictor.module import (
-    N_NN_INPUTS,
-    Inputs,
     ProfilePredictorReservoir,
     ProfilePredictorShapeInit,
     ProfilePredictorUnstructuredNN,
     ShapeType,
     kmeans_initial_guess,
+    make_nn_input_normalizer,
     pca_initial_guess,
 )
 from transport_study.modules.profile_predictor.torax_module import ProfilePredictorTorax
@@ -63,39 +57,6 @@ def resolve_relaxation_overrides(model_init_config: dict) -> dict:
     elif fixed_dt is not None:
         overrides["fixed_dt"] = float(fixed_dt)
     return overrides
-
-
-def _fit_nn_input_normalizer(train_ds: xr.Dataset, n_devices: int, data_normalization: str) -> FeatureNormalizer:
-    """Fit the per-device stat stage (CORAL or z-score) on the 10 dimensionless nn_inputs.
-
-    Evaluates the Inputs properties over the flattened training data
-    (rows with incomplete features or an unattributable device index are
-    dropped by the fit).
-    """
-    reference = train_ds["Ip_MA"]
-
-    def col(var: str) -> np.ndarray:
-        return np.asarray(train_ds[var].broadcast_like(reference).values, dtype=float).ravel()
-
-    source_idx = col("ds_source_idx")
-    inputs = Inputs(
-        Ip=col("Ip_MA"),
-        B0=col("B0"),
-        betan=col("betan"),
-        ne20_line_avg=col("ne20_line_avg"),
-        R0=col("R0"),
-        a_minor=col("a_minor"),
-        kappa=col("kappa"),
-        delta_top=col("delta_top"),
-        delta_bot=col("delta_bot"),
-        ds_source_idx=source_idx,
-        rho=jnp.zeros(1),  # Unused by nn_inputs
-    )
-    features = np.asarray(inputs.nn_inputs).T  # (N, N_NN_INPUTS)
-    shot_idx = np.asarray(train_ds["shot"].broadcast_like(reference).values).ravel()
-    attributed = ~np.isnan(source_idx)
-    normalizer_cls = ZScoreFeatureNormalizer if data_normalization == "physics-zscore" else CoralFeatureNormalizer
-    return normalizer_cls.fit_from_features(features[attributed], source_idx[attributed].astype(int), n_devices, shot_idx[attributed])
 
 
 class ProfilePredictorTRB(TrainRunBuilder):
@@ -147,22 +108,18 @@ class ProfilePredictorTRB(TrainRunBuilder):
         and a model config dict.
         """
         # Stat stage (CORAL or z-score) on the dimensionless nn_inputs. Fitted
-        # from the training data, or left at identity when the physics inputs
-        # are used as-is or a transfer checkpoint will overwrite the buffers
-        # anyway (the identity class must still match the checkpoint's pytree).
-        # transfer_pretrain dataloaders carry a combined historic + target
-        # fit dataset as an attribute (see get_dataloaders)
-        data_normalization = model_init_config.get("data_normalization", "physics-coral")
-        if data_normalization not in ("physics", "physics-coral", "physics-zscore"):
-            raise ValueError(f"Unknown profile data normalization method: {data_normalization}")
+        # from the training data only. When a transfer checkpoint will overwrite
+        # the module anyway, skip the fit (a fit on a handful of target shots is
+        # ill-conditioned and the restored stats, fitted on historic + target
+        # shots by the transfer_pretrain prereq case, are the correct ones).
+        # transfer_pretrain dataloaders carry that combined fit dataset as an
+        # attribute (see get_dataloaders)
         n_devices = len(config.ds_source_to_idx)
-        if data_normalization == "physics":
-            normalizer: FeatureNormalizer = CoralFeatureNormalizer.identity(n_devices, N_NN_INPUTS)
-        elif model_init_config.get("transfer_checkpoint"):
-            identity_cls = ZScoreFeatureNormalizer if data_normalization == "physics-zscore" else CoralFeatureNormalizer
-            normalizer = identity_cls.identity(n_devices, N_NN_INPUTS)
+        if model_init_config.get("transfer_checkpoint"):
+            fit_ds = None
         else:
-            normalizer = _fit_nn_input_normalizer(getattr(train_dl, "normalizer_fit_ds", train_dl.ds), n_devices, data_normalization)
+            fit_ds = getattr(train_dl, "normalizer_fit_ds", train_dl.ds)
+        normalizer = make_nn_input_normalizer(model_init_config["data_normalization"], fit_ds, n_devices)
 
         if model_init_config["model_type"] in ["shape-init-pca", "shape-init-kmeans"]:
             te_shape_var = model_init_config["te_shape_var"]
@@ -512,16 +469,36 @@ class ProfilePredictorTRB(TrainRunBuilder):
             ids_of_nn_leaves = [id(x) for x in jax.tree.leaves((module.nn_transport, module.nn_sources, module.nn_edge))]
             return [x for x in jax.tree.leaves(module) if id(x) in ids_of_nn_leaves]
 
+        def _networks(module) -> tuple:
+            """The module's networks, whatever the family calls them."""
+            if isinstance(module, ProfilePredictorTorax):
+                return (module.nn_transport, module.nn_sources, module.nn_edge)
+            return (module.nn,)
+
+        def get_trainable_transfer(module):
+            # Transfer fine-tunes the last layer of every network and nothing
+            # else, matching the power balance study (PowerBalanceEnv.get_trainable).
+            # Shapes and reservoir weights stay frozen regardless of
+            # freeze_shapes, and the normalizer statistics restored from the
+            # pretrain checkpoint are never touched.
+            last_layers = tuple(nn.layers[-1] for nn in _networks(module))
+            ids_of_last_layer_leaves = [id(x) for x in jax.tree.leaves(last_layers)]
+            return [x for x in jax.tree.leaves(module) if id(x) in ids_of_last_layer_leaves]
+
         if model_init_config["model_type"] in ["shape-init-pca", "shape-init-kmeans"]:
-            return get_trainable_shape_init
+            getter = get_trainable_shape_init
         elif model_init_config["model_type"] in ["mlp", "reservoir"]:
             # For the reservoir, only the readout (module.nn) is trainable, the
             # fixed random reservoir weights stay frozen
-            return get_trainable_nn
+            getter = get_trainable_nn
         elif model_init_config["model_type"].startswith("torax-"):
-            return get_trainable_torax
+            getter = get_trainable_torax
         else:
             raise ValueError(f"Invalid model type {model_init_config['model_type']}")
+
+        if model_init_config.get("domain_adaptation") == "transfer":
+            return get_trainable_transfer
+        return getter
 
     @staticmethod
     def get_val_eval_suite(suite_config) -> EvaluationSuite:

@@ -527,10 +527,63 @@ class ZScoreFeatureNormalizer(TimeIndepModule):
         return cls(means=means, stds=stds)
 
 
-# Either per-device stat stage a profile predictor module can hold. The two
-# classes have different pytree structures, so a study must keep one method
-# for its whole lifetime (data_normalization is config-lock guarded)
+# Either per-device stat stage a profile or transport predictor module can
+# hold. The two classes have different pytree structures, so a study must keep
+# one method for its whole lifetime (data_normalization is config-lock guarded)
 FeatureNormalizer = CoralFeatureNormalizer | ZScoreFeatureNormalizer
+
+# Methods available to the studies whose models normalize their own
+# dimensionless feature vector rather than the 7 physical inputs
+FEATURE_NORMALIZATIONS = ("physics", "physics-coral", "physics-zscore")
+
+
+def feature_fit_arrays(ds: xr.Dataset, features: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Attach an (N, F) feature matrix to its device and shot indices.
+
+    The matrix rows are the dataset flattened against Ip_MA (see each module's
+    feature-matrix helper). NaN device indices (from NaN-padded concatenation)
+    can't be attributed to a device, so their rows are dropped.
+    """
+    reference = ds["Ip_MA"]
+    source_idx = np.asarray(ds["ds_source_idx"].broadcast_like(reference).values, dtype=float).ravel()
+    shot_idx = np.asarray(ds["shot"].broadcast_like(reference).values).ravel()
+    attributed = ~np.isnan(source_idx)
+    return features[attributed], source_idx[attributed].astype(int), shot_idx[attributed]
+
+
+def make_feature_normalizer(
+    method: str,
+    fit_data: tuple[np.ndarray, np.ndarray, np.ndarray] | None,
+    n_devices: int,
+    n_features: int,
+) -> FeatureNormalizer:
+    """Build the per-device stat stage over an arbitrary dimensionless feature vector.
+
+    The counterpart of make_normalizer for the profile and transport predictors,
+    whose models normalize their own nn_inputs instead of the 7 physical inputs,
+    with the same contract: fit_data None yields identity statistics with the
+    correct pytree structure, for callers about to overwrite the buffers from a
+    checkpoint (transfer restore).
+
+    fit_data is the (features, source_idx, shot_idx) triple from
+    feature_fit_arrays. "physics" feeds the features to the network unchanged,
+    so it keeps the CORAL identity buffers (the class is arbitrary for an
+    identity transform, but it is fixed here because it names the checkpointed
+    pytree).
+    """
+    if method == "physics":
+        return CoralFeatureNormalizer.identity(n_devices, n_features)
+    if method == "physics-coral":
+        normalizer_cls: type[CoralFeatureNormalizer] | type[ZScoreFeatureNormalizer] = CoralFeatureNormalizer
+    elif method == "physics-zscore":
+        normalizer_cls = ZScoreFeatureNormalizer
+    else:
+        raise ValueError(f"Unknown feature normalization method: {method}. Must be one of {FEATURE_NORMALIZATIONS}.")
+
+    if fit_data is None:
+        return normalizer_cls.identity(n_devices, n_features)
+    features, source_idx, shot_idx = fit_data
+    return normalizer_cls.fit_from_features(features, source_idx, n_devices, shot_idx)
 
 
 def _feature_matrix(ds: xr.Dataset) -> tuple[np.ndarray, np.ndarray, np.ndarray]:

@@ -21,7 +21,11 @@ from torax._src.geometry import geometry_provider as geometry_provider_lib
 from torax._src.orchestration.step_function import SimulationStepFn
 from torax._src.torax_pydantic import torax_pydantic
 
-from transport_study.modules.normalization import FeatureNormalizer
+from transport_study.modules.normalization import (
+    FeatureNormalizer,
+    feature_fit_arrays,
+    make_feature_normalizer,
+)
 from transport_study.modules.power_balance.module import PowerBalance, PowerBalanceEnv
 
 # Namespace import: the profile predictor also names its input dataclass
@@ -29,6 +33,7 @@ from transport_study.modules.power_balance.module import PowerBalance, PowerBala
 from transport_study.modules.profile_predictor import module as profile_predictor_module
 from transport_study.modules.profile_predictor.module import (
     N_NN_INPUTS,
+    NN_INPUT_NAMES,
     ProfilePredictor,
 )
 from transport_study.modules.profile_predictor.torax_module import (
@@ -56,6 +61,25 @@ MIN_W_MJ = 1e-3
 
 # The 10 profile predictor feature slots plus one aux power feature
 N_TRANSPORT_NN_INPUTS = N_NN_INPUTS + 1
+
+# Names of the transport_nn_inputs slots, in order. The beta-derived slots keep
+# the profile predictor's names even though they come from Wtot here
+TRANSPORT_NN_INPUT_NAMES = (*NN_INPUT_NAMES, "paux_norm")
+
+# Dataset variables transport_nn_inputs is derived from (no betan - the
+# beta-derived slots come from the stored energy)
+TRANSPORT_NN_INPUT_SOURCE_VARS = (
+    "Ip_MA",
+    "B0",
+    "ne20_line_avg",
+    "R0",
+    "a_minor",
+    "kappa",
+    "delta_top",
+    "delta_bot",
+    "P_aux_MW",
+    "Wtot_MJ",
+)
 
 # Coefficients predicted by the transport predictor sources network, in the
 # order of the network outputs. Unlike ProfilePredictorTorax there is no
@@ -208,6 +232,46 @@ class Inputs:
             ds_source_idx=self.ds_source_idx,
             rho=rho,
         )
+
+
+def transport_nn_input_matrix(ds: xr.Dataset) -> np.ndarray:
+    """(N, N_TRANSPORT_NN_INPUTS) matrix of the transport features over a flattened dataset.
+
+    Every column is broadcast against Ip_MA first, so per-shot variables line up
+    with the per-timeslice ones. The beta-derived entries use the MEASURED
+    stored energy (at runtime the modules use the state-implied Wtot instead).
+    The profile predictor's counterpart is module.nn_input_matrix.
+    """
+    reference = ds["Ip_MA"]
+
+    def col(var: str) -> np.ndarray:
+        return np.asarray(ds[var].broadcast_like(reference).values, dtype=float).ravel()
+
+    inputs = Inputs(
+        Ip_MA=col("Ip_MA"),
+        B0=col("B0"),
+        ne20_line_avg=col("ne20_line_avg"),
+        R0=col("R0"),
+        a_minor=col("a_minor"),
+        kappa=col("kappa"),
+        delta_top=col("delta_top"),
+        delta_bot=col("delta_bot"),
+        P_aux_MW=col("P_aux_MW"),
+        ds_source_idx=np.zeros(reference.size),  # Unused by transport_nn_inputs
+    )
+    return np.asarray(inputs.transport_nn_inputs(col("Wtot_MJ"))).T
+
+
+def make_transport_nn_input_normalizer(method: str, fit_ds: xr.Dataset | None, n_devices: int) -> FeatureNormalizer:
+    """Build the per-device stat stage over the 11 transport features.
+
+    Thin wrapper around normalization.make_feature_normalizer (which holds the
+    method dispatch shared with the profile predictor), so fit_ds None yields
+    identity statistics with the correct pytree structure for callers about to
+    overwrite the buffers from a checkpoint.
+    """
+    fit_data = None if fit_ds is None else feature_fit_arrays(fit_ds, transport_nn_input_matrix(fit_ds))
+    return make_feature_normalizer(method, fit_data, n_devices, N_TRANSPORT_NN_INPUTS)
 
 
 def wtot_from_profiles(ne20: Array, te_keV: Array, rho: Array, volume_m3: ArrayLike) -> ArrayLike:

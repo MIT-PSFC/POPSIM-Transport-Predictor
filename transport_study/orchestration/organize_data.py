@@ -1,5 +1,6 @@
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import jax
 import jax.numpy as jnp
@@ -23,6 +24,14 @@ from transport_study.modules.normalization import (
     identity_coral_stats,
     physics_feature_vec,
 )
+from transport_study.modules.profile_predictor.module import (
+    NN_INPUT_NAMES,
+    NN_INPUT_SOURCE_VARS,
+    nn_input_matrix,
+)
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 
 @dataclass(frozen=True)
@@ -481,6 +490,7 @@ def normalize_domain(
     ds_source: xr.Dataset,
     ds_target: xr.Dataset | None = None,
     method: str | None = "raw",
+    feature_space: str = "power_balance",
 ) -> tuple[xr.Dataset, xr.Dataset | None]:
     """Apply the specified domain normalization method to the dataset.
 
@@ -493,22 +503,61 @@ def normalize_domain(
     ds_source is used to inform the normalization parameters (e.g. mean and std for z-score, covariance for coral),
     but the normalization is applied to both source and target datasets.
 
+    feature_space selects which model family's features the stat stage runs on,
+    so each study visualizes what its own modules consume:
+        - "power_balance": the 7 physics features of normalization.physics_feature_vec
+          (q_star, epsilon, aB0, f_G, surface_power_density, ...), fitted over the
+          7 physical inputs
+        - "profile": the 10 dimensionless nn_inputs of the profile predictor
+          (beta, q_star, epsilon, f_G, aB0, betan, kappa, delta_top, delta_bot,
+          log_nu_star)
+        - "transport": those 10 slots with the beta-derived ones computed from
+          the measured Wtot, plus the normalized aux power (paux_norm)
+    Only the physics* methods honor it, the raw-variable methods ("zscore",
+    "coral") are power-balance inputs by definition.
+
     Methods:
         - "raw": No normalization, Ip, Wtot, etc. are in their original units
-        - "physics": The module's dimensionless features (q_star, epsilon, aB0, f_G, surface_power_density) plus beta as a visualization-only extra
+        - "physics": The module's dimensionless features. In the power-balance space that is
+          (q_star, epsilon, aB0, f_G, surface_power_density) plus beta as a visualization-only extra,
+          in the profile space the nn_inputs themselves (which carry their own beta)
         - "zscore": Within each device, normalize each variable to zero mean and unit variance. Variable gets a `_z` suffix after normalization. Wtot_MJ is a visualization-only extra column (harmless, z-scoring is per-variable)
         - "coral": Use the CORAL method to align covariances of various devices over exactly the model's 7 input vars. Variable gets a `_coral` suffix after normalization.
-        - "physics-coral": CORAL alignment over the 7 physics features. Variable gets a `_pcoral` suffix (a `_coral` suffix would collide with the raw coral vars).
-        - "physics-zscore": Per-device z-score over the 7 physics features. Variable gets a `_pz` suffix.
+        - "physics-coral": CORAL alignment over the physics features of the selected feature space. Variable gets a `_pcoral` suffix (a `_coral` suffix would collide with the raw coral vars).
+        - "physics-zscore": Per-device z-score over the physics features of the selected feature space. Variable gets a `_pz` suffix.
 
     Args:
         ds_source: The source dataset (e.g. historic data)
         ds_target: The target dataset (e.g. DIII-D high-hazard shots)
         method: The normalization method to apply
+        feature_space: Which model family's feature vector the physics* methods use
 
     Returns:
         The normalized source and target datasets.
     """
+    physics_names: tuple[str, ...]
+    physics_source_vars: tuple[str, ...]
+    physics_matrix_fn: Callable[[xr.Dataset], np.ndarray] | None
+    if feature_space == "transport":
+        # Function-level import: the transport predictor module pulls in TORAX,
+        # and organize_data is imported by everything
+        from transport_study.modules.transport_predictor.module import (
+            TRANSPORT_NN_INPUT_NAMES,
+            TRANSPORT_NN_INPUT_SOURCE_VARS,
+            transport_nn_input_matrix,
+        )
+
+        physics_names, physics_source_vars, physics_matrix_fn = (
+            TRANSPORT_NN_INPUT_NAMES,
+            TRANSPORT_NN_INPUT_SOURCE_VARS,
+            transport_nn_input_matrix,
+        )
+    elif feature_space == "profile":
+        physics_names, physics_source_vars, physics_matrix_fn = NN_INPUT_NAMES, NN_INPUT_SOURCE_VARS, nn_input_matrix
+    elif feature_space == "power_balance":
+        physics_names, physics_source_vars, physics_matrix_fn = PHYSICS_FEATURE_NAMES, NORM_INPUT_VARS, None
+    else:
+        raise ValueError(f"Unknown feature space: {feature_space}")
     datasets = [ds_source] if ds_target is None else [ds_source, ds_target]
 
     def _reference(ds: xr.Dataset) -> xr.DataArray:
@@ -528,8 +577,13 @@ def normalize_domain(
         return np.column_stack(columns)
 
     def _physics_matrix(ds: xr.Dataset) -> np.ndarray:
+        if physics_matrix_fn is not None:
+            return physics_matrix_fn(ds)
         raw = jnp.asarray(_feature_matrix_for(ds, NORM_INPUT_VARS))
         return np.asarray(jax.vmap(physics_feature_vec)(raw))
+
+    # Physics slots that are identity mappings of a raw input var of the same name
+    identity_slots = set(physics_source_vars)
 
     def _write_features(ds: xr.Dataset, matrix: np.ndarray, names: tuple[str, ...], suffix: str) -> None:
         reference = _reference(ds)
@@ -539,11 +593,15 @@ def normalize_domain(
     def _add_physics_vars(ds: xr.Dataset) -> None:
         phys = _physics_matrix(ds)
         reference = _reference(ds)
-        for j, name in enumerate(PHYSICS_FEATURE_NAMES):
-            # Ip_MA and kappa slots are identity mappings, the raw vars already exist
-            if name in NORM_INPUT_VARS:
+        for j, name in enumerate(physics_names):
+            # Identity slots (Ip_MA / kappa, plus betan / delta_* in the profile
+            # feature space) already exist as raw vars
+            if name in identity_slots:
                 continue
             ds[name] = (reference.dims, np.asarray(phys[:, j], dtype=float).reshape(reference.shape))
+        if feature_space != "power_balance":
+            # The profile and transport feature vectors carry their own beta slot
+            return
         # beta needs the stored energy, which is the predicted state rather than
         # a model input, so it is a visualization-only extra
         epsilon = ds["a_minor"] / ds["R0"]
@@ -581,7 +639,7 @@ def normalize_domain(
         means, stds = fit_z_score_stats(_physics_matrix(ds_source), _source_idx_for(ds_source), len(registry))
         for ds in datasets:
             matrix = apply_z_score(jnp.asarray(_physics_matrix(ds)), _source_idx_for(ds), means, stds)
-            _write_features(ds, np.asarray(matrix), PHYSICS_FEATURE_NAMES, "_pz")
+            _write_features(ds, np.asarray(matrix), physics_names, "_pz")
         return ds_source, ds_target
 
     def _shot_idx_for(ds: xr.Dataset) -> np.ndarray:
@@ -602,7 +660,7 @@ def normalize_domain(
         _coral_normalization(NORM_INPUT_VARS, "_coral", lambda ds: _feature_matrix_for(ds, NORM_INPUT_VARS))
         return ds_source, ds_target
     if method == "physics-coral":
-        _coral_normalization(PHYSICS_FEATURE_NAMES, "_pcoral", _physics_matrix)
+        _coral_normalization(physics_names, "_pcoral", _physics_matrix)
         return ds_source, ds_target
 
     raise ValueError(f"Unknown normalization method: {method}")

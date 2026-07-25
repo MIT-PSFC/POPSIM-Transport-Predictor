@@ -172,7 +172,7 @@ class ProfileStudy(Study):
         - none: No domain adaptation, train and test on the same device(s). This is used for hyperparameter tuning and as a baseline for comparison, answering the question "what is the best possible performance we could expect if we had a bunch of data?"
         - weighted: Add a small amount of highly-weighted target data during training
         - addition: Add target shots to the training set as normal samples, no weighting
-        - transfer: Train on source data, freeze all but the last layers of the model, and fine-tune on a small amount of target data
+        - transfer: Train on source data, freeze all but the last layer of every network, and fine-tune on a small amount of target data (ProfilePredictorTRB.get_trainable_getter)
         - transfer_pretrain: The pretrain half of a transfer case, never a case-grid axis value (see Study.Case.transfer_pretrain_case). Trains on historic data only with checkpoint selection on the target test set. Stat normalizations (physics-coral / physics-zscore) fit the stat stage on historic + the transfer case's target shots, stateless ones share one twin at 0 target shots
 
         freeze_shapes:

@@ -375,3 +375,42 @@ def test_profile_case_norm_token_naming():
     - restore_predictor.checkpoint_to_profile_case round-trips all three
       (with and without geom_ / targ_ / da_ tokens present)
     """
+
+
+def test_model_init_requires_data_normalization():
+    """ProfilePredictorTRB.model_init and TransportPredictorTRB.model_init raise
+    KeyError when model_init_config has no data_normalization key, instead of
+    silently falling back to a fitted stat stage. Matches the power balance
+    TRBs, which index the key strictly - a config that lost the key must fail
+    loudly, not train a different model than its case name claims.
+    """
+
+
+def test_make_feature_normalizer_matches_make_normalizer_contract():
+    """make_feature_normalizer is the feature-vector twin of make_normalizer,
+    and both module wrappers (profile make_nn_input_normalizer, transport
+    make_transport_nn_input_normalizer) inherit its contract:
+    - fit_data None yields identity buffers whose pytree structure matches the
+      fitted instance of the same method (so a transfer restore lands cleanly)
+    - 'physics' yields identity CoralFeatureNormalizer buffers with either
+      fit_data, 'physics-coral' / 'physics-zscore' yield their fitted class
+    - a power-balance-only method ('raw', 'zscore', 'coral') raises ValueError
+    - feature_fit_arrays drops rows whose ds_source_idx is NaN and keeps the
+      features, device indices, and shot indices aligned
+    """
+
+
+def test_normalize_domain_feature_spaces_match_modules():
+    """normalize_domain(..., feature_space=...) visualizes exactly the features
+    each study's modules consume:
+    - 'profile' writes module.nn_input_matrix column by column (identity slots
+      betan / kappa / delta_top / delta_bot stay the raw dataset vars)
+    - 'transport' writes transport_nn_input_matrix the same way (identity slots
+      kappa / delta_top / delta_bot, and betan IS written since the transport
+      datasets carry no measured betan)
+    - physics-coral / physics-zscore stats fitted here match the stats the
+      matching make_*_normalizer fits on the same dataset
+    - 'power_balance' is unchanged (still the 7 physics features plus the
+      Wtot-derived beta extra)
+    - an unknown feature space raises ValueError
+    """

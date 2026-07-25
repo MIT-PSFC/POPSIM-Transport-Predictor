@@ -121,6 +121,8 @@ def test_reservoir_training_smoke():
         },
         model_init_config={
             "model_type": "reservoir",
+            # model_init indexes this strictly, the study normally supplies it
+            "data_normalization": "physics-coral",
             "reservoir_size": RESERVOIR_SIZE,
             "spectral_radius": 0.9,
             "input_scaling": 0.5,

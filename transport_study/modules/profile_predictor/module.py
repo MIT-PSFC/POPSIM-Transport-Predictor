@@ -17,7 +17,11 @@ from popsim.math_utils import safe_log
 from popsim.ml.rtd_mlp import Activation, RtdMLP
 from scipy.constants import epsilon_0, eV, mu_0
 
-from transport_study.modules.normalization import FeatureNormalizer
+from transport_study.modules.normalization import (
+    FeatureNormalizer,
+    feature_fit_arrays,
+    make_feature_normalizer,
+)
 
 
 class ProfileShape(TimeIndepModule):
@@ -130,6 +134,35 @@ class ProfileShape(TimeIndepModule):
 
 # Size of the dimensionless nn_inputs feature vector every profile model consumes
 N_NN_INPUTS = 10
+
+# Names of the nn_inputs slots, in order (see Inputs.nn_inputs). The data
+# visualization plots these, so it shows exactly the feature space the models
+# consume (the power balance study's counterpart is PHYSICS_FEATURE_NAMES)
+NN_INPUT_NAMES = (
+    "beta",
+    "q_star",
+    "epsilon",
+    "f_G",
+    "aB0",
+    "betan",
+    "kappa",
+    "delta_top",
+    "delta_bot",
+    "log_nu_star",
+)
+
+# Dataset variables Inputs.nn_inputs is derived from
+NN_INPUT_SOURCE_VARS = (
+    "Ip_MA",
+    "B0",
+    "betan",
+    "ne20_line_avg",
+    "R0",
+    "a_minor",
+    "kappa",
+    "delta_top",
+    "delta_bot",
+)
 
 
 @chex.dataclass
@@ -253,6 +286,46 @@ class Inputs:
             ]
         )
         return inp_array
+
+
+def nn_input_matrix(ds: xr.Dataset) -> np.ndarray:
+    """(N, N_NN_INPUTS) matrix of the dimensionless nn_inputs over a flattened dataset.
+
+    Every column is broadcast against Ip_MA first, so per-shot variables line up
+    with the per-timeslice ones. Shared by the normalizer fit and the data
+    visualization so both see exactly the feature space the modules consume.
+    """
+    reference = ds["Ip_MA"]
+
+    def col(var: str) -> np.ndarray:
+        return np.asarray(ds[var].broadcast_like(reference).values, dtype=float).ravel()
+
+    inputs = Inputs(
+        Ip=col("Ip_MA"),
+        B0=col("B0"),
+        betan=col("betan"),
+        ne20_line_avg=col("ne20_line_avg"),
+        R0=col("R0"),
+        a_minor=col("a_minor"),
+        kappa=col("kappa"),
+        delta_top=col("delta_top"),
+        delta_bot=col("delta_bot"),
+        ds_source_idx=np.zeros(reference.size),  # Unused by nn_inputs
+        rho=jnp.zeros(1),  # Unused by nn_inputs
+    )
+    return np.asarray(inputs.nn_inputs).T
+
+
+def make_nn_input_normalizer(method: str, fit_ds: xr.Dataset | None, n_devices: int) -> FeatureNormalizer:
+    """Build the per-device stat stage over the 10 dimensionless nn_inputs.
+
+    Thin wrapper around normalization.make_feature_normalizer (which holds the
+    method dispatch shared with the transport predictor), so fit_ds None yields
+    identity statistics with the correct pytree structure for callers about to
+    overwrite the buffers from a checkpoint.
+    """
+    fit_data = None if fit_ds is None else feature_fit_arrays(fit_ds, nn_input_matrix(fit_ds))
+    return make_feature_normalizer(method, fit_data, n_devices, N_NN_INPUTS)
 
 
 @chex.dataclass

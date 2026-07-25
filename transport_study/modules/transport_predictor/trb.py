@@ -12,21 +12,15 @@ from popsim.ml.checkpointing import create_default_checkpoint_manager, restore_m
 from popsim.ml.eval import EvaluationSuite
 
 from transport_study.config import config
-from transport_study.modules.normalization import (
-    CoralFeatureNormalizer,
-    FeatureNormalizer,
-    ZScoreFeatureNormalizer,
-)
 from transport_study.modules.power_balance.trb import PowerBalanceTRB
 from transport_study.modules.profile_predictor.trb import ProfilePredictorTRB
 from transport_study.modules.transport_predictor.module import (
-    N_TRANSPORT_NN_INPUTS,
-    Inputs,
     TransportPredictorEnv,
     TransportPredictorSciML,
     TransportPredictorTorax,
     TransportPredictorToraxSimState,
     TransportPredictorTransformer,
+    make_transport_nn_input_normalizer,
 )
 from transport_study.modules.trb_utils import (
     get_time_dep_dataloaders,
@@ -34,39 +28,6 @@ from transport_study.modules.trb_utils import (
 )
 
 STUDY_TYPE = "transport_transfer"
-
-
-def _fit_transport_input_normalizer(train_ds: xr.Dataset, n_devices: int, data_normalization: str) -> FeatureNormalizer:
-    """Fit the per-device stat stage (CORAL or z-score) on the 11 transport_nn_inputs.
-
-    Evaluates the module's own feature math over the flattened training data,
-    with the beta-derived entries computed from the MEASURED stored energy
-    (at runtime the modules use the state-implied Wtot instead). Rows with
-    incomplete features or an unattributable device index are dropped by the fit.
-    """
-    reference = train_ds["Ip_MA"]
-
-    def col(var: str) -> np.ndarray:
-        return np.asarray(train_ds[var].broadcast_like(reference).values, dtype=float).ravel()
-
-    source_idx = col("ds_source_idx")
-    inputs = Inputs(
-        Ip_MA=col("Ip_MA"),
-        B0=col("B0"),
-        ne20_line_avg=col("ne20_line_avg"),
-        R0=col("R0"),
-        a_minor=col("a_minor"),
-        kappa=col("kappa"),
-        delta_top=col("delta_top"),
-        delta_bot=col("delta_bot"),
-        P_aux_MW=col("P_aux_MW"),
-        ds_source_idx=source_idx,
-    )
-    features = np.asarray(inputs.transport_nn_inputs(col("Wtot_MJ"))).T  # (N, N_TRANSPORT_NN_INPUTS)
-    shot_idx = np.asarray(train_ds["shot"].broadcast_like(reference).values).ravel()
-    attributed = ~np.isnan(source_idx)
-    normalizer_cls = ZScoreFeatureNormalizer if data_normalization == "physics-zscore" else CoralFeatureNormalizer
-    return normalizer_cls.fit_from_features(features[attributed], source_idx[attributed].astype(int), n_devices, shot_idx[attributed])
 
 
 def _submodule_config_dict(submodule_config: TrainConfig | dict) -> dict:
@@ -91,27 +52,19 @@ class TransportPredictorTRB(TrainRunBuilder):
 
         def _build_module(train_dl: DataLoader, model_init_config: dict) -> Any:
             model_type = model_init_config["model_type"]
-            # Stat stage (CORAL or z-score) on the 11 transport features.
-            # Fitted from the training data, or left at identity when the
-            # physics features are used as-is or a transfer checkpoint will
-            # overwrite the buffers anyway (a stat fit on a handful of target
-            # shots is ill-conditioned, the restored stats are the correct
-            # ones; the identity class must still match the checkpoint's
-            # pytree). transfer_pretrain dataloaders carry a combined historic
-            # + target fit dataset as an attribute (see get_time_dep_dataloaders)
-            data_normalization = model_init_config.get("data_normalization", "physics-coral")
-            if data_normalization not in ("physics", "physics-coral", "physics-zscore"):
-                raise ValueError(f"Unknown transport data normalization method: {data_normalization}")
+            # Stat stage (CORAL or z-score) on the 11 transport features, fitted
+            # from the training data only. When a transfer checkpoint will
+            # overwrite the module anyway, skip the fit (a fit on a handful of
+            # target shots is ill-conditioned and the restored stats, fitted on
+            # historic + target shots by the transfer_pretrain prereq case, are
+            # the correct ones). transfer_pretrain dataloaders carry that
+            # combined fit dataset as an attribute (see get_time_dep_dataloaders)
             n_devices = len(config.ds_source_to_idx)
-            if data_normalization == "physics":
-                normalizer: FeatureNormalizer = CoralFeatureNormalizer.identity(n_devices, N_TRANSPORT_NN_INPUTS)
-            elif model_init_config.get("transfer_checkpoint"):
-                identity_cls = ZScoreFeatureNormalizer if data_normalization == "physics-zscore" else CoralFeatureNormalizer
-                normalizer = identity_cls.identity(n_devices, N_TRANSPORT_NN_INPUTS)
+            if model_init_config.get("transfer_checkpoint"):
+                fit_ds = None
             else:
-                normalizer = _fit_transport_input_normalizer(
-                    getattr(train_dl, "normalizer_fit_ds", train_dl.ds), n_devices, data_normalization
-                )
+                fit_ds = getattr(train_dl, "normalizer_fit_ds", train_dl.ds)
+            normalizer = make_transport_nn_input_normalizer(model_init_config["data_normalization"], fit_ds, n_devices)
 
             if model_type == "sciml":
                 # Submodule skeletons come from their own TRBs, then their

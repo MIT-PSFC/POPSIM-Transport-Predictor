@@ -5,12 +5,16 @@ from transport_study.orchestration.data_visualization import DataVisualizationBa
 
 class DataVisualization(DataVisualizationBase):
     STUDY_TYPE: ClassVar[str] = "profile_transfer"
+    # The profile models normalize their own 10 dimensionless nn_inputs, not the
+    # power balance inputs, so the physics* plots show that feature space
+    FEATURE_SPACE: ClassVar[str] = "profile"
 
-    # Input-variable pairs to plot per normalization method. Only references
-    # variables guaranteed present for profile-transfer datasets
-    # (no P_aux_MW / surface_power_density, which are zero here).
-    # Coral and physics-coral pairs use only the module's joint feature set
-    # (adding Wtot_MJ or beta to the fit would change every var's transform).
+    # Input-variable pairs to plot per normalization method. Only the methods
+    # this study can actually run (VALID_DATA_NORMALIZATIONS) plus the raw
+    # physical inputs for reference.
+    # The physics* pairs are nn_inputs slots, so they are exactly the features
+    # the stat stage aligns (adding anything outside the joint feature set to a
+    # CORAL fit would change every var's transform).
     VAR_GROUPS: ClassVar[dict[str, list[list[str]]]] = {
         "raw": [
             ["Ip_MA", "Wtot_MJ"],
@@ -19,33 +23,21 @@ class DataVisualization(DataVisualizationBase):
             ["betan", "kappa"],
         ],
         "physics": [
-            ["Ip_MA", "beta"],
+            ["beta", "betan"],
             ["q_star", "epsilon"],
             ["f_G", "aB0"],
-            ["beta", "kappa"],
-        ],
-        "zscore": [
-            ["Ip_MA_z", "Wtot_MJ_z"],
-            ["R0_z", "a_minor_z"],
-            ["ne20_line_avg_z", "B0_z"],
-            ["Wtot_MJ_z", "kappa_z"],
-        ],
-        "coral": [
-            ["Ip_MA_coral", "kappa_coral"],
-            ["R0_coral", "a_minor_coral"],
-            ["ne20_line_avg_coral", "B0_coral"],
-            ["Ip_MA_coral", "B0_coral"],
+            ["log_nu_star", "kappa"],
         ],
         "physics-coral": [
-            ["Ip_MA_pcoral", "kappa_pcoral"],
+            ["beta_pcoral", "betan_pcoral"],
             ["q_star_pcoral", "epsilon_pcoral"],
             ["f_G_pcoral", "aB0_pcoral"],
-            ["q_star_pcoral", "aB0_pcoral"],
+            ["log_nu_star_pcoral", "kappa_pcoral"],
         ],
         "physics-zscore": [
-            ["Ip_MA_pz", "kappa_pz"],
+            ["beta_pz", "betan_pz"],
             ["q_star_pz", "epsilon_pz"],
             ["f_G_pz", "aB0_pz"],
-            ["q_star_pz", "aB0_pz"],
+            ["log_nu_star_pz", "kappa_pz"],
         ],
     }

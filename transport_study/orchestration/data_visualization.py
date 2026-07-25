@@ -348,11 +348,14 @@ class DataVisualizationBase:
     Adapts to an arbitrary number of source datasets and a single distinct target
     dataset, both read from `config.dataset_paths` / `config.target_device`.
     Subclasses set STUDY_TYPE and VAR_GROUPS (input-variable pairs to plot per
-    normalization method).
+    normalization method), and FEATURE_SPACE when their models do not consume
+    the power balance inputs.
     """
 
     STUDY_TYPE: ClassVar[str]
     VAR_GROUPS: ClassVar[dict[str, list[list[str]]]]
+    # Feature vector the physics* normalizations run on, see normalize_domain
+    FEATURE_SPACE: ClassVar[str] = "power_balance"
 
     @classmethod
     def hazard_extrapolation(cls, figure_dir: Path | str):
@@ -440,7 +443,7 @@ class DataVisualizationBase:
             if fig_path.exists():
                 continue
             try:
-                ds_norm, _ = normalize_domain(combined.copy(deep=True), method=method)
+                ds_norm, _ = normalize_domain(combined.copy(deep=True), method=method, feature_space=cls.FEATURE_SPACE)
                 domain_plot(
                     ds=ds_norm,
                     var_groups=cls.VAR_GROUPS[method],

@@ -44,6 +44,11 @@ def test_torax_predictor(transport_model):
                 "target_vars": [*PROFILE_TARGET_VARS, "ds_source_idx"],
                 "batch_size": 512,
             },
+            "model_init_config": {
+                **train_config.model_init_config,
+                # model_init indexes this strictly, the study normally supplies it
+                "data_normalization": "physics-coral",
+            },
         }
     )
 
@@ -85,6 +90,8 @@ def test_torax_predictor_mast_miller(transport_model):
             "model_init_config": {
                 **train_config.model_init_config,
                 "geometry_builder": "miller",
+                # model_init indexes this strictly, the study normally supplies it
+                "data_normalization": "physics-coral",
             },
         }
     )
