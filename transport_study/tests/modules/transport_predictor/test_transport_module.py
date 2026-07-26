@@ -225,16 +225,17 @@ def test_env_create_state_per_model_type(transformer_module, sciml_module, torax
     # NN Dirichlet boundary conditions computed from the floored seeds
     state_carry = TransportPredictorEnv(module=torax_carry_module).create_state(obs, obs)
     assert isinstance(state_carry, TransportPredictorToraxSimState.State)
-    assert state_carry.sim_state is not None
-    assert state_carry.post_processed is not None
-    assert float(state_carry.sim_state.t) == pytest.approx(0.0)
+    sim_state, post_processed = state_carry.unwrap()
+    assert sim_state is not None
+    assert post_processed is not None
+    assert float(sim_state.t) == pytest.approx(0.0)
 
     inputs0 = TransportPredictorEnv.create_inputs(obs)
     ne_seed = jnp.maximum(jnp.asarray(NE0), NE_SEED_FLOOR_20)
     te_seed = jnp.maximum(jnp.asarray(TE0), TE_SEED_FLOOR_KEV)
     wtot0 = wtot_from_profiles(ne_seed, te_seed, jnp.asarray(RHO), inputs0.volume_approx)
     coeffs = torax_carry_module.nn_coefficients(inputs0, wtot0)
-    core_profiles = state_carry.sim_state.core_profiles
+    core_profiles = sim_state.core_profiles
     np.testing.assert_allclose(
         np.asarray(core_profiles.T_e.right_face_constraint),
         np.squeeze(np.asarray(coeffs["T_e_right_bc"])),
@@ -559,7 +560,7 @@ def test_torax_absorbed_power_matches_absorption_fraction(torax_carry_module):
 
     # Recompute the coefficients exactly as __call__ does, from the stored
     # energy implied by the carried TORAX core profiles
-    core_profiles = state.sim_state.core_profiles
+    core_profiles = state.unwrap()[0].core_profiles
     rho_cells = jnp.asarray(torax_carry_module.rho_norm_grid)
     wtot = wtot_from_profiles(
         core_profiles.n_e.value / 1e20,
@@ -570,7 +571,7 @@ def test_torax_absorbed_power_matches_absorption_fraction(torax_carry_module):
     coeffs = torax_carry_module.nn_coefficients(inputs, wtot)
 
     next_state, _output = torax_carry_module(state, inputs)
-    absorbed = float(np.squeeze(np.asarray(next_state.post_processed.P_aux_generic_total)))
+    absorbed = float(np.squeeze(np.asarray(next_state.unwrap()[1].P_aux_generic_total)))
     expected = float(inputs.P_aux_MW) * 1e6 * float(np.squeeze(np.asarray(coeffs["absorption_fraction"])))
     assert absorbed == pytest.approx(expected, rel=1e-3)
 

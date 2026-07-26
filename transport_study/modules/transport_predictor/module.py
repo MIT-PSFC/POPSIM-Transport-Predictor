@@ -918,15 +918,33 @@ class TransportPredictorToraxSimState(TransportPredictorToraxBase):
 
     @chex.dataclass
     class State:
-        sim_state: PyTree = discrete_no_save_field(default=None)  # ToraxSimState
-        post_processed: PyTree = discrete_no_save_field(default=None)  # PostProcessedOutputs
+        # Both TORAX pytrees are held inside 1-tuples, see wrap / unwrap below.
+        # popsim's create_filter_spec (field_labels.py) builds its boolean
+        # filter spec by recursing into every nested DATACLASS field and
+        # rebuilding it with dataclasses.replace. TORAX's CellVariable rejects
+        # that: its __post_init__ requires exactly one face constraint set, and
+        # a spec sets both to booleans. A tuple is not a dataclass, so the walk
+        # stops at the wrapper and the whole subtree inherits this field's
+        # discrete / no-save label through eqx.partition's prefix semantics
+        sim_state: PyTree = discrete_no_save_field(default=None)  # (ToraxSimState,)
+        post_processed: PyTree = discrete_no_save_field(default=None)  # (PostProcessedOutputs,)
+
+        @staticmethod
+        def wrap(sim_state, post_processed) -> "TransportPredictorToraxSimState.State":
+            """Build a State from the bare TORAX pytrees."""
+            return TransportPredictorToraxSimState.State(sim_state=(sim_state,), post_processed=(post_processed,))
+
+        def unwrap(self) -> tuple:
+            """The bare (ToraxSimState, PostProcessedOutputs) this state carries."""
+            return self.sim_state[0], self.post_processed[0]
 
     def __call__(self, state: "TransportPredictorToraxSimState.State", inputs: Inputs) -> tuple:
         rho = jnp.array(self.rhogrid)
+        carried_state, carried_post = state.unwrap()
 
         # Stored energy implied by the carried TORAX core profiles drives the
         # NN features, cell values suffice for the integral
-        core_profiles = state.sim_state.core_profiles
+        core_profiles = carried_state.core_profiles
         rho_cells = jnp.asarray(self.rho_norm_grid)
         Wtot_MJ = wtot_from_profiles(
             core_profiles.n_e.value / 1e20,
@@ -943,17 +961,17 @@ class TransportPredictorToraxSimState(TransportPredictorToraxBase):
         # advanced to t_final, so rewind t to t_initial before each step
         numerics = self.step_fn.runtime_params_provider.numerics
         sim_state = dataclasses.replace(
-            state.sim_state,
-            t=jnp.full_like(state.sim_state.t, float(numerics.t_initial)),
+            carried_state,
+            t=jnp.full_like(carried_state.t, float(numerics.t_initial)),
         )
-        final_state, final_post = self._advance_one_step(sim_state, state.post_processed, provider, geo_provider)
+        final_state, final_post = self._advance_one_step(sim_state, carried_post, provider, geo_provider)
 
         # Output the profile estimate at the current time from the carried state
-        ne_now, te_now = self._interp_profiles(state.sim_state, coeffs, rho)
+        ne_now, te_now = self._interp_profiles(carried_state, coeffs, rho)
         ne_now, te_now, debug_info = self.positive_profiles(ne_now, te_now)
         debug_info.update(Wtot_MJ_state=Wtot_MJ)
 
-        state_out = TransportPredictorToraxSimState.State(sim_state=final_state, post_processed=final_post)
+        state_out = TransportPredictorToraxSimState.State.wrap(final_state, final_post)
         output = Output(ne=ne_now, te=te_now, rho=rho, debug_info=debug_info)
         return state_out, output
 
@@ -1020,7 +1038,7 @@ class TransportPredictorEnv(ModuleTrainingEnv):
                 runtime_params_overrides=provider,
                 geometry_overrides=geo_provider,
             )
-            return TransportPredictorToraxSimState.State(sim_state=initial_state, post_processed=initial_post)
+            return TransportPredictorToraxSimState.State.wrap(initial_state, initial_post)
 
         raise ValueError(f"Unknown transport predictor module type: {type(self.module)}")
 

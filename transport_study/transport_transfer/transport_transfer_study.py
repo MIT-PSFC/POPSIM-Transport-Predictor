@@ -359,10 +359,17 @@ class TransportStudy(Study):
                     continue  # Invalid case, skip
             if model_type != "sciml" and freeze_submodules != config.hyperparam_freeze_submodules:
                 continue  # No submodules to freeze, just do one of the two
-            if not model_type.startswith("torax-") and geometry_builder != "circular":
-                continue  # geometry_builder only applies to torax model types
-            if not model_type.startswith("torax-") and torax_state != "rebuild":
-                continue  # torax_state only applies to torax model types
+            case_geometry, case_torax_state = geometry_builder, torax_state
+            if not model_type.startswith("torax-"):
+                # geometry_builder and torax_state only apply to torax model
+                # types, and Case._validate pins non-torax cases to the
+                # "circular" / "rebuild" values. Emit each non-torax case once,
+                # on the first value of each axis, rather than on the pinned
+                # value: a study running only torax-carry (or only miller)
+                # would otherwise drop every non-torax case from the grid
+                if (geometry_builder, torax_state) != (config.geometry_builders[0], config.torax_state_options[0]):
+                    continue
+                case_geometry, case_torax_state = "circular", "rebuild"
 
             case = self.Case(
                 model_type=model_type,
@@ -370,8 +377,8 @@ class TransportStudy(Study):
                 domain_adaptation=domain_adaptation,
                 freeze_submodules=freeze_submodules,
                 num_target_shots=num_target_shots,
-                geometry_builder=geometry_builder,
-                torax_state=torax_state,
+                geometry_builder=case_geometry,
+                torax_state=case_torax_state,
             )
 
             cases.append(case)
@@ -393,12 +400,20 @@ class TransportStudy(Study):
             # Hyperparameters
             "segment_length_train": 100,
             "segment_overlap_train": 50,
-            # Far below the power balance study's 4096: every torax sample
-            # runs a 100-step differentiated TORAX rollout under vmap (with
-            # jax.checkpoint remat, see _advance_one_step). Measure before
-            # raising; memory and time scale linearly with batch and
-            # segment_length_train
-            "batch_size": 64,
+            # Below the power balance study's 4096: every torax sample runs a
+            # 100-step differentiated TORAX rollout under vmap (with
+            # jax.checkpoint remat, see _advance_one_step). Memory and time
+            # scale linearly with batch and segment_length_train, so measure
+            # before changing this.
+            # Measured 2026-07-26 (A100-80GB, gyrobohm, real cmod dataloader):
+            # VRAM is NOT the limit at any usable size - a linear ~5 MB/sample
+            # puts batch 8192 at 38 GB of the 68 GB pool. Wall-clock per epoch
+            # is 5.50 min at 64, 2.19 at 256, 1.46 at 512, then flat (1.00 at
+            # 8192) because s/step doubles with batch past that point. So 512
+            # takes nearly all the available speedup while still running 34
+            # optimizer steps per epoch on the full cmod set; going higher
+            # would only spend gradient updates for no wall-clock gain
+            "batch_size": 512,
             # Part of validation, should be left alone during hyperparameter tuning
             "segment_length_val": None,
             "segment_overlap_val": 0,
