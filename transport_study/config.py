@@ -64,6 +64,9 @@ class StudyConfig(BaseModel):
 
     # Debugging and dev stuff
     debug: bool = True
+    # Unused by the studies, but every existing working dir's config_lock.toml
+    # carries it and the lock is reloaded through this frozen model
+    # TODO(ZanderKeith): Remove this for APS study
     dry_run: bool = False
     max_ds_size: int = 1000
     hyperparam_sweeps: int = 200
