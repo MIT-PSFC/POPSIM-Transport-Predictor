@@ -204,7 +204,7 @@ class PowerBalanceStudy(Study):
             if self.model_type not in MODEL_TYPES_WITH_SUBMODULES:
                 return []
             return [
-                self._replace(model_type=submodule_type, freeze_submodules=config.hyperparam_freeze_submodules)
+                self.replace(model_type=submodule_type, freeze_submodules=config.hyperparam_freeze_submodules)
                 for submodule_type in SUBMODULE_MODEL_TYPES
             ]
 
@@ -300,7 +300,7 @@ class PowerBalanceStudy(Study):
     def _make_submodule_config(self, case: Case, submodule_type: str) -> TrainConfig:
         """Full TrainConfig for a p_oh/p_rad submodule, recursing through make_train_config
         so submodule cases get their own tuned merge and transfer wiring."""
-        return self.make_train_config(case._replace(model_type=submodule_type, freeze_submodules=config.hyperparam_freeze_submodules))
+        return self.make_train_config(case.replace(model_type=submodule_type, freeze_submodules=config.hyperparam_freeze_submodules))
 
     def _model_train_spec(self, case: Case, dataloader_config_base: dict) -> ModelTrainSpec:
         trb = "transport_study.modules.power_balance.trb.PowerBalanceTRB"
@@ -425,35 +425,6 @@ class PowerBalanceStudy(Study):
         "freeze_submodules",
         "num_target_shots",
     )
-
-    def collect_results(self):
-        """Collect scalar summary statistics per case (one row per case).
-
-        Dims: case_idx
-        Coords (along case_idx): model_type, training_data, data_normalization,
-        domain_adaptation, freeze_submodules, num_target_shots
-        Data variables (along case_idx): err_E_D_S where E is 'abs' or 'rel', D is
-        'shot' (time-integrated per shot) or 'ts' (per timeslice), and S is one of
-        mean, std, med, p25, p75, min, max. E.g. err_abs_shot_mean, err_rel_ts_p75.
-        """
-        results = []
-        for case_idx, case in enumerate(self.cases):
-            result_path = self.result_path(case)
-            if not result_path.exists():
-                continue
-
-            ds = xr.load_dataset(result_path)
-
-            result = self._summarize_case_errors(ds).assign_coords(self._case_coords(case_idx, case))
-            results.append(result)
-
-        if not results:
-            logger.warning("No case results found to collect!")
-            return xr.Dataset()
-
-        # coords="different" stacks the per-case scalar coords along case_idx
-        ds_merged = xr.concat(results, dim="case_idx", coords="different")
-        return ds_merged
 
     ############
     # ANALYSIS #

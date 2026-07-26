@@ -40,9 +40,11 @@ from transport_study.modules.profile_predictor.torax_module import (
     TAU_REF_S,
     TORAX_TRANSPORT_MODEL_NAMES,
     TRANSPORT_COEFFICIENT_NAMES,
+    bound_transport_coefficients,
     build_circular_geometry_jax,
     build_miller_geometry_jax,
     clamp_core_profiles,
+    transport_provider_mapping,
 )
 
 # Positivity floor for the profile outputs, ne [1e20 m^-3] and te [keV]
@@ -682,61 +684,16 @@ class TransportPredictorToraxBase(TransportPredictor):
         face_centers = np.array(self._face_centers)
         return (face_centers[:-1] + face_centers[1:]) / 2.0
 
-    def _transport_coefficients(self, nn_transport_out: jax.Array) -> dict:
-        """Bound the raw transport-network outputs to physical ranges for the configured model.
+    def transport_coefficients(self, nn_transport_out: jax.Array) -> dict:
+        """Bound the raw transport-network outputs to physical ranges, see bound_transport_coefficients."""
+        return bound_transport_coefficients(self.transport_model, nn_transport_out)
 
-        The bounds keep the TORAX solver stable during training for any network
-        output. Keys and order match TRANSPORT_COEFFICIENT_NAMES[self.transport_model].
-        Same bounds as ProfilePredictorTorax, see the rationale comments there.
-        """
-        if self.transport_model == "constant":
-            #   chi_i: 0.1 - 5 m^2/s
-            #   chi_e: 0.1 - 10 m^2/s
-            #   D_e:   0.1 - 2 m^2/s   (nonzero floor prevents advection-only blowup)
-            #   V_e:   -5 - 5 m/s      (signed pinch)
-            return {
-                "chi_i": 0.1 + 4.9 * jax.nn.sigmoid(nn_transport_out[0:1]),
-                "chi_e": 0.1 + 9.9 * jax.nn.sigmoid(nn_transport_out[1:2]),
-                "D_e": 0.1 + 1.9 * jax.nn.sigmoid(nn_transport_out[2:3]),
-                "V_e": 5.0 * jnp.tanh(nn_transport_out[3:4]),
-            }
-        elif self.transport_model == "cgm":
-            # Bounds: chi_e_i_ratio 0.2 to 5, chi_D_ratio 1 to 20,
-            # VR_D_ratio -5 to 5, alpha 1.8 to 2.2, chi_stiff 0.5 to 3
-            return {
-                "chi_e_i_ratio": 0.2 + 4.8 * jax.nn.sigmoid(nn_transport_out[0:1]),
-                "chi_D_ratio": 1.0 + 19.0 * jax.nn.sigmoid(nn_transport_out[1:2]),
-                "VR_D_ratio": 5.0 * jnp.tanh(nn_transport_out[2:3]),
-                "alpha": 1.8 + 0.4 * jax.nn.sigmoid(nn_transport_out[3:4]),
-                "chi_stiff": 0.5 + 2.5 * jax.nn.sigmoid(nn_transport_out[4:5]),
-            }
-        elif self.transport_model == "gyrobohm":
-            # Bounds: bohm and gyrobohm multipliers exp(-3) to exp(3),
-            # D_face_c1 and D_face_c2 0.01 to 5, V_face_coeff -4 to 2 with the
-            # sigmoid bias putting a random init at the TORAX default -0.1
-            return {
-                "chi_bohm_multiplier": jnp.exp(3.0 * jnp.tanh(nn_transport_out[0:1])),
-                "chi_gyrobohm_multiplier": jnp.exp(3.0 * jnp.tanh(nn_transport_out[1:2])),
-                "D_face_c1": 0.01 + 4.99 * jax.nn.sigmoid(nn_transport_out[2:3]),
-                "D_face_c2": 0.01 + 4.99 * jax.nn.sigmoid(nn_transport_out[3:4]),
-                "V_face_coeff": 2.0 - 6.0 * jax.nn.sigmoid(nn_transport_out[4:5] - 0.62),
-            }
-        else:  # qlknn
-            #   ITG_flux_ratio_correction: ~0.08 - 12 around 1
-            #   ETG_correction_factor: ~0.03 - 4 around the default 1/3
-            #   collisionality_multiplier: ~0.08 - 12 around 1
-            return {
-                "ITG_flux_ratio_correction": jnp.exp(2.5 * jnp.tanh(nn_transport_out[0:1])),
-                "ETG_correction_factor": (1.0 / 3.0) * jnp.exp(2.5 * jnp.tanh(nn_transport_out[1:2])),
-                "collisionality_multiplier": jnp.exp(2.5 * jnp.tanh(nn_transport_out[2:3])),
-            }
-
-    def _nn_coefficients(self, inputs: Inputs, Wtot_MJ: ArrayLike) -> dict:
+    def nn_coefficients(self, inputs: Inputs, Wtot_MJ: ArrayLike) -> dict:
         # Transport model free parameters, source shape and edge boundary
         # conditions from neural networks, bounded to physical ranges so the
         # TORAX solver stays stable during training. The heating MAGNITUDE is
         # NOT here: it is the measured P_aux_MW input, wired directly to
-        # generic_heat.P_total in _build_provider_and_geo (the NN-predicted
+        # generic_heat.P_total in build_provider_and_geo (the NN-predicted
         # absorption_fraction below scales it into absorbed power).
         # Source network outputs, per SOURCE_SHAPE_COEFFICIENT_NAMES:
         #   S_total: 0 - inf, softplus multiple of the device fueling scale
@@ -751,7 +708,7 @@ class TransportPredictorToraxBase(TransportPredictor):
         #     absorption grows linearly with line density when optically thin
         #     and saturates smoothly toward 1, with the NN predicting the opacity per unit density.
         nn_inputs = self.normalizer(inputs.transport_nn_inputs(Wtot_MJ), inputs.ds_source_idx)
-        coeffs = self._transport_coefficients(self.nn_transport(nn_inputs))
+        coeffs = self.transport_coefficients(self.nn_transport(nn_inputs))
         nn_sources_out = self.nn_sources(nn_inputs)
         # Particle inventory in 1e21 electrons: ne20_line_avg * volume * 0.1
         inventory = 0.1 * inputs.ne20_line_avg * inputs.volume_approx
@@ -773,7 +730,7 @@ class TransportPredictorToraxBase(TransportPredictor):
         coeffs["T_e_right_bc"] = 0.02 + jax.nn.sigmoid(nn_edge_out[1:2] - 5.0) * te_scale  # [keV]
         return coeffs
 
-    def _build_provider_and_geo(
+    def build_provider_and_geo(
         self,
         inputs: Inputs,
         coeffs: dict,
@@ -821,7 +778,7 @@ class TransportPredictorToraxBase(TransportPredictor):
             # Assume the ion temperature matches the electron temperature
             mapping["profile_conditions.T_i"] = t_ic_update
             mapping["profile_conditions.n_e"] = n_ic_update
-        mapping.update(self._transport_provider_mapping(coeffs))
+        mapping.update(transport_provider_mapping(self.transport_model, coeffs))
         new_provider = self.step_fn.runtime_params_provider.update_provider_from_mapping(mapping)
 
         # Build JAX-differentiable geometry from per-sample inputs
@@ -851,60 +808,6 @@ class TransportPredictorToraxBase(TransportPredictor):
             )
         geo_provider = geometry_provider_lib.ConstantGeometryProvider(geo=geo)
         return new_provider, geo_provider
-
-    def _transport_provider_mapping(self, coeffs: dict) -> dict:
-        """Runtime-params override entries for the configured transport model."""
-
-        def scalar(name: str) -> torax_experimental.TimeVaryingScalarUpdate:
-            return torax_experimental.TimeVaryingScalarUpdate(value=coeffs[name])
-
-        if self.transport_model == "constant":
-            # chi_i etc. are radial profiles (TimeVaryingArray) in the constant
-            # model: broadcast the NN scalar to a flat profile
-            rho = jnp.array([1.0])
-
-            def flat_profile(name: str) -> torax_experimental.TimeVaryingArrayUpdate:
-                return torax_experimental.TimeVaryingArrayUpdate(
-                    value=jnp.broadcast_to(coeffs[name][:, jnp.newaxis], (1, 1)),
-                    rho_norm=rho,
-                )
-
-            return {
-                "transport_model.chi_i": flat_profile("chi_i"),
-                "transport_model.chi_e": flat_profile("chi_e"),
-                "transport_model.D_e": flat_profile("D_e"),
-                "transport_model.V_e": flat_profile("V_e"),
-            }
-        elif self.transport_model == "cgm":
-            return {
-                "transport_model.chi_e_i_ratio": scalar("chi_e_i_ratio"),
-                "transport_model.chi_D_ratio": scalar("chi_D_ratio"),
-                "transport_model.VR_D_ratio": scalar("VR_D_ratio"),
-                # Plain float leaves in the provider: replaced with traced scalars
-                # directly rather than via TimeVaryingScalarUpdate
-                "transport_model.alpha": jnp.squeeze(coeffs["alpha"]),
-                "transport_model.chi_stiff": jnp.squeeze(coeffs["chi_stiff"]),
-            }
-        elif self.transport_model == "gyrobohm":
-            # Same NN multiplier applied to both species: the BgB model already
-            # fixes chi_i_B = 2 * chi_e_B and chi_i_gB = 0.5 * chi_e_gB
-            return {
-                "transport_model.chi_e_bohm_multiplier": scalar("chi_bohm_multiplier"),
-                "transport_model.chi_i_bohm_multiplier": scalar("chi_bohm_multiplier"),
-                "transport_model.chi_e_gyrobohm_multiplier": scalar("chi_gyrobohm_multiplier"),
-                "transport_model.chi_i_gyrobohm_multiplier": scalar("chi_gyrobohm_multiplier"),
-                "transport_model.D_face_c1": scalar("D_face_c1"),
-                "transport_model.D_face_c2": scalar("D_face_c2"),
-                "transport_model.V_face_coeff": scalar("V_face_coeff"),
-            }
-        else:  # qlknn
-            # Plain float leaves in the provider (like cgm alpha and chi_stiff):
-            # replaced with traced scalars directly
-            return {
-                "transport_model.ITG_flux_ratio_correction": jnp.squeeze(coeffs["ITG_flux_ratio_correction"]),
-                "transport_model.ETG_correction_factor": jnp.squeeze(coeffs["ETG_correction_factor"]),
-                "transport_model.collisionality_multiplier": jnp.squeeze(coeffs["collisionality_multiplier"]),
-            }
 
     def _advance_one_step(self, sim_state, post_processed, provider, geo_provider):
         """Advance TORAX by exactly one solver step of sim_dt.
@@ -976,13 +879,13 @@ class TransportPredictorTorax(TransportPredictorToraxBase):
         ne_state = jnp.maximum(state.ne, NE_SEED_FLOOR_20)
         te_state = jnp.maximum(state.te, TE_SEED_FLOOR_KEV)
         Wtot_MJ = wtot_from_profiles(ne_state, te_state, rho, inputs.volume_approx)
-        coeffs = self._nn_coefficients(inputs, Wtot_MJ)
+        coeffs = self.nn_coefficients(inputs, Wtot_MJ)
 
         # Initial condition from the stored profiles, edge point pinned to the NN Dirichlet BC
         # a discontinuity at the LCFS NaNs the solver under the critical gradient model
         te_ic = te_state.at[-1].set(jnp.squeeze(coeffs["T_e_right_bc"]))
         ne_ic = ne_state.at[-1].set(jnp.squeeze(coeffs["n_e_right_bc"]))
-        provider, geo_provider = self._build_provider_and_geo(inputs, coeffs, ne_ic=ne_ic, te_ic=te_ic)
+        provider, geo_provider = self.build_provider_and_geo(inputs, coeffs, ne_ic=ne_ic, te_ic=te_ic)
 
         initial_state, initial_post = torax_experimental.get_initial_state_and_post_processed_outputs(
             step_fn=self.step_fn,
@@ -1031,9 +934,9 @@ class TransportPredictorToraxSimState(TransportPredictorToraxBase):
             rho_cells,
             inputs.volume_approx,
         )
-        coeffs = self._nn_coefficients(inputs, Wtot_MJ)
+        coeffs = self.nn_coefficients(inputs, Wtot_MJ)
         # No initial profile conditions: the state is carried, not rebuilt
-        provider, geo_provider = self._build_provider_and_geo(inputs, coeffs)
+        provider, geo_provider = self.build_provider_and_geo(inputs, coeffs)
 
         # step_fn evaluates time-varying params at the state time and clips
         # dt against the config t_final, and the carried state has already
@@ -1108,10 +1011,10 @@ class TransportPredictorEnv(ModuleTrainingEnv):
             ne0 = jnp.maximum(ne0, NE_SEED_FLOOR_20)
             te0 = jnp.maximum(te0, TE_SEED_FLOOR_KEV)
             Wtot_MJ = wtot_from_profiles(ne0, te0, rho, inputs0.volume_approx)
-            coeffs = module._nn_coefficients(inputs0, Wtot_MJ)
+            coeffs = module.nn_coefficients(inputs0, Wtot_MJ)
             te_ic = te0.at[-1].set(jnp.squeeze(coeffs["T_e_right_bc"]))
             ne_ic = ne0.at[-1].set(jnp.squeeze(coeffs["n_e_right_bc"]))
-            provider, geo_provider = module._build_provider_and_geo(inputs0, coeffs, ne_ic=ne_ic, te_ic=te_ic)
+            provider, geo_provider = module.build_provider_and_geo(inputs0, coeffs, ne_ic=ne_ic, te_ic=te_ic)
             initial_state, initial_post = torax_experimental.get_initial_state_and_post_processed_outputs(
                 step_fn=module.step_fn,
                 runtime_params_overrides=provider,

@@ -106,7 +106,7 @@ class TransportPredictorTRB(TrainRunBuilder):
                 torax_cls = {
                     "rebuild": TransportPredictorTorax,
                     "carry": TransportPredictorToraxSimState,
-                }[model_init_config.get("torax_state", "rebuild")]
+                }[model_init_config["torax_state"]]
                 module = torax_cls.init(
                     rhogrid=np.asarray(train_dl.ds["rho"]),
                     torax_config=model_init_config["torax_config"],
@@ -116,8 +116,8 @@ class TransportPredictorTRB(TrainRunBuilder):
                     normalizer=normalizer,
                     sim_dt=model_init_config["sim_dt"],
                     transport_model=model_type.removeprefix("torax-"),
-                    geometry_builder=model_init_config.get("geometry_builder", "circular"),
-                    delta_exponent=model_init_config.get("delta_exponent", 2.0),
+                    geometry_builder=model_init_config["geometry_builder"],
+                    delta_exponent=model_init_config["delta_exponent"],
                 )
             else:
                 raise ValueError(f"Invalid model type: {model_type}")
@@ -235,8 +235,9 @@ class TransportPredictorTRB(TrainRunBuilder):
             def value_err(residual):
                 return residual
 
-            # Down-weighting of the residual inside the measurement error bar
-            within_error_weight = loss_config.get("within_error_weight", ProfilePredictorTRB.WITHIN_ERROR_WEIGHT)
+            # Down-weighting of the residual inside the measurement error bar,
+            # read strictly (see ProfilePredictorTRB)
+            within_error_weight = loss_config["within_error_weight"]
 
             def _residual(pred, targ, sigma):
                 # Piecewise-linear shrink of the residual, same as the profile

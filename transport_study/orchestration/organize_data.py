@@ -446,42 +446,32 @@ def add_hazard(
     hazard_timeseries = ds.eval(f"(({Wtot_scale} * Wtot_MJ)**2 + ({Ip_scale} * Ip_MA)**2)**0.5")
 
     # Get the 95th percentile value per shot
-    if TIME_DIM in ds.dims:
-        ds["hazard"] = hazard_timeseries.quantile(0.95, dim=TIME_DIM, skipna=True)
-    else:
-        ds["hazard"] = hazard_timeseries.quantile(0.95, dim=TIME_COORD, skipna=True)
+    ds["hazard"] = hazard_timeseries.quantile(0.95, dim=TIME_DIM, skipna=True)
 
     n_shots = ds.sizes[episode_coord]
 
-    # Initialize arrays for Ip_MA and Wtot_MJ at p95
     Ip_MA_p95 = np.full(n_shots, np.nan)
     Wtot_MJ_p95 = np.full(n_shots, np.nan)
 
-    # For each shot, find the time index closest to 95th percentile
+    # Per shot, take Ip and Wtot at the timeslice whose hazard is closest to the p95 value
     hazard_ts_data = hazard_timeseries.values  # shape: (n_shots, n_time)
     p95_vals = ds["hazard"].values  # shape: (n_shots,)
     Ip_MA_data = ds["Ip_MA"].values
     Wtot_MJ_data = ds["Wtot_MJ"].values
 
     for i in range(n_shots):
-        # Get hazard timeseries for this shot
         hazard_shot = hazard_ts_data[i]
         p95_val = p95_vals[i]
-
-        # Find valid (non-NaN) indices
         valid_mask = ~np.isnan(hazard_shot)
 
         if valid_mask.sum() > 0 and not np.isnan(p95_val):
             # Find index where hazard is closest to p95
             abs_diff = np.abs(hazard_shot - p95_val)
-            abs_diff[~valid_mask] = np.inf  # Ignore NaN positions
+            abs_diff[~valid_mask] = np.inf
             idx_p95 = np.argmin(abs_diff)
-
-            # Extract Ip_MA and Wtot_MJ at that time
             Ip_MA_p95[i] = Ip_MA_data[i, idx_p95]
             Wtot_MJ_p95[i] = Wtot_MJ_data[i, idx_p95]
 
-    # Add to dataset
     ds["Ip_MA_p95"] = (episode_coord, Ip_MA_p95)
     ds["Wtot_MJ_p95"] = (episode_coord, Wtot_MJ_p95)
 
@@ -491,7 +481,7 @@ def add_hazard(
 def normalize_domain(
     ds_source: xr.Dataset,
     ds_target: xr.Dataset | None = None,
-    method: str | None = "raw",
+    method: str = "raw",
     feature_space: str = "power_balance",
 ) -> tuple[xr.Dataset, xr.Dataset | None]:
     """Apply the specified domain normalization method to the dataset.
@@ -786,7 +776,7 @@ def _split_target_shots(
 
 def get_train_test_datasets(
     training_data: "TrainingData",
-    domain_adaptation: str,
+    domain_adaptation: str | None,
     num_target_shots: int,
     target_test_set_size: int,
     study_type: str = "profile_transfer",

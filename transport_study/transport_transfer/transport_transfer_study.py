@@ -327,7 +327,7 @@ class TransportStudy(Study):
             else:
                 return []
             return [
-                self._replace(model_type=submodule_type, freeze_submodules=config.hyperparam_freeze_submodules)
+                self.replace(model_type=submodule_type, freeze_submodules=config.hyperparam_freeze_submodules)
                 for submodule_type in submodule_types
             ]
 
@@ -457,7 +457,7 @@ class TransportStudy(Study):
     def _make_submodule_config(self, case: Case, submodule_type: str) -> TrainConfig:
         """Full TrainConfig for a submodule prereq case, recursing through make_train_config
         so submodule cases get their own tuned merge and transfer wiring."""
-        return self.make_train_config(case._replace(model_type=submodule_type, freeze_submodules=config.hyperparam_freeze_submodules))
+        return self.make_train_config(case.replace(model_type=submodule_type, freeze_submodules=config.hyperparam_freeze_submodules))
 
     def _transport_dataloader_config(self, dataloader_config_base: dict) -> dict:
         """Dataloader config shared by every top-level transport model type."""
@@ -537,7 +537,7 @@ class TransportStudy(Study):
                 dataloader_config={
                     "input_vars": PROFILE_INPUT_VARS,
                     # Profiles plus their gradient / error-bar companions, the
-                    # profile loss uses the error bars as a deadband
+                    # validation loss softens the residual inside the error bars
                     "target_vars": [*PROFILE_TARGET_VARS, "ds_source_idx"],
                     "extra_vars": ["Te_shape", "ne_shape"],
                     **dataloader_config_base,
@@ -658,35 +658,6 @@ class TransportStudy(Study):
         "torax_state",
         "num_target_shots",
     )
-
-    def collect_results(self):
-        """Collect scalar summary statistics per case (one row per case).
-
-        Dims: case_idx
-        Coords (along case_idx): model_type, training_data, domain_adaptation,
-        freeze_submodules, geometry_builder, torax_state, num_target_shots
-        Data variables (along case_idx): err_E_D_S where E is 'abs' or 'rel', D is
-        'shot' (time-integrated per shot) or 'ts' (per timeslice), and S is one of
-        mean, std, med, p25, p75, min, max. E.g. err_abs_shot_mean, err_rel_ts_p75.
-        """
-        results = []
-        for case_idx, case in enumerate(self.cases):
-            result_path = self.result_path(case)
-            if not result_path.exists():
-                continue
-
-            ds = xr.load_dataset(result_path)
-
-            result = self._summarize_case_errors(ds).assign_coords(self._case_coords(case_idx, case))
-            results.append(result)
-
-        if not results:
-            logger.warning("No case results found to collect!")
-            return xr.Dataset()
-
-        # coords="different" stacks the per-case scalar coords along case_idx
-        ds_merged = xr.concat(results, dim="case_idx", coords="different")
-        return ds_merged
 
     ############
     # ANALYSIS #

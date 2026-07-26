@@ -61,7 +61,7 @@ def compute_topk_study_results(
     Trainer.train (result_dict["test/study_results"]), so that dataset is
     reused and only the remaining retained checkpoints are evaluated. With
     a single retained checkpoint this returns the best-checkpoint result
-    unchanged, recovering the old behavior.
+    unchanged.
     """
     best_ds = result_dict["test/study_results"]
     manager = trainer.checkpoint_manager

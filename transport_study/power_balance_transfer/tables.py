@@ -5,7 +5,7 @@ adaptation, number of target shots) and every combination of the remaining
 axes, one markdown table comparing the cases that differ only along that axis.
 Columns combine the stage-resolved TIME-AVERAGED errors from
 collected_metrics.nc (per-timeslice means, free of the shot-duration confound
-in the raw time-integrated per-shot errors) with the legacy time-integrated
+in the raw time-integrated per-shot errors) with the time-integrated
 medians from collected_results.nc.
 
 A flat case_stats.csv with one row per case and every column is written next

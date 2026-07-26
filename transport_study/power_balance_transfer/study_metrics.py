@@ -304,7 +304,7 @@ def collect_metrics(study) -> xr.Dataset:
         case_ds = compute_and_save_case_metrics(study, case)
         if not case_ds.data_vars:
             continue
-        results.append(case_ds.assign_coords(study._case_coords(case_idx, case)))
+        results.append(case_ds.assign_coords(study.case_coords(case_idx, case)))
 
     if not results:
         logger.warning("No finished cases with valid metrics, stage-resolved metrics are empty")

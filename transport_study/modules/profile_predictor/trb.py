@@ -199,8 +199,8 @@ class ProfilePredictorTRB(TrainRunBuilder):
                 key=jax.random.PRNGKey(model_init_config["prng_seed"]),
                 normalizer=normalizer,
                 transport_model=model_init_config["model_type"].removeprefix("torax-"),
-                geometry_builder=model_init_config.get("geometry_builder", "circular"),
-                delta_exponent=model_init_config.get("delta_exponent", 2.0),
+                geometry_builder=model_init_config["geometry_builder"],
+                delta_exponent=model_init_config["delta_exponent"],
             )
         else:
             raise ValueError(f"Invalid model type {model_init_config['model_type']}")
@@ -229,10 +229,6 @@ class ProfilePredictorTRB(TrainRunBuilder):
     # are extrapolating into the pedestal / scrape-off layer where the
     # measured gradients are unreliable, so they should not steer training
     GRAD_LOSS_RHO_MAX = 0.9
-
-    # Default down-weighting of the residual inside the measurement error bar
-    # VALIDATION loss only (the training loss uses the raw residual)
-    WITHIN_ERROR_WEIGHT = 0.25
 
     @staticmethod
     def _make_profile_loss_fn(loss_config: dict, use_huber: bool) -> Callable[[Any, Any], jnp.ndarray]:
@@ -300,8 +296,10 @@ class ProfilePredictorTRB(TrainRunBuilder):
 
             grad_err = value_err
 
-            # Down-weighting of the residual inside the measurement error bar
-            within_error_weight = loss_config.get("within_error_weight", ProfilePredictorTRB.WITHIN_ERROR_WEIGHT)
+            # Down-weighting of the residual inside the measurement error bar,
+            # read strictly: a silent default here would change checkpoint
+            # selection without changing the case
+            within_error_weight = loss_config["within_error_weight"]
 
             def _residual(pred, targ, sigma):
                 # Piecewise-linear shrink of the residual: full weight on the
@@ -439,12 +437,12 @@ class ProfilePredictorTRB(TrainRunBuilder):
         return ProfilePredictorTRB._make_profile_loss_fn(loss_config, use_huber=False)
 
     @staticmethod
-    def get_optimizer(config: dict) -> optax.GradientTransformation:
+    def get_optimizer(optimizer_config: dict) -> optax.GradientTransformation:
         # Standard AdamW plus a global-norm cap: the differentiated TORAX
         # solve can spike gradients and NaN a run without it
         return optax.chain(
-            optax.clip_by_global_norm(config.get("grad_clip_max_norm", 1.0)),
-            make_exponential_adamw(config),
+            optax.clip_by_global_norm(optimizer_config.get("grad_clip_max_norm", 1.0)),
+            make_exponential_adamw(optimizer_config),
         )
 
     @staticmethod
@@ -512,7 +510,7 @@ class ProfilePredictorTRB(TrainRunBuilder):
         return make_loss_eval_suite(ProfilePredictorTRB.get_val_loss_fn(suite_config["loss_config"]))
 
     @staticmethod
-    def get_test_eval_suite(config) -> EvaluationSuite:
+    def get_test_eval_suite(suite_config) -> EvaluationSuite:
         """Evaluation suite for testing after training."""
 
         def study_results(eval_data: EvalData) -> xr.Dataset:
@@ -658,7 +656,7 @@ class ProfilePredictorTRB(TrainRunBuilder):
             ds = ds.drop_vars("input_batch", errors="ignore")
             return ds
 
-        if config:
+        if suite_config:
             eval_suite = {
                 "study_results": study_results,
             }

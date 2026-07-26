@@ -187,7 +187,7 @@ def test_weighted_device_weight():
         num_target_shots=3,
     )
 
-    weights = study._make_weighted_device_weights(case_p_oh)
+    weights = study.make_weighted_device_weights(case_p_oh)
     assert set(weights) == {"cmod-low1", "cmod-low2", "cmod-high"}
     assert all(w > 0 for w in weights.values())
     # Target gets the largest per-sample weight (few shots, half the budget)
@@ -383,9 +383,9 @@ def test_transfer_weights():
     )
     # The pretrain twin keeps this case's num_target_shots, the old shared
     # source-only pretrain (da=None) is not a prereq anymore
-    case_pretrain = case_transfer._replace(domain_adaptation="transfer_pretrain")
+    case_pretrain = case_transfer.replace(domain_adaptation="transfer_pretrain")
     assert case_pretrain in case_transfer.prereqs
-    assert case_transfer._replace(domain_adaptation=None, num_target_shots=HYPERPARAM_TARGET_SHOTS) not in case_transfer.prereqs
+    assert case_transfer.replace(domain_adaptation=None, num_target_shots=HYPERPARAM_TARGET_SHOTS) not in case_transfer.prereqs
     assert case_pretrain in study.cases
 
     _clean_case(study, case_pretrain)
@@ -454,9 +454,9 @@ def test_transfer_weights_submodules(freeze_submodules):
     case_p_oh_transfer = _case("p_oh", "transfer", True)
     case_p_rad_transfer = _case("p_rad", "transfer", True)
     case_sciml_transfer = _case("sciml-taue-nn", "transfer", freeze_submodules)
-    case_p_oh_pretrain = case_p_oh_transfer._replace(domain_adaptation="transfer_pretrain")
-    case_p_rad_pretrain = case_p_rad_transfer._replace(domain_adaptation="transfer_pretrain")
-    case_sciml_pretrain = case_sciml_transfer._replace(domain_adaptation="transfer_pretrain")
+    case_p_oh_pretrain = case_p_oh_transfer.replace(domain_adaptation="transfer_pretrain")
+    case_p_rad_pretrain = case_p_rad_transfer.replace(domain_adaptation="transfer_pretrain")
+    case_sciml_pretrain = case_sciml_transfer.replace(domain_adaptation="transfer_pretrain")
 
     # Prereq order:
     # submodule pretrains,

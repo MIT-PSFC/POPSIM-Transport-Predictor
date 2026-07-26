@@ -451,5 +451,5 @@ class DataVisualizationBase:
                     save_path=fig_path,
                     source_colors=colors,
                 )
-            except Exception as exc:
-                logger.warning(f"Skipping domain overlap plot for '{method}' normalization: {exc}")
+            except Exception:
+                logger.exception(f"Skipping domain overlap plot for '{method}' normalization")

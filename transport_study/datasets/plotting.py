@@ -5,9 +5,7 @@ import numpy as np
 import xarray as xr
 from matplotlib.backends.backend_pdf import PdfPages
 
-BACKGROUND_COLOR = "#2F2F2F"
-FACE_COLOR = "#1A1A1A"
-TEXT_COLOR = "white"
+from transport_study.plot_style import BACKGROUND_COLOR, FACE_COLOR, TEXT_COLOR
 
 TITLE_FONTSIZE = 20
 LABEL_FONTSIZE = 20

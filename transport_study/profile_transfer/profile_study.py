@@ -281,8 +281,8 @@ class ProfileStudy(Study):
 
     def _base_dataloader_config(self, case: Case) -> dict:
         return {
-            # Profiles plus their gradient / error-bar companions, the loss
-            # uses the error bars as an epsilon-insensitive deadband
+            # Profiles plus their gradient / error-bar companions, the
+            # validation loss softens the residual inside the error bars
             "target_vars": [*PROFILE_TARGET_VARS, "ds_source_idx"],
             "training_data": case.training_data,
             "domain_adaptation": case.domain_adaptation,
@@ -398,10 +398,10 @@ class ProfileStudy(Study):
                     "in_size": 10,  # Dimensionless nn_inputs derived from the raw input_vars, includes log(nu_star)
                     "torax_config": torax_defaults["torax_config"],
                     "geometry_builder": case.geometry_builder,
-                    "delta_exponent": torax_defaults.get("delta_exponent", 2.0),
-                    "t_final": torax_defaults.get("t_final"),
-                    "fixed_dt": torax_defaults.get("fixed_dt"),
-                    "n_solver_steps": torax_defaults.get("n_solver_steps"),
+                    "delta_exponent": torax_defaults["delta_exponent"],
+                    "t_final": torax_defaults["t_final"],
+                    "fixed_dt": torax_defaults["fixed_dt"],
+                    "n_solver_steps": torax_defaults["n_solver_steps"],
                     "prng_seed": 42,
                 },
             )
@@ -455,8 +455,9 @@ class ProfileStudy(Study):
 
         Dims: record (flat index over all case x shot pairs)
         Coords (along record):
-        - case_idx, model_type, training_data, domain_adaptation,
-          freeze_shapes, num_target_shots (identify the case)
+        - case_idx, model_type, training_data, data_normalization,
+          domain_adaptation, freeze_shapes, geometry_builder,
+          num_target_shots (identify the case)
         - shot (device shot id), ds_source (which dataset the shot came from)
         Data variables (along record):
         - err_abs_shot / err_rel_shot: time-integrated combined (ne+Te) error for the shot
@@ -508,8 +509,8 @@ class ProfileStudy(Study):
 
             shot_ids = ds["shot"].values
             n_shots = len(shot_ids)
-            ds_source = ds["ds_source"].values if "ds_source" in ds.coords else np.array([""] * n_shots)
-            case_coords = self._case_coords(case_idx, case)
+            ds_source = ds["ds_source"].values
+            case_coords = self.case_coords(case_idx, case)
 
             for i in range(n_shots):
                 record = {name: per_shot[name][i] for name in data_var_names}

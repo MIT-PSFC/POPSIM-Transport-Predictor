@@ -160,7 +160,7 @@ class DataWorkflow(ABC):
         fit_workers : int
             Number of local processes for in-process GP fitting (serial mode only).
         prepare_workers : int
-            Threads used to stage source data (see _stage_shots). Only raise it
+            Threads used to stage source data (see stage_shots). Only raise it
             for sources that tolerate concurrent reads: MAST reads public S3 and
             does, disruption_py's MDSplus connections do not.
         """
@@ -251,7 +251,7 @@ class DataWorkflow(ABC):
         dispatcher = ClusterFitDispatcher(self.cluster_config, self.ds_name, self.fit_staging_dir)
         dispatcher.clean()
 
-    def _stage_shots(self, target: int) -> tuple[int, dict]:
+    def stage_shots(self, target: int) -> tuple[int, dict]:
         """Stage source data for shots that have no raw file yet, in shotlist order.
 
         Returns (raw files already present, {shot: ShotFitInput}), the two
@@ -333,7 +333,7 @@ class DataWorkflow(ABC):
         self.fit_staging_dir.mkdir(parents=True, exist_ok=True)
 
         target = self.max_num_shots if self.max_num_shots is not None else len(self.shotlist)
-        n_existing, pending = self._stage_shots(target)
+        n_existing, pending = self.stage_shots(target)
 
         logger.info(f"{n_existing} raw files already exist, {len(pending)} shots need GP fitting")
         if not pending:

@@ -1,4 +1,4 @@
-"""Tests for DataWorkflow._stage_shots, the source-staging phase.
+"""Tests for DataWorkflow.stage_shots, the source-staging phase.
 
 Staging is the slow, network-bound half of a distributed dataset build (10.5
 hours for 844 MAST shots serially), so it runs threaded.
@@ -82,7 +82,7 @@ def test_stage_shots_threaded_matches_serial_selection(make_workflow):
     serial = make_workflow(shots, prepare_workers=1)
     threaded = make_workflow(shots, prepare_workers=4)
 
-    assert serial._stage_shots(len(shots)) == threaded._stage_shots(len(shots))
+    assert serial.stage_shots(len(shots)) == threaded.stage_shots(len(shots))
     assert sorted(threaded.calls) == shots
     assert serial.peak_concurrency == 1
 
@@ -91,7 +91,7 @@ def test_stage_shots_runs_concurrently(make_workflow):
     """Staging is latency bound, so the threads must genuinely overlap."""
     workflow = make_workflow(list(range(8)), prepare_workers=4, delay=0.05)
 
-    workflow._stage_shots(8)
+    workflow.stage_shots(8)
 
     assert workflow.peak_concurrency > 1
 
@@ -101,7 +101,7 @@ def test_stage_shots_skips_shots_that_already_have_raw_files(make_workflow):
     for shot in (1, 3):
         (workflow.raw_data_dir / f"{shot}.nc").write_bytes(b"")
 
-    n_existing, pending = workflow._stage_shots(4)
+    n_existing, pending = workflow.stage_shots(4)
 
     assert n_existing == 2
     assert set(pending) == {2, 4}
@@ -113,7 +113,7 @@ def test_stage_shots_stops_at_target_without_over_staging(make_workflow):
     even with several threads in flight."""
     workflow = make_workflow(list(range(20)), prepare_workers=4)
 
-    n_existing, pending = workflow._stage_shots(6)
+    n_existing, pending = workflow.stage_shots(6)
 
     assert n_existing == 0
     assert list(pending) == [0, 1, 2, 3, 4, 5]
@@ -125,7 +125,7 @@ def test_stage_shots_counts_existing_files_toward_target(make_workflow):
     for shot in (0, 1):
         (workflow.raw_data_dir / f"{shot}.nc").write_bytes(b"")
 
-    n_existing, pending = workflow._stage_shots(5)
+    n_existing, pending = workflow.stage_shots(5)
 
     assert n_existing == 2
     assert list(pending) == [2, 3, 4]
@@ -136,7 +136,7 @@ def test_stage_shots_keeps_going_past_invalid_shots(make_workflow):
     the loop has to reach further down the shotlist to fill it."""
     workflow = make_workflow(list(range(10)), prepare_workers=3, bad_shots={1, 2, 5})
 
-    n_existing, pending = workflow._stage_shots(4)
+    n_existing, pending = workflow.stage_shots(4)
 
     assert n_existing == 0
     assert list(pending) == [0, 3, 4, 6]
@@ -146,7 +146,7 @@ def test_stage_shots_survives_a_raising_shot(make_workflow):
     """One shot blowing up must not kill a staging run that may be hours in."""
     workflow = make_workflow(list(range(5)), prepare_workers=2, raising_shots={2})
 
-    n_existing, pending = workflow._stage_shots(5)
+    n_existing, pending = workflow.stage_shots(5)
 
     assert n_existing == 0
     assert list(pending) == [0, 1, 3, 4]
@@ -156,7 +156,7 @@ def test_stage_shots_exhausted_shotlist_returns_what_it_has(make_workflow):
     """Asking for more shots than the shotlist can supply terminates."""
     workflow = make_workflow([1, 2, 3], prepare_workers=2, bad_shots={2})
 
-    n_existing, pending = workflow._stage_shots(10)
+    n_existing, pending = workflow.stage_shots(10)
 
     assert n_existing == 0
     assert list(pending) == [1, 3]

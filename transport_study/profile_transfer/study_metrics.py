@@ -34,9 +34,7 @@ from transport_study.orchestration.organize_data import (
     PROFILE_TARGET_VARS,
     add_missing_profile_companions,
 )
-from transport_study.orchestration.stages import (  # noqa: F401  (re-exported, stage segmentation lives in orchestration.stages)
-    AUX_SIGNIFICANT_MW,
-    FLATTOP_IP_FRACTION,
+from transport_study.orchestration.stages import (
     STAGE_AGG_NAMES,
     segment_stages,
 )
@@ -72,8 +70,6 @@ def load_eval_dataset(device: str) -> xr.Dataset:
             ds[sig] = xr.zeros_like(ds["Ip_MA"])
 
     keep = [*PROFILE_TARGET_VARS, *INPUT_POWER_SIGNALS, "Ip_MA", "time"]
-    if "fresh_profiles" in ds:
-        keep.append("fresh_profiles")
     ds = ds[keep]
 
     ds = ds.interp(rho=RHO_GRID, kwargs={"fill_value": "extrapolate"})
@@ -166,7 +162,7 @@ def compute_case_timeslice_metrics(result_ds: xr.Dataset, loss_config: dict) -> 
     result file does not carry.
     """
     gradient_weight = loss_config.get("gradient_weight", 0.0)
-    within_error_weight = loss_config.get("within_error_weight", ProfilePredictorTRB.WITHIN_ERROR_WEIGHT)
+    within_error_weight = loss_config["within_error_weight"]
 
     rho = result_ds["rho"].values
 
@@ -371,7 +367,7 @@ def collect_metrics(study) -> xr.Dataset:
         case_ds = compute_and_save_case_metrics(study, case)
         if not case_ds.data_vars:
             continue
-        results.append(case_ds.assign_coords(study._case_coords(case_idx, case)))
+        results.append(case_ds.assign_coords(study.case_coords(case_idx, case)))
 
     if not results:
         logger.warning("No finished cases with valid metrics, stage-resolved metrics are empty")

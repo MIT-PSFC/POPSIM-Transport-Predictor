@@ -485,6 +485,143 @@ def _run_loop_jit_with_geo(
     return output_state, post_processed
 
 
+def bound_transport_coefficients(transport_model: str, nn_transport_out: jax.Array) -> dict:
+    """Bound the raw transport-network outputs to physical ranges for the configured model.
+
+    The bounds keep the TORAX solver stable during training for any network output.
+    Keys and order match TRANSPORT_COEFFICIENT_NAMES[transport_model].
+    Shared by the profile and transport predictor TORAX modules.
+    """
+    if transport_model == "constant":
+        # Approximate ranges taken from DIII-D study and TFTR
+        # https://iopscience-iop-org.libproxy.mit.edu/article/10.1088/0029-5515/38/4/301/pdf
+        # https://iopscience-iop-org.libproxy.mit.edu/article/10.1088/0029-5515/39/1/309/pdf
+        #   chi_i: 0.1 - 5 m^2/s
+        #   chi_e: 0.1 - 10 m^2/s
+        #   D_e:   0.1 - 2 m^2/s   (nonzero floor prevents advection-only blowup)
+        #   V_e:   -5 - 5 m/s      (signed pinch)
+        return {
+            "chi_i": 0.1 + 4.9 * jax.nn.sigmoid(nn_transport_out[0:1]),
+            "chi_e": 0.1 + 9.9 * jax.nn.sigmoid(nn_transport_out[1:2]),
+            "D_e": 0.1 + 1.9 * jax.nn.sigmoid(nn_transport_out[2:3]),
+            "V_e": 5.0 * jnp.tanh(nn_transport_out[3:4]),
+        }
+    elif transport_model == "cgm":
+        # Free parameters of the Critical Gradient Model. The critical gradient
+        # itself is computed by TORAX from the evolving state and geometry
+        # (known inputs), only the dimensionless ratios are learned.
+        #   chi_e_i_ratio: 0.2 - 5   (chi_e = chi_i / ratio, ITG turbulence > 1,
+        #                  but spherical tokamaks are electron-transport
+        #                  dominated so the range extends below 0.5)
+        #   chi_D_ratio:   1 - 20    (D_e = chi_i / ratio, must stay positive)
+        #   VR_D_ratio:    -5 - 5    (R0*V_e/D_e, negative peaks the density profile)
+        #   alpha:      1.8 - 2.2   (critical gradient exponent, TORAX default 2)
+        #   chi_stiff:     0.5 - 3   (stiffness parameter, TORAX default 2)
+        return {
+            "chi_e_i_ratio": 0.2 + 4.8 * jax.nn.sigmoid(nn_transport_out[0:1]),
+            "chi_D_ratio": 1.0 + 19.0 * jax.nn.sigmoid(nn_transport_out[1:2]),
+            "VR_D_ratio": 5.0 * jnp.tanh(nn_transport_out[2:3]),
+            "alpha": 1.8 + 0.4 * jax.nn.sigmoid(nn_transport_out[3:4]),
+            "chi_stiff": 0.5 + 2.5 * jax.nn.sigmoid(nn_transport_out[4:5]),
+        }
+    elif transport_model == "gyrobohm":
+        # Free parameters of the Bohm-GyroBohm model. The Bohm and GyroBohm
+        # chi terms are computed by TORAX from the evolving state and geometry,
+        # the NN learns one log-scale multiplier per term, applied to both
+        # species, since the model already fixes the ion/electron split
+        # (chi_i_B = 2 * chi_e_B, chi_i_gB = 0.5 * chi_e_gB). The coeff prefactors stay at the TORAX defaults (8e-5, 5e-6).
+        #   chi_bohm_multiplier and chi_gyrobohm_multiplier:
+        #     exp(-3) - exp(3), ~0.05 - 20, log-uniform around 1
+        #   D_face_c1: 0.01 - 5  (diffusivity weighting at the axis, TORAX default 1.0)
+        #   D_face_c2: 0.01 - 5  (diffusivity weighting at the edge, TORAX default 0.3)
+        #   V_face_coeff: -4 - 2 (convectivity / diffusivity ratio, TORAX default -0.1).
+        #     The sigmoid bias puts a random init at the TORAX default
+        return {
+            "chi_bohm_multiplier": jnp.exp(3.0 * jnp.tanh(nn_transport_out[0:1])),
+            "chi_gyrobohm_multiplier": jnp.exp(3.0 * jnp.tanh(nn_transport_out[1:2])),
+            "D_face_c1": 0.01 + 4.99 * jax.nn.sigmoid(nn_transport_out[2:3]),
+            "D_face_c2": 0.01 + 4.99 * jax.nn.sigmoid(nn_transport_out[3:4]),
+            "V_face_coeff": 2.0 - 6.0 * jax.nn.sigmoid(nn_transport_out[4:5] - 0.62),
+        }
+    else:  # qlknn
+        # Free parameters of the QLKNN surrogate. TORAX computes ITG/TEM/ETG
+        # fluxes from the evolving state via the qlknn_7_11_v1 network, the NN
+        # learns three scalar correction knobs, each a log-scale multiplier
+        # centered on its TORAX default so a zero-mean random init starts at
+        # stock QLKNN behavior.
+        # MAST sitsoutside the QuaLiKiz training domain (clip_inputs saturates),
+        # so the knobs need more authority to compensate.
+        #   ITG_flux_ratio_correction: ~0.08 - 12 around 1, multiplies the
+        #     ITG electron heat flux (QLKNN10D heritage value 2.0 in range)
+        #   ETG_correction_factor: ~0.03 - 4 around the default 1/3,
+        #     multiplies the ETG electron heat flux
+        #   collisionality_multiplier: ~0.08 - 12 around 1, scales the
+        #     collisionality input (QLKNN10D heritage value 0.25 in range)
+        return {
+            "ITG_flux_ratio_correction": jnp.exp(2.5 * jnp.tanh(nn_transport_out[0:1])),
+            "ETG_correction_factor": (1.0 / 3.0) * jnp.exp(2.5 * jnp.tanh(nn_transport_out[1:2])),
+            "collisionality_multiplier": jnp.exp(2.5 * jnp.tanh(nn_transport_out[2:3])),
+        }
+
+
+def transport_provider_mapping(transport_model: str, coeffs: dict) -> dict:
+    """Runtime-params override entries for the configured transport model.
+
+    Shared by the profile and transport predictor TORAX modules.
+    """
+
+    def scalar(name: str) -> torax_experimental.TimeVaryingScalarUpdate:
+        return torax_experimental.TimeVaryingScalarUpdate(value=coeffs[name])
+
+    if transport_model == "constant":
+        # chi_i etc. are radial profiles (TimeVaryingArray) in the constant
+        # model: broadcast the NN scalar to a flat profile
+        rho = jnp.array([1.0])
+
+        def flat_profile(name: str) -> torax_experimental.TimeVaryingArrayUpdate:
+            return torax_experimental.TimeVaryingArrayUpdate(
+                value=jnp.broadcast_to(coeffs[name][:, jnp.newaxis], (1, 1)),
+                rho_norm=rho,
+            )
+
+        return {
+            "transport_model.chi_i": flat_profile("chi_i"),
+            "transport_model.chi_e": flat_profile("chi_e"),
+            "transport_model.D_e": flat_profile("D_e"),
+            "transport_model.V_e": flat_profile("V_e"),
+        }
+    elif transport_model == "cgm":
+        return {
+            "transport_model.chi_e_i_ratio": scalar("chi_e_i_ratio"),
+            "transport_model.chi_D_ratio": scalar("chi_D_ratio"),
+            "transport_model.VR_D_ratio": scalar("VR_D_ratio"),
+            # Plain float leaves in the provider: replaced with traced scalars
+            # directly rather than via TimeVaryingScalarUpdate
+            "transport_model.alpha": jnp.squeeze(coeffs["alpha"]),
+            "transport_model.chi_stiff": jnp.squeeze(coeffs["chi_stiff"]),
+        }
+    elif transport_model == "gyrobohm":
+        # Same NN multiplier applied to both species: the BgB model already
+        # fixes chi_i_B = 2 * chi_e_B and chi_i_gB = 0.5 * chi_e_gB
+        return {
+            "transport_model.chi_e_bohm_multiplier": scalar("chi_bohm_multiplier"),
+            "transport_model.chi_i_bohm_multiplier": scalar("chi_bohm_multiplier"),
+            "transport_model.chi_e_gyrobohm_multiplier": scalar("chi_gyrobohm_multiplier"),
+            "transport_model.chi_i_gyrobohm_multiplier": scalar("chi_gyrobohm_multiplier"),
+            "transport_model.D_face_c1": scalar("D_face_c1"),
+            "transport_model.D_face_c2": scalar("D_face_c2"),
+            "transport_model.V_face_coeff": scalar("V_face_coeff"),
+        }
+    else:  # qlknn
+        # Plain float leaves in the provider (like cgm alpha and chi_stiff):
+        # replaced with traced scalars directly
+        return {
+            "transport_model.ITG_flux_ratio_correction": jnp.squeeze(coeffs["ITG_flux_ratio_correction"]),
+            "transport_model.ETG_correction_factor": jnp.squeeze(coeffs["ETG_correction_factor"]),
+            "transport_model.collisionality_multiplier": jnp.squeeze(coeffs["collisionality_multiplier"]),
+        }
+
+
 class ProfilePredictorTorax(TimeIndepModule):
     rhogrid: tuple = eqx.field(static=True)
     # Which TORAX transport model the transport network parameterizes:
@@ -602,84 +739,11 @@ class ProfilePredictorTorax(TimeIndepModule):
             )
         return inputs
 
-    def _transport_coefficients(self, nn_transport_out: jax.Array) -> dict:
-        """Bound the raw transport-network outputs to physical ranges for the configured model.
+    def transport_coefficients(self, nn_transport_out: jax.Array) -> dict:
+        """Bound the raw transport-network outputs to physical ranges, see bound_transport_coefficients."""
+        return bound_transport_coefficients(self.transport_model, nn_transport_out)
 
-        The bounds keep the TORAX solver stable during training for any network output.
-        Keys and order match TRANSPORT_COEFFICIENT_NAMES[self.transport_model].
-        """
-        if self.transport_model == "constant":
-            # Approximate ranges taken from DIII-D study and TFTR
-            # https://iopscience-iop-org.libproxy.mit.edu/article/10.1088/0029-5515/38/4/301/pdf
-            # https://iopscience-iop-org.libproxy.mit.edu/article/10.1088/0029-5515/39/1/309/pdf
-            #   chi_i: 0.1 - 5 m^2/s
-            #   chi_e: 0.1 - 10 m^2/s
-            #   D_e:   0.1 - 2 m^2/s   (nonzero floor prevents advection-only blowup)
-            #   V_e:   -5 - 5 m/s      (signed pinch)
-            return {
-                "chi_i": 0.1 + 4.9 * jax.nn.sigmoid(nn_transport_out[0:1]),
-                "chi_e": 0.1 + 9.9 * jax.nn.sigmoid(nn_transport_out[1:2]),
-                "D_e": 0.1 + 1.9 * jax.nn.sigmoid(nn_transport_out[2:3]),
-                "V_e": 5.0 * jnp.tanh(nn_transport_out[3:4]),
-            }
-        elif self.transport_model == "cgm":
-            # Free parameters of the Critical Gradient Model. The critical gradient
-            # itself is computed by TORAX from the evolving state and geometry
-            # (known inputs), only the dimensionless ratios are learned.
-            #   chi_e_i_ratio: 0.2 - 5   (chi_e = chi_i / ratio, ITG turbulence > 1,
-            #                  but spherical tokamaks are electron-transport
-            #                  dominated so the range extends below 0.5)
-            #   chi_D_ratio:   1 - 20    (D_e = chi_i / ratio, must stay positive)
-            #   VR_D_ratio:    -5 - 5    (R0*V_e/D_e, negative peaks the density profile)
-            #   alpha:      1.8 - 2.2   (critical gradient exponent, TORAX default 2)
-            #   chi_stiff:     0.5 - 3   (stiffness parameter, TORAX default 2)
-            return {
-                "chi_e_i_ratio": 0.2 + 4.8 * jax.nn.sigmoid(nn_transport_out[0:1]),
-                "chi_D_ratio": 1.0 + 19.0 * jax.nn.sigmoid(nn_transport_out[1:2]),
-                "VR_D_ratio": 5.0 * jnp.tanh(nn_transport_out[2:3]),
-                "alpha": 1.8 + 0.4 * jax.nn.sigmoid(nn_transport_out[3:4]),
-                "chi_stiff": 0.5 + 2.5 * jax.nn.sigmoid(nn_transport_out[4:5]),
-            }
-        elif self.transport_model == "gyrobohm":
-            # Free parameters of the Bohm-GyroBohm model. The Bohm and GyroBohm
-            # chi terms are computed by TORAX from the evolving state and geometry,
-            # the NN learns one log-scale multiplier per term, applied to both
-            # species, since the model already fixes the ion/electron split
-            # (chi_i_B = 2 * chi_e_B, chi_i_gB = 0.5 * chi_e_gB). The coeff prefactors stay at the TORAX defaults (8e-5, 5e-6).
-            #   chi_bohm_multiplier and chi_gyrobohm_multiplier:
-            #     exp(-3) - exp(3), ~0.05 - 20, log-uniform around 1
-            #   D_face_c1: 0.01 - 5  (diffusivity weighting at the axis, TORAX default 1.0)
-            #   D_face_c2: 0.01 - 5  (diffusivity weighting at the edge, TORAX default 0.3)
-            #   V_face_coeff: -4 - 2 (convectivity / diffusivity ratio, TORAX default -0.1).
-            #     The sigmoid bias puts a random init at the TORAX default
-            return {
-                "chi_bohm_multiplier": jnp.exp(3.0 * jnp.tanh(nn_transport_out[0:1])),
-                "chi_gyrobohm_multiplier": jnp.exp(3.0 * jnp.tanh(nn_transport_out[1:2])),
-                "D_face_c1": 0.01 + 4.99 * jax.nn.sigmoid(nn_transport_out[2:3]),
-                "D_face_c2": 0.01 + 4.99 * jax.nn.sigmoid(nn_transport_out[3:4]),
-                "V_face_coeff": 2.0 - 6.0 * jax.nn.sigmoid(nn_transport_out[4:5] - 0.62),
-            }
-        else:  # qlknn
-            # Free parameters of the QLKNN surrogate. TORAX computes ITG/TEM/ETG
-            # fluxes from the evolving state via the qlknn_7_11_v1 network, the NN
-            # learns three scalar correction knobs, each a log-scale multiplier
-            # centered on its TORAX default so a zero-mean random init starts at
-            # stock QLKNN behavior.
-            # MAST sitsoutside the QuaLiKiz training domain (clip_inputs saturates),
-            # so the knobs need more authority to compensate.
-            #   ITG_flux_ratio_correction: ~0.08 - 12 around 1, multiplies the
-            #     ITG electron heat flux (QLKNN10D heritage value 2.0 in range)
-            #   ETG_correction_factor: ~0.03 - 4 around the default 1/3,
-            #     multiplies the ETG electron heat flux
-            #   collisionality_multiplier: ~0.08 - 12 around 1, scales the
-            #     collisionality input (QLKNN10D heritage value 0.25 in range)
-            return {
-                "ITG_flux_ratio_correction": jnp.exp(2.5 * jnp.tanh(nn_transport_out[0:1])),
-                "ETG_correction_factor": (1.0 / 3.0) * jnp.exp(2.5 * jnp.tanh(nn_transport_out[1:2])),
-                "collisionality_multiplier": jnp.exp(2.5 * jnp.tanh(nn_transport_out[2:3])),
-            }
-
-    def _nn_coefficients(self, inputs: Inputs, debug: bool = False) -> dict:
+    def nn_coefficients(self, inputs: Inputs, debug: bool = False) -> dict:
         # Get the transport model free parameters and the particle / heat
         # sources from neural networks, bounded to physical ranges so the
         # TORAX solver stays stable during training.
@@ -699,7 +763,7 @@ class ProfilePredictorTorax(TimeIndepModule):
         #   gaussian_width: 0.02 - 0.4 (deposition width in rho_norm)
         #   electron_heat_fraction: 0.2 - 0.95 (amount of aux heating going to electrons)
         nn_inputs = self.normalizer(inputs.nn_inputs, inputs.ds_source_idx)
-        coeffs = self._transport_coefficients(self.nn_transport(nn_inputs))
+        coeffs = self.transport_coefficients(self.nn_transport(nn_inputs))
         nn_sources_out = self.nn_sources(nn_inputs)
         # Particle inventory in 1e21 electrons: ne20_line_avg * volume * 0.1
         inventory = 0.1 * inputs.ne20_line_avg * inputs.volume_approx
@@ -743,61 +807,7 @@ class ProfilePredictorTorax(TimeIndepModule):
             jax.debug.print("[nn] " + fmt + " nn_in={nn_in}", nn_in=nn_inputs, **coeffs)
         return coeffs
 
-    def _transport_provider_mapping(self, coeffs: dict) -> dict:
-        """Runtime-params override entries for the configured transport model."""
-
-        def scalar(name: str) -> torax_experimental.TimeVaryingScalarUpdate:
-            return torax_experimental.TimeVaryingScalarUpdate(value=coeffs[name])
-
-        if self.transport_model == "constant":
-            # chi_i etc. are radial profiles (TimeVaryingArray) in the constant
-            # model: broadcast the NN scalar to a flat profile
-            rho = jnp.array([1.0])
-
-            def flat_profile(name: str) -> torax_experimental.TimeVaryingArrayUpdate:
-                return torax_experimental.TimeVaryingArrayUpdate(
-                    value=jnp.broadcast_to(coeffs[name][:, jnp.newaxis], (1, 1)),
-                    rho_norm=rho,
-                )
-
-            return {
-                "transport_model.chi_i": flat_profile("chi_i"),
-                "transport_model.chi_e": flat_profile("chi_e"),
-                "transport_model.D_e": flat_profile("D_e"),
-                "transport_model.V_e": flat_profile("V_e"),
-            }
-        elif self.transport_model == "cgm":
-            return {
-                "transport_model.chi_e_i_ratio": scalar("chi_e_i_ratio"),
-                "transport_model.chi_D_ratio": scalar("chi_D_ratio"),
-                "transport_model.VR_D_ratio": scalar("VR_D_ratio"),
-                # Plain float leaves in the provider: replaced with traced scalars
-                # directly rather than via TimeVaryingScalarUpdate
-                "transport_model.alpha": jnp.squeeze(coeffs["alpha"]),
-                "transport_model.chi_stiff": jnp.squeeze(coeffs["chi_stiff"]),
-            }
-        elif self.transport_model == "gyrobohm":
-            # Same NN multiplier applied to both species: the BgB model already
-            # fixes chi_i_B = 2 * chi_e_B and chi_i_gB = 0.5 * chi_e_gB
-            return {
-                "transport_model.chi_e_bohm_multiplier": scalar("chi_bohm_multiplier"),
-                "transport_model.chi_i_bohm_multiplier": scalar("chi_bohm_multiplier"),
-                "transport_model.chi_e_gyrobohm_multiplier": scalar("chi_gyrobohm_multiplier"),
-                "transport_model.chi_i_gyrobohm_multiplier": scalar("chi_gyrobohm_multiplier"),
-                "transport_model.D_face_c1": scalar("D_face_c1"),
-                "transport_model.D_face_c2": scalar("D_face_c2"),
-                "transport_model.V_face_coeff": scalar("V_face_coeff"),
-            }
-        else:  # qlknn
-            # Plain float leaves in the provider (like cgm alpha and chi_stiff):
-            # replaced with traced scalars directly
-            return {
-                "transport_model.ITG_flux_ratio_correction": jnp.squeeze(coeffs["ITG_flux_ratio_correction"]),
-                "transport_model.ETG_correction_factor": jnp.squeeze(coeffs["ETG_correction_factor"]),
-                "transport_model.collisionality_multiplier": jnp.squeeze(coeffs["collisionality_multiplier"]),
-            }
-
-    def _build_provider_and_geo(self, inputs: Inputs, coeffs: dict):
+    def build_provider_and_geo(self, inputs: Inputs, coeffs: dict):
         S_total = coeffs["S_total"]
         ne_right_bc = coeffs["n_e_right_bc"]
         te_right_bc = coeffs["T_e_right_bc"]
@@ -864,7 +874,7 @@ class ProfilePredictorTorax(TimeIndepModule):
             "sources.generic_heat.gaussian_width": gaussian_width_update,
             "sources.generic_heat.electron_heat_fraction": electron_heat_fraction_update,
         }
-        mapping.update(self._transport_provider_mapping(coeffs))
+        mapping.update(transport_provider_mapping(self.transport_model, coeffs))
         new_provider = self.step_fn.runtime_params_provider.update_provider_from_mapping(mapping)
 
         # Build JAX-differentiable geometry from per-sample inputs
@@ -907,8 +917,8 @@ class ProfilePredictorTorax(TimeIndepModule):
 
     def __call__(self, inputs: Inputs | xr.Dataset, debug: bool = False) -> Outputs:
         inputs = self._coerce_inputs(inputs)
-        coeffs = self._nn_coefficients(inputs, debug=debug)
-        new_provider, geo_provider = self._build_provider_and_geo(inputs, coeffs)
+        coeffs = self.nn_coefficients(inputs, debug=debug)
+        new_provider, geo_provider = self.build_provider_and_geo(inputs, coeffs)
 
         # Get initial state and run simulation
         initial_state, initial_post = torax_experimental.get_initial_state_and_post_processed_outputs(
@@ -1007,7 +1017,7 @@ class ProfilePredictorTorax(TimeIndepModule):
                 coeffs: the transport/source coefficients actually used, as floats.
         """
         inputs = self._coerce_inputs(inputs)
-        coeffs = self._nn_coefficients(inputs)
+        coeffs = self.nn_coefficients(inputs)
         if prescribed is not None:
             unknown = set(prescribed) - set(coeffs)
             if unknown:
@@ -1017,7 +1027,7 @@ class ProfilePredictorTorax(TimeIndepModule):
                     # Match the NN output dtype exactly: a weakly-typed scalar would get
                     # demoted to float32 inside TORAX and fail its float64 checks
                     coeffs[name] = jnp.full_like(coeffs[name], float(value))
-        new_provider, geo_provider = self._build_provider_and_geo(inputs, coeffs)
+        new_provider, geo_provider = self.build_provider_and_geo(inputs, coeffs)
 
         state, post = torax_experimental.get_initial_state_and_post_processed_outputs(
             step_fn=self.step_fn,

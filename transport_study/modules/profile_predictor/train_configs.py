@@ -141,7 +141,7 @@ TORAX_CONFIG_BASE: dict[str, Any] = {
         "n_e_right_bc": 0.5e20,  # [m^-3] Predicted by NN
         # Placeholder initial profiles; overridden per sample with
         # parabolic inits scaled to te_approx / ne20_line_avg and
-        # continuous with the NN edge BCs (see _build_provider_and_geo)
+        # continuous with the NN edge BCs (see build_provider_and_geo)
         "T_i": {0: {0: 0.3, 1: 0.2}},
         "T_e": {0: {0: 0.3, 1: 0.2}},
         "n_e": {0: {0: 1e20, 1: 0.5e20}},

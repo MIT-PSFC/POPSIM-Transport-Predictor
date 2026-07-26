@@ -79,8 +79,7 @@ RELAUNCH_GRACE_S = 180
 # the schedule by a step budget instead of a fixed factor: keep lr x total_steps
 # at roughly lr0 x max_epochs, so a step-starved finetune (batch_size larger
 # than the finetune dataset, 1 optimizer step per epoch) runs at the full tuned
-# LR while a step-rich one cools toward this floor (the previous fixed transfer
-# factor, so no case ever finetunes colder than the old behavior). See _scale_transfer_lr
+# LR while a step-rich one cools toward this floor. See _scale_transfer_lr
 TRANSFER_LR_FLOOR = 0.1
 
 # A training job is considered stuck once it has run at least this long with no progress (e.g. OpenBLAS or XLA compile-pool deadlocks)
@@ -343,7 +342,7 @@ class Study:
             """[hyperparam case, model-type prereqs, transfer pretrain case], deduped in order."""
             prereqs = []
             if not self.is_hyperparam_case():
-                prereqs.append(self._replace(**self._hyperparam_field_values()))
+                prereqs.append(self.replace(**self._hyperparam_field_values()))
             prereqs.extend(self._model_type_prereqs())
             if self.domain_adaptation == "transfer":
                 prereqs.append(self.transfer_pretrain_case())
@@ -373,10 +372,10 @@ class Study:
             transfer cases share one twin at HYPERPARAM_TARGET_SHOTS.
             """
             if self._normalization_method() in STAT_NORMALIZATIONS:
-                return self._replace(domain_adaptation="transfer_pretrain")
-            return self._replace(domain_adaptation="transfer_pretrain", num_target_shots=HYPERPARAM_TARGET_SHOTS)
+                return self.replace(domain_adaptation="transfer_pretrain")
+            return self.replace(domain_adaptation="transfer_pretrain", num_target_shots=HYPERPARAM_TARGET_SHOTS)
 
-        def _replace(self, **changes) -> Study.Case:
+        def replace(self, **changes) -> Study.Case:
             """Rebuild through the real constructor with some fields changed, so validation and prereqs stay consistent."""
             kwargs = {f.name: getattr(self, f.name) for f in fields(self) if f.name != "prereqs"}
             kwargs.update(changes)
@@ -395,7 +394,7 @@ class Study:
         def get_hyperparam_prereq(self) -> Study.Case:
             if self.is_hyperparam_case():
                 return self
-            return self._replace(**self._hyperparam_field_values())
+            return self.replace(**self._hyperparam_field_values())
 
         def is_impossible(self) -> bool:
             """Some cases don't make sense to run. Mark those cases as impossible and raise an error if we try to run them."""
@@ -588,7 +587,7 @@ class Study:
     #############
     # EXECUTION #
     #############
-    def _make_weighted_device_weights(self, case: Case) -> dict[str, float]:
+    def make_weighted_device_weights(self, case: Case) -> dict[str, float]:
         """Loss weights per device for weighted domain adaptation.
 
         Mirrors the actual training-set composition of get_train_test_datasets:
@@ -701,7 +700,7 @@ class Study:
         exponential_decay clamps to a constant) so the whole step budget is
         spent at working LR - best-checkpoint selection and early stopping
         already guard against overshoot. Yes I know this is cheating since
-        in a live case you woudln't know when to stop, but it's a fair
+        in a live case you wouldn't know when to stop, but it's a fair
         comparison to the other cases which also use early stopping.
 
         Applied after the tuned-config merge so the swept optimizer_config
@@ -742,7 +741,7 @@ class Study:
             # loss is weighted consistently with training.
             # "addition" adds the same target shots but as normal samples,
             # so it deliberately gets no device_weights entry
-            loss_config["device_weights"] = self._make_weighted_device_weights(case)
+            loss_config["device_weights"] = self.make_weighted_device_weights(case)
 
         # Weighted / addition with no target shots runs to max_epochs, early stopping disabled
         patience = None if case.domain_adaptation in ("weighted", "addition") and case.num_target_shots == 0 else config.patience
@@ -872,7 +871,7 @@ class Study:
         """
         return self.train_job_name(case) in running_job_names
 
-    def _kill_stuck_jobs(self, cases: list[Case]):
+    def kill_stuck_jobs(self, cases: list[Case]):
         """Kill training jobs that are running but making no checkpoint progress.
 
         A job counts as deadlocked once it has run at least WATCHDOG_MIN_AGE_S
@@ -999,7 +998,7 @@ class Study:
                     logger.warning("Could not query SLURM job state, waiting before trying again...")
                     time.sleep(ORCHESTRATION_POLL_INTERVAL_S)
                     continue
-                self._kill_stuck_jobs(unfinished)
+                self.kill_stuck_jobs(unfinished)
                 self._kill_stuck_agents(unfinished)
                 self._kill_long_pending_jobs(unfinished)
             else:
@@ -1397,7 +1396,7 @@ class Study:
     # Coords describing which case a record belongs to, set per subclass
     _CASE_COORD_NAMES: ClassVar[tuple[str, ...]] = ()
 
-    def _case_coords(self, case_idx: int, case: Case) -> dict:
+    def case_coords(self, case_idx: int, case: Case) -> dict:
         """Build the per-case coordinate values for collect_results."""
         coords = {}
         for name in self._CASE_COORD_NAMES:
@@ -1413,8 +1412,36 @@ class Study:
         return coords
 
     def collect_results(self) -> xr.Dataset:
-        """Collect every finished case's results into one dataset (schema is study-specific)."""
-        raise NotImplementedError
+        """Collect scalar summary statistics per case (one row per case).
+
+        Default implementation for the scalar-summary studies (power balance,
+        transport); the profile study overrides with a per-shot long form.
+
+        Dims: case_idx
+        Coords (along case_idx): the _CASE_COORD_NAMES fields of each case
+        Data variables (along case_idx): err_E_D_S where E is 'abs' or 'rel', D is
+        'shot' (time-integrated per shot) or 'ts' (per timeslice), and S is one of
+        mean, std, med, p25, p75, min, max. E.g. err_abs_shot_mean, err_rel_ts_p75.
+        """
+        results = []
+        for case_idx, case in enumerate(self.cases):
+            result_path = self.result_path(case)
+            if not result_path.exists():
+                continue
+
+            ds = xr.load_dataset(result_path)
+
+            result = self._summarize_case_errors(ds).assign_coords(self.case_coords(case_idx, case))
+            results.append(result)
+
+        if not results:
+            logger.warning("No case results found to collect!")
+            return xr.Dataset()
+
+        # coords="different" stacks the per-case scalar coords along case_idx.
+        # compat pinned explicitly, the xarray default is changing to
+        # "override" which is incompatible with coords="different"
+        return xr.concat(results, dim="case_idx", coords="different", compat="equals")
 
     def _run_analysis(self, enable_parallelism: bool) -> None:
         """Post-orchestration analysis and plotting (study-specific)."""

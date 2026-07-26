@@ -170,5 +170,4 @@ def generate_case_report(study, case, figure_dir: Path):
         logger.warning(f"No valid test timeslices for case {case}, skipping case report")
         return
 
-    page_fn = _shot_page if "rho" in result_ds.dims else None
-    best_worst_pdf(result_ds, ts_metrics, case_dir / "best_worst_shots.pdf", page_fn=page_fn)
+    best_worst_pdf(result_ds, ts_metrics, case_dir / "best_worst_shots.pdf", page_fn=_shot_page)
