@@ -58,8 +58,16 @@ MIN_PROFILE = 1e-3
 TE_SEED_FLOOR_KEV = 0.05
 NE_SEED_FLOOR_20 = 0.02
 
-# Floor on the stored energy when used as a denominator or feature scale
-MIN_W_MJ = 1e-3
+# Floor on the stored energy when used as a denominator or feature scale.
+# Raised 1e-3 -> 3e-3 (2026-07-26): paux_norm divides an external input by this
+# denominator, so a near-empty plasma turns a normal beam power into an
+# out-of-distribution feature. The old 1e-3 was the 0.19th percentile of the
+# state-implied Wtot over cmod + mast, i.e. it floored almost nothing, and the
+# raw dataset minimum is lower still (4.5e-4, a MAST initiation slice) so the
+# measured minimum is not a usable floor. 3e-3 clips the bottom 2% of
+# timeslices, sits below C-Mod's 0.1th percentile (3.2e-3) so it is
+# effectively MAST-initiation only, and caps the paux_norm tail 3x.
+MIN_W_MJ = 3e-3
 
 # The 10 profile predictor feature slots plus one aux power feature
 N_TRANSPORT_NN_INPUTS = N_NN_INPUTS + 1
@@ -187,10 +195,22 @@ class Inputs:
         # The 10 profile predictor feature slots in the same order, with every
         # beta-derived entry computed from the state Wtot instead of a measured
         # betan, plus a dimensionless aux power feature: P_aux over the
-        # Wtot / TAU_REF_S power scale. No log on the power feature so
-        # P_aux = 0 ohmic phases stay finite.
+        # Wtot / TAU_REF_S power scale, log1p compressed.
+        #
+        # Every other slot is a ratio of co-varying measured quantities and so
+        # stays bounded. This one divides an INDEPENDENT external input by the
+        # evolving state, and the state legitimately approaches zero at plasma
+        # initiation while the beam is already on, so nothing co-varies to keep
+        # it finite. Left raw it reached 57-78 against a healthy median of 5.7
+        # on MAST initiation segments, which railed the gyrobohm chi multiplier
+        # at its exp(3) bound and drove the TORAX solve non-finite on the first
+        # step (2026-07-26 attribution probe, see MIN_W_MJ).
+        #
+        # log1p rather than safe_log: it compresses the tail while keeping the
+        # P_aux = 0 ohmic phases finite AND at exactly 0, which was the reason
+        # the slot originally carried no log at all.
         W_safe = jnp.maximum(Wtot_MJ, MIN_W_MJ)
-        paux_norm = TAU_REF_S * self.P_aux_MW / W_safe
+        paux_norm = jnp.log1p(TAU_REF_S * self.P_aux_MW / W_safe)
         inp_array = jnp.array(
             [
                 self.beta_from_wtot(W_safe),

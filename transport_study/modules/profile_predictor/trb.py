@@ -113,9 +113,15 @@ class ProfilePredictorTRB(TrainRunBuilder):
         # ill-conditioned and the restored stats, fitted on historic + target
         # shots by the transfer_pretrain prereq case, are the correct ones).
         # transfer_pretrain dataloaders carry that combined fit dataset as an
-        # attribute (see get_dataloaders)
+        # attribute (see get_dataloaders).
+        # skip_data_init is the same escape hatch for a caller building this
+        # module as a submodule skeleton on a dataset that cannot support the
+        # data-driven init at all - the transport study's sciml model type builds
+        # one on its own dataloader, which carries neither a measured betan nor
+        # the profile shape variables (see transport_predictor/trb.py)
         n_devices = len(config.ds_source_to_idx)
-        if model_init_config.get("transfer_checkpoint"):
+        skip_data_init = model_init_config.get("skip_data_init", False)
+        if model_init_config.get("transfer_checkpoint") or skip_data_init:
             fit_ds = None
         else:
             fit_ds = getattr(train_dl, "normalizer_fit_ds", train_dl.ds)
@@ -146,7 +152,9 @@ class ProfilePredictorTRB(TrainRunBuilder):
             # PCA/K-means initial guess for the shapes.
             # Skipped when restoring from a transfer checkpoint, which overwrites the
             # shapes anyway and whose fine-tune dataset may have fewer samples than shapes.
-            if not model_init_config.get("transfer_checkpoint", False):
+            # Also skipped for a restore-bound submodule skeleton (skip_data_init),
+            # whose dataloader need not carry the shape variables at all.
+            if not model_init_config.get("transfer_checkpoint", False) and not skip_data_init:
                 ds = train_dl.ds
                 sample_dim = train_dl.dataset.training_metadata.sample_dim
 

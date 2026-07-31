@@ -434,6 +434,15 @@ class TransportStudy(Study):
             # validation loss only. Read by both the transport loss and the
             # profile submodule cases
             "within_error_weight": 0.01,
+            # Charged per diverged (non-finite) timeslice, in BOTH the training
+            # and validation loss. Typical converged losses here are ~5e-3, so
+            # at 10.0 even one diverged timeslice in a thousand adds ~1e-2 and
+            # dominates the metric - a diverged trial can no longer win the
+            # sweep, which it previously could (see TransportPredictorTRB).
+            # Sized to be unambiguous rather than finely tuned; lower it only
+            # with a reason, since the whole point is that it swamps ordinary
+            # loss differences
+            "divergence_penalty": 10.0,
             # Anchor terms keeping the sciml submodule predictions close to
             # the measured signals while the whole module trains on the
             # profiles: the power balance's Wtot plus its own p_oh/p_rad

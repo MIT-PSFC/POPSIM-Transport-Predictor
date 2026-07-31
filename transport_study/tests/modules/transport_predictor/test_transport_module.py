@@ -615,8 +615,10 @@ def test_normalizer_fit_features():
         matrix[row],
         rtol=1e-6,
     )
-    # The aux power slot is the dimensionless TAU_REF_S * P_aux / Wtot scale
-    expected_paux_norm = TAU_REF_S * columns["P_aux_MW"] / np.maximum(columns["Wtot_MJ"], MIN_W_MJ)
+    # The aux power slot is the dimensionless TAU_REF_S * P_aux / Wtot scale,
+    # log1p compressed so a near-zero stored energy cannot send it out of
+    # distribution (P_aux = 0 still maps to exactly 0)
+    expected_paux_norm = np.log1p(TAU_REF_S * columns["P_aux_MW"] / np.maximum(columns["Wtot_MJ"], MIN_W_MJ))
     np.testing.assert_allclose(matrix[:, -1], expected_paux_norm, rtol=1e-6, equal_nan=True)
 
     # Rows with a NaN device index are dropped before fitting

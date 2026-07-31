@@ -205,10 +205,19 @@ TORAX_CONFIG_BASE: dict[str, Any] = {
         "generic_current": {},
     },
     "solver": {
-        # Gradient-dependent transport (CGM is stiff, BgB chi depends on the
-        # evolving gradients); the Pereverzev-Corrigan terms keep the linear
-        # theta solver stable at large fixed steps. Harmless for the
-        # constant model.
+        # INERT with the solver this config selects. TORAX only applies the
+        # Pereverzev-Corrigan terms in the NONLINEAR (Newton-Raphson) solver,
+        # to build its optional initial guess from a linear solve - see the
+        # use_pereverzev docstring in torax._src.solver.pydantic_model. No
+        # solver_type is set here, so this is a bare LinearThetaMethod and the
+        # flag does nothing: every chi_face_*_pereverzev / d_face_el_pereverzev
+        # / v_face_el_pereverzev term measured out as identically zero on both
+        # healthy and diverging samples (2026-07-26 trace probe).
+        # Kept True only so the intent survives if the solver is ever switched
+        # to newton_raphson, which is what it would take to actually get the
+        # stabilization the gradient-dependent models (stiff CGM, BgB chi
+        # driven by the evolving gradients) would otherwise want at large
+        # fixed steps. Do NOT rely on this flag for stability as written.
         "use_pereverzev": True,
         "use_predictor_corrector": True,
         # Picard iterations run n_corrector_steps + 1 times with no early exit.

@@ -81,7 +81,19 @@ class TransportPredictorTRB(TrainRunBuilder):
                 pb_config = _submodule_config_dict(model_init_config["submodules"]["power_balance"])
                 prof_config = _submodule_config_dict(model_init_config["submodules"]["profile_predictor"])
                 pb_env = PowerBalanceTRB.model_init(train_dl, pb_config["model_init_config"])
-                profile_module = ProfilePredictorTRB.model_init(train_dl, prof_config["model_init_config"])
+                # The profile TRB derives two things from its dataloader that this
+                # study's cannot supply: the normalizer stats over the 10 nn_inputs
+                # (one is a measured betan the transport modules deliberately do
+                # without, deriving beta from the evolving stored-energy state -
+                # see Inputs.betan_from_wtot and REQUIRED_SIGNALS_TRANSPORT_TRANSFER)
+                # and the PCA / k-means shape guess (needs Te_shape / ne_shape,
+                # which the transport dataloader does not carry). Both are moot
+                # here: this is only a skeleton, and restore_submodules below
+                # overwrites every leaf with the profile prereq case's trained
+                # weights, fitted on the profile study's own dataset - the feature
+                # space this submodule actually consumes at runtime
+                prof_init_config = {**prof_config["model_init_config"], "skip_data_init": True}
+                profile_module = ProfilePredictorTRB.model_init(train_dl, prof_init_config)
                 if model_init_config["restore_submodules"]:
                     pb_manager = create_default_checkpoint_manager(pb_config["checkpoint_dir"])
                     pb_env = restore_model(pb_manager, pb_env)
@@ -269,8 +281,23 @@ class TransportPredictorTRB(TrainRunBuilder):
             ne_sigma = _sigma_from_targ(targ, "ne20_rho_error", ne_scale)
             te_sigma = _sigma_from_targ(targ, "Te_keV_rho_error", te_scale)
 
-            ne_err = value_err(_residual(pred.ne / ne_scale, ne_targ / ne_scale, ne_sigma))
-            te_err = value_err(_residual(pred.te / te_scale, te_targ / te_scale, te_sigma))
+            # A diverged rollout is a failure of the model, not a missing
+            # measurement, so it is charged instead of being allowed through as
+            # NaN. Sanitize BEFORE the arithmetic: a single jnp.where after the
+            # fact still drags NaN through the backward pass, because reverse
+            # mode differentiates the discarded branch too. Replacing the bad
+            # values with the target makes the residual exactly 0 there, so the
+            # only thing those timeslices contribute is the explicit penalty
+            # term below.
+            ne_finite = jnp.isfinite(pred.ne)
+            te_finite = jnp.isfinite(pred.te)
+            ne_pred = jnp.where(ne_finite, pred.ne, ne_targ)
+            te_pred = jnp.where(te_finite, pred.te, te_targ)
+            # Per-timeslice divergence flag (any bad point on either channel)
+            diverged = ~(jnp.all(ne_finite, axis=-1) & jnp.all(te_finite, axis=-1))
+
+            ne_err = value_err(_residual(ne_pred / ne_scale, ne_targ / ne_scale, ne_sigma))
+            te_err = value_err(_residual(te_pred / te_scale, te_targ / te_scale, te_sigma))
 
             # Build per-sample weights from device labels
             ds_source_idx = targ["ds_source_idx"].data
@@ -298,8 +325,31 @@ class TransportPredictorTRB(TrainRunBuilder):
                 if anchor_weight <= 0.0 or signal not in targ:
                     continue
                 pred_attr = ANCHOR_SIGNALS[signal][0]
-                anchor_errors = jnp.abs(getattr(pred, pred_attr) - targ[signal].data)
+                anchor_pred = getattr(pred, pred_attr)
+                anchor_finite = jnp.isfinite(anchor_pred)
+                anchor_targ = targ[signal].data
+                # Same sanitize-then-charge treatment as the profiles
+                anchor_errors = jnp.abs(jnp.where(anchor_finite, anchor_pred, anchor_targ) - anchor_targ)
                 loss = loss + anchor_weight * jnp.mean(sample_weights * anchor_errors)
+                diverged = diverged | ~anchor_finite
+
+            # Divergence penalty, deliberately OUTSIDE the freshness mask: a
+            # rollout that went non-finite is broken whether or not those
+            # timeslices happened to carry a fresh profile measurement, and
+            # masking it would let a fully diverged run score as though the
+            # stale slices simply did not count.
+            #
+            # Applied to BOTH the training and validation loss (one builder),
+            # which is the point: previously a diverged trial paid nothing.
+            # popsim's own guard only counts SKIPPED steps, so steps recovered
+            # by NaN-masking left train/nan_skip_fraction at 0, and the sweep
+            # metric val/loss.mean never saw the divergence at all - so the
+            # bayes sweep was free to walk into the divergent high-lr corner
+            # and did (2026-07-26: 93% of trials above lr0 1e-3 diverged, and
+            # those trials scored BEST). Charging it here makes both the
+            # trained-on objective and the sweep metric reflect it.
+            divergence_penalty = loss_config["divergence_penalty"]
+            loss = loss + divergence_penalty * jnp.mean(sample_weights * diverged.astype(loss.dtype))
 
             return loss
 
@@ -322,13 +372,24 @@ class TransportPredictorTRB(TrainRunBuilder):
 
     @staticmethod
     def get_optimizer(optimizer_config: dict) -> optax.GradientTransformation:
-        # Global-norm cap as in the profile study (the differentiated TORAX
-        # solve can spike gradients and NaN a run without it), on top of the
-        # power balance study's grouped schedule: submodule_lr_factors runs
+        # zero_nans FIRST, because the global-norm cap cannot help against a
+        # non-finite gradient: clip_by_global_norm(NaN) is still NaN, so one
+        # bad backward pass poisons every parameter and the run is dead even
+        # though the forward losses were all finite (the transformer rollout
+        # does this - the loss sanitizes non-finite PREDICTIONS, but a finite
+        # loss can still have a NaN derivative). Zeroing turns that step into
+        # a no-op for the affected leaves instead of ending the run, and the
+        # divergence_penalty term still charges the sample in the loss so the
+        # sweep metric keeps seeing it.
+        #
+        # Then the global-norm cap as in the profile study (the differentiated
+        # TORAX solve can spike gradients and NaN a run without it), on top of
+        # the power balance study's grouped schedule: submodule_lr_factors runs
         # the sciml power_balance subtree at a reduced learning rate while
         # the profile predictor keeps the full one (pytree-path labeling, a
         # no-op for model types without a matching path)
         return optax.chain(
+            optax.zero_nans(),
             optax.clip_by_global_norm(optimizer_config.get("grad_clip_max_norm", 1.0)),
             make_grouped_exponential_adamw(optimizer_config),
         )

@@ -21,6 +21,27 @@ def make_transport_torax_config(transport_model: str) -> dict:
         raise ValueError(f"Unknown transport model '{transport_model}', valid: {sorted(TORAX_TRANSPORT_BLOCKS)}")
     torax_config = copy.deepcopy(TORAX_CONFIG_BASE)
     torax_config["transport"] = copy.deepcopy(TORAX_TRANSPORT_BLOCKS[transport_model])
+    # Cyclotron radiation is dropped HERE and not from TORAX_CONFIG_BASE, so
+    # the profile study (which never diverged) keeps its physics unchanged.
+    #
+    # TORAX models it with something where the fit is singular
+    # on a FLAT profile (p_axis -> p_edge zeroes the denominator) and NaN on a
+    # non-monotonic one (log of a negative). This study seeds every rollout
+    # from measured profiles floored at TE_SEED_FLOOR_KEV / NE_SEED_FLOOR_20,
+    # so plasma-initiation timeslices arrive largely flat at those floors and
+    # hit the first case, while record-pressure timeslices hit the second.
+    # Source ablation over the offending segments (2026-07-26): dropping this
+    # single source takes them 5 -> 0, while ablating ohmic / bremsstrahlung /
+    # ei_exchange / current evolution changes nothing (removing ohmic is much
+    # worse, 5 -> 139, since ohmic heating is what lifts these plasmas off the
+    # floor). Solver budget, torax_state, and the chi / D / V clips were all
+    # ruled out first and none of them move the count.
+    #
+    # Physically cheap to lose: cyclotron losses scale ~ B^2 and matter for
+    # high-field reactor plasmas, not for MAST at ~0.66 T (utterly negligible)
+    # or C-Mod at a few keV (small). Preferred over patching the TORAX
+    # submodule, whose working-tree guards do not survive a submodule update.
+    torax_config["sources"].pop("cyclotron_radiation", None)
     torax_config["numerics"].update(
         {
             "t_initial": 0.0,
