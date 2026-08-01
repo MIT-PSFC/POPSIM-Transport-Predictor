@@ -229,3 +229,6 @@ fetch_*
 _debug_runner.py
 working_dir_base
 wandb
+.ua/intermediate
+.ua/diff-overlay.json
+.ua/.trash*
