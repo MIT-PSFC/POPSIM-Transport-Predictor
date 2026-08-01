@@ -1,52 +1,56 @@
 # POPSIM-Transport-Predictor
 
-Study that investigates using POPSIM for full-shot profile prediction.
+Benchmarking hybrid physics architectures for tasks related to full-shot transport prediction.
 
-# Installation
+We desire models which can predict the evolution of the plasma state according to future actuator control signals.
+Such control-oriented models enable using Model Predictive Control (MPC) and Reinforcement Learning (RL) to design feedforward trajectory targets which avoid instabilities.
+This has been demonstrated to work in the past for several different tasks on multiple tokamaks.
+However, these studies trained and developed their models using data from the same tokamak on which they were deployed (thousands of shots in some instances). This is only possible because the consequences of failure on present-day experimental tokamaks is low. This will *not* be the case for next-generation tokamaks which operate at significantly higher plasma current and stored energy.
+Before using MPC+RL for trajectory optimization on a next-generation tokamak, we must have confidence that the models we are using can achieve good predictive performance without training data from hazardous operating regimes (and preferably with as little data from the target device as possible).
 
-This repo should be able to completely reproduce all plots in the ICDDPS presentation, and all plots in the upcoming paper provided the person trying to do the reproduction has proper data access.
+My work focuses on Neoclassical Tearing Modes (NTMs), which are pressure-driven instances of magnetic reconnection that grow into magnetic islands.
+NTM stability is influenced by kinetic profiles of temperature and density.
+The idea is that if we can understand how actuators available on a next-generation tokamak influence the kinetic profiles, we can design trajectories which are more passively stable against NTM onset.
+(Note that this also requires a model relating profiles to NTM stability, which is ongoing work)
 
-A C-Mod dataset is provided, and the MAST dataset can be created using the provided scripts.
-
-The number of people who have access to C-Mod, DIII-D, and TCV data is extremely small (might just be you), so there should be plots that demonstrate performance on only a subset of the above devices (probably C-Mod since we're aiming to release all of it anyway)
-
-A simple `uv sync` should work. However, there might be some finagling you have to do to get the GPU dependencies working.
-I think this is a symptopm of POPSIM having a slightly older JAX dependency. Will get around to fixing that at some point in the future (likely after APS 2026).
-For the ORCD cluster in particular, the required dependency can be installed with `uv sync --group gpu-orcd`.
+Predicting kinetic profiles is essentially predicting particle and energy transport, hence the name of this repo.
 
 # Studies
 
-The goal of each of these study types is to compare the performance of various architectures when trained on a lot of historic data and a small amount of data from the target device.
+The goal of each of these study types is to compare the performance of various model architectures when trained on a lot of data from several devices and a small amount of data from a separate target device.
 
 In particular, we aim to answer the following questions:
 
 ### 1: Which model architecture is best at domain adaptation?
 
+The Scientific Machine Learning (SciML) paradigm describes model architectures which have some physics structure included in them (like a neural differential equation). The idea is that this physics structure enables these models to train faster and/or extrapolate better outside their training domain than an unstructured model (like a multilayer perceptron).
+
 My hypothesis is that SciML / hybird physics models will do well when there is little data from the target domain. However, if there is plentiful target data then the expressiveness of purely data-driven models will likely enable them to do better.
 
-### 2: Is historic data needed at all / can we reach good predictability quickly from nothing (exnihilo) on the target device?
+### 2: Is data from other devices needed at all / can we reach good predictability quickly from nothing (exnihilo) on the target device?
 
-Obtaining historic datasets that can be mapped into the operating regime of the target device is challenging. Need to deal with differences in geometries, diagnostics, actuators, and data sharing agreements. If we could get away with training our models on one or two shots of low-performance data from the target device that would be excellent, I just don't think it is possible.
+Curating multi-device datasets is extremely challenging. Considerations must be taken to handle differences in geometries, diagnostics, actuators, and (most difficult of all) data sharing agreements. If we could get away with training models on a few low-hazard shots from the target device, that would be excellent. I'm not expecting this to be the case, but it's worth investigating.
 
 ### 3: If we have a lot of historic data, how many shots are needed from the target device to achieve good predictions?
 
-To answer this question, for each model we do training with an increasing number of shots from the target device. (e.g. 0, 1, 3, 10, 32, 100, 316, etc.). This is on a per-shot basis because that is the meaningful unit for tokamak operations, since if you run a shot, you get all the data from that shot. When commissioning future tokamaks this is also important because we would like to have all our predictive models trained before going to more dangerous high-performance operating scenarios.
+To answer this question, for each model we do training with an increasing number of shots from the target device. (e.g. 0, 1, 3, 10, 32, 100, etc.). This is on a per-shot basis because that is the meaningful unit for tokamak operations. If you run a shot, you get all the data from that shot. When commissioning future tokamaks this is also important because we would like to have all our predictive models trained before going to more hazardous operating scenarios.
 
 ### 4: How should we be normalizing our input features?
 
-The raw input features from different devices can have little domain overlap, which can be problematic for data-driven models. There are many ways to process the input features to maintain the same dimensionality but have better overlap, and we will compare the results for the following:
-- Raw: No normalization. Ip, Wtot, etc. are in their original units
-- Physics: Convert to dimensionless parameters like beta, q95, f_G, etc.
+The raw input features (plasma current, toroidal field, major and minor radii, etc.) from different devices are wildly different, which can be problematic for data-driven models. There are many ways to process the input features to maintain the same dimensionality but have better domain overlap, and we will compare the results for the following:
+- Raw: No normalization. Ip, Wtot, R0, a_minor, etc. are in their original units
+- Physics: Convert to dimensionless parameters like 195, betan, epsilon, etc.
 - Z-Score: Within each device, normalize each variable to zero mean and unit variance.
 - CORAL: Correlation alignment algorithm (https://arxiv.org/abs/1612.01939) to align the covariances of source and target domains
 
 ### 5: How should we be training our networks for a new domain?
 
-Many methods to take a data-driven model trained in one domain and adapt it to a new domain, we investigate two:
-- Data mixing: The model is trained once on a dataset which includes both historic data and target data. The samples are weighted such that the target's are more important.
-- Transfer learning: The model is trained for many epochs on historic data, and the training is continued with a reduced learning rate using target data.
+Many methods exist to take a data-driven model trained in one domain and adapt it to a new domain. here, we investigate three:
+- Addition: The model is trained once on a dataset which includes both historic data and target data. Samples are unweighted.
+- Weighted: The model is trained once on a dataset which includes both historic data and target data. The samples are weighted such that the target's are more important.
+- Transfer: The model is trained for many epochs on historic data, and the training is continued with a reduced learning rate using target data.
 
-## Power Balance Transfer
+## Study 1: Time-dependent power balance
 
 Time-dependent stored energy prediction. Given the present timestep's stored energy and controllable input signals, predict the change in stored energy to the next timestep.
 
@@ -55,56 +59,87 @@ These signals were chosen since they are present in the H89/H98 scaling laws whi
 
 Four model architectures investigated:
 
-1: Scaling Law, predicting energy confinement time with H89/H98 scaling laws, and a P_LH scaling law to switch between them. Since the H98 scaling law takes a 'P_abs' but we can only directly control 'P_aux', it also has a network which predicts the ohmic power from the remaining inputs (essentially Ip * network).
+1: SciML-ScalingLaw: Predicting energy confinement time with H89/H98 scaling laws, and a P_LH scaling law to switch between them. Since the H98 scaling law takes a 'P_abs' but we can only directly control 'P_aux', it also has a network which predicts the ohmic power from the remaining inputs (essentially Ip * network).
 
-2: SciML, predicting energy confinement time with a neural network. Change in stored energy is P_oh + P_aux - P_rad - P_cond, where P_cond = Wtot / tau_e. tau_e very difficult to figure out from first principles, so use a neural network. In addition, P_oh and P_rad can't be directly controlled from our inputs, so have networks which predict their values (essentially Ip * network and ne * network).
+2: SciML-NN: Predicting energy confinement time with a neural network. Change in stored energy is P_oh + P_aux - P_rad - P_cond, where P_cond = Wtot / tau_e. tau_e very difficult to figure out from first principles, so use a neural network. In addition, P_oh and P_rad can't be directly controlled from our inputs, so have networks which predict their values (essentially Ip * network and ne * network).
 
-3: Unstructured NN, directly predict change in stored energy from a neural network (in this case, simple MLP). Has all the same inputs as the other models, but the architecture itself has no physics information.
+3: MLP: Directly predict change in stored energy from a neural network (in this case, a simple multilayer perceptron). Has all the same inputs as the other models, but the architecture itself has no physics information.
 
-4: Transformer architecture. Again, just directly predicting change in stored energy with a purely data-driven model, but a different one to compare against the MLP.
+4: Transformer: Again, just directly predicting change in stored energy with a purely data-driven model, but a different one to compare against the MLP. This network attends over its previous predictions with an embedding to provide information on ordering (most recent vs most distant predictions).
 
 We also compare the different data normalization methods, where normalization is implemented as a POPSIM module. This is done since each model above may need real-valued units as well as those which are normalized for input to a neural network. Dimensionality is maintained so no new information is being provided. In addition, the normalization methods are set up via configuration parameters that are chosen based on only the available training data so there is no out-of-domain information obtained from this processing.
 
-## Profile Transfer
+## Study 2: Time-independent profile prediction
 
-In the power balance transfer study we determined that 'physics' normalization performed best, so we only look at that method here.
-We still compare the differences between 'mixing' and 'transfer' domain adaptations.
+For this study, the inputs are Ip_MA, B0, ne20, beta, and shaping (R0, a_minor, kappa, delta_top, delta_bot).
+This is similar to the plasma control system setup you might see on a present-day experimental device like DIII-D.
+Feedforward targets are given for each of the above quantities, so you have a reasonably good idea of what they will be in the future.
+The goal of the model is then to predict what the 1D profiles of temperature and density will be for a given set of inputs.
 
-## Transport Transfer
+Three model architectures are investigated:
 
-Again, we only consider 'physics' normalization.
-The above two studies indicated there is little difference between 'mixing' and 'transfer' domain adaptation, so we only use 'mixing' here.
+1: Shape-init (K-Means or PCA): From only the training data, determine the dominant profile shapes. Then use a small neural network to determine how they are added together to produce the predicted profile. Since the shapes are normalized, they are scaled back to physical quantities using the inputs (line-averaged density and an estimate of temperature from prescribed betan).
 
+2: MLP: Go directly from inputs to output profiles with an unstructured neural network.
 
-# Repo organization:
+3: Reservoir: Go directly from inputs to output profiles with a reservoir architecture. This has been used for a similar problem setup in the past for DIII-D. The reservoir itself is untrained, only the weights in the readout layer are updated.
 
-## Datasets
-Creation of the datasets for C-Mod, DIII-D, and TCV
-Requires proper data access
+3: TORAX: Utilize a fast, differentiable transport code to predict profiles. The inputs to TORAX are geometry, boundary conditions, particle/energy sources and sinks, and the transport coiefficients. These are computed from the input features where possible, and predicted with small neural networks otherwise. The kinetic profiles start as an initial parabolic guess, and then the transport solver iterates them for a few timesteps until they relax into the final shape which is taken as the prediction.
 
-## Modules
+## Study 3: Time-dependent profile prediction
 
-All the POPSIM modules and configs used in the various studies
+TODO(ZanderKeith)
 
-`power_balance`: Used for power balance transfer learning
+# Repo Organization:
 
-`profile_trajectory`: Used for DIII-D trajectory optimization
-- Has a slightly different version of the profile predictor module
+For robots, see `CLAUDE.md`. 
 
-## Orchestration
+For humans, read on. (or check out `.ua/`)
 
-Helper scripts for organizing training cases, launching SLURM jobs, and hyperparameter tuning.
+## `transport_study/datasets`
+
+Creation of the datasets for C-Mod, MAST, DIII-D, and TCV.
+There's a general `DataWorkflow` class which organizes the steps in making these datasets, however running it for a particular machine requires data access.
+
+MAST is publicly hosted so anyone can create the dataset for that device.
+In the near future `TODO(ZanderKeith)` I will be releasing the C-Mod and MAST datasets used in the studies presented at ICDDPS 2026.
+
+It is unlikely I will be able to release the DIII-D and TCV datasets.
+
+See `transport_study/datasets/dataset_creation.md` for more info.
+
+## `transport_study/modules`
+
+All the POPSIM modules, training run builders, and configs used in the three studies.
+
+## `transport_study/orchestration`
+
+The `Study` class is the workflow that goes from datasets to trained models and their performance statistics. Each study type described above implements a subclass of `Study` to handle its unique model and data setup.
+
+This section also has helper functions for launching SLURM jobs and hyperparameter tuning using WandB.
+
+## `transport_study/power_balance_transfer`, `transport_study/profile_transfer`, `transport_study/transport_transfer`
+
+Everything unique to each study type, primarily module setup and plotting.
 
 ## Trajectory Optimization
 
-This was briefly attempted on DIII-D in March 2026, though results were inconclusive due to difficulties in reproducing the target scenario.
-# Workflow:
+This was briefly attempted on DIII-D in March 2026, though results were inconclusive due to difficulties in reproducing the target scenario. Again, out of date, but keeping around as an example
 
-I am not happy with how things are set up right now. The structure is a consequence of my development environment and as such might be tricky to adapt. I've attempted to make it general where possible, but at the end of the day this is a thing I made to facilitate my own work on a tight schedule. It could be tweaked to work for a more general set of environments, I simply do not have the bandwidth to do so.
+# Misc. Notes from the Author
+
+I am not completely satisfied with how things are set up right now. The workflows are a consequence of my development environment and as such might be tricky to adapt. I've attempted to make the structure general where possible, but as it stands this is a project I made to facilitate my own work on a tight schedule.
 
 I run the dataset creation on a local workstation, where it has access to C-Mod/DIII-D/TCV data (private) and MAST data (public). However, this workstation is too small to do the computationally intensive GP fitting routines for C-Mod and MAST. To get around this, it packages the raw TS data, ships it off to a remote cluster with srunx, and pulls back the results for assembly.
 
-I run the training orchestration on an interactive node on a compute cluster (either Engaging or OMEGA). This is convenient for testing because whenever something breaks I can just run the study serially to step through the logic with a debugger without worrying about things being slightly different between CPU and GPU. The downside is the interactive job the orchestrator lives on takes up a GPU which could be used for training. Maybe not the biggest concern (still leveraging 55/56 on my partition) but when going through hundreds of cases and thousands of tuning runs it adds up.
+I run the training orchestration on an interactive node on a compute cluster (either Engaging or OMEGA). This is convenient for testing because whenever something breaks I can just run the study serially to step through the logic with a debugger.
+
+For installation, a simple `uv sync` should work. However, there might be some finagling you have to do to get the GPU dependencies to function. (For the ORCD cluster in particular, the required dependency can be installed with `uv sync --group gpu-orcd`.
+) I think this is a symptopm of POPSIM having an older JAX dependency. I will get around to fixing that at some point in the future.
+
+This whole thing could be iterated upon to work for a more general set of environments, I simply do not have the bandwidth to do so. Nevertheless, I'm still releasing this on the off chance someone finds it useful.
+
+And if you do, please cite the preprint on arXiv `TODO(ZanderKeith)` put that reference in here.
 
 # Generative AI Disclosure
 
