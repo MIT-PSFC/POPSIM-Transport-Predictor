@@ -23,8 +23,8 @@ from transport_study.modules.profile_predictor.module import (
     Outputs,
 )
 
-# Per transport model: the coefficients predicted by the transport network,
-# in the order of the network outputs.
+# For each type of TORAX transport model:
+# the coefficients predicted by the transport network, in the order of the network outputs.
 TRANSPORT_COEFFICIENT_NAMES = {
     "constant": ("chi_i", "chi_e", "D_e", "V_e"),
     "cgm": ("chi_e_i_ratio", "chi_D_ratio", "VR_D_ratio", "alpha", "chi_stiff"),
@@ -41,7 +41,7 @@ SOURCE_COEFFICIENT_NAMES = (
     "electron_heat_fraction",
 )
 
-# Reference confinement time [s] anchoring the NN aux-heating and fueling scales:
+# Reference confinement time [s] anchoring the NN aux-heating and fueling scales
 # P_aux_total is a bounded fraction of w_approx / TAU_REF
 # S_total a softplus multiple of particle_inventory / TAU_REF
 TAU_REF_S = 0.05
@@ -66,8 +66,7 @@ def build_circular_geometry_jax(
     """Circular geometry builder using JAX ops for differentiability.
 
     Mirrors _build_circular_geometry from torax but uses jnp.* so that
-    R_major, a_minor, B_0, elongation_LCFS remain JAX-traced through the
-    geometry construction.
+    R_major, a_minor, B_0, elongation_LCFS remain JAX-traced through the geometry construction.
     """
     rho_face_norm = jnp.array(torax_mesh.face_centers)
     rho_norm = jnp.array(torax_mesh.cell_centers)
@@ -103,8 +102,9 @@ def build_circular_geometry_jax(
     g1_face = vpr_face**2 / rho_b**2
     g2 = g1 / R_major**2
     g2_face = g1_face / R_major**2
-    # Clamp 1 - (rho/R)^2 away from zero, the large-aspect-ratio formulas
-    # below blow up as local epsilon -> 1 (MAST edge epsilon reaches 0.78 nominally, noisy per-sample a_minor/R0 can push it further)
+    # Clamp 1 - (rho/R)^2 away from zero,
+    # the large-aspect-ratio formulas below blow up as local epsilon -> 1
+    # (MAST edge epsilon reaches 0.78 nominally, noisy per-sample a_minor/R0 can push it further)
     g3 = 1.0 / (R_major**2 * jnp.clip(1.0 - (rho / R_major) ** 2, 0.05, None) ** 1.5)
     g3_face = 1.0 / (R_major**2 * jnp.clip(1.0 - (rho_face / R_major) ** 2, 0.05, None) ** 1.5)
 
@@ -207,19 +207,18 @@ def build_miller_geometry_jax(
 ) -> torax_geometry.Geometry:
     """Miller shaped geometry builder using JAX ops for differentiability.
 
-    Up-down asymmetric Miller parameterization (R.L. Miller et al., Phys.
-    Plasmas 5, 973 (1998), with Turnbull-style asymmetric triangularity):
+    Up-down asymmetric Miller parameterization
+    (R.L. Miller et al., Phys. Plasmas 5, 973 (1998), with Turnbull-style asymmetric triangularity):
 
         delta(rn, theta) = rn**p * (delta_mean + delta_diff*sin(theta))
         R = R_major + r*cos(theta + arcsin(delta)*sin(theta))
         Z = kappa(rn)*r*sin(theta)
 
     where rn is normalized rho, r = rn*a_minor, and the sin(theta) blend
-    gives exactly delta_top at the top, delta_bot at the bottom, and their
-    mean at the midplane. Flux-surface metrics come from poloidal
-    quadrature with closed-form contour derivatives. The toroidal field
-    model matches the circular builder (vacuum B = B_0*R_major/R with
-    F = R_major*B_0), so gm4 = <R^2>/F^2 and gm5 = F^2*<1/R^2>.
+    gives exactly delta_top at the top, delta_bot at the bottom, and their mean at the midplane.
+    Flux-surface metrics come from poloidal quadrature with closed-form contour derivatives.
+    The toroidal field model matches the circular builder
+    (vacuum B = B_0*R_major/R with F = R_major*B_0), so gm4 = <R^2>/F^2 and gm5 = F^2*<1/R^2>.
     """
     rho_face_norm = jnp.array(torax_mesh.face_centers)
     rho_norm = jnp.array(torax_mesh.cell_centers)
@@ -231,8 +230,8 @@ def build_miller_geometry_jax(
     cos_t = jnp.cos(theta)
     w_theta = 2.0 * jnp.pi / _MILLER_NTHETA
 
-    # Clip triangularities for arcsin safety, |delta| <= 0.9 everywhere
-    # keeps 1 - delta^2 >= 0.19 and avoids self-intersecting contours
+    # Clip triangularities for arcsin safety,
+    # |delta| <= 0.9 everywhere keeps 1 - delta^2 >= 0.19 and avoids self-intersecting contours
     delta_top_c = jnp.clip(delta_top, -0.9, 0.9)
     delta_bot_c = jnp.clip(delta_bot, -0.9, 0.9)
     delta_mean = 0.5 * (delta_top_c + delta_bot_c)
@@ -266,17 +265,17 @@ def build_miller_geometry_jax(
 
     def metrics(rn_1d: jax.Array) -> dict[str, jax.Array]:
         rn_col = rn_1d[:, None]
-        # Exact contour for integral quantities, all vanish at the axis
-        # without division so no floor is needed
+        # Exact contour for integral quantities,
+        # all vanish at the axis without division so no floor is needed
         R, Jp, _, dZ_dt = contour(rn_col)
         vpr = rho_b * 2.0 * jnp.pi * jnp.sum(R * Jp, axis=1) * w_theta
         spr = rho_b * jnp.sum(Jp, axis=1) * w_theta
         # Green's theorem over the closed contour, exact for this shape
         volume = jnp.pi * jnp.sum(R**2 * dZ_dt, axis=1) * w_theta
         area = jnp.sum(R * dZ_dt, axis=1) * w_theta
-        # Floored contour for flux-surface averages, the ratios are
-        # degree-0 homogeneous in r near the axis so a tiny floor
-        # evaluates the correct limit instead of 0/0
+        # Floored contour for flux-surface averages,
+        # the ratios are degree-0 homogeneous in r near the axis
+        # so a tiny floor evaluates the correct limit instead of 0/0
         Rf, Jpf, dR_dtf, dZ_dtf = contour(jnp.maximum(rn_col, 1e-6))
         Jpf = jnp.maximum(Jpf, 1e-12)
         Jf = Rf * Jpf
@@ -314,8 +313,8 @@ def build_miller_geometry_jax(
     rho_face = rho_face_norm * rho_b
     rho_hires = rho_hires_norm * rho_b
 
-    # Phi = pi*B_0*rho^2 must be kept exact, the Geometry.rho_b property
-    # recovers a_minor from Phi_face[-1]
+    # Phi = pi*B_0*rho^2 must be kept exact,
+    # the Geometry.rho_b property recovers a_minor from Phi_face[-1]
     Phi = jnp.pi * B_0 * rho**2
     Phi_face = jnp.pi * B_0 * rho_face**2
 
@@ -343,12 +342,10 @@ def build_miller_geometry_jax(
     R_in_face = R_major - rho_face
 
     return torax_geometry.Geometry(
-        # Deliberately kept CIRCULAR even though the metric is shaped: a
-        # non-CIRCULAR type would set q_correction_factor to 1.0 instead of
-        # 1.25 (geometry.py property), which shrinks q, inflates the 2|s|/q
-        # term in the CGM critical gradient, and pushes samples subcritical
-        # where the NN gradient dies. A 400-epoch MAST pilot measured val
-        # loss 0.043 with the q fudge off vs 0.038 with it on (2026-07)
+        # Deliberately kept CIRCULAR even though the metric is shaped
+        # a non-CIRCULAR type would set q_correction_factor to 1.0 instead of 1.25 (geometry.py property),
+        # which shrinks q, inflates the 2|s|/q term in the CGM critical gradient,
+        # and pushes samples subcritical where the NN gradient dies
         geometry_type=torax_geometry.GeometryType.CIRCULAR,
         torax_mesh=torax_mesh,
         Phi=Phi,
@@ -397,8 +394,8 @@ def build_miller_geometry_jax(
     )
 
 
-# Soft clamp bounds (lo, hi, lo_width, hi_width) for the evolving core
-# profiles, in TORAX internal units: temperatures in keV, density in m^-3.
+# Soft clamp bounds (lo, hi, lo_width, hi_width) for the evolving core profiles,
+# in TORAX internal units: temperatures in keV, density in m^-3.
 # Bounds sit far outside the physical range of C-Mod/MAST/TCV/DIII-D
 # widths set how far past a bound the saturation still has usable gradient.
 _TE_CLAMP_KEV = (0.005, 30.0, 0.005, 4.0)
@@ -408,10 +405,10 @@ _NE_CLAMP_M3 = (1e17, 1e21, 1e17, 5e19)
 def clamp_core_profiles(state):
     """Return state with T_e, T_i, n_e cell values soft-clamped to physical range.
 
-    Applied to the state carried between solver steps, before the next step_fn
-    call, so the clamp acts before the operations that manufacture inf/NaN from
-    an extreme state (resistivity ~ T^-1.5, divisions by n_e). Clamping after
-    the loop would be too late: NaN propagates, and softplus(NaN) stays NaN.
+    Applied to the state carried between solver steps, before the next step_fn call,
+    so the clamp acts before the operations that manufacture inf/NaN from an extreme state
+    (resistivity ~ T^-1.5, divisions by n_e)
+    Clamping after the loop would be too late: NaN propagates, and softplus(NaN) stays NaN.
     """
     cp = state.core_profiles
     cp = dataclasses.replace(
@@ -435,11 +432,12 @@ def _run_loop_jit_with_geo(
 ):
     """Local copy of torax_experimental.run_loop_jit that also accepts geo_overrides.
 
-    Mirrors torax._src.orchestration.jit_run_loop.run_loop_jit (the recommended
-    fully-JITted simulation loop pattern from the TORAX docs) but:
-      - Accepts a geo_overrides argument so per-sample geometry can be passed
-        in without retracing the outer step_fn.
-      - Skips the per-step history buffers (we only need the final state).
+    Mirrors torax._src.orchestration.jit_run_loop.run_loop_jit
+    (the recommended fully-JITted simulation loop pattern from the TORAX docs)
+    Modified in the following way:
+      - Accepts a geo_overrides argument so per-sample geometry can be passed in
+        without retracing the outer step_fn
+      - Skips the per-step history buffers (we only need the final state)
       - Optionally wraps the body in jax.checkpoint so reverse-mode AD recomputes
         per-step activations rather than storing all max_steps copies.
     """
@@ -507,15 +505,15 @@ def bound_transport_coefficients(transport_model: str, nn_transport_out: jax.Arr
             "V_e": 5.0 * jnp.tanh(nn_transport_out[3:4]),
         }
     elif transport_model == "cgm":
-        # Free parameters of the Critical Gradient Model. The critical gradient
-        # itself is computed by TORAX from the evolving state and geometry
-        # (known inputs), only the dimensionless ratios are learned.
+        # Free parameters of the Critical Gradient Model.
+        # The critical gradient itself is computed by TORAX
+        # from the evolving state and geometry (known inputs),
+        # only the dimensionless ratios are learned.
         #   chi_e_i_ratio: 0.2 - 5   (chi_e = chi_i / ratio, ITG turbulence > 1,
-        #                  but spherical tokamaks are electron-transport
-        #                  dominated so the range extends below 0.5)
+        #                            if electron transport dominates then < 1)
         #   chi_D_ratio:   1 - 20    (D_e = chi_i / ratio, must stay positive)
         #   VR_D_ratio:    -5 - 5    (R0*V_e/D_e, negative peaks the density profile)
-        #   alpha:      1.8 - 2.2   (critical gradient exponent, TORAX default 2)
+        #   alpha:      1.8 - 2.2    (critical gradient exponent, TORAX default 2)
         #   chi_stiff:     0.5 - 3   (stiffness parameter, TORAX default 2)
         return {
             "chi_e_i_ratio": 0.2 + 4.8 * jax.nn.sigmoid(nn_transport_out[0:1]),
@@ -549,7 +547,8 @@ def bound_transport_coefficients(transport_model: str, nn_transport_out: jax.Arr
         # learns three scalar correction knobs, each a log-scale multiplier
         # centered on its TORAX default so a zero-mean random init starts at
         # stock QLKNN behavior.
-        # MAST sitsoutside the QuaLiKiz training domain (clip_inputs saturates),
+        # MAST sits outside the QLKNN training domain
+        # (TORAX forces inputs to be clipped within its expected bounds),
         # so the knobs need more authority to compensate.
         #   ITG_flux_ratio_correction: ~0.08 - 12 around 1, multiplies the
         #     ITG electron heat flux (QLKNN10D heritage value 2.0 in range)
@@ -574,8 +573,11 @@ def transport_provider_mapping(transport_model: str, coeffs: dict) -> dict:
         return torax_experimental.TimeVaryingScalarUpdate(value=coeffs[name])
 
     if transport_model == "constant":
-        # chi_i etc. are radial profiles (TimeVaryingArray) in the constant
-        # model: broadcast the NN scalar to a flat profile
+        # transport coeffs are radial profiles (TimeVaryingArray) in the constant model,
+        # so need to broadcast the NN scalar to a flat profile
+        # TODO(ZanderKeith): What would happen if we predicted more than one?
+        # Seems to me like that's just the MLP profile predictor with extra steps
+        # Might be worth investigating though
         rho = jnp.array([1.0])
 
         def flat_profile(name: str) -> torax_experimental.TimeVaryingArrayUpdate:
@@ -601,7 +603,7 @@ def transport_provider_mapping(transport_model: str, coeffs: dict) -> dict:
             "transport_model.chi_stiff": jnp.squeeze(coeffs["chi_stiff"]),
         }
     elif transport_model == "gyrobohm":
-        # Same NN multiplier applied to both species: the BgB model already
+        # Same NN multiplier applied to both species: the BGB model already
         # fixes chi_i_B = 2 * chi_e_B and chi_i_gB = 0.5 * chi_e_gB
         return {
             "transport_model.chi_e_bohm_multiplier": scalar("chi_bohm_multiplier"),
@@ -716,8 +718,8 @@ class ProfilePredictorTorax(TimeIndepModule):
         self._rho_hires_norm = tuple(np.array(static_geo.rho_hires_norm).tolist())
 
         # With the fixed time-step calculator, steps to cover t_final are
-        # deterministic: ceil((t_final - t_initial) / fixed_dt). Add 1 for the
-        # clipped final step that lands exactly on t_final.
+        # deterministic: ceil((t_final - t_initial) / fixed_dt)
+        # Add 1 for the clipped final step that lands exactly on t_final
         numerics = self.step_fn.runtime_params_provider.numerics
         fixed_dt = float(numerics.fixed_dt.get_value(0.0))
         self.max_steps = int(np.ceil((numerics.t_final - numerics.t_initial) / fixed_dt)) + 1
@@ -749,10 +751,7 @@ class ProfilePredictorTorax(TimeIndepModule):
         # TORAX solver stays stable during training.
         # Source network outputs are ordered per SOURCE_COEFFICIENT_NAMES:
         #   S_total: 0 - inf, softplus multiple of the device fueling scale
-        #     particle_inventory / TAU_REF_S (x 1e21 below). S_total was the
-        #     only knob in absolute units (P_aux scales with w_approx, edge
-        #     BCs with ne20_line_avg / te_approx), so a fueling magnitude
-        #     learned on the source device could not transfer across machine sizes.
+        #     particle_inventory / TAU_REF_S (x 1e21 below)
         #   P_aux_total: 0 - 4x the w_approx / TAU_REF_S power scale [MW].
         #     The heating magnitude is NN-inferred (betan encodes the stored
         #     energy the heating sustains) rather than a measured input, so
@@ -781,9 +780,8 @@ class ProfilePredictorTorax(TimeIndepModule):
         # particle source, so the BC must scale with the requested density.
         # Both BCs are floored: a near-vacuum edge ill-conditions the density
         # equation, and te_approx (beta / ne_la) is off-scale on early-shot
-        # low-density samples where betan is noisy, which put the solver far
-        # from equilibrium on exactly the samples that NaN'd training. Floors
-        # are affine in the sigmoid so the NN gradient path stays intact,
+        # low-density samples where betan is noisy, which can NaN training.
+        # Floors are affine in the sigmoid so the NN gradient path stays intact,
         # te_approx carries no NN params so a hard clip on it costs nothing.
         # The negative bias on the temperature fraction makes random-init edge
         # temperatures small (a few tens of eV): te_approx is a beta-derived

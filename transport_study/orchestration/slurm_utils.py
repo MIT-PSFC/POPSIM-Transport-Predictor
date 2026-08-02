@@ -626,13 +626,13 @@ def _gres_fragments(partition: str) -> list[str]:
     """Candidate values for the #SBATCH --gres line of a one-GPU job, in order.
 
     First the untyped request plus the exclude list keeping the job on
-    config.gpu_types cards. Since July 2026 some partitions (mit_preemptable,
-    mit_normal_gpu) reject untyped gpu requests aimed at a100/h100/h200 nodes
+    config.gpu_types cards. Some partitions (mit_preemptable, mit_normal_gpu)
+    reject untyped gpu requests aimed at a100/h100/h200 nodes
     with "Requested node configuration is not available" while typed requests
     for the same cards still work, so each allowed type present in the
-    partition follows as a typed fallback, most plentiful first. A typed
-    request pins the card type by itself, so its exclude list only carries
-    config.exclude_nodes.
+    partition follows as a typed fallback, most plentiful first.
+    A typed request pins the card type by itself,
+    so its exclude list only carries config.exclude_nodes.
     """
     fragments = [f"gpu:1{_gpu_exclude_directive(partition)}"]
     if config.gpu_types:

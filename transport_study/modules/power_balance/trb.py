@@ -34,8 +34,11 @@ from transport_study.modules.trb_utils import (  # noqa: F401 re-exported, histo
 
 STUDY_TYPE = "power_balance_transfer"
 
-# Anchor terms in the training loss, keyed by measured target signal:
-# (Output attribute holding the model's own prediction, loss_config key for the weight)
+# Anchor terms in the training loss for SciML models, keyed by measured target signal
+# Meant to keep the submodule's predictions from straying too far from what they're supposed
+# to be doing during training. This is not cheating because we'd have these anchor signals
+# to use in training in addition to the overall target Wtot after these shots.
+# Output attribute holding the model's own prediction, loss_config key for the weight
 ANCHOR_SIGNALS = {
     "P_oh_MW": ("P_oh_MW_pred", "anchor_weight_p_oh"),
     "P_rad_MW": ("P_rad_MW_pred", "anchor_weight_p_rad"),
@@ -61,13 +64,11 @@ class PowerBalanceTRB(TrainRunBuilder):
 
         def _build_module(train_dl: DataLoader, model_init_config: dict) -> Any:
             model_type = model_init_config["model_type"]
-            # Fit normalization stats from the training data only. When a
-            # transfer checkpoint will overwrite the module anyway, skip the
-            # fit (a CORAL fit on a handful of target shots is ill-conditioned
-            # and the restored stats, fitted on historic + target shots by the
-            # transfer_pretrain prereq case, are the correct ones).
-            # transfer_pretrain dataloaders carry that combined fit dataset as
-            # an attribute (see get_dataloaders)
+            # Fit normalization stats from the training data only.
+            # When a transfer checkpoint will overwrite the module anyway, skip the fit
+            # (a CORAL fit on a handful of target shots is ill-conditioned and the restored stats,
+            # fitted on historic + target shots by the transfer_pretrain prereq case, are the correct ones)
+            # transfer_pretrain dataloaders carry that combined fit dataset as an attribute (see get_dataloaders)
             n_devices = len(config.ds_source_to_idx)
             if model_init_config.get("transfer_checkpoint"):
                 fit_ds = None
@@ -149,6 +150,7 @@ class PowerBalanceTRB(TrainRunBuilder):
             transfer_manager = create_default_checkpoint_manager(model_init_config["transfer_checkpoint"])
             env = restore_model(transfer_manager, env)
             # Restoring the whole env overwrote the freshly restored submodule weights, restore them again from their own checkpoints
+            # TODO(ZanderKeith): Verify we're testing this logic
             if model_init_config["model_type"] in ["sciml-taue-scalinglaw", "sciml-taue-nn"]:
                 p_oh_config = model_init_config["submodules"]["p_oh_predictor"]
                 if isinstance(p_oh_config, TrainConfig):
@@ -184,15 +186,14 @@ class PowerBalanceTRB(TrainRunBuilder):
     def _make_wtot_loss_fn(loss_config: dict, use_huber: bool, include_anchors: bool = False) -> IntegralLoss:
         """Device-weighted loss on Wtot_MJ_pred, wrapped for time integration.
 
-        use_huber selects the training loss (huber, with the swept
-        huber_delta) or the delta-free validation loss (plain absolute error),
+        use_huber selects the training loss (huber, with the swept huber_delta)
+        or the delta-free validation loss (plain absolute error),
         so the sweep metric val/loss.mean cannot be gamed by shrinking delta.
 
         include_anchors adds the ANCHOR_SIGNALS terms pulling the submodule
-        predictions toward the measured signals, weighted by the
-        anchor_weight_* loss_config keys. Training loss only: validation stays
-        pure Wtot so the sweep metric is comparable across model types. The
-        terms drop out at trace time for model types whose target_vars do not
+        predictions toward the measured signals, weighted by the anchor_weight_* loss_config keys.
+        Training loss only: validation stays pure Wtot so the sweep metric is comparable across model types.
+        The terms drop out at trace time for model types whose target_vars do not
         carry the measured signals (mlp, transformer).
 
         Anchor errors are plain absolute error, not huber.

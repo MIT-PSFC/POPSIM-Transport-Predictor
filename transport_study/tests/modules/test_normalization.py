@@ -193,10 +193,8 @@ def test_coral_whitening_gain_bounded():
     """No entry of any fitted transform, expressed in pooled-std units
     (scale[i] * T[i, j] / scale[j]), exceeds ~1/CORAL_DEGENERATE_STD_FRAC even
     when a device covariance is near-singular from collinear features (two
-    features that are near-copies of each other within one device). This pins
-    the CORAL_EIGVAL_FLOOR backstop for non-axis-aligned degeneracy, the
-    dance2 failure mode (transform diag gains up to 78 with the old
-    CORAL_REG=1e-6 regularization).
+    features that are near-copies of each other within one device).
+    This pins the CORAL_EIGVAL_FLOOR backstop for non-axis-aligned degeneracy
     """
     rng = np.random.default_rng(13)
     n_shots, n_time = 20, 30

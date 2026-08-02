@@ -50,30 +50,21 @@ from transport_study.modules.profile_predictor.torax_module import (
 # Positivity floor for the profile outputs, ne [1e20 m^-3] and te [keV]
 MIN_PROFILE = 1e-3
 
-# Floors applied to profiles used to seed a TORAX state. The GP-fit profiles
-# clamp to exactly 0 over several edge points on rampdown timeslices, and
-# zero-temperature cells NaN the TORAX solve regardless of the predicted
-# coefficients (2026-07-24 attribution probe). 0.02 keV still left one NaN
-# sample, these values gave 0/256
+# Floors applied to profiles used to seed a TORAX state.
+# zero-value cells NaN the TORAX solve regardless of the predicted coefficients
 TE_SEED_FLOOR_KEV = 0.05
 NE_SEED_FLOOR_20 = 0.02
 
 # Floor on the stored energy when used as a denominator or feature scale.
-# Raised 1e-3 -> 3e-3 (2026-07-26): paux_norm divides an external input by this
-# denominator, so a near-empty plasma turns a normal beam power into an
-# out-of-distribution feature. The old 1e-3 was the 0.19th percentile of the
-# state-implied Wtot over cmod + mast, i.e. it floored almost nothing, and the
-# raw dataset minimum is lower still (4.5e-4, a MAST initiation slice) so the
-# measured minimum is not a usable floor. 3e-3 clips the bottom 2% of
-# timeslices, sits below C-Mod's 0.1th percentile (3.2e-3) so it is
-# effectively MAST-initiation only, and caps the paux_norm tail 3x.
+# paux_norm divides an external input by this denominator,
+# so a near-empty plasma turns a normal beam power into an out-of-distribution feature
 MIN_W_MJ = 3e-3
 
 # The 10 profile predictor feature slots plus one aux power feature
 N_TRANSPORT_NN_INPUTS = N_NN_INPUTS + 1
 
-# Names of the transport_nn_inputs slots, in order. The beta-derived slots keep
-# the profile predictor's names even though they come from Wtot here
+# Names of the transport_nn_inputs slots, in order.
+# The beta-derived slots keep the profile predictor's names even though they come from Wtot here
 TRANSPORT_NN_INPUT_NAMES = (*NN_INPUT_NAMES, "paux_norm")
 
 # Dataset variables transport_nn_inputs is derived from (no betan - the
@@ -93,9 +84,9 @@ TRANSPORT_NN_INPUT_SOURCE_VARS = (
 
 # Coefficients predicted by the transport predictor sources network, in the
 # order of the network outputs. Unlike ProfilePredictorTorax there is no
-# P_aux_total entry: the auxiliary heating magnitude is a measured input here,
-# the NN only predicts the deposition shape, the particle fueling, and the
-# absorbed fraction of the injected power.
+# P_aux_total entry: the auxiliary heating magnitude is a prescribed input here,
+# the NN only predicts the deposition shape, the particle fueling,
+# and the absorbed fraction of the injected power.
 SOURCE_SHAPE_COEFFICIENT_NAMES = (
     "S_total",
     "gaussian_location",
@@ -112,7 +103,7 @@ class Inputs:
     Union of the profile predictor and power balance input sets, minus betan:
     the stored energy is part of the predicted state, so every beta-derived
     quantity is computed from the state Wtot via the *_from_wtot methods
-    instead of a measurement.
+    instead of a prescribed input.
     """
 
     Ip_MA: float  # Plasma current [MA]
@@ -197,14 +188,10 @@ class Inputs:
         # betan, plus a dimensionless aux power feature: P_aux over the
         # Wtot / TAU_REF_S power scale, log1p compressed.
         #
-        # Every other slot is a ratio of co-varying measured quantities and so
-        # stays bounded. This one divides an INDEPENDENT external input by the
-        # evolving state, and the state legitimately approaches zero at plasma
-        # initiation while the beam is already on, so nothing co-varies to keep
-        # it finite. Left raw it reached 57-78 against a healthy median of 5.7
-        # on MAST initiation segments, which railed the gyrobohm chi multiplier
-        # at its exp(3) bound and drove the TORAX solve non-finite on the first
-        # step (2026-07-26 attribution probe, see MIN_W_MJ).
+        # Every other slot is a ratio of co-varying controlled quantities and so
+        # stays bounded. This one divides an INDEPENDENT external input (P_aux)
+        # by the evolving state (Wtot_MJ), and the state can be small at plasma
+        # initiation while P_aux is high.
         #
         # log1p rather than safe_log: it compresses the tail while keeping the
         # P_aux = 0 ohmic phases finite AND at exactly 0, which was the reason
@@ -324,9 +311,8 @@ class Output:
 class TransportPredictor(TimeDepModule):
     """Base for the time-dependent profile predictors.
 
-    Inputs are always in physical units plus the device index. Subclasses
-    define their own State: the three architectures carry genuinely different
-    state (stored energy, profile history buffer, TORAX internals).
+    Inputs are always in physical units plus the device index.
+    Subclasses define their own State: (stored energy, profile history buffer, TORAX internals).
     """
 
     # Class attribute aliases satisfy the TimeDepModule required-inner-class
@@ -354,8 +340,8 @@ class TransportPredictorTransformer(TransportPredictor):
     continuous state and passes discrete fields through as the next state
     directly (see popsim.simulate._single_step and popsim.modules.delay.DelayBuffer),
     so the buffer update is an exact discrete shift and the model MUST run
-    under a SIMPLE_EULER stepper. no_save keeps the buffer out of the recorded
-    simulation output.
+    under a SIMPLE_EULER stepper.
+    no_save keeps the buffer out of the recorded simulation output.
 
     Each step
     1: derive the stored energy implied by the current buffered profile (there is no measured betan)
@@ -550,14 +536,12 @@ class TransportPredictorToraxBase(TransportPredictor):
     Every beta-derived feature comes from the stored energy implied
     by the profile state, there is no input betan.
 
-    One __call__ advances TORAX by exactly one solver step of sim_dt, so the
-    torax config numerics must satisfy t_final - t_initial == fixed_dt ==
-    sim_dt. rhogrid must span [0, 1] inclusive, it doubles as the
-    initial-condition grid.
+    One __call__ advances TORAX by exactly one solver step of sim_dt,
+    so the torax config numerics must satisfy t_final - t_initial == fixed_dt == sim_dt.
+    rhogrid must span [0, 1] inclusive, it doubles as the initial-condition grid.
 
-    Subclasses define State and __call__, both carry state as DISCRETE
-    fields, so a SIMPLE_EULER stepper is required (see the
-    TransportPredictorTransformer docstring).
+    Subclasses define State and __call__, both carry state as DISCRETE fields,
+    so a SIMPLE_EULER stepper is required (see the TransportPredictorTransformer docstring).
     """
 
     rhogrid: tuple = eqx.field(static=True)
@@ -840,10 +824,10 @@ class TransportPredictorToraxBase(TransportPredictor):
 
         The step is wrapped in jax.checkpoint: reverse-mode AD through an
         outer rollout scan recomputes the solver step instead of storing its
-        residuals, which dominate training memory (measured 12 to 17 MB per
-        step per sample at float64, so a 100-step rollout would need over
-        1 GB per sample without remat, at a measured ~1.35x compute cost
-        with it).
+        residuals, which dominate training memory
+        (measured 12 to 17 MB per step per sample at float64,
+        so a 100-step rollout would need over 1 GB per sample without remat,
+        at a measured ~1.35x compute cost with it).
         """
 
         # Provider and geometry stay closure captures, matching the

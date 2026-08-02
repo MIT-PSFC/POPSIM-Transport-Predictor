@@ -15,15 +15,19 @@ from transport_study.modules.power_balance.p_rad.module import RadiatedPower
 
 MIN_TAUE = 0.001  # Default minimum reasonable value for tau_e [s]
 MAX_TAUE = 0.8  # Maximum reasonable value for tau_e [s]
+
 # Floor smoothing width of the scaling-law tau_e clamp [s], kept narrow so
 # physically common low tau_e (20-50 ms) passes through undistorted
 TAUE_CLAMP_MIN_WIDTH = 0.001
+
 # Sharpness of the sigmoid L-H mode blend in the scaling law
 # a hard jnp.where switch would zero the gradient of the P_LH threshold coefficients
 LH_BLEND_SHARPNESS = 8.0
+
 MIN_POWER = -32  # Minimum reasonable value for conducted power (dW/dt) [MW]
 MAX_POWER = 32  # Maximum reasonable value for conducted power (dW/dt) [MW]
 MIN_WTOT_MJ = 0.001  # Floor for predicted stored energy [MJ], keeps Wtot strictly positive
+
 # Smoothing width of every smooth_clamp bound, as a fraction of the bound range.
 # smooth_clamp is identity inside (min+width, max-width) and its gradient tail
 # decays as exp(-overshoot/width), staying alive ~10x further out than tanh soft_clip
@@ -95,7 +99,10 @@ class ScalingLawPredictor(eqx.Module):
         kappa: float  # Elongation [-]
         ne20: float  # Electron density [10^20 m^-3]
         P_aux_MW: float
-        # Only ever used for the scaling law to calculate P_abs
+
+        # Needed for the scaling law to calculate P_abs
+        # This MUST come from the P_oh submodule and NOT from the training dataset!
+        # otherwise that's giving this model more information and that's cheating!
         P_oh_MW: float
 
         @property
@@ -173,7 +180,7 @@ class ScalingLawPredictor(eqx.Module):
         # smoothing must stay narrow: device tau_e commonly sits at 20-50 ms,
         # which a range-fraction min width would distort by tens of percent.
         # (BoundedNNPredictor keeps symmetric widths, its clamp input is a raw
-        # NN output with no physical meaning.)
+        # NN output with no physical meaning)
         width_max = BOUND_CLAMP_WIDTH_FRAC * (self.max_taue - self.min_taue)
         bounded = smooth_clamp(taue, self.min_taue, self.max_taue, TAUE_CLAMP_MIN_WIDTH, width_max)
         taue_pred = bounded.squeeze()
@@ -295,13 +302,13 @@ class PowerBalance(TimeDepModule):
     def bound_wtot_dot(wtot_mj: ArrayLike, wtot_mj_dot: ArrayLike) -> ArrayLike:
         """The single dW/dt path every model type routes through.
 
-        Smooth-clamps the raw dW/dt to [MIN_POWER, MAX_POWER] (identity in
-        the interior, only the edges smooth), then blocks further decrease
-        once the integrated state is at the Wtot floor so the raw state
-        cannot run away to large negative values.
-        The clamp is the same physical prior for all model types: the
-        structured models can otherwise emit unbounded dW/dt (P_cond at
-        the tau_e floor, the unbounded softplus P_oh/P_rad submodules).
+        Smooth-clamps the raw dW/dt to [MIN_POWER, MAX_POWER]
+        (identity in the interior, only the edges smooth),
+        then blocks further decrease once the integrated state is
+        at the Wtot floor so the raw state cannot run away to large negative values.
+        The clamp is the same physical prior for all model types:
+        the structured models can otherwise emit unbounded dW/dt
+        (P_cond at the tau_e floor, the unbounded softplus P_oh/P_rad submodules).
         """
         width = BOUND_CLAMP_WIDTH_FRAC * (MAX_POWER - MIN_POWER)
         bounded = smooth_clamp(wtot_mj_dot, MIN_POWER, MAX_POWER, width, width)
@@ -344,8 +351,6 @@ class PowerBalanceScalingLaw(PowerBalance):
         p_rad_predictor_output = self.p_rad_predictor(normalizer_inputs)
 
         # The scaling law is dimensional physics, it MUST see physical units.
-        # (The pre-normalizer-module code fed it normalized features, which was
-        # only correct for raw normalization.)
         taue_predictor_inputs = ScalingLawPredictor.Inputs(
             Ip_MA=inputs.Ip_MA,
             B0=inputs.B0,
@@ -501,21 +506,21 @@ class PowerBalanceUnstructuredNN(PowerBalance):
 class PowerBalanceTransformer(PowerBalance):
     """Purely data-driven dW/dt predictor with recurrent causal attention.
 
-    A rolling buffer of the last history_len predicted Wtot values is carried
-    in the module State as a DISCRETE field
-    the simple-Euler stepper integrates only continuous state (Wtot_MJ)
+    A rolling buffer of the last history_len predicted Wtot values
+    is carried in the module State as a DISCRETE field
+    The simple-Euler stepper integrates only continuous state (Wtot_MJ)
     and passes discrete fields through as the next state directly
     (see popsim.simulate._single_step and popsim.modules.delay.DelayBuffer for the pattern),
     so the buffer update is an exact discrete shift
     no_save keeps the (history_len,) buffer out of the recorded simulation output.
 
-    Each step: shift the current (floored) Wtot state into the buffer, embed
-    the normalized 7-vector to a query token, embed each buffered Wtot value
-    plus a learned per-slot position embedding to key/value tokens, attend
-    (causal by construction, the buffer only ever contains current and past
-    predictions), then a residual connection and an MLP head produce a
-    bounded Wtot_MJ_dot. Scalar Wtot tokens are indistinguishable beyond
-    their value, so without the position embedding attention would be
+    Each step: shift the current (floored) Wtot state into the buffer,
+    embed the normalized 7-vector to a query token,
+    embed each buffered Wtot value plus a learned per-slot position embedding to key/value tokens,
+    attend (causal by construction, the buffer only ever contains current and past predictions),
+    then a residual connection and an MLP head produce a bounded Wtot_MJ_dot.
+    Scalar Wtot tokens are indistinguishable beyond their value,
+    so without the position embedding attention would be
     permutation-invariant over the history and unable to read trends
     """
 
@@ -570,8 +575,8 @@ class PowerBalanceTransformer(PowerBalance):
         key_embed, key_wtot, key_pos, key_attn, key_head = jax.random.split(jax.random.PRNGKey(prng_seed), 5)
         feature_embed = eqx.nn.Linear(7, d_model, key=key_embed)
         wtot_embed = eqx.nn.Linear(1, d_model, key=key_wtot)
-        # Small random init breaks slot symmetry when the buffer holds a
-        # constant history (the seeded state at t0)
+        # Small random init breaks slot symmetry when the buffer holds a constant history
+        # (the seeded state at t0)
         pos_embed = 0.02 * jax.random.normal(key_pos, (history_len, d_model))
         attention = eqx.nn.MultiheadAttention(num_heads=num_heads, query_size=d_model, key=key_attn)
         head = eqx.nn.MLP(
@@ -602,8 +607,8 @@ class PowerBalanceEnv(ModuleTrainingEnv):
     def create_state(self, observations: dict[str, ArrayLike], inputs: dict[str, ArrayLike]):
         Wtot_MJ = observations["Wtot_MJ"].data
         if isinstance(self.module, PowerBalanceTransformer):
-            # Seed the Wtot history with the measured t0 value tiled, a
-            # constant history rather than a fake all-zero one
+            # Seed the Wtot history with the measured t0 value tiled,
+            # a constant history rather than a fake all-zero one
             Wtot_MJ = jnp.asarray(Wtot_MJ)
             history = jnp.broadcast_to(Wtot_MJ[..., None], (*Wtot_MJ.shape, self.module.history_len))
             return PowerBalanceTransformer.State(Wtot_MJ=Wtot_MJ, history=history)

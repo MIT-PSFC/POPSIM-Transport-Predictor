@@ -28,7 +28,7 @@ class ProfileShape(TimeIndepModule):
     """
     A module defining a profile shape on the normalized minor radius (rho) grid [0, 1].
 
-    The profile shape can either be specified either directly with points on the rho grid or with a set of coefficients for a B-spline basis.
+    The profile shape can be specified either directly with points on the rho grid or with a set of coefficients for a B-spline basis.
     """
 
     basis: Basis1DProtocol  # B-spline basis used to define the profile shape
@@ -135,9 +135,8 @@ class ProfileShape(TimeIndepModule):
 # Size of the dimensionless nn_inputs feature vector every profile model consumes
 N_NN_INPUTS = 10
 
-# Names of the nn_inputs slots, in order (see Inputs.nn_inputs). The data
-# visualization plots these, so it shows exactly the feature space the models
-# consume (the power balance study's counterpart is PHYSICS_FEATURE_NAMES)
+# Names of the nn_inputs slots, in order (see Inputs.nn_inputs).
+# The data visualization plots these, so it shows exactly the feature space the models consume
 NN_INPUT_NAMES = (
     "beta",
     "q_star",
@@ -169,13 +168,13 @@ NN_INPUT_SOURCE_VARS = (
 class Inputs:
     Ip: float  # Plasma current [MA]
     B0: float  # On-axis toroidal field [T]
-    betan: float  # Normalized beta
+    betan: float  # Normalized beta [-]
     ne20_line_avg: float  # line-averaged electron density [10^20 m^-3]
     R0: float  # Geometric major radius [m]
     a_minor: float  # Minor radius [m]
-    kappa: float  # Elongation
-    delta_top: float  # Upper triangularity
-    delta_bot: float  # Bottom triangularity
+    kappa: float  # Elongation [-]
+    delta_top: float  # Upper triangularity [-]
+    delta_bot: float  # Bottom triangularity [-]
     ds_source_idx: float  # Device index selecting per-device normalization statistics
 
     # Other
@@ -254,9 +253,9 @@ class Inputs:
         # characteristic collisionality, from https://arxiv.org/pdf/2406.18442 eqn 2
         # SI formula with temperature in joules, rearranged so the physical
         # constants and unit conversions fold into python-float coefficients
-        # before touching the arrays: float32 array intermediates would
-        # otherwise overflow (ne_m3 / te_J^2 ~ 1e49) or underflow (eV^4 ~ 6.6e-76)
-        # and produce inf * 0 = nan
+        # before touching the arrays
+        # float32 array intermediates would otherwise overflow (ne_m3 / te_J^2 ~ 1e49)
+        # or underflow (eV^4 ~ 6.6e-76) and produce inf * 0 = nan
         te_eV = self.te_approx * 1e3
         # coulomb logarithm of debye_length over b90, which expands to
         # log of 4 pi eps0^1.5 te_J^1.5 / (e^3 ne_m3^0.5) with te_J = te_eV * e
@@ -319,10 +318,10 @@ def nn_input_matrix(ds: xr.Dataset) -> np.ndarray:
 def make_nn_input_normalizer(method: str, fit_ds: xr.Dataset | None, n_devices: int) -> FeatureNormalizer:
     """Build the per-device stat stage over the 10 dimensionless nn_inputs.
 
-    Thin wrapper around normalization.make_feature_normalizer (which holds the
-    method dispatch shared with the transport predictor), so fit_ds None yields
-    identity statistics with the correct pytree structure for callers about to
-    overwrite the buffers from a checkpoint.
+    Thin wrapper around normalization.make_feature_normalizer
+    (which holds the method dispatch shared with the transport predictor),
+    so fit_ds None yields identity statistics with the correct pytree structure
+    for callers about to overwrite the buffers from a checkpoint.
     """
     fit_data = None if fit_ds is None else feature_fit_arrays(fit_ds, nn_input_matrix(fit_ds))
     return make_feature_normalizer(method, fit_data, n_devices, N_NN_INPUTS)
@@ -352,7 +351,8 @@ def kmeans_initial_guess(
     te_data = te_data.transpose(sample_dim, ...)
     ne_data = ne_data.transpose(sample_dim, ...)
 
-    # Small datasets (e.g. exnihilo with 1 target shot) may have fewer samples than shapes
+    # Small datasets may have fewer samples than shapes
+    # (e.g. exnihilo with 1 target shot and it happens to only have 2 or 3 valid profile fits) 
     n_clusters = min(n_shapes, te_data.sizes[sample_dim])
     if n_clusters < n_shapes:
         logger.warning(
@@ -360,7 +360,6 @@ def kmeans_initial_guess(
         )
 
     te_kmeans = KMeans(n_clusters=n_clusters, random_state=seed).fit(te_data.values)
-
     ne_kmeans = KMeans(n_clusters=n_clusters, random_state=seed).fit(ne_data.values)
 
     te_shapes = [
@@ -375,7 +374,8 @@ def kmeans_initial_guess(
 def pca_initial_guess(n_shapes: int, te_data: xr.DataArray, ne_data: xr.DataArray, sample_dim: str):
     from xeofs.single import EOF
 
-    # Small datasets (e.g. exnihilo with 1 target shot) may have fewer samples than shapes
+    # Small datasets may have fewer samples than shapes
+    # (e.g. exnihilo with 1 target shot and it happens to only have 2 or 3 valid profile fits) 
     n_modes = min(n_shapes, te_data.sizes[sample_dim])
     if n_modes < n_shapes:
         logger.warning(
@@ -548,11 +548,11 @@ class ProfilePredictorReservoir(ProfilePredictor):
     """Reservoir computing (echo state network) profile predictor.
 
     Same input/output contract as ProfilePredictorUnstructuredNN, but instead of an MLP
-    the physics inputs are expanded through a fixed random reservoir. The reservoir
-    state is iterated to a washed-out state with a leaky tanh update, and only the
-    linear readout (self.nn, an RtdMLP with depth=0) is trained. The reservoir weights
-    (w_in, w_res, res_bias) are drawn once at init and kept frozen by the trainable
-    getter, which only exposes self.nn leaves.
+    the physics inputs are expanded through a fixed random reservoir.
+    The reservoir state is iterated to a washed-out state with a leaky tanh update,
+    and only the linear readout (self.nn, an RtdMLP with depth=0) is trained.
+    The reservoir weights (w_in, w_res, res_bias) are drawn once at init
+    and kept frozen by the trainable getter, which only exposes self.nn leaves.
     """
 
     w_in: Array  # Fixed random input weights (reservoir_size, 10)
@@ -579,8 +579,9 @@ class ProfilePredictorReservoir(ProfilePredictor):
         self.w_in = input_scaling * jax.random.uniform(key_in, (reservoir_size, N_NN_INPUTS), minval=-1.0, maxval=1.0)
         w_res = jax.random.normal(key_res, (reservoir_size, reservoir_size))
         # Rescale recurrent weights to the requested spectral radius so the state
-        # update is contracting (echo state property). Done with numpy at init time
-        # since general eigvals is host-side anyway.
+        # update is contracting (echo state property)
+        # Done with numpy at init time since general eigvals is host-side anyway.
+        # TODO(ZanderKeith): double check this
         eig_max = float(np.max(np.abs(np.linalg.eigvals(np.asarray(w_res)))))
         self.w_res = w_res * (spectral_radius / eig_max)
         self.res_bias = input_scaling * jax.random.uniform(key_bias, (reservoir_size,), minval=-1.0, maxval=1.0)

@@ -333,8 +333,8 @@ class TransportPredictorTRB(TrainRunBuilder):
                 loss = loss + anchor_weight * jnp.mean(sample_weights * anchor_errors)
                 diverged = diverged | ~anchor_finite
 
-            # Divergence penalty, deliberately OUTSIDE the freshness mask: a
-            # rollout that went non-finite is broken whether or not those
+            # Divergence penalty, deliberately OUTSIDE the freshness mask:
+            # a rollout that went non-finite is broken whether or not those
             # timeslices happened to carry a fresh profile measurement, and
             # masking it would let a fully diverged run score as though the
             # stale slices simply did not count.
@@ -345,9 +345,7 @@ class TransportPredictorTRB(TrainRunBuilder):
             # by NaN-masking left train/nan_skip_fraction at 0, and the sweep
             # metric val/loss.mean never saw the divergence at all - so the
             # bayes sweep was free to walk into the divergent high-lr corner
-            # and did (2026-07-26: 93% of trials above lr0 1e-3 diverged, and
-            # those trials scored BEST). Charging it here makes both the
-            # trained-on objective and the sweep metric reflect it.
+            # TODO(ZanderKeith): This deserves a revisit
             divergence_penalty = loss_config["divergence_penalty"]
             loss = loss + divergence_penalty * jnp.mean(sample_weights * diverged.astype(loss.dtype))
 

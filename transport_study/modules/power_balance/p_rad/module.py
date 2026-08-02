@@ -10,15 +10,12 @@ from transport_study.modules.normalization import InputNormalizer
 class RadiatedPower(TimeIndepModule):
     """Model that predicts radiated power from plasma parameters.
 
-    P_rad = ne20 * softplus(network), i.e. the network predicts a positive
-    per-density radiation factor. Positive by construction with no upper
-    bound: a hard ceiling saturates its gradient at the rail, which left
-    railed predictions unrecoverable during transfer fine-tuning.
+    P_rad = ne20 * softplus(network),
+    i.e. the network predicts a positive per-density radiation factor
 
-    Consumes PHYSICAL inputs and normalizes them internally with its own
-    normalizer, so its NN weights and normalization statistics always travel
-    together through checkpoints (standalone training, submodule restore, and
-    transfer learning all round-trip both).
+    Consumes PHYSICAL inputs and normalizes them internally with its own normalizer,
+    so its NN weights and normalization statistics always travel together through checkpoints
+    (standalone training, submodule restore, and transfer learning all round-trip both)
     """
 
     nn: eqx.Module

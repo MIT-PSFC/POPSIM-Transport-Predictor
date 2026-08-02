@@ -30,17 +30,10 @@ def make_transport_torax_config(transport_model: str) -> dict:
     # from measured profiles floored at TE_SEED_FLOOR_KEV / NE_SEED_FLOOR_20,
     # so plasma-initiation timeslices arrive largely flat at those floors and
     # hit the first case, while record-pressure timeslices hit the second.
-    # Source ablation over the offending segments (2026-07-26): dropping this
-    # single source takes them 5 -> 0, while ablating ohmic / bremsstrahlung /
-    # ei_exchange / current evolution changes nothing (removing ohmic is much
-    # worse, 5 -> 139, since ohmic heating is what lifts these plasmas off the
-    # floor). Solver budget, torax_state, and the chi / D / V clips were all
-    # ruled out first and none of them move the count.
     #
     # Physically cheap to lose: cyclotron losses scale ~ B^2 and matter for
     # high-field reactor plasmas, not for MAST at ~0.66 T (utterly negligible)
-    # or C-Mod at a few keV (small). Preferred over patching the TORAX
-    # submodule, whose working-tree guards do not survive a submodule update.
+    # or C-Mod at a few keV (small).
     torax_config["sources"].pop("cyclotron_radiation", None)
     torax_config["numerics"].update(
         {

@@ -96,6 +96,7 @@ class ProfilePredictorTRB(TrainRunBuilder):
         # Transfer pretrain fits the normalizer on more data than it trains on
         # (historic + target shots). model_init reads this attribute off the
         # train dataloader, every other case fits on train_dl.ds itself
+        # TODO(ZanderKeith): Must be *extremely clear* about why you're doing this
         if normalizer_fit_ds is not None:
             train_dl.normalizer_fit_ds = normalizer_fit_ds
         # The validation set doubles as the test set (see resolve_case_datasets)
@@ -107,8 +108,8 @@ class ProfilePredictorTRB(TrainRunBuilder):
         Instantiate and return your model given a training DataLoader
         and a model config dict.
         """
-        # Stat stage (CORAL or z-score) on the dimensionless nn_inputs. Fitted
-        # from the training data only. When a transfer checkpoint will overwrite
+        # Stat stage (CORAL or z-score) on the dimensionless nn_inputs.
+        # Fitted from the training data only. When a transfer checkpoint will overwrite
         # the module anyway, skip the fit (a fit on a handful of target shots is
         # ill-conditioned and the restored stats, fitted on historic + target
         # shots by the transfer_pretrain prereq case, are the correct ones).
@@ -226,8 +227,8 @@ class ProfilePredictorTRB(TrainRunBuilder):
     # blowing up the 1/scale division
     PROFILE_SCALE_FLOOR = 1e-2
 
-    # Softening fraction for the relative-error denominator in study_results:
-    # the floor added to abs(targ) is this fraction of the profile's own peak
+    # Softening fraction for the relative-error denominator in study_results
+    # The floor added to abs(targ) is this fraction of the profile's own peak
     # (per timeslice, floored by PROFILE_SCALE_FLOOR), so it reads as the same
     # relative amount for ne (1e20 m^-3) and Te (keV) on every device instead
     # of a fixed absolute offset in mismatched units
@@ -294,8 +295,8 @@ class ProfilePredictorTRB(TrainRunBuilder):
                 return optax.huber_loss(excess, delta=huber_delta_grad)
 
             def _residual(pred, targ, sigma):
-                # Training residual: plain distance to the GP fit mean, the
-                # error bars do not soften it
+                # Training residual: plain distance to the GP fit mean,
+                # the error bars do not soften it
                 return jnp.abs(pred - targ)
         else:
 
@@ -304,9 +305,10 @@ class ProfilePredictorTRB(TrainRunBuilder):
 
             grad_err = value_err
 
-            # Down-weighting of the residual inside the measurement error bar,
-            # read strictly: a silent default here would change checkpoint
-            # selection without changing the case
+            # Down-weighting of the residual inside the measurement error bar, read strictly
+            # a silent default here would change checkpoint selection without changing the case
+            # TODO(ZanderKeith): This was a poor design choice on my part. Should be doing chi metrics.
+            # I'm reporting on chi metrics in the presentation, must update this to match
             within_error_weight = loss_config["within_error_weight"]
 
             def _residual(pred, targ, sigma):
@@ -381,10 +383,9 @@ class ProfilePredictorTRB(TrainRunBuilder):
                     # the finite-difference prediction gradients
                     return 0.5 * (arr[..., :-1] + arr[..., 1:])
 
-                # Gradient targets come from the GP-fit gradient signals when
-                # present (measured slope, smoother than differencing the
-                # values), otherwise fall back to finite differences of the
-                # value targets
+                # Gradient targets come from the GP-fit gradient signals when present
+                # (measured slope, smoother than differencing the values),
+                # otherwise fall back to finite differences of the value targets
                 if "ne20_rho_grad" in targ:
                     ne_grad_targ = _to_mid(targ["ne20_rho_grad"].data) / ne_scale
                 else:
@@ -421,11 +422,11 @@ class ProfilePredictorTRB(TrainRunBuilder):
     def get_loss_fn(loss_config: dict) -> Callable[[Any, Any], jnp.ndarray]:
         """Training loss: huber on the raw peak-normalized residual.
 
-        No error-bar softening: robustness to GP-fit noise comes from the huber
-        deltas alone. huber_delta and huber_delta_grad are swept
-        hyperparameters, so this loss must only be used for training.
-        Validation uses get_val_loss_fn, which is delta-free, so the sweep
-        metric stays comparable across delta values.
+        No error-bar softening, so robustness to GP-fit noise comes from the huber deltas alone.
+        huber_delta and huber_delta_grad are swept hyperparameters,
+        so this loss must only be used for training.
+        Validation uses get_val_loss_fn, which is delta-free,
+        so the sweep metric stays comparable across delta values.
         """
         return ProfilePredictorTRB._make_profile_loss_fn(loss_config, use_huber=True)
 
@@ -446,8 +447,8 @@ class ProfilePredictorTRB(TrainRunBuilder):
 
     @staticmethod
     def get_optimizer(optimizer_config: dict) -> optax.GradientTransformation:
-        # Standard AdamW plus a global-norm cap: the differentiated TORAX
-        # solve can spike gradients and NaN a run without it
+        # Standard AdamW plus a global-norm cap
+        # the differentiated TORAX solve can spike gradients and NaN a run without it
         return optax.chain(
             optax.clip_by_global_norm(optimizer_config.get("grad_clip_max_norm", 1.0)),
             make_exponential_adamw(optimizer_config),
@@ -458,8 +459,9 @@ class ProfilePredictorTRB(TrainRunBuilder):
         """Optionally return a function that takes in the trainable parameters of your model and returns the trainable parameters."""
 
         def get_trainable_shape_init(module: ProfilePredictorShapeInit):
-            # The normalizer statistics are never trainable, the shapes only
-            # when freeze_shapes is off. Everything else trains.
+            # The normalizer statistics are never trainable,
+            # the shapes only trainable when freeze_shapes is off
+            # Everything else trains.
             if model_init_config["freeze_shapes"]:
                 frozen = (module.te_shapes, module.ne_shapes, module.normalizer)
             else:
@@ -537,10 +539,11 @@ class ProfilePredictorTRB(TrainRunBuilder):
                 squeeze_dims = [d for d, n in da.sizes.items() if n == 1 and d not in protected_dims]
                 if squeeze_dims:
                     da = da.squeeze(dim=squeeze_dims, drop=True)
-                # Time-dependent dataloaders suffix every input-side dim (the
-                # transport study reuses this suite): rename them back
-                # (time_idx_input -> time_idx, rho_input -> rho) so targets and
-                # predictions share one grid. No-op for time-independent evals.
+                # Time-dependent dataloaders suffix every input-side dim
+                # (the transport study reuses this suite)
+                # rename them back (time_idx_input -> time_idx, rho_input -> rho)
+                # so targets and predictions share one grid
+                # No-op for time-independent evals.
                 renames = {d: d.removesuffix("_input") for d in da.dims if isinstance(d, str) and d.endswith("_input")}
                 if renames:
                     da = da.rename(renames)
@@ -554,10 +557,10 @@ class ProfilePredictorTRB(TrainRunBuilder):
 
             def _ensure_rho_dim(pred: xr.DataArray, targ: xr.DataArray) -> xr.DataArray:
                 # Time-dependent stepper outputs are bare arrays whose profile
-                # axis gets a generic auto-generated dim name (the transport
-                # study reuses this suite). Identify it as the one dim the
-                # target does not have and rename it, so the error math never
-                # silently outer-broadcasts pred rho against targ rho
+                # axis gets a generic auto-generated dim name
+                # (the transport study reuses this suite)
+                # Identify it as the one dim the target does not have and rename it,
+                # so the error math never silently outer-broadcasts pred rho against targ rho
                 if "rho" in pred.dims:
                     return pred
                 extra = [d for d in pred.dims if d not in targ.dims]

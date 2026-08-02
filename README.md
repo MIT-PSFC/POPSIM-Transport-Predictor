@@ -143,4 +143,4 @@ And if you do, please cite the preprint on arXiv `TODO(ZanderKeith)` put that re
 
 # Generative AI Disclosure
 
-Github Copilot and Claude Code were used for code completion, snippet generation, and code review. However, the results of this were carefully vetted. A human has read and understands every line in this repo.
+Github Copilot and Claude Code were used for code completion, snippet generation, and code review. However, the results of this were carefully vetted. A human has read and understands every line in this repo (except for plots, which were fully vibe coded).

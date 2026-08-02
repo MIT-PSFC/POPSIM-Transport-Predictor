@@ -130,8 +130,8 @@ TORAX_TRANSPORT_BLOCKS = {
 
 # TORAX config skeleton shared by the torax-backed profile predictor and, with
 # a one-step numerics override, the torax-backed transport predictor, whose
-# builder lives in the transport_predictor train_configs module. The
-# "transport" block is filled per transport model from TORAX_TRANSPORT_BLOCKS.
+# builder lives in the transport_predictor train_configs module.
+# The "transport" block is filled per transport model from TORAX_TRANSPORT_BLOCKS.
 TORAX_CONFIG_BASE: dict[str, Any] = {
     "profile_conditions": {
         "Ip": 9999,  # Overridden by dataloader input
@@ -207,23 +207,16 @@ TORAX_CONFIG_BASE: dict[str, Any] = {
     "solver": {
         # INERT with the solver this config selects. TORAX only applies the
         # Pereverzev-Corrigan terms in the NONLINEAR (Newton-Raphson) solver,
-        # to build its optional initial guess from a linear solve - see the
-        # use_pereverzev docstring in torax._src.solver.pydantic_model. No
-        # solver_type is set here, so this is a bare LinearThetaMethod and the
-        # flag does nothing: every chi_face_*_pereverzev / d_face_el_pereverzev
-        # / v_face_el_pereverzev term measured out as identically zero on both
-        # healthy and diverging samples (2026-07-26 trace probe).
-        # Kept True only so the intent survives if the solver is ever switched
-        # to newton_raphson, which is what it would take to actually get the
-        # stabilization the gradient-dependent models (stiff CGM, BgB chi
-        # driven by the evolving gradients) would otherwise want at large
-        # fixed steps. Do NOT rely on this flag for stability as written.
+        # to build its optional initial guess from a linear solve
+        # No solver_type is set here, so this is a bare LinearThetaMethod
+        # Do NOT rely on this flag for stability as written.
         "use_pereverzev": True,
         "use_predictor_corrector": True,
         # Picard iterations run n_corrector_steps + 1 times with no early exit.
         # Benchmarked at the 20ms dt above: 1/2/4/8 corrector steps all
         # converge to mean-best val losses within the seed spread, so extra
         # iterations buy nothing. 1 is the minimum TORAX accepts
+        # TODO(ZanderKeith): Is this the closest we can get to an Euler step in TORAX?
         "n_corrector_steps": 1,
     },
     "time_step_calculator": {"calculator_type": "fixed"},
