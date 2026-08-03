@@ -294,7 +294,7 @@ class MASTDataWorkflow(DataWorkflow):
         # {signal: max_value}: once any of these exceeds its threshold the shot is
         # cut from 10ms before to the end (transient event, see filter_ds)
         self.transient_filter_config = {
-            "P_rad_MW": 3,  # Just vibes
+            "P_rad_MW": 3,  # Purely empirical
             "P_oh_MW": 5,  # Shot 29153 at t ~3.8s
         }
         # Early campaign MAST shots
