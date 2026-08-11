@@ -34,9 +34,7 @@ dev = [
     "yamllint>=1.37.1",
 ]
 
-gpu-orcd = [
-    "jax[cuda13]>=0.8.1,<0.9",
-]
+gpu = ["jax[cuda13]>=0.10.0,<0.12"]
 
 [tool.isort]
 profile = "black"
@@ -48,11 +46,6 @@ packages = ["transport_study"]
 disruption-py = { path = "./submodules/disruption-py", editable = true }
 popsim = { path = "./submodules/popsim-public", editable = true }
 torax = { path = "./submodules/torax", editable = true }
-
-[tool.uv]
-override-dependencies = [
-  "jax[cuda13]>=0.8.1,<0.9",
-]
 
 [tool.hatch.build.targets.sdist]
 include = ["transport_study"]
