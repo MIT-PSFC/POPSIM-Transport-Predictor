@@ -1,4 +1,5 @@
 import dataclasses
+from collections.abc import Mapping
 
 import equinox as eqx
 import jax
@@ -46,7 +47,8 @@ SOURCE_COEFFICIENT_NAMES = (
 # S_total a softplus multiple of particle_inventory / TAU_REF
 TAU_REF_S = 0.05
 
-# TORAX transport.model_name expected in the torax_config for each transport model
+# TORAX sub-model name expected inside the combined transport wrapper
+# (torax_config.transport.transport_models[0].model_name) for each transport model
 TORAX_TRANSPORT_MODEL_NAMES = {
     "constant": "constant",
     "cgm": "CGM",
@@ -440,6 +442,9 @@ def _run_loop_jit_with_geo(
       - Skips the per-step history buffers (we only need the final state)
       - Optionally wraps the body in jax.checkpoint so reverse-mode AD recomputes
         per-step activations rather than storing all max_steps copies.
+    The upstream signature changed at TORAX v1.4.3 (it now builds its own
+    initial state and takes no geometry override), so this copy still cannot
+    be replaced by the upstream loop.
     """
 
     def cond(carry):
@@ -563,10 +568,65 @@ def bound_transport_coefficients(transport_model: str, nn_transport_out: jax.Arr
         }
 
 
+def _resolve_provider_node(provider, path: str):
+    """Node at a dotted path, extending torax get_node_from_path with sequence indices.
+
+    Upstream RuntimeParamsProvider.get_node_from_path only traverses Mapping
+    keys and attributes, so it cannot reach into the combined transport
+    wrapper's transport_models list. Integer path segments index sequences.
+    """
+    x = provider
+    for part in path.split("."):
+        if part.isdigit():
+            x = x[int(part)]
+        elif isinstance(x, Mapping) and part in x:
+            x = x[part]
+        else:
+            x = getattr(x, part)
+    return x
+
+
+def update_provider_from_paths(provider, mapping: dict):
+    """Single jit-safe update_provider call from a dict of dotted paths.
+
+    Drop-in replacement for provider.update_provider_from_mapping that also
+    supports integer segments (transport_model.transport_models.0.alpha).
+    One eqx.tree_at application, same cost as the upstream mapping form.
+    """
+    keys = tuple(mapping)
+    return provider.update_provider(
+        lambda p: tuple(_resolve_provider_node(p, key) for key in keys),
+        tuple(mapping.values()),
+    )
+
+
+def validate_transport_model_name(torax_config: ToraxConfig, transport_model: str) -> None:
+    """Check the combined transport wrapper holds exactly the expected sub-model.
+
+    torax_config.transport is always the combined wrapper in the new TORAX
+    schema, and the NN knob paths address transport_models[0], so exactly one
+    sub-model of the expected type must be configured. Also catches the
+    silent TORAX default: a transport dict without model_name is wrapped as
+    combined with a single constant sub-model.
+    """
+    expected = TORAX_TRANSPORT_MODEL_NAMES[transport_model]
+    sub_names = [m.model_name for m in torax_config.transport.transport_models]
+    if torax_config.transport.model_name != "combined" or sub_names != [expected]:
+        raise ValueError(
+            f"transport_model '{transport_model}' requires a combined transport wrapper "
+            f"with exactly one '{expected}' sub-model, got model_name "
+            f"'{torax_config.transport.model_name}' with sub-models {sub_names}"
+        )
+
+
 def transport_provider_mapping(transport_model: str, coeffs: dict) -> dict:
     """Runtime-params override entries for the configured transport model.
 
-    Shared by the profile and transport predictor TORAX modules.
+    Shared by the profile and transport predictor TORAX modules. Keys are
+    dotted provider paths whose "0" segment indexes the single sub-model
+    inside the combined transport wrapper; apply the returned dict with
+    update_provider_from_paths (upstream update_provider_from_mapping cannot
+    index into the transport_models list).
     """
 
     def scalar(name: str) -> torax_experimental.TimeVaryingScalarUpdate:
@@ -587,40 +647,40 @@ def transport_provider_mapping(transport_model: str, coeffs: dict) -> dict:
             )
 
         return {
-            "transport_model.chi_i": flat_profile("chi_i"),
-            "transport_model.chi_e": flat_profile("chi_e"),
-            "transport_model.D_e": flat_profile("D_e"),
-            "transport_model.V_e": flat_profile("V_e"),
+            "transport_model.transport_models.0.chi_i": flat_profile("chi_i"),
+            "transport_model.transport_models.0.chi_e": flat_profile("chi_e"),
+            "transport_model.transport_models.0.D_e": flat_profile("D_e"),
+            "transport_model.transport_models.0.V_e": flat_profile("V_e"),
         }
     elif transport_model == "cgm":
         return {
-            "transport_model.chi_e_i_ratio": scalar("chi_e_i_ratio"),
-            "transport_model.chi_D_ratio": scalar("chi_D_ratio"),
-            "transport_model.VR_D_ratio": scalar("VR_D_ratio"),
+            "transport_model.transport_models.0.chi_e_i_ratio": scalar("chi_e_i_ratio"),
+            "transport_model.transport_models.0.chi_D_ratio": scalar("chi_D_ratio"),
+            "transport_model.transport_models.0.VR_D_ratio": scalar("VR_D_ratio"),
             # Plain float leaves in the provider: replaced with traced scalars
             # directly rather than via TimeVaryingScalarUpdate
-            "transport_model.alpha": jnp.squeeze(coeffs["alpha"]),
-            "transport_model.chi_stiff": jnp.squeeze(coeffs["chi_stiff"]),
+            "transport_model.transport_models.0.alpha": jnp.squeeze(coeffs["alpha"]),
+            "transport_model.transport_models.0.chi_stiff": jnp.squeeze(coeffs["chi_stiff"]),
         }
     elif transport_model == "gyrobohm":
         # Same NN multiplier applied to both species: the BGB model already
         # fixes chi_i_B = 2 * chi_e_B and chi_i_gB = 0.5 * chi_e_gB
         return {
-            "transport_model.chi_e_bohm_multiplier": scalar("chi_bohm_multiplier"),
-            "transport_model.chi_i_bohm_multiplier": scalar("chi_bohm_multiplier"),
-            "transport_model.chi_e_gyrobohm_multiplier": scalar("chi_gyrobohm_multiplier"),
-            "transport_model.chi_i_gyrobohm_multiplier": scalar("chi_gyrobohm_multiplier"),
-            "transport_model.D_face_c1": scalar("D_face_c1"),
-            "transport_model.D_face_c2": scalar("D_face_c2"),
-            "transport_model.V_face_coeff": scalar("V_face_coeff"),
+            "transport_model.transport_models.0.chi_e_bohm_multiplier": scalar("chi_bohm_multiplier"),
+            "transport_model.transport_models.0.chi_i_bohm_multiplier": scalar("chi_bohm_multiplier"),
+            "transport_model.transport_models.0.chi_e_gyrobohm_multiplier": scalar("chi_gyrobohm_multiplier"),
+            "transport_model.transport_models.0.chi_i_gyrobohm_multiplier": scalar("chi_gyrobohm_multiplier"),
+            "transport_model.transport_models.0.D_face_c1": scalar("D_face_c1"),
+            "transport_model.transport_models.0.D_face_c2": scalar("D_face_c2"),
+            "transport_model.transport_models.0.V_face_coeff": scalar("V_face_coeff"),
         }
     else:  # qlknn
         # Plain float leaves in the provider (like cgm alpha and chi_stiff):
         # replaced with traced scalars directly
         return {
-            "transport_model.ITG_flux_ratio_correction": jnp.squeeze(coeffs["ITG_flux_ratio_correction"]),
-            "transport_model.ETG_correction_factor": jnp.squeeze(coeffs["ETG_correction_factor"]),
-            "transport_model.collisionality_multiplier": jnp.squeeze(coeffs["collisionality_multiplier"]),
+            "transport_model.transport_models.0.ITG_flux_ratio_correction": jnp.squeeze(coeffs["ITG_flux_ratio_correction"]),
+            "transport_model.transport_models.0.ETG_correction_factor": jnp.squeeze(coeffs["ETG_correction_factor"]),
+            "transport_model.transport_models.0.collisionality_multiplier": jnp.squeeze(coeffs["collisionality_multiplier"]),
         }
 
 
@@ -701,24 +761,29 @@ class ProfilePredictorTorax(TimeIndepModule):
         if isinstance(torax_config, dict):
             torax_config = ToraxConfig.from_dict(torax_config)
 
-        expected_model_name = TORAX_TRANSPORT_MODEL_NAMES[transport_model]
-        if torax_config.transport.model_name != expected_model_name:
-            raise ValueError(
-                f"transport_model '{transport_model}' requires torax_config transport.model_name "
-                f"'{expected_model_name}', got '{torax_config.transport.model_name}'"
-            )
+        validate_transport_model_name(torax_config, transport_model)
 
         self.step_fn = torax_experimental.make_step_fn(torax_config)
         # Coerce to tuple: arrays in static fields break pytree metadata
         # equality (ambiguous truth value) when two module instances coexist
         self.rhogrid = tuple(np.asarray(rhogrid).tolist())
 
+        # Harvest the static grid structure from the config-built placeholder
+        # geometry (a cached lookup, the provider is a ConstantGeometryProvider
+        # built at config validation). Per-sample geometry is rebuilt from
+        # traced inputs inside build_provider_and_geo, but the mesh and hires
+        # grids must be CONCRETE there: Grid1D is a pydantic object constructed
+        # at trace time and the grids fix array shapes, so traced values would
+        # retrace every call. Stored as tuples because static eqx fields must
+        # be hashable (arrays break pytree metadata equality). Harvesting from
+        # the built geometry rather than rederiving from n_rho/hires_factor
+        # keeps us exact under TORAX's non-uniform face_centers support.
         static_geo = self.step_fn.geometry_provider(0.0)
         self._face_centers = tuple(static_geo.torax_mesh.face_centers.tolist())
         self._rho_hires_norm = tuple(np.array(static_geo.rho_hires_norm).tolist())
 
         # With the fixed time-step calculator, steps to cover t_final are
-        # deterministic: ceil((t_final - t_initial) / fixed_dt)
+        # deterministic: ceil((t_final - t_initial) / fixed_dt) # noqa: ERA001
         # Add 1 for the clipped final step that lands exactly on t_final
         numerics = self.step_fn.runtime_params_provider.numerics
         fixed_dt = float(numerics.fixed_dt.get_value(0.0))
@@ -873,7 +938,7 @@ class ProfilePredictorTorax(TimeIndepModule):
             "sources.generic_heat.electron_heat_fraction": electron_heat_fraction_update,
         }
         mapping.update(transport_provider_mapping(self.transport_model, coeffs))
-        new_provider = self.step_fn.runtime_params_provider.update_provider_from_mapping(mapping)
+        new_provider = update_provider_from_paths(self.step_fn.runtime_params_provider, mapping)
 
         # Build JAX-differentiable geometry from per-sample inputs
         torax_mesh = torax_pydantic.Grid1D(face_centers=face_centers_np)

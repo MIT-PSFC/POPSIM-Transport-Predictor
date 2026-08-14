@@ -57,74 +57,100 @@ PROFILE_PREDICTOR_SHAPE_INIT_CONFIG = {
     },
 }
 
+# Stability clipping shared by the cgm, gyrobohm, and qlknn blocks. TORAX
+# moved chi_min/chi_max/D_e_min (and smoothing_width) from the per-model
+# configs to the top-level combined wrapper, so these are combined-level keys.
+# Subcritical CGM/BGB/QLKNN drops chi to chi_min. The TORAX default of
+# 0.05 m^2/s is near-zero transport, so ohmic heating in low-density plasmas
+# runs away within a 20 ms step and NaNs the solver. A floor of 0.3 keeps
+# some background transport, the cap bounds the stiff side.
+_STABILITY_CLIPPING = {
+    "chi_min": 0.3,
+    "chi_max": 50.0,
+    "D_e_min": 0.1,
+}
+
 # Transport blocks for the TORAX transport models the torax profile
-# predictor can be benchmarked with. Values are placeholders that must pass
-# pydantic validation; the NN-driven entries are overridden at call time.
+# predictor can be benchmarked with. Each block is a TORAX combined-model
+# wrapper holding exactly one sub-model in transport_models. Values are
+# placeholders that must pass pydantic validation; the NN-driven entries are
+# overridden at call time via transport_provider_mapping.
 TORAX_TRANSPORT_BLOCKS = {
     "constant": {
-        # Prescribed (flat) transport coefficients, all predicted by the NN.
-        "model_name": "constant",
-        "chi_i": 1.0,  # Predicted by NN
-        "chi_e": 1.0,  # Predicted by NN
-        "D_e": 1.0,  # Predicted by NN
-        "V_e": -0.33,  # Predicted by NN
+        "model_name": "combined",
+        "transport_models": [
+            {
+                # Prescribed (flat) transport coefficients, all predicted by the NN.
+                "model_name": "constant",
+                "chi_i": 1.0,  # Predicted by NN
+                "chi_e": 1.0,  # Predicted by NN
+                "D_e": 1.0,  # Predicted by NN
+                "V_e": -0.33,  # Predicted by NN
+            }
+        ],
+        # No stability clipping here: the NN bounds already floor chi and D
+        # (bound_transport_coefficients), so the combined-level TORAX defaults
+        # (chi_min 0.05, chi_max 100, D_e_min 0.05) never bind, matching the
+        # old per-model defaults.
     },
     "cgm": {
-        # Critical Gradient Model: TORAX computes the critical ion temperature
-        # gradient from the evolving state and geometry (known inputs); the NN
-        # predicts the dimensionless free parameters.
-        "model_name": "CGM",
-        "alpha": 2.0,  # Predicted by NN
-        "chi_stiff": 2.0,  # Predicted by NN
-        "chi_e_i_ratio": 2.0,  # Predicted by NN
-        "chi_D_ratio": 5.0,  # Predicted by NN
-        "VR_D_ratio": 0.0,  # Predicted by NN
-        # Subcritical CGM drops chi to chi_min. The TORAX default of 0.05 m^2/s
-        # is near-zero transport, so ohmic heating in low-density plasmas runs
-        # away within a 20 ms step and NaNs the solver.
-        # A floor of 0.3 keeps some background transport.
-        "chi_min": 0.3,
-        "chi_max": 50.0,
-        "D_e_min": 0.1,
+        "model_name": "combined",
+        "transport_models": [
+            {
+                # Critical Gradient Model: TORAX computes the critical ion temperature
+                # gradient from the evolving state and geometry (known inputs); the NN
+                # predicts the dimensionless free parameters.
+                "model_name": "CGM",
+                "alpha": 2.0,  # Predicted by NN
+                "chi_stiff": 2.0,  # Predicted by NN
+                "chi_e_i_ratio": 2.0,  # Predicted by NN
+                "chi_D_ratio": 5.0,  # Predicted by NN
+                "VR_D_ratio": 0.0,  # Predicted by NN
+            }
+        ],
+        **_STABILITY_CLIPPING,
     },
     "gyrobohm": {
-        # Bohm-GyroBohm model: TORAX computes the Bohm and GyroBohm chi terms
-        # from the evolving state and geometry; the NN predicts one multiplier
-        # per term (applied to both species) plus the particle transport
-        # weighting constants. The coeff prefactors stay at TORAX defaults.
-        "model_name": "bohm-gyrobohm",
-        "chi_e_bohm_multiplier": 1.0,  # Predicted by NN
-        "chi_i_bohm_multiplier": 1.0,  # Predicted by NN
-        "chi_e_gyrobohm_multiplier": 1.0,  # Predicted by NN
-        "chi_i_gyrobohm_multiplier": 1.0,  # Predicted by NN
-        "D_face_c1": 1.0,  # Predicted by NN
-        "D_face_c2": 0.3,  # Predicted by NN
-        "V_face_coeff": -0.1,  # Predicted by NN
-        # Same stability clipping as the cgm, floor background transport
-        # so cold low-density samples cannot run away, cap the stiff side.
-        "chi_min": 0.3,
-        "chi_max": 50.0,
-        "D_e_min": 0.1,
+        "model_name": "combined",
+        "transport_models": [
+            {
+                # Bohm-GyroBohm model: TORAX computes the Bohm and GyroBohm chi terms
+                # from the evolving state and geometry; the NN predicts one multiplier
+                # per term (applied to both species) plus the particle transport
+                # weighting constants. The coeff prefactors stay at TORAX defaults.
+                "model_name": "bohm-gyrobohm",
+                "chi_e_bohm_multiplier": 1.0,  # Predicted by NN
+                "chi_i_bohm_multiplier": 1.0,  # Predicted by NN
+                "chi_e_gyrobohm_multiplier": 1.0,  # Predicted by NN
+                "chi_i_gyrobohm_multiplier": 1.0,  # Predicted by NN
+                "D_face_c1": 1.0,  # Predicted by NN
+                "D_face_c2": 0.3,  # Predicted by NN
+                "V_face_coeff": -0.1,  # Predicted by NN
+            }
+        ],
+        **_STABILITY_CLIPPING,
     },
     "qlknn": {
-        # QLKNN surrogate of QuaLiKiz turbulent transport. model_path and
-        # qlknn_model_name left unset so fusion_surrogates loads its bundled
-        # qlknn_7_11_v1 weights.
-        "model_name": "qlknn",
-        "ITG_flux_ratio_correction": 1.0,  # Predicted by NN
-        "ETG_correction_factor": 0.333,  # Predicted by NN
-        "collisionality_multiplier": 1.0,  # Predicted by NN
-        # QLKNN is data-driven itself
-        # Clip inputs so out-of-range samples saturate instead of extrapolating
-        "clip_inputs": True,
-        "clip_margin": 0.95,
-        "DV_effective": False,
+        "model_name": "combined",
+        "transport_models": [
+            {
+                # QLKNN surrogate of QuaLiKiz turbulent transport. model_path and
+                # qlknn_model_name left unset so fusion_surrogates loads its bundled
+                # qlknn_7_11_v1 weights.
+                "model_name": "qlknn",
+                "ITG_flux_ratio_correction": 1.0,  # Predicted by NN
+                "ETG_correction_factor": 0.333,  # Predicted by NN
+                "collisionality_multiplier": 1.0,  # Predicted by NN
+                # QLKNN is data-driven itself
+                # Clip inputs so out-of-range samples saturate instead of extrapolating
+                "clip_inputs": True,
+                "clip_margin": 0.95,
+                "DV_effective": False,
+            }
+        ],
+        # Gaussian smoothing of the stiff QLKNN outputs, now a combined-level knob
         "smoothing_width": 0.1,
-        # Same stability clipping as cgm and gyrobohm blocks: subcritical QLKNN
-        # drops chi toward zero and low-density ohmic samples run away.
-        "chi_min": 0.3,
-        "chi_max": 50.0,
-        "D_e_min": 0.1,
+        **_STABILITY_CLIPPING,
     },
 }
 
@@ -205,19 +231,28 @@ TORAX_CONFIG_BASE: dict[str, Any] = {
         "generic_current": {},
     },
     "solver": {
-        # INERT with the solver this config selects. TORAX only applies the
-        # Pereverzev-Corrigan terms in the NONLINEAR (Newton-Raphson) solver,
-        # to build its optional initial guess from a linear solve
-        # No solver_type is set here, so this is a bare LinearThetaMethod
-        # Do NOT rely on this flag for stability as written.
+        # ACTIVE for the bare LinearThetaMethod this config selects: the
+        # linear solver applies the Pereverzev-Corrigan terms whenever this
+        # is True, and TORAX warns when a nonlinear transport model (CGM,
+        # qlknn) runs on a linear solver without them.
         "use_pereverzev": True,
-        "use_predictor_corrector": True,
-        # Picard iterations run n_corrector_steps + 1 times with no early exit.
-        # Benchmarked at the 20ms dt above: 1/2/4/8 corrector steps all
-        # converge to mean-best val losses within the seed spread, so extra
-        # iterations buy nothing. 1 is the minimum TORAX accepts
-        # TODO(ZanderKeith): Is this the closest we can get to an Euler step in TORAX?
-        "n_corrector_steps": 1,
+        # Single linearized solve per step, no fixed-point (Picard) corrector
+        # iterations. With theta_implicit=1.0 this is exactly one backward
+        # (implicit) Euler tridiagonal solve, the minimal Euler step TORAX
+        # offers, and now also the upstream default. The old
+        # use_predictor_corrector=True / n_corrector_steps=1 config ran one
+        # extra corrector iteration; benchmarked at the 20 ms dt above,
+        # 1/2/4/8 corrector steps all converge to mean-best val losses within
+        # the seed spread, so the iteration bought nothing.
+        "use_predictor_corrector": False,
+        # Euler toggle: 1.0 = backward (implicit) Euler, unconditionally
+        # stable at the 20 ms dt. 0.0 = forward (explicit) Euler, which
+        # violates the diffusion CFL bound dt <= dx^2 / (2 chi) by 3 to 5
+        # orders of magnitude at this dt and grid (dx ~ a/50, so the bound is
+        # ~0.01 ms at chi = 1 m^2/s) and is expected to blow up. Kept as a
+        # knob (see make_profile_predictor_torax_config) for demonstrating
+        # exactly that.
+        "theta_implicit": 1.0,
     },
     "time_step_calculator": {"calculator_type": "fixed"},
     "neoclassical": {},
@@ -279,11 +314,20 @@ _PROFILE_PREDICTOR_TORAX_CONFIG_BASE: dict[str, Any] = {
 }
 
 
-def make_profile_predictor_torax_config(transport_model: str, geometry_builder: str = "circular", delta_exponent: float = 2.0) -> dict:
+def make_profile_predictor_torax_config(
+    transport_model: str,
+    geometry_builder: str = "circular",
+    delta_exponent: float = 2.0,
+    theta_implicit: float = 1.0,
+) -> dict:
     """Train config for the torax profile predictor with the given transport model.
 
     transport_model is one of "constant", "cgm", "gyrobohm", "qlknn"
     the corresponding model_type is "torax-<transport_model>".
+    theta_implicit selects the Euler step: 1.0 (default) is backward
+    (implicit) Euler, 0.0 is forward (explicit) Euler, which violates the
+    diffusion CFL bound at the configured dt and is only useful for
+    demonstrating the blowup. Not a study axis.
     """
     if transport_model not in TORAX_TRANSPORT_BLOCKS:
         raise ValueError(f"Unknown transport model '{transport_model}', valid: {sorted(TORAX_TRANSPORT_BLOCKS)}")
@@ -291,6 +335,7 @@ def make_profile_predictor_torax_config(transport_model: str, geometry_builder: 
     cfg["project"] = f"profile_predictor_torax_{transport_model}"
     cfg["model_init_config"]["model_type"] = f"torax-{transport_model}"
     cfg["model_init_config"]["torax_config"]["transport"] = copy.deepcopy(TORAX_TRANSPORT_BLOCKS[transport_model])
+    cfg["model_init_config"]["torax_config"]["solver"]["theta_implicit"] = theta_implicit
     cfg["model_init_config"]["geometry_builder"] = geometry_builder
     cfg["model_init_config"]["delta_exponent"] = delta_exponent
     return cfg

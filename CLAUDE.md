@@ -110,7 +110,7 @@ The GP-fitting devices (C-Mod, MAST) implement the distributed-fitting interface
 - `orchestration/study.py`: `CaseGridConfig(StudyConfig)` shared base for study configs (training_datasets, domain_adaptation_methods, target_test_set_size, hyperparam_domain_adaptation, hyperparam_num_target_shots, dataset_fractions, from_toml/save) plus the shared `is_compatible` config-lock check, which compares study identity and the hyperparam fields listed in the per-study `COMPAT_HYPERPARAM_FIELDS` ClassVar (case-grid axes like model_types may differ between runs); each study nests its own `Config(CaseGridConfig)` adding model_types and its study-specific hyperparam fields. `HYPERPARAM_TARGET_SHOTS` also lives in study.py (power_balance_study re-exports it)
 - Per-device `config.toml` files in each dataset subfolder
 - `pyproject.toml`: dependencies, build (hatchling), tooling config
-- GPU group: `uv sync --group gpu-orcd` for JAX CUDA 13 support
+- GPU group: `uv sync --group gpu` for JAX CUDA 13 support
 
 ### Data Schema
 

@@ -38,13 +38,14 @@ from transport_study.modules.profile_predictor.module import (
 )
 from transport_study.modules.profile_predictor.torax_module import (
     TAU_REF_S,
-    TORAX_TRANSPORT_MODEL_NAMES,
     TRANSPORT_COEFFICIENT_NAMES,
     bound_transport_coefficients,
     build_circular_geometry_jax,
     build_miller_geometry_jax,
     clamp_core_profiles,
     transport_provider_mapping,
+    update_provider_from_paths,
+    validate_transport_model_name,
 )
 
 # Positivity floor for the profile outputs, ne [1e20 m^-3] and te [keV]
@@ -621,18 +622,17 @@ class TransportPredictorToraxBase(TransportPredictor):
         if isinstance(torax_config, dict):
             torax_config = ToraxConfig.from_dict(torax_config)
 
-        expected_model_name = TORAX_TRANSPORT_MODEL_NAMES[transport_model]
-        if torax_config.transport.model_name != expected_model_name:
-            raise ValueError(
-                f"transport_model '{transport_model}' requires torax_config transport.model_name "
-                f"'{expected_model_name}', got '{torax_config.transport.model_name}'"
-            )
+        validate_transport_model_name(torax_config, transport_model)
 
         self.step_fn = torax_experimental.make_step_fn(torax_config)
         # Coerce to tuple: arrays in static fields break pytree metadata
         # equality (ambiguous truth value) when two module instances coexist
         self.rhogrid = tuple(np.asarray(rhogrid).tolist())
 
+        # Static grid structure harvested once from the config-built
+        # placeholder geometry, needed as concrete hashable values for the
+        # per-sample jnp geometry rebuild. See the matching harvest in
+        # ProfilePredictorTorax.__init__ for the full rationale.
         static_geo = self.step_fn.geometry_provider(0.0)
         self._face_centers = tuple(static_geo.torax_mesh.face_centers.tolist())
         self._rho_hires_norm = tuple(np.array(static_geo.rho_hires_norm).tolist())
@@ -783,7 +783,7 @@ class TransportPredictorToraxBase(TransportPredictor):
             mapping["profile_conditions.T_i"] = t_ic_update
             mapping["profile_conditions.n_e"] = n_ic_update
         mapping.update(transport_provider_mapping(self.transport_model, coeffs))
-        new_provider = self.step_fn.runtime_params_provider.update_provider_from_mapping(mapping)
+        new_provider = update_provider_from_paths(self.step_fn.runtime_params_provider, mapping)
 
         # Build JAX-differentiable geometry from per-sample inputs
         face_centers_np = np.array(self._face_centers)
