@@ -1,5 +1,4 @@
 import dataclasses
-from collections.abc import Mapping
 
 import equinox as eqx
 import jax
@@ -47,10 +46,10 @@ SOURCE_COEFFICIENT_NAMES = (
 # S_total a softplus multiple of particle_inventory / TAU_REF
 TAU_REF_S = 0.05
 
-# TORAX sub-model name expected inside the combined transport wrapper
-# (torax_config.transport.transport_models[0].model_name) for each transport model
+# TORAX model_name of the single core transport model each transport model's config holds,
+# at torax_config.transport.core_transport_models[transport_model]
 TORAX_TRANSPORT_MODEL_NAMES = {
-    "constant": "constant",
+    "constant": "prescribed",
     "cgm": "CGM",
     "gyrobohm": "bohm-gyrobohm",
     "qlknn": "qlknn",
@@ -430,30 +429,25 @@ def _run_loop_jit_with_geo(
     geo_provider,
     max_steps: int,
     debug: bool = False,
-    wrap_body_in_checkpoint: bool = False,
 ):
-    """Local copy of torax_experimental.run_loop_jit that also accepts geo_overrides.
+    """Local copy of torax._src.orchestration.jit_run_loop.run_loop_jit that accepts a geometry override.
 
-    Mirrors torax._src.orchestration.jit_run_loop.run_loop_jit
-    (the recommended fully-JITted simulation loop pattern from the TORAX docs)
-    Modified in the following way:
-      - Accepts a geo_overrides argument so per-sample geometry can be passed in
-        without retracing the outer step_fn
-      - Skips the per-step history buffers (we only need the final state)
-      - Optionally wraps the body in jax.checkpoint so reverse-mode AD recomputes
-        per-step activations rather than storing all max_steps copies.
-    The upstream signature changed at TORAX v1.4.3 (it now builds its own
-    initial state and takes no geometry override), so this copy still cannot
-    be replaced by the upstream loop.
+    The upstream loop builds its own initial state and takes no geo_overrides,
+    so per-sample geometry cannot reach it.
+    Differences from upstream:
+      - initial state and geometry provider are passed in
+      - every step is clamped (clamp_core_profiles) before the next one
+      - only the final state is returned
+    while_loop_bounded enforces max_steps and its custom VJP reruns each step's
+    vjp from the stored per-step history, so reverse mode already stores states, not activations.
     """
 
     def cond(carry):
-        i, current_state, _ = carry
-        is_done = step_fn.is_done(current_state.t)
-        return jnp.logical_and(i < max_steps, jnp.logical_not(is_done))
+        current_state, _ = carry
+        return jnp.logical_not(step_fn.is_done(current_state.t))
 
     def body(carry):
-        i, prev_state, prev_post = carry
+        prev_state, prev_post = carry
         current_state, post_processed = step_fn(
             prev_state,
             prev_post,
@@ -464,8 +458,7 @@ def _run_loop_jit_with_geo(
         cp = current_state.core_profiles
         if debug:
             jax.debug.print(
-                "[scan i={i}] t={t} dt={dt} err={err} Te[min,max]=[{te_lo},{te_hi}] ne[min,max]=[{ne_lo},{ne_hi}]",
-                i=i,
+                "[loop] t={t} dt={dt} err={err} Te[min,max]=[{te_lo},{te_hi}] ne[min,max]=[{ne_lo},{ne_hi}]",
                 t=current_state.t,
                 dt=current_state.dt,
                 err=current_state.solver_numeric_outputs.solver_error_state,
@@ -474,17 +467,15 @@ def _run_loop_jit_with_geo(
                 ne_lo=cp.n_e.value.min(),
                 ne_hi=cp.n_e.value.max(),
             )
-        return i + 1, current_state, post_processed
+        return current_state, post_processed
 
-    if wrap_body_in_checkpoint:
-        body = jax.checkpoint(body, prevent_cse=False)
-
-    _, output_state, post_processed = torax_jax_utils.while_loop_bounded(
+    final_carry, _num_steps, _history = torax_jax_utils.while_loop_bounded(
         cond,
         body,
-        (0, input_state, previous_post_processed_outputs),
+        (input_state, previous_post_processed_outputs),
         max_steps,
     )
+    output_state, post_processed = final_carry
     return output_state, post_processed
 
 
@@ -568,76 +559,40 @@ def bound_transport_coefficients(transport_model: str, nn_transport_out: jax.Arr
         }
 
 
-def _resolve_provider_node(provider, path: str):
-    """Node at a dotted path, extending torax get_node_from_path with sequence indices.
-
-    Upstream RuntimeParamsProvider.get_node_from_path only traverses Mapping
-    keys and attributes, so it cannot reach into the combined transport
-    wrapper's transport_models list. Integer path segments index sequences.
-    """
-    x = provider
-    for part in path.split("."):
-        if part.isdigit():
-            x = x[int(part)]
-        elif isinstance(x, Mapping) and part in x:
-            x = x[part]
-        else:
-            x = getattr(x, part)
-    return x
-
-
-def update_provider_from_paths(provider, mapping: dict):
-    """Single jit-safe update_provider call from a dict of dotted paths.
-
-    Drop-in replacement for provider.update_provider_from_mapping that also
-    supports integer segments (transport_model.transport_models.0.alpha).
-    One eqx.tree_at application, same cost as the upstream mapping form.
-    """
-    keys = tuple(mapping)
-    return provider.update_provider(
-        lambda p: tuple(_resolve_provider_node(p, key) for key in keys),
-        tuple(mapping.values()),
-    )
-
-
 def validate_transport_model_name(torax_config: ToraxConfig, transport_model: str) -> None:
-    """Check the combined transport wrapper holds exactly the expected sub-model.
+    """Check the TORAX transport config holds exactly the core model transport_model expects.
 
-    torax_config.transport is always the combined wrapper in the new TORAX
-    schema, and the NN knob paths address transport_models[0], so exactly one
-    sub-model of the expected type must be configured. Also catches the
-    silent TORAX default: a transport dict without model_name is wrapped as
-    combined with a single constant sub-model.
+    The NN overrides address core_transport_models[transport_model] (see transport_provider_mapping),
+    so exactly that one core model of the expected type must be configured and no pedestal model.
+    Also catches the silent TORAX default,
+    a transport dict without core_transport_models gets a single prescribed core model.
     """
-    expected = TORAX_TRANSPORT_MODEL_NAMES[transport_model]
-    sub_names = [m.model_name for m in torax_config.transport.transport_models]
-    if torax_config.transport.model_name != "combined" or sub_names != [expected]:
+    expected = {transport_model: TORAX_TRANSPORT_MODEL_NAMES[transport_model]}
+    transport = torax_config.transport
+    core_names = {key: model.model_name for key, model in transport.core_transport_models.items()}
+    pedestal_keys = sorted(transport.pedestal_transport_models)
+    if core_names != expected or pedestal_keys:
         raise ValueError(
-            f"transport_model '{transport_model}' requires a combined transport wrapper "
-            f"with exactly one '{expected}' sub-model, got model_name "
-            f"'{torax_config.transport.model_name}' with sub-models {sub_names}"
+            f"transport_model '{transport_model}' requires exactly the core transport models {expected} "
+            f"and no pedestal transport models, got core {core_names} and pedestal {pedestal_keys}"
         )
 
 
 def transport_provider_mapping(transport_model: str, coeffs: dict) -> dict:
     """Runtime-params override entries for the configured transport model.
 
-    Shared by the profile and transport predictor TORAX modules. Keys are
-    dotted provider paths whose "0" segment indexes the single sub-model
-    inside the combined transport wrapper; apply the returned dict with
-    update_provider_from_paths (upstream update_provider_from_mapping cannot
-    index into the transport_models list).
+    Shared by the profile and transport predictor TORAX modules.
+    Keys are dotted provider paths into the single core transport model,
+    applied with RuntimeParamsProvider.update_provider_from_mapping.
     """
+    prefix = f"transport_model.core_transport_models.{transport_model}."
 
     def scalar(name: str) -> torax_experimental.TimeVaryingScalarUpdate:
         return torax_experimental.TimeVaryingScalarUpdate(value=coeffs[name])
 
     if transport_model == "constant":
-        # transport coeffs are radial profiles (TimeVaryingArray) in the constant model,
+        # transport coeffs are radial profiles (TimeVaryingArray) in the prescribed model,
         # so need to broadcast the NN scalar to a flat profile
-        # TODO(ZanderKeith): What would happen if we predicted more than one?
-        # Seems to me like that's just the MLP profile predictor with extra steps
-        # Might be worth investigating though
         rho = jnp.array([1.0])
 
         def flat_profile(name: str) -> torax_experimental.TimeVaryingArrayUpdate:
@@ -646,42 +601,43 @@ def transport_provider_mapping(transport_model: str, coeffs: dict) -> dict:
                 rho_norm=rho,
             )
 
-        return {
-            "transport_model.transport_models.0.chi_i": flat_profile("chi_i"),
-            "transport_model.transport_models.0.chi_e": flat_profile("chi_e"),
-            "transport_model.transport_models.0.D_e": flat_profile("D_e"),
-            "transport_model.transport_models.0.V_e": flat_profile("V_e"),
+        updates = {
+            "chi_i": flat_profile("chi_i"),
+            "chi_e": flat_profile("chi_e"),
+            "D_e": flat_profile("D_e"),
+            "V_e": flat_profile("V_e"),
         }
     elif transport_model == "cgm":
-        return {
-            "transport_model.transport_models.0.chi_e_i_ratio": scalar("chi_e_i_ratio"),
-            "transport_model.transport_models.0.chi_D_ratio": scalar("chi_D_ratio"),
-            "transport_model.transport_models.0.VR_D_ratio": scalar("VR_D_ratio"),
+        updates = {
+            "chi_e_i_ratio": scalar("chi_e_i_ratio"),
+            "chi_D_ratio": scalar("chi_D_ratio"),
+            "VR_D_ratio": scalar("VR_D_ratio"),
             # Plain float leaves in the provider: replaced with traced scalars
             # directly rather than via TimeVaryingScalarUpdate
-            "transport_model.transport_models.0.alpha": jnp.squeeze(coeffs["alpha"]),
-            "transport_model.transport_models.0.chi_stiff": jnp.squeeze(coeffs["chi_stiff"]),
+            "alpha": jnp.squeeze(coeffs["alpha"]),
+            "chi_stiff": jnp.squeeze(coeffs["chi_stiff"]),
         }
     elif transport_model == "gyrobohm":
         # Same NN multiplier applied to both species: the BGB model already
         # fixes chi_i_B = 2 * chi_e_B and chi_i_gB = 0.5 * chi_e_gB
-        return {
-            "transport_model.transport_models.0.chi_e_bohm_multiplier": scalar("chi_bohm_multiplier"),
-            "transport_model.transport_models.0.chi_i_bohm_multiplier": scalar("chi_bohm_multiplier"),
-            "transport_model.transport_models.0.chi_e_gyrobohm_multiplier": scalar("chi_gyrobohm_multiplier"),
-            "transport_model.transport_models.0.chi_i_gyrobohm_multiplier": scalar("chi_gyrobohm_multiplier"),
-            "transport_model.transport_models.0.D_face_c1": scalar("D_face_c1"),
-            "transport_model.transport_models.0.D_face_c2": scalar("D_face_c2"),
-            "transport_model.transport_models.0.V_face_coeff": scalar("V_face_coeff"),
+        updates = {
+            "chi_e_bohm_multiplier": scalar("chi_bohm_multiplier"),
+            "chi_i_bohm_multiplier": scalar("chi_bohm_multiplier"),
+            "chi_e_gyrobohm_multiplier": scalar("chi_gyrobohm_multiplier"),
+            "chi_i_gyrobohm_multiplier": scalar("chi_gyrobohm_multiplier"),
+            "D_face_c1": scalar("D_face_c1"),
+            "D_face_c2": scalar("D_face_c2"),
+            "V_face_coeff": scalar("V_face_coeff"),
         }
     else:  # qlknn
         # Plain float leaves in the provider (like cgm alpha and chi_stiff):
         # replaced with traced scalars directly
-        return {
-            "transport_model.transport_models.0.ITG_flux_ratio_correction": jnp.squeeze(coeffs["ITG_flux_ratio_correction"]),
-            "transport_model.transport_models.0.ETG_correction_factor": jnp.squeeze(coeffs["ETG_correction_factor"]),
-            "transport_model.transport_models.0.collisionality_multiplier": jnp.squeeze(coeffs["collisionality_multiplier"]),
+        updates = {
+            "ITG_flux_ratio_correction": jnp.squeeze(coeffs["ITG_flux_ratio_correction"]),
+            "ETG_correction_factor": jnp.squeeze(coeffs["ETG_correction_factor"]),
+            "collisionality_multiplier": jnp.squeeze(coeffs["collisionality_multiplier"]),
         }
+    return {prefix + field: value for field, value in updates.items()}
 
 
 class ProfilePredictorTorax(TimeIndepModule):
@@ -742,7 +698,7 @@ class ProfilePredictorTorax(TimeIndepModule):
         self.nn_sources = RtdMLP(
             in_size=10,
             # One output per SOURCE_COEFFICIENT_NAMES entry:
-            # S_total,P_aux_total, gaussian_location, gaussian_width, electron_heat_fraction
+            # S_total, P_aux_total, gaussian_location, gaussian_width, electron_heat_fraction
             out_size=len(SOURCE_COEFFICIENT_NAMES),
             width_size=nn_width,
             depth=nn_depth,
@@ -782,9 +738,8 @@ class ProfilePredictorTorax(TimeIndepModule):
         self._face_centers = tuple(static_geo.torax_mesh.face_centers.tolist())
         self._rho_hires_norm = tuple(np.array(static_geo.rho_hires_norm).tolist())
 
-        # With the fixed time-step calculator, steps to cover t_final are
-        # deterministic: ceil((t_final - t_initial) / fixed_dt) # noqa: ERA001
-        # Add 1 for the clipped final step that lands exactly on t_final
+        # With the fixed time-step calculator the step count to cover the window is deterministic,
+        # the ceiling of the window over fixed_dt, plus 1 for the clipped final step that lands exactly on t_final
         numerics = self.step_fn.runtime_params_provider.numerics
         fixed_dt = float(numerics.fixed_dt.get_value(0.0))
         self.max_steps = int(np.ceil((numerics.t_final - numerics.t_initial) / fixed_dt)) + 1
@@ -911,7 +866,7 @@ class ProfilePredictorTorax(TimeIndepModule):
 
         # Density core anchor set so the midplane chord average of the parabola matches the measured line average
         # mean of (1 - rho^2) over the chord is 2/3, so core = bc + 1.5*(line_avg - bc).
-        # ne_right_bc is a fraction in (0.05, 0.95) of ne20_line_avg, so
+        # ne_right_bc is a fraction in (0.01, 0.95) of ne20_line_avg, so
         # core > bc always holds and the init is continuous with the BC.
         ne_core_init = ne_right_bc + 1.5 * (inputs.ne20_line_avg - ne_right_bc)
         n_init_value = 1e20 * (ne_right_bc + (ne_core_init - ne_right_bc) * ic_shape)[jnp.newaxis, :]
@@ -938,7 +893,7 @@ class ProfilePredictorTorax(TimeIndepModule):
             "sources.generic_heat.electron_heat_fraction": electron_heat_fraction_update,
         }
         mapping.update(transport_provider_mapping(self.transport_model, coeffs))
-        new_provider = update_provider_from_paths(self.step_fn.runtime_params_provider, mapping)
+        new_provider = self.step_fn.runtime_params_provider.update_provider_from_mapping(mapping)
 
         # Build JAX-differentiable geometry from per-sample inputs
         torax_mesh = torax_pydantic.Grid1D(face_centers=face_centers_np)
@@ -1007,12 +962,6 @@ class ProfilePredictorTorax(TimeIndepModule):
             geo_provider=geo_provider,
             max_steps=self.max_steps,
             debug=debug,
-            # Recompute the loop body activations in the backward pass instead
-            # of storing them: reverse-mode memory otherwise scales with
-            # solver steps times mesh size, and OOMs the GPU at full batch
-            # The sweep now allows up to 40 steps, so every model
-            # needs the flat-memory loop.
-            wrap_body_in_checkpoint=True,
         )
 
         # n_e is in m^-3 and T_e is keV in TORAX

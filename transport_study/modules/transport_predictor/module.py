@@ -44,7 +44,6 @@ from transport_study.modules.profile_predictor.torax_module import (
     build_miller_geometry_jax,
     clamp_core_profiles,
     transport_provider_mapping,
-    update_provider_from_paths,
     validate_transport_model_name,
 )
 
@@ -603,7 +602,7 @@ class TransportPredictorToraxBase(TransportPredictor):
         self.nn_sources = RtdMLP(
             in_size=N_TRANSPORT_NN_INPUTS,
             # One output per SOURCE_SHAPE_COEFFICIENT_NAMES entry:
-            # S_total, gaussian_location, gaussian_width, electron_heat_fraction
+            # S_total, gaussian_location, gaussian_width, electron_heat_fraction, absorption_fraction
             out_size=len(SOURCE_SHAPE_COEFFICIENT_NAMES),
             width_size=nn_width,
             depth=nn_depth,
@@ -727,8 +726,7 @@ class TransportPredictorToraxBase(TransportPredictor):
         # comments there), with the temperature scale from the state-implied
         # stored energy instead of a measured betan
         nn_edge_out = self.nn_edge(nn_inputs)
-        # Floor lowered 0.05 -> 0.01 with the profile predictor (ceiling probe
-        # railed the old floor on 88% of MAST samples)
+        # Same 0.01 floor as the profile predictor, a higher floor railed on most MAST samples
         coeffs["n_e_right_bc"] = (0.01 + 0.94 * jax.nn.sigmoid(nn_edge_out[0:1])) * inputs.ne20_line_avg  # [1e20 m^-3]
         te_scale = jnp.clip(inputs.te_approx_from_wtot(Wtot_MJ), 0.05, 5.0)
         coeffs["T_e_right_bc"] = 0.02 + jax.nn.sigmoid(nn_edge_out[1:2] - 5.0) * te_scale  # [keV]
@@ -783,7 +781,7 @@ class TransportPredictorToraxBase(TransportPredictor):
             mapping["profile_conditions.T_i"] = t_ic_update
             mapping["profile_conditions.n_e"] = n_ic_update
         mapping.update(transport_provider_mapping(self.transport_model, coeffs))
-        new_provider = update_provider_from_paths(self.step_fn.runtime_params_provider, mapping)
+        new_provider = self.step_fn.runtime_params_provider.update_provider_from_mapping(mapping)
 
         # Build JAX-differentiable geometry from per-sample inputs
         face_centers_np = np.array(self._face_centers)
@@ -830,9 +828,8 @@ class TransportPredictorToraxBase(TransportPredictor):
         at a measured ~1.35x compute cost with it).
         """
 
-        # Provider and geometry stay closure captures, matching the
-        # wrap_body_in_checkpoint pattern in _run_loop_jit_with_geo: their
-        # closed-over traced values are saved rather than rematerialized,
+        # Provider and geometry stay closure captures:
+        # their closed-over traced values are saved rather than rematerialized,
         # and they are small (NN coefficient scalars, mesh-sized geometry)
         def step(sim_state, post_processed):
             next_state, next_post = self.step_fn(
@@ -913,7 +910,7 @@ class TransportPredictorToraxSimState(TransportPredictorToraxBase):
     """TORAX transport predictor carrying the full TORAX state.
 
     Alternative to TransportPredictorTorax: instead of rebuilding a TORAX
-    initial state from stored ne/te each step, the whole ToraxSimState pytree
+    initial state from stored ne/te each step, the whole TORAX SimState pytree
     (profiles, psi, currents) is carried as DISCRETE state, so nothing is
     lost to per-step reinitialization. The cost is TORAX internals inside the
     module state: seeding requires get_initial_state_and_post_processed_outputs
@@ -929,8 +926,10 @@ class TransportPredictorToraxSimState(TransportPredictorToraxBase):
         # that: its __post_init__ requires exactly one face constraint set, and
         # a spec sets both to booleans. A tuple is not a dataclass, so the walk
         # stops at the wrapper and the whole subtree inherits this field's
-        # discrete / no-save label through eqx.partition's prefix semantics
-        sim_state: PyTree = discrete_no_save_field(default=None)  # (ToraxSimState,)
+        # discrete / no-save label through eqx.partition's prefix semantics.
+        # Known broken on upstream TORAX: eqx.partition still rebuilds the complementary
+        # half with None leaves, which CellVariable.__post_init__ rejects (see CLAUDE.md)
+        sim_state: PyTree = discrete_no_save_field(default=None)  # (SimState,)
         post_processed: PyTree = discrete_no_save_field(default=None)  # (PostProcessedOutputs,)
 
         @staticmethod
@@ -939,7 +938,7 @@ class TransportPredictorToraxSimState(TransportPredictorToraxBase):
             return TransportPredictorToraxSimState.State(sim_state=(sim_state,), post_processed=(post_processed,))
 
         def unwrap(self) -> tuple:
-            """The bare (ToraxSimState, PostProcessedOutputs) this state carries."""
+            """The bare (SimState, PostProcessedOutputs) this state carries."""
             return self.sim_state[0], self.post_processed[0]
 
     def __call__(self, state: "TransportPredictorToraxSimState.State", inputs: Inputs) -> tuple:

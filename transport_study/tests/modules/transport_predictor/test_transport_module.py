@@ -485,6 +485,38 @@ def test_torax_p_aux_change_reaches_one_step_output(torax_rebuild_module):
     assert not np.allclose(np.asarray(next_low.te), np.asarray(next_high.te))
 
 
+@pytest.mark.slow
+@pytest.mark.parametrize("transport_model", ["constant", "gyrobohm"])
+def test_torax_rebuild_step_gradients_finite(transport_model):
+    """One rebuild step (initial state built from the carried profiles, checkpointed solver step)
+    gives finite, nonzero gradients for every trainable network."""
+    module = TransportPredictorTorax.init(
+        rhogrid=RHO,
+        torax_config=make_transport_torax_config(transport_model),
+        nn_width=8,
+        nn_depth=2,
+        prng_seed=0,
+        normalizer=make_transport_nn_input_normalizer("physics", None, 2),
+        sim_dt=0.001,
+        transport_model=transport_model,
+        geometry_builder="miller",
+    )
+    obs = make_observations()
+    state = TransportPredictorEnv(module=module).create_state(obs, obs)
+    inputs = make_inputs()
+
+    def loss(mod):
+        next_state, _output = mod(state, inputs)
+        return jnp.sum(next_state.te) + jnp.sum(next_state.ne)
+
+    value, grads = eqx.filter_jit(eqx.filter_value_and_grad(loss))(module)
+    assert np.isfinite(float(value))
+    for name in ("nn_transport", "nn_sources", "nn_edge"):
+        leaves = jax.tree_util.tree_leaves(eqx.filter(getattr(grads, name), eqx.is_inexact_array))
+        assert all(bool(jnp.all(jnp.isfinite(leaf))) for leaf in leaves), name
+        assert any(bool(jnp.any(leaf != 0.0)) for leaf in leaves), name
+
+
 def test_torax_absorption_fraction_nn(torax_rebuild_module):
     """The transport sources network's last output sets absorption_fraction
     via the saturating Beer-Lambert form 1 - exp(-ne20_line_avg * softplus(nn

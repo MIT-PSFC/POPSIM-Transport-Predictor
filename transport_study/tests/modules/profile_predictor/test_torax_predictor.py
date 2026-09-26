@@ -1,15 +1,140 @@
+import copy
+
+import equinox as eqx
+import jax
+import jax.numpy as jnp
 import numpy as np
 import pytest
 from popsim.ml import TrainConfig
 from popsim.ml.launch import launch_train
+from torax import ToraxConfig
+from torax import experimental as torax_experimental
 
 from transport_study import PACKAGE_ROOT
-from transport_study.config import StudyConfig, load_config
+from transport_study.config import RHO_GRID, StudyConfig, load_config
+from transport_study.modules.profile_predictor.module import Inputs
+from transport_study.modules.profile_predictor.torax_module import (
+    TRANSPORT_COEFFICIENT_NAMES,
+    bound_transport_coefficients,
+    transport_provider_mapping,
+    validate_transport_model_name,
+)
 from transport_study.modules.profile_predictor.train_configs import (
     PROFILE_PREDICTOR_TORAX_CONFIGS,
+    TORAX_CONFIG_BASE,
+    TORAX_TRANSPORT_BLOCKS,
 )
 from transport_study.modules.profile_predictor.trb import resolve_relaxation_overrides
 from transport_study.orchestration.organize_data import PROFILE_TARGET_VARS
+
+TRANSPORT_MODELS = ("constant", "cgm", "gyrobohm", "qlknn")
+
+# TORAX runtime-param field -> the bounded NN coefficient that must land in it.
+# gyrobohm applies one multiplier to both species
+RUNTIME_FIELD_TO_COEFFICIENT = {
+    "constant": {"chi_i": "chi_i", "chi_e": "chi_e", "D_e": "D_e", "V_e": "V_e"},
+    "cgm": {
+        "chi_e_i_ratio": "chi_e_i_ratio",
+        "chi_D_ratio": "chi_D_ratio",
+        "VR_D_ratio": "VR_D_ratio",
+        "alpha": "alpha",
+        "chi_stiff": "chi_stiff",
+    },
+    "gyrobohm": {
+        "chi_e_bohm_multiplier": "chi_bohm_multiplier",
+        "chi_i_bohm_multiplier": "chi_bohm_multiplier",
+        "chi_e_gyrobohm_multiplier": "chi_gyrobohm_multiplier",
+        "chi_i_gyrobohm_multiplier": "chi_gyrobohm_multiplier",
+        "D_face_c1": "D_face_c1",
+        "D_face_c2": "D_face_c2",
+        "V_face_coeff": "V_face_coeff",
+    },
+    "qlknn": {
+        "ITG_flux_ratio_correction": "ITG_flux_ratio_correction",
+        "ETG_correction_factor": "ETG_correction_factor",
+        "collisionality_multiplier": "collisionality_multiplier",
+    },
+}
+
+
+def _torax_config(transport: dict) -> ToraxConfig:
+    config_dict = copy.deepcopy(TORAX_CONFIG_BASE)
+    config_dict["transport"] = copy.deepcopy(transport)
+    return ToraxConfig.from_dict(config_dict)
+
+
+def _batch_inputs() -> Inputs:
+    """Two C-Mod-like timeslices differing in Ip, betan, and density."""
+    n_batch = 2
+    return Inputs(
+        Ip=jnp.array([1.0, 0.8]),
+        B0=jnp.full(n_batch, 5.4),
+        betan=jnp.array([1.2, 0.9]),
+        ne20_line_avg=jnp.array([1.5, 1.2]),
+        R0=jnp.full(n_batch, 0.68),
+        a_minor=jnp.full(n_batch, 0.22),
+        kappa=jnp.full(n_batch, 1.6),
+        delta_top=jnp.full(n_batch, 0.4),
+        delta_bot=jnp.full(n_batch, 0.5),
+        ds_source_idx=jnp.zeros(n_batch),
+        rho=jnp.tile(jnp.asarray(RHO_GRID), (n_batch, 1)),
+    )
+
+
+@pytest.mark.parametrize("transport_model", TRANSPORT_MODELS)
+def test_transport_provider_mapping_reaches_runtime_params(transport_model):
+    """Every NN transport coefficient lands in the TORAX runtime params of the single core model.
+
+    Regression test for the TORAX transport schema:
+    the config must validate, validate_transport_model_name must accept it,
+    and each provider path in transport_provider_mapping must resolve and replace the placeholder.
+    """
+    torax_config = _torax_config(TORAX_TRANSPORT_BLOCKS[transport_model])
+    validate_transport_model_name(torax_config, transport_model)
+    provider = torax_experimental.make_step_fn(torax_config).runtime_params_provider
+
+    n_coefficients = len(TRANSPORT_COEFFICIENT_NAMES[transport_model])
+    raw_outputs = 0.5 + 0.37 * jnp.arange(n_coefficients)
+    coeffs = bound_transport_coefficients(transport_model, raw_outputs)
+    mapping = transport_provider_mapping(transport_model, coeffs)
+    updated_provider = provider.update_provider_from_mapping(mapping)
+
+    params_placeholder = provider(t=0.0).transport.core_transport_model_params[transport_model]
+    params_updated = updated_provider(t=0.0).transport.core_transport_model_params[transport_model]
+    field_to_coefficient = RUNTIME_FIELD_TO_COEFFICIENT[transport_model]
+    assert {key.rsplit(".", 1)[1] for key in mapping} == set(field_to_coefficient)
+    for field, coefficient in field_to_coefficient.items():
+        expected = float(np.squeeze(np.asarray(coeffs[coefficient])))
+        updated = np.asarray(getattr(params_updated, field))
+        placeholder = np.asarray(getattr(params_placeholder, field))
+        # Constant-model coefficients are flat radial profiles, every face carries the value
+        np.testing.assert_allclose(updated, np.full(updated.shape, expected), err_msg=field)
+        assert not np.allclose(placeholder, expected), field
+
+
+@pytest.mark.parametrize(
+    ("transport", "transport_model"),
+    [
+        (TORAX_TRANSPORT_BLOCKS["cgm"], "gyrobohm"),
+        # No core models: TORAX silently injects a single prescribed one
+        ({}, "cgm"),
+        ({"core_transport_models": {"other": {"model_name": "CGM"}}}, "cgm"),
+        (
+            {"core_transport_models": {"cgm": {"model_name": "CGM"}, "extra": {"model_name": "prescribed", "rho_min": 0.9}}},
+            "cgm",
+        ),
+        (
+            {"core_transport_models": {"cgm": {"model_name": "CGM"}}, "pedestal_transport_models": {"ped": {"model_name": "prescribed"}}},
+            "cgm",
+        ),
+    ],
+    ids=["wrong_model", "default_prescribed", "wrong_key", "extra_core_model", "pedestal_model"],
+)
+def test_validate_transport_model_name_rejects_mismatch(transport, transport_model):
+    """Any transport config the NN overrides cannot address exactly is rejected."""
+    torax_config = _torax_config(transport)
+    with pytest.raises(ValueError, match="requires exactly the core transport models"):
+        validate_transport_model_name(torax_config, transport_model)
 
 
 @pytest.mark.slow
@@ -172,3 +297,54 @@ def test_torax_max_steps_from_n_solver_steps(make_torax_module):
     # n_solver_steps override must bound the scan length to n_solver_steps + 1
     module = make_torax_module("cgm", numerics_overrides=resolve_relaxation_overrides({"t_final": 0.4, "n_solver_steps": 10}))
     assert module.max_steps == 11
+
+
+@pytest.mark.slow
+def test_torax_relaxation_loop_matches_step_replay(make_torax_module):
+    """The jitted bounded relaxation loop in __call__ runs to t_final and matches evolve's step-by-step replay.
+
+    Both apply the same steps and clamps, so the final cell profiles must agree
+    once interpolated onto the output grid the way __call__ does.
+    """
+    module = make_torax_module("constant")
+    inputs = jax.tree_util.tree_map(lambda x: x[0], _batch_inputs())
+
+    outputs = module(inputs)
+    steps, coeffs = module.evolve(inputs)
+
+    numerics = module.step_fn.runtime_params_provider.numerics
+    assert steps[-1]["t"] == pytest.approx(float(numerics.t_final))
+    rho_full = np.concatenate([[0.0], steps[-1]["rho"], [1.0]])
+    ne_full = np.concatenate([steps[-1]["ne20"][:1], steps[-1]["ne20"], [coeffs["n_e_right_bc"]]])
+    te_full = np.concatenate([steps[-1]["te_keV"][:1], steps[-1]["te_keV"], [coeffs["T_e_right_bc"]]])
+    np.testing.assert_allclose(outputs.ne.values, np.interp(RHO_GRID, rho_full, ne_full), rtol=1e-6)
+    np.testing.assert_allclose(outputs.te.values, np.interp(RHO_GRID, rho_full, te_full), rtol=1e-6)
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize("transport_model", ["constant", "gyrobohm", "qlknn"])
+def test_torax_batched_gradients_finite(make_torax_module, transport_model):
+    """Gradient of a vmapped batch through the relaxation loop is finite for every trainable network.
+
+    Production training differentiates the vmapped forward, which exercises the
+    bounded while loop's batching rule and custom VJP rather than a single sample.
+    torax-cgm is excluded: upstream TORAX evaluates a negative base to the traced alpha power
+    in the dead branch of the critical gradient (see CLAUDE.md).
+    """
+    module = make_torax_module(transport_model, geometry_builder="miller")
+    inputs = _batch_inputs()
+
+    def loss(mod):
+        def one_sample(sample_inputs):
+            out = mod(sample_inputs)
+            return jnp.sum(out.te.data) + jnp.sum(out.ne.data)
+
+        per_sample = jax.vmap(one_sample)(inputs)
+        return jnp.sum(per_sample)
+
+    value, grads = eqx.filter_jit(eqx.filter_value_and_grad(loss))(module)
+    assert np.isfinite(float(value))
+    for name in ("nn_transport", "nn_sources", "nn_edge"):
+        leaves = jax.tree_util.tree_leaves(eqx.filter(getattr(grads, name), eqx.is_inexact_array))
+        assert all(bool(jnp.all(jnp.isfinite(leaf))) for leaf in leaves), name
+        assert any(bool(jnp.any(leaf != 0.0)) for leaf in leaves), name

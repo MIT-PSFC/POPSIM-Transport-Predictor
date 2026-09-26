@@ -9,23 +9,18 @@ from transport_study.modules.profile_predictor.train_configs import (
 )
 
 
-def make_transport_torax_config(transport_model: str, theta_implicit: float = 1.0) -> dict:
+def make_transport_torax_config(transport_model: str) -> dict:
     """One-step TORAX config for the transport predictor.
 
     Reuses the profile predictor's TORAX skeleton and transport blocks, with
     the numerics window collapsed to a single solver step of the dataset
     timebase: TransportPredictorToraxBase advances exactly one step per
     __call__ and enforces t_final - t_initial == fixed_dt == sim_dt.
-    theta_implicit selects the Euler step: 1.0 (default) is backward
-    (implicit) Euler, 0.0 is forward (explicit) Euler, which violates the
-    diffusion CFL bound even at the 1 ms step and is only useful for
-    demonstrating the blowup. Not a study axis.
     """
     if transport_model not in TORAX_TRANSPORT_BLOCKS:
         raise ValueError(f"Unknown transport model '{transport_model}', valid: {sorted(TORAX_TRANSPORT_BLOCKS)}")
     torax_config = copy.deepcopy(TORAX_CONFIG_BASE)
     torax_config["transport"] = copy.deepcopy(TORAX_TRANSPORT_BLOCKS[transport_model])
-    torax_config["solver"]["theta_implicit"] = theta_implicit
     # Cyclotron radiation is dropped HERE and not from TORAX_CONFIG_BASE, so
     # the profile study (which never diverged) keeps its physics unchanged.
     #
@@ -49,8 +44,6 @@ def make_transport_torax_config(transport_model: str, theta_implicit: float = 1.
             "adaptive_dt": False,
         }
     )
-    # The base already runs a single implicit-Euler linear solve per step
-    # (no corrector iterations; benchmarked: corrector count does not change
-    # converged loss), and a 1 ms step is far less stiff than the base's
-    # 20 ms relaxation anyway
+    # The base solver settings (one implicit-Euler linear solve per step) carry over,
+    # a 1 ms step is far less stiff than the base's 20 ms relaxation
     return torax_config

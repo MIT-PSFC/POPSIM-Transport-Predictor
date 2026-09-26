@@ -214,7 +214,7 @@ def plot_torax_evolution(
         dataset: Path to a NetCDF dataset with dims (shot, time_idx, rho).
         shot: Shot number to select.
         timestep: time_idx index of the timeslice to predict.
-        transport_model: TORAX transport model: "constant", "cgm", or "gyrobohm".
+        transport_model: TORAX transport model: "constant", "cgm", "gyrobohm", or "qlknn".
         checkpoint: Optional checkpoint directory of a trained torax profile predictor
             (must have been trained with the same transport_model).
         n_devices: Number of devices the checkpoint was trained with (sizes the
@@ -230,7 +230,8 @@ def plot_torax_evolution(
             (constant: chi_i, chi_e, D_e [m^2/s], V_e [m/s];
             cgm: chi_e_i_ratio, chi_D_ratio, VR_D_ratio, alpha, chi_stiff;
             gyrobohm: chi_bohm_multiplier, chi_gyrobohm_multiplier, D_face_c1,
-            D_face_c2, V_face_coeff)
+            D_face_c2, V_face_coeff,
+            qlknn: ITG_flux_ratio_correction, ETG_correction_factor, collisionality_multiplier)
             plus the source coefficients (S_total [1e21 /s], P_aux_total [MW],
             gaussian_location, gaussian_width, electron_heat_fraction) and
             n_e_right_bc [1e20 m^-3], T_e_right_bc [keV].
