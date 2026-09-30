@@ -14,6 +14,7 @@ from torax import experimental as torax_experimental
 from torax._src import jax_utils as torax_jax_utils
 from torax._src.geometry import geometry as torax_geometry
 from torax._src.geometry import geometry_provider as geometry_provider_lib
+from torax._src.geometry import trapped_fraction as torax_trapped_fraction
 from torax._src.orchestration.step_function import SimulationStepFn
 from torax._src.torax_pydantic import torax_pydantic
 
@@ -139,6 +140,7 @@ def build_circular_geometry_jax(
     gm4_face = B_0**-2 * (1.0 + 1.5 * epsilon_face**2)
     gm5 = B_0**2 / jnp.sqrt(jnp.clip(1.0 - epsilon**2, 0.05, None))
     gm5_face = B_0**2 / jnp.sqrt(jnp.clip(1.0 - epsilon_face**2, 0.05, None))
+    trapped_fraction_face = torax_trapped_fraction.calculate_sauter_trapped_fraction(epsilon=epsilon_face, delta=delta_face)
 
     return torax_geometry.Geometry(
         geometry_type=torax_geometry.GeometryType.CIRCULAR,
@@ -157,6 +159,7 @@ def build_circular_geometry_jax(
         spr=spr,
         spr_face=spr_face,
         delta_face=delta_face,
+        trapped_fraction_face=trapped_fraction_face,
         g0=g0,
         g0_face=g0_face,
         g1=g1,
@@ -341,6 +344,8 @@ def build_miller_geometry_jax(
     R_out_face = R_major + rho_face
     R_in = R_major - rho
     R_in_face = R_major - rho_face
+    epsilon_face = (R_out_face - R_in_face) / (R_out_face + R_in_face)
+    trapped_fraction_face = torax_trapped_fraction.calculate_sauter_trapped_fraction(epsilon=epsilon_face, delta=delta_face)
 
     return torax_geometry.Geometry(
         # Deliberately kept CIRCULAR even though the metric is shaped
@@ -363,6 +368,7 @@ def build_miller_geometry_jax(
         spr=cell["spr"],
         spr_face=face["spr"],
         delta_face=delta_face,
+        trapped_fraction_face=trapped_fraction_face,
         g0=cell["g0"],
         g0_face=face["g0"],
         g1=cell["g1"],

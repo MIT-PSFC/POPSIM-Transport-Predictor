@@ -136,7 +136,7 @@ class ScalingLawPredictor(eqx.Module):
         # Ensure each of the input values is strictly greater than 0.001 to avoid numerical instability.
         Ip_MA = jnp.clip(inp.Ip_MA, 0.001, None)
         B0 = jnp.clip(inp.B0, 0.001, None)
-        ne19 = jnp.clip(inp.ne20 / 10, 0.001, None)
+        ne19 = jnp.clip(inp.ne20 * 10, 0.001, None)
         ne20 = jnp.clip(inp.ne20, 0.001, None)
         P_abs_MW = jnp.clip(inp.P_abs_MW, 0.001, None)
         kappa = jnp.clip(inp.kappa, 0.001, None)
