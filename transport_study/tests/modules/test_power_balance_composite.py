@@ -2,7 +2,6 @@
 and the grouped optimizer (reduced submodule learning rate).
 """
 
-import os
 from pathlib import Path
 
 import equinox as eqx
@@ -12,7 +11,6 @@ import numpy as np
 import xarray as xr
 from popsim.ml.partition import make_partition_by_members
 
-from transport_study import PACKAGE_ROOT
 from transport_study.config import StudyConfig, load_config
 from transport_study.modules.normalization import make_normalizer
 from transport_study.modules.power_balance.module import (
@@ -31,8 +29,7 @@ from transport_study.power_balance_transfer.power_balance_study import (
     HYPERPARAM_TARGET_SHOTS,
     PowerBalanceStudy,
 )
-
-SAMPLE_DIR = PACKAGE_ROOT / "datasets" / "sample"
+from transport_study.tests.sample_data import SAMPLE_DIR, requires_sample_data
 
 ##################
 # Loss functions #
@@ -288,12 +285,11 @@ def test_grouped_adamw_labels_transfer_partition():
     assert np.isclose(float(u_p_oh / u_taue), 0.1, atol=1e-3)
 
 
-def test_base_optimizer_config_carries_lr_factors():
-    working_dir_base = os.environ.get("PTPS_TEST_WORKING_DIR_BASE", PACKAGE_ROOT / "tests" / "test_outputs")
+def test_base_optimizer_config_carries_lr_factors(tmp_path):
     study = PowerBalanceStudy(
         PowerBalanceStudy.Config(
             study_name="composite_optimizer_test",
-            working_dir_base=Path(working_dir_base) / "power_balance_transfer",
+            working_dir_base=tmp_path,
             dataset_paths={
                 "cmod-low1": SAMPLE_DIR / "cmod-low1.nc",
                 "cmod-high": SAMPLE_DIR / "cmod-high.nc",
@@ -315,17 +311,17 @@ def test_base_optimizer_config_carries_lr_factors():
     assert train_config.optimizer_config["submodule_lr_factors"] == expected
 
 
-def test_transfer_config_stacks_submodule_lr_factors():
+@requires_sample_data
+def test_transfer_config_stacks_submodule_lr_factors(tmp_path):
     # The submodule LR reduction deliberately stacks with the step-budgeted
     # transfer LR: the submodules already ran their own pretrain + finetune
     # prereq chain, so the joint finetune moves their last layers only at
     # 0.1x the transfer LR. The factors must survive make_train_config for
     # transfer cases exactly as for da=None cases
-    working_dir_base = os.environ.get("PTPS_TEST_WORKING_DIR_BASE", PACKAGE_ROOT / "tests" / "test_outputs")
     study = PowerBalanceStudy(
         PowerBalanceStudy.Config(
             study_name="composite_transfer_lr_test",
-            working_dir_base=Path(working_dir_base) / "power_balance_transfer",
+            working_dir_base=tmp_path,
             dataset_paths={
                 "cmod-low1": SAMPLE_DIR / "cmod-low1.nc",
                 "cmod-high": SAMPLE_DIR / "cmod-high.nc",

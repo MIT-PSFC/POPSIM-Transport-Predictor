@@ -8,11 +8,12 @@ huber delta split, anchor terms, device weighting) is blocked out in
 test_transport_transfer.py.
 """
 
+from pathlib import Path
+
 import jax.numpy as jnp
 import pytest
 import xarray as xr
 
-from transport_study import PACKAGE_ROOT
 from transport_study.config import RHO_GRID, StudyConfig, load_config
 from transport_study.modules.transport_predictor.module import Output
 from transport_study.modules.transport_predictor.trb import TransportPredictorTRB
@@ -26,8 +27,8 @@ def loaded_config():
         StudyConfig(
             study_name="test_transport_loss_fn",
             dataset_paths={
-                "cmod-low": PACKAGE_ROOT / "datasets" / "sample" / "cmod-low1.nc",
-                "cmod-high": PACKAGE_ROOT / "datasets" / "sample" / "cmod-high.nc",
+                "cmod-low": Path("path/to/cmod_low.nc"),
+                "cmod-high": Path("path/to/cmod_high.nc"),
             },
             target_device="cmod-high",
         )

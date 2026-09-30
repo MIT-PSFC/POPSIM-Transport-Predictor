@@ -10,7 +10,6 @@ from popsim.ml.launch import launch_train
 from torax import ToraxConfig
 from torax import experimental as torax_experimental
 
-from transport_study import PACKAGE_ROOT
 from transport_study.config import RHO_GRID, StudyConfig, load_config
 from transport_study.modules.profile_predictor.module import Inputs
 from transport_study.modules.profile_predictor.torax_module import (
@@ -26,6 +25,7 @@ from transport_study.modules.profile_predictor.train_configs import (
 )
 from transport_study.modules.profile_predictor.trb import resolve_relaxation_overrides
 from transport_study.orchestration.organize_data import PROFILE_TARGET_VARS
+from transport_study.tests.sample_data import SAMPLE_DIR, requires_sample_data
 
 TRANSPORT_MODELS = ("constant", "cgm", "gyrobohm", "qlknn")
 
@@ -138,13 +138,14 @@ def test_validate_transport_model_name_rejects_mismatch(transport, transport_mod
 
 
 @pytest.mark.slow
+@requires_sample_data
 @pytest.mark.parametrize("transport_model", ["constant", "cgm", "gyrobohm", "qlknn"])
 def test_torax_predictor(transport_model):
     config = StudyConfig(
         study_name=f"test_torax_predictor_{transport_model}",
         dataset_paths={
-            "cmod-low": PACKAGE_ROOT / "datasets" / "sample" / "cmod-low1.nc",
-            "cmod-high": PACKAGE_ROOT / "datasets" / "sample" / "cmod-high.nc",
+            "cmod-low": SAMPLE_DIR / "cmod-low1.nc",
+            "cmod-high": SAMPLE_DIR / "cmod-high.nc",
         },
         target_device="cmod-high",
         # large batch with the the full ~100 shot sample dataset OOMs the GPU
@@ -183,13 +184,14 @@ def test_torax_predictor(transport_model):
 # cgm and qlknn are the models whose training blew up on MAST samples with
 # the circular geometry, so they are the smoke coverage for the miller builder
 @pytest.mark.slow
+@requires_sample_data
 @pytest.mark.parametrize("transport_model", ["cgm", "qlknn"])
 def test_torax_predictor_mast_miller(transport_model):
     config = StudyConfig(
         study_name=f"test_torax_predictor_mast_miller_{transport_model}",
         dataset_paths={
-            "mast-low": PACKAGE_ROOT / "datasets" / "sample" / "mast-low1.nc",
-            "mast-high": PACKAGE_ROOT / "datasets" / "sample" / "mast-high.nc",
+            "mast-low": SAMPLE_DIR / "mast-low1.nc",
+            "mast-high": SAMPLE_DIR / "mast-high.nc",
         },
         target_device="mast-high",
         max_ds_size=10,
@@ -225,6 +227,7 @@ def test_torax_predictor_mast_miller(transport_model):
 
 
 @pytest.mark.slow
+@requires_sample_data
 def test_torax_heat_source_response(make_torax_module, sample_timeslices):
     # Pins the generic_heat wiring end to end: prescribing more auxiliary
     # power through the NN-controlled source must heat the relaxed profile
@@ -247,6 +250,7 @@ def test_torax_heat_source_response(make_torax_module, sample_timeslices):
 
 
 @pytest.mark.slow
+@requires_sample_data
 def test_torax_output_hits_edge_bc_and_smooth_init(make_torax_module, sample_timeslices):
     module = make_torax_module("cgm")
     timeslice = sample_timeslices("cmod-high.nc")[0]

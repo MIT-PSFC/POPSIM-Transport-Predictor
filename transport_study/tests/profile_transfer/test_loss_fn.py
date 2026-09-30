@@ -10,7 +10,7 @@ import pytest
 import xarray as xr
 from popsim.ml.dataloading import make_dataloaders
 
-from transport_study import EPISODE_DIM, PACKAGE_ROOT, TIME_COORD
+from transport_study import EPISODE_DIM, TIME_COORD
 from transport_study.config import RHO_GRID, config, load_config
 from transport_study.modules.profile_predictor.module import Outputs
 from transport_study.modules.profile_predictor.trb import ProfilePredictorTRB
@@ -20,6 +20,7 @@ from transport_study.orchestration.organize_data import (
     get_loaded_shot_count,
 )
 from transport_study.profile_transfer.profile_study import ProfileStudy
+from transport_study.tests.sample_data import SAMPLE_DIR, requires_sample_data
 
 RHO = RHO_GRID
 
@@ -31,8 +32,8 @@ def study_config(tmp_path) -> ProfileStudy.Config:
         study_name="test_loss_fn",
         working_dir_base=tmp_path,
         dataset_paths={
-            "cmod-low": PACKAGE_ROOT / "datasets" / "sample" / "cmod-low1.nc",
-            "cmod-high": PACKAGE_ROOT / "datasets" / "sample" / "cmod-high.nc",
+            "cmod-low": SAMPLE_DIR / "cmod-low1.nc",
+            "cmod-high": SAMPLE_DIR / "cmod-high.nc",
         },
         target_device="cmod-high",
         model_types=("mlp",),
@@ -218,6 +219,7 @@ def weighted_case(study: ProfileStudy, num_target_shots: int):
 
 
 @pytest.mark.slow
+@requires_sample_data
 def test_weighted_case_weights_reach_loss_config(study_config):
     """The per-device weights of a weighted case land in loss_config as device_weights.
 
@@ -253,6 +255,7 @@ def test_weighted_case_weights_reach_loss_config(study_config):
 
 
 @pytest.mark.slow
+@requires_sample_data
 def test_weighted_zero_target_shots_disables_patience(study_config):
     """A weighted case with num_target_shots == 0 must run to max_epochs.
 
@@ -397,6 +400,7 @@ def test_gradient_loss_only_below_rho_09():
 
 
 @pytest.mark.slow
+@requires_sample_data
 def test_loss_on_prepared_sample_dataset():
     """Full-pipeline check: signals prepared by get_ds feed the loss directly.
 

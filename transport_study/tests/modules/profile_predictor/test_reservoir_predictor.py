@@ -12,7 +12,6 @@ import pytest
 from popsim.ml import TrainConfig
 from popsim.ml.launch import launch_train
 
-from transport_study import PACKAGE_ROOT
 from transport_study.config import RHO_GRID, StudyConfig, load_config
 from transport_study.modules.normalization import CoralFeatureNormalizer
 from transport_study.modules.profile_predictor.module import (
@@ -23,6 +22,7 @@ from transport_study.modules.profile_predictor.module import (
 from transport_study.modules.profile_predictor.trb import ProfilePredictorTRB
 from transport_study.orchestration.organize_data import PROFILE_TARGET_VARS
 from transport_study.profile_transfer.profile_study import PROFILE_INPUT_VARS
+from transport_study.tests.sample_data import SAMPLE_DIR, requires_sample_data
 
 RESERVOIR_SIZE = 32
 
@@ -33,8 +33,8 @@ def loaded_config():
         StudyConfig(
             study_name="test_reservoir_predictor",
             dataset_paths={
-                "cmod-low": PACKAGE_ROOT / "datasets" / "sample" / "cmod-low1.nc",
-                "cmod-high": PACKAGE_ROOT / "datasets" / "sample" / "cmod-high.nc",
+                "cmod-low": SAMPLE_DIR / "cmod-low1.nc",
+                "cmod-high": SAMPLE_DIR / "cmod-high.nc",
             },
             target_device="cmod-high",
         )
@@ -105,6 +105,7 @@ def test_reservoir_trainable_getter_only_readout(make_module):
 
 
 @pytest.mark.slow
+@requires_sample_data
 def test_reservoir_training_smoke():
     """End-to-end launch_train on the sample dataset."""
     train_config = TrainConfig(

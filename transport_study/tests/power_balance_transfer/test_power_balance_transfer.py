@@ -15,8 +15,7 @@ from transport_study.power_balance_transfer.power_balance_study import (
     HYPERPARAM_TARGET_SHOTS,
     PowerBalanceStudy,
 )
-
-SAMPLE_DIR = PACKAGE_ROOT / "datasets" / "sample"
+from transport_study.tests.sample_data import SAMPLE_DIR, requires_sample_data
 
 
 def _working_dir_base() -> Path:
@@ -27,7 +26,7 @@ def _working_dir_base() -> Path:
 
 
 def _make_config(study_name: str, **overrides) -> PowerBalanceStudy.Config:
-    """Small Config against the bundled sample datasets, quick enough for smoke training."""
+    """Small Config against the sample datasets, quick enough for smoke training."""
     defaults = dict(
         study_name=study_name,
         working_dir_base=_working_dir_base(),
@@ -75,11 +74,12 @@ def _hyperparam_case(study: PowerBalanceStudy, model_type: str) -> PowerBalanceS
     return case.get_hyperparam_prereq()
 
 
-def test_power_balance_transfer_cases():
+def test_power_balance_transfer_cases(tmp_path):
     """Make sure the case graph is set up correctly (pure logic, no training)."""
     study = PowerBalanceStudy(
         _make_config(
             "xfer_test",
+            working_dir_base=tmp_path,
             model_types=("sciml-taue-nn", "mlp", "transformer"),
             data_normalization_methods=("raw", "coral"),
             freeze_submodules_options=(True, False),
@@ -166,6 +166,7 @@ def test_power_balance_transfer_cases():
 
 
 @pytest.mark.slow
+@requires_sample_data
 def test_weighted_device_weight():
     """Train a single p_oh case with weighted domain adaptation to exercise device weighting."""
     study = PowerBalanceStudy(
@@ -197,7 +198,8 @@ def test_weighted_device_weight():
     assert study.result_path(case_p_oh).exists()
 
 
-def test_addition_no_device_weights():
+@requires_sample_data
+def test_addition_no_device_weights(tmp_path):
     """An 'addition' case adds target shots as normal samples without loss weighting.
 
     make_train_config for a domain_adaptation='addition' case must NOT put a
@@ -210,6 +212,7 @@ def test_addition_no_device_weights():
     study = PowerBalanceStudy(
         _make_config(
             "test_addition_no_device_weights",
+            working_dir_base=tmp_path,
             model_types=("mlp",),
             training_datasets=("cmod-low1_cmod-low2",),
             domain_adaptation_methods=("weighted", "addition"),
@@ -259,6 +262,7 @@ def test_addition_no_device_weights():
 
 
 @pytest.mark.slow
+@requires_sample_data
 def test_transformer_training():
     """Smoke-train the transformer case and check the normalizer stats stay frozen."""
     study = PowerBalanceStudy(
@@ -298,6 +302,7 @@ def test_transformer_training():
 
 
 @pytest.mark.slow
+@requires_sample_data
 def test_submodule_freezing():
     study = PowerBalanceStudy(
         _make_config(
@@ -357,6 +362,7 @@ def test_submodule_freezing():
 
 
 @pytest.mark.slow
+@requires_sample_data
 def test_transfer_weights():
     """Transfer with a stat-based normalization runs as two cases: a
     transfer_pretrain twin trains on the historic data with the normalizer
@@ -428,6 +434,7 @@ def test_transfer_weights():
 
 
 @pytest.mark.slow
+@requires_sample_data
 @pytest.mark.parametrize("freeze_submodules", [True, False], ids=["frozen", "unfrozen"])
 def test_transfer_weights_submodules(freeze_submodules):
     study = PowerBalanceStudy(
@@ -524,6 +531,7 @@ def test_transfer_weights_submodules(freeze_submodules):
 
 
 @pytest.mark.slow
+@requires_sample_data
 def test_collect_results():
     study = PowerBalanceStudy(
         _make_config(

@@ -10,9 +10,11 @@ from transport_study.profile_transfer.study_metrics import (
     STAGE_AGG_NAMES,
     collected_metrics_path,
 )
+from transport_study.tests.sample_data import SAMPLE_DIR, requires_sample_data
 
 
 @pytest.mark.slow()
+@requires_sample_data
 class TestCmodToCmod:
     """Test to ensure all the important results are generated for a cmod to cmod profile transfer study"""
 
@@ -25,9 +27,9 @@ class TestCmodToCmod:
             study_name="test_results_cmod_to_cmod_plots",
             working_dir_base=Path(working_dir_base),
             dataset_paths={
-                "cmod-low1": PACKAGE_ROOT / "datasets" / "sample" / "cmod-low1.nc",
-                "cmod-low2": PACKAGE_ROOT / "datasets" / "sample" / "cmod-low2.nc",
-                "cmod-high": PACKAGE_ROOT / "datasets" / "sample" / "cmod-high.nc",
+                "cmod-low1": SAMPLE_DIR / "cmod-low1.nc",
+                "cmod-low2": SAMPLE_DIR / "cmod-low2.nc",
+                "cmod-high": SAMPLE_DIR / "cmod-high.nc",
             },
             target_device="cmod-high",
             debug=True,

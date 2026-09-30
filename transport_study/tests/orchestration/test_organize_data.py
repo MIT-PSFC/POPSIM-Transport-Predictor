@@ -1,10 +1,8 @@
-from pathlib import Path
-
 import numpy as np
 import pytest
 import xarray as xr
 
-from transport_study import EPISODE_DIM, PACKAGE_ROOT, TIME_COORD, TIME_DIM
+from transport_study import EPISODE_DIM, TIME_COORD, TIME_DIM
 from transport_study.config import StudyConfig, load_config
 from transport_study.orchestration.organize_data import (
     TrainingData,
@@ -15,9 +13,8 @@ from transport_study.orchestration.organize_data import (
     parse_training_data,
     reindex_to_uniform_timebase,
 )
+from transport_study.tests.sample_data import SAMPLE_DIR, requires_sample_data
 
-# Sample dataset paths (real .nc files checked into the repo)
-SAMPLE_DIR = Path(PACKAGE_ROOT) / "datasets" / "sample"
 SAMPLE_PATHS = {
     "cmod-low1": SAMPLE_DIR / "cmod-low1.nc",
     "cmod-low2": SAMPLE_DIR / "cmod-low2.nc",
@@ -29,7 +26,7 @@ MAX_DS_SIZE = 20
 
 @pytest.fixture
 def sample_dataset_config() -> StudyConfig:
-    """Load the global config with the bundled sample datasets, cmod-high as target."""
+    """Load the global config with the sample datasets, cmod-high as target."""
     return load_config(
         StudyConfig(
             study_name="test-organize-data",
@@ -41,6 +38,7 @@ def sample_dataset_config() -> StudyConfig:
 
 
 class TestGetDs:
+    @requires_sample_data
     @pytest.mark.parametrize("source_ds", ["cmod-low1", "mast-high"])
     @pytest.mark.parametrize("study_type", ["profile_transfer", "power_balance_transfer"])
     def test_get_ds_returns_dataset_and_dims(self, sample_dataset_config, source_ds, study_type):
@@ -55,24 +53,29 @@ class TestGetDs:
         with pytest.raises(ValueError, match="Unknown source dataset"):
             get_ds("nonexistent_device", study_type)
 
+    @requires_sample_data
     def test_get_ds_unknown_study_type_raises(self, sample_dataset_config):
         with pytest.raises(ValueError, match="Unknown study type"):
             get_ds("cmod-low1", "not_a_study")
 
+    @requires_sample_data
     def test_get_ds_profile_transfer_has_shape_vars(self, sample_dataset_config):
         ds, _ = get_ds("cmod-low1", "profile_transfer")
         assert "Te_shape" in ds
         assert "ne_shape" in ds
 
+    @requires_sample_data
     def test_get_ds_power_balance_has_aux_power(self, sample_dataset_config):
         ds, _ = get_ds("cmod-low1", "power_balance_transfer")
         assert "P_aux_MW" in ds
 
+    @requires_sample_data
     def test_get_ds_max_ds_size_limits_shots(self, sample_dataset_config):
         ds, _ = get_ds("cmod-low1", "power_balance_transfer")
         assert ds.sizes[EPISODE_DIM] <= MAX_DS_SIZE
 
 
+@requires_sample_data
 class TestAddHazard:
     @pytest.mark.parametrize("study_type", ["profile_transfer", "power_balance_transfer"])
     def test_add_hazard_adds_variables(self, sample_dataset_config, study_type):
@@ -122,6 +125,7 @@ class TestTrainingData:
 
 
 class TestGetTrainValDatasets:
+    @requires_sample_data
     def test_get_train_val_datasets_returns_split(self, sample_dataset_config):
         td = TrainingData(sources_unsorted=["cmod-low1", "cmod-low2"])
         train_ds, val_ds = get_train_val_datasets(td, study_type="power_balance_transfer")
@@ -143,6 +147,7 @@ class TestGetTrainValDatasets:
             get_train_val_datasets(td, study_type="power_balance_transfer")
 
 
+@requires_sample_data
 class TestGetTrainTestDatasets:
     def test_get_train_test_datasets_returns_split(self, sample_dataset_config):
         td = TrainingData(sources_unsorted=["cmod-low1", "cmod-low2"])

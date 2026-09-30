@@ -4,7 +4,6 @@ import jax
 import pytest
 import xarray as xr
 
-from transport_study import PACKAGE_ROOT
 from transport_study.config import RHO_GRID
 from transport_study.modules.normalization import CoralFeatureNormalizer
 from transport_study.modules.profile_predictor.module import N_NN_INPUTS
@@ -13,13 +12,14 @@ from transport_study.modules.profile_predictor.train_configs import (
     PROFILE_PREDICTOR_TORAX_CONFIGS,
 )
 from transport_study.profile_transfer.plot_torax_evolution import valid_timesteps
-
-SAMPLE_DIR = PACKAGE_ROOT / "datasets" / "sample"
+from transport_study.tests.sample_data import SAMPLE_DIR
 
 
 @pytest.fixture
 def sample_timeslices():
-    """Load timeslices with a valid TORAX input state from a bundled sample file.
+    """Load timeslices with a valid TORAX input state from a sample file.
+
+    Tests using this fixture must carry requires_sample_data.
 
     The first and last valid slice of each shot are taken, so a small request
     still spans the shot's parameter range. Raw sample files predate the device

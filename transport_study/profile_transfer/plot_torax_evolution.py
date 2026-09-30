@@ -6,7 +6,7 @@ temperature evolution against the measured target profiles.
 
 Example:
     python -m transport_study.profile_transfer.plot_torax_evolution \
-        --dataset transport_study/datasets/sample/cmod-low1.nc \
+        --dataset $PTPS_TEST_SAMPLE_DIR/cmod-low1.nc \
         --shot 1160824011 --timestep 800 \
         --transport_model cgm \
         --checkpoint /path/to/trained/torax/checkpoint \

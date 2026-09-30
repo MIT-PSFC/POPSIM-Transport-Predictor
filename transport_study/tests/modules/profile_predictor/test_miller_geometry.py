@@ -15,6 +15,7 @@ from transport_study.modules.profile_predictor.torax_module import (
     build_circular_geometry_jax,
     build_miller_geometry_jax,
 )
+from transport_study.tests.sample_data import requires_sample_data
 
 N_FACES = 26
 
@@ -31,6 +32,7 @@ GEOMETRY_FIELDS = [
     "spr",
     "spr_face",
     "delta_face",
+    "trapped_fraction_face",
     "g0",
     "g0_face",
     "g1",
@@ -252,6 +254,7 @@ def test_miller_geometry_differentiable():
 
 
 @pytest.mark.slow
+@requires_sample_data
 @pytest.mark.parametrize("transport_model", ["cgm", "qlknn"])
 def test_miller_evolve_mast_no_nan(transport_model, make_torax_module, sample_timeslices):
     # Direct replay of the failure mode behind the NaN/Inf training

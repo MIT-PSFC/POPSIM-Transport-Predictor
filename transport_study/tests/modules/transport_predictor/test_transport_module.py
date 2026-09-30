@@ -16,7 +16,6 @@ import numpy as np
 import pytest
 import xarray as xr
 
-from transport_study import PACKAGE_ROOT
 from transport_study.config import RHO_GRID
 from transport_study.modules.normalization import (
     CoralFeatureNormalizer,
@@ -63,8 +62,7 @@ from transport_study.modules.transport_predictor.module import (
 from transport_study.modules.transport_predictor.train_configs import (
     make_transport_torax_config,
 )
-
-SAMPLE_DIR = PACKAGE_ROOT / "datasets" / "sample"
+from transport_study.tests.sample_data import SAMPLE_DIR, requires_sample_data
 
 RHO = np.asarray(RHO_GRID)
 N_RHO = len(RHO)
@@ -608,6 +606,7 @@ def test_torax_absorbed_power_matches_absorption_fraction(torax_carry_module):
     assert absorbed == pytest.approx(expected, rel=1e-3)
 
 
+@requires_sample_data
 def test_normalizer_fit_features():
     """make_transport_nn_input_normalizer builds an (N, 11) feature matrix
     whose columns match Inputs.transport_nn_inputs evaluated with the

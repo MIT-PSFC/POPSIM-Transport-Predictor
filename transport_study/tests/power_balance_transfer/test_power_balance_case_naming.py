@@ -8,11 +8,8 @@ from pathlib import Path
 
 import pytest
 
-from transport_study import PACKAGE_ROOT
 from transport_study.config import load_config
 from transport_study.power_balance_transfer.power_balance_study import PowerBalanceStudy
-
-SAMPLE_DIR = Path(PACKAGE_ROOT) / "datasets" / "sample"
 
 
 @pytest.fixture
@@ -20,7 +17,7 @@ def loaded_config():
     return load_config(
         PowerBalanceStudy.Config(
             study_name="test-case-naming",
-            dataset_paths={"cmod-low1": SAMPLE_DIR / "cmod-low1.nc", "cmod-high": SAMPLE_DIR / "cmod-high.nc"},
+            dataset_paths={"cmod-low1": Path("path/to/cmod_low1.nc"), "cmod-high": Path("path/to/cmod_high.nc")},
             target_device="cmod-high",
             target_test_set_size=5,
             training_datasets=("cmod-low1",),

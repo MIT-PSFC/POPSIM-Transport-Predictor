@@ -1,4 +1,4 @@
-"""End-to-end runs of the profile transfer study on the bundled sample datasets.
+"""End-to-end runs of the profile transfer study on the sample datasets.
 
 Every case in a small grid is trained for a couple of epochs and collected, so
 the orchestration path (case grid, prereq chain, training, result collection)
@@ -9,11 +9,11 @@ import pytest
 
 from transport_study import PACKAGE_ROOT
 from transport_study.profile_transfer.profile_study import ProfileStudy
+from transport_study.tests.sample_data import SAMPLE_DIR, requires_sample_data
 
-SAMPLE_DIR = PACKAGE_ROOT / "datasets" / "sample"
 WORKING_DIR_BASE = PACKAGE_ROOT / "tests" / "test_outputs" / "profile_transfer"
 
-pytestmark = pytest.mark.slow
+pytestmark = [pytest.mark.slow, requires_sample_data]
 
 
 def _make_config(study_name: str, working_dir_name: str, **overrides) -> ProfileStudy.Config:
