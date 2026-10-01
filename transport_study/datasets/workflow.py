@@ -36,6 +36,10 @@ class DataWorkflow(ABC):
     """
 
     STORE_VARIABLES: ClassVar[dict[str, tuple[str, ...]]] = {PREDICTION_STORE_NAME: STORE_SIGNALS}
+    # Attributes set on every store shot: per variable or coordinate (description, units, ref = IMAS path),
+    # and dataset level. Units of the shared schema always come from signals.STORE_SIGNAL_UNITS.
+    SIGNAL_ATTRS: ClassVar[dict[str, dict[str, str]]] = {}
+    STORE_ATTRS: ClassVar[dict[str, str]] = {}
 
     def __init__(self, ds_name: str, data_assembly_dir: Path | str, max_num_shots: int | None = None):
         """
@@ -75,17 +79,20 @@ class DataWorkflow(ABC):
         return False
 
     def process_fn(self, shot: int, variables: tuple[str, ...]) -> xr.Dataset | None:
-        """One shot of one store: loaded, culled, unit-labelled, and cut down to the store's variables."""
+        """One shot of one store: loaded, culled, cut down to the store's variables, and labelled with attributes."""
         shot_ds = self.load_shot(shot)
         if shot_ds is None:
             logger.warning(f"Skipping shot {shot}, it could not be loaded")
             return None
         if self.cull_shot(shot_ds):
             return None
-        for name in variables:
+        store_ds = shot_ds[list(variables)]
+        store_ds.attrs.update(self.STORE_ATTRS)
+        for name, variable in store_ds.variables.items():
+            variable.attrs.update(self.SIGNAL_ATTRS.get(name, {}))
             if name in STORE_SIGNAL_UNITS:
-                shot_ds[name].attrs["units"] = STORE_SIGNAL_UNITS[name]
-        return shot_ds[list(variables)]
+                variable.attrs["units"] = STORE_SIGNAL_UNITS[name]
+        return store_ds
 
     def log_ds_details(self, ds: xr.Dataset):
         logger.info(f"Final dataset dimensions: {ds.dims}")

@@ -20,6 +20,10 @@ RHO_TOR_NORM_GRID = np.linspace(
     config["profile_grid"]["num_rho_points"],
 )
 PSI_NORM_DIM = "psi_norm"
+RHO_TOR_NORM_DEFINITION = (
+    "Normalized toroidal flux coordinate rho_tor_norm = sqrt(Phi_N): 0 at the magnetic axis, 1 at the LCFS. "
+    "Outside the LCFS Phi_N continues linearly in psi_N, see the sol_extension attribute."
+)
 PSI_NORM_GRID = np.linspace(0.0, config["profile_grid"]["psi_norm_max"], config["profile_grid"]["num_psi_norm_points"])
 
 SOL_EXTENSIONS = ("secant", "tangent")

@@ -12,99 +12,283 @@ from disruption_py.settings.output_setting import DatasetOutputSetting
 from disruption_py.workflow import get_shots_data
 from loguru import logger
 
-from transport_study import RADIAL_DIM
+from transport_study import RADIAL_DIM, TIME_COORD
 from transport_study.datasets.d3d import config
 from transport_study.datasets.d3d.dispy_utils import passive_log_settings
 from transport_study.datasets.d3d.physics_methods import (
     D3DDatasetMethods,
+    DispyEfitNicknameSetting,
     Uniform1kHzTimeSetting,
 )
-from transport_study.datasets.d3d.profiles import find_ida_path, find_ida_shots
+from transport_study.datasets.d3d.profiles import (
+    PSI_NORM_DIM,
+    RHO_TOR_NORM_DEFINITION,
+    find_ida_path,
+    find_ida_shots,
+)
 from transport_study.datasets.workflow import RawFileWorkflow
 from transport_study.signals import PREDICTION_STORE_NAME, STORE_SIGNALS
 
 INNER_WALL = 1.05  # Location of the inner wall, used to calculate minor radius from gapin and R0
 
-# Everything is fetched through one disruption-py call per shot.
-# Built-in methods live in the disruption-py submodule, custom ones in physics_methods.py.
+# Everything is fetched through one disruption-py call per shot, all EFIT signals from the shot's DISPY run
 RUN_METHODS = [
-    # built-in
-    "get_efit_parameters",  # beta_n, beta_p, kappa, wmhd, q95, chisq, ...
+    # disruption-py 0.14 built-ins
+    "get_efit_parameters",  # wmhd, beta_n, kappa
     "get_power_parameters",  # p_rad, p_nbi, p_ech
     "get_ohmic_parameters",  # p_ohm
-    "get_density_parameters",  # n_e, greenwald_fraction
     "get_ip_parameters",  # ip, ip_prog
-    "get_btor",  # btor
     # custom methods from physics_methods.py
-    "get_pedestal_parameters",  # wmhdf, betanf, dssneped
-    "get_programmed_parameters",  # PCS waveforms for predict-first
-    "get_extended_efit_parameters",  # betat, aminor, tritop, tribot, rsurf, X points, gapin
-    "get_ida_profiles",  # Te/ne on psi_n and rho_tor_norm
+    "get_ptdata_parameters",  # bt, dssneped, PCS programmed waveforms
+    "get_line_average_density",  # n_e_line_average
+    "get_boundary_parameters",  # aminor, rsurf, tritop, tribot
+    "get_xpoint_gap_parameters",  # gapin, X points
+    "get_ida_profiles",  # Te/ne on rho_tor_norm and psi_norm
 ]
 
-# Signals only the trajectory optimization reads. TODO(ZanderKeith): IMAS-equivalent names and units?
-# The PCS programmed targets (feedforward control) and the measured signals they are compared against.
+# Store signal -> (raw disruption-py column, factor to SI units)
+PREDICTION_SOURCES = {
+    "ip": ("ip", 1.0),
+    "b0": ("bt", 1.0),
+    "energy_mhd": ("wmhd", 1.0),
+    "beta_tor_norm": ("beta_n", 1.0),
+    "n_e_line_average": ("n_e_line_average", 1.0),
+    "minor_radius": ("aminor", 1.0),
+    "geometric_axis_r": ("rsurf", 1.0),
+    "elongation": ("kappa", 1.0),
+    "triangularity_upper": ("tritop", 1.0),
+    "triangularity_lower": ("tribot", 1.0),
+    "power_ohm": ("p_ohm", 1.0),
+    "power_radiated": ("p_rad", 1.0),
+    "power_nbi": ("p_nbi", 1.0),
+    "power_ec": ("p_ech", 1.0),
+    **{
+        f"{store_profile}{store_suffix}": (f"{raw_profile}{raw_suffix}", 1.0)
+        for raw_profile, store_profile in [("te_rho", "t_e"), ("ne_rho", "n_e")]
+        for raw_suffix, store_suffix in [("", ""), ("_error", "_error"), ("_grad", "_gradient"), ("_grad_error", "_gradient_error")]
+    },
+}
+TRAJOPT_SOURCES = {
+    "ip_reference": ("ip_prog", 1.0),
+    "beta_tor_norm_reference": ("bmtpwrtar", 1.0),
+    "geometric_axis_r_reference": ("idtrp", 1.0),
+    "x_point_lower_r_reference": ("idtrxbot", 1.0),
+    "x_point_lower_z_reference": ("idtzxbot", 1.0),
+    "x_point_upper_r_reference": ("idtrxtop", 1.0),
+    "x_point_upper_z_reference": ("idtzxtop", 1.0),
+    "gap_inner": ("gapin", 1.0),
+    "x_point_lower_r": ("rxpt1", 1.0),
+    "x_point_lower_z": ("zxpt1", 1.0),
+    "x_point_upper_r": ("rxpt2", 1.0),
+    "x_point_upper_z": ("zxpt2", 1.0),
+    "n_e_pedestal": ("dssneped", 1e19),
+    "t_e_psi_norm": ("te_psi", 1.0),
+    "n_e_psi_norm": ("ne_psi", 1.0),
+    # TODO(ZanderKeith): pin down these three PCS pointnames, kept raw (name and units) until then.
+    # bttbt is labeled the programmed toroidal field but does not track the measured one
+    # (1.62 T vs 2.08 T on 206743), maybe another pointname is the active target.
+    # dstdenp is the density request, line average or pedestal depending on the PCS control scheme.
+    # ieeseg07 is labeled the programmed inner gap but behaves like an isoflux segment control error.
+    "bttbt": ("bttbt", 1.0),
+    "dstdenp": ("dstdenp", 1.0),
+    "ieeseg07": ("ieeseg07", 1.0),
+}
+# Signed in the source, stored as magnitudes
+MAGNITUDE_SIGNALS = ("ip", "b0", "ip_reference")
+
+# The PCS programmed targets (feedforward control) and the measured signals they are compared against,
+# read only by the trajectory optimization.
 # They go in their own store, on the same shot / time_idx layout as the prediction store.
 TRAJOPT_STORE_NAME = "trajopt"
-D3D_TRAJOPT_STORE_SIGNALS = (
-    "Ip_MA_prog",
-    "B0_prog",
-    "betan_prog",
-    "ne20_edge_prog",
-    "R0_prog",
-    "gapin_prog",
-    "rxbot_prog",
-    "zxbot_prog",
-    "rxtop_prog",
-    "zxtop_prog",
-    "gapin",
-    "rxbot",
-    "zxbot",
-    "rxtop",
-    "zxtop",
-    "ne20_edge",
-    "Te_keV_psi",
-    "ne20_psi",
-)
+D3D_TRAJOPT_STORE_SIGNALS = tuple(TRAJOPT_SOURCES)
+
+PCS_UNVERIFIED = "Raw PCS pointname whose meaning is unverified, see the TODO on D3D_TRAJOPT_STORE_SIGNALS. "
+
+# description and ref (IMAS path) of every store variable and coordinate. ref is absent where IMAS has no leaf.
+# The prediction store units come from signals.STORE_SIGNAL_UNITS.
+D3D_SIGNAL_ATTRS = {
+    # Coordinates
+    TIME_COORD: {"units": "s", "description": "Time on the uniform 1 kHz timebase"},
+    RADIAL_DIM: {
+        "units": "dimensionless",
+        "description": RHO_TOR_NORM_DEFINITION,
+        "ref": "/core_profiles/profiles_1d(itime)/grid/rho_tor_norm",
+    },
+    PSI_NORM_DIM: {
+        "units": "dimensionless",
+        "description": "Normalized poloidal flux of the IDA reconstruction",
+        "ref": "/equilibrium/time_slice(itime)/profiles_1d/psi_norm",
+    },
+    # Prediction store
+    "ip": {"description": "Measured plasma current magnitude (PTDATA ip)", "ref": "/summary/global_quantities/ip/value"},
+    "b0": {
+        "description": "Vacuum toroidal field magnitude at R0 = 1.6955 m (PTDATA bt)",
+        "ref": "/summary/global_quantities/b0/value",
+    },
+    "energy_mhd": {
+        "description": "Stored energy from the 1 kHz DISPY EFIT (wmhd)",
+        "ref": "/equilibrium/time_slice(itime)/global_quantities/energy_mhd",
+    },
+    "beta_tor_norm": {
+        "description": "Normalized toroidal beta from the 1 kHz DISPY EFIT (betan)",
+        "ref": "/equilibrium/time_slice(itime)/global_quantities/beta_tor_norm",
+    },
+    "n_e_line_average": {
+        "description": "Line-averaged electron density from the DISPY EFIT tree (density)",
+        "ref": "/summary/line_average/n_e/value",
+    },
+    "minor_radius": {
+        "description": "Minor radius of the plasma boundary, DISPY EFIT aminor",
+        "ref": "/equilibrium/time_slice(itime)/boundary/minor_radius",
+    },
+    "geometric_axis_r": {
+        "description": "Major radius of the geometric center of the boundary, DISPY EFIT rsurf",
+        "ref": "/equilibrium/time_slice(itime)/boundary/geometric_axis/r",
+    },
+    "elongation": {
+        "description": "Elongation of the plasma boundary, DISPY EFIT kappa",
+        "ref": "/equilibrium/time_slice(itime)/boundary/elongation",
+    },
+    "triangularity_upper": {
+        "description": "Upper triangularity of the plasma boundary, DISPY EFIT tritop",
+        "ref": "/equilibrium/time_slice(itime)/boundary/triangularity_upper",
+    },
+    "triangularity_lower": {
+        "description": "Lower triangularity of the plasma boundary, DISPY EFIT tribot",
+        "ref": "/equilibrium/time_slice(itime)/boundary/triangularity_lower",
+    },
+    "power_ohm": {
+        "description": "Ohmic heating power, Ip * (V_loop - L dIp/dt), clipped at 0 (disruption-py)",
+        "ref": "/summary/global_quantities/power_ohm/value",
+    },
+    "power_radiated": {
+        "description": "Total radiated power including the divertor, causal 10 ms bolometer reconstruction (disruption-py)",
+        "ref": "/summary/global_quantities/power_radiated/value",
+    },
+    "power_nbi": {
+        "description": "Neutral beam power injected into the vessel (pinj)",
+        "ref": "/summary/heating_current_drive/power_launched_nbi/value",
+    },
+    "power_ic": {
+        "description": "Ion cyclotron heating power, zero (fast wave unused in these campaigns)",
+        "ref": "/summary/heating_current_drive/power_ic/value",
+    },
+    "power_lh": {
+        "description": "Lower hybrid heating power, zero (DIII-D has no LHCD)",
+        "ref": "/summary/heating_current_drive/power_lh/value",
+    },
+    "power_ec": {
+        "description": "Electron cyclotron power injected into the vessel (echpwrc)",
+        "ref": "/summary/heating_current_drive/power_launched_ec/value",
+    },
+    "fresh_profile": {"description": "1 where the profiles are a new IDA slice, 0 where an earlier slice is held"},
+    **{
+        f"{store_profile}{suffix}": attrs
+        for store_profile, quantity, ref_leaf in [
+            ("t_e", "electron temperature", "temperature"),
+            ("n_e", "electron density", "density"),
+        ]
+        for suffix, attrs in [
+            ("", {"description": f"IDA {quantity} profile", "ref": f"/core_profiles/profiles_1d(itime)/electrons/{ref_leaf}"}),
+            (
+                "_error",
+                {
+                    "description": f"1-sigma uncertainty of the IDA {quantity} profile",
+                    "ref": f"/core_profiles/profiles_1d(itime)/electrons/{ref_leaf}_error_upper",
+                },
+            ),
+            ("_gradient", {"description": f"d/drho_tor_norm gradient of the IDA {quantity} profile"}),
+            (
+                "_gradient_error",
+                {"description": f"1-sigma uncertainty of the d/drho_tor_norm gradient of the IDA {quantity}, assuming independent points"},
+            ),
+        ]
+    },
+    # Trajopt store
+    "ip_reference": {
+        "units": "A",
+        "description": "PCS programmed plasma current magnitude (PTDATA iptipp)",
+        "ref": "/pulse_schedule/flux_control/ip/reference",
+    },
+    "beta_tor_norm_reference": {
+        "units": "dimensionless",
+        "description": "PCS programmed normalized beta (PTDATA bmtpwrtar), not reached without active beta control",
+        "ref": "/pulse_schedule/flux_control/beta_tor_norm/reference",
+    },
+    "geometric_axis_r_reference": {
+        "units": "m",
+        "description": "PCS programmed major radius (PTDATA idtrp)",
+        "ref": "/pulse_schedule/position_control/geometric_axis/r/reference",
+    },
+    **{
+        f"x_point_{position}_{component}_reference": {
+            "units": "m",
+            "description": f"PCS programmed {position} X point {component.upper()} (PTDATA idt{component}x{pcs_position})",
+            "ref": f"/pulse_schedule/position_control/x_point(i1)/{component}/reference",
+        }
+        for position, pcs_position in [("lower", "bot"), ("upper", "top")]
+        for component in ["r", "z"]
+    },
+    "gap_inner": {
+        "units": "m",
+        "description": "Gap between the separatrix and the inner wall, DISPY EFIT gapin",
+        "ref": "/equilibrium/time_slice(itime)/boundary/gap(i1)/value",
+    },
+    **{
+        f"x_point_{position}_{component}": {
+            "units": "m",
+            "description": f"{position.capitalize()} X point {component.upper()}, DISPY EFIT {component}xpt{efit_index}",
+            "ref": f"/equilibrium/time_slice(itime)/contour_tree/node(i1)/{component}",
+        }
+        for position, efit_index in [("lower", 1), ("upper", 2)]
+        for component in ["r", "z"]
+    },
+    "n_e_pedestal": {
+        "units": "m^-3",
+        "description": "PCS real-time pedestal density estimate (PTDATA dssneped)",
+        "ref": "/summary/local/pedestal/n_e/value",
+    },
+    "t_e_psi_norm": {
+        "units": "eV",
+        "description": "IDA electron temperature profile on psi_norm",
+        "ref": "/core_profiles/profiles_1d(itime)/electrons/temperature",
+    },
+    "n_e_psi_norm": {
+        "units": "m^-3",
+        "description": "IDA electron density profile on psi_norm",
+        "ref": "/core_profiles/profiles_1d(itime)/electrons/density",
+    },
+    "bttbt": {"units": "T", "description": f"{PCS_UNVERIFIED}Labeled the programmed toroidal field (PTDATA bttbt)"},
+    "dstdenp": {"units": "1e19 m^-3", "description": f"{PCS_UNVERIFIED}PCS density request (PTDATA dstdenp)"},
+    "ieeseg07": {"units": "m", "description": f"{PCS_UNVERIFIED}Labeled the programmed inner gap (PTDATA ieeseg07)"},
+}
 
 
 class D3DDataWorkflow(RawFileWorkflow):
     """DIII-D specific data workflow for creating and processing datasets.
 
-    All signals come from disruption-py (branch zk/ptps) in a single
-    get_shots_data call per shot: 1 kHz EFIT from the DISPY runtag trees,
-    PTDATA and pedestal-tree signals via the custom physics methods in
-    physics_methods.py, and Te/ne profiles from the IDA database on its own rho_tor_norm.
+    All signals come from disruption-py 0.14 in a single get_shots_data call per shot:
+    the 1 kHz EFIT of the shot's DISPY run (DispyEfitNicknameSetting skips a shot without one),
+    PTDATA via the custom physics methods in physics_methods.py,
+    and Te/ne from the IDA database, mapped from IDA's psi_n onto rho_tor_norm through the DISPY q profile.
+    Raw data fetching requires access to the DIII-D data servers.
 
     Two stores: the prediction store (the shared IMAS schema, SI units)
-    and the trajopt store (D3D_TRAJOPT_STORE_SIGNALS),
-    which only the trajectory optimization reads.
-
-    Note: raw data fetching requires access to the DIII-D data servers.
-
-    SIGNAL MAP, prediction store (IMAS name: source):
-    energy_mhd: wmhdf (pedestal tree), filled from EFIT wmhd where missing
-    ip: ip (get_ip_parameters, PTDATA ip)
-    b0: btor (PTDATA bt)
-    beta_tor_norm: betanf (pedestal, fallbacks efsbetan, betat scaling, EFIT beta_n)
-    n_e_line_average: n_e (get_density_parameters)
-    geometric_axis_r, minor_radius, elongation, triangularity_upper / _lower:
-        EFIT rsurf, aminor, kappa, tritop, tribot
-    power_ohm, power_radiated, power_nbi, power_ec: p_ohm, p_rad, p_nbi, p_ech
-    t_e, n_e (+_error, _gradient, _gradient_error): IDA profiles on rho_tor_norm
-
-    SIGNAL MAP, trajopt store (standardized name: source):
-    Ip_MA_prog: ip_prog (PTDATA iptipp)
-    B0_prog, betan_prog, ne20_edge_prog, R0_prog, gapin_prog: PTDATA bttbt, bmtpwrtar, dstdenp, idtrp, ieeseg07
-    rx,zx bot,top (+_prog): EFIT rxpt1, zxpt1, rxpt2, zxpt2 / PTDATA idtr,zx...
-    gapin: EFIT gapin
-    ne20_edge: PTDATA dssneped, filled from ne20_psi at psi_n 0.9 where missing
-    Te_keV_psi, ne20_psi: IDA T_e, n_e on the native psi_n grid
+    and the trajopt store (D3D_TRAJOPT_STORE_SIGNALS), which only the trajectory optimization reads.
+    Every variable carries description, units and ref (its IMAS path) attributes, see D3D_SIGNAL_ATTRS.
+    The signal sources are PREDICTION_SOURCES and TRAJOPT_SOURCES.
     """
 
     STORE_VARIABLES: ClassVar[dict[str, tuple[str, ...]]] = {
         PREDICTION_STORE_NAME: STORE_SIGNALS,
         TRAJOPT_STORE_NAME: D3D_TRAJOPT_STORE_SIGNALS,
+    }
+    SIGNAL_ATTRS: ClassVar[dict[str, dict[str, str]]] = D3D_SIGNAL_ATTRS
+    STORE_ATTRS: ClassVar[dict[str, str]] = {
+        "efit_runtag": config["efit"]["runtag"],
+        "profile_source": "IDA",
+        "sol_extension": config["profile_grid"]["sol_extension"],
+        "rho_tor_norm_definition": RHO_TOR_NORM_DEFINITION,
     }
 
     def __init__(
@@ -151,30 +335,27 @@ class D3DDataWorkflow(RawFileWorkflow):
             "beta_tor_norm": {"min": 0.01, "max": 6},
         }
 
-        # Set signals outside this range to nan, but don't drop the entire timeslice.
-        # SI for the prediction store signals, pre-IMAS units for the trajopt ones.
+        # Set signals outside this range to nan, but don't drop the entire timeslice. Store units.
         self.individual_filter_config = {
             "power_ec": {"min": 0, "max": 1e7},
             "power_ohm": {"min": 0, "max": 7e6},  # 201849 P_oh spikes
             "power_radiated": {"min": 0, "max": 1e7},  # 201855 P_rad far out of distribution
             "power_nbi": {"min": 0, "max": 2.5e7},
-            "ne20_edge": {"min": 0, "max": 2},
-            "Ip_MA_prog": {"min": 0, "max": 2.5},
-            "B0_prog": {"min": 0, "max": 3},
-            "betan_prog": {"min": 0, "max": 6},
-            "ne20_edge_prog": {"min": 0, "max": 2},
-            "R0_prog": {"min": 1.4, "max": 2.0},
-            "gapin": {"min": 0, "max": 0.5},
-            "gapin_prog": {"min": 0, "max": 0.5},
+            # dssneped reads 0 when the PCS does not estimate the pedestal
+            "n_e_pedestal": {"min": 1e18, "max": 2e20},
+            "ip_reference": {"min": 0, "max": 2.5e6},
+            "beta_tor_norm_reference": {"min": 0, "max": 6},
+            "geometric_axis_r_reference": {"min": 1.4, "max": 2.0},
+            "gap_inner": {"min": 0, "max": 0.5},
             # X points, measured and programmed
-            "rxbot": {"min": 1.0, "max": 2.0},
-            "rxbot_prog": {"min": 1.0, "max": 2.0},
-            "rxtop": {"min": 1.0, "max": 2.0},
-            "rxtop_prog": {"min": 1.0, "max": 2.0},
-            "zxbot": {"min": -1.5, "max": 0.0},
-            "zxbot_prog": {"min": -1.5, "max": 0.0},
-            "zxtop": {"min": 0.0, "max": 1.5},
-            "zxtop_prog": {"min": 0.0, "max": 1.5},
+            "x_point_lower_r": {"min": 1.0, "max": 2.0},
+            "x_point_lower_r_reference": {"min": 1.0, "max": 2.0},
+            "x_point_upper_r": {"min": 1.0, "max": 2.0},
+            "x_point_upper_r_reference": {"min": 1.0, "max": 2.0},
+            "x_point_lower_z": {"min": -1.5, "max": 0.0},
+            "x_point_lower_z_reference": {"min": -1.5, "max": 0.0},
+            "x_point_upper_z": {"min": 0.0, "max": 1.5},
+            "x_point_upper_z_reference": {"min": 0.0, "max": 1.5},
         }
 
     def _get_shotlist_from_source(self) -> list[int]:
@@ -183,26 +364,33 @@ class D3DDataWorkflow(RawFileWorkflow):
         shots = find_ida_shots(patterns)
         if not shots:
             raise FileNotFoundError(f"No IDA files found for any pattern in {patterns}")
-        return sorted(shots)
+        return shots
 
     def _get_shot_dataset(self, shot: int) -> xr.Dataset:
-        """Fetch every signal for one shot through disruption-py."""
+        """Fetch every signal for one shot through disruption-py.
+
+        Raises:
+            RuntimeError: If disruption-py returns no data, e.g. the shot has no DISPY EFIT run (see the log).
+        """
         retrieval_settings = RetrievalSettings(
             run_methods=RUN_METHODS,
             custom_physics_methods=[D3DDatasetMethods],
+            efit_nickname_setting=DispyEfitNicknameSetting(),
             time_setting=Uniform1kHzTimeSetting(),
             only_requested_columns=False,
         )
         result = get_shots_data(
             tokamak=Tokamak.D3D,
-            shotlist_setting=shot,
+            shotlist_setting=[shot],
             retrieval_settings=retrieval_settings,
             output_setting=DatasetOutputSetting(path=False),
             log_settings=passive_log_settings(),
             num_processes=1,
         )
+        if result.sizes.get("idx", 0) == 0:
+            raise RuntimeError(f"disruption-py returned no data for shot {shot}")
         result = result.set_index(idx=["shot", "time"]).unstack("idx")
-        return result.transpose("shot", "time", "psi_n", RADIAL_DIM, missing_dims="ignore")
+        return result.transpose("shot", "time", RADIAL_DIM, PSI_NORM_DIM, missing_dims="ignore")
 
     def make_raw_data_files(self):
         """Create raw data files from source for the DIII-D dataset.
@@ -245,138 +433,46 @@ class D3DDataWorkflow(RawFileWorkflow):
         logger.info("Finished making raw data files.")
 
     def standardize_signal_names(self, ds: xr.Dataset) -> xr.Dataset | None:
-        """Build the on-disk schema (IMAS names, SI units) and the trajopt signals from the raw disruption-py columns.
-
-        Builds a fresh Dataset rather than renaming in place:
-        disruption-py's n_e column is the line-averaged density, not the IDA profile.
+        """Build both stores' signals (IMAS names, SI units) from the raw disruption-py columns.
 
         Parameters
         ----------
         ds : xr.Dataset
-            Raw dataset with device-specific signal names
+            Raw dataset with disruption-py column names
 
         Returns
         -------
         xr.Dataset | None
-            Standardized dataset, or None if critical signals are missing
+            Standardized dataset, or None if a source column is missing or a critical signal is all NaN
         """
-
-        raw_required = [
-            "wmhdf",
-            "wmhd",
-            "ip",
-            "ip_prog",
-            "btor",
-            "rsurf",
-            "aminor",
-            "kappa",
-            "n_e",
-            "greenwald_fraction",
-            "p_ohm",
-            "p_rad",
-            "p_nbi",
-            "p_ech",
-            "te_psi",
-            "ne_psi",
-            "te_rho",
-            "te_rho_error",
-            "te_rho_grad",
-            "te_rho_grad_error",
-            "ne_rho",
-            "ne_rho_error",
-            "ne_rho_grad",
-            "ne_rho_grad_error",
-            "betanf",
-            "dssneped",
-            "tritop",
-            "tribot",
-            "bttbt",
-            "bmtpwrtar",
-            "dstdenp",
-            "idtrp",
-            "ieeseg07",
-            "idtrxbot",
-            "idtzxbot",
-            "idtrxtop",
-            "idtzxtop",
-            "rxpt1",
-            "zxpt1",
-            "rxpt2",
-            "zxpt2",
-            "gapin",
-            "beta_n",
-            "betat",
-        ]
-        missing = [var for var in raw_required if var not in ds]
+        sources = {**PREDICTION_SOURCES, **TRAJOPT_SOURCES}
+        raw_required = {raw_name for raw_name, _ in sources.values()}
+        missing = sorted(raw_required - set(ds.data_vars))
         if missing:
             logger.warning(f"Shot {ds['shot'].item()}: missing raw signals {missing}, skipping shot.")
             return None
 
-        # PREDICTION STORE, IMAS names in SI units (IDA: T_e in eV, n_e in m^-3)
-        signals = {
-            "ip": np.abs(ds["ip"]),
-            "b0": np.abs(ds["btor"]),
-            "energy_mhd": ds["wmhdf"],
-            "beta_tor_norm": ds["betanf"],
-            "n_e_line_average": ds["n_e"],
-            "minor_radius": ds["aminor"],
-            "geometric_axis_r": ds["rsurf"],
-            "elongation": ds["kappa"],
-            "triangularity_upper": ds["tritop"],
-            "triangularity_lower": ds["tribot"],
-            "power_ohm": ds["p_ohm"],
-            "power_radiated": ds["p_rad"],
-            "power_nbi": ds["p_nbi"],
-            "power_ec": ds["p_ech"],
-            "power_ic": xr.zeros_like(ds["p_ohm"]),  # fast wave unused in these campaigns
-            "power_lh": xr.zeros_like(ds["p_ohm"]),  # DIII-D has no LHCD
-        }
-        for src, dst in [("te_rho", "t_e"), ("ne_rho", "n_e")]:
-            for src_suffix, dst_suffix in [("", ""), ("_error", "_error"), ("_grad", "_gradient"), ("_grad_error", "_gradient_error")]:
-                signals[f"{dst}{dst_suffix}"] = ds[f"{src}{src_suffix}"]
-
-        # PROCESSING ONLY: fallbacks and filter inputs
-        signals["energy_mhd_efit"] = ds["wmhd"]
-        signals["beta_tor_norm_efit"] = ds["beta_n"]
-        signals["beta_tor"] = ds["betat"]  # [%]
-        signals["greenwald_fraction"] = ds["greenwald_fraction"]
-
-        # TRAJOPT STORE, pre-IMAS names and units
-        signals["Te_keV_psi"] = ds["te_psi"] / 1e3  # Convert eV to keV
-        signals["ne20_psi"] = ds["ne_psi"] / 1e20  # Convert m^-3 to 10^20 m^-3
-        signals["ne20_edge"] = ds["dssneped"] / 10  # assumes 10^19 m^-3, verified vs ne20_psi(0.9)
-        signals["Ip_MA_prog"] = np.abs(ds["ip_prog"]) / 1e6  # Convert A to MA
-        signals["B0_prog"] = np.abs(ds["bttbt"])
-        signals["betan_prog"] = ds["bmtpwrtar"]
-        signals["ne20_edge_prog"] = ds["dstdenp"] / 10  # same unit assumption as dssneped
-        signals["R0_prog"] = ds["idtrp"]
-        signals["gapin"] = ds["gapin"]
-        signals["gapin_prog"] = ds["ieeseg07"]
-        signals["rxbot"] = ds["rxpt1"]
-        signals["rxbot_prog"] = ds["idtrxbot"]
-        signals["zxbot"] = ds["zxpt1"]
-        signals["zxbot_prog"] = ds["idtzxbot"]
-        signals["rxtop"] = ds["rxpt2"]
-        signals["rxtop_prog"] = ds["idtrxtop"]
-        signals["zxtop"] = ds["zxpt2"]
-        signals["zxtop_prog"] = ds["idtzxtop"]
-
+        signals = {}
+        for store_name, (raw_name, factor) in sources.items():
+            signal = ds[raw_name] * factor
+            if store_name in MAGNITUDE_SIGNALS:
+                signal = np.abs(signal)
+            signals[store_name] = signal
+        signals["power_ic"] = xr.zeros_like(ds["p_ohm"])
+        signals["power_lh"] = xr.zeros_like(ds["p_ohm"])
         ds_standardized = xr.Dataset(signals)
 
-        # If any *important* signal is all NaN, return None to skip this shot
-        if self.has_all_nan_signal(ds_standardized, ["t_e", "n_e", "Te_keV_psi", "ne20_psi", "ip"]):
+        # p_nbi is only NaN when the whole get_power_parameters call failed, which also NaNs p_rad and p_ech
+        critical_signals = ["ip", "n_e_line_average", "power_nbi", "t_e", "n_e", "t_e_psi_norm"]
+        if self.has_all_nan_signal(ds_standardized, critical_signals):
             return None
 
         return self.standardize_dim_names(ds_standardized)
 
     def device_specific_processing(self, ds: xr.Dataset) -> xr.Dataset:
-        """Apply DIII-D specific processing steps.
+        """Derive the processing-only filter inputs.
 
-        This includes:
-        - Substituting the EFIT stored energy where the pedestal-tree one is missing or zero
-        - Filling beta_tor_norm from fallback sources
-        - Filling ne20_edge from the psi_n profile where the measurement is missing
-        - Deriving t_e_axis so filter_config can range-check the profiles
+        greenwald_fraction and t_e_axis are range-checked by filter_config and never stored.
 
         Parameters
         ----------
@@ -388,31 +484,14 @@ class D3DDataWorkflow(RawFileWorkflow):
         xr.Dataset
             Processed dataset ready for general workflow
         """
-
-        # The pedestal-tree stored energy is close enough to EFIT's while being less available
-        # Take the EFIT values where it is missing or zero
-        mask_energy_missing = ds["energy_mhd"].isnull() | (ds["energy_mhd"] == 0)
-        ds["energy_mhd"] = ds["energy_mhd"].where(~mask_energy_missing, other=ds["energy_mhd_efit"])
-
-        # Similarly, we sometimes need to fill in beta_tor_norm (from pedestal) from some other source
-        # Our order of preference is as follows:
-        # 1: beta_tor_norm from the pedestal tree (betanf, with efsbetan fallback in the physics method)
-        beta_tor_norm = ds["beta_tor_norm"]
-        # 2: recomputed from beta_tor [%] with the Troyon normalization, ip in MA
+        # n_Greenwald [1e20 m^-3] = Ip [MA] / (pi a^2)
         ip_MA = ds["ip"] * 1e-6
-        beta_tor_norm_from_beta_tor = ds["beta_tor"] * ds["minor_radius"] * ds["b0"] / ip_MA
-        beta_tor_norm = beta_tor_norm.where(beta_tor_norm.notnull() & (beta_tor_norm > 0), beta_tor_norm_from_beta_tor)
-        # 3: beta_tor_norm from EFIT
-        beta_tor_norm = beta_tor_norm.where(beta_tor_norm.notnull() & (beta_tor_norm > 0), ds["beta_tor_norm_efit"])
-        ds["beta_tor_norm"] = beta_tor_norm
+        n_greenwald_1e20 = ip_MA / (np.pi * ds["minor_radius"] ** 2)
+        ds["greenwald_fraction"] = ds["n_e_line_average"] * 1e-20 / n_greenwald_1e20
 
-        # dssneped is often missing, so fill it in with density from the profile where need be
-        ds["ne20_edge"] = ds["ne20_edge"].where(
-            ds["ne20_edge"].notnull() & (ds["ne20_edge"] > 0.001),
-            ds["ne20_psi"].sel(psi_n=0.9, method="nearest"),
-        )
-
-        # Scalar axis temperature so the shared filter_ds can range-check the profile
         ds["t_e_axis"] = ds["t_e"].sel({RADIAL_DIM: 0}, method="nearest")
-
         return ds
+
+    def device_specific_culling(self, ds: xr.Dataset) -> bool:
+        """The default profile cull, plus shots whose EFIT boundary is entirely missing after filtering."""
+        return super().device_specific_culling(ds) or self.has_all_nan_signal(ds, ["geometric_axis_r", "minor_radius"])

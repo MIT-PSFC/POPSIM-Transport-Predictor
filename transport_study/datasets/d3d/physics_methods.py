@@ -93,8 +93,8 @@ class D3DDatasetMethods:
     """Signals the transport study needs that disruption-py 0.14 has no built-in for."""
 
     # Measured: bt (vacuum toroidal field at R = 1.6955 m) and dssneped (PCS pedestal density estimate).
-    # Programmed (PCS targets): bttbt (B0), bmtpwrtar (beta_N), dstdenp (density), idtrp (R0),
-    # ieeseg07 (inner gap), idtrxbot / idtzxbot / idtrxtop / idtzxtop (X points).
+    # PCS targets: bmtpwrtar (beta_N), idtrp (R0), idtrxbot / idtzxbot / idtrxtop / idtzxtop (X points).
+    # Unverified, see D3D_TRAJOPT_STORE_SIGNALS: bttbt, dstdenp, ieeseg07.
     # iptipp (Ip) comes from the built-in get_ip_parameters as ip_prog.
     PTDATA_POINTNAMES: ClassVar[list[str]] = [
         "bt",
@@ -129,6 +129,20 @@ class D3DDatasetMethods:
             times_s = times_ms / 1e3
             signals[pointname] = interp1(times_s, values, params.times)
         return signals
+
+    @staticmethod
+    @physics_method(columns=["n_e_line_average"], tokamak=Tokamak.D3D)
+    def get_line_average_density(params: PhysicsMethodParams):
+        """Line-averaged electron density [m^-3], \\density of the DISPY EFIT tree.
+
+        Replaces the built-in get_density_parameters, which silently falls back to \\d3d::denv2
+        when the EFIT tree lacks \\density, and that reads about 3x higher.
+        """
+        density_cm3, density_time_ms = params.mds_conn.get_data_with_dims(r"\density", tree_name="_efit_tree")
+        density = density_cm3 * 1e6
+        density_time = density_time_ms / 1e3
+        n_e_line_average = interp1(density_time, density, params.times)
+        return {"n_e_line_average": n_e_line_average}
 
     @staticmethod
     @physics_method(columns=BOUNDARY_NODES, tokamak=Tokamak.D3D)

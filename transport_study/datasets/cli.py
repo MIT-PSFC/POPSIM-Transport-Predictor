@@ -6,7 +6,6 @@ import fire
 from loguru import logger
 
 from transport_study.datasets.cmod.cmod_dataset import CModDataWorkflow
-from transport_study.datasets.d3d.d3d_dataset import D3DDataWorkflow
 from transport_study.datasets.mast.mast_dataset import MASTDataWorkflow
 from transport_study.datasets.tcv.tcv_dataset import TCVDataWorkflow
 from transport_study.datasets.workflow import DataWorkflow, RawFileWorkflow
@@ -61,6 +60,9 @@ class DatasetCLI:
         mode: str = "raw",
         clean: bool = False,
     ):
+        # Imported here so only d3d runs import disruption-py
+        from transport_study.datasets.d3d.d3d_dataset import D3DDataWorkflow
+
         workflow = D3DDataWorkflow(
             ds_name=ds_name,
             shotlist_file=shotlist_file,
