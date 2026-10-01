@@ -4,8 +4,6 @@ Every tensorized device store (and every sample dataset) uses IMAS names in SI u
 The study works in engineering units instead, so organize_data converts each store once on load.
 In the study a bare IMAS name always means SI, and any other unit is a suffix on the name
 (ip_MA, energy_mhd_MJ, t_e_keV, n_e_1e20, ...).
-
-Only xarray is imported here, so the dataset workflows (and the numpy < 2 DIII-D venv) can use it without JAX.
 """
 
 import xarray as xr

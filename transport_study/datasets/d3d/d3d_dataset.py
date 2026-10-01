@@ -83,9 +83,7 @@ class D3DDataWorkflow(RawFileWorkflow):
     and the trajopt store (D3D_TRAJOPT_STORE_SIGNALS),
     which only the trajectory optimization reads.
 
-    Note: raw data fetching requires numpy < 2 (MDSplus backend on OMEGA) and
-    access to the DIII-D data servers, see make_d3d_venv.sh.
-    Processing (--mode process) runs in the main uv venv.
+    Note: raw data fetching requires access to the DIII-D data servers.
 
     SIGNAL MAP, prediction store (IMAS name: source):
     energy_mhd: wmhdf (pedestal tree), filled from EFIT wmhd where missing
@@ -220,14 +218,8 @@ class D3DDataWorkflow(RawFileWorkflow):
         """Create raw data files from source for the DIII-D dataset.
 
         One netCDF file per shot on a uniform 1 kHz timebase with standardized
-        signal names. Requires numpy < 2 and DIII-D data server access.
+        signal names. Requires DIII-D data server access.
         """
-
-        if not int(np.version.version.split(".")[0]) < 2:
-            raise RuntimeError(
-                "The MDSplus backend on DIII-D requires numpy < 2, "
-                "please use the make_d3d_venv.sh script to create the correct environment."
-            )
 
         processed_shots = 0
         for shot in self.shotlist:

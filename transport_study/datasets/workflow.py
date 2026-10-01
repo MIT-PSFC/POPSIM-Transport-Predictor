@@ -132,9 +132,6 @@ class DataWorkflow(ABC):
         """Build every STORE_VARIABLES store, then log and plot the prediction store."""
         from popsim.data.dataset_utils import build_tensorized_dataset
 
-        if not int(np.version.version.split(".")[0]) >= 2:
-            raise RuntimeError("Numpy version must be greater than 2 to run data processing workflow on all devices.")
-
         prediction_store_path = self.store_path(PREDICTION_STORE_NAME)
         if prediction_store_path.exists():
             logger.info(f"Dataset already exists at {prediction_store_path}, skipping processing.")
