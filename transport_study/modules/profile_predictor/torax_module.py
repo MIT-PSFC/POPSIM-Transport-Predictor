@@ -18,6 +18,7 @@ from torax._src.geometry import trapped_fraction as torax_trapped_fraction
 from torax._src.orchestration.step_function import SimulationStepFn
 from torax._src.torax_pydantic import torax_pydantic
 
+from transport_study import RADIAL_DIM
 from transport_study.modules.normalization import FeatureNormalizer
 from transport_study.modules.profile_predictor.module import (
     Inputs,
@@ -106,7 +107,7 @@ def build_circular_geometry_jax(
     g2_face = g1_face / R_major**2
     # Clamp 1 - (rho/R)^2 away from zero,
     # the large-aspect-ratio formulas below blow up as local epsilon -> 1
-    # (MAST edge epsilon reaches 0.78 nominally, noisy per-sample a_minor/R0 can push it further)
+    # (MAST edge epsilon reaches 0.78 nominally, noisy per-sample minor_radius / geometric_axis_r can push it further)
     g3 = 1.0 / (R_major**2 * jnp.clip(1.0 - (rho / R_major) ** 2, 0.05, None) ** 1.5)
     g3_face = 1.0 / (R_major**2 * jnp.clip(1.0 - (rho_face / R_major) ** 2, 0.05, None) ** 1.5)
 
@@ -203,8 +204,8 @@ def build_miller_geometry_jax(
     a_minor: jax.Array,
     B_0: jax.Array,
     elongation_LCFS: jax.Array,
-    delta_top: jax.Array,
-    delta_bot: jax.Array,
+    triangularity_upper: jax.Array,
+    triangularity_lower: jax.Array,
     torax_mesh: torax_pydantic.Grid1D,
     rho_hires_norm_np: np.ndarray,
     delta_exponent: float = 2.0,
@@ -218,8 +219,8 @@ def build_miller_geometry_jax(
         R = R_major + r*cos(theta + arcsin(delta)*sin(theta))
         Z = kappa(rn)*r*sin(theta)
 
-    where rn is normalized rho, r = rn*a_minor, and the sin(theta) blend
-    gives exactly delta_top at the top, delta_bot at the bottom, and their mean at the midplane.
+    where rn is normalized rho, r = rn*a_minor, p = delta_exponent, and the sin(theta) blend
+    gives exactly triangularity_upper at the top, triangularity_lower at the bottom, and their mean at the midplane.
     Flux-surface metrics come from poloidal quadrature with closed-form contour derivatives.
     The toroidal field model matches the circular builder
     (vacuum B = B_0*R_major/R with F = R_major*B_0), so gm4 = <R^2>/F^2 and gm5 = F^2*<1/R^2>.
@@ -236,17 +237,16 @@ def build_miller_geometry_jax(
 
     # Clip triangularities for arcsin safety,
     # |delta| <= 0.9 everywhere keeps 1 - delta^2 >= 0.19 and avoids self-intersecting contours
-    delta_top_c = jnp.clip(delta_top, -0.9, 0.9)
-    delta_bot_c = jnp.clip(delta_bot, -0.9, 0.9)
-    delta_mean = 0.5 * (delta_top_c + delta_bot_c)
-    delta_diff = 0.5 * (delta_top_c - delta_bot_c)
+    triangularity_upper_c = jnp.clip(triangularity_upper, -0.9, 0.9)
+    triangularity_lower_c = jnp.clip(triangularity_lower, -0.9, 0.9)
+    delta_mean = 0.5 * (triangularity_upper_c + triangularity_lower_c)
+    delta_diff = 0.5 * (triangularity_upper_c - triangularity_lower_c)
     dkappa_dr = (elongation_LCFS - 1.0) / rho_b
-    p = delta_exponent
 
     def contour(rn_col: jax.Array) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
         # rn_col shape (n_rho, 1), broadcast against theta arrays (n_theta,)
         r = rn_col * rho_b
-        rn_pow = rn_col**p
+        rn_pow = rn_col**delta_exponent
         kappa = 1.0 + rn_col * (elongation_LCFS - 1.0)
         delta_edge_t = delta_mean + delta_diff * sin_t
         delta = rn_pow * delta_edge_t
@@ -258,7 +258,7 @@ def build_miller_geometry_jax(
         dsd_dtheta = rn_pow * delta_diff * cos_t * inv_sqrt
         # dsd_dr alone is singular at the axis for p < 1, but it only ever
         # appears multiplied by r, and r*dsd_dr = p*rn^p*(...) is regular
-        r_dsd_dr = p * rn_pow * delta_edge_t * inv_sqrt
+        r_dsd_dr = delta_exponent * rn_pow * delta_edge_t * inv_sqrt
         du_dtheta = 1.0 + sd * cos_t + dsd_dtheta * sin_t
         dR_dr = jnp.cos(u) - sin_u * sin_t * r_dsd_dr
         dR_dt = -r * sin_u * du_dtheta
@@ -324,7 +324,7 @@ def build_miller_geometry_jax(
 
     elongation = 1.0 + rho_norm * (elongation_LCFS - 1.0)
     elongation_face = 1.0 + rho_face_norm * (elongation_LCFS - 1.0)
-    delta_face = rho_face_norm**p * delta_mean
+    delta_face = rho_face_norm**delta_exponent * delta_mean
 
     n = rho_norm.shape[0]
     n_face = rho_face_norm.shape[0]
@@ -753,15 +753,15 @@ class ProfilePredictorTorax(TimeIndepModule):
     def _coerce_inputs(self, inputs: Inputs | xr.Dataset) -> Inputs:
         if isinstance(inputs, xr.Dataset):
             inputs = Inputs(
-                Ip=inputs["Ip_MA"].data,
-                B0=inputs["B0"].data,
-                betan=inputs["betan"].data,
-                ne20_line_avg=inputs["ne20_line_avg"].data,
-                R0=inputs["R0"].data,
-                a_minor=inputs["a_minor"].data,
-                kappa=inputs["kappa"].data,
-                delta_top=inputs["delta_top"].data,
-                delta_bot=inputs["delta_bot"].data,
+                ip_MA=inputs["ip_MA"].data,
+                b0=inputs["b0"].data,
+                beta_tor_norm=inputs["beta_tor_norm"].data,
+                n_e_line_average_1e20=inputs["n_e_line_average_1e20"].data,
+                geometric_axis_r=inputs["geometric_axis_r"].data,
+                minor_radius=inputs["minor_radius"].data,
+                elongation=inputs["elongation"].data,
+                triangularity_upper=inputs["triangularity_upper"].data,
+                triangularity_lower=inputs["triangularity_lower"].data,
                 ds_source_idx=inputs["ds_source_idx"].data,
                 rho=jnp.array(self.rhogrid),
             )
@@ -779,7 +779,7 @@ class ProfilePredictorTorax(TimeIndepModule):
         #   S_total: 0 - inf, softplus multiple of the device fueling scale
         #     particle_inventory / TAU_REF_S (x 1e21 below)
         #   P_aux_total: 0 - 4x the w_approx / TAU_REF_S power scale [MW].
-        #     The heating magnitude is NN-inferred (betan encodes the stored
+        #     The heating magnitude is NN-inferred (beta_tor_norm encodes the stored
         #     energy the heating sustains) rather than a measured input, so
         #     every model has identical inputs.
         #     The -2 bias makes random-init heating small, starting the solver near
@@ -790,8 +790,8 @@ class ProfilePredictorTorax(TimeIndepModule):
         nn_inputs = self.normalizer(inputs.nn_inputs, inputs.ds_source_idx)
         coeffs = self.transport_coefficients(self.nn_transport(nn_inputs))
         nn_sources_out = self.nn_sources(nn_inputs)
-        # Particle inventory in 1e21 electrons: ne20_line_avg * volume * 0.1
-        inventory = 0.1 * inputs.ne20_line_avg * inputs.volume_approx
+        # Particle inventory in 1e21 electrons: n_e_line_average_1e20 * volume * 0.1
+        inventory = 0.1 * inputs.n_e_line_average_1e20 * inputs.volume_approx
         S_total = jax.nn.softplus(nn_sources_out[0:1]) * inventory / TAU_REF_S
         p_aux_total = 4.0 * jax.nn.sigmoid(nn_sources_out[1:2] - 2.0) * inputs.w_approx / TAU_REF_S
         gaussian_location = 0.8 * jax.nn.sigmoid(nn_sources_out[2:3])
@@ -806,7 +806,7 @@ class ProfilePredictorTorax(TimeIndepModule):
         # particle source, so the BC must scale with the requested density.
         # Both BCs are floored: a near-vacuum edge ill-conditions the density
         # equation, and te_approx (beta / ne_la) is off-scale on early-shot
-        # low-density samples where betan is noisy, which can NaN training.
+        # low-density samples where beta_tor_norm is noisy, which can NaN training.
         # Floors are affine in the sigmoid so the NN gradient path stays intact,
         # te_approx carries no NN params so a hard clip on it costs nothing.
         # The negative bias on the temperature fraction makes random-init edge
@@ -815,7 +815,7 @@ class ProfilePredictorTorax(TimeIndepModule):
         # itself, which keeps the critical gradient model subcritical
         # (chi = chi_min) and kills the gradient to the transport network.
         nn_edge_out = self.nn_edge(nn_inputs)
-        ne_right_bc = (0.01 + 0.94 * jax.nn.sigmoid(nn_edge_out[0:1])) * inputs.ne20_line_avg
+        ne_right_bc = (0.01 + 0.94 * jax.nn.sigmoid(nn_edge_out[0:1])) * inputs.n_e_line_average_1e20
         te_scale = jnp.clip(inputs.te_approx, 0.05, 5.0)
         te_right_bc = 0.02 + jax.nn.sigmoid(nn_edge_out[1:2] - 5.0) * te_scale
 
@@ -838,7 +838,7 @@ class ProfilePredictorTorax(TimeIndepModule):
 
         # Build runtime params override
         ip_update = torax_experimental.TimeVaryingScalarUpdate(
-            value=jnp.atleast_1d(inputs.Ip * 1e6),
+            value=jnp.atleast_1d(inputs.ip_MA * 1e6),
         )
         S_total_update = torax_experimental.TimeVaryingScalarUpdate(value=S_total * 1e21)
         p_aux_update = torax_experimental.TimeVaryingScalarUpdate(value=coeffs["P_aux_total"] * 1e6)
@@ -872,9 +872,9 @@ class ProfilePredictorTorax(TimeIndepModule):
 
         # Density core anchor set so the midplane chord average of the parabola matches the measured line average
         # mean of (1 - rho^2) over the chord is 2/3, so core = bc + 1.5*(line_avg - bc).
-        # ne_right_bc is a fraction in (0.01, 0.95) of ne20_line_avg, so
+        # ne_right_bc is a fraction in (0.01, 0.95) of n_e_line_average_1e20, so
         # core > bc always holds and the init is continuous with the BC.
-        ne_core_init = ne_right_bc + 1.5 * (inputs.ne20_line_avg - ne_right_bc)
+        ne_core_init = ne_right_bc + 1.5 * (inputs.n_e_line_average_1e20 - ne_right_bc)
         n_init_value = 1e20 * (ne_right_bc + (ne_core_init - ne_right_bc) * ic_shape)[jnp.newaxis, :]
         n_init_update = torax_experimental.TimeVaryingArrayUpdate(
             value=n_init_value,
@@ -906,22 +906,22 @@ class ProfilePredictorTorax(TimeIndepModule):
         rho_hires_norm_np = np.array(self._rho_hires_norm)
         if self.geometry_builder == "miller":
             geo = build_miller_geometry_jax(
-                R_major=inputs.R0,
-                a_minor=inputs.a_minor,
-                B_0=inputs.B0,
-                elongation_LCFS=inputs.kappa,
-                delta_top=inputs.delta_top,
-                delta_bot=inputs.delta_bot,
+                R_major=inputs.geometric_axis_r,
+                a_minor=inputs.minor_radius,
+                B_0=inputs.b0,
+                elongation_LCFS=inputs.elongation,
+                triangularity_upper=inputs.triangularity_upper,
+                triangularity_lower=inputs.triangularity_lower,
                 torax_mesh=torax_mesh,
                 rho_hires_norm_np=rho_hires_norm_np,
                 delta_exponent=self.delta_exponent,
             )
         else:
             geo = build_circular_geometry_jax(
-                R_major=inputs.R0,
-                a_minor=inputs.a_minor,
-                B_0=inputs.B0,
-                elongation_LCFS=inputs.kappa,
+                R_major=inputs.geometric_axis_r,
+                a_minor=inputs.minor_radius,
+                B_0=inputs.b0,
+                elongation_LCFS=inputs.elongation,
                 torax_mesh=torax_mesh,
                 rho_hires_norm_np=rho_hires_norm_np,
             )
@@ -932,9 +932,8 @@ class ProfilePredictorTorax(TimeIndepModule):
     def rho_norm_grid(self) -> np.ndarray:
         """Cell-center grid the TORAX core profiles live on.
 
-        This is rho_norm, the normalized toroidal flux radius. For the
-        circular geometry used here, minor radius = a * rho_norm, so rho_norm
-        is exactly the normalized minor radius rho the datasets use.
+        This is rho_norm, the normalized toroidal flux radius,
+        which is the rho_tor_norm the datasets use.
         """
         face_centers = np.array(self._face_centers)
         return (face_centers[:-1] + face_centers[1:]) / 2.0
@@ -974,14 +973,13 @@ class ProfilePredictorTorax(TimeIndepModule):
         ne = state.core_profiles.n_e.value / 1e20
         te = state.core_profiles.T_e.value
 
-        # Interpolate onto rhogrid: TORAX evolves profiles on rho_norm, which
-        # for the circular geometry used here equals the normalized minor
-        # radius rho, so no flux-coordinate mapping is needed. Augment the
-        # cell values with both endpoints before interpolating: jnp.interp
-        # flat-holds outside the data range, which would ignore the exact
-        # Dirichlet edge BC at rho = 1 (the flat-held edge overpredicts
-        # exactly where measured profiles fall steeply). Duplicating the
-        # innermost cell at rho = 0 encodes the zero-gradient axis condition.
+        # Interpolate onto rhogrid.
+        # TORAX evolves profiles on rho_norm, its normalized toroidal flux coordinate,
+        # which is the data's rho_tor_norm, so no coordinate mapping is needed.
+        # The cell values are augmented with both endpoints before interpolating.
+        # jnp.interp flat-holds outside the data range, which would ignore the exact Dirichlet edge BC at rho = 1
+        # (the flat-held edge overpredicts exactly where measured profiles fall steeply).
+        # Duplicating the innermost cell at rho = 0 encodes the zero-gradient axis condition.
         rho_cells = jnp.asarray(self.rho_norm_grid)
         rho_full = jnp.concatenate([jnp.zeros(1), rho_cells, jnp.ones(1)])
         ne_full = jnp.concatenate([ne[:1], ne, coeffs["n_e_right_bc"]])
@@ -992,13 +990,13 @@ class ProfilePredictorTorax(TimeIndepModule):
         return Outputs(
             ne=xr.DataArray(
                 data=ne_interp,
-                dims=("rho",),
-                coords={"rho": list(self.rhogrid)},
+                dims=(RADIAL_DIM,),
+                coords={RADIAL_DIM: list(self.rhogrid)},
             ),
             te=xr.DataArray(
                 data=te_interp,
-                dims=("rho",),
-                coords={"rho": list(self.rhogrid)},
+                dims=(RADIAL_DIM,),
+                coords={RADIAL_DIM: list(self.rhogrid)},
             ),
         )
 
@@ -1030,8 +1028,8 @@ class ProfilePredictorTorax(TimeIndepModule):
         Returns:
             (steps, coeffs):
                 steps: list of dicts, one per TORAX state including the initial one, with keys
-                    t [s], ne20 [1e20 m^-3], te_keV [keV] and rho (the static rho_norm cell
-                    grid, equal to the normalized minor radius for circular geometry).
+                    t [s], n_e_1e20 [1e20 m^-3], t_e_keV [keV] and rho_tor_norm
+                    (the static rho_norm cell grid).
                 coeffs: the transport/source coefficients actually used, as floats.
         """
         inputs = self._coerce_inputs(inputs)
@@ -1057,9 +1055,9 @@ class ProfilePredictorTorax(TimeIndepModule):
             cp = s.core_profiles
             return {
                 "t": float(s.t),
-                "ne20": np.asarray(cp.n_e.value) / 1e20,
-                "te_keV": np.asarray(cp.T_e.value),
-                "rho": self.rho_norm_grid,
+                "n_e_1e20": np.asarray(cp.n_e.value) / 1e20,
+                "t_e_keV": np.asarray(cp.T_e.value),
+                RADIAL_DIM: self.rho_norm_grid,
             }
 
         steps = [record(state)]

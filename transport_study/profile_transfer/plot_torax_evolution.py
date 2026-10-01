@@ -24,7 +24,11 @@ from loguru import logger
 from matplotlib import cm
 from popsim.ml.checkpointing import create_default_checkpoint_manager, restore_model
 
-from transport_study.modules.profile_predictor.module import make_nn_input_normalizer
+from transport_study import RADIAL_DIM
+from transport_study.modules.profile_predictor.module import (
+    NN_INPUT_SOURCE_VARS,
+    make_nn_input_normalizer,
+)
 from transport_study.modules.profile_predictor.torax_module import (
     SOURCE_COEFFICIENT_NAMES,
     TRANSPORT_COEFFICIENT_NAMES,
@@ -34,33 +38,22 @@ from transport_study.modules.profile_predictor.train_configs import (
     PROFILE_PREDICTOR_TORAX_CONFIGS,
 )
 from transport_study.plot_style import BACKGROUND_COLOR, TEXT_COLOR, style_axis
+from transport_study.signals import convert_to_working_units
 
 TITLE_FONTSIZE = 20
 LABEL_FONTSIZE = 18
 TICK_FONTSIZE = 16
 LEGEND_FONTSIZE = 13
 
-INPUT_VARS = [
-    "Ip_MA",
-    "B0",
-    "betan",
-    "ne20_line_avg",
-    "R0",
-    "a_minor",
-    "kappa",
-    "delta_top",
-    "delta_bot",
-]
-
 
 def valid_timesteps(shot_ds: xr.Dataset) -> np.ndarray:
     """Timesteps where all inputs are finite and the target profiles are freshly measured."""
     valid = np.ones(shot_ds.sizes["time_idx"], dtype=bool)
-    for var in INPUT_VARS:
+    for var in NN_INPUT_SOURCE_VARS:
         valid &= ~np.isnan(shot_ds[var].values)
-    valid &= shot_ds["fresh_profiles"].values.astype(bool)
-    valid &= ~np.all(np.isnan(shot_ds["ne20_rho"].values), axis=-1)
-    valid &= ~np.all(np.isnan(shot_ds["Te_keV_rho"].values), axis=-1)
+    valid &= shot_ds["fresh_profile"].values.astype(bool)
+    valid &= ~np.all(np.isnan(shot_ds["n_e_1e20"].values), axis=-1)
+    valid &= ~np.all(np.isnan(shot_ds["t_e_keV"].values), axis=-1)
     return np.flatnonzero(valid)
 
 
@@ -68,7 +61,8 @@ def _load_timeslice(dataset: str | Path, shot: int, timestep: int, ds_source_idx
     ds_path = Path(dataset)
     if not ds_path.exists():
         raise FileNotFoundError(f"Dataset not found: {ds_path}")
-    ds = xr.open_dataset(ds_path)
+    ds_store = xr.open_dataset(ds_path)
+    ds = convert_to_working_units(ds_store)
     shot_ds = ds.sel(shot=shot)
 
     valid = valid_timesteps(shot_ds)
@@ -98,7 +92,7 @@ def _build_module(
     module = ProfilePredictorTorax(
         nn_width=model_cfg["nn_width"],
         nn_depth=model_cfg["nn_depth"],
-        rhogrid=tuple(timeslice["rho"].values.tolist()),
+        rhogrid=tuple(timeslice[RADIAL_DIM].values.tolist()),
         torax_config=model_cfg["torax_config"],
         key=jax.random.PRNGKey(model_cfg["prng_seed"]),
         # Identity buffers, restore_model overwrites them with the trained
@@ -141,9 +135,9 @@ def plot_relaxation(
     """
     prescribed_names = prescribed_names or set()
 
-    rho = timeslice["rho"].values
-    ne_targ = timeslice["ne20_rho"].values
-    te_targ = timeslice["Te_keV_rho"].values
+    rho = timeslice[RADIAL_DIM].values
+    ne_targ = timeslice["n_e_1e20"].values
+    te_targ = timeslice["t_e_keV"].values
 
     fig, (ax_ne, ax_te) = plt.subplots(2, 1, figsize=(12, 10), sharex=True)
     fig.patch.set_facecolor(BACKGROUND_COLOR)
@@ -165,17 +159,17 @@ def plot_relaxation(
     colors = cm.viridis(np.linspace(0.25, 1.0, len(steps)))
     for i, step in enumerate(steps):
         label = f"t={step['t'] * 1e3:.0f} ms"
-        ax_ne.plot(step["rho"], step["ne20"], color=colors[i], linewidth=2, label=label)
-        ax_te.plot(step["rho"], step["te_keV"], color=colors[i], linewidth=2, label=label)
+        ax_ne.plot(step[RADIAL_DIM], step["n_e_1e20"], color=colors[i], linewidth=2, label=label)
+        ax_te.plot(step[RADIAL_DIM], step["t_e_keV"], color=colors[i], linewidth=2, label=label)
 
     ax_ne.plot(rho, ne_targ, color="white", linewidth=3, linestyle="--", label="Measured target")
     ax_te.plot(rho, te_targ, color="white", linewidth=3, linestyle="--", label="Measured target")
 
     ax_ne.set_ylabel(r"$n_e$ [$10^{20}$ m$^{-3}$]", fontsize=LABEL_FONTSIZE, color=TEXT_COLOR)
     ax_te.set_ylabel(r"$T_e$ [keV]", fontsize=LABEL_FONTSIZE, color=TEXT_COLOR)
-    # TORAX evolves profiles on rho_norm, which for circular geometry equals the
-    # normalized minor radius, so both the TORAX steps and the measured targets are in rho.
-    ax_te.set_xlabel(r"$\rho$", fontsize=LABEL_FONTSIZE, color=TEXT_COLOR)
+    # TORAX evolves profiles on rho_norm, its normalized toroidal flux coordinate,
+    # which is the rho_tor_norm the measured targets are on.
+    ax_te.set_xlabel(r"$\rho_{tor,N}$", fontsize=LABEL_FONTSIZE, color=TEXT_COLOR)
 
     for ax in (ax_ne, ax_te):
         style_axis(ax, TICK_FONTSIZE)
@@ -211,7 +205,7 @@ def plot_torax_evolution(
     """Plot ne/Te profile evolution across the internal TORAX relaxation steps.
 
     Args:
-        dataset: Path to a NetCDF dataset with dims (shot, time_idx, rho).
+        dataset: Path to a device store (on-disk IMAS schema) with dims (shot, time_idx, rho_tor_norm).
         shot: Shot number to select.
         timestep: time_idx index of the timeslice to predict.
         transport_model: TORAX transport model: "constant", "cgm", "gyrobohm", or "qlknn".

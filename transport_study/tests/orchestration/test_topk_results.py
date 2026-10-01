@@ -1,8 +1,8 @@
 """Tests for orchestration/topk_results.py, the top-K checkpoint result averaging.
 
 Aggregation is driven with small hand-built xr.Datasets shaped like the
-study_results outputs (data vars error_abs_ts / error_rel_shot / Wtot_MJ_pred /
-Wtot_MJ_targ over dims shot, time_idx), no training needed. The checkpoint
+study_results outputs (data vars error_abs_ts / error_rel_shot / energy_mhd_MJ_pred /
+energy_mhd_MJ_targ over dims shot, time_idx), no training needed. The checkpoint
 retention test exercises the real orbax manager on tmp_path.
 """
 
@@ -38,8 +38,8 @@ def _result_ds(error_offset: float, pred_value: float) -> xr.Dataset:
         data_vars={
             "error_abs_ts": (("shot", "time_idx"), err_ts),
             "error_rel_shot": ("shot", np.array([1.0, 2.0]) + error_offset),
-            "Wtot_MJ_pred": (("shot", "time_idx"), np.full((2, 3), pred_value)),
-            "Wtot_MJ_targ": (("shot", "time_idx"), np.ones((2, 3))),
+            "energy_mhd_MJ_pred": (("shot", "time_idx"), np.full((2, 3), pred_value)),
+            "energy_mhd_MJ_targ": (("shot", "time_idx"), np.ones((2, 3))),
         },
         coords={"shot": ["a", "b"], "time_idx": np.arange(3)},
     )
@@ -70,20 +70,20 @@ def test_aggregate_adds_ckpt_std_companions():
     out = aggregate_topk_results(_three_checkpoint_results(), best_step=25)
     assert np.allclose(out["error_abs_ts_ckpt_std"].values, CKPT_STD_012)
     assert np.allclose(out["error_rel_shot_ckpt_std"].values, CKPT_STD_012)
-    assert "Wtot_MJ_pred_ckpt_std" not in out.data_vars
-    assert "Wtot_MJ_targ_ckpt_std" not in out.data_vars
+    assert "energy_mhd_MJ_pred_ckpt_std" not in out.data_vars
+    assert "energy_mhd_MJ_targ_ckpt_std" not in out.data_vars
 
 
 def test_aggregate_pred_and_targ_from_best_checkpoint():
-    """Give each fake checkpoint a distinct Wtot_MJ_pred. The aggregated
-    dataset's Wtot_MJ_pred and Wtot_MJ_targ must be bit-identical to the
+    """Give each fake checkpoint a distinct energy_mhd_MJ_pred. The aggregated
+    dataset's energy_mhd_MJ_pred and energy_mhd_MJ_targ must be bit-identical to the
     best checkpoint's (predictions are never averaged across checkpoints,
     a mean trajectory would be smoother than any actual model), where
     'best' is the step passed as best_step, not the lowest or highest."""
     per_step = _three_checkpoint_results()
     out = aggregate_topk_results(per_step, best_step=25)
-    assert (out["Wtot_MJ_pred"].values == 25.0).all()
-    assert (out["Wtot_MJ_targ"].values == per_step[25]["Wtot_MJ_targ"].values).all()
+    assert (out["energy_mhd_MJ_pred"].values == 25.0).all()
+    assert (out["energy_mhd_MJ_targ"].values == per_step[25]["energy_mhd_MJ_targ"].values).all()
 
 
 def test_aggregate_records_checkpoint_epochs_in_attrs(tmp_path: Path):

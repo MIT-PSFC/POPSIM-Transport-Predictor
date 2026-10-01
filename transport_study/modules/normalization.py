@@ -1,8 +1,7 @@
 """Input normalization implemented as POPSIM modules.
 
-Each normalizer maps the 7 physical power-balance inputs
-(Ip_MA, B0, R0, a_minor, kappa, ne20_line_avg, P_aux_MW) to 7 NN-ready
-features. Dimensionality is maintained so no new information is provided.
+Each normalizer maps the 7 physical power-balance inputs (NORM_INPUT_VARS) to 7 NN-ready features.
+Dimensionality is maintained so no new information is provided.
 Stats-bearing methods (zscore, coral, and their physics- variants) are fitted
 from TRAINING data only, at model_init time, and store their statistics as
 frozen buffers on the module.
@@ -45,13 +44,13 @@ from popsim.cfspopcon_jax.geometry import calc_plasma_surface_area
 from popsim.module_base import TimeIndepModule
 
 NORM_INPUT_VARS = (
-    "Ip_MA",
-    "B0",
-    "R0",
-    "a_minor",
-    "kappa",
-    "ne20_line_avg",
-    "P_aux_MW",
+    "ip_MA",
+    "b0",
+    "geometric_axis_r",
+    "minor_radius",
+    "elongation",
+    "n_e_line_average_1e20",
+    "power_additional_MW",
 )
 N_FEATURES = len(NORM_INPUT_VARS)
 
@@ -92,35 +91,35 @@ class InputNormalizer(TimeIndepModule):
 
     @chex.dataclass
     class Inputs:
-        Ip_MA: float
-        B0: float
-        R0: float
-        a_minor: float
-        kappa: float
-        ne20_line_avg: float
-        P_aux_MW: float
+        ip_MA: float
+        b0: float
+        geometric_axis_r: float
+        minor_radius: float
+        elongation: float
+        n_e_line_average_1e20: float
+        power_additional_MW: float
         ds_source_idx: float
 
     @chex.dataclass
     class Output:
-        Ip_MA: float
-        B0: float
-        R0: float
-        a_minor: float
-        kappa: float
-        ne20_line_avg: float
-        P_aux_MW: float
+        ip_MA: float
+        b0: float
+        geometric_axis_r: float
+        minor_radius: float
+        elongation: float
+        n_e_line_average_1e20: float
+        power_additional_MW: float
 
         def to_vec(self) -> jnp.ndarray:
             return jnp.stack(
                 [
-                    self.Ip_MA,
-                    self.B0,
-                    self.R0,
-                    self.a_minor,
-                    self.kappa,
-                    self.ne20_line_avg,
-                    self.P_aux_MW,
+                    self.ip_MA,
+                    self.b0,
+                    self.geometric_axis_r,
+                    self.minor_radius,
+                    self.elongation,
+                    self.n_e_line_average_1e20,
+                    self.power_additional_MW,
                 ]
             )
 
@@ -130,13 +129,13 @@ class InputNormalizer(TimeIndepModule):
         if isinstance(data, xr.Dataset):
             data = {var: data[var].data for var in data.data_vars}
         return cls.Inputs(
-            Ip_MA=data["Ip_MA"],
-            B0=data["B0"],
-            R0=data["R0"],
-            a_minor=data["a_minor"],
-            kappa=data["kappa"],
-            ne20_line_avg=data["ne20_line_avg"],
-            P_aux_MW=data["P_aux_MW"],
+            ip_MA=data["ip_MA"],
+            b0=data["b0"],
+            geometric_axis_r=data["geometric_axis_r"],
+            minor_radius=data["minor_radius"],
+            elongation=data["elongation"],
+            n_e_line_average_1e20=data["n_e_line_average_1e20"],
+            power_additional_MW=data["power_additional_MW"],
             ds_source_idx=data["ds_source_idx"],
         )
 
@@ -146,24 +145,24 @@ class InputNormalizer(TimeIndepModule):
     def __call__(self, inputs: Inputs) -> Output:
         vec = jnp.stack(
             [
-                inputs.Ip_MA,
-                inputs.B0,
-                inputs.R0,
-                inputs.a_minor,
-                inputs.kappa,
-                inputs.ne20_line_avg,
-                inputs.P_aux_MW,
+                inputs.ip_MA,
+                inputs.b0,
+                inputs.geometric_axis_r,
+                inputs.minor_radius,
+                inputs.elongation,
+                inputs.n_e_line_average_1e20,
+                inputs.power_additional_MW,
             ]
         )
         out = self._normalize_vec(vec, inputs.ds_source_idx)
         return self.Output(
-            Ip_MA=out[0],
-            B0=out[1],
-            R0=out[2],
-            a_minor=out[3],
-            kappa=out[4],
-            ne20_line_avg=out[5],
-            P_aux_MW=out[6],
+            ip_MA=out[0],
+            b0=out[1],
+            geometric_axis_r=out[2],
+            minor_radius=out[3],
+            elongation=out[4],
+            n_e_line_average_1e20=out[5],
+            power_additional_MW=out[6],
         )
 
 
@@ -176,11 +175,11 @@ class RawNormalizer(InputNormalizer):
 
 # Names of the physics_feature_vec output slots, in order
 PHYSICS_FEATURE_NAMES = (
-    "Ip_MA",
+    "ip_MA",
     "q_star",
     "epsilon",
     "aB0",
-    "kappa",
+    "elongation",
     "f_G",
     "surface_power_density",
 )
@@ -190,16 +189,16 @@ def physics_feature_vec(vec: jnp.ndarray) -> jnp.ndarray:
     """The dimensionless physics features for a stacked 7-input vector.
 
     Slot mapping (slot name -> feature):
-    - Ip_MA          -> Ip_MA (kept raw, sufficiently device-invariant)
-    - B0             -> q_star (zero triangularity, consistent with H89/H98)
-    - R0             -> epsilon = a_minor / R0
-    - a_minor        -> aB0 = a_minor * B0 (dimensional, but the dimensionless
-                        alternatives like normalized gyroradius need a temperature,
-                        which the scaling-law baselines do not have. A fair
-                        comparison keeps the same information budget)
-    - kappa          -> kappa
-    - ne20_line_avg  -> Greenwald fraction f_G
-    - P_aux_MW       -> P_aux / plasma surface area
+    - ip_MA                  -> ip_MA (kept raw, sufficiently device-invariant)
+    - b0                     -> q_star (zero triangularity, consistent with H89/H98)
+    - geometric_axis_r       -> epsilon = minor_radius / geometric_axis_r
+    - minor_radius           -> aB0 = minor_radius * b0 (dimensional, but the dimensionless
+                                alternatives like normalized gyroradius need a temperature,
+                                which the scaling-law baselines do not have.
+                                A fair comparison keeps the same information budget)
+    - elongation             -> elongation
+    - n_e_line_average_1e20  -> Greenwald fraction f_G
+    - power_additional_MW    -> P_aux / plasma surface area
     """
     ip_ma, b0, r0, a_minor, kappa, ne20, p_aux = vec
     epsilon = a_minor / r0
@@ -540,11 +539,11 @@ FEATURE_NORMALIZATIONS = ("physics", "physics-coral", "physics-zscore")
 def feature_fit_arrays(ds: xr.Dataset, features: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Attach an (N, F) feature matrix to its device and shot indices.
 
-    The matrix rows are the dataset flattened against Ip_MA (see each module's
+    The matrix rows are the dataset flattened against ip_MA (see each module's
     feature-matrix helper). NaN device indices (from NaN-padded concatenation)
     can't be attributed to a device, so their rows are dropped.
     """
-    reference = ds["Ip_MA"]
+    reference = ds["ip_MA"]
     source_idx = np.asarray(ds["ds_source_idx"].broadcast_like(reference).values, dtype=float).ravel()
     shot_idx = np.asarray(ds["shot"].broadcast_like(reference).values).ravel()
     attributed = ~np.isnan(source_idx)

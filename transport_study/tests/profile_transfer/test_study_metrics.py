@@ -12,6 +12,7 @@ import numpy as np
 import pytest
 import xarray as xr
 
+from transport_study import RADIAL_DIM
 from transport_study.config import RHO_GRID
 from transport_study.orchestration.stages import STAGE_AGG_NAMES
 from transport_study.profile_transfer import study_metrics
@@ -29,19 +30,19 @@ def _make_result_ds(times: np.ndarray, ne_pred, ne_targ, te_pred, te_targ, shot:
     n_ts = len(times)
 
     def _var(arr):
-        return (("shot", "time_idx", "rho"), np.broadcast_to(arr, (1, n_ts, len(RHO_GRID))).copy())
+        return (("shot", "time_idx", RADIAL_DIM), np.broadcast_to(arr, (1, n_ts, len(RHO_GRID))).copy())
 
     return xr.Dataset(
         data_vars={
-            "ne20_rho_pred": _var(ne_pred),
-            "ne20_rho_targ": _var(ne_targ),
-            "Te_keV_rho_pred": _var(te_pred),
-            "Te_keV_rho_targ": _var(te_targ),
+            "n_e_1e20_pred": _var(ne_pred),
+            "n_e_1e20_targ": _var(ne_targ),
+            "t_e_keV_pred": _var(te_pred),
+            "t_e_keV_targ": _var(te_targ),
         },
         coords={
             "shot": [shot],
             "time_idx": np.arange(n_ts),
-            "rho": RHO_GRID,
+            RADIAL_DIM: RHO_GRID,
             "time": (("shot", "time_idx"), times[None, :]),
             "ds_source": (("shot",), np.array(["devA"], dtype=object)),
         },
@@ -64,7 +65,7 @@ def _make_eval_ds(
     n_rho = len(RHO_GRID)
 
     def _profile_var(arr):
-        return (("shot", "time_idx", "rho"), np.broadcast_to(arr, (1, n_ts, n_rho)).copy())
+        return (("shot", "time_idx", RADIAL_DIM), np.broadcast_to(arr, (1, n_ts, n_rho)).copy())
 
     def _scalar_var(arr):
         return (("shot", "time_idx"), np.asarray(arr, dtype=float)[None, :])
@@ -72,22 +73,22 @@ def _make_eval_ds(
     zeros = np.zeros(n_ts)
     return xr.Dataset(
         data_vars={
-            "ne20_rho_error": _profile_var(ne_err),
-            "Te_keV_rho_error": _profile_var(te_err),
-            "ne20_rho_grad": _profile_var(ne_grad if ne_grad is not None else 0.0),
-            "Te_keV_rho_grad": _profile_var(te_grad if te_grad is not None else 0.0),
-            "ne20_rho_grad_error": _profile_var(ne_grad_err),
-            "Te_keV_rho_grad_error": _profile_var(te_grad_err),
-            "Ip_MA": _scalar_var(ip),
-            "P_NBI_MW": _scalar_var(p_nbi),
-            "P_LH_MW": _scalar_var(zeros),
-            "P_ECRH_MW": _scalar_var(zeros),
-            "P_ICRF_MW": _scalar_var(zeros),
+            "n_e_1e20_error": _profile_var(ne_err),
+            "t_e_keV_error": _profile_var(te_err),
+            "n_e_1e20_gradient": _profile_var(ne_grad if ne_grad is not None else 0.0),
+            "t_e_keV_gradient": _profile_var(te_grad if te_grad is not None else 0.0),
+            "n_e_1e20_gradient_error": _profile_var(ne_grad_err),
+            "t_e_keV_gradient_error": _profile_var(te_grad_err),
+            "ip_MA": _scalar_var(ip),
+            "power_nbi_MW": _scalar_var(p_nbi),
+            "power_lh_MW": _scalar_var(zeros),
+            "power_ec_MW": _scalar_var(zeros),
+            "power_ic_MW": _scalar_var(zeros),
         },
         coords={
             "shot": [shot],
             "time_idx": np.arange(n_ts),
-            "rho": RHO_GRID,
+            RADIAL_DIM: RHO_GRID,
             "time": (("shot", "time_idx"), times[None, :]),
         },
     )

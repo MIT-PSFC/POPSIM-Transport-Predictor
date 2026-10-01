@@ -39,8 +39,8 @@ from transport_study.tests.sample_data import SAMPLE_DIR, requires_sample_data
 # global config (only the device-weight test loads one)
 BASE_LOSS_CONFIG = {
     "huber_delta": 0.5,
-    "anchor_weight_p_oh": 0.1,
-    "anchor_weight_p_rad": 0.1,
+    "anchor_weight_power_ohm": 0.1,
+    "anchor_weight_power_radiated": 0.1,
     "device_weights": {},
 }
 
@@ -48,11 +48,11 @@ BASE_LOSS_CONFIG = {
 def _make_output(n: int, p_oh: float | None = None, p_rad: float | None = None) -> PowerBalance.Output:
     kwargs = {}
     if p_oh is not None:
-        kwargs["P_oh_MW_pred"] = jnp.full(n, p_oh)
+        kwargs["power_ohm_MW_pred"] = jnp.full(n, p_oh)
     if p_rad is not None:
-        kwargs["P_rad_MW_pred"] = jnp.full(n, p_rad)
+        kwargs["power_radiated_MW_pred"] = jnp.full(n, p_rad)
     return PowerBalance.Output(
-        Wtot_MJ_pred=jnp.ones(n),
+        energy_mhd_MJ_pred=jnp.ones(n),
         P_cond_MW=jnp.ones(n),
         taue_predictor_output=TauePredictorOutputs(taue_pred=jnp.ones(n), debug_info={}),
         **kwargs,
@@ -63,12 +63,12 @@ def _make_targets(n: int, with_powers: bool = True, ds_source_idx=None) -> dict:
     if ds_source_idx is None:
         ds_source_idx = np.zeros(n, dtype=np.float32)
     targ = {
-        "Wtot_MJ": xr.DataArray(np.ones(n, dtype=np.float32)),
+        "energy_mhd_MJ": xr.DataArray(np.ones(n, dtype=np.float32)),
         "ds_source_idx": xr.DataArray(np.asarray(ds_source_idx, dtype=np.float32)),
     }
     if with_powers:
-        targ["P_oh_MW"] = xr.DataArray(np.full(n, 2.0, dtype=np.float32))
-        targ["P_rad_MW"] = xr.DataArray(np.full(n, 1.0, dtype=np.float32))
+        targ["power_ohm_MW"] = xr.DataArray(np.full(n, 2.0, dtype=np.float32))
+        targ["power_radiated_MW"] = xr.DataArray(np.full(n, 1.0, dtype=np.float32))
     return targ
 
 
@@ -108,7 +108,7 @@ def test_anchor_terms_noop_without_power_targets():
 
 
 def test_anchor_weight_zero_disables_term():
-    loss_config = {**BASE_LOSS_CONFIG, "anchor_weight_p_oh": 0.0, "anchor_weight_p_rad": 0.0}
+    loss_config = {**BASE_LOSS_CONFIG, "anchor_weight_power_ohm": 0.0, "anchor_weight_power_radiated": 0.0}
     inst = PowerBalanceTRB.get_loss_fn(loss_config).instantaneous_loss
     targ = _make_targets(4)
 
@@ -144,13 +144,13 @@ def test_anchor_terms_respect_device_weights():
 
 def _scalar_inputs() -> PowerBalance.Inputs:
     return PowerBalance.Inputs(
-        Ip_MA=jnp.asarray(1.0),
-        B0=jnp.asarray(5.0),
-        R0=jnp.asarray(1.7),
-        a_minor=jnp.asarray(0.5),
-        kappa=jnp.asarray(1.7),
-        ne20_line_avg=jnp.asarray(1.5),
-        P_aux_MW=jnp.asarray(2.0),
+        ip_MA=jnp.asarray(1.0),
+        b0=jnp.asarray(5.0),
+        geometric_axis_r=jnp.asarray(1.7),
+        minor_radius=jnp.asarray(0.5),
+        elongation=jnp.asarray(1.7),
+        n_e_line_average_1e20=jnp.asarray(1.5),
+        power_additional_MW=jnp.asarray(2.0),
         ds_source_idx=jnp.asarray(0),
     )
 
@@ -164,10 +164,10 @@ def _make_submodules() -> tuple[OhmicPower, RadiatedPower]:
 def test_structured_outputs_carry_submodule_predictions():
     p_oh, p_rad = _make_submodules()
     inputs = _scalar_inputs()
-    state = PowerBalance.State(Wtot_MJ=jnp.asarray(0.1))
+    state = PowerBalance.State(energy_mhd_MJ=jnp.asarray(0.1))
 
-    expected_p_oh = p_oh(inputs.to_normalizer_inputs()).P_oh_MW_pred
-    expected_p_rad = p_rad(inputs.to_normalizer_inputs()).P_rad_MW_pred
+    expected_p_oh = p_oh(inputs.to_normalizer_inputs()).power_ohm_MW_pred
+    expected_p_rad = p_rad(inputs.to_normalizer_inputs()).power_radiated_MW_pred
 
     sciml = PowerBalanceSciML.init(
         in_size=7,
@@ -181,21 +181,21 @@ def test_structured_outputs_carry_submodule_predictions():
     scalinglaw = PowerBalanceScalingLaw.init(p_oh_predictor=p_oh, p_rad_predictor=p_rad)
     for module in (sciml, scalinglaw):
         _, output = module(state, inputs)
-        assert np.isclose(float(output.P_oh_MW_pred), float(expected_p_oh))
-        assert np.isclose(float(output.P_rad_MW_pred), float(expected_p_rad))
+        assert np.isclose(float(output.power_ohm_MW_pred), float(expected_p_oh))
+        assert np.isclose(float(output.power_radiated_MW_pred), float(expected_p_rad))
 
     mlp = PowerBalanceUnstructuredNN.init(in_size=7, out_size=1, nn_width=4, nn_depth=1, normalizer=make_normalizer("raw", None, 1))
     _, output = mlp(state, inputs)
-    assert np.isnan(float(output.P_oh_MW_pred))
-    assert np.isnan(float(output.P_rad_MW_pred))
+    assert np.isnan(float(output.power_ohm_MW_pred))
+    assert np.isnan(float(output.power_radiated_MW_pred))
 
     transformer = PowerBalanceTransformer.init(
         d_model=8, num_heads=2, history_len=4, nn_width=4, nn_depth=1, normalizer=make_normalizer("raw", None, 1)
     )
-    transformer_state = PowerBalanceTransformer.State(Wtot_MJ=jnp.asarray(0.1), history=jnp.full((4,), 0.1))
+    transformer_state = PowerBalanceTransformer.State(energy_mhd_MJ=jnp.asarray(0.1), history=jnp.full((4,), 0.1))
     _, output = transformer(transformer_state, inputs)
-    assert np.isnan(float(output.P_oh_MW_pred))
-    assert np.isnan(float(output.P_rad_MW_pred))
+    assert np.isnan(float(output.power_ohm_MW_pred))
+    assert np.isnan(float(output.power_radiated_MW_pred))
 
 
 #####################

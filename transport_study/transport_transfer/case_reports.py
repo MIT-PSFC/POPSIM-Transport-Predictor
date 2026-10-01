@@ -21,7 +21,7 @@ import xarray as xr
 from loguru import logger
 from matplotlib.patches import Patch
 
-from transport_study import EPISODE_DIM, TIME_DIM
+from transport_study import EPISODE_DIM, RADIAL_DIM, TIME_DIM
 from transport_study.plot_style import BACKGROUND_COLOR, TEXT_COLOR, style_axis
 from transport_study.power_balance_transfer.case_reports import (  # noqa: F401 re-exported for the ANALYSIS_REPORTS_MODULE contract
     AUX_SHADE_COLOR,
@@ -40,8 +40,8 @@ from transport_study.transport_transfer.study_metrics import (
     compute_case_timeslice_metrics,
 )
 
-PROFILE_CMAPS = {"Te_keV_rho": "magma", "ne20_rho": "viridis"}
-PROFILE_LABELS = {"Te_keV_rho": "Te [keV]", "ne20_rho": "ne [1e20 m^-3]"}
+PROFILE_CMAPS = {"t_e_keV": "magma", "n_e_1e20": "viridis"}
+PROFILE_LABELS = {"t_e_keV": "Te [keV]", "n_e_1e20": "ne [1e20 m^-3]"}
 
 
 def _profile_map(ax, times: np.ndarray, rho: np.ndarray, values: np.ndarray, cmap: str, vmin: float, vmax: float):
@@ -65,10 +65,10 @@ def _shot_page(
     """
     shot_res = result_ds.sel({EPISODE_DIM: shot})
     res_time = shot_res["time"].values
-    rho = shot_res["rho"].values
+    rho = shot_res[RADIAL_DIM].values
     valid = np.isfinite(res_time)
     for signal in PROFILE_CMAPS:
-        valid &= np.isfinite(shot_res[f"{signal}_targ"].transpose(TIME_DIM, "rho").values).any(axis=-1)
+        valid &= np.isfinite(shot_res[f"{signal}_targ"].transpose(TIME_DIM, RADIAL_DIM).values).any(axis=-1)
 
     rec = np.flatnonzero(ts_metrics.shot == shot)
     rec = rec[np.argsort(ts_metrics.time[rec])]
@@ -79,15 +79,15 @@ def _shot_page(
     fig.patch.set_facecolor(BACKGROUND_COLOR)
 
     for row, signal in enumerate(PROFILE_CMAPS):
-        targ = shot_res[f"{signal}_targ"].transpose(TIME_DIM, "rho").values[valid]
-        pred = shot_res[f"{signal}_pred"].transpose(TIME_DIM, "rho").values[valid]
+        targ = shot_res[f"{signal}_targ"].transpose(TIME_DIM, RADIAL_DIM).values[valid]
+        pred = shot_res[f"{signal}_pred"].transpose(TIME_DIM, RADIAL_DIM).values[valid]
         finite_targ = targ[np.isfinite(targ)]
         vmin = float(finite_targ.min()) if len(finite_targ) else 0.0
         vmax = float(finite_targ.max()) if len(finite_targ) else 1.0
         cmap = PROFILE_CMAPS[signal]
         _profile_map(axes[row, 0], res_time[valid], rho, targ, cmap, vmin, vmax)
         im = _profile_map(axes[row, 1], res_time[valid], rho, pred, cmap, vmin, vmax)
-        axes[row, 0].set_ylabel("rho", color=TEXT_COLOR, fontsize=LABEL_FONTSIZE)
+        axes[row, 0].set_ylabel(r"$\rho_{tor,N}$", color=TEXT_COLOR, fontsize=LABEL_FONTSIZE)
         axes[row, 0].set_title(f"Measured {PROFILE_LABELS[signal]}", color=TEXT_COLOR, fontsize=LABEL_FONTSIZE)
         axes[row, 1].set_title(f"Predicted {PROFILE_LABELS[signal]}", color=TEXT_COLOR, fontsize=LABEL_FONTSIZE)
         cbar = fig.colorbar(im, ax=axes[row, :].tolist(), pad=0.02)

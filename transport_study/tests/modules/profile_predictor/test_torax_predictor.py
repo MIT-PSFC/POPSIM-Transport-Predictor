@@ -10,6 +10,7 @@ from popsim.ml.launch import launch_train
 from torax import ToraxConfig
 from torax import experimental as torax_experimental
 
+from transport_study import RADIAL_DIM
 from transport_study.config import RHO_GRID, StudyConfig, load_config
 from transport_study.modules.profile_predictor.module import Inputs
 from transport_study.modules.profile_predictor.torax_module import (
@@ -64,18 +65,18 @@ def _torax_config(transport: dict) -> ToraxConfig:
 
 
 def _batch_inputs() -> Inputs:
-    """Two C-Mod-like timeslices differing in Ip, betan, and density."""
+    """Two C-Mod-like timeslices differing in Ip, beta_tor_norm, and density."""
     n_batch = 2
     return Inputs(
-        Ip=jnp.array([1.0, 0.8]),
-        B0=jnp.full(n_batch, 5.4),
-        betan=jnp.array([1.2, 0.9]),
-        ne20_line_avg=jnp.array([1.5, 1.2]),
-        R0=jnp.full(n_batch, 0.68),
-        a_minor=jnp.full(n_batch, 0.22),
-        kappa=jnp.full(n_batch, 1.6),
-        delta_top=jnp.full(n_batch, 0.4),
-        delta_bot=jnp.full(n_batch, 0.5),
+        ip_MA=jnp.array([1.0, 0.8]),
+        b0=jnp.full(n_batch, 5.4),
+        beta_tor_norm=jnp.array([1.2, 0.9]),
+        n_e_line_average_1e20=jnp.array([1.5, 1.2]),
+        geometric_axis_r=jnp.full(n_batch, 0.68),
+        minor_radius=jnp.full(n_batch, 0.22),
+        elongation=jnp.full(n_batch, 1.6),
+        triangularity_upper=jnp.full(n_batch, 0.4),
+        triangularity_lower=jnp.full(n_batch, 0.5),
         ds_source_idx=jnp.zeros(n_batch),
         rho=jnp.tile(jnp.asarray(RHO_GRID), (n_batch, 1)),
     )
@@ -241,11 +242,11 @@ def test_torax_heat_source_response(make_torax_module, sample_timeslices):
     assert coeffs_hot["P_aux_total"] == pytest.approx(10.0)
     for steps in (steps_cold, steps_hot):
         for step in steps:
-            assert np.all(np.isfinite(step["ne20"]))
-            assert np.all(np.isfinite(step["te_keV"]))
+            assert np.all(np.isfinite(step["n_e_1e20"]))
+            assert np.all(np.isfinite(step["t_e_keV"]))
 
-    te_cold = steps_cold[-1]["te_keV"].mean()
-    te_hot = steps_hot[-1]["te_keV"].mean()
+    te_cold = steps_cold[-1]["t_e_keV"].mean()
+    te_hot = steps_hot[-1]["t_e_keV"].mean()
     assert te_hot > te_cold * 1.05
 
 
@@ -263,7 +264,7 @@ def test_torax_output_hits_edge_bc_and_smooth_init(make_torax_module, sample_tim
     assert outputs.ne.values[-1] == pytest.approx(coeffs["n_e_right_bc"], rel=1e-3)
 
     # The initial condition sampled on the cell grid must be a smooth parabola
-    for key in ("te_keV", "ne20"):
+    for key in ("t_e_keV", "n_e_1e20"):
         init = steps[0][key]
         d2 = np.diff(init, n=2)
         scale = np.abs(init).max()
@@ -318,9 +319,9 @@ def test_torax_relaxation_loop_matches_step_replay(make_torax_module):
 
     numerics = module.step_fn.runtime_params_provider.numerics
     assert steps[-1]["t"] == pytest.approx(float(numerics.t_final))
-    rho_full = np.concatenate([[0.0], steps[-1]["rho"], [1.0]])
-    ne_full = np.concatenate([steps[-1]["ne20"][:1], steps[-1]["ne20"], [coeffs["n_e_right_bc"]]])
-    te_full = np.concatenate([steps[-1]["te_keV"][:1], steps[-1]["te_keV"], [coeffs["T_e_right_bc"]]])
+    rho_full = np.concatenate([[0.0], steps[-1][RADIAL_DIM], [1.0]])
+    ne_full = np.concatenate([steps[-1]["n_e_1e20"][:1], steps[-1]["n_e_1e20"], [coeffs["n_e_right_bc"]]])
+    te_full = np.concatenate([steps[-1]["t_e_keV"][:1], steps[-1]["t_e_keV"], [coeffs["T_e_right_bc"]]])
     np.testing.assert_allclose(outputs.ne.values, np.interp(RHO_GRID, rho_full, ne_full), rtol=1e-6)
     np.testing.assert_allclose(outputs.te.values, np.interp(RHO_GRID, rho_full, te_full), rtol=1e-6)
 

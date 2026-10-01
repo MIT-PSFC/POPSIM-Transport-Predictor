@@ -11,7 +11,7 @@ from popsim.cfspopcon_jax.geometry import calc_plasma_volume
 from popsim.ml.split_utils import split_dataset_by_fracs
 from scipy.constants import mu_0
 
-from transport_study import EPISODE_DIM, TIME_COORD, TIME_DIM
+from transport_study import EPISODE_DIM, RADIAL_DIM, TIME_COORD, TIME_DIM
 from transport_study.config import RHO_GRID, TRAIN_VAL_SPLIT, config
 from transport_study.datasets import UNIFORM_TIMEBASE_DT_S, make_uniform_1khz_timebase
 from transport_study.modules.normalization import (
@@ -29,6 +29,7 @@ from transport_study.modules.profile_predictor.module import (
     NN_INPUT_SOURCE_VARS,
     nn_input_matrix,
 )
+from transport_study.signals import convert_to_working_units
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -75,37 +76,25 @@ def parse_training_data(s: str, dataset_paths: dict, target_device: str | None) 
 
 REQUIRED_SIGNALS_POWER_BALANCE = [
     # Target
-    "Wtot_MJ",
+    "energy_mhd_MJ",
     # Inputs
-    "Ip_MA",
-    "B0",
-    "R0",
-    "kappa",
-    "a_minor",  # For inverse aspect ratio
+    "ip_MA",
+    "b0",
+    "geometric_axis_r",
+    "elongation",
+    "minor_radius",  # For inverse aspect ratio
+    "n_e_line_average_1e20",
+    "power_additional_MW",
 ]
-INPUT_POWER_SIGNALS = ["P_ECRH_MW", "P_NBI_MW", "P_ICRF_MW", "P_LH_MW"]
-
-
-def _add_aux_power(ds: xr.Dataset) -> xr.Dataset:
-    """Zero-fill missing per-system aux power signals and sum them to P_aux_MW.
-
-    Some devices lack entire heating systems (and the sample datasets lack all
-    of them), the submodule TRBs still expect the per-system names to exist.
-    """
-    for signal in INPUT_POWER_SIGNALS:
-        if signal not in ds:
-            ds[signal] = xr.zeros_like(ds["Ip_MA"])
-    ds["P_aux_MW"] = ds["P_NBI_MW"] + ds["P_ECRH_MW"] + ds["P_ICRF_MW"] + ds["P_LH_MW"]
-    return ds
 
 
 # Profile channels that carry GP-fit gradient and error-bar companions.
-# For each base signal <v> the companions are <v>_grad, <v>_error and
-# <v>_grad_error. An error of 0 is the sentinel for "no rigorous error
-# quantification", the loss treats it as a zero-width error bar
-PROFILE_BASE_SIGNALS = ["Te_keV_rho", "ne20_rho"]
-PROFILE_GRAD_SIGNALS = [f"{v}_grad" for v in PROFILE_BASE_SIGNALS]
-PROFILE_ERROR_SIGNALS = [f"{v}_error" for v in PROFILE_BASE_SIGNALS] + [f"{v}_grad_error" for v in PROFILE_BASE_SIGNALS]
+# For each base signal <v> the companions are <v>_gradient, <v>_error and <v>_gradient_error.
+# An error of 0 is the sentinel for "no rigorous error quantification",
+# the loss treats it as a zero-width error bar
+PROFILE_BASE_SIGNALS = ["t_e_keV", "n_e_1e20"]
+PROFILE_GRAD_SIGNALS = [f"{v}_gradient" for v in PROFILE_BASE_SIGNALS]
+PROFILE_ERROR_SIGNALS = [f"{v}_error" for v in PROFILE_BASE_SIGNALS] + [f"{v}_gradient_error" for v in PROFILE_BASE_SIGNALS]
 
 # Everything the profile-predictor loss reads from the target side:
 # the profiles themselves plus their gradients and error-bars
@@ -120,9 +109,9 @@ def add_missing_profile_companions(ds: xr.Dataset) -> xr.Dataset:
     errors get the 0 sentinel (no rigorous error quantification).
     """
     for base in PROFILE_BASE_SIGNALS:
-        if f"{base}_grad" not in ds:
-            ds[f"{base}_grad"] = ds[base].differentiate("rho")
-        for err in (f"{base}_error", f"{base}_grad_error"):
+        if f"{base}_gradient" not in ds:
+            ds[f"{base}_gradient"] = ds[base].differentiate(RADIAL_DIM)
+        for err in (f"{base}_error", f"{base}_gradient_error"):
             if err not in ds:
                 ds[err] = xr.zeros_like(ds[base])
     return ds
@@ -133,46 +122,46 @@ REQUIRED_SIGNALS_PROFILE_TRANSFER = [
     *PROFILE_BASE_SIGNALS,
     *PROFILE_GRAD_SIGNALS,
     *PROFILE_ERROR_SIGNALS,
-    "fresh_profiles",  # Needed so we only train on time points where the profile data is fresh, avoiding forward-filled.
+    "fresh_profile",  # Needed so we only train on time points where the profile data is fresh, avoiding forward-filled.
     # Inputs
-    "Ip_MA",
-    "B0",
-    "betan",
-    "ne20_line_avg",
-    "R0",
-    "a_minor",
-    "kappa",
-    "delta_top",
-    "delta_bot",
+    "ip_MA",
+    "b0",
+    "beta_tor_norm",
+    "n_e_line_average_1e20",
+    "geometric_axis_r",
+    "minor_radius",
+    "elongation",
+    "triangularity_upper",
+    "triangularity_lower",
     # Extra
     "time",  # Data variable holding per-shot time values, the var selection below would drop it and the dataloader consumes it as the time coordinate
-    "Wtot_MJ",  # Not strictly necessary but used for hazard extrapolation
+    "energy_mhd_MJ",  # Not strictly necessary but used for hazard extrapolation
 ]
 
-# Union of the profile and power balance needs, minus betan: the transport
-# modules derive every beta quantity from the evolving stored-energy state
-# instead of a measured betan (see modules/transport_predictor/module.py).
-# P_aux_MW is computed from the per-system signals by _add_aux_power.
+# Union of the profile and power balance needs, minus beta_tor_norm:
+# the transport modules derive every beta quantity from the evolving stored-energy state
+# instead of a measured beta_tor_norm (see modules/transport_predictor/module.py).
 REQUIRED_SIGNALS_TRANSPORT_TRANSFER = [
     # Targets and their companions
     *PROFILE_BASE_SIGNALS,
     *PROFILE_GRAD_SIGNALS,
     *PROFILE_ERROR_SIGNALS,
-    "fresh_profiles",  # Kept as data (not a filter) so downstream losses or metrics can mask stale forward-filled profiles
+    "fresh_profile",  # Kept as data (not a filter) so downstream losses or metrics can mask stale forward-filled profiles
     # Inputs
-    "Ip_MA",
-    "B0",
-    "ne20_line_avg",
-    "R0",
-    "a_minor",
-    "kappa",
-    "delta_top",
-    "delta_bot",
+    "ip_MA",
+    "b0",
+    "n_e_line_average_1e20",
+    "geometric_axis_r",
+    "minor_radius",
+    "elongation",
+    "triangularity_upper",
+    "triangularity_lower",
+    "power_additional_MW",
     # Extra
     "time",  # Data variable holding per-shot time values, promoted to the time coordinate downstream
-    "Wtot_MJ",  # Seeds the sciml stored-energy state and the normalizer fit, also used for hazard extrapolation and as an anchor target in the sciml training loss
-    "P_oh_MW",  # Anchor target for the sciml training loss
-    "P_rad_MW",  # Anchor target for the sciml training loss
+    "energy_mhd_MJ",  # Seeds the sciml stored-energy state and the normalizer fit, also used for hazard extrapolation and as an anchor target in the sciml training loss
+    "power_ohm_MW",  # Anchor target for the sciml training loss
+    "power_radiated_MW",  # Anchor target for the sciml training loss
 ]
 
 
@@ -311,16 +300,18 @@ def get_ds(
         raise ValueError(f"Unknown source dataset: {source_ds!r}. Available: {set(config.dataset_paths)}")
     ds_path = Path(config.dataset_paths[source_ds])
 
-    ds = xr.open_dataset(ds_path)
+    ds_store = xr.open_dataset(ds_path)
 
-    if study_type == "power_balance_transfer":
+    if study_type == "power_balance_transfer" and RADIAL_DIM in ds_store.dims:
         # Power balance only uses scalar time series. Drop profile variables
         # before the eager astype below so their (shot, time, rho) arrays are
         # never read from disk. Keeping them OOMs training jobs: concatenating
         # devices with mismatched rho grids NaN-pads every profile variable to
         # the union grid across all shots, blowing past the SLURM memory request
-        ds = ds.drop_dims([d for d in ("rho", "psi_n") if d in ds.dims])
+        ds_store = ds_store.drop_dims(RADIAL_DIM)
 
+    # Stores are IMAS names in SI, the study works in the suffixed working units
+    ds = convert_to_working_units(ds_store)
     ds = ds.astype(jax.numpy.float64 if jax.config.jax_enable_x64 else jax.numpy.float32)
 
     if EPISODE_DIM not in ds.dims:
@@ -334,10 +325,10 @@ def get_ds(
         ds = ds[REQUIRED_SIGNALS_PROFILE_TRANSFER]
 
         # Only keep fresh profiles for training
-        ds = ds.where(ds["fresh_profiles"] == 1, drop=True)
+        ds = ds.where(ds["fresh_profile"] == 1, drop=True)
         # TCV only has profile data out to rho=1
         # Put all the datasets on the shared uniform rho grid for consistency
-        ds = ds.interp(rho=RHO_GRID, kwargs={"fill_value": "extrapolate"})
+        ds = ds.interp({RADIAL_DIM: RHO_GRID}, kwargs={"fill_value": "extrapolate"})
 
         # Linear extrapolation at the grid edges can push error bars slightly
         # negative, error bars are widths so clamp them
@@ -345,8 +336,8 @@ def get_ds(
             ds[err_sig] = ds[err_sig].clip(min=0.0)
 
         # Compute means and shapes
-        ds["Te_shape"] = ds["Te_keV_rho"] / ds["Te_keV_rho"].integrate("rho")
-        ds["ne_shape"] = ds["ne20_rho"] / ds["ne20_rho"].integrate("rho")
+        ds["t_e_shape"] = ds["t_e_keV"] / ds["t_e_keV"].integrate(RADIAL_DIM)
+        ds["n_e_shape"] = ds["n_e_1e20"] / ds["n_e_1e20"].integrate(RADIAL_DIM)
         return ds
 
     def _power_balance(ds: xr.Dataset) -> xr.Dataset:
@@ -354,10 +345,6 @@ def get_ds(
         for signal in REQUIRED_SIGNALS_POWER_BALANCE:
             if signal not in ds:
                 raise ValueError(f"Required signal for training {signal} not found in dataset.")
-
-        # Additional signals and duplicates for slight renames between submodules
-        # This is for the individual submodule training to work, since when they're running on their own they expect these names.
-        ds = _add_aux_power(ds)
 
         # Some device datasets carry multi-element numpy arrays in variable
         # attrs (e.g. a 'validity' time range). Attrs become static jit
@@ -376,14 +363,13 @@ def get_ds(
 
     def _transport_transfer(ds: xr.Dataset) -> xr.Dataset:
         ds = add_missing_profile_companions(ds)
-        ds = _add_aux_power(ds)
-        ds = ds[[*REQUIRED_SIGNALS_TRANSPORT_TRANSFER, *INPUT_POWER_SIGNALS, "P_aux_MW"]]
+        ds = ds[REQUIRED_SIGNALS_TRANSPORT_TRANSFER]
 
         # Unlike the profile branch there is NO fresh-profile filter here: the
         # time-dependent rollouts need contiguous segments, so the stale
         # (forward-filled) profile timeslices stay in as targets and
-        # fresh_profiles rides along as data for masking downstream
-        ds = ds.interp(rho=RHO_GRID, kwargs={"fill_value": "extrapolate"})
+        # fresh_profile rides along as data for masking downstream
+        ds = ds.interp({RADIAL_DIM: RHO_GRID}, kwargs={"fill_value": "extrapolate"})
 
         # Linear extrapolation at the grid edges can push error bars slightly
         # negative, error bars are widths so clamp them
@@ -392,8 +378,8 @@ def get_ds(
 
         # Shape variables so the sciml profile submodule skeleton can run its
         # PCA / k-means initial guess on this dataset (ProfilePredictorTRB.model_init)
-        ds["Te_shape"] = ds["Te_keV_rho"] / ds["Te_keV_rho"].integrate("rho")
-        ds["ne_shape"] = ds["ne20_rho"] / ds["ne20_rho"].integrate("rho")
+        ds["t_e_shape"] = ds["t_e_keV"] / ds["t_e_keV"].integrate(RADIAL_DIM)
+        ds["n_e_shape"] = ds["n_e_1e20"] / ds["n_e_1e20"].integrate(RADIAL_DIM)
 
         # Same attr-stripping rationale as the power balance branch: array-valued
         # attrs become static jit metadata and break the treedef equality check
@@ -429,35 +415,37 @@ def add_hazard(
 ) -> xr.Dataset:
     """
     Add hazard metric to dataset
-    We are saying hazard is 95th percentile of (Wtot_MJ^2 + Ip_MA^2)**0.5 along a shot,
+    We are saying hazard is 95th percentile of (energy_mhd_MJ^2 + ip_MA^2)**0.5 along a shot,
     indicating shots are more dangerous with more stored energy and plasma current
     Ignoring nans in the calculation
 
-    Also stores the specific Ip_MA and Wtot_MJ values at the time point where the
+    Also stores the specific ip_MA and energy_mhd_MJ values at the time point where the
     hazard metric reaches its 95th percentile for plotting in parameter space
     """
 
-    max_Wtot = float(ds["Wtot_MJ"].max().values)
-    max_Ip = float(ds["Ip_MA"].max().values)
-    Wtot_scale = 1.0 / max_Wtot if max_Wtot != 0 else 1.0
-    Ip_scale = 1.0 / max_Ip if max_Ip != 0 else 1.0
+    max_energy_mhd = float(ds["energy_mhd_MJ"].max().values)
+    max_ip = float(ds["ip_MA"].max().values)
+    energy_mhd_scale = 1.0 / max_energy_mhd if max_energy_mhd != 0 else 1.0
+    ip_scale = 1.0 / max_ip if max_ip != 0 else 1.0
 
     # Calculate hazard at each time step (once for all shots)
-    hazard_timeseries = ds.eval(f"(({Wtot_scale} * Wtot_MJ)**2 + ({Ip_scale} * Ip_MA)**2)**0.5")
+    energy_mhd_normalized = energy_mhd_scale * ds["energy_mhd_MJ"]
+    ip_normalized = ip_scale * ds["ip_MA"]
+    hazard_timeseries = (energy_mhd_normalized**2 + ip_normalized**2) ** 0.5
 
     # Get the 95th percentile value per shot
     ds["hazard"] = hazard_timeseries.quantile(0.95, dim=TIME_DIM, skipna=True)
 
     n_shots = ds.sizes[episode_coord]
 
-    Ip_MA_p95 = np.full(n_shots, np.nan)
-    Wtot_MJ_p95 = np.full(n_shots, np.nan)
+    ip_MA_p95 = np.full(n_shots, np.nan)
+    energy_mhd_MJ_p95 = np.full(n_shots, np.nan)
 
-    # Per shot, take Ip and Wtot at the timeslice whose hazard is closest to the p95 value
+    # Per shot, take ip_MA and energy_mhd_MJ at the timeslice whose hazard is closest to the p95 value
     hazard_ts_data = hazard_timeseries.values  # shape: (n_shots, n_time)
     p95_vals = ds["hazard"].values  # shape: (n_shots,)
-    Ip_MA_data = ds["Ip_MA"].values
-    Wtot_MJ_data = ds["Wtot_MJ"].values
+    ip_MA_data = ds["ip_MA"].values
+    energy_mhd_MJ_data = ds["energy_mhd_MJ"].values
 
     for i in range(n_shots):
         hazard_shot = hazard_ts_data[i]
@@ -469,11 +457,11 @@ def add_hazard(
             abs_diff = np.abs(hazard_shot - p95_val)
             abs_diff[~valid_mask] = np.inf
             idx_p95 = np.argmin(abs_diff)
-            Ip_MA_p95[i] = Ip_MA_data[i, idx_p95]
-            Wtot_MJ_p95[i] = Wtot_MJ_data[i, idx_p95]
+            ip_MA_p95[i] = ip_MA_data[i, idx_p95]
+            energy_mhd_MJ_p95[i] = energy_mhd_MJ_data[i, idx_p95]
 
-    ds["Ip_MA_p95"] = (episode_coord, Ip_MA_p95)
-    ds["Wtot_MJ_p95"] = (episode_coord, Wtot_MJ_p95)
+    ds["ip_MA_p95"] = (episode_coord, ip_MA_p95)
+    ds["energy_mhd_MJ_p95"] = (episode_coord, energy_mhd_MJ_p95)
 
     return ds
 
@@ -501,19 +489,19 @@ def normalize_domain(
           (q_star, epsilon, aB0, f_G, surface_power_density, ...), fitted over the
           7 physical inputs
         - "profile": the 10 dimensionless nn_inputs of the profile predictor
-          (beta, q_star, epsilon, f_G, aB0, betan, kappa, delta_top, delta_bot,
-          log_nu_star)
+          (beta, q_star, epsilon, f_G, aB0, beta_tor_norm, elongation,
+          triangularity_upper, triangularity_lower, log_nu_star)
         - "transport": those 10 slots with the beta-derived ones computed from
-          the measured Wtot, plus the normalized aux power (paux_norm)
+          the measured energy_mhd_MJ, plus the normalized aux power (paux_norm)
     Only the physics* methods honor it, the raw-variable methods ("zscore",
     "coral") are power-balance inputs by definition.
 
     Methods:
-        - "raw": No normalization, Ip, Wtot, etc. are in their original units
+        - "raw": No normalization, ip_MA, energy_mhd_MJ, etc. are in their working units
         - "physics": The module's dimensionless features. In the power-balance space that is
           (q_star, epsilon, aB0, f_G, surface_power_density) plus beta as a visualization-only extra,
           in the profile space the nn_inputs themselves (which carry their own beta)
-        - "zscore": Within each device, normalize each variable to zero mean and unit variance. Variable gets a `_z` suffix after normalization. Wtot_MJ is a visualization-only extra column (harmless, z-scoring is per-variable)
+        - "zscore": Within each device, normalize each variable to zero mean and unit variance. Variable gets a `_z` suffix after normalization. energy_mhd_MJ is a visualization-only extra column (harmless, z-scoring is per-variable)
         - "coral": Use the CORAL method to align covariances of various devices over exactly the model's 7 input vars. Variable gets a `_coral` suffix after normalization.
         - "physics-coral": CORAL alignment over the physics features of the selected feature space. Variable gets a `_pcoral` suffix (a `_coral` suffix would collide with the raw coral vars).
         - "physics-zscore": Per-device z-score over the physics features of the selected feature space. Variable gets a `_pz` suffix.
@@ -563,7 +551,7 @@ def normalize_domain(
             if var in ds:
                 col = np.asarray(ds[var].broadcast_like(reference).values, dtype=float).ravel()
             else:
-                # Missing signals become zeros (profile-transfer sets lack P_aux_MW unless zero-filled upstream)
+                # Missing signals become zeros (profile-transfer sets lack power_additional_MW unless zero-filled upstream)
                 col = np.zeros(reference.size)
             columns.append(col)
         return np.column_stack(columns)
@@ -586,7 +574,7 @@ def normalize_domain(
         phys = _physics_matrix(ds)
         reference = _reference(ds)
         for j, name in enumerate(physics_names):
-            # Identity slots (Ip_MA / kappa, plus betan / delta_* in the profile
+            # Identity slots (ip_MA / elongation, plus beta_tor_norm / triangularity_* in the profile
             # feature space) already exist as raw vars
             if name in identity_slots:
                 continue
@@ -596,9 +584,9 @@ def normalize_domain(
             return
         # beta needs the stored energy, which is the predicted state rather than
         # a model input, so it is a visualization-only extra
-        epsilon = ds["a_minor"] / ds["R0"]
-        avg_pressure = (2.0 / 3.0) * (ds["Wtot_MJ"] * 1e6) / calc_plasma_volume(ds["R0"], epsilon, ds["kappa"])
-        ds["beta"] = 100 * avg_pressure / ((ds["B0"] ** 2) / (2 * mu_0))
+        epsilon = ds["minor_radius"] / ds["geometric_axis_r"]
+        avg_pressure = (2.0 / 3.0) * (ds["energy_mhd_MJ"] * 1e6) / calc_plasma_volume(ds["geometric_axis_r"], epsilon, ds["elongation"])
+        ds["beta"] = 100 * avg_pressure / ((ds["b0"] ** 2) / (2 * mu_0))
 
     if method == "raw":
         return ds_source, ds_target
@@ -620,7 +608,7 @@ def normalize_domain(
         return np.asarray(idx_da.broadcast_like(_reference(ds)).values).ravel().astype(int)
 
     if method == "zscore":
-        zscore_vars = (*NORM_INPUT_VARS, "Wtot_MJ")
+        zscore_vars = (*NORM_INPUT_VARS, "energy_mhd_MJ")
         means, stds = fit_z_score_stats(_feature_matrix_for(ds_source, zscore_vars), _source_idx_for(ds_source), len(registry))
         for ds in datasets:
             matrix = apply_z_score(jnp.asarray(_feature_matrix_for(ds, zscore_vars)), _source_idx_for(ds), means, stds)

@@ -12,6 +12,7 @@ from transport_study.modules.profile_predictor.train_configs import (
     PROFILE_PREDICTOR_TORAX_CONFIGS,
 )
 from transport_study.profile_transfer.plot_torax_evolution import valid_timesteps
+from transport_study.signals import convert_to_working_units
 from transport_study.tests.sample_data import SAMPLE_DIR
 
 
@@ -22,12 +23,14 @@ def sample_timeslices():
     Tests using this fixture must carry requires_sample_data.
 
     The first and last valid slice of each shot are taken, so a small request
-    still spans the shot's parameter range. Raw sample files predate the device
-    index organize_data adds, which the modules read to pick a normalizer row.
+    still spans the shot's parameter range. Sample files are device stores in SI,
+    so they are converted to working units, and they lack the device index
+    organize_data adds, which the modules read to pick a normalizer row.
     """
 
     def _load(sample_name: str, n_slices: int = 1) -> list[xr.Dataset]:
-        ds = xr.open_dataset(SAMPLE_DIR / sample_name)
+        ds_sample = xr.open_dataset(SAMPLE_DIR / sample_name)
+        ds = convert_to_working_units(ds_sample)
         slices: list[xr.Dataset] = []
         for shot in ds["shot"].values:
             shot_ds = ds.sel(shot=shot)

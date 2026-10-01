@@ -5,5 +5,5 @@ from transport_study.modules.power_balance.scalar_power_trb import ScalarPowerTR
 class RadiatedPowerTRB(ScalarPowerTRB):
     """TrainRunBuilder for the radiated power predictor used in transfer learning"""
 
-    SIGNAL = "P_rad_MW"
+    SIGNAL = "power_radiated_MW"
     MODULE_CLS = RadiatedPower

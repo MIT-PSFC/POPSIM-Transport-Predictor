@@ -57,15 +57,15 @@ def make_module():
 
 def _inputs() -> Inputs:
     return Inputs(
-        Ip=1.0,
-        B0=5.4,
-        betan=1.2,
-        ne20_line_avg=1.5,
-        R0=0.68,
-        a_minor=0.22,
-        kappa=1.6,
-        delta_top=0.4,
-        delta_bot=0.5,
+        ip_MA=1.0,
+        b0=5.4,
+        beta_tor_norm=1.2,
+        n_e_line_average_1e20=1.5,
+        geometric_axis_r=0.68,
+        minor_radius=0.22,
+        elongation=1.6,
+        triangularity_upper=0.4,
+        triangularity_lower=0.5,
         rho=jnp.asarray(RHO_GRID),
         ds_source_idx=jnp.asarray(0.0),
     )

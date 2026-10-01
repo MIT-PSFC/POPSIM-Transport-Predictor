@@ -48,21 +48,21 @@ from transport_study.transport_transfer.tables import write_comparison_tables
 
 # The physical inputs every transport predictor model consumes (the TRB adds
 # ds_source_idx itself). Normalization happens inside the modules; there is
-# deliberately no betan: beta quantities come from the evolving state Wtot
+# deliberately no beta_tor_norm: beta quantities come from the evolving state Wtot
 TRANSPORT_INPUT_VARS = [
-    "Ip_MA",
-    "B0",
-    "ne20_line_avg",
-    "R0",
-    "a_minor",
-    "kappa",
-    "delta_top",
-    "delta_bot",
-    "P_aux_MW",
+    "ip_MA",
+    "b0",
+    "n_e_line_average_1e20",
+    "geometric_axis_r",
+    "minor_radius",
+    "elongation",
+    "triangularity_upper",
+    "triangularity_lower",
+    "power_additional_MW",
 ]
 
 # Predicted profile channels (the loss and test eval compare against these)
-TRANSPORT_PROFILE_TARGETS = ["ne20_rho", "Te_keV_rho"]
+TRANSPORT_PROFILE_TARGETS = ["n_e_1e20", "t_e_keV"]
 
 # Everything the transport loss reads from the target side: the profiles,
 # their error-bar companions (softening the validation loss residual), the
@@ -70,9 +70,9 @@ TRANSPORT_PROFILE_TARGETS = ["ne20_rho", "Te_keV_rho"]
 # measurement, and the device label for per-device weighting
 TRANSPORT_TARGET_VARS = [
     *TRANSPORT_PROFILE_TARGETS,
-    "ne20_rho_error",
-    "Te_keV_rho_error",
-    "fresh_profiles",
+    "n_e_1e20_error",
+    "t_e_keV_error",
+    "fresh_profile",
     "ds_source_idx",
 ]
 
@@ -81,7 +81,7 @@ TRANSPORT_TARGET_VARS = [
 # energy (sciml power balance state), and every scalar input plus the device
 # index (the torax sim-state variant builds a full TORAX initial state, which
 # needs the t0 inputs, see TransportPredictorEnv.create_state)
-TRANSPORT_STATE_VARS = ["Wtot_MJ", *TRANSPORT_PROFILE_TARGETS, *TRANSPORT_INPUT_VARS, "ds_source_idx"]
+TRANSPORT_STATE_VARS = ["energy_mhd_MJ", *TRANSPORT_PROFILE_TARGETS, *TRANSPORT_INPUT_VARS, "ds_source_idx"]
 
 # The TORAX-backed model types (one per TORAX transport model)
 TORAX_MODEL_TYPES = ("torax-constant", "torax-cgm", "torax-gyrobohm", "torax-qlknn")
@@ -222,7 +222,7 @@ class TransportStudy(Study):
         model_type: The type of transport predictor model to use.
         - transformer: recurrent causal attention over a rolling buffer of past profiles
         - sciml: a time-dependent power balance evolves the stored energy, a
-          time-independent profile predictor maps the state-implied betan to profiles
+          time-independent profile predictor maps the state-implied beta_tor_norm to profiles
         - torax-constant / torax-cgm / torax-gyrobohm / torax-qlknn: one-step
           differentiable TORAX simulation with NN-predicted transport, source
           shape, and edge parameters
@@ -249,7 +249,7 @@ class TransportStudy(Study):
         geometry_builder: Per-sample TORAX geometry construction, only meaningful for torax-* model
         types (every other model type is pinned to "circular").
         - circular: large-aspect-ratio analytic geometry (delta = 0 everywhere)
-        - miller: shaped Miller geometry driven by delta_top/delta_bot
+        - miller: shaped Miller geometry driven by triangularity_upper/triangularity_lower
 
         torax_state: How the torax-* model types carry state between steps,
         only meaningful for torax-* (every other model type is pinned to "rebuild").
@@ -449,10 +449,10 @@ class TransportStudy(Study):
             # submodules. Training loss only, and a no-op for model types
             # whose target_vars lack the measured signals (only the sciml
             # case carries them). The power balance submodule prereq case
-            # also reads anchor_weight_p_oh/_p_rad through PowerBalanceTRB
-            "anchor_weight_wtot": 0.1,
-            "anchor_weight_p_oh": 0.1,
-            "anchor_weight_p_rad": 0.1,
+            # also reads anchor_weight_power_ohm/_power_radiated through PowerBalanceTRB
+            "anchor_weight_energy_mhd": 0.1,
+            "anchor_weight_power_ohm": 0.1,
+            "anchor_weight_power_radiated": 0.1,
         }
 
     def _base_optimizer_config(self) -> dict:
@@ -530,8 +530,8 @@ class TransportStudy(Study):
                     # anchor the p_oh/p_rad submodule predictions to them
                     # (anchor_weight_* in the loss config), matching the power
                     # balance study's structured cases
-                    "target_vars": ["Wtot_MJ", "P_oh_MW", "P_rad_MW", "ds_source_idx"],
-                    "state_vars": ["Wtot_MJ"],
+                    "target_vars": ["energy_mhd_MJ", "power_ohm_MW", "power_radiated_MW", "ds_source_idx"],
+                    "state_vars": ["energy_mhd_MJ"],
                     **dataloader_config_base,
                     # Scalar-signal training is cheap, match the power balance study
                     "batch_size": 4096,
@@ -543,7 +543,7 @@ class TransportStudy(Study):
                     "freeze_submodules": config.power_balance_freeze_submodules,
                     "nn_depth": 2,
                     "nn_width": 16,
-                    "in_size": 7,  # Ip, B0, R0, a_minor, kappa, ne20_line_avg, P_aux_MW
+                    "in_size": 7,  # The NORM_INPUT_VARS
                     "out_size": 1,
                     "prng_seed": 42,
                     "submodules": {
@@ -555,7 +555,7 @@ class TransportStudy(Study):
             )
         elif case.model_type == "profile":
             # The profile submodule of sciml, trained exactly like the profile
-            # study's time-independent cases (profile-prepped data has betan)
+            # study's time-independent cases (profile-prepped data has beta_tor_norm)
             return ModelTrainSpec(
                 train_run_builder="transport_study.modules.profile_predictor.trb.ProfilePredictorTRB",
                 dataloader_config={
@@ -563,7 +563,7 @@ class TransportStudy(Study):
                     # Profiles plus their gradient / error-bar companions, the
                     # validation loss softens the residual inside the error bars
                     "target_vars": [*PROFILE_TARGET_VARS, "ds_source_idx"],
-                    "extra_vars": ["Te_shape", "ne_shape"],
+                    "extra_vars": ["t_e_shape", "n_e_shape"],
                     **dataloader_config_base,
                     # Timeslice samples are cheap, match the profile study
                     "batch_size": 2048,
@@ -575,8 +575,8 @@ class TransportStudy(Study):
                     # Profile study hyperparam default; the shapes are an
                     # initial-guess basis, not physics to fine-tune here
                     "freeze_shapes": True,
-                    "te_shape_var": "Te_shape",
-                    "ne_shape_var": "ne_shape",
+                    "te_shape_var": "t_e_shape",
+                    "ne_shape_var": "n_e_shape",
                     "n_shapes": 3,
                     "nn_depth": 2,
                     "nn_width": 16,
@@ -595,9 +595,9 @@ class TransportStudy(Study):
                     # predictions to them (anchor_weight_* in the loss config)
                     "target_vars": [
                         *TRANSPORT_TARGET_VARS,
-                        "Wtot_MJ",
-                        "P_oh_MW",
-                        "P_rad_MW",
+                        "energy_mhd_MJ",
+                        "power_ohm_MW",
+                        "power_radiated_MW",
                     ],
                 },
                 model_init_config={

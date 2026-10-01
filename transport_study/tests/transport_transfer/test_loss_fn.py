@@ -14,6 +14,7 @@ import jax.numpy as jnp
 import pytest
 import xarray as xr
 
+from transport_study import RADIAL_DIM
 from transport_study.config import RHO_GRID, StudyConfig, load_config
 from transport_study.modules.transport_predictor.module import Output
 from transport_study.modules.transport_predictor.trb import TransportPredictorTRB
@@ -38,7 +39,7 @@ def loaded_config():
 def _pred_and_targ(fresh: float, offset: float = 0.3, **pred_extra):
     """Single-timeslice prediction/target pair with a nonzero profile residual.
 
-    fresh sets the fresh_profiles flag on the target side. pred_extra sets
+    fresh sets the fresh_profile flag on the target side. pred_extra sets
     extra Output fields by name (the sciml anchor predictions).
     """
     ne_targ = 1.5 * (1 - RHO**2) + 0.5
@@ -50,18 +51,18 @@ def _pred_and_targ(fresh: float, offset: float = 0.3, **pred_extra):
         **pred_extra,
     )
     targ = {
-        "ne20_rho": xr.DataArray(ne_targ, dims=("rho",)),
-        "Te_keV_rho": xr.DataArray(te_targ, dims=("rho",)),
+        "n_e_1e20": xr.DataArray(ne_targ, dims=(RADIAL_DIM,)),
+        "t_e_keV": xr.DataArray(te_targ, dims=(RADIAL_DIM,)),
         "ds_source_idx": xr.DataArray(0.0),
-        "fresh_profiles": xr.DataArray(float(fresh)),
+        "fresh_profile": xr.DataArray(float(fresh)),
     }
     return pred, targ
 
 
 def test_stale_timeslice_contributes_zero_loss():
-    """A slice whose profiles are forward-filled (fresh_profiles 0) must steer
+    """A slice whose profiles are forward-filled (fresh_profile 0) must steer
     neither training nor checkpoint selection, whatever its residual."""
-    loss_config = {"huber_delta": 0.1}
+    loss_config = {"huber_delta": 0.1, "within_error_weight": 0.5, "divergence_penalty": 10.0}
     train_loss = TransportPredictorTRB.get_loss_fn(loss_config).instantaneous_loss
     val_loss = TransportPredictorTRB.get_val_loss_fn(loss_config).instantaneous_loss
 
@@ -87,13 +88,13 @@ def test_fresh_mask_zeroes_only_stale_slices():
 
     def targ_with_fresh(fresh_flags):
         return {
-            "ne20_rho": xr.DataArray([ne_targ] * 2, dims=("time_idx", "rho")),
-            "Te_keV_rho": xr.DataArray([te_targ] * 2, dims=("time_idx", "rho")),
+            "n_e_1e20": xr.DataArray([ne_targ] * 2, dims=("time_idx", RADIAL_DIM)),
+            "t_e_keV": xr.DataArray([te_targ] * 2, dims=("time_idx", RADIAL_DIM)),
             "ds_source_idx": xr.DataArray([0.0, 0.0], dims=("time_idx",)),
-            "fresh_profiles": xr.DataArray(fresh_flags, dims=("time_idx",)),
+            "fresh_profile": xr.DataArray(fresh_flags, dims=("time_idx",)),
         }
 
-    loss_config = {"huber_delta": 0.1}
+    loss_config = {"huber_delta": 0.1, "within_error_weight": 0.5, "divergence_penalty": 10.0}
     for loss in (
         TransportPredictorTRB.get_loss_fn(loss_config).instantaneous_loss,
         TransportPredictorTRB.get_val_loss_fn(loss_config).instantaneous_loss,
@@ -106,27 +107,29 @@ def test_fresh_mask_zeroes_only_stale_slices():
 
 def test_anchor_terms_exempt_from_fresh_mask():
     """The sciml anchor signals are measured at every timeslice, so a stale
-    profile slice keeps its anchor loss: with fresh_profiles 0 the training
+    profile slice keeps its anchor loss: with fresh_profile 0 the training
     loss reduces to exactly the weighted anchor errors, and the validation
     loss (no anchors) stays zero."""
     loss_config = {
         "huber_delta": 0.1,
-        "anchor_weight_wtot": 0.2,
-        "anchor_weight_p_oh": 0.3,
-        "anchor_weight_p_rad": 0.5,
+        "within_error_weight": 0.5,
+        "divergence_penalty": 10.0,
+        "anchor_weight_energy_mhd": 0.2,
+        "anchor_weight_power_ohm": 0.3,
+        "anchor_weight_power_radiated": 0.5,
     }
     train_loss = TransportPredictorTRB.get_loss_fn(loss_config).instantaneous_loss
     val_loss = TransportPredictorTRB.get_val_loss_fn(loss_config).instantaneous_loss
 
     pred, targ = _pred_and_targ(
         fresh=0.0,
-        Wtot_MJ_pred=jnp.asarray(0.10),
-        P_oh_MW_pred=jnp.asarray(1.5),
-        P_rad_MW_pred=jnp.asarray(0.9),
+        energy_mhd_MJ_pred=jnp.asarray(0.10),
+        power_ohm_MW_pred=jnp.asarray(1.5),
+        power_radiated_MW_pred=jnp.asarray(0.9),
     )
-    targ["Wtot_MJ"] = xr.DataArray(0.15)
-    targ["P_oh_MW"] = xr.DataArray(1.0)
-    targ["P_rad_MW"] = xr.DataArray(0.4)
+    targ["energy_mhd_MJ"] = xr.DataArray(0.15)
+    targ["power_ohm_MW"] = xr.DataArray(1.0)
+    targ["power_radiated_MW"] = xr.DataArray(0.4)
 
     expected = 0.2 * abs(0.10 - 0.15) + 0.3 * abs(1.5 - 1.0) + 0.5 * abs(0.9 - 0.4)
     assert float(train_loss(pred, targ)) == pytest.approx(expected, rel=1e-6)

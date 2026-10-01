@@ -11,6 +11,7 @@ from popsim.ml import DataLoader, IntegralLoss, TrainConfig, TrainRunBuilder
 from popsim.ml.checkpointing import create_default_checkpoint_manager, restore_model
 from popsim.ml.eval import EvaluationSuite
 
+from transport_study import RADIAL_DIM
 from transport_study.config import config
 from transport_study.modules.power_balance.trb import PowerBalanceTRB
 from transport_study.modules.profile_predictor.trb import ProfilePredictorTRB
@@ -33,9 +34,9 @@ STUDY_TYPE = "transport_transfer"
 # Anchor terms in the sciml training loss, keyed by measured target signal:
 # (Output attribute holding the model's own prediction, loss_config key for the weight)
 ANCHOR_SIGNALS = {
-    "Wtot_MJ": ("Wtot_MJ_pred", "anchor_weight_wtot"),
-    "P_oh_MW": ("P_oh_MW_pred", "anchor_weight_p_oh"),
-    "P_rad_MW": ("P_rad_MW_pred", "anchor_weight_p_rad"),
+    "energy_mhd_MJ": ("energy_mhd_MJ_pred", "anchor_weight_energy_mhd"),
+    "power_ohm_MW": ("power_ohm_MW_pred", "anchor_weight_power_ohm"),
+    "power_radiated_MW": ("power_radiated_MW_pred", "anchor_weight_power_radiated"),
 }
 
 
@@ -83,10 +84,10 @@ class TransportPredictorTRB(TrainRunBuilder):
                 pb_env = PowerBalanceTRB.model_init(train_dl, pb_config["model_init_config"])
                 # The profile TRB derives two things from its dataloader that this
                 # study's cannot supply: the normalizer stats over the 10 nn_inputs
-                # (one is a measured betan the transport modules deliberately do
+                # (one is a measured beta_tor_norm the transport modules deliberately do
                 # without, deriving beta from the evolving stored-energy state -
-                # see Inputs.betan_from_wtot and REQUIRED_SIGNALS_TRANSPORT_TRANSFER)
-                # and the PCA / k-means shape guess (needs Te_shape / ne_shape,
+                # see Inputs.beta_tor_norm_from_energy_mhd and REQUIRED_SIGNALS_TRANSPORT_TRANSFER)
+                # and the PCA / k-means shape guess (needs t_e_shape / n_e_shape,
                 # which the transport dataloader does not carry). Both are moot
                 # here: this is only a skeleton, and restore_submodules below
                 # overwrites every leaf with the profile prereq case's trained
@@ -110,7 +111,7 @@ class TransportPredictorTRB(TrainRunBuilder):
                     history_len=model_init_config["history_len"],
                     nn_width=model_init_config["nn_width"],
                     nn_depth=model_init_config["nn_depth"],
-                    rhogrid=np.asarray(train_dl.ds["rho"]),
+                    rhogrid=np.asarray(train_dl.ds[RADIAL_DIM]),
                     normalizer=normalizer,
                     prng_seed=model_init_config.get("prng_seed", 42),
                 )
@@ -120,7 +121,7 @@ class TransportPredictorTRB(TrainRunBuilder):
                     "carry": TransportPredictorToraxSimState,
                 }[model_init_config["torax_state"]]
                 module = torax_cls.init(
-                    rhogrid=np.asarray(train_dl.ds["rho"]),
+                    rhogrid=np.asarray(train_dl.ds[RADIAL_DIM]),
                     torax_config=model_init_config["torax_config"],
                     nn_width=model_init_config["nn_width"],
                     nn_depth=model_init_config["nn_depth"],
@@ -193,7 +194,7 @@ class TransportPredictorTRB(TrainRunBuilder):
         the profile study loss.
 
         Both losses count only timeslices with a fresh profile measurement:
-        the profile residual is masked by the fresh_profiles target var, so
+        the profile residual is masked by the fresh_profile target var, so
         forward-filled (stale) profile slices steer neither training nor
         checkpoint selection. The anchor terms are exempt, their measured
         signals exist at every timeslice.
@@ -271,15 +272,15 @@ class TransportPredictorTRB(TrainRunBuilder):
             return 0.0
 
         def loss_fn(pred, targ):
-            ne_targ = targ["ne20_rho"].data
-            te_targ = targ["Te_keV_rho"].data
+            ne_targ = targ["n_e_1e20"].data
+            te_targ = targ["t_e_keV"].data
 
             floor = ProfilePredictorTRB.PROFILE_SCALE_FLOOR
             ne_scale = jnp.maximum(jnp.max(jnp.abs(ne_targ), axis=-1, keepdims=True), floor)
             te_scale = jnp.maximum(jnp.max(jnp.abs(te_targ), axis=-1, keepdims=True), floor)
 
-            ne_sigma = _sigma_from_targ(targ, "ne20_rho_error", ne_scale)
-            te_sigma = _sigma_from_targ(targ, "Te_keV_rho_error", te_scale)
+            ne_sigma = _sigma_from_targ(targ, "n_e_1e20_error", ne_scale)
+            te_sigma = _sigma_from_targ(targ, "t_e_keV_error", te_scale)
 
             # A diverged rollout is a failure of the model, not a missing
             # measurement, so it is charged instead of being allowed through as
@@ -311,7 +312,7 @@ class TransportPredictorTRB(TrainRunBuilder):
 
             # Freshness mask: only timeslices with a fresh profile measurement
             # contribute to the profile terms, forward-filled slices are zeroed
-            profile_weights = sample_weights * targ["fresh_profiles"].data
+            profile_weights = sample_weights * targ["fresh_profile"].data
             # Broadcast across the rho axis
             while profile_weights.ndim < ne_err.ndim:
                 profile_weights = profile_weights[..., None]

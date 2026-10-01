@@ -61,13 +61,13 @@ class TestGetDs:
     @requires_sample_data
     def test_get_ds_profile_transfer_has_shape_vars(self, sample_dataset_config):
         ds, _ = get_ds("cmod-low1", "profile_transfer")
-        assert "Te_shape" in ds
-        assert "ne_shape" in ds
+        assert "t_e_shape" in ds
+        assert "n_e_shape" in ds
 
     @requires_sample_data
     def test_get_ds_power_balance_has_aux_power(self, sample_dataset_config):
         ds, _ = get_ds("cmod-low1", "power_balance_transfer")
-        assert "P_aux_MW" in ds
+        assert "power_additional_MW" in ds
 
     @requires_sample_data
     def test_get_ds_max_ds_size_limits_shots(self, sample_dataset_config):
@@ -82,8 +82,8 @@ class TestAddHazard:
         ds, episode_coord = get_ds("cmod-low1", study_type)
         result = add_hazard(ds, episode_coord)
         assert "hazard" in result
-        assert "Ip_MA_p95" in result
-        assert "Wtot_MJ_p95" in result
+        assert "ip_MA_p95" in result
+        assert "energy_mhd_MJ_p95" in result
         assert result["hazard"].dims == (episode_coord,)
 
     def test_add_hazard_nonnegative(self, sample_dataset_config):
@@ -194,8 +194,8 @@ class TestReindexToUniformTimebase:
         return xr.Dataset(
             data_vars={
                 TIME_COORD: ((EPISODE_DIM, TIME_DIM), times),
-                "Wtot_MJ": ((EPISODE_DIM, TIME_DIM), values),
-                "R0": ((EPISODE_DIM,), np.arange(times.shape[0], dtype=np.float32)),
+                "energy_mhd_MJ": ((EPISODE_DIM, TIME_DIM), values),
+                "geometric_axis_r": ((EPISODE_DIM,), np.arange(times.shape[0], dtype=np.float32)),
             },
             coords={EPISODE_DIM: np.arange(times.shape[0])},
         )
@@ -215,7 +215,7 @@ class TestReindexToUniformTimebase:
 
         # Columns are absolute canonical-grid slots, so the dim spans t=0..12 ms
         assert ds.sizes[TIME_DIM] == 13
-        w = ds["Wtot_MJ"].values
+        w = ds["energy_mhd_MJ"].values
         # Values land on their absolute slots, the mid-shot gap is NaN
         assert np.allclose(w[0, :7], [10.0, 11.0, 12.0, nan, nan, 15.0, 16.0], equal_nan=True)
         assert np.isnan(w[0, 7:]).all()
@@ -244,14 +244,14 @@ class TestReindexToUniformTimebase:
         values = [[1.0, 2.0, 3.0, 4.0]]
         ds = reindex_to_uniform_timebase(self._make_ds(times, values))
         assert ds.sizes[TIME_DIM] == 4
-        assert np.allclose(ds["Wtot_MJ"].values, values)
+        assert np.allclose(ds["energy_mhd_MJ"].values, values)
         assert np.allclose(ds[TIME_COORD].values, times, atol=1e-6)
 
     def test_non_time_vars_untouched(self):
         times = [[0.000, 0.001, 0.003]]
         values = [[1.0, 2.0, 3.0]]
         ds = reindex_to_uniform_timebase(self._make_ds(times, values))
-        assert np.allclose(ds["R0"].values, [0.0])
+        assert np.allclose(ds["geometric_axis_r"].values, [0.0])
 
     def test_oversampled_data_raises(self):
         # Two samples 0.1 ms apart map to the same 1 ms grid slot

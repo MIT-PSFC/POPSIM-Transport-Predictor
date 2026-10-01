@@ -26,7 +26,7 @@ from transport_study.modules.trb_utils import (
 class ScalarPowerTRB(TrainRunBuilder):
     """TrainRunBuilder for a scalar power predictor used in transfer learning.
 
-    Subclasses set SIGNAL (the target variable, e.g. "P_oh_MW")
+    Subclasses set SIGNAL (the target variable, e.g. "power_ohm_MW")
     and MODULE_CLS (the predictor module class).
     """
 

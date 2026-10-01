@@ -47,20 +47,20 @@ def _toy_dataset(n_shots: int = 6, n_time: int = 40) -> xr.Dataset:
 
     ds = xr.Dataset(
         {
-            "Ip_MA": _var(1.0, 0.2, 0.2, 0.1),
-            "B0": _var(5.0, 1.4, 0.5, 0.5),
-            "R0": _var(0.68, 0.88, 0.04, 0.04),
-            "a_minor": _var(0.22, 0.25, 0.02, 0.02),
-            "kappa": _var(1.6, 1.4, 0.1, 0.1),
-            "ne20_line_avg": _var(1.5, 0.5, 0.4, 0.15),
-            "P_aux_MW": _var(2.0, 0.5, 0.8, 0.3),
-            "Wtot_MJ": _var(0.15, 0.02, 0.05, 0.01),
+            "ip_MA": _var(1.0, 0.2, 0.2, 0.1),
+            "b0": _var(5.0, 1.4, 0.5, 0.5),
+            "geometric_axis_r": _var(0.68, 0.88, 0.04, 0.04),
+            "minor_radius": _var(0.22, 0.25, 0.02, 0.02),
+            "elongation": _var(1.6, 1.4, 0.1, 0.1),
+            "n_e_line_average_1e20": _var(1.5, 0.5, 0.4, 0.15),
+            "power_additional_MW": _var(2.0, 0.5, 0.8, 0.3),
+            "energy_mhd_MJ": _var(0.15, 0.02, 0.05, 0.01),
             "ds_source_idx": (("shot",), device_of_shot.astype(float)),
         },
         coords={"shot": np.arange(n_shots)},
     )
     # A NaN row must not poison the statistics
-    ds["Ip_MA"][0, 0] = np.nan
+    ds["ip_MA"][0, 0] = np.nan
     return ds
 
 
@@ -87,13 +87,13 @@ def test_physics_matches_normalize_domain():
     norm = PhysicsNormalizer()
     for shot, t in [(0, 5), (2, 10), (4, 0)]:
         out = norm(_sample_inputs(ds, shot, t, 0))
-        assert np.isclose(float(out.Ip_MA), float(ds["Ip_MA"][shot, t]))
-        assert np.isclose(float(out.B0), float(ds_ref["q_star"][shot, t]), rtol=1e-5)
-        assert np.isclose(float(out.R0), float(ds_ref["epsilon"][shot, t]), rtol=1e-5)
-        assert np.isclose(float(out.a_minor), float(ds_ref["aB0"][shot, t]), rtol=1e-5)
-        assert np.isclose(float(out.kappa), float(ds["kappa"][shot, t]))
-        assert np.isclose(float(out.ne20_line_avg), float(ds_ref["f_G"][shot, t]), rtol=1e-5)
-        assert np.isclose(float(out.P_aux_MW), float(ds_ref["surface_power_density"][shot, t]), rtol=1e-5)
+        assert np.isclose(float(out.ip_MA), float(ds["ip_MA"][shot, t]))
+        assert np.isclose(float(out.b0), float(ds_ref["q_star"][shot, t]), rtol=1e-5)
+        assert np.isclose(float(out.geometric_axis_r), float(ds_ref["epsilon"][shot, t]), rtol=1e-5)
+        assert np.isclose(float(out.minor_radius), float(ds_ref["aB0"][shot, t]), rtol=1e-5)
+        assert np.isclose(float(out.elongation), float(ds["elongation"][shot, t]))
+        assert np.isclose(float(out.n_e_line_average_1e20), float(ds_ref["f_G"][shot, t]), rtol=1e-5)
+        assert np.isclose(float(out.power_additional_MW), float(ds_ref["surface_power_density"][shot, t]), rtol=1e-5)
 
 
 def test_z_score_standardizes_per_device():
@@ -402,10 +402,10 @@ def test_normalize_domain_feature_spaces_match_modules():
     """normalize_domain(..., feature_space=...) visualizes exactly the features
     each study's modules consume:
     - 'profile' writes module.nn_input_matrix column by column (identity slots
-      betan / kappa / delta_top / delta_bot stay the raw dataset vars)
+      beta_tor_norm / kappa / triangularity_upper / triangularity_lower stay the raw dataset vars)
     - 'transport' writes transport_nn_input_matrix the same way (identity slots
-      kappa / delta_top / delta_bot, and betan IS written since the transport
-      datasets carry no measured betan)
+      kappa / triangularity_upper / triangularity_lower, and beta_tor_norm IS written since the transport
+      datasets carry no measured beta_tor_norm)
     - physics-coral / physics-zscore stats fitted here match the stats the
       matching make_*_normalizer fits on the same dataset
     - 'power_balance' is unchanged (still the 7 physics features plus the

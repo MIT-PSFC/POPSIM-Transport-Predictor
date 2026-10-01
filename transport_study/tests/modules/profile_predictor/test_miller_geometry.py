@@ -114,15 +114,15 @@ def make_mesh() -> tuple[torax_pydantic.Grid1D, np.ndarray]:
     return torax_mesh, rho_hires_norm
 
 
-def build_miller(R_major, a_minor, B_0, kappa, delta_top, delta_bot, delta_exponent=2.0):
+def build_miller(R_major, a_minor, B_0, kappa, triangularity_upper, triangularity_lower, delta_exponent=2.0):
     torax_mesh, rho_hires_norm = make_mesh()
     return build_miller_geometry_jax(
         R_major=jnp.asarray(R_major),
         a_minor=jnp.asarray(a_minor),
         B_0=jnp.asarray(B_0),
         elongation_LCFS=jnp.asarray(kappa),
-        delta_top=jnp.asarray(delta_top),
-        delta_bot=jnp.asarray(delta_bot),
+        triangularity_upper=jnp.asarray(triangularity_upper),
+        triangularity_lower=jnp.asarray(triangularity_lower),
         torax_mesh=torax_mesh,
         rho_hires_norm_np=rho_hires_norm,
         delta_exponent=delta_exponent,
@@ -210,8 +210,8 @@ def test_miller_mast_invariants():
 
 
 def test_miller_updown_swap_invariant():
-    # The parameterization is Z-symmetric, so swapping delta_top and
-    # delta_bot mirrors the contour about the midplane and all
+    # The parameterization is Z-symmetric, so swapping triangularity_upper and
+    # triangularity_lower mirrors the contour about the midplane and all
     # flux-surface-averaged metrics must be unchanged
     geo_a = build_miller(0.85, 0.6, 0.5, 1.7, 0.4, 0.1)
     geo_b = build_miller(0.85, 0.6, 0.5, 1.7, 0.1, 0.4)
@@ -227,15 +227,15 @@ def test_miller_updown_swap_invariant():
 
 def test_miller_geometry_differentiable():
     def scalar(args):
-        R_major, a_minor, B_0, kappa, delta_top, delta_bot = args
+        R_major, a_minor, B_0, kappa, triangularity_upper, triangularity_lower = args
         torax_mesh, rho_hires_norm = make_mesh()
         geo = build_miller_geometry_jax(
             R_major=R_major,
             a_minor=a_minor,
             B_0=B_0,
             elongation_LCFS=kappa,
-            delta_top=delta_top,
-            delta_bot=delta_bot,
+            triangularity_upper=triangularity_upper,
+            triangularity_lower=triangularity_lower,
             torax_mesh=torax_mesh,
             rho_hires_norm_np=rho_hires_norm,
         )
@@ -243,7 +243,9 @@ def test_miller_geometry_differentiable():
 
     args = tuple(jnp.asarray(v) for v in (0.85, 0.6, 0.5, 1.7, 0.4, 0.1))
     grads = jax.grad(scalar)(args)
-    for name, grad in zip(("R_major", "a_minor", "B_0", "kappa", "delta_top", "delta_bot"), grads, strict=True):
+    for name, grad in zip(
+        ("R_major", "minor_radius", "B_0", "elongation", "triangularity_upper", "triangularity_lower"), grads, strict=True
+    ):
         assert np.isfinite(float(grad)), name
     grad_top = float(grads[4])
     grad_bot = float(grads[5])
@@ -266,5 +268,5 @@ def test_miller_evolve_mast_no_nan(transport_model, make_torax_module, sample_ti
     for timeslice in timeslices:
         steps, _coeffs = module.evolve(timeslice)
         for step in steps:
-            assert np.all(np.isfinite(step["ne20"])), f"NaN ne20 at t={step['t']}"
-            assert np.all(np.isfinite(step["te_keV"])), f"NaN te_keV at t={step['t']}"
+            assert np.all(np.isfinite(step["n_e_1e20"])), f"NaN n_e_1e20 at t={step['t']}"
+            assert np.all(np.isfinite(step["t_e_keV"])), f"NaN t_e_keV at t={step['t']}"

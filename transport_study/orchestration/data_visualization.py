@@ -72,8 +72,8 @@ def hazard_extrapolation_plot(
     ds_list: list[xr.Dataset],
     ds_type_list: list[str],
     source_colors: dict[str, str],
-    x_var: str = "Ip_MA",
-    y_var: str = "Wtot_MJ",
+    x_var: str = "ip_MA",
+    y_var: str = "energy_mhd_MJ",
 ):
     """
     Scatter each shot in x_var-y_var (hazard) space.
@@ -86,8 +86,8 @@ def hazard_extrapolation_plot(
         ds_list: xarray Datasets to plot. Each has a coordinate "ds_source".
         ds_type_list: Dataset split for each dataset in ds_list ("train"/"val"/"test").
         source_colors: Mapping from device name to plot color.
-        x_var: Variable on the x-axis (default "Ip_MA").
-        y_var: Variable on the y-axis (default "Wtot_MJ").
+        x_var: Variable on the x-axis (default "ip_MA").
+        y_var: Variable on the y-axis (default "energy_mhd_MJ").
     """
     fig, ax = plt.subplots(figsize=(8, 6))
     fig.patch.set_facecolor(BACKGROUND_COLOR)
@@ -328,9 +328,9 @@ def _combined_raw_dataset(study_type: str) -> tuple[xr.Dataset, str]:
         ds = add_hazard(ds, episode_coord)
         # Profile-transfer datasets have no aux-power signal, but zscore/coral
         # normalization iterate over it unconditionally. Zero-fill so they run
-        # (a no-op for power-balance datasets, which always carry P_aux_MW).
-        if "P_aux_MW" not in ds:
-            ds["P_aux_MW"] = xr.zeros_like(ds["Ip_MA"])
+        # (a no-op for power-balance datasets, which always carry power_additional_MW).
+        if "power_additional_MW" not in ds:
+            ds["power_additional_MW"] = xr.zeros_like(ds["ip_MA"])
         ds = ds.assign_coords(ds_source=device)
         datasets.append(ds)
 
@@ -359,7 +359,7 @@ class DataVisualizationBase:
 
     @classmethod
     def hazard_extrapolation(cls, figure_dir: Path | str):
-        """Plot where each dataset lands in hazard (Ip_MA-Wtot_MJ) space.
+        """Plot where each dataset lands in hazard (ip_MA-energy_mhd_MJ) space.
 
         Generates:
         1. One plot per source device (train/val).

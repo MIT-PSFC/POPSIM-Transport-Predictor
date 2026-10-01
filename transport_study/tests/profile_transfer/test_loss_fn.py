@@ -10,7 +10,7 @@ import pytest
 import xarray as xr
 from popsim.ml.dataloading import make_dataloaders
 
-from transport_study import EPISODE_DIM, TIME_COORD
+from transport_study import EPISODE_DIM, RADIAL_DIM, TIME_COORD
 from transport_study.config import RHO_GRID, config, load_config
 from transport_study.modules.profile_predictor.module import Outputs
 from transport_study.modules.profile_predictor.trb import ProfilePredictorTRB
@@ -52,21 +52,21 @@ def loaded_config(request):
 
 
 def _profile_da(values):
-    return xr.DataArray(data=jnp.asarray(values), dims=("rho",), coords={"rho": RHO})
+    return xr.DataArray(data=jnp.asarray(values), dims=(RADIAL_DIM,), coords={RADIAL_DIM: RHO})
 
 
 def _pred_and_targ(ne_pred, te_pred, ne_targ, te_targ, **extra_targ_vars):
     """Build a prediction/target pair for the loss.
 
     extra_targ_vars adds optional target vars by name, e.g. the error-bar and
-    gradient signals ne20_rho_error / Te_keV_rho_grad / etc. Tests that omit
+    gradient signals n_e_1e20_error / t_e_keV_gradient / etc. Tests that omit
     them exercise the defaults: zero-width error bars and finite-difference
     gradient targets.
     """
     pred = Outputs(ne=_profile_da(ne_pred), te=_profile_da(te_pred))
     targ = {
-        "ne20_rho": _profile_da(ne_targ),
-        "Te_keV_rho": _profile_da(te_targ),
+        "n_e_1e20": _profile_da(ne_targ),
+        "t_e_keV": _profile_da(te_targ),
         "ds_source_idx": xr.DataArray(data=jnp.asarray(0.0)),
     }
     for name, values in extra_targ_vars.items():
@@ -160,7 +160,7 @@ def test_channels_balanced_by_peak_normalization():
 
     for loss_fn in (
         ProfilePredictorTRB.get_loss_fn({"huber_delta": 0.1, "gradient_weight": 0.1, "huber_delta_grad": 1.0}),
-        ProfilePredictorTRB.get_val_loss_fn({"gradient_weight": 0.1}),
+        ProfilePredictorTRB.get_val_loss_fn({"gradient_weight": 0.1, "within_error_weight": 0.5}),
     ):
         ne_off_loss = float(loss_fn(pred_ne_off, targ))
         te_off_loss = float(loss_fn(pred_te_off, targ))
@@ -180,8 +180,8 @@ def test_val_loss_independent_of_huber_delta():
     te = 3.0 * (1 - RHO**2)
     pred, targ = _pred_and_targ(ne + 0.3, te - 0.4, ne, te)
 
-    small = {"huber_delta": 0.01, "huber_delta_grad": 0.1, "gradient_weight": 0.1}
-    large = {"huber_delta": 1.0, "huber_delta_grad": 10.0, "gradient_weight": 0.1}
+    small = {"huber_delta": 0.01, "huber_delta_grad": 0.1, "gradient_weight": 0.1, "within_error_weight": 0.5}
+    large = {"huber_delta": 1.0, "huber_delta_grad": 10.0, "gradient_weight": 0.1, "within_error_weight": 0.5}
 
     val_small = float(ProfilePredictorTRB.get_val_loss_fn(small)(pred, targ))
     val_large = float(ProfilePredictorTRB.get_val_loss_fn(large)(pred, targ))
@@ -207,7 +207,7 @@ def test_normalized_loss_magnitude_is_numerically_safe():
     pred, targ = _pred_and_targ(1.05 * ne, 1.05 * te, ne, te)
 
     train_loss = float(ProfilePredictorTRB.get_loss_fn({"huber_delta": 0.1, "gradient_weight": 0.1, "huber_delta_grad": 1.0})(pred, targ))
-    val_loss = float(ProfilePredictorTRB.get_val_loss_fn({"gradient_weight": 0.1})(pred, targ))
+    val_loss = float(ProfilePredictorTRB.get_val_loss_fn({"gradient_weight": 0.1, "within_error_weight": 0.5})(pred, targ))
 
     for loss in (train_loss, val_loss):
         assert np.isfinite(loss)
@@ -287,7 +287,7 @@ def test_error_bars_soften_loss_within_them():
     te = 3.0 * (1 - RHO**2)
     ne_sigma = np.full_like(RHO, 0.2)
     te_sigma = np.full_like(RHO, 0.3)
-    errors = {"ne20_rho_error": ne_sigma, "Te_keV_rho_error": te_sigma}
+    errors = {"n_e_1e20_error": ne_sigma, "t_e_keV_error": te_sigma}
 
     train_loss = ProfilePredictorTRB.get_loss_fn({"huber_delta": 0.1, "within_error_weight": w})
     val_loss = ProfilePredictorTRB.get_val_loss_fn({"within_error_weight": w})
@@ -324,14 +324,14 @@ def test_zero_error_sentinel_matches_missing_error_signals():
     te = 3.0 * (1 - RHO**2)
     zeros = np.zeros_like(RHO)
     sentinel_extras = {
-        "ne20_rho_error": zeros,
-        "Te_keV_rho_error": zeros,
-        "ne20_rho_grad": -3.0 * RHO,
-        "Te_keV_rho_grad": -6.0 * RHO,
-        "ne20_rho_grad_error": zeros,
-        "Te_keV_rho_grad_error": zeros,
+        "n_e_1e20_error": zeros,
+        "t_e_keV_error": zeros,
+        "n_e_1e20_gradient": -3.0 * RHO,
+        "t_e_keV_gradient": -6.0 * RHO,
+        "n_e_1e20_gradient_error": zeros,
+        "t_e_keV_gradient_error": zeros,
     }
-    loss_base = {"huber_delta": 0.5, "gradient_weight": 0.1, "huber_delta_grad": 5.0}
+    loss_base = {"huber_delta": 0.5, "gradient_weight": 0.1, "huber_delta_grad": 5.0, "within_error_weight": 0.5}
 
     pred, targ_sentinel = _pred_and_targ(ne + 0.3, te - 0.4, ne, te, **sentinel_extras)
     _, targ_no_signals = _pred_and_targ(ne + 0.3, te - 0.4, ne, te)
@@ -354,8 +354,8 @@ def test_measured_gradient_signal_is_the_gradient_target():
     te = 3.0 * (1 - RHO**2)
     grad_offset = 1.0
     extras = {
-        "ne20_rho_grad": -3.0 * RHO + grad_offset,
-        "Te_keV_rho_grad": -6.0 * RHO + grad_offset,
+        "n_e_1e20_gradient": -3.0 * RHO + grad_offset,
+        "t_e_keV_gradient": -6.0 * RHO + grad_offset,
     }
     loss_base = {"gradient_weight": 0.1, "within_error_weight": w}
     with_grad = ProfilePredictorTRB.get_val_loss_fn(loss_base)
@@ -371,7 +371,7 @@ def test_measured_gradient_signal_is_the_gradient_target():
     # error bar comparison runs on normalized quantities, so any error bar
     # >= the offset works for both channels
     big_sigma = np.full_like(RHO, 2.0 * grad_offset)
-    _, targ_banded = _pred_and_targ(ne, te, ne, te, **extras, ne20_rho_grad_error=big_sigma, Te_keV_rho_grad_error=big_sigma)
+    _, targ_banded = _pred_and_targ(ne, te, ne, te, **extras, n_e_1e20_gradient_error=big_sigma, t_e_keV_gradient_error=big_sigma)
     assert float(with_grad(pred, targ_banded)) == pytest.approx(w * unbanded, rel=1e-5)
 
 
@@ -391,11 +391,13 @@ def test_gradient_loss_only_below_rho_09():
     loss_fn = ProfilePredictorTRB.get_loss_fn({"huber_delta": 0.5, "gradient_weight": 0.1, "huber_delta_grad": 5.0})
 
     edge_offset = np.where(RHO >= 0.92, 50.0, 0.0)
-    pred, targ_edge = _pred_and_targ(ne, te, ne, te, ne20_rho_grad=ne_grad_true + edge_offset, Te_keV_rho_grad=te_grad_true + edge_offset)
+    pred, targ_edge = _pred_and_targ(
+        ne, te, ne, te, n_e_1e20_gradient=ne_grad_true + edge_offset, t_e_keV_gradient=te_grad_true + edge_offset
+    )
     assert float(loss_fn(pred, targ_edge)) == pytest.approx(0.0, abs=1e-9)
 
     core_offset = np.where(RHO <= 0.5, 50.0, 0.0)
-    _, targ_core = _pred_and_targ(ne, te, ne, te, ne20_rho_grad=ne_grad_true + core_offset, Te_keV_rho_grad=te_grad_true + core_offset)
+    _, targ_core = _pred_and_targ(ne, te, ne, te, n_e_1e20_gradient=ne_grad_true + core_offset, t_e_keV_gradient=te_grad_true + core_offset)
     assert float(loss_fn(pred, targ_core)) > 0.0
 
 
@@ -418,17 +420,17 @@ def test_loss_on_prepared_sample_dataset():
     for var in PROFILE_TARGET_VARS:
         finite &= np.isfinite(ds[var].values).all(axis=-1)
     # The deadband assertions need real (nonzero) error bars on every point
-    finite &= (ds["ne20_rho_error"].values > 0).all(axis=-1)
-    finite &= (ds["Te_keV_rho_error"].values > 0).all(axis=-1)
+    finite &= (ds["n_e_1e20_error"].values > 0).all(axis=-1)
+    finite &= (ds["t_e_keV_error"].values > 0).all(axis=-1)
     assert finite.any(), "sample dataset has no fully-finite timeslice with error bars"
     i_shot, i_time = np.argwhere(finite)[0]
     ts = ds.isel({EPISODE_DIM: i_shot, "time_idx": i_time})
 
-    ne = ts["ne20_rho"].values
-    te = ts["Te_keV_rho"].values
-    ne_sigma = ts["ne20_rho_error"].values
-    te_sigma = ts["Te_keV_rho_error"].values
-    extras = {var: ts[var].values for var in PROFILE_TARGET_VARS if var not in ("ne20_rho", "Te_keV_rho")}
+    ne = ts["n_e_1e20"].values
+    te = ts["t_e_keV"].values
+    ne_sigma = ts["n_e_1e20_error"].values
+    te_sigma = ts["t_e_keV_error"].values
+    extras = {var: ts[var].values for var in PROFILE_TARGET_VARS if var not in ("n_e_1e20", "t_e_keV")}
 
     val_loss = ProfilePredictorTRB.get_val_loss_fn({"within_error_weight": w})
     train_loss = ProfilePredictorTRB.get_loss_fn(
@@ -456,7 +458,7 @@ def test_loss_on_prepared_sample_dataset():
 def test_nan_target_samples_never_reach_loss():
     """Samples with NaN targets must be dropped before batching.
 
-    fresh_profiles is computed from ne20 only (workflow.py), so a slice where
+    fresh_profile is computed from ne20 only (workflow.py), so a slice where
     the ne GP fit succeeded but the Te fit failed is labeled fresh with an
     all-NaN Te profile. The loss has no NaN mask, so it relies on the
     time-indep dataloader path (no state_init_vars, dropna how="any" on the
@@ -478,11 +480,11 @@ def test_nan_target_samples_never_reach_loss():
 
     ds = xr.Dataset(
         {
-            "Te_keV_rho": ((EPISODE_DIM, "time_idx", "rho"), te),
-            "ne20_rho": ((EPISODE_DIM, "time_idx", "rho"), ne),
-            "Ip_MA": ((EPISODE_DIM, "time_idx"), ip),
+            "t_e_keV": ((EPISODE_DIM, "time_idx", RADIAL_DIM), te),
+            "n_e_1e20": ((EPISODE_DIM, "time_idx", RADIAL_DIM), ne),
+            "ip_MA": ((EPISODE_DIM, "time_idx"), ip),
         },
-        coords={EPISODE_DIM: [1, 2], "rho": RHO, TIME_COORD: ((EPISODE_DIM, "time_idx"), time)},
+        coords={EPISODE_DIM: [1, 2], RADIAL_DIM: RHO, TIME_COORD: ((EPISODE_DIM, "time_idx"), time)},
     )
 
     # Mirror the ProfilePredictorTRB.get_dataloaders call: no state_init_vars,
@@ -491,8 +493,8 @@ def test_nan_target_samples_never_reach_loss():
         datasets=(ds, ds),
         time_coord=TIME_COORD,
         episode_coord=EPISODE_DIM,
-        input_vars=["Ip_MA"],
-        target_vars=["Te_keV_rho", "ne20_rho"],
+        input_vars=["ip_MA"],
+        target_vars=["t_e_keV", "n_e_1e20"],
         batch_size=None,
         shuffle=[True, False],
         convert_xr_to_jnp=False,
@@ -502,6 +504,6 @@ def test_nan_target_samples_never_reach_loss():
         sample_ds = dl.dataset.ds
         # Both poisoned slices dropped, clean ones kept
         assert sample_ds.sizes["sample"] == n_shot * n_t - 2
-        assert not bool(sample_ds["Te_keV_rho"].isnull().any())
-        assert not bool(sample_ds["ne20_rho"].isnull().any())
-        assert not bool(sample_ds["Ip_MA"].isnull().any())
+        assert not bool(sample_ds["t_e_keV"].isnull().any())
+        assert not bool(sample_ds["n_e_1e20"].isnull().any())
+        assert not bool(sample_ds["ip_MA"].isnull().any())

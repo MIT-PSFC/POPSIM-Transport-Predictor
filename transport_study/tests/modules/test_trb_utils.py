@@ -12,8 +12,8 @@ nan = np.nan
 def _make_ds(times, wtot, ip):
     return xr.Dataset(
         data_vars={
-            "Wtot_MJ": ((EPISODE_DIM, TIME_DIM), np.asarray(wtot, dtype=np.float32)),
-            "Ip_MA": ((EPISODE_DIM, TIME_DIM), np.asarray(ip, dtype=np.float32)),
+            "energy_mhd_MJ": ((EPISODE_DIM, TIME_DIM), np.asarray(wtot, dtype=np.float32)),
+            "ip_MA": ((EPISODE_DIM, TIME_DIM), np.asarray(ip, dtype=np.float32)),
             "hazard": ((EPISODE_DIM,), np.arange(len(wtot), dtype=np.float32)),
         },
         coords={
@@ -38,9 +38,9 @@ def test_keeps_only_longest_contiguous_run():
         [1.0, 1.0, nan, 1.0, 1.0, 1.0, nan],
         [1.0, 1.0, 1.0, 1.0, 1.0, nan, nan],
     ]
-    ds = mask_to_largest_contiguous_segment(_make_ds(times, wtot, ip), ["Wtot_MJ", "Ip_MA"])
+    ds = mask_to_largest_contiguous_segment(_make_ds(times, wtot, ip), ["energy_mhd_MJ", "ip_MA"])
 
-    got = ds["Wtot_MJ"].values
+    got = ds["energy_mhd_MJ"].values
     assert np.allclose(got[0], [nan, nan, nan, 4.0, 5.0, 6.0, nan], equal_nan=True)
     assert np.allclose(got[1], [1.0, 2.0, 3.0, 4.0, 5.0, nan, nan], equal_nan=True)
 
@@ -56,15 +56,15 @@ def test_gap_in_any_training_var_splits_the_run():
     times = [[0.000, 0.001, 0.002, 0.003, 0.004]]
     wtot = [[1.0, 2.0, 3.0, 4.0, 5.0]]
     ip = [[1.0, nan, 1.0, 1.0, 1.0]]
-    ds = mask_to_largest_contiguous_segment(_make_ds(times, wtot, ip), ["Wtot_MJ", "Ip_MA"])
-    assert np.allclose(ds["Wtot_MJ"].values[0], [nan, nan, 3.0, 4.0, 5.0], equal_nan=True)
+    ds = mask_to_largest_contiguous_segment(_make_ds(times, wtot, ip), ["energy_mhd_MJ", "ip_MA"])
+    assert np.allclose(ds["energy_mhd_MJ"].values[0], [nan, nan, 3.0, 4.0, 5.0], equal_nan=True)
 
 
 def test_per_shot_vars_keep_their_dims():
     times = [[0.000, 0.001, 0.002]]
     wtot = [[1.0, nan, 3.0]]
     ip = [[1.0, nan, 1.0]]
-    ds = mask_to_largest_contiguous_segment(_make_ds(times, wtot, ip), ["Wtot_MJ", "Ip_MA"])
+    ds = mask_to_largest_contiguous_segment(_make_ds(times, wtot, ip), ["energy_mhd_MJ", "ip_MA"])
     # force_drop_nans-style ds.where would broadcast this to (shot, time)
     assert ds["hazard"].dims == (EPISODE_DIM,)
     assert np.allclose(ds["hazard"].values, [0.0])

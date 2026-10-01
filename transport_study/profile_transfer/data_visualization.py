@@ -17,27 +17,27 @@ class DataVisualization(DataVisualizationBase):
     # CORAL fit would change every var's transform).
     VAR_GROUPS: ClassVar[dict[str, list[list[str]]]] = {
         "raw": [
-            ["Ip_MA", "Wtot_MJ"],
-            ["R0", "a_minor"],
-            ["ne20_line_avg", "B0"],
-            ["betan", "kappa"],
+            ["ip_MA", "energy_mhd_MJ"],
+            ["geometric_axis_r", "minor_radius"],
+            ["n_e_line_average_1e20", "b0"],
+            ["beta_tor_norm", "elongation"],
         ],
         "physics": [
-            ["beta", "betan"],
+            ["beta", "beta_tor_norm"],
             ["q_star", "epsilon"],
             ["f_G", "aB0"],
-            ["log_nu_star", "kappa"],
+            ["log_nu_star", "elongation"],
         ],
         "physics-coral": [
-            ["beta_pcoral", "betan_pcoral"],
+            ["beta_pcoral", "beta_tor_norm_pcoral"],
             ["q_star_pcoral", "epsilon_pcoral"],
             ["f_G_pcoral", "aB0_pcoral"],
-            ["log_nu_star_pcoral", "kappa_pcoral"],
+            ["log_nu_star_pcoral", "elongation_pcoral"],
         ],
         "physics-zscore": [
-            ["beta_pz", "betan_pz"],
+            ["beta_pz", "beta_tor_norm_pz"],
             ["q_star_pz", "epsilon_pz"],
             ["f_G_pz", "aB0_pz"],
-            ["log_nu_star_pz", "kappa_pz"],
+            ["log_nu_star_pz", "elongation_pz"],
         ],
     }

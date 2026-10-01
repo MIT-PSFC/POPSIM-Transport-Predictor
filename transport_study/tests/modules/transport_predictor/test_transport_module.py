@@ -16,6 +16,7 @@ import numpy as np
 import pytest
 import xarray as xr
 
+from transport_study import RADIAL_DIM
 from transport_study.config import RHO_GRID
 from transport_study.modules.normalization import (
     CoralFeatureNormalizer,
@@ -55,13 +56,14 @@ from transport_study.modules.transport_predictor.module import (
     TransportPredictorToraxBase,
     TransportPredictorToraxSimState,
     TransportPredictorTransformer,
+    energy_mhd_from_profiles,
     make_transport_nn_input_normalizer,
     transport_nn_input_matrix,
-    wtot_from_profiles,
 )
 from transport_study.modules.transport_predictor.train_configs import (
     make_transport_torax_config,
 )
+from transport_study.signals import convert_to_working_units
 from transport_study.tests.sample_data import SAMPLE_DIR, requires_sample_data
 
 RHO = np.asarray(RHO_GRID)
@@ -78,15 +80,15 @@ TE0 = 2.0 * (1.0 - RHO**2) + 0.05
 TE0[-3:] = 0.0
 
 INPUT_SCALARS = {
-    "Ip_MA": 1.0,
-    "B0": 5.4,
-    "ne20_line_avg": 1.5,
-    "R0": 0.68,
-    "a_minor": 0.22,
-    "kappa": 1.6,
-    "delta_top": 0.35,
-    "delta_bot": 0.45,
-    "P_aux_MW": 2.0,
+    "ip_MA": 1.0,
+    "b0": 5.4,
+    "n_e_line_average_1e20": 1.5,
+    "geometric_axis_r": 0.68,
+    "minor_radius": 0.22,
+    "elongation": 1.6,
+    "triangularity_upper": 0.35,
+    "triangularity_lower": 0.45,
+    "power_additional_MW": 2.0,
     "ds_source_idx": 0.0,
 }
 
@@ -94,9 +96,9 @@ INPUT_SCALARS = {
 def make_observations(**overrides) -> xr.Dataset:
     """t0 slice of the state_init_vars the dataloader hands create_state."""
     data = {
-        "ne20_rho": ("rho", NE0.copy()),
-        "Te_keV_rho": ("rho", TE0.copy()),
-        "Wtot_MJ": 0.15,
+        "n_e_1e20": (RADIAL_DIM, NE0.copy()),
+        "t_e_keV": (RADIAL_DIM, TE0.copy()),
+        "energy_mhd_MJ": 0.15,
         **INPUT_SCALARS,
         **overrides,
     }
@@ -191,7 +193,7 @@ def torax_carry_module() -> TransportPredictorToraxSimState:
 def test_env_create_state_per_model_type(transformer_module, sciml_module, torax_rebuild_module, torax_carry_module):
     """TransportPredictorEnv.create_state seeds the right state per module:
     transformer gets a (history_len, 2 n_rho) buffer tiled from the measured
-    t0 profiles, sciml gets PowerBalance.State with the measured Wtot_MJ,
+    t0 profiles, sciml gets PowerBalance.State with the measured energy_mhd_MJ,
     torax rebuild gets ne/te from the measured profiles, and torax carry gets
     a full ToraxSimState built from the measured profiles with the edge points
     pinned to the NN boundary conditions."""
@@ -207,7 +209,7 @@ def test_env_create_state_per_model_type(transformer_module, sciml_module, torax
     # Sciml: PowerBalance.State seeded with the measured stored energy
     state_sciml = TransportPredictorEnv(module=sciml_module).create_state(obs, obs)
     assert isinstance(state_sciml, PowerBalance.State)
-    assert float(state_sciml.Wtot_MJ) == pytest.approx(0.15)
+    assert float(state_sciml.energy_mhd_MJ) == pytest.approx(0.15)
 
     # Torax rebuild: measured profiles with the seed floors applied
     state_rb = TransportPredictorEnv(module=torax_rebuild_module).create_state(obs, obs)
@@ -231,7 +233,7 @@ def test_env_create_state_per_model_type(transformer_module, sciml_module, torax
     inputs0 = TransportPredictorEnv.create_inputs(obs)
     ne_seed = jnp.maximum(jnp.asarray(NE0), NE_SEED_FLOOR_20)
     te_seed = jnp.maximum(jnp.asarray(TE0), TE_SEED_FLOOR_KEV)
-    wtot0 = wtot_from_profiles(ne_seed, te_seed, jnp.asarray(RHO), inputs0.volume_approx)
+    wtot0 = energy_mhd_from_profiles(ne_seed, te_seed, jnp.asarray(RHO), inputs0.volume_approx)
     coeffs = torax_carry_module.nn_coefficients(inputs0, wtot0)
     core_profiles = sim_state.core_profiles
     np.testing.assert_allclose(
@@ -383,8 +385,8 @@ def test_transformer_history_holds_profiles_only(transformer_module):
     # The buffer update is a pure shift plus the newest prediction: the rows
     # carried over are byte-identical to the old rows regardless of the
     # current input features, so no feature values ever enter the buffer
-    next_a, _ = transformer_module(state, make_inputs(P_aux_MW=0.0))
-    next_b, _ = transformer_module(state, make_inputs(P_aux_MW=6.0))
+    next_a, _ = transformer_module(state, make_inputs(power_additional_MW=0.0))
+    next_b, _ = transformer_module(state, make_inputs(power_additional_MW=6.0))
     np.testing.assert_array_equal(np.asarray(next_a.profiles[:-1]), np.asarray(state.profiles[1:]))
     np.testing.assert_array_equal(np.asarray(next_b.profiles[:-1]), np.asarray(state.profiles[1:]))
     # Only the newest row responds to the changed features (via the query)
@@ -397,7 +399,7 @@ def test_transformer_history_holds_profiles_only(transformer_module):
 
 
 def test_torax_p_aux_feed_through(torax_rebuild_module):
-    """The measured P_aux_MW input is wired directly to the TORAX
+    """The measured power_additional_MW input is wired directly to the TORAX
     generic_heat.P_total runtime update (MW to W) for the rebuild variant,
     the carry variant, and the env's initial TORAX state construction (all
     three route through TransportPredictorToraxBase.build_provider_and_geo);
@@ -424,7 +426,7 @@ def test_torax_p_aux_feed_through(torax_rebuild_module):
     assert TransportPredictorToraxSimState.build_provider_and_geo is TransportPredictorToraxBase.build_provider_and_geo
 
     for p_aux in (0.0, 2.0, 6.0):
-        inputs = make_inputs(P_aux_MW=p_aux)
+        inputs = make_inputs(power_additional_MW=p_aux)
         coeffs = module.nn_coefficients(inputs, 0.15)
         provider, _geo = module.build_provider_and_geo(inputs, coeffs)
         heat = provider(t=0.0).sources["generic_heat"]
@@ -465,19 +467,19 @@ def test_torax_p_aux_feed_through(torax_rebuild_module):
     )
     heat = module.build_provider_and_geo(inputs, coeffs)[0](t=0.0).sources["generic_heat"]
     heat_perturbed = perturbed.build_provider_and_geo(inputs, coeffs_perturbed)[0](t=0.0).sources["generic_heat"]
-    np.testing.assert_allclose(np.asarray(heat.P_total), inputs.P_aux_MW * 1e6)
-    np.testing.assert_allclose(np.asarray(heat_perturbed.P_total), inputs.P_aux_MW * 1e6)
+    np.testing.assert_allclose(np.asarray(heat.P_total), inputs.power_additional_MW * 1e6)
+    np.testing.assert_allclose(np.asarray(heat_perturbed.P_total), inputs.power_additional_MW * 1e6)
 
 
 @pytest.mark.slow
 def test_torax_p_aux_change_reaches_one_step_output(torax_rebuild_module):
-    """Changing P_aux_MW changes the one-step evolved profiles with the
+    """Changing power_additional_MW changes the one-step evolved profiles with the
     module weights held fixed, so the measured heating magnitude feeds
     through the whole TORAX solve, not just the runtime params."""
     obs = make_observations()
     state = TransportPredictorEnv(module=torax_rebuild_module).create_state(obs, obs)
-    next_low, _ = torax_rebuild_module(state, make_inputs(P_aux_MW=0.0))
-    next_high, _ = torax_rebuild_module(state, make_inputs(P_aux_MW=8.0))
+    next_low, _ = torax_rebuild_module(state, make_inputs(power_additional_MW=0.0))
+    next_high, _ = torax_rebuild_module(state, make_inputs(power_additional_MW=8.0))
     assert np.all(np.isfinite(np.asarray(next_low.te)))
     assert np.all(np.isfinite(np.asarray(next_high.te)))
     assert not np.allclose(np.asarray(next_low.te), np.asarray(next_high.te))
@@ -517,7 +519,7 @@ def test_torax_rebuild_step_gradients_finite(transport_model):
 
 def test_torax_absorption_fraction_nn(torax_rebuild_module):
     """The transport sources network's last output sets absorption_fraction
-    via the saturating Beer-Lambert form 1 - exp(-ne20_line_avg * softplus(nn
+    via the saturating Beer-Lambert form 1 - exp(-n_e_line_average_1e20 * softplus(nn
     output)): always in (0, 1), linear in line density when optically thin,
     smoothly saturating toward 1 with no gradient-dead cap. The value reaches
     the generic_heat.absorption_fraction runtime update in
@@ -528,7 +530,7 @@ def test_torax_absorption_fraction_nn(torax_rebuild_module):
 
     # Manual reconstruction of the Beer-Lambert form from the raw network output
     for ne in (0.05, 0.5, 1.5, 5.0):
-        inputs = make_inputs(ne20_line_avg=ne)
+        inputs = make_inputs(n_e_line_average_1e20=ne)
         coeffs = module.nn_coefficients(inputs, wtot)
         nn_inputs = module.normalizer(inputs.transport_nn_inputs(wtot), inputs.ds_source_idx)
         opacity = jax.nn.softplus(module.nn_sources(nn_inputs)[4:5])
@@ -573,7 +575,7 @@ def test_torax_absorption_fraction_nn(torax_rebuild_module):
         transport_model="constant",
         geometry_builder="circular",
     )
-    profile_inputs = inputs.to_profile_predictor_inputs(rho=jnp.asarray(RHO), betan=1.5)
+    profile_inputs = inputs.to_profile_predictor_inputs(rho=jnp.asarray(RHO), beta_tor_norm=1.5)
     profile_coeffs = profile_module.nn_coefficients(profile_inputs)
     profile_heat = profile_module.build_provider_and_geo(profile_inputs, profile_coeffs)[0](t=0.0).sources["generic_heat"]
     np.testing.assert_allclose(np.asarray(profile_heat.absorption_fraction), 0.9)
@@ -592,7 +594,7 @@ def test_torax_absorbed_power_matches_absorption_fraction(torax_carry_module):
     # energy implied by the carried TORAX core profiles
     core_profiles = state.unwrap()[0].core_profiles
     rho_cells = jnp.asarray(torax_carry_module.rho_norm_grid)
-    wtot = wtot_from_profiles(
+    wtot = energy_mhd_from_profiles(
         core_profiles.n_e.value / 1e20,
         core_profiles.T_e.value,
         rho_cells,
@@ -602,7 +604,7 @@ def test_torax_absorbed_power_matches_absorption_fraction(torax_carry_module):
 
     next_state, _output = torax_carry_module(state, inputs)
     absorbed = float(np.squeeze(np.asarray(next_state.unwrap()[1].P_aux_generic_total)))
-    expected = float(inputs.P_aux_MW) * 1e6 * float(np.squeeze(np.asarray(coeffs["absorption_fraction"])))
+    expected = float(inputs.power_additional_MW) * 1e6 * float(np.squeeze(np.asarray(coeffs["absorption_fraction"])))
     assert absorbed == pytest.approx(expected, rel=1e-3)
 
 
@@ -610,14 +612,14 @@ def test_torax_absorbed_power_matches_absorption_fraction(torax_carry_module):
 def test_normalizer_fit_features():
     """make_transport_nn_input_normalizer builds an (N, 11) feature matrix
     whose columns match Inputs.transport_nn_inputs evaluated with the
-    measured Wtot_MJ, drops rows with NaN device index, and returns identity
+    measured energy_mhd_MJ, drops rows with NaN device index, and returns identity
     stats for devices with too few samples."""
     assert N_TRANSPORT_NN_INPUTS == 11
     assert len(TRANSPORT_NN_INPUT_NAMES) == N_TRANSPORT_NN_INPUTS
     assert TRANSPORT_NN_INPUT_NAMES[-1] == "paux_norm"
 
-    ds = xr.open_dataset(SAMPLE_DIR / "cmod-low1.nc").isel(shot=slice(0, 40), time_idx=slice(0, 600, 3))
-    ds["P_aux_MW"] = sum(ds[var].fillna(0.0) for var in ("P_NBI_MW", "P_ICRF_MW", "P_ECRH_MW", "P_LH_MW"))
+    ds_sample = xr.open_dataset(SAMPLE_DIR / "cmod-low1.nc").isel(shot=slice(0, 40), time_idx=slice(0, 600, 3))
+    ds = convert_to_working_units(ds_sample)
     source_idx_per_shot = np.zeros(ds.sizes["shot"])
     source_idx_per_shot[30:35] = 1.0  # a device with too few shots for CORAL
     source_idx_per_shot[35:] = np.nan  # unattributed shots (NaN-padded concat)
@@ -630,26 +632,36 @@ def test_normalizer_fit_features():
 
     # Columns match Inputs.transport_nn_inputs evaluated with the MEASURED
     # stored energy, checked on one complete flattened row
-    reference = ds["Ip_MA"]
+    reference = ds["ip_MA"]
 
     def flat(var: str) -> np.ndarray:
         return np.asarray(ds[var].broadcast_like(reference).values, dtype=float).ravel()
 
-    source_vars = ("Ip_MA", "B0", "ne20_line_avg", "R0", "a_minor", "kappa", "delta_top", "delta_bot", "P_aux_MW")
-    columns = {var: flat(var) for var in (*source_vars, "Wtot_MJ")}
+    source_vars = (
+        "ip_MA",
+        "b0",
+        "n_e_line_average_1e20",
+        "geometric_axis_r",
+        "minor_radius",
+        "elongation",
+        "triangularity_upper",
+        "triangularity_lower",
+        "power_additional_MW",
+    )
+    columns = {var: flat(var) for var in (*source_vars, "energy_mhd_MJ")}
     stacked = np.column_stack(list(columns.values()))
     row = int(np.argmax(~np.isnan(stacked).any(axis=1)))
     assert not np.isnan(stacked[row]).any()
     scalar_inputs = Inputs(**{var: columns[var][row] for var in source_vars}, ds_source_idx=0.0)
     np.testing.assert_allclose(
-        np.asarray(scalar_inputs.transport_nn_inputs(columns["Wtot_MJ"][row])),
+        np.asarray(scalar_inputs.transport_nn_inputs(columns["energy_mhd_MJ"][row])),
         matrix[row],
         rtol=1e-6,
     )
     # The aux power slot is the dimensionless TAU_REF_S * P_aux / Wtot scale,
     # log1p compressed so a near-zero stored energy cannot send it out of
     # distribution (P_aux = 0 still maps to exactly 0)
-    expected_paux_norm = np.log1p(TAU_REF_S * columns["P_aux_MW"] / np.maximum(columns["Wtot_MJ"], MIN_W_MJ))
+    expected_paux_norm = np.log1p(TAU_REF_S * columns["power_additional_MW"] / np.maximum(columns["energy_mhd_MJ"], MIN_W_MJ))
     np.testing.assert_allclose(matrix[:, -1], expected_paux_norm, rtol=1e-6, equal_nan=True)
 
     # Rows with a NaN device index are dropped before fitting

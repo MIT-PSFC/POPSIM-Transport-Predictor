@@ -2,6 +2,7 @@ import copy
 from typing import Any
 
 from transport_study.modules.profile_predictor.module import (
+    NN_INPUT_SOURCE_VARS,
     ShapeType,
 )
 from transport_study.modules.profile_predictor.trb import (
@@ -16,25 +17,15 @@ PROFILE_PREDICTOR_SHAPE_INIT_CONFIG = {
     "epochs_per_val": 2,
     "checkpoint_dir": None,
     "dataloader_config": {
-        "input_vars": [
-            "Ip_MA",
-            "B0",
-            "betan",
-            "ne20_line_avg",
-            "R0",
-            "a_minor",
-            "kappa",
-            "delta_top",
-            "delta_bot",
-        ],
+        "input_vars": list(NN_INPUT_SOURCE_VARS),
         "target_vars": [*PROFILE_TARGET_VARS, "ds_source_idx"],
-        "extra_vars": ["Te_shape", "ne_shape"],
+        "extra_vars": ["t_e_shape", "n_e_shape"],
     },
     "model_init_config": {
         "model_type": "shape_init",
         "shape_type": ShapeType.CONVEX_COMBINATION.value,
-        "te_shape_var": "Te_shape",
-        "ne_shape_var": "ne_shape",
+        "te_shape_var": "t_e_shape",
+        "ne_shape_var": "n_e_shape",
         "n_shapes": 3,
         "nn_depth": 2,
         "nn_width": 16,
@@ -154,12 +145,12 @@ TORAX_TRANSPORT_BLOCKS = {
 TORAX_CONFIG_BASE: dict[str, Any] = {
     "profile_conditions": {
         "Ip": 9999,  # Overridden by dataloader input
-        # Edge BCs predicted by NN as fractions of te_approx and ne20_line_avg.
+        # Edge BCs predicted by NN as fractions of te_approx and n_e_line_average_1e20.
         "T_i_right_bc": 0.2,  # [keV] Predicted by NN
         "T_e_right_bc": 0.2,  # [keV] Predicted by NN
         "n_e_right_bc": 0.5e20,  # [m^-3] Predicted by NN
         # Placeholder initial profiles; overridden per sample with
-        # parabolic inits scaled to te_approx / ne20_line_avg and
+        # parabolic inits scaled to te_approx / n_e_line_average_1e20 and
         # continuous with the NN edge BCs (see build_provider_and_geo)
         "T_i": {0: {0: 0.3, 1: 0.2}},
         "T_e": {0: {0: 0.3, 1: 0.2}},
@@ -247,17 +238,7 @@ _PROFILE_PREDICTOR_TORAX_CONFIG_BASE: dict[str, Any] = {
     "epochs_per_val": 2,
     "checkpoint_dir": None,
     "dataloader_config": {
-        "input_vars": [
-            "Ip_MA",
-            "B0",
-            "betan",
-            "ne20_line_avg",
-            "R0",
-            "a_minor",
-            "kappa",
-            "delta_top",
-            "delta_bot",
-        ],
+        "input_vars": list(NN_INPUT_SOURCE_VARS),
         "target_vars": [*PROFILE_TARGET_VARS, "ds_source_idx"],
     },
     "model_init_config": {
@@ -269,7 +250,7 @@ _PROFILE_PREDICTOR_TORAX_CONFIG_BASE: dict[str, Any] = {
         "torax_config": TORAX_CONFIG_BASE,
         "prng_seed": 42,
         # Per-sample geometry builder: "circular" or "miller" (shaped,
-        # uses delta_top/delta_bot with delta ~ rho_norm**delta_exponent)
+        # uses triangularity_upper/triangularity_lower with delta ~ rho_norm**delta_exponent)
         "geometry_builder": "circular",
         "delta_exponent": 2.0,
         # Relaxation window overrides, None keeps the torax_config numerics values.
@@ -326,17 +307,7 @@ PROFILE_PREDICTOR_DIRECT_POINTS_CONFIG = {
     "epochs_per_val": 2,
     "checkpoint_dir": None,
     "dataloader_config": {
-        "input_vars": [
-            "Ip_MA",
-            "B0",
-            "betan",
-            "ne20_line_avg",
-            "R0",
-            "a_minor",
-            "kappa",
-            "delta_top",
-            "delta_bot",
-        ],
+        "input_vars": list(NN_INPUT_SOURCE_VARS),
         "target_vars": [*PROFILE_TARGET_VARS, "ds_source_idx"],
     },
     "model_init_config": {

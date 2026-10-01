@@ -6,46 +6,46 @@ from transport_study.orchestration.data_visualization import DataVisualizationBa
 class DataVisualization(DataVisualizationBase):
     STUDY_TYPE: ClassVar[str] = "power_balance_transfer"
 
-    # Input-variable pairs to plot per normalization method. Power-balance
-    # datasets always carry P_aux_MW (get_ds sums the per-system aux power
-    # signals), so the aux-power derived variables are safe to plot.
+    # Input-variable pairs to plot per normalization method.
+    # Power-balance datasets always carry power_additional_MW (signals.convert_to_working_units sums the heating powers),
+    # so the aux-power derived variables are safe to plot.
     # Coral and physics-coral pairs use only the module's joint feature set
-    # (adding Wtot_MJ or beta to the fit would change every var's transform).
+    # (adding energy_mhd_MJ or beta to the fit would change every var's transform).
     VAR_GROUPS: ClassVar[dict[str, list[list[str]]]] = {
         "raw": [
-            ["Ip_MA", "Wtot_MJ"],
-            ["R0", "a_minor"],
-            ["ne20_line_avg", "B0"],
-            ["P_aux_MW", "kappa"],
+            ["ip_MA", "energy_mhd_MJ"],
+            ["geometric_axis_r", "minor_radius"],
+            ["n_e_line_average_1e20", "b0"],
+            ["power_additional_MW", "elongation"],
         ],
         "physics": [
-            ["Ip_MA", "beta"],
+            ["ip_MA", "beta"],
             ["q_star", "epsilon"],
             ["f_G", "aB0"],
-            ["surface_power_density", "kappa"],
+            ["surface_power_density", "elongation"],
         ],
         "zscore": [
-            ["Ip_MA_z", "Wtot_MJ_z"],
-            ["R0_z", "a_minor_z"],
-            ["ne20_line_avg_z", "B0_z"],
-            ["P_aux_MW_z", "kappa_z"],
+            ["ip_MA_z", "energy_mhd_MJ_z"],
+            ["geometric_axis_r_z", "minor_radius_z"],
+            ["n_e_line_average_1e20_z", "b0_z"],
+            ["power_additional_MW_z", "elongation_z"],
         ],
         "coral": [
-            ["Ip_MA_coral", "kappa_coral"],
-            ["R0_coral", "a_minor_coral"],
-            ["ne20_line_avg_coral", "B0_coral"],
-            ["P_aux_MW_coral", "Ip_MA_coral"],
+            ["ip_MA_coral", "elongation_coral"],
+            ["geometric_axis_r_coral", "minor_radius_coral"],
+            ["n_e_line_average_1e20_coral", "b0_coral"],
+            ["power_additional_MW_coral", "ip_MA_coral"],
         ],
         "physics-coral": [
-            ["Ip_MA_pcoral", "kappa_pcoral"],
+            ["ip_MA_pcoral", "elongation_pcoral"],
             ["q_star_pcoral", "epsilon_pcoral"],
             ["f_G_pcoral", "aB0_pcoral"],
-            ["surface_power_density_pcoral", "kappa_pcoral"],
+            ["surface_power_density_pcoral", "elongation_pcoral"],
         ],
         "physics-zscore": [
-            ["Ip_MA_pz", "kappa_pz"],
+            ["ip_MA_pz", "elongation_pz"],
             ["q_star_pz", "epsilon_pz"],
             ["f_G_pz", "aB0_pz"],
-            ["surface_power_density_pz", "kappa_pz"],
+            ["surface_power_density_pz", "elongation_pz"],
         ],
     }

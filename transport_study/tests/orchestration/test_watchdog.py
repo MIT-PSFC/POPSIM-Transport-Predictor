@@ -2,7 +2,7 @@
 
 Both exist so a case can never be stranded by a job that will not finish:
 
-- The stall watchdog (Study._kill_stuck_jobs) kills a RUNNING training job that
+- The stall watchdog (Study.kill_stuck_jobs) kills a RUNNING training job that
   deadlocks (e.g. an OpenBLAS or XLA compile-pool hang) and so sits in the
   queue forever without checkpointing.
 - The pending watchdog (Study._kill_long_pending_jobs) cancels a job stuck
@@ -60,13 +60,13 @@ def write_checkpoint(study: Study, case, epoch: int, age_s: float):
 
 
 # ----------------------------------------------------------------------
-# Stall watchdog (Study._kill_stuck_jobs)
+# Stall watchdog (Study.kill_stuck_jobs)
 # ----------------------------------------------------------------------
 def test_young_job_not_killed(study, case, killed, monkeypatch):
     """A job that has not yet run WATCHDOG_MIN_AGE_S is left alone even with no checkpoint."""
     set_job_elapsed(monkeypatch, study, case, WATCHDOG_MIN_AGE_S - 1)
 
-    study._kill_stuck_jobs([case])
+    study.kill_stuck_jobs([case])
 
     assert killed == []
 
@@ -76,7 +76,7 @@ def test_old_job_with_recent_checkpoint_not_killed(study, case, killed, monkeypa
     write_checkpoint(study, case, epoch=40, age_s=WATCHDOG_STALL_S - 1)
     set_job_elapsed(monkeypatch, study, case, WATCHDOG_MIN_AGE_S + 1)
 
-    study._kill_stuck_jobs([case])
+    study.kill_stuck_jobs([case])
 
     assert killed == []
 
@@ -86,7 +86,7 @@ def test_old_job_with_stale_checkpoint_killed(study, case, killed, monkeypatch):
     write_checkpoint(study, case, epoch=40, age_s=WATCHDOG_STALL_S + 1)
     set_job_elapsed(monkeypatch, study, case, WATCHDOG_MIN_AGE_S + 1)
 
-    study._kill_stuck_jobs([case])
+    study.kill_stuck_jobs([case])
 
     assert killed == [study.train_job_name(case)]
 
@@ -95,7 +95,7 @@ def test_old_job_with_no_checkpoint_killed(study, case, killed, monkeypatch):
     """An old job that never wrote a first checkpoint is also deadlocked."""
     set_job_elapsed(monkeypatch, study, case, WATCHDOG_MIN_AGE_S + 1)
 
-    study._kill_stuck_jobs([case])
+    study.kill_stuck_jobs([case])
 
     assert killed == [study.train_job_name(case)]
 
@@ -108,7 +108,7 @@ def test_job_absent_from_elapsed_map_not_killed(study, case, killed, monkeypatch
     """
     set_job_elapsed(monkeypatch, study, case, None)
 
-    study._kill_stuck_jobs([case])
+    study.kill_stuck_jobs([case])
 
     assert killed == []
 

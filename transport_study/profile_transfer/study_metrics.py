@@ -3,7 +3,7 @@
 Recomputes the delta-free validation loss components (see
 ProfilePredictorTRB._make_profile_loss_fn with use_huber=False) in numpy from
 the per-case result files, joined back to the device datasets for measurement
-error bars, GP-fit gradients, Ip, and auxiliary heating power. Each test
+error bars, GP-fit gradients, ip_MA, and the heating powers. Each test
 timeslice gets three metrics:
 
 - metric_value: peak-normalized, error-bar-softened profile residual integrated
@@ -25,11 +25,10 @@ import numpy as np
 import xarray as xr
 from loguru import logger
 
-from transport_study import EPISODE_DIM, TIME_DIM
+from transport_study import EPISODE_DIM, RADIAL_DIM, TIME_COORD, TIME_DIM
 from transport_study.config import RHO_GRID, config
 from transport_study.modules.profile_predictor.trb import ProfilePredictorTRB
 from transport_study.orchestration.organize_data import (
-    INPUT_POWER_SIGNALS,
     PROFILE_ERROR_SIGNALS,
     PROFILE_TARGET_VARS,
     add_missing_profile_companions,
@@ -39,6 +38,7 @@ from transport_study.orchestration.stages import (
     segment_stages,
 )
 from transport_study.orchestration.study import Study
+from transport_study.signals import HEATING_POWERS_MW, convert_to_working_units
 
 # Joined eval timeslice must be within this of the result timeslice.
 # Timebases are 1 kHz, so anything beyond half a sample is a bad join
@@ -56,23 +56,17 @@ def load_eval_dataset(device: str) -> xr.Dataset:
 
     Profile signals and their gradient / error-bar companions are put on the
     same uniform 51-point rho grid as training (mirrors the preprocessing in
-    organize_data.get_ds). Ip, auxiliary heating powers, and the time coord are
+    organize_data.get_ds). ip_MA, the heating powers, and the time coord are
     kept for stage segmentation. Non-fresh timeslices are kept: the join is by
     time, so only timeslices that appear in a result file are ever read.
     """
     ds_path = Path(config.dataset_paths[device])
-    ds = xr.open_dataset(ds_path)
+    ds_store = xr.open_dataset(ds_path)
+    ds_working = convert_to_working_units(ds_store)
+    ds_with_companions = add_missing_profile_companions(ds_working)
+    ds = ds_with_companions[[*PROFILE_TARGET_VARS, *HEATING_POWERS_MW, "ip_MA", TIME_COORD]]
 
-    ds = add_missing_profile_companions(ds)
-
-    for sig in INPUT_POWER_SIGNALS:
-        if sig not in ds:
-            ds[sig] = xr.zeros_like(ds["Ip_MA"])
-
-    keep = [*PROFILE_TARGET_VARS, *INPUT_POWER_SIGNALS, "Ip_MA", "time"]
-    ds = ds[keep]
-
-    ds = ds.interp(rho=RHO_GRID, kwargs={"fill_value": "extrapolate"})
+    ds = ds.interp({RADIAL_DIM: RHO_GRID}, kwargs={"fill_value": "extrapolate"})
     for err_sig in PROFILE_ERROR_SIGNALS:
         ds[err_sig] = ds[err_sig].clip(min=0.0)
 
@@ -164,7 +158,7 @@ def compute_case_timeslice_metrics(result_ds: xr.Dataset, loss_config: dict) -> 
     gradient_weight = loss_config.get("gradient_weight", 0.0)
     within_error_weight = loss_config["within_error_weight"]
 
-    rho = result_ds["rho"].values
+    rho = result_ds[RADIAL_DIM].values
 
     records: dict[str, list] = {
         name: [] for name in ("shot", "ds_source", "time", "result_time_idx", "eval_time_idx", "stage", "aux_heated")
@@ -179,12 +173,12 @@ def compute_case_timeslice_metrics(result_ds: xr.Dataset, loss_config: dict) -> 
             logger.warning(f"Shot {shot} not found in dataset for device {device}, skipping")
             continue
         shot_eval = eval_ds.sel({EPISODE_DIM: shot})
-        if not np.allclose(shot_eval["rho"].values, rho):
+        if not np.allclose(shot_eval[RADIAL_DIM].values, rho):
             raise ValueError(f"rho grid mismatch between result file and {device} dataset")
 
         res_time = shot_res["time"].values
-        ne_pred_all = shot_res["ne20_rho_pred"].transpose(TIME_DIM, "rho").values
-        te_pred_all = shot_res["Te_keV_rho_pred"].transpose(TIME_DIM, "rho").values
+        ne_pred_all = shot_res["n_e_1e20_pred"].transpose(TIME_DIM, RADIAL_DIM).values
+        te_pred_all = shot_res["t_e_keV_pred"].transpose(TIME_DIM, RADIAL_DIM).values
         valid = np.isfinite(res_time) & ~np.all(np.isnan(ne_pred_all), axis=-1) & ~np.all(np.isnan(te_pred_all), axis=-1)
         result_idxs = np.flatnonzero(valid)
         if len(result_idxs) == 0:
@@ -217,20 +211,20 @@ def compute_case_timeslice_metrics(result_ds: xr.Dataset, loss_config: dict) -> 
             continue
 
         # Stage labels over the full shot, then picked at the joined timeslices
-        p_aux = sum(np.nan_to_num(shot_eval[sig].values, nan=0.0) for sig in INPUT_POWER_SIGNALS)
-        stage_full, aux_full = segment_stages(shot_eval["Ip_MA"].values, p_aux)
+        p_aux = sum(np.nan_to_num(shot_eval[sig].values, nan=0.0) for sig in HEATING_POWERS_MW)
+        stage_full, aux_full = segment_stages(shot_eval["ip_MA"].values, p_aux)
 
         ne_pred = ne_pred_all[result_idxs]
         te_pred = te_pred_all[result_idxs]
-        ne_targ = shot_res["ne20_rho_targ"].transpose(TIME_DIM, "rho").values[result_idxs]
-        te_targ = shot_res["Te_keV_rho_targ"].transpose(TIME_DIM, "rho").values[result_idxs]
+        ne_targ = shot_res["n_e_1e20_targ"].transpose(TIME_DIM, RADIAL_DIM).values[result_idxs]
+        te_targ = shot_res["t_e_keV_targ"].transpose(TIME_DIM, RADIAL_DIM).values[result_idxs]
 
-        ne_err = shot_eval["ne20_rho_error"].transpose(TIME_DIM, "rho").values[eval_idxs]
-        te_err = shot_eval["Te_keV_rho_error"].transpose(TIME_DIM, "rho").values[eval_idxs]
-        ne_grad = shot_eval["ne20_rho_grad"].transpose(TIME_DIM, "rho").values[eval_idxs]
-        te_grad = shot_eval["Te_keV_rho_grad"].transpose(TIME_DIM, "rho").values[eval_idxs]
-        ne_grad_err = shot_eval["ne20_rho_grad_error"].transpose(TIME_DIM, "rho").values[eval_idxs]
-        te_grad_err = shot_eval["Te_keV_rho_grad_error"].transpose(TIME_DIM, "rho").values[eval_idxs]
+        ne_err = shot_eval["n_e_1e20_error"].transpose(TIME_DIM, RADIAL_DIM).values[eval_idxs]
+        te_err = shot_eval["t_e_keV_error"].transpose(TIME_DIM, RADIAL_DIM).values[eval_idxs]
+        ne_grad = shot_eval["n_e_1e20_gradient"].transpose(TIME_DIM, RADIAL_DIM).values[eval_idxs]
+        te_grad = shot_eval["t_e_keV_gradient"].transpose(TIME_DIM, RADIAL_DIM).values[eval_idxs]
+        ne_grad_err = shot_eval["n_e_1e20_gradient_error"].transpose(TIME_DIM, RADIAL_DIM).values[eval_idxs]
+        te_grad_err = shot_eval["t_e_keV_gradient_error"].transpose(TIME_DIM, RADIAL_DIM).values[eval_idxs]
 
         metric_value = _channel_value_metric(ne_pred, ne_targ, ne_err, rho, within_error_weight) + _channel_value_metric(
             te_pred, te_targ, te_err, rho, within_error_weight

@@ -1,9 +1,8 @@
-
 def test_s_total_scales_with_device_inventory():
-    """S_total should scale with ne20_line_avg * volume_approx / TAU_REF_S.
+    """S_total should scale with n_e_line_average_1e20 * volume_approx / TAU_REF_S.
 
-    Build two Inputs differing only in ne20_line_avg and volume-relevant
-    geometry (R0, a_minor, kappa), run _nn_coefficients with a fixed
+    Build two Inputs differing only in n_e_line_average_1e20 and volume-relevant
+    geometry (geometric_axis_r, minor_radius, elongation), run _nn_coefficients with a fixed
     network, and check the S_total ratio equals the inventory ratio.
     """
 

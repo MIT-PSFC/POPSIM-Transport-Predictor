@@ -9,7 +9,6 @@ import numpy as np
 import pytest
 import xarray as xr
 
-from transport_study.orchestration.organize_data import INPUT_POWER_SIGNALS
 from transport_study.power_balance_transfer import study_metrics
 from transport_study.power_balance_transfer.case_reports import best_worst_pdf
 from transport_study.power_balance_transfer.study_metrics import (
@@ -19,6 +18,7 @@ from transport_study.power_balance_transfer.study_metrics import (
     shot_time_averaged_errors,
 )
 from transport_study.power_balance_transfer.tables import write_comparison_tables
+from transport_study.signals import HEATING_POWERS_MW
 
 N_TS = 100
 SHOTS = [101, 102]
@@ -33,10 +33,10 @@ def device_ds() -> xr.Dataset:
     time = np.arange(N_TS) * 1e-3
 
     data_vars = {
-        "Ip_MA": (("shot", "time_idx"), np.stack([ip, ip])),
-        "P_NBI_MW": (("shot", "time_idx"), np.stack([p_nbi, p_nbi])),
+        "ip_MA": (("shot", "time_idx"), np.stack([ip, ip])),
+        "power_nbi_MW": (("shot", "time_idx"), np.stack([p_nbi, p_nbi])),
     }
-    for sig in INPUT_POWER_SIGNALS:
+    for sig in HEATING_POWERS_MW:
         if sig not in data_vars:
             data_vars[sig] = (("shot", "time_idx"), np.zeros((2, N_TS)))
     return xr.Dataset(
@@ -58,8 +58,8 @@ def result_ds() -> xr.Dataset:
 
     return xr.Dataset(
         data_vars={
-            "Wtot_MJ_targ": (("time_idx", "shot"), targ),
-            "Wtot_MJ_pred": (("time_idx", "shot"), pred),
+            "energy_mhd_MJ_targ": (("time_idx", "shot"), targ),
+            "energy_mhd_MJ_pred": (("time_idx", "shot"), pred),
             "error_abs_ts": (("time_idx", "shot"), err),
             "error_rel_ts": (("time_idx", "shot"), err / 1.1),
         },

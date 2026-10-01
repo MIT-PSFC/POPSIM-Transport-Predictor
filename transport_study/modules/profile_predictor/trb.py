@@ -14,7 +14,7 @@ from popsim.ml.checkpointing import create_default_checkpoint_manager, restore_m
 from popsim.ml.dataloading import make_dataloaders
 from popsim.ml.eval import EvalData, EvaluationSuite
 
-from transport_study import EPISODE_DIM, TIME_COORD, TIME_DIM
+from transport_study import EPISODE_DIM, RADIAL_DIM, TIME_COORD, TIME_DIM
 from transport_study.config import config
 from transport_study.modules.profile_predictor.module import (
     ProfilePredictorReservoir,
@@ -118,7 +118,7 @@ class ProfilePredictorTRB(TrainRunBuilder):
         # skip_data_init is the same escape hatch for a caller building this
         # module as a submodule skeleton on a dataset that cannot support the
         # data-driven init at all - the transport study's sciml model type builds
-        # one on its own dataloader, which carries neither a measured betan nor
+        # one on its own dataloader, which carries neither a measured beta_tor_norm nor
         # the profile shape variables (see transport_predictor/trb.py)
         n_devices = len(config.ds_source_to_idx)
         skip_data_init = model_init_config.get("skip_data_init", False)
@@ -140,7 +140,7 @@ class ProfilePredictorTRB(TrainRunBuilder):
 
             module = ProfilePredictorShapeInit.init(
                 n_shapes=model_init_config["n_shapes"],
-                rhogrid=np.asarray(train_dl.ds["rho"]),
+                rhogrid=np.asarray(train_dl.ds[RADIAL_DIM]),
                 nn_width=model_init_config["nn_width"],
                 nn_depth=model_init_config["nn_depth"],
                 in_size=model_init_config["in_size"],
@@ -176,7 +176,7 @@ class ProfilePredictorTRB(TrainRunBuilder):
             module = ProfilePredictorUnstructuredNN(
                 nn_width=model_init_config["nn_width"],
                 nn_depth=model_init_config["nn_depth"],
-                rhogrid=np.asarray(train_dl.ds["rho"]),
+                rhogrid=np.asarray(train_dl.ds[RADIAL_DIM]),
                 key=jax.random.PRNGKey(model_init_config["prng_seed"]),
                 normalizer=normalizer,
             )
@@ -187,7 +187,7 @@ class ProfilePredictorTRB(TrainRunBuilder):
                 input_scaling=model_init_config.get("input_scaling", 0.5),
                 leak_rate=model_init_config.get("leak_rate", 1.0),
                 n_steps=model_init_config.get("n_steps", 20),
-                rhogrid=np.asarray(train_dl.ds["rho"]),
+                rhogrid=np.asarray(train_dl.ds[RADIAL_DIM]),
                 key=jax.random.PRNGKey(model_init_config["prng_seed"]),
                 normalizer=normalizer,
             )
@@ -203,7 +203,7 @@ class ProfilePredictorTRB(TrainRunBuilder):
             module = ProfilePredictorTorax(
                 nn_width=model_init_config["nn_width"],
                 nn_depth=model_init_config["nn_depth"],
-                rhogrid=np.asarray(train_dl.ds["rho"]),
+                rhogrid=np.asarray(train_dl.ds[RADIAL_DIM]),
                 torax_config=torax_config,
                 key=jax.random.PRNGKey(model_init_config["prng_seed"]),
                 normalizer=normalizer,
@@ -250,7 +250,7 @@ class ProfilePredictorTRB(TrainRunBuilder):
         channel nor device dominates, and an error of 0.1 always means 10% of
         the profile peak.
 
-        Measurement error bars (<v>_error / <v>_grad_error target vars, from
+        Measurement error bars (<v>_error / <v>_gradient_error target vars, from
         the GP profile fits) soften the VALIDATION residual only: the part of
         the residual inside the error bar is down-weighted by
         within_error_weight, the part beyond it is penalized at full weight, so
@@ -332,8 +332,8 @@ class ProfilePredictorTRB(TrainRunBuilder):
             return 0.0
 
         def loss_fn(pred, targ):
-            ne_targ = targ["ne20_rho"].data
-            te_targ = targ["Te_keV_rho"].data
+            ne_targ = targ["n_e_1e20"].data
+            te_targ = targ["t_e_keV"].data
 
             # Peak-normalize per sample: scale comes from the target only and is
             # applied to prediction and target alike, so a perfect prediction
@@ -342,8 +342,8 @@ class ProfilePredictorTRB(TrainRunBuilder):
             ne_scale = jnp.maximum(jnp.max(jnp.abs(ne_targ), axis=-1, keepdims=True), floor)
             te_scale = jnp.maximum(jnp.max(jnp.abs(te_targ), axis=-1, keepdims=True), floor)
 
-            ne_sigma = _sigma_from_targ(targ, "ne20_rho_error", ne_scale)
-            te_sigma = _sigma_from_targ(targ, "Te_keV_rho_error", te_scale)
+            ne_sigma = _sigma_from_targ(targ, "n_e_1e20_error", ne_scale)
+            te_sigma = _sigma_from_targ(targ, "t_e_keV_error", te_scale)
 
             ne_err = value_err(_residual(pred.ne.data / ne_scale, ne_targ / ne_scale, ne_sigma))
             te_err = value_err(_residual(pred.te.data / te_scale, te_targ / te_scale, te_sigma))
@@ -362,7 +362,7 @@ class ProfilePredictorTRB(TrainRunBuilder):
             while sample_weights.ndim < ne_err.ndim:
                 sample_weights = sample_weights[..., None]
 
-            rho = pred.ne.rho.data
+            rho = pred.ne[RADIAL_DIM].data
             ne_rho_loss = jnp.trapezoid(sample_weights * ne_err, x=rho)
             te_rho_loss = jnp.trapezoid(sample_weights * te_err, x=rho)
 
@@ -386,17 +386,17 @@ class ProfilePredictorTRB(TrainRunBuilder):
                 # Gradient targets come from the GP-fit gradient signals when present
                 # (measured slope, smoother than differencing the values),
                 # otherwise fall back to finite differences of the value targets
-                if "ne20_rho_grad" in targ:
-                    ne_grad_targ = _to_mid(targ["ne20_rho_grad"].data) / ne_scale
+                if "n_e_1e20_gradient" in targ:
+                    ne_grad_targ = _to_mid(targ["n_e_1e20_gradient"].data) / ne_scale
                 else:
                     ne_grad_targ = jnp.diff(ne_targ / ne_scale, axis=-1) / d_rho
-                if "Te_keV_rho_grad" in targ:
-                    te_grad_targ = _to_mid(targ["Te_keV_rho_grad"].data) / te_scale
+                if "t_e_keV_gradient" in targ:
+                    te_grad_targ = _to_mid(targ["t_e_keV_gradient"].data) / te_scale
                 else:
                     te_grad_targ = jnp.diff(te_targ / te_scale, axis=-1) / d_rho
 
-                ne_grad_sigma = _sigma_from_targ(targ, "ne20_rho_grad_error", ne_scale)
-                te_grad_sigma = _sigma_from_targ(targ, "Te_keV_rho_grad_error", te_scale)
+                ne_grad_sigma = _sigma_from_targ(targ, "n_e_1e20_gradient_error", ne_scale)
+                te_grad_sigma = _sigma_from_targ(targ, "t_e_keV_gradient_error", te_scale)
                 if not isinstance(ne_grad_sigma, float):
                     ne_grad_sigma = _to_mid(ne_grad_sigma)
                 if not isinstance(te_grad_sigma, float):
@@ -525,7 +525,7 @@ class ProfilePredictorTRB(TrainRunBuilder):
 
         def study_results(eval_data: EvalData) -> xr.Dataset:
             """Calculate final study results for profile prediction.
-                - Target vs predicted ne20_rho and Te_keV_rho profiles
+                - Target vs predicted n_e_1e20 and t_e_keV profiles
                 - Per-timeslice profile-integrated absolute/relative errors
                 - Per-shot time-integrated errors
             Keeps shot and ds_source coordinates for downstream analysis.
@@ -541,7 +541,7 @@ class ProfilePredictorTRB(TrainRunBuilder):
                     da = da.squeeze(dim=squeeze_dims, drop=True)
                 # Time-dependent dataloaders suffix every input-side dim
                 # (the transport study reuses this suite)
-                # rename them back (time_idx_input -> time_idx, rho_input -> rho)
+                # rename them back (time_idx_input -> time_idx, rho_tor_norm_input -> rho_tor_norm)
                 # so targets and predictions share one grid
                 # No-op for time-independent evals.
                 renames = {d: d.removesuffix("_input") for d in da.dims if isinstance(d, str) and d.endswith("_input")}
@@ -561,16 +561,16 @@ class ProfilePredictorTRB(TrainRunBuilder):
                 # (the transport study reuses this suite)
                 # Identify it as the one dim the target does not have and rename it,
                 # so the error math never silently outer-broadcasts pred rho against targ rho
-                if "rho" in pred.dims:
+                if RADIAL_DIM in pred.dims:
                     return pred
                 extra = [d for d in pred.dims if d not in targ.dims]
-                if len(extra) != 1 or pred.sizes[extra[0]] != targ.sizes["rho"]:
+                if len(extra) != 1 or pred.sizes[extra[0]] != targ.sizes[RADIAL_DIM]:
                     raise ValueError(f"Cannot identify the profile axis of the prediction, dims {pred.dims} vs target {targ.dims}")
-                return pred.rename({extra[0]: "rho"}).assign_coords(rho=targ["rho"].values)
+                return pred.rename({extra[0]: RADIAL_DIM}).assign_coords({RADIAL_DIM: targ[RADIAL_DIM].values})
 
             # Targets from input dataset
-            ne_targ = _unstack_and_rename_time(eval_data.input_ds["ne20_rho"])
-            te_targ = _unstack_and_rename_time(eval_data.input_ds["Te_keV_rho"])
+            ne_targ = _unstack_and_rename_time(eval_data.input_ds["n_e_1e20"])
+            te_targ = _unstack_and_rename_time(eval_data.input_ds["t_e_keV"])
             time_2d = _unstack_and_rename_time(eval_data.input_ds[TIME_COORD])
 
             # Predictions from output dataset.
@@ -595,17 +595,17 @@ class ProfilePredictorTRB(TrainRunBuilder):
             # amount for ne and Te on every device (see REL_ERROR_FLOOR_FRAC)
             floor_frac = ProfilePredictorTRB.REL_ERROR_FLOOR_FRAC
             scale_floor = ProfilePredictorTRB.PROFILE_SCALE_FLOOR
-            ne_peak = np.maximum(xr.apply_ufunc(np.abs, ne_targ).max(dim="rho"), scale_floor)
-            te_peak = np.maximum(xr.apply_ufunc(np.abs, te_targ).max(dim="rho"), scale_floor)
+            ne_peak = np.maximum(xr.apply_ufunc(np.abs, ne_targ).max(dim=RADIAL_DIM), scale_floor)
+            te_peak = np.maximum(xr.apply_ufunc(np.abs, te_targ).max(dim=RADIAL_DIM), scale_floor)
 
             ne_error_rel_profile = ne_error_abs_profile / (xr.apply_ufunc(np.abs, ne_targ) + floor_frac * ne_peak)
             te_error_rel_profile = te_error_abs_profile / (xr.apply_ufunc(np.abs, te_targ) + floor_frac * te_peak)
 
             # Integrate profile error over rho for each timeslice
-            ne_error_abs_ts = ne_error_abs_profile.integrate("rho")
-            te_error_abs_ts = te_error_abs_profile.integrate("rho")
-            ne_error_rel_ts = ne_error_rel_profile.integrate("rho")
-            te_error_rel_ts = te_error_rel_profile.integrate("rho")
+            ne_error_abs_ts = ne_error_abs_profile.integrate(RADIAL_DIM)
+            te_error_abs_ts = te_error_abs_profile.integrate(RADIAL_DIM)
+            ne_error_rel_ts = ne_error_rel_profile.integrate(RADIAL_DIM)
+            te_error_rel_ts = te_error_rel_profile.integrate(RADIAL_DIM)
 
             # Combined timeslice errors (equal weighting between ne and Te channels)
             error_abs_ts = 0.5 * (ne_error_abs_ts + te_error_abs_ts)
@@ -643,10 +643,10 @@ class ProfilePredictorTRB(TrainRunBuilder):
 
             ds = xr.Dataset(
                 data_vars={
-                    "ne20_rho_targ": ne_targ,
-                    "ne20_rho_pred": ne_pred,
-                    "Te_keV_rho_targ": te_targ,
-                    "Te_keV_rho_pred": te_pred,
+                    "n_e_1e20_targ": ne_targ,
+                    "n_e_1e20_pred": ne_pred,
+                    "t_e_keV_targ": te_targ,
+                    "t_e_keV_pred": te_pred,
                     "ne_error_abs_ts": ne_error_abs_ts,
                     "te_error_abs_ts": te_error_abs_ts,
                     "ne_error_rel_ts": ne_error_rel_ts,

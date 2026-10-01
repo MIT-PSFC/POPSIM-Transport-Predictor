@@ -17,6 +17,7 @@ from pydantic import Field, field_validator
 
 from transport_study import PACKAGE_ROOT, TIME_DIM
 from transport_study.config import config
+from transport_study.modules.profile_predictor.module import NN_INPUT_SOURCE_VARS
 from transport_study.modules.profile_predictor.train_configs import (
     PROFILE_PREDICTOR_TORAX_CONFIGS,
 )
@@ -63,17 +64,7 @@ VALID_GEOMETRY_BUILDERS = ("circular", "miller")
 VALID_DATA_NORMALIZATIONS = ("physics", "physics-coral", "physics-zscore")
 
 # The physical inputs every profile-predictor model consumes
-PROFILE_INPUT_VARS = [
-    "Ip_MA",
-    "B0",
-    "betan",
-    "ne20_line_avg",
-    "R0",
-    "a_minor",
-    "kappa",
-    "delta_top",
-    "delta_bot",
-]
+PROFILE_INPUT_VARS = list(NN_INPUT_SOURCE_VARS)
 
 
 class ProfileStudy(Study):
@@ -181,7 +172,7 @@ class ProfileStudy(Study):
         geometry_builder: Per-sample TORAX geometry construction, only meaningful for torax-* model
         types (every other model type is pinned to "circular").
         - circular: large-aspect-ratio analytic geometry (delta = 0 everywhere)
-        - miller: shaped Miller geometry driven by delta_top/delta_bot
+        - miller: shaped Miller geometry driven by triangularity_upper/triangularity_lower
 
         num_target_shots: The number of shots included in the training data from the target dataset, or -1 to include all shots (including all shots in training is cheating, but again answers the question of what is the best possible performance).
         """
@@ -333,7 +324,7 @@ class ProfileStudy(Study):
                 train_run_builder=trb,
                 dataloader_config={
                     "input_vars": PROFILE_INPUT_VARS,
-                    "extra_vars": ["Te_shape", "ne_shape"],
+                    "extra_vars": ["t_e_shape", "n_e_shape"],
                     **dataloader_config_base,
                 },
                 model_init_config={
@@ -341,8 +332,8 @@ class ProfileStudy(Study):
                     "data_normalization": case.data_normalization,
                     "domain_adaptation": case.domain_adaptation,
                     "freeze_shapes": case.freeze_shapes,
-                    "te_shape_var": "Te_shape",
-                    "ne_shape_var": "ne_shape",
+                    "te_shape_var": "t_e_shape",
+                    "ne_shape_var": "n_e_shape",
                     "n_shapes": 3,
                     "nn_depth": 2,
                     "nn_width": 16,

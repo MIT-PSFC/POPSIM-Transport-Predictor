@@ -42,8 +42,8 @@ AUX_SHADE_COLOR = "#ffb347"
 
 
 def _result_signal(result_ds: xr.Dataset) -> str:
-    """Base name of the predicted signal in a result file, e.g. Wtot_MJ for the
-    full power balance cases or P_oh_MW / P_rad_MW for the submodule cases."""
+    """Base name of the predicted signal in a result file, e.g. energy_mhd_MJ for the
+    full power balance cases or power_ohm_MW / power_radiated_MW for the submodule cases."""
     for name in result_ds.data_vars:
         if str(name).endswith("_targ"):
             return str(name)[: -len("_targ")]

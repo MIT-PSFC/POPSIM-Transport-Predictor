@@ -40,8 +40,8 @@ STUDY_TYPE = "power_balance_transfer"
 # to use in training in addition to the overall target Wtot after these shots.
 # Output attribute holding the model's own prediction, loss_config key for the weight
 ANCHOR_SIGNALS = {
-    "P_oh_MW": ("P_oh_MW_pred", "anchor_weight_p_oh"),
-    "P_rad_MW": ("P_rad_MW_pred", "anchor_weight_p_rad"),
+    "power_ohm_MW": ("power_ohm_MW_pred", "anchor_weight_power_ohm"),
+    "power_radiated_MW": ("power_radiated_MW_pred", "anchor_weight_power_radiated"),
 }
 
 
@@ -184,7 +184,7 @@ class PowerBalanceTRB(TrainRunBuilder):
 
     @staticmethod
     def _make_wtot_loss_fn(loss_config: dict, use_huber: bool, include_anchors: bool = False) -> IntegralLoss:
-        """Device-weighted loss on Wtot_MJ_pred, wrapped for time integration.
+        """Device-weighted loss on energy_mhd_MJ_pred, wrapped for time integration.
 
         use_huber selects the training loss (huber, with the swept huber_delta)
         or the delta-free validation loss (plain absolute error),
@@ -213,12 +213,12 @@ class PowerBalanceTRB(TrainRunBuilder):
         def loss_fn(pred, targ):
             if use_huber:
                 errors = optax.huber_loss(
-                    pred.Wtot_MJ_pred,
-                    targ["Wtot_MJ"].data,
+                    pred.energy_mhd_MJ_pred,
+                    targ["energy_mhd_MJ"].data,
                     delta=loss_config["huber_delta"],
                 )
             else:
-                errors = jnp.abs(pred.Wtot_MJ_pred - targ["Wtot_MJ"].data)
+                errors = jnp.abs(pred.energy_mhd_MJ_pred - targ["energy_mhd_MJ"].data)
 
             # Build per-sample weights from device labels
             ds_source_idx = targ["ds_source_idx"].data
@@ -272,15 +272,15 @@ class PowerBalanceTRB(TrainRunBuilder):
 
         def study_results(eval_data: EvalData) -> xr.Dataset:
             """Calculate final study results
-                - Target vs predicted Wtot_MJ
+                - Target vs predicted energy_mhd_MJ
                 - Absolute and relative error on a per-timeslice basis
                 - Integrated error over time for each shot
             This should maintain the coordinates of the original dataset, in particular `ds_source` and `shot`
             """
 
             # Unstack sample MultiIndex -> (shot, time_idx) and sqeeze out batch dimension so we can integrate per shot
-            targ = eval_data.input_ds.Wtot_MJ.unstack("sample").squeeze()
-            pred = eval_data.output_ds["output.Wtot_MJ_pred"].unstack("sample").squeeze()
+            targ = eval_data.input_ds.energy_mhd_MJ.unstack("sample").squeeze()
+            pred = eval_data.output_ds["output.energy_mhd_MJ_pred"].unstack("sample").squeeze()
             time_2d = eval_data.input_ds[TIME_COORD].unstack("sample").squeeze()
 
             # time-dependent modules modify the time dimension name, change it back to avoid confusion
@@ -306,8 +306,8 @@ class PowerBalanceTRB(TrainRunBuilder):
 
             ds = xr.Dataset(
                 data_vars={
-                    "Wtot_MJ_targ": targ,
-                    "Wtot_MJ_pred": pred,
+                    "energy_mhd_MJ_targ": targ,
+                    "energy_mhd_MJ_pred": pred,
                     "error_abs_ts": error_abs_ts,
                     "error_rel_ts": error_rel_ts,
                     "error_abs_shot": error_abs_shot,

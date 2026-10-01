@@ -17,6 +17,7 @@ from popsim.math_utils import safe_log
 from popsim.ml.rtd_mlp import Activation, RtdMLP
 from scipy.constants import epsilon_0, eV, mu_0
 
+from transport_study import RADIAL_DIM
 from transport_study.modules.normalization import (
     FeatureNormalizer,
     feature_fit_arrays,
@@ -26,7 +27,7 @@ from transport_study.modules.normalization import (
 
 class ProfileShape(TimeIndepModule):
     """
-    A module defining a profile shape on the normalized minor radius (rho) grid [0, 1].
+    A module defining a profile shape on the rho_tor_norm grid [0, 1].
 
     The profile shape can be specified either directly with points on the rho grid or with a set of coefficients for a B-spline basis.
     """
@@ -88,7 +89,7 @@ class ProfileShape(TimeIndepModule):
         ax.plot(rho, profile_shape, label="Profile Shape", color="black", linewidth=2)
 
         # Add labels and legend
-        ax.set_xlabel("rho")
+        ax.set_xlabel(r"$\rho_{tor,N}$")
         ax.set_ylabel("Profile value")
         ax.legend()
 
@@ -113,7 +114,7 @@ class ProfileShape(TimeIndepModule):
         return cls(basis=basis, coeffs=coeffs, normalize=normalize)
 
     @classmethod
-    def make_points(cls, points: Array, grid: Array, normalize: bool = True) -> "ProfileShape":
+    def make_points(cls, points: Array, grid: Array | np.ndarray, normalize: bool = True) -> "ProfileShape":
         """Create a ProfileShape with points on the grid. To evaluate the profile shape on an arbitrary grid, we use interpolation.
 
         Args:
@@ -143,109 +144,109 @@ NN_INPUT_NAMES = (
     "epsilon",
     "f_G",
     "aB0",
-    "betan",
-    "kappa",
-    "delta_top",
-    "delta_bot",
+    "beta_tor_norm",
+    "elongation",
+    "triangularity_upper",
+    "triangularity_lower",
     "log_nu_star",
 )
 
 # Dataset variables Inputs.nn_inputs is derived from
 NN_INPUT_SOURCE_VARS = (
-    "Ip_MA",
-    "B0",
-    "betan",
-    "ne20_line_avg",
-    "R0",
-    "a_minor",
-    "kappa",
-    "delta_top",
-    "delta_bot",
+    "ip_MA",
+    "b0",
+    "beta_tor_norm",
+    "n_e_line_average_1e20",
+    "geometric_axis_r",
+    "minor_radius",
+    "elongation",
+    "triangularity_upper",
+    "triangularity_lower",
 )
 
 
 @chex.dataclass
 class Inputs:
-    Ip: float  # Plasma current [MA]
-    B0: float  # On-axis toroidal field [T]
-    betan: float  # Normalized beta [-]
-    ne20_line_avg: float  # line-averaged electron density [10^20 m^-3]
-    R0: float  # Geometric major radius [m]
-    a_minor: float  # Minor radius [m]
-    kappa: float  # Elongation [-]
-    delta_top: float  # Upper triangularity [-]
-    delta_bot: float  # Bottom triangularity [-]
+    ip_MA: float  # Plasma current [MA]
+    b0: float  # On-axis toroidal field [T]
+    beta_tor_norm: float  # Normalized beta [-]
+    n_e_line_average_1e20: float  # line-averaged electron density [10^20 m^-3]
+    geometric_axis_r: float  # Geometric major radius [m]
+    minor_radius: float  # Minor radius [m]
+    elongation: float  # Elongation [-]
+    triangularity_upper: float  # Upper triangularity [-]
+    triangularity_lower: float  # Bottom triangularity [-]
     ds_source_idx: float  # Device index selecting per-device normalization statistics
 
     # Other
-    rho: Array  # Normalized minor radius coordinate to evaluate the profiles at
+    rho: Array  # rho_tor_norm values to evaluate the profiles at
 
     @classmethod
     def from_dataset(cls, ds: xr.Dataset, rho: Array) -> "Inputs":
         return cls(
-            Ip=ds["Ip_MA"].data,
-            B0=ds["B0"].data,
-            betan=ds["betan"].data,
-            ne20_line_avg=ds["ne20_line_avg"].data,
-            R0=ds["R0"].data,
-            a_minor=ds["a_minor"].data,
-            kappa=ds["kappa"].data,
-            delta_top=ds["delta_top"].data,
-            delta_bot=ds["delta_bot"].data,
+            ip_MA=ds["ip_MA"].data,
+            b0=ds["b0"].data,
+            beta_tor_norm=ds["beta_tor_norm"].data,
+            n_e_line_average_1e20=ds["n_e_line_average_1e20"].data,
+            geometric_axis_r=ds["geometric_axis_r"].data,
+            minor_radius=ds["minor_radius"].data,
+            elongation=ds["elongation"].data,
+            triangularity_upper=ds["triangularity_upper"].data,
+            triangularity_lower=ds["triangularity_lower"].data,
             ds_source_idx=ds["ds_source_idx"].data,
             rho=rho,
         )
 
     @property
     def epsilon(self):
-        return self.a_minor / self.R0
+        return self.minor_radius / self.geometric_axis_r
 
     @property
     def q_star(self):
-        delta = (self.delta_top + self.delta_bot) / 2
+        delta = (self.triangularity_upper + self.triangularity_lower) / 2
         f_shaping = calc_f_shaping(
             self.epsilon,
-            self.kappa,
+            self.elongation,
             delta,
         )
-        q_star = calc_q_star(self.B0, self.R0, self.epsilon, self.Ip, f_shaping)
+        q_star = calc_q_star(self.b0, self.geometric_axis_r, self.epsilon, self.ip_MA, f_shaping)
         return q_star
 
     @property
     def fGW(self):
-        greenwald_limit = self.Ip / (jnp.pi * self.a_minor**2)
-        return self.ne20_line_avg / greenwald_limit
+        greenwald_limit = self.ip_MA / (jnp.pi * self.minor_radius**2)
+        return self.n_e_line_average_1e20 / greenwald_limit
 
     @property
     def aB0(self):
-        return self.a_minor * self.B0
+        return self.minor_radius * self.b0
 
     @property
     def volume_approx(self):
         return calc_plasma_volume(
-            major_radius=self.R0,
+            major_radius=self.geometric_axis_r,
             inverse_aspect_ratio=self.epsilon,
-            areal_elongation=self.kappa,
+            areal_elongation=self.elongation,
         )
 
     @property
     def beta(self):
-        # betan follows the percent Troyon convention (beta[%] * a*B0/Ip)
+        # beta_tor_norm follows the percent Troyon convention (beta[%] * a*B0/Ip)
         # divide by 100 to return beta as a true fraction
-        return self.betan * self.Ip / (self.a_minor * self.B0) / 100.0
+        return self.beta_tor_norm * self.ip_MA / (self.minor_radius * self.b0) / 100.0
 
     @property
     def te_approx(self):
-        pressure_Pa = self.beta * self.B0**2 / (2 * mu_0)
+        pressure_Pa = self.beta * self.b0**2 / (2 * mu_0)
         pressure_eV = pressure_Pa / eV
         pressure_keV20 = pressure_eV / 1e3 / 1e20
-        temp_keV = pressure_keV20 / self.ne20_line_avg
+        temp_keV = pressure_keV20 / self.n_e_line_average_1e20
         return temp_keV
 
     @property
     def w_approx(self):
         # Beta-derived stored energy estimate [MJ], W = (3/2) p V
-        pressure_Pa = self.beta * self.B0**2 / (2 * mu_0)
+        pressure_Pa = self.beta * self.b0**2 / (2 * mu_0)
         return 1.5 * pressure_Pa * self.volume_approx / 1e6
 
     @property
@@ -260,11 +261,11 @@ class Inputs:
         # coulomb logarithm of debye_length over b90, which expands to
         # log of 4 pi eps0^1.5 te_J^1.5 / (e^3 ne_m3^0.5) with te_J = te_eV * e
         lambda_coeff = 4 * jnp.pi * epsilon_0**1.5 / (eV**1.5 * 1e10)
-        ln_lambda = safe_log(lambda_coeff * te_eV**1.5 / jnp.sqrt(self.ne20_line_avg))
+        ln_lambda = safe_log(lambda_coeff * te_eV**1.5 / jnp.sqrt(self.n_e_line_average_1e20))
         # e^4 / (2 pi eps0^2) * ne_m3 / te_J^2
         collision_coeff = eV**2 / (2 * jnp.pi * epsilon_0**2) * 1e20
-        collision_term = collision_coeff * self.ne20_line_avg / te_eV**2
-        geometry_term = self.q_star * self.R0 / (self.epsilon**1.5)
+        collision_term = collision_coeff * self.n_e_line_average_1e20 / te_eV**2
+        geometry_term = self.q_star * self.geometric_axis_r / (self.epsilon**1.5)
         return collision_term * geometry_term * ln_lambda
 
     @property
@@ -277,10 +278,10 @@ class Inputs:
                 self.epsilon,
                 self.fGW,
                 self.aB0,
-                self.betan,
-                self.kappa,
-                self.delta_top,
-                self.delta_bot,
+                self.beta_tor_norm,
+                self.elongation,
+                self.triangularity_upper,
+                self.triangularity_lower,
                 safe_log(self.nu_star),
             ]
         )
@@ -290,25 +291,25 @@ class Inputs:
 def nn_input_matrix(ds: xr.Dataset) -> np.ndarray:
     """(N, N_NN_INPUTS) matrix of the dimensionless nn_inputs over a flattened dataset.
 
-    Every column is broadcast against Ip_MA first, so per-shot variables line up
+    Every column is broadcast against ip_MA first, so per-shot variables line up
     with the per-timeslice ones. Shared by the normalizer fit and the data
     visualization so both see exactly the feature space the modules consume.
     """
-    reference = ds["Ip_MA"]
+    reference = ds["ip_MA"]
 
     def col(var: str) -> np.ndarray:
         return np.asarray(ds[var].broadcast_like(reference).values, dtype=float).ravel()
 
     inputs = Inputs(
-        Ip=col("Ip_MA"),
-        B0=col("B0"),
-        betan=col("betan"),
-        ne20_line_avg=col("ne20_line_avg"),
-        R0=col("R0"),
-        a_minor=col("a_minor"),
-        kappa=col("kappa"),
-        delta_top=col("delta_top"),
-        delta_bot=col("delta_bot"),
+        ip_MA=col("ip_MA"),
+        b0=col("b0"),
+        beta_tor_norm=col("beta_tor_norm"),
+        n_e_line_average_1e20=col("n_e_line_average_1e20"),
+        geometric_axis_r=col("geometric_axis_r"),
+        minor_radius=col("minor_radius"),
+        elongation=col("elongation"),
+        triangularity_upper=col("triangularity_upper"),
+        triangularity_lower=col("triangularity_lower"),
         ds_source_idx=np.zeros(reference.size),  # Unused by nn_inputs
         rho=jnp.zeros(1),  # Unused by nn_inputs
     )
@@ -352,7 +353,7 @@ def kmeans_initial_guess(
     ne_data = ne_data.transpose(sample_dim, ...)
 
     # Small datasets may have fewer samples than shapes
-    # (e.g. exnihilo with 1 target shot and it happens to only have 2 or 3 valid profile fits) 
+    # (e.g. exnihilo with 1 target shot and it happens to only have 2 or 3 valid profile fits)
     n_clusters = min(n_shapes, te_data.sizes[sample_dim])
     if n_clusters < n_shapes:
         logger.warning(
@@ -363,10 +364,12 @@ def kmeans_initial_guess(
     ne_kmeans = KMeans(n_clusters=n_clusters, random_state=seed).fit(ne_data.values)
 
     te_shapes = [
-        ProfileShape.make_points(points=te_kmeans.cluster_centers_[i % n_clusters], grid=te_data.rho.values) for i in range(n_shapes)
+        ProfileShape.make_points(points=te_kmeans.cluster_centers_[i % n_clusters], grid=te_data[RADIAL_DIM].values)
+        for i in range(n_shapes)
     ]
     ne_shapes = [
-        ProfileShape.make_points(points=ne_kmeans.cluster_centers_[i % n_clusters], grid=ne_data.rho.values) for i in range(n_shapes)
+        ProfileShape.make_points(points=ne_kmeans.cluster_centers_[i % n_clusters], grid=ne_data[RADIAL_DIM].values)
+        for i in range(n_shapes)
     ]
     return te_shapes, ne_shapes
 
@@ -375,7 +378,7 @@ def pca_initial_guess(n_shapes: int, te_data: xr.DataArray, ne_data: xr.DataArra
     from xeofs.single import EOF
 
     # Small datasets may have fewer samples than shapes
-    # (e.g. exnihilo with 1 target shot and it happens to only have 2 or 3 valid profile fits) 
+    # (e.g. exnihilo with 1 target shot and it happens to only have 2 or 3 valid profile fits)
     n_modes = min(n_shapes, te_data.sizes[sample_dim])
     if n_modes < n_shapes:
         logger.warning(
@@ -388,7 +391,7 @@ def pca_initial_guess(n_shapes: int, te_data: xr.DataArray, ne_data: xr.DataArra
     te_shapes = [
         ProfileShape.make_points(
             points=te_components.sel(mode=te_components.mode.values[i % n_modes]).values,
-            grid=te_data.rho.values,
+            grid=te_data[RADIAL_DIM].values,
             normalize=False,
         )
         for i in range(n_shapes)
@@ -399,7 +402,7 @@ def pca_initial_guess(n_shapes: int, te_data: xr.DataArray, ne_data: xr.DataArra
     ne_shapes = [
         ProfileShape.make_points(
             points=ne_components.sel(mode=ne_components.mode.values[i % n_modes]).values,
-            grid=ne_data.rho.values,
+            grid=ne_data[RADIAL_DIM].values,
             normalize=False,
         )
         for i in range(n_shapes)
@@ -487,7 +490,7 @@ class ProfilePredictorShapeInit(ProfilePredictor):
         )
 
         # Compute the ne profile.
-        ne = jnp.sum(ne_shapes, axis=0) * inputs.ne20_line_avg
+        ne = jnp.sum(ne_shapes, axis=0) * inputs.n_e_line_average_1e20
 
         # Compute the te profile using the learned correction.
         te = jnp.sum(te_shapes, axis=0) * inputs.te_approx * te_correction
@@ -502,8 +505,8 @@ class ProfilePredictorShapeInit(ProfilePredictor):
             debug_info = None
 
         out = Outputs(
-            ne=xr.DataArray(data=ne, dims=("rho",), coords={"rho": list(self.rhogrid)}),
-            te=xr.DataArray(data=te, dims=("rho",), coords={"rho": list(self.rhogrid)}),
+            ne=xr.DataArray(data=ne, dims=(RADIAL_DIM,), coords={RADIAL_DIM: list(self.rhogrid)}),
+            te=xr.DataArray(data=te, dims=(RADIAL_DIM,), coords={RADIAL_DIM: list(self.rhogrid)}),
             debug_info=debug_info,
         )
 
@@ -625,12 +628,12 @@ class ProfilePredictorReservoir(ProfilePredictor):
         ne_correction = jnp.abs(outputs[-1])
         te_correction = jnp.abs(outputs[-2])
 
-        ne = ne_points * inputs.ne20_line_avg * ne_correction
+        ne = ne_points * inputs.n_e_line_average_1e20 * ne_correction
         te = te_points * inputs.te_approx * te_correction
 
         out = Outputs(
-            ne=xr.DataArray(data=ne, dims=("rho",), coords={"rho": list(self.rhogrid)}),
-            te=xr.DataArray(data=te, dims=("rho",), coords={"rho": list(self.rhogrid)}),
+            ne=xr.DataArray(data=ne, dims=(RADIAL_DIM,), coords={RADIAL_DIM: list(self.rhogrid)}),
+            te=xr.DataArray(data=te, dims=(RADIAL_DIM,), coords={RADIAL_DIM: list(self.rhogrid)}),
             debug_info=None,
         )
 
@@ -675,12 +678,12 @@ class ProfilePredictorUnstructuredNN(ProfilePredictor):
         ne_correction = jnp.abs(outputs[-1])
         te_correction = jnp.abs(outputs[-2])
 
-        ne = ne_points * inputs.ne20_line_avg * ne_correction
+        ne = ne_points * inputs.n_e_line_average_1e20 * ne_correction
         te = te_points * inputs.te_approx * te_correction
 
         out = Outputs(
-            ne=xr.DataArray(data=ne, dims=("rho",), coords={"rho": list(self.rhogrid)}),
-            te=xr.DataArray(data=te, dims=("rho",), coords={"rho": list(self.rhogrid)}),
+            ne=xr.DataArray(data=ne, dims=(RADIAL_DIM,), coords={RADIAL_DIM: list(self.rhogrid)}),
+            te=xr.DataArray(data=te, dims=(RADIAL_DIM,), coords={RADIAL_DIM: list(self.rhogrid)}),
             debug_info=None,
         )
 

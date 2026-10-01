@@ -23,7 +23,7 @@ from loguru import logger
 from matplotlib.backends.backend_pdf import PdfPages
 from PIL import Image
 
-from transport_study import EPISODE_DIM, TIME_DIM
+from transport_study import EPISODE_DIM, RADIAL_DIM, TIME_DIM
 from transport_study.config import config
 from transport_study.modules.profile_predictor.trb import ProfilePredictorTRB
 from transport_study.plot_style import BACKGROUND_COLOR, TEXT_COLOR, style_axis
@@ -43,15 +43,15 @@ TICK_FONTSIZE = 9
 TITLE_FONTSIZE = 12
 
 VALUE_LABELS = {
-    "Te_keV_rho": r"$T_e$ [keV]",
-    "ne20_rho": r"$n_e$ [$10^{20}$ m$^{-3}$]",
+    "t_e_keV": r"$T_e$ [keV]",
+    "n_e_1e20": r"$n_e$ [$10^{20}$ m$^{-3}$]",
 }
 GRAD_LABELS = {
-    "Te_keV_rho": r"$dT_e/d\rho$ [keV]",
-    "ne20_rho": r"$dn_e/d\rho$ [$10^{20}$ m$^{-3}$]",
+    "t_e_keV": r"$dT_e/d\rho$ [keV]",
+    "n_e_1e20": r"$dn_e/d\rho$ [$10^{20}$ m$^{-3}$]",
 }
 # Panel order: Te value, ne value, Te gradient, ne gradient
-PANEL_VARS = ("Te_keV_rho", "ne20_rho")
+PANEL_VARS = ("t_e_keV", "n_e_1e20")
 
 
 def _axis_lims(*arrays: np.ndarray) -> tuple[float, float]:
@@ -98,7 +98,7 @@ def _timeslice_panel(
     shot_res = result_ds.sel({EPISODE_DIM: shot}).isel({TIME_DIM: int(ts_metrics.result_time_idx[record_idx])})
     shot_eval = load_eval_dataset(device).sel({EPISODE_DIM: shot}).isel({TIME_DIM: int(ts_metrics.eval_time_idx[record_idx])})
 
-    rho = result_ds["rho"].values
+    rho = result_ds[RADIAL_DIM].values
     rho_mid = 0.5 * (rho[:-1] + rho[1:])
     d_rho = np.diff(rho)
 
@@ -109,8 +109,8 @@ def _timeslice_panel(
         targ = shot_res[f"{var}_targ"].values
         pred = shot_res[f"{var}_pred"].values
         err = shot_eval[f"{var}_error"].values
-        grad_targ = shot_eval[f"{var}_grad"].values
-        grad_err = shot_eval[f"{var}_grad_error"].values
+        grad_targ = shot_eval[f"{var}_gradient"].values
+        grad_err = shot_eval[f"{var}_gradient_error"].values
         grad_targ_mid = 0.5 * (grad_targ[:-1] + grad_targ[1:])
         grad_err_mid = 0.5 * (grad_err[:-1] + grad_err[1:])
         grad_pred = np.diff(pred) / d_rho
@@ -131,9 +131,9 @@ def _timeslice_panel(
         ax_grad.plot(rho_mid, grad_targ_mid, color="white", linewidth=2, linestyle="--", label="Measured")
         ax_grad.plot(rho_mid, grad_pred, color="#0095ff", linewidth=2, label="Predicted")
         ax_grad.set_ylabel(GRAD_LABELS[var], color=TEXT_COLOR, fontsize=LABEL_FONTSIZE)
-        ax_grad.set_xlabel(r"$\rho$", color=TEXT_COLOR, fontsize=LABEL_FONTSIZE)
-        if ylims and f"{var}_grad" in ylims:
-            ax_grad.set_ylim(*ylims[f"{var}_grad"])
+        ax_grad.set_xlabel(r"$\rho_{tor,N}$", color=TEXT_COLOR, fontsize=LABEL_FONTSIZE)
+        if ylims and f"{var}_gradient" in ylims:
+            ax_grad.set_ylim(*ylims[f"{var}_gradient"])
         else:
             grad_rho_mask = rho_mid < ProfilePredictorTRB.GRAD_LOSS_RHO_MAX
             ax_grad.set_ylim(
@@ -164,7 +164,7 @@ def _shot_ylims(result_ds: xr.Dataset, ts_metrics: CaseTimesliceMetrics, record_
     outside that region does not blow out the axis scale.
     """
     ylims = {}
-    rho = result_ds["rho"].values
+    rho = result_ds[RADIAL_DIM].values
     d_rho = np.diff(rho)
     rho_mid = 0.5 * (rho[:-1] + rho[1:])
     grad_rho_mask = rho_mid < ProfilePredictorTRB.GRAD_LOSS_RHO_MAX
@@ -176,11 +176,11 @@ def _shot_ylims(result_ds: xr.Dataset, ts_metrics: CaseTimesliceMetrics, record_
     eval_idxs = ts_metrics.eval_time_idx[record_idxs]
 
     for var in PANEL_VARS:
-        targ = shot_res[f"{var}_targ"].transpose(TIME_DIM, "rho").values[res_idxs]
-        pred = shot_res[f"{var}_pred"].transpose(TIME_DIM, "rho").values[res_idxs]
-        err = shot_eval[f"{var}_error"].transpose(TIME_DIM, "rho").values[eval_idxs]
-        grad_targ = shot_eval[f"{var}_grad"].transpose(TIME_DIM, "rho").values[eval_idxs]
-        grad_err = shot_eval[f"{var}_grad_error"].transpose(TIME_DIM, "rho").values[eval_idxs]
+        targ = shot_res[f"{var}_targ"].transpose(TIME_DIM, RADIAL_DIM).values[res_idxs]
+        pred = shot_res[f"{var}_pred"].transpose(TIME_DIM, RADIAL_DIM).values[res_idxs]
+        err = shot_eval[f"{var}_error"].transpose(TIME_DIM, RADIAL_DIM).values[eval_idxs]
+        grad_targ = shot_eval[f"{var}_gradient"].transpose(TIME_DIM, RADIAL_DIM).values[eval_idxs]
+        grad_err = shot_eval[f"{var}_gradient_error"].transpose(TIME_DIM, RADIAL_DIM).values[eval_idxs]
         # Measured gradients live on the full rho grid, average to the rho
         # midpoints where the panel plots them so the mask lines up
         grad_targ_mid = 0.5 * (grad_targ[:, :-1] + grad_targ[:, 1:])
@@ -188,7 +188,7 @@ def _shot_ylims(result_ds: xr.Dataset, ts_metrics: CaseTimesliceMetrics, record_
         grad_pred = np.diff(pred, axis=-1) / d_rho
 
         ylims[f"{var}_value"] = _axis_lims(targ - err, targ + err, pred)
-        ylims[f"{var}_grad"] = _axis_lims(
+        ylims[f"{var}_gradient"] = _axis_lims(
             (grad_targ_mid - grad_err_mid)[:, grad_rho_mask],
             (grad_targ_mid + grad_err_mid)[:, grad_rho_mask],
             grad_pred[:, grad_rho_mask],

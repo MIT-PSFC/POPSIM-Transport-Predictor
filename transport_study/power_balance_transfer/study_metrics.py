@@ -4,7 +4,7 @@ The per-case result files already carry per-timeslice absolute and relative
 Wtot errors (error_abs_ts / error_rel_ts, see PowerBalanceTRB); what they do
 not carry is where in the discharge each timeslice sits. This module joins
 each result timeslice back to its device dataset by (shot, nearest time) to
-pick up Ip and the auxiliary heating powers, labels it with a shot stage
+pick up ip_MA and the heating powers, labels it with a shot stage
 (rampup / flattop / rampdown, with an aux-heating flag subdividing the
 flattop), and aggregates the errors per stage.
 
@@ -22,11 +22,15 @@ import numpy as np
 import xarray as xr
 from loguru import logger
 
-from transport_study import EPISODE_DIM
+from transport_study import EPISODE_DIM, TIME_COORD
 from transport_study.config import config
-from transport_study.orchestration.organize_data import INPUT_POWER_SIGNALS
 from transport_study.orchestration.stages import STAGE_AGG_NAMES, segment_stages
 from transport_study.orchestration.study import PAD_TIME_STEP_S, Study
+from transport_study.signals import (
+    HEATING_POWERS_MW,
+    STORE_HEATING_POWERS,
+    convert_to_working_units,
+)
 
 # Joined dataset timeslice must be within this of the result timeslice.
 # Timebases are 1 kHz, so anything beyond half a sample is a bad join
@@ -54,19 +58,14 @@ __all__ = [
 def load_stage_dataset(device: str) -> xr.Dataset:
     """Device dataset with the signals needed to stage-label result timeslices.
 
-    Only Ip, the auxiliary heating powers, and the time coordinate are kept
-    (the errors themselves already live in the result files). Missing aux
-    power signals are filled with zeros, matching organize_data.
+    Only ip_MA, the heating powers, and the time coordinate are kept
+    (the errors themselves already live in the result files).
     """
     ds_path = Path(config.dataset_paths[device])
-    ds = xr.open_dataset(ds_path)
-
-    for sig in INPUT_POWER_SIGNALS:
-        if sig not in ds:
-            ds[sig] = xr.zeros_like(ds["Ip_MA"])
-
-    ds = ds[[*INPUT_POWER_SIGNALS, "Ip_MA", "time"]]
-    return ds.load()
+    ds_store = xr.open_dataset(ds_path)
+    ds_store_selected = ds_store[["ip", *STORE_HEATING_POWERS, TIME_COORD]]
+    ds = convert_to_working_units(ds_store_selected)
+    return ds[["ip_MA", *HEATING_POWERS_MW, TIME_COORD]].load()
 
 
 @dataclass
@@ -157,8 +156,8 @@ def compute_case_timeslice_metrics(result_ds: xr.Dataset) -> CaseTimesliceMetric
             continue
 
         # Stage labels over the full shot, then picked at the joined timeslices
-        p_aux = sum(np.nan_to_num(shot_stage[sig].values, nan=0.0) for sig in INPUT_POWER_SIGNALS)
-        stage_full, aux_full = segment_stages(shot_stage["Ip_MA"].values, p_aux)
+        p_aux = sum(np.nan_to_num(shot_stage[sig].values, nan=0.0) for sig in HEATING_POWERS_MW)
+        stage_full, aux_full = segment_stages(shot_stage["ip_MA"].values, p_aux)
 
         n = len(result_idxs)
         records["shot"].append(np.full(n, shot))

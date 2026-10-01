@@ -243,7 +243,7 @@ def resolve_case_datasets(
     if "ds_source_idx" not in input_vars:
         input_vars.append("ds_source_idx")
     for ds in (ds_train, ds_val):
-        ds["ds_source_idx"] = ds["ds_source_idx"].broadcast_like(ds["Ip_MA"]).astype(ds["Ip_MA"].dtype)
+        ds["ds_source_idx"] = ds["ds_source_idx"].broadcast_like(ds["ip_MA"]).astype(ds["ip_MA"].dtype)
 
     return ds_train, ds_val, input_vars, normalizer_fit_ds
 

@@ -26,7 +26,7 @@ class RadiatedPower(TimeIndepModule):
 
     @chex.dataclass
     class Output:
-        P_rad_MW_pred: float
+        power_radiated_MW_pred: float
         debug_info: dict
 
     def __call__(self, inputs: InputNormalizer.Inputs) -> Output:
@@ -36,10 +36,10 @@ class RadiatedPower(TimeIndepModule):
 
         features = self.normalizer(inputs)
         nn_out = self.nn(features.to_vec())
-        p_rad = (jnp.abs(inputs.ne20_line_avg) * jax.nn.softplus(nn_out)).squeeze()
+        p_rad = (jnp.abs(inputs.n_e_line_average_1e20) * jax.nn.softplus(nn_out)).squeeze()
 
         output = RadiatedPower.Output(
-            P_rad_MW_pred=p_rad,
+            power_radiated_MW_pred=p_rad,
             debug_info={
                 "nn_out": nn_out.squeeze(),
             },

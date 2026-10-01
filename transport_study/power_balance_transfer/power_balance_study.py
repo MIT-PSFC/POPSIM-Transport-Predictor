@@ -16,6 +16,7 @@ from pydantic import Field, field_validator
 
 from transport_study import PACKAGE_ROOT
 from transport_study.config import config
+from transport_study.modules.normalization import NORM_INPUT_VARS
 from transport_study.orchestration.case_analysis import run_case_analysis_parallel
 from transport_study.orchestration.study import (
     HYPERPARAM_TARGET_SHOTS,
@@ -37,15 +38,7 @@ from transport_study.power_balance_transfer.tables import write_comparison_table
 # The 7 physical inputs every power-balance model consumes. Normalization is
 # done inside the modules (transport_study.modules.normalization), so the
 # dataloader always pulls exactly these (the TRB adds ds_source_idx itself)
-POWER_BALANCE_INPUT_VARS = [
-    "Ip_MA",
-    "B0",
-    "R0",
-    "a_minor",
-    "kappa",
-    "ne20_line_avg",
-    "P_aux_MW",
-]
+POWER_BALANCE_INPUT_VARS = list(NORM_INPUT_VARS)
 
 # Model types with p_oh/p_rad submodules (the SciML-style structured models)
 MODEL_TYPES_WITH_SUBMODULES = ("sciml-taue-scalinglaw", "sciml-taue-nn")
@@ -61,11 +54,11 @@ VALID_DATA_NORMALIZATIONS = ("raw", "physics", "zscore", "coral", "physics-coral
 SCALAR_SUBMODULE_SETTINGS = {
     "p_oh": {
         "train_run_builder": "transport_study.modules.power_balance.p_oh.trb.OhmicPowerTRB",
-        "target_vars": ["P_oh_MW", "ds_source_idx"],
+        "target_vars": ["power_ohm_MW", "ds_source_idx"],
     },
     "p_rad": {
         "train_run_builder": "transport_study.modules.power_balance.p_rad.trb.RadiatedPowerTRB",
-        "target_vars": ["P_rad_MW", "ds_source_idx"],
+        "target_vars": ["power_radiated_MW", "ds_source_idx"],
     },
 }
 
@@ -159,7 +152,7 @@ class PowerBalanceStudy(Study):
         - transfer_pretrain: The pretrain half of a transfer case, never a case-grid axis value (see Study.Case.transfer_pretrain_case). Trains on historic data only with checkpoint selection on the target test set. Stat normalizations fit the normalizer on historic + the transfer case's target shots so the fine-tune case inherits target-aware statistics through the checkpoint restore, stateless ones (raw / physics) share one twin at 0 target shots
 
         freeze_submodules: Whether to freeze the p_oh/p_rad submodules of the model during training.
-        The P_oh and P_rad signals are hard to quantify, we might want to let them drift from the original targets to better match Wtot_MJ
+        The P_oh and P_rad signals are hard to quantify, we might want to let them drift from the original targets to better match energy_mhd_MJ
 
         num_target_shots: The number of shots included in the training data from the target dataset, or -1 to include all shots (including all shots in training is cheating, but again answers the question of what is the best possible performance).
         """
@@ -292,9 +285,9 @@ class PowerBalanceStudy(Study):
             # Anchor terms keeping the p_oh/p_rad submodule predictions close
             # to the measured signals while the whole module trains on Wtot.
             # Training loss only, and a no-op for model types without
-            # submodules (their target_vars carry no P_oh_MW / P_rad_MW)
-            "anchor_weight_p_oh": 0.1,
-            "anchor_weight_p_rad": 0.1,
+            # submodules (their target_vars carry no power_ohm_MW / power_radiated_MW)
+            "anchor_weight_power_ohm": 0.1,
+            "anchor_weight_power_radiated": 0.1,
         }
 
     def _make_submodule_config(self, case: Case, submodule_type: str) -> TrainConfig:
@@ -332,8 +325,8 @@ class PowerBalanceStudy(Study):
                     # The measured powers are targets so the training loss can
                     # anchor the submodule predictions to them (anchor_weight_*
                     # in the loss config)
-                    "target_vars": ["Wtot_MJ", "P_oh_MW", "P_rad_MW", "ds_source_idx"],
-                    "state_vars": ["Wtot_MJ"],
+                    "target_vars": ["energy_mhd_MJ", "power_ohm_MW", "power_radiated_MW", "ds_source_idx"],
+                    "state_vars": ["energy_mhd_MJ"],
                     **dataloader_config_base,
                 },
                 model_init_config={
@@ -343,7 +336,7 @@ class PowerBalanceStudy(Study):
                     "freeze_submodules": case.freeze_submodules,
                     "nn_depth": 2,
                     "nn_width": 16,
-                    "in_size": 7,  # Ip, B0, R0, a_minor, kappa, ne20_line_avg, P_aux_MW
+                    "in_size": 7,  # The NORM_INPUT_VARS
                     "out_size": 1,
                     "prng_seed": 42,
                     "submodules": {
@@ -358,9 +351,9 @@ class PowerBalanceStudy(Study):
                 train_run_builder=trb,
                 dataloader_config={
                     "input_vars": POWER_BALANCE_INPUT_VARS,
-                    "target_vars": ["Wtot_MJ", "ds_source_idx"],
-                    "state_vars": ["Wtot_MJ"],
-                    "extra_vars": ["P_oh_MW", "P_rad_MW"],
+                    "target_vars": ["energy_mhd_MJ", "ds_source_idx"],
+                    "state_vars": ["energy_mhd_MJ"],
+                    "extra_vars": ["power_ohm_MW", "power_radiated_MW"],
                     **dataloader_config_base,
                 },
                 model_init_config={
@@ -369,7 +362,7 @@ class PowerBalanceStudy(Study):
                     "domain_adaptation": case.domain_adaptation,
                     "nn_depth": 2,
                     "nn_width": 16,
-                    "in_size": 7,  # Ip, B0, R0, a_minor, kappa, ne20_line_avg, P_aux_MW
+                    "in_size": 7,  # The NORM_INPUT_VARS
                     "out_size": 1,
                     "prng_seed": 42,
                 },
@@ -379,9 +372,9 @@ class PowerBalanceStudy(Study):
                 train_run_builder=trb,
                 dataloader_config={
                     "input_vars": POWER_BALANCE_INPUT_VARS,
-                    "target_vars": ["Wtot_MJ", "ds_source_idx"],
-                    "state_vars": ["Wtot_MJ"],
-                    "extra_vars": ["P_oh_MW", "P_rad_MW"],
+                    "target_vars": ["energy_mhd_MJ", "ds_source_idx"],
+                    "state_vars": ["energy_mhd_MJ"],
+                    "extra_vars": ["power_ohm_MW", "power_radiated_MW"],
                     **dataloader_config_base,
                 },
                 model_init_config={

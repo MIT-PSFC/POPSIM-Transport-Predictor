@@ -11,10 +11,10 @@ repository convention.
 
 def test_get_ds_transport_transfer():
     """get_ds(source, "transport_transfer") returns a dataset that keeps the
-    profile signals interpolated onto the shared RHO_GRID, computes P_aux_MW
-    from the zero-filled per-system aux power signals, retains Wtot_MJ,
-    P_oh_MW/P_rad_MW (anchor targets for the sciml training loss),
-    delta_top/delta_bot, fresh_profiles, and the Te_shape/ne_shape variables,
+    profile signals interpolated onto the shared RHO_GRID, computes power_additional_MW
+    from the zero-filled per-system aux power signals, retains energy_mhd_MJ,
+    power_ohm_MW/power_radiated_MW (anchor targets for the sciml training loss),
+    triangularity_upper/triangularity_lower, fresh_profile, and the t_e_shape/n_e_shape variables,
     clips the profile error signals at zero, and is reindexed to the uniform
     1 kHz timebase (mid-shot gaps become NaN slices). Also belongs as a
     parametrization of TestGetDs in tests/orchestration/test_organize_data.py."""
@@ -37,21 +37,21 @@ def test_make_train_config_sciml_submodule_wiring():
     restore_submodules True, and the power_balance submodule config itself
     nesting p_oh/p_rad submodule configs (recursion through
     _make_submodule_config reaches depth two). Every transport model type's
-    target_vars carry the profile error-bar companions and fresh_profiles
+    target_vars carry the profile error-bar companions and fresh_profile
     (TRANSPORT_TARGET_VARS, read by the loss), the sciml target_vars
-    additionally carry Wtot_MJ/P_oh_MW/P_rad_MW for the anchor terms, the
-    loss config carries the anchor_weight_wtot/_p_oh/_p_rad keys, and the
+    additionally carry energy_mhd_MJ/power_ohm_MW/power_radiated_MW for the anchor terms, the
+    loss config carries the anchor_weight_energy_mhd/_p_oh/_p_rad keys, and the
     optimizer config carries submodule_lr_factors for the power_balance
     subtree."""
 
 
 def test_loss_fn_sciml_anchor_terms():
     """The training loss adds plain absolute-error anchor terms pulling the
-    Output's Wtot_MJ_pred/P_oh_MW_pred/P_rad_MW_pred toward the measured
-    Wtot_MJ/P_oh_MW/P_rad_MW targets, scaled by anchor_weight_wtot/_p_oh/
+    Output's energy_mhd_MJ_pred/power_ohm_MW_pred/power_radiated_MW_pred toward the measured
+    energy_mhd_MJ/power_ohm_MW/power_radiated_MW targets, scaled by anchor_weight_energy_mhd/_p_oh/
     _p_rad and the per-device sample weights; a term drops out when its
     weight is zero or its signal is absent from the targets (transformer and
-    torax target_vars), the anchors are exempt from the fresh_profiles mask
+    torax target_vars), the anchors are exempt from the fresh_profile mask
     (their signals are measured at every timeslice), and the validation loss
     stays pure profile error."""
 
@@ -75,7 +75,7 @@ def test_make_train_config_transfer_lr_scaling():
 def test_env_create_state_per_model_type():
     """TransportPredictorEnv.create_state seeds the right state per module:
     transformer gets a (history_len, 2 n_rho) buffer tiled from the measured
-    t0 profiles, sciml gets PowerBalance.State with the measured Wtot_MJ,
+    t0 profiles, sciml gets PowerBalance.State with the measured energy_mhd_MJ,
     torax rebuild gets ne/te from the measured profiles, and torax carry gets
     a full ToraxSimState built from the measured profiles with the edge points
     pinned to the NN boundary conditions."""
@@ -106,7 +106,7 @@ def test_transformer_history_holds_profiles_only():
 def test_loss_fn_shapes_and_weighting():
     """The transport loss peak-normalizes each channel per timeslice, applies
     the huber delta on the normalized residual, weights samples by device via
-    ds_source_idx, masks the profile terms by fresh_profiles, and returns a
+    ds_source_idx, masks the profile terms by fresh_profile, and returns a
     scalar; the validation variant is delta-free error-bar-softened absolute
     error and both handle a (time, rho) prediction against xr-backed
     targets. The fresh-mask cases are implemented in test_loss_fn.py."""
@@ -114,7 +114,7 @@ def test_loss_fn_shapes_and_weighting():
 
 def test_val_loss_error_bar_softening_only():
     """The validation loss down-weights the part of the residual inside the
-    ne20_rho_error/Te_keV_rho_error bars by within_error_weight while the
+    n_e_1e20_error/t_e_keV_error bars by within_error_weight while the
     part beyond the bar keeps full weight, the training loss ignores the
     error bars entirely, and an absent or zero error var reduces the
     validation loss to the plain absolute error (the 0 sentinel means a
@@ -129,25 +129,25 @@ def test_huber_delta_train_loss_only():
 
 def test_transformer_training_smoke():
     """A transformer case trains end to end on the sample datasets for a
-    couple of epochs and writes a result file containing ne20_rho_pred /
-    Te_keV_rho_pred plus the error_abs_ts / error_rel_ts / error_abs_shot /
+    couple of epochs and writes a result file containing n_e_1e20_pred /
+    t_e_keV_pred plus the error_abs_ts / error_rel_ts / error_abs_shot /
     error_rel_shot variables the base _summarize_case_errors reads."""
 
 
 def test_torax_p_aux_feed_through():
-    """The measured P_aux_MW input is wired directly to the TORAX
+    """The measured power_additional_MW input is wired directly to the TORAX
     generic_heat.P_total runtime update (MW to W) for the rebuild variant,
     the carry variant, and the env's initial TORAX state construction; the
     sources network predicts only the deposition shape (gaussian_location,
     gaussian_width, electron_heat_fraction), the gas-puff fueling, and the
-    absorption_fraction, so changing P_aux_MW changes the one-step output
+    absorption_fraction, so changing power_additional_MW changes the one-step output
     with the module weights held fixed, and no NN output can override the
     measured injected heating magnitude."""
 
 
 def test_torax_absorption_fraction_nn():
     """The transport sources network's last output sets absorption_fraction
-    via the saturating Beer-Lambert form 1 - exp(-ne20_line_avg * softplus(nn
+    via the saturating Beer-Lambert form 1 - exp(-n_e_line_average_1e20 * softplus(nn
     output)): always in (0, 1), linear in line density when optically thin,
     smoothly saturating toward 1 with no gradient-dead cap. The value reaches
     the generic_heat.absorption_fraction runtime update in
@@ -172,5 +172,5 @@ def test_collect_results_schema():
 def test_normalizer_fit_features():
     """_fit_transport_input_normalizer builds an (N, 11) feature matrix whose
     columns match Inputs.transport_nn_inputs evaluated with the measured
-    Wtot_MJ, drops rows with NaN device index, and returns identity stats for
+    energy_mhd_MJ, drops rows with NaN device index, and returns identity stats for
     devices with too few samples."""

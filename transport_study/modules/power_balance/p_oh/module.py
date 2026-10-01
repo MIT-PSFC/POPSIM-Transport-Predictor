@@ -26,7 +26,7 @@ class OhmicPower(TimeIndepModule):
 
     @chex.dataclass
     class Output:
-        P_oh_MW_pred: float
+        power_ohm_MW_pred: float
         debug_info: dict
 
     def __call__(self, inputs: InputNormalizer.Inputs) -> Output:
@@ -36,10 +36,10 @@ class OhmicPower(TimeIndepModule):
 
         features = self.normalizer(inputs)
         nn_out = self.nn(features.to_vec())
-        p_oh = (jnp.abs(inputs.Ip_MA) * jax.nn.softplus(nn_out)).squeeze()
+        p_oh = (jnp.abs(inputs.ip_MA) * jax.nn.softplus(nn_out)).squeeze()
 
         output = OhmicPower.Output(
-            P_oh_MW_pred=p_oh,
+            power_ohm_MW_pred=p_oh,
             debug_info={
                 "nn_out": nn_out.squeeze(),
             },
