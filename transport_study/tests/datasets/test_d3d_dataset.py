@@ -1,0 +1,449 @@
+"""Tests for the DIII-D dataset workflow.
+
+The fast tests cover the psi_n -> rho_tor_norm map, the IDA regridding and hold, the strict DISPY EFIT
+selection, signal standardization, and the IMAS attributes of both stores, all on synthetic data.
+The slow test pulls one real shot, so it needs the IDA database and the DIII-D data servers.
+"""
+
+import os
+import sys
+from pathlib import Path
+
+import numpy as np
+import pytest
+import xarray as xr
+from disruption_py.machine.tokamak import Tokamak
+from disruption_py.settings import TimeSettingParams
+from disruption_py.settings.nickname_setting import NicknameSettingParams
+from loguru import logger
+
+from transport_study import RADIAL_DIM
+from transport_study.datasets.d3d import config
+from transport_study.datasets.d3d.d3d_dataset import (
+    D3D_SIGNAL_ATTRS,
+    D3D_TRAJOPT_STORE_SIGNALS,
+    PREDICTION_SOURCES,
+    TRAJOPT_SOURCES,
+    TRAJOPT_STORE_NAME,
+    D3DDataWorkflow,
+)
+from transport_study.datasets.d3d.physics_methods import (
+    DispyEfitNicknameSetting,
+    Uniform1kHzTimeSetting,
+)
+from transport_study.datasets.d3d.profiles import (
+    IDA_PSI_COLUMNS,
+    IDA_RHO_COLUMNS,
+    PSI_NORM_DIM,
+    PSI_NORM_GRID,
+    RHO_TOR_NORM_GRID,
+    find_ida_path,
+    find_ida_shots,
+    gradient_and_error,
+    ida_profiles_on_grids,
+    rho_tor_norm_from_psi_n,
+)
+from transport_study.signals import PREDICTION_STORE_NAME, STORE_SIGNALS
+
+IDA_DIR = Path("/fusion/projects/results/ida-results/HBP_database")
+
+
+def test_rho_map_constant_q_is_sqrt_psi_n():
+    """Constant q makes Phi_N = psi_N, and the secant continuation keeps slope 1 past the LCFS."""
+    psi_n = np.linspace(0.0, 1.2, 121)
+    qpsi = np.full(65, 3.0)
+
+    rho = rho_tor_norm_from_psi_n(psi_n, qpsi, "secant")
+    rho_flipped_q = rho_tor_norm_from_psi_n(psi_n, -qpsi, "secant")
+
+    np.testing.assert_allclose(rho, np.sqrt(psi_n), atol=1e-12)
+    np.testing.assert_allclose(rho_flipped_q, rho, atol=1e-12)
+    psi_n_edge_cases = np.array([-0.01, np.nan])
+    rho_edge_cases = rho_tor_norm_from_psi_n(psi_n_edge_cases, qpsi, "secant")
+    assert rho_edge_cases[0] == 0.0
+    assert np.isnan(rho_edge_cases[1])
+
+
+def test_rho_map_rising_q_matches_closed_form():
+    """q = 1 + 3 psi^2 gives Phi_N = (psi + psi^3) / 2 inside the LCFS, continued along the secant from 0.95."""
+    psi_n = np.linspace(0.0, 1.2, 241)
+    psi_n_q_grid = np.linspace(0.0, 1.0, 129)
+    qpsi = 1.0 + 3.0 * psi_n_q_grid**2
+
+    rho = rho_tor_norm_from_psi_n(psi_n, qpsi, "secant")
+
+    mask_inside = psi_n <= 1.0
+    phi_n_closed_form = (psi_n + psi_n**3) / 2
+    np.testing.assert_allclose(rho[mask_inside], np.sqrt(phi_n_closed_form[mask_inside]), atol=1e-4)
+    assert rho[psi_n == 1.0] == pytest.approx(1.0)
+    assert np.all(np.diff(rho) > 0)
+    phi_n_at_secant_start = (0.95 + 0.95**3) / 2
+    secant_slope = (1.0 - phi_n_at_secant_start) / 0.05
+    mask_outside = psi_n > 1.0
+    phi_n_outside = 1.0 + secant_slope * (psi_n[mask_outside] - 1.0)
+    np.testing.assert_allclose(rho[mask_outside], np.sqrt(phi_n_outside), rtol=1e-4)
+
+
+# Synthetic IDA slice times [ms]: a doubled interior gap (180 -> 260) inside the hold limit
+IDA_TIMES_MS = np.array([100.0, 140.0, 180.0, 260.0, 300.0])
+IDA_UNMAPPED_TIME_MS = 180.0
+
+
+def _synthetic_ida(psi_n: np.ndarray) -> xr.Dataset:
+    """IDA file layout with T_e linear in psi_n, so the psi_norm regrid is exact."""
+    n_slices = IDA_TIMES_MS.size
+    t_e = np.tile(1000.0 * (1.2 - psi_n), (n_slices, 1))
+    n_e = np.tile(4e19 * (1.3 - psi_n), (n_slices, 1))
+    data_vars = {
+        "T_e": (("time", "psi_n"), t_e),
+        "T_e_err": (("time", "psi_n"), np.full_like(t_e, 50.0)),
+        "n_e": (("time", "psi_n"), n_e),
+        "n_e_err": (("time", "psi_n"), np.full_like(n_e, 1e18)),
+    }
+    return xr.Dataset(data_vars, coords={"time": IDA_TIMES_MS, "psi_n": psi_n})
+
+
+def _profiles_on_grids(psi_n: np.ndarray) -> tuple[xr.Dataset, np.ndarray]:
+    """IDA profiles of the synthetic file on the store grids, with no valid EFIT near IDA_UNMAPPED_TIME_MS."""
+    efit_time = np.arange(50, 501) * 1e-3
+    qpsi = np.full((efit_time.size, 65), 2.0)
+    efit_unmapped_offset = np.abs(efit_time - IDA_UNMAPPED_TIME_MS / 1e3)
+    mask_efit_valid = efit_unmapped_offset > 0.005
+    times = np.arange(0, 600) * 1e-3
+    ida = _synthetic_ida(psi_n)
+    return ida_profiles_on_grids(ida, efit_time, qpsi, mask_efit_valid, times), times
+
+
+def test_ida_profiles_land_on_store_grids():
+    """Constant q maps psi_n to rho_tor_norm = sqrt(psi_n), so T_e = 1000 (1.2 - rho^2) on the rho grid.
+
+    The native grid starts off axis, so the axis value is the innermost IDA value (left clamp),
+    and grid points past the IDA domain (sqrt(1.2) ~ 1.095) are NaN.
+    """
+    psi_n_native = 1e-3 + (1.2 - 1e-3) * np.linspace(0.0, 1.0, 150) ** 1.2
+    profiles, times = _profiles_on_grids(psi_n_native)
+
+    assert set(profiles.data_vars) == {*IDA_RHO_COLUMNS, *IDA_PSI_COLUMNS}
+    np.testing.assert_array_equal(profiles[RADIAL_DIM].values, RHO_TOR_NORM_GRID.astype(np.float32))
+    te_rho = profiles["te_rho"].values[np.argmin(np.abs(times - 0.12))]
+    mask_rho_inside = RHO_TOR_NORM_GRID**2 >= psi_n_native[0]
+    mask_rho_covered = RHO_TOR_NORM_GRID <= np.sqrt(1.2)
+    mask_rho_interpolated = mask_rho_inside & mask_rho_covered
+    te_rho_expected = 1000.0 * (1.2 - RHO_TOR_NORM_GRID**2)
+    np.testing.assert_allclose(te_rho[mask_rho_interpolated], te_rho_expected[mask_rho_interpolated], atol=1.0)
+    assert te_rho[0] == pytest.approx(1000.0 * (1.2 - psi_n_native[0]), abs=1e-3)
+    assert np.isnan(te_rho[~mask_rho_covered]).all()
+
+    te_gradient = profiles["te_rho_grad"].values[np.argmin(np.abs(times - 0.12))]
+    rho_mid = (RHO_TOR_NORM_GRID > 0.3) & (RHO_TOR_NORM_GRID < 0.9)
+    np.testing.assert_allclose(te_gradient[rho_mid], -2000.0 * RHO_TOR_NORM_GRID[rho_mid], rtol=1e-2)
+
+
+def test_differing_native_psi_grids_land_on_one_psi_norm_grid():
+    """Each IDA file has its own psi_n grid, but every shot's trajopt profiles share PSI_NORM_GRID."""
+    psi_n_native_a = 1.2 * np.linspace(0.0, 1.0, 150) ** 1.2
+    psi_n_native_b = 1.2 * np.linspace(0.0, 1.0, 140) ** 1.05
+    te_psi_expected = (1000.0 * (1.2 - PSI_NORM_GRID)).astype(np.float32)
+
+    for psi_n_native in [psi_n_native_a, psi_n_native_b]:
+        profiles, times = _profiles_on_grids(psi_n_native)
+        np.testing.assert_array_equal(profiles[PSI_NORM_DIM].values, PSI_NORM_GRID.astype(np.float32))
+        te_psi = profiles["te_psi"].values[np.argmin(np.abs(times - 0.12))]
+        np.testing.assert_allclose(te_psi, te_psi_expected, rtol=1e-5)
+
+
+def test_ida_hold_and_unmapped_slice():
+    """Slices hold across interior gaps, the hold ends max_hold_ida_steps median steps after the last slice,
+    and a slice with no valid EFIT within match_max_ms keeps its psi_norm profiles but no rho_tor_norm ones."""
+    psi_n_native = 1.2 * np.linspace(0.0, 1.0, 150) ** 1.2
+    profiles, times = _profiles_on_grids(psi_n_native)
+    te_rho_axis = profiles["te_rho"].values[:, 0]
+    te_psi_axis = profiles["te_psi"].values[:, 0]
+    times_ms = np.round(times * 1e3)
+
+    assert np.isnan(te_rho_axis[times_ms < 100]).all()
+    mask_mapped_held = ((times_ms >= 100) & (times_ms < 180)) | ((times_ms >= 260) & (times_ms <= 300))
+    assert np.isfinite(te_rho_axis[mask_mapped_held]).all()
+    mask_unmapped_held = (times_ms >= 180) & (times_ms < 260)
+    assert np.isnan(te_rho_axis[mask_unmapped_held]).all()
+    assert np.isfinite(te_psi_axis[mask_unmapped_held]).all()
+
+    ida_step_median_ms = np.median(np.diff(IDA_TIMES_MS))
+    hold_end_ms = IDA_TIMES_MS[-1] + config["profile_grid"]["max_hold_ida_steps"] * ida_step_median_ms
+    # One slice of margin either side of the limit, where float round-off decides
+    assert np.isfinite(te_psi_axis[(times_ms > 300) & (times_ms < hold_end_ms)]).all()
+    assert np.isnan(te_psi_axis[times_ms > hold_end_ms]).all()
+
+
+def test_gradient_and_error():
+    """Linear profiles have a constant gradient, the error is the central-difference propagation."""
+    x = np.linspace(0.0, 1.0, 11)
+    values = np.tile(2.0 * x + 1.0, (3, 1))
+    errors = np.full_like(values, 0.5)
+
+    gradient, gradient_error = gradient_and_error(values, errors, x)
+
+    np.testing.assert_allclose(gradient, 2.0)
+    x_step = x[1] - x[0]
+    np.testing.assert_allclose(gradient_error[:, 1:-1], np.sqrt(2 * 0.5**2) / (2 * x_step))
+    np.testing.assert_allclose(gradient_error[:, 0], gradient_error[:, 1])
+    np.testing.assert_allclose(gradient_error[:, -1], gradient_error[:, -2])
+
+
+def test_ida_path_priority_wildcards_and_union(tmp_path):
+    """The first pattern with a file wins, wildcards match VVUQ-style names, and the shotlist is the union."""
+    primary, fallback, wild = tmp_path / "primary", tmp_path / "fallback", tmp_path / "wild"
+    for directory in [primary, fallback, wild]:
+        directory.mkdir()
+    patterns = [
+        str(primary / "IDA_{shot}_.cdf"),
+        str(fallback / "ida{shot}.nc"),
+        str(wild / "IDA_{shot}_*_.cdf"),
+    ]
+    for path in [primary / "IDA_2_.cdf", fallback / "ida1.nc", fallback / "ida2.nc", wild / "IDA_4_0.2_4.0_.cdf"]:
+        path.touch()
+
+    assert find_ida_path(2, patterns) == primary / "IDA_2_.cdf"
+    assert find_ida_path(1, patterns) == fallback / "ida1.nc"
+    assert find_ida_path(3, patterns) is None
+    assert find_ida_path(4, patterns) == wild / "IDA_4_0.2_4.0_.cdf"
+    assert find_ida_shots(patterns) == [1, 2, 4]
+
+
+class _StubDatabase:
+    """Answers the code_rundb query with fixed rows and records it."""
+
+    def __init__(self, rows):
+        self.rows = rows
+        self.queries = []
+
+    def query(self, query, use_pandas=True):
+        self.queries.append(query)
+        return self.rows
+
+
+def _nickname_params(database) -> NicknameSettingParams:
+    return NicknameSettingParams(shot_id=199051, mds_conn=None, database=database, disruption_time=None, tokamak=Tokamak.D3D)
+
+
+def test_dispy_nickname_takes_latest_run_and_raises_without_one():
+    """The latest DISPY run is the EFIT tree, and a shot without one fails instead of falling back to efit01."""
+    database = _StubDatabase([("EFIT04",), ("EFIT07",)])
+
+    tree = DispyEfitNicknameSetting().get_tree_name(_nickname_params(database))
+
+    assert tree == "EFIT07"
+    assert "runtag = 'DISPY'" in database.queries[0]
+    with pytest.raises(ValueError, match="no EFIT run under runtag DISPY"):
+        DispyEfitNicknameSetting().get_tree_name(_nickname_params(_StubDatabase([])))
+
+
+class _StubEfitConnection:
+    """Serves one atime array [ms] for every get_data call."""
+
+    def __init__(self, atime_ms):
+        self.atime_ms = atime_ms
+
+    def get_data(self, path, tree_name=None):
+        return self.atime_ms
+
+
+def _time_params(atime_ms) -> TimeSettingParams:
+    connection = _StubEfitConnection(atime_ms)
+    return TimeSettingParams(shot_id=199051, mds_conn=connection, database=None, disruption_time=None, tokamak=Tokamak.D3D)
+
+
+def test_time_setting_is_1khz_and_rejects_slow_efit():
+    """A 1 kHz EFIT gives the uniform timebase out to 8 s, a 50 Hz one (not DISPY) fails the shot."""
+    atime_1khz_ms = np.arange(100.0, 5001.0)
+    times = Uniform1kHzTimeSetting().get_times(_time_params(atime_1khz_ms))
+
+    assert times[0] == 0.0
+    assert times[-1] == pytest.approx(8.0)
+    np.testing.assert_allclose(np.diff(times), 1e-3, atol=1e-6)
+    atime_50hz_ms = np.arange(100.0, 5001.0, 20.0)
+    with pytest.raises(ValueError, match="not a 1 kHz reconstruction"):
+        Uniform1kHzTimeSetting().get_times(_time_params(atime_50hz_ms))
+
+
+N_TIME = 700  # 0.7 s, over min_shot_duration once the end margin is cut
+RAW_SCALAR_VALUES = {
+    "ip": -1.2e6,
+    "bt": -2.1,
+    "wmhd": 8e5,
+    "beta_n": 2.0,
+    "n_e_line_average": 4e19,
+    "aminor": 0.6,
+    "rsurf": 1.7,
+    "kappa": 1.8,
+    "tritop": 0.4,
+    "tribot": 0.5,
+    "p_ohm": 1e6,
+    "p_rad": 2e6,
+    "p_nbi": 5e6,
+    "p_ech": 1e6,
+    "ip_prog": -1.0e6,
+    "bmtpwrtar": 2.5,
+    "idtrp": 1.7,
+    "idtrxbot": 1.3,
+    "idtzxbot": -1.1,
+    "idtrxtop": 1.4,
+    "idtzxtop": 1.05,
+    "gapin": 0.09,
+    "rxpt1": 1.31,
+    "zxpt1": -1.12,
+    "rxpt2": 1.41,
+    "zxpt2": 1.06,
+    "dssneped": 3.5,
+    "bttbt": 2.0,
+    "dstdenp": 5.2,
+    "ieeseg07": 0.004,
+}
+RAW_PROFILE_VALUES = {
+    "te_rho": 2000.0,
+    "te_rho_error": 100.0,
+    "te_rho_grad": -500.0,
+    "te_rho_grad_error": 50.0,
+    "ne_rho": 6e19,
+    "ne_rho_error": 1e18,
+    "ne_rho_grad": -1e19,
+    "ne_rho_grad_error": 5e17,
+    "te_psi": 3000.0,
+    "ne_psi": 5e19,
+}
+
+
+def _raw_dataset(shot: int = 199051) -> xr.Dataset:
+    """A shot of raw disruption-py columns, as _get_shot_dataset returns it, that passes every filter and cull."""
+    data_vars = {name: (("shot", "time"), np.full((1, N_TIME), value)) for name, value in RAW_SCALAR_VALUES.items()}
+    for name, value in RAW_PROFILE_VALUES.items():
+        radial_dim, radial_grid = (PSI_NORM_DIM, PSI_NORM_GRID) if name in IDA_PSI_COLUMNS else (RADIAL_DIM, RHO_TOR_NORM_GRID)
+        data_vars[name] = (("shot", "time", radial_dim), np.full((1, N_TIME, radial_grid.size), value))
+    # float32 grids, as get_ida_profiles writes them
+    coords = {
+        "shot": [shot],
+        "time": np.arange(N_TIME) * 1e-3,
+        RADIAL_DIM: RHO_TOR_NORM_GRID.astype(np.float32),
+        PSI_NORM_DIM: PSI_NORM_GRID.astype(np.float32),
+    }
+    return xr.Dataset(data_vars, coords=coords)
+
+
+@pytest.fixture
+def workflow(tmp_path) -> D3DDataWorkflow:
+    shotlist = tmp_path / "shotlist"
+    shotlist.write_text("199051\n199052\n")
+    d3d_workflow = D3DDataWorkflow(ds_name="d3d_test", shotlist_file=shotlist, data_assembly_dir=tmp_path)
+    d3d_workflow.raw_data_dir.mkdir(parents=True, exist_ok=True)
+    return d3d_workflow
+
+
+def test_standardize_builds_both_stores_in_si(workflow):
+    """Every store signal is built from its raw column, signed currents and fields become magnitudes,
+    dssneped [1e19 m^-3] becomes m^-3, and a missing column or an all-NaN profile skips the shot."""
+    ds = workflow.standardize_signal_names(_raw_dataset())
+
+    assert set(STORE_SIGNALS) - {"fresh_profile"} <= set(ds.data_vars)
+    assert set(D3D_TRAJOPT_STORE_SIGNALS) <= set(ds.data_vars)
+    np.testing.assert_allclose(ds["ip"], 1.2e6)
+    np.testing.assert_allclose(ds["b0"], 2.1)
+    np.testing.assert_allclose(ds["ip_reference"], 1.0e6)
+    np.testing.assert_allclose(ds["n_e_pedestal"], 3.5e19)
+    np.testing.assert_allclose(ds["energy_mhd"], 8e5)
+    np.testing.assert_allclose(ds["t_e_gradient"], -500.0)
+    np.testing.assert_allclose(ds["power_ic"], 0.0)
+    assert {"time_idx", "shot"} <= set(ds.dims)
+    assert "time" in ds.coords
+
+    assert workflow.standardize_signal_names(_raw_dataset().drop_vars("wmhd")) is None
+    raw_no_profile = _raw_dataset()
+    raw_no_profile["te_rho"] = xr.full_like(raw_no_profile["te_rho"], np.nan)
+    assert workflow.standardize_signal_names(raw_no_profile) is None
+
+
+def test_missing_efit_boundary_culls_the_shot(workflow):
+    """A shot with profiles but no EFIT geometry left after filtering is culled."""
+    ds = workflow.standardize_signal_names(_raw_dataset())
+    assert not workflow.device_specific_culling(ds)
+
+    ds["geometric_axis_r"] = xr.full_like(ds["geometric_axis_r"], np.nan)
+    assert workflow.device_specific_culling(ds)
+
+
+@pytest.fixture
+def built_stores(workflow):
+    """Both stores built from two synthetic raw files."""
+    for shot in [199051, 199052]:
+        raw = _raw_dataset(shot)
+        raw_standardized = workflow.standardize_signal_names(raw)
+        raw_standardized.to_netcdf(workflow.raw_data_dir / f"{shot}.nc")
+    workflow.run_processed_data_workflow()
+    ds_prediction = xr.open_zarr(workflow.store_path(PREDICTION_STORE_NAME))
+    ds_trajopt = xr.open_zarr(workflow.store_path(TRAJOPT_STORE_NAME))
+    return ds_prediction, ds_trajopt
+
+
+def test_stores_carry_imas_attributes_and_grids(built_stores):
+    """Every stored variable and profile coordinate has a description and units,
+    the ref (IMAS path) of D3D_SIGNAL_ATTRS wherever IMAS has a leaf, and the store grids."""
+    ds_prediction, ds_trajopt = built_stores
+
+    assert set(ds_prediction.data_vars) == {*STORE_SIGNALS, "time"}
+    assert set(ds_trajopt.data_vars) == {*D3D_TRAJOPT_STORE_SIGNALS, "time"}
+    for ds_store in [ds_prediction, ds_trajopt]:
+        assert ds_store.attrs["efit_runtag"] == "DISPY"
+        assert ds_store.attrs["sol_extension"] == config["profile_grid"]["sol_extension"]
+        names = [name for name in ds_store.variables if name not in ("shot", "time_idx")]
+        for name in names:
+            attrs = ds_store[name].attrs
+            assert {"description", "units"} <= set(attrs), name
+            if "ref" in D3D_SIGNAL_ATTRS[name]:
+                assert attrs["ref"] == D3D_SIGNAL_ATTRS[name]["ref"], name
+    np.testing.assert_array_equal(ds_prediction[RADIAL_DIM].values, RHO_TOR_NORM_GRID.astype(np.float32))
+    np.testing.assert_array_equal(ds_trajopt[PSI_NORM_DIM].values, PSI_NORM_GRID.astype(np.float32))
+
+
+def test_every_source_column_has_attrs():
+    """A store signal added to the sources without attributes would be written undocumented."""
+    store_names = {*PREDICTION_SOURCES, *TRAJOPT_SOURCES, *STORE_SIGNALS}
+    assert store_names <= set(D3D_SIGNAL_ATTRS)
+
+
+@pytest.mark.slow
+@pytest.mark.skipif(not IDA_DIR.exists(), reason="needs the /fusion IDA database and DIII-D data server access")
+def test_live_single_shot(tmp_path):
+    """One real shot end to end: thin-client MDSplus, the DISPY EFIT, physical ranges, and no netCDF in tmp."""
+    dispy_tmp_dir = Path(os.getenv("LOCALSCRATCH", "/tmp")) / os.environ["USER"] / "disruption-py"
+    netcdf_before = set(dispy_tmp_dir.rglob("*.nc"))
+    d3d_workflow = D3DDataWorkflow(ds_name="d3d_live", shotlist_file=None, data_assembly_dir=tmp_path, max_num_shots=1)
+    d3d_workflow.raw_data_dir.mkdir(parents=True, exist_ok=True)
+    # A file sink, since disruption-py logs from a forked worker process
+    log_path = tmp_path / "live.log"
+    sink_id = logger.add(log_path)
+
+    try:
+        d3d_workflow.make_raw_data_files()
+    finally:
+        logger.remove(sink_id)
+
+    shot = d3d_workflow.shotlist[0]
+    raw_path = d3d_workflow.raw_data_dir / f"{shot}.nc"
+    assert raw_path.exists(), f"raw file for shot {shot} was not written"
+    assert "mdsthin" in sys.modules
+    assert "(runtag DISPY)" in log_path.read_text()
+    netcdf_after = set(dispy_tmp_dir.rglob("*.nc"))
+    assert netcdf_after == netcdf_before, "disruption-py wrote netCDF files to its temporary folder"
+
+    ds = xr.open_dataset(raw_path)
+    ip_max = float(ds["ip"].max())
+    assert 3e5 < ip_max < 2.5e6
+    assert 1.0 < float(ds["b0"].median()) < 2.5
+    assert 0.5 < float(ds["minor_radius"].median()) < 0.7
+    assert 1.6 < float(ds["geometric_axis_r"].median()) < 1.8
+    assert 1e19 < float(ds["n_e_line_average"].median()) < 1.5e20
+    t_e_axis = ds["t_e"].sel({RADIAL_DIM: 0}).values
+    assert 500 < np.nanmax(t_e_axis) < 1e4
+    # Every held slice has a value at the axis (left clamp), otherwise the t_e_axis filter drops it
+    t_e = ds["t_e"].values.squeeze()
+    mask_held = np.isfinite(t_e).any(axis=-1)
+    assert np.isfinite(t_e[mask_held][:, 0]).all()

@@ -11,7 +11,6 @@ Tokamak plasma transport prediction study using POPSIM ML framework. Trains mode
 ```bash
 # Run tests (fast suite by default, ~1 min: addopts deselects -m slow)
 uv run pytest
-JAX_PLATFORMS=cpu uv run pytest  # on a node without a GPU, see Tests
 uv run pytest transport_study/tests/power_balance_transfer/  # single study
 uv run pytest transport_study/tests/modules/test_normalization.py
 uv run pytest -m slow      # training / TORAX / figures / real device data, GPU node, serial
@@ -121,7 +120,7 @@ xarray Datasets with dims `(shot, time_idx, psi_n)`. Power balance signals: `Wto
 
 `uv run pytest` runs the fast suite only: `addopts = -m 'not slow'` in pyproject. The `slow` marker covers anything that trains a model, runs a TORAX relaxation, renders comparison figures, or needs real device data (C-Mod MDSplus, the MAST S3 store). Run those with `-m slow` on a GPU node, one suite at a time - concurrent suites OOM the node GPU. Study tests also need the `PTPS_*` env vars from `.vscode/launch.json`; without them they fail with misleading shot-count errors.
 
-On a node without a GPU (like the interactive node), run pytest with `JAX_PLATFORMS=cpu`. Otherwise the jax CUDA13 plugin's CUDA library version check hangs forever at the first JAX op, which `popsim.ml` runs at import, so collection never finishes and pytest prints nothing.
+On a node without a GPU (like the interactive node), the jax CUDA13 plugin's CUDA library version check hangs forever at the first JAX op, which `popsim.ml` runs at import, so collection never finishes and pytest prints nothing. The root `conftest.py` defaults `JAX_PLATFORMS=cpu` when no `/dev/nvidia*` device exists, which also covers VSCode test discovery. Any other entry point that imports JAX on such a node still needs `JAX_PLATFORMS=cpu` set by hand.
 
 The sample device datasets (`cmod-low1/low2/high.nc`, `mast-low1/low2/high.nc`) are NOT in the repo (they were Git LFS files until September 2026). Tests that open them read them from the directory in `PTPS_TEST_SAMPLE_DIR` via `tests/sample_data.SAMPLE_DIR` and carry `requires_sample_data`, which skips them when the variable is unset. Tests that only need a loaded config use `path/to/...` placeholders, and study tests that only build configs use a `tmp_path` working dir so no stale `config_lock.toml` can trip them.
 
