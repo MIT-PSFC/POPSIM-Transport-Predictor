@@ -21,19 +21,42 @@ python -m transport_study.datasets.cli mast <data_assembly_dir> <mast_published.
 
 2. DIII-D
 
-MDSPlus on Omega requires numpy < 2 which is incompatible with POPSIM, so we have a separate virtual environment
-that only has the requirements for Disruption-Py to first pull the data. (set up this venv with `make_d3d_venv.sh`)
-Further filtering and preprocessing is done on the uv-managed venv with numpy >= 2.
-All signals come from Disruption-Py in one call per shot: 1 kHz EFIT via the DISPY runtag trees, PTDATA and
-pedestal-tree signals via the custom physics methods in `d3d/physics_methods.py`, and Te/ne profiles from the
-IDA database (`IDA_{shot}_.cdf` files) interpolated from IDA's own rho_tor_norm onto a uniform grid.
-No GP fitting is needed since IDA profiles are already a Bayesian fit with errors.
-Processing writes two stores on the same shot / time_idx layout:
-`ds.zarr`, the shared schema, and `trajopt.zarr`, the PCS programmed targets (feedforward control)
-and the measured signals only the trajectory optimization reads, under their pre-IMAS names and units.
-Note for `--mode process` on Omega: the login environment exports PYTHONPATH pointing at the system MDSplus,
-which cannot import under numpy >= 2 and makes disruption-py refuse to import. Strip it for the processing
-step: `PYTHONPATH= python -m transport_study.datasets.cli d3d <data_assembly_dir> --mode process ...`
+Pulled with disruption-py 0.14.0 from PyPI, in the main uv venv.
+disruption-py 0.14.0 pins numpy < 2, which `[tool.uv] override-dependencies` in `pyproject.toml` lifts
+(none of the code paths used here need numpy < 2).
+The OMEGA system MDSplus cannot import under numpy >= 2, so disruption-py falls back to the mdsthin thin client on its own,
+with the login PYTHONPATH left as it is.
+Everything comes from one `get_shots_data` call per shot, built-in methods (EFIT scalars, powers, Ip)
+plus the custom ones in `d3d/physics_methods.py`:
+
+- EFIT: every EFIT signal comes from the shot's latest code_rundb run tagged `DISPY` (the 1 kHz disruption-efit).
+  A shot without one, or whose EFIT is slower than 1 kHz, is skipped (`DispyEfitNicknameSetting`, `Uniform1kHzTimeSetting`).
+  disruption-py's own EFIT selection falls back to the 50 Hz efit01 and forces runtag DIS under pytest, so it is not used.
+- Profiles: Te/ne from the IDA database (`IDA_{shot}_.cdf`, plus the VVUQ files, see `d3d/config.toml`).
+  No GP fitting is needed since IDA profiles are already a Bayesian fit with errors.
+  IDA files are on psi_n (poloidal flux) and carry no rho coordinate, so each IDA slice is mapped to rho_tor_norm
+  through the q profile of the nearest DISPY EFIT slice, with the same definition and secant extension past the LCFS
+  as the published C-Mod/MAST stores (`d3d/profiles.py`).
+  The profiles go onto rho_tor_norm = linspace(0, 1.1, 56), the published C-Mod grid (MAST's has 67 points over the same range),
+  and each slice is held onto the 1 kHz timebase until the next one, for at most 3 median IDA steps.
+  IDA gives no point covariance, so the gradient errors assume independent points.
+- `n_e_line_average` is `\density` of the DISPY tree. disruption-py's `get_density_parameters` is not used,
+  since it falls back to `\denv2`, which reads about 3x higher.
+
+Processing writes two stores on the same shot / time_idx layout, both in IMAS names and SI units, with description,
+units, and ref (IMAS path) attributes on every variable: `ds.zarr`, the shared schema, and `trajopt.zarr`,
+the PCS programmed targets (feedforward control) and the measured signals only the trajectory optimization reads.
+Three PCS pointnames of unverified meaning (`bttbt`, `dstdenp`, `ieeseg07`) are kept under their raw names and units,
+see the TODO in `d3d/d3d_dataset.py`.
+disruption-py writes no netCDF (its output setting has `path=False`), only a small `config.json` per call
+under `$LOCALSCRATCH/$USER/disruption-py/`.
+
+```bash
+python -m transport_study.datasets.cli d3d <data_assembly_dir> --mode raw
+JAX_PLATFORMS=cpu python -m transport_study.datasets.cli d3d <data_assembly_dir> --mode process
+```
+
+Processing imports popsim and with it JAX, so on a node without a GPU it needs `JAX_PLATFORMS=cpu`.
 
 3. TCV
 
