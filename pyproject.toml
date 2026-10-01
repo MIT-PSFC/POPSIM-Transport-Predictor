@@ -5,7 +5,8 @@ description = "Benchmarking model architectures on tasks related to particle tra
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
-    "disruption-py",
+    "disruption-py==0.14.0",
+    "mdsthin>=1.7.1",
     "popsim",
     "torax",
     "pre-commit>=4.3.0",
@@ -37,11 +38,14 @@ gpu = ["jax[cuda13]>=0.11.1,<0.12"]
 [tool.isort]
 profile = "black"
 
+[tool.uv]
+# disruption-py 0.14.0 pins numpy<2, but none of the code paths the DIII-D workflow uses need it.
+override-dependencies = ["numpy>=2.4.4,<3"]
+
 [tool.setuptools]
 packages = ["transport_study"]
 
 [tool.uv.sources]
-disruption-py = { path = "./submodules/disruption-py", editable = true }
 popsim = { path = "./submodules/popsim-public", editable = true }
 torax = { path = "./submodules/torax", editable = true }
 
