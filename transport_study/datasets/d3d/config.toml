@@ -2,15 +2,33 @@
 
 [data_sources]
 # IDA profile databases, one file per shot. Searched in priority order:
-# a shot is read from the first pattern that has a file for it.
+# a shot is read from the first pattern that has a file for it, and patterns may hold * wildcards.
 # The union across patterns also defines shot availability for the default shotlist.
 ida_path_patterns = [
   "/fusion/projects/results/ida-results/HBP_database/IDA_{shot}_.cdf",
+  "/fusion/projects/xpsi/nelsonand/VVUQ/Output_KumarJul9/IDA_{shot}_*_.cdf",
 ]
 
+[efit]
+# code_rundb runtag of the 1 kHz disruption-efit reconstructions. A shot without one is skipped.
+runtag = "DISPY"
+# A shot whose EFIT median step exceeds this is not a 1 kHz reconstruction and is skipped [ms]
+max_step_ms = 1.5
+# EFIT slices with a chi-squared above this are invalid, same cut as disruption-py's get_efit_parameters
+chisq_max = 50
+# An IDA slice maps to rho_tor_norm through the nearest valid EFIT slice no farther away than this [ms]
+match_max_ms = 2.0
+
 [profile_grid]
-# Uniform rho_tor_norm grid the IDA profiles are interpolated onto
-# rho_max 1.1 covers the usable part of IDA's psi_n <= 1.2 domain
+# Uniform rho_tor_norm grid the IDA profiles are interpolated onto, the same grid as the published C-Mod store
 rho_min = 0.0
 rho_max = 1.1
-num_rho_points = 64
+num_rho_points = 56
+# How rho_tor_norm continues past the LCFS, "secant" or "tangent" (same default as the published stores)
+sol_extension = "secant"
+# Uniform psi_norm grid for the trajopt store profiles, inside IDA's psi_n <= 1.2 domain
+psi_norm_max = 1.18
+num_psi_norm_points = 60
+# Longest an IDA slice is held onto the 1 kHz timebase, in median IDA steps.
+# Interior IDA gaps reach 2.6 median steps, so this only cuts the hold after the last slice.
+max_hold_ida_steps = 3.0

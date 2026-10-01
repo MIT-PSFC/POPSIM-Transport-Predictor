@@ -1,6 +1,5 @@
 """Makes the 'raw' DIII-D dataset on omega, to be processed later by POPSIM"""
 
-import re
 from pathlib import Path
 from typing import ClassVar
 
@@ -11,22 +10,20 @@ from disruption_py.machine.tokamak import Tokamak
 from disruption_py.settings import RetrievalSettings
 from disruption_py.settings.output_setting import DatasetOutputSetting
 from disruption_py.workflow import get_shots_data
-from dynaconf import Dynaconf
 from loguru import logger
 
-from transport_study import PACKAGE_ROOT, RADIAL_DIM
+from transport_study import RADIAL_DIM
+from transport_study.datasets.d3d import config
+from transport_study.datasets.d3d.dispy_utils import passive_log_settings
 from transport_study.datasets.d3d.physics_methods import (
     D3DDatasetMethods,
     Uniform1kHzTimeSetting,
-    find_ida_path,
 )
-from transport_study.datasets.dispy_utils import passive_log_settings
+from transport_study.datasets.d3d.profiles import find_ida_path, find_ida_shots
 from transport_study.datasets.workflow import RawFileWorkflow
 from transport_study.signals import PREDICTION_STORE_NAME, STORE_SIGNALS
 
 INNER_WALL = 1.05  # Location of the inner wall, used to calculate minor radius from gapin and R0
-
-config = Dynaconf(settings_files=[Path(PACKAGE_ROOT) / "datasets/d3d/config.toml"])
 
 # Everything is fetched through one disruption-py call per shot.
 # Built-in methods live in the disruption-py submodule, custom ones in physics_methods.py.
@@ -183,14 +180,7 @@ class D3DDataWorkflow(RawFileWorkflow):
     def _get_shotlist_from_source(self) -> list[int]:
         """Union of shots with an IDA profile file in any configured database."""
         patterns = self.config["data_sources"]["ida_path_patterns"]
-        shots: set[int] = set()
-        for pattern in patterns:
-            pattern_path = Path(str(pattern))
-            name_re = re.compile(re.escape(pattern_path.name).replace(re.escape("{shot}"), r"(\d+)"))
-            for p in pattern_path.parent.glob(pattern_path.name.format(shot="*")):
-                match = name_re.fullmatch(p.name)
-                if match:
-                    shots.add(int(match.group(1)))
+        shots = find_ida_shots(patterns)
         if not shots:
             raise FileNotFoundError(f"No IDA files found for any pattern in {patterns}")
         return sorted(shots)

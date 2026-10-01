@@ -1,10 +1,9 @@
-"""Custom disruption-py physics methods for the DIII-D dataset.
+"""Custom disruption-py physics methods, EFIT tree and timebase for the DIII-D dataset.
 
-Passed to disruption-py via RetrievalSettings.custom_physics_methods so the
-submodule's machine files stay untouched. Also holds the uniform 1 kHz time setting.
+Written against the PyPI disruption-py 0.14.0 API (params.mds_conn) and passed in through
+RetrievalSettings, so nothing in disruption-py is patched.
 """
 
-from pathlib import Path
 from typing import ClassVar
 
 import numpy as np
@@ -15,219 +14,159 @@ from disruption_py.core.physics_method.params import PhysicsMethodParams
 from disruption_py.core.utils.math import interp1
 from disruption_py.inout.mds import mdsExceptions
 from disruption_py.machine.tokamak import Tokamak
-from disruption_py.settings.time_setting import (
-    TimeSetting,
-    TimeSettingParams,
-    _postprocess,
+from disruption_py.settings import TimeSetting, TimeSettingParams
+from disruption_py.settings.nickname_setting import (
+    NicknameSetting,
+    NicknameSettingParams,
 )
-from dynaconf import Dynaconf
 from loguru import logger
 
-from transport_study import PACKAGE_ROOT, RADIAL_DIM
-
-config = Dynaconf(settings_files=[Path(PACKAGE_ROOT) / "datasets/d3d/config.toml"])
-
-RHO_TOR_NORM_GRID = np.linspace(
-    config["profile_grid"]["rho_min"],
-    config["profile_grid"]["rho_max"],
-    config["profile_grid"]["num_rho_points"],
+from transport_study.datasets import make_uniform_1khz_timebase
+from transport_study.datasets.d3d import config
+from transport_study.datasets.d3d.profiles import (
+    IDA_PSI_COLUMNS,
+    IDA_RHO_COLUMNS,
+    find_ida_path,
+    ida_profiles_on_grids,
 )
 
-# Programmed waveforms run past early plasma termination, keep them for predict-first
-MIN_TIMEBASE_MS = 8000
+# Programmed waveforms run past early plasma termination, keep them for predict-first [s]
+MIN_TIMEBASE_S = 8.0
 
 
-def find_ida_path(shot: int, patterns: list[str] | None = None) -> Path | None:
-    """First existing IDA file for the shot across the configured patterns, in priority order."""
-    if patterns is None:
-        patterns = config["data_sources"]["ida_path_patterns"]
-    for pattern in patterns:
-        path = Path(str(pattern).format(shot=shot))
-        if path.exists():
-            return path
-    return None
+class DispyEfitNicknameSetting(NicknameSetting):
+    """The shot's _efit_tree: its latest run under the configured runtag (DISPY, the 1 kHz disruption-efit).
+
+    disruption-py's own DIII-D nickname falls back to the 50 Hz efit01 when the runtag has no run,
+    and forces runtag DIS under pytest. This raises instead, so no shot is built on another EFIT.
+    """
+
+    def _get_tree_name(self, params: NicknameSettingParams) -> str:
+        runtag = config["efit"]["runtag"]
+        efit_runs = params.database.query(
+            f"select tree from code_rundb.dbo.plasmas where shot = {params.shot_id} and runtag = '{runtag}' and deleted = 0 order by idx",
+            use_pandas=False,
+        )
+        if not efit_runs:
+            raise ValueError(f"Shot {params.shot_id} has no EFIT run under runtag {runtag}")
+        efit_tree = efit_runs[-1][0]
+        logger.info(f"Shot {params.shot_id}: EFIT tree {efit_tree} (runtag {runtag})")
+        return efit_tree
 
 
 class Uniform1kHzTimeSetting(TimeSetting):
-    """Uniform 1 kHz timebase covering the EFIT range and the programmed waveforms."""
+    """Uniform 1 kHz timebase [s] from 0 to the end of the EFIT, and at least MIN_TIMEBASE_S long.
+
+    Raises when the EFIT is slower than 1 kHz, the mark of a reconstruction that is not DISPY.
+    """
 
     def _get_times(self, params: TimeSettingParams) -> np.ndarray:
-        (efit_time,) = params.get_dims(r"\efit_aeqdsk:ali", tree_name="_efit_tree")  # [ms]
-        typical_delta = np.median(np.diff(efit_time))
-        if typical_delta > 2:
-            logger.warning(
-                f"Shot {params.shot_id}: EFIT timebase slower than 1 kHz "
-                f"(typical delta {typical_delta:.1f} ms), DISPY tree probably missing"
-            )
-        max_time = max(np.max(efit_time), MIN_TIMEBASE_MS)
-        return _postprocess(times=np.round(np.arange(0, max_time + 1, 1), 0), units="ms")
+        efit_time_ms = params.mds_conn.get_data(r"\efit_a_eqdsk:atime", tree_name="_efit_tree")
+        efit_steps_ms = np.diff(efit_time_ms)
+        efit_step_median_ms = np.median(efit_steps_ms)
+        if efit_step_median_ms > config["efit"]["max_step_ms"]:
+            raise ValueError(f"Shot {params.shot_id}: median EFIT step {efit_step_median_ms:.1f} ms, not a 1 kHz reconstruction")
+        efit_end_s = np.max(efit_time_ms) / 1e3
+        timebase_end_s = max(efit_end_s, MIN_TIMEBASE_S)
+        return make_uniform_1khz_timebase(timebase_end_s)
 
 
-def _gradient_and_error(vals: np.ndarray, errs: np.ndarray, x: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    """Numerical gradient along the last axis with propagated error."""
-    grad = np.gradient(vals, x, axis=1)
-    # central difference error propagation, endpoints copy their neighbor.
-    # No point covariance available from IDA, unlike the GP fits on C-Mod/MAST.
-    grad_err = np.full_like(vals, np.nan)
-    grad_err[:, 1:-1] = np.sqrt(errs[:, 2:] ** 2 + errs[:, :-2] ** 2) / (x[2:] - x[:-2])
-    grad_err[:, 0], grad_err[:, -1] = grad_err[:, 1], grad_err[:, -2]
-    return grad, grad_err
+def _efit_signals(params: PhysicsMethodParams, nodes: list[str]) -> tuple[np.ndarray, dict[str, np.ndarray]]:
+    """A-eqdsk nodes on the EFIT timebase [s], NaN on slices whose chi-squared exceeds chisq_max.
+
+    Reads DIII-D's own a-eqdsk node names only. The a-file-format names in the same tree are NID
+    aliases, and about half of them point at a different quantity.
+    """
+    efit_time_ms = params.mds_conn.get_data(r"\efit_a_eqdsk:atime", tree_name="_efit_tree")
+    efit_time = efit_time_ms / 1e3
+    chisq = params.mds_conn.get_data(r"\efit_a_eqdsk:chisq", tree_name="_efit_tree")
+    mask_invalid = chisq > config["efit"]["chisq_max"]
+    signals = {}
+    for node in nodes:
+        values = params.mds_conn.get_data(rf"\efit_a_eqdsk:{node}", tree_name="_efit_tree")
+        values[mask_invalid] = np.nan
+        signals[node] = values
+    return efit_time, signals
 
 
 class D3DDatasetMethods:
-    """Signals needed by the transport study that are not disruption-py built-ins."""
+    """Signals the transport study needs that disruption-py 0.14 has no built-in for."""
 
-    PROGRAMMED_POINTNAMES: ClassVar[list[str]] = [
-        "bttbt",  # programmed B0 [T]
-        "bmtpwrtar",  # programmed betan target
-        "dstdenp",  # programmed pedestal density
-        "idtrp",  # programmed R0 [m]
-        "ieeseg07",  # programmed inner gap [m]
-        "idtrxbot",  # programmed bottom X point R [m]
-        "idtzxbot",  # programmed bottom X point Z [m]
-        "idtrxtop",  # programmed top X point R [m]
-        "idtzxtop",  # programmed top X point Z [m]
-    ]  # iptipp is covered by the built-in get_ip_parameters as ip_prog
-
-    EXTENDED_EFIT_COLS: ClassVar[dict[str, str]] = {
-        "betat": r"\efit_a_eqdsk:betat",
-        "aminor": r"\efit_a_eqdsk:aminor",
-        "tritop": r"\efit_a_eqdsk:tritop",
-        "tribot": r"\efit_a_eqdsk:tribot",
-        "rsurf": r"\efit_a_eqdsk:rsurf",
-        "rxpt1": r"\efit_a_eqdsk:rxpt1",
-        "zxpt1": r"\efit_a_eqdsk:zxpt1",
-        "rxpt2": r"\efit_a_eqdsk:rxpt2",
-        "zxpt2": r"\efit_a_eqdsk:zxpt2",
-        "gapin": r"\efit_a_eqdsk:gapin",
-    }
+    # Measured: bt (vacuum toroidal field at R = 1.6955 m) and dssneped (PCS pedestal density estimate).
+    # Programmed (PCS targets): bttbt (B0), bmtpwrtar (beta_N), dstdenp (density), idtrp (R0),
+    # ieeseg07 (inner gap), idtrxbot / idtzxbot / idtrxtop / idtzxtop (X points).
+    # iptipp (Ip) comes from the built-in get_ip_parameters as ip_prog.
+    PTDATA_POINTNAMES: ClassVar[list[str]] = [
+        "bt",
+        "dssneped",
+        "bttbt",
+        "bmtpwrtar",
+        "dstdenp",
+        "idtrp",
+        "ieeseg07",
+        "idtrxbot",
+        "idtzxbot",
+        "idtrxtop",
+        "idtzxtop",
+    ]
+    # Store geometry the built-in get_efit_parameters lacks (it has kappa)
+    BOUNDARY_NODES: ClassVar[list[str]] = ["aminor", "rsurf", "tritop", "tribot"]
+    # Trajopt geometry. rxpt1 / zxpt1 is the lower X point, rxpt2 / zxpt2 the upper.
+    XPOINT_GAP_NODES: ClassVar[list[str]] = ["gapin", "rxpt1", "zxpt1", "rxpt2", "zxpt2"]
 
     @staticmethod
-    @physics_method(columns=["wmhdf", "betanf", "dssneped"], tokamak=Tokamak.D3D)
-    def get_pedestal_parameters(params: PhysicsMethodParams):
-        """Fast stored energy and normalized beta from the pedestal tree, plus the pedestal density."""
-        out = {}
-        for col, node in [("wmhdf", r"\wmhdf"), ("betanf", r"\betanf")]:
+    @physics_method(columns=PTDATA_POINTNAMES, tokamak=Tokamak.D3D)
+    def get_ptdata_parameters(params: PhysicsMethodParams):
+        """PTDATA pointnames on the timebase, each NaN when its pointname is missing from the shot."""
+        signals = {}
+        for pointname in D3DDatasetMethods.PTDATA_POINTNAMES:
             try:
-                sig, t = params.get_data_with_dims(node, tree_name="pedestal")
-                out[col] = interp1(t / 1e3, sig, params.times)
+                values, times_ms = params.mds_conn.get_data_with_dims(f"ptdata('{pointname}', {params.shot_id})")
             except mdsExceptions.MdsException:
-                params.logger.warning("pedestal node {node} missing", node=node)
-                out[col] = np.full(len(params.times), np.nan)
-        if not np.isfinite(out["betanf"]).any():
-            # efsbetan is the rt-EFIT beta_n, close enough when the pedestal calc is missing
-            try:
-                sig, t = params.get_data_with_dims(f"ptdata('efsbetan', {params.shot_id})")
-                out["betanf"] = interp1(t / 1e3, sig, params.times)
-            except mdsExceptions.MdsException:
-                pass
-        try:
-            sig, t = params.get_data_with_dims(f"ptdata('dssneped', {params.shot_id})")
-            out["dssneped"] = interp1(t / 1e3, sig, params.times)
-        except mdsExceptions.MdsException:
-            params.logger.warning("ptdata dssneped missing")
-            out["dssneped"] = np.full(len(params.times), np.nan)
-        return out
+                params.logger.warning("ptdata {pointname} missing", pointname=pointname)
+                signals[pointname] = np.full(len(params.times), np.nan)
+                continue
+            times_s = times_ms / 1e3
+            signals[pointname] = interp1(times_s, values, params.times)
+        return signals
 
     @staticmethod
-    @physics_method(columns=PROGRAMMED_POINTNAMES, tokamak=Tokamak.D3D)
-    def get_programmed_parameters(params: PhysicsMethodParams):
-        """PCS programmed waveforms for the predict-first trajectory optimization."""
-        out = {}
-        for name in D3DDatasetMethods.PROGRAMMED_POINTNAMES:
-            try:
-                sig, t = params.get_data_with_dims(f"ptdata('{name}', {params.shot_id})")
-                out[name] = interp1(t / 1e3, sig, params.times)
-            except mdsExceptions.MdsException:
-                params.logger.warning("ptdata {name} missing", name=name)
-                out[name] = np.full(len(params.times), np.nan)
-        return out
+    @physics_method(columns=BOUNDARY_NODES, tokamak=Tokamak.D3D)
+    def get_boundary_parameters(params: PhysicsMethodParams):
+        """Plasma boundary minor radius, geometric axis R and triangularities from the DISPY EFIT."""
+        efit_time, signals = _efit_signals(params, D3DDatasetMethods.BOUNDARY_NODES)
+        return {node: interp1(efit_time, values, params.times) for node, values in signals.items()}
 
     @staticmethod
-    @physics_method(columns=list(EXTENDED_EFIT_COLS), tokamak=Tokamak.D3D)
-    def get_extended_efit_parameters(params: PhysicsMethodParams):
-        """A-eqdsk shape and beta signals not covered by the built-in get_efit_parameters."""
-        data = {k: params.get_data(v, tree_name="_efit_tree") for k, v in D3DDatasetMethods.EXTENDED_EFIT_COLS.items()}
-        efit_time = params.get_data(r"\efit_a_eqdsk:atime", tree_name="_efit_tree") / 1e3
-        chisq = params.get_data(r"\efit_a_eqdsk:chisq", tree_name="_efit_tree")
-        invalid = np.where(chisq > 50)  # same validity criterion as get_efit_parameters
-        for values in data.values():
-            values[invalid] = np.nan
-        # X points read -9.99 when EFIT finds no X point, mask the whole set when either is bad
-        xpt_bad = ~((data["rxpt1"] > 0) & (data["rxpt2"] > 0))
-        for k in ["rxpt1", "zxpt1", "rxpt2", "zxpt2"]:
-            data[k][xpt_bad] = np.nan
-        return {k: interp1(efit_time, v, params.times) for k, v in data.items()}
+    @physics_method(columns=XPOINT_GAP_NODES, tokamak=Tokamak.D3D)
+    def get_xpoint_gap_parameters(params: PhysicsMethodParams):
+        """Inner gap and both X points from the DISPY EFIT, each X point NaN where EFIT finds none."""
+        efit_time, signals = _efit_signals(params, D3DDatasetMethods.XPOINT_GAP_NODES)
+        # EFIT writes R = -9.99 when it finds no X point
+        for r_node, z_node in [("rxpt1", "zxpt1"), ("rxpt2", "zxpt2")]:
+            mask_no_xpoint = ~(signals[r_node] > 0)
+            signals[r_node][mask_no_xpoint] = np.nan
+            signals[z_node][mask_no_xpoint] = np.nan
+        return {node: interp1(efit_time, values, params.times) for node, values in signals.items()}
 
     @staticmethod
-    @physics_method(
-        columns=[
-            "te_psi",
-            "ne_psi",
-            "te_rho",
-            "te_rho_error",
-            "te_rho_grad",
-            "te_rho_grad_error",
-            "ne_rho",
-            "ne_rho_error",
-            "ne_rho_grad",
-            "ne_rho_grad_error",
-        ],
-        tokamak=Tokamak.D3D,
-    )
+    @physics_method(columns=[*IDA_RHO_COLUMNS, *IDA_PSI_COLUMNS], tokamak=Tokamak.D3D)
     def get_ida_profiles(params: PhysicsMethodParams):
-        """IDA Te/ne profiles on the native psi_n grid and on a uniform rho_tor_norm grid.
-
-        IDA carries its own rho_tor_norm for every psi_n point, so no equilibrium is needed for the mapping.
-        Profiles are forward-filled onto params.times (NaN before the first IDA slice), the
-        same hold-last-value behavior the raw 1 kHz assembly always used.
-        """
+        """IDA Te/ne on the rho_tor_norm grid (mapped through the DISPY EFIT q profile) and on the psi_norm grid."""
         ida_path = find_ida_path(params.shot_id)
         if ida_path is None:
             raise CalculationError(f"no IDA file for shot {params.shot_id}")
         ida = xr.load_dataset(ida_path)
-        ida = ida.sortby("time")
-        ida_times = ida["time"].values / 1e3  # [ms] -> [s]
-        psi_n_grid = ida["psi_n"].values
-        n_t = len(ida_times)
 
-        # TODO: verify IDA's rho_tor_norm variable name and layout when rebuilding the D3D dataset
-        # Broadcast covers both a fixed (psi_n,) grid and a per-slice (time, psi_n) mapping
-        rho_tor_norm_ida = np.broadcast_to(ida["rho_tor_norm"].values, (n_t, len(psi_n_grid)))
+        efit_time_ms = params.mds_conn.get_data(r"\efit_a_eqdsk:atime", tree_name="_efit_tree")
+        efit_time = efit_time_ms / 1e3
+        qpsi = params.mds_conn.get_data(r"\top.results.geqdsk:qpsi", tree_name="_efit_tree")
+        if qpsi.shape[0] != efit_time.size:
+            raise CalculationError(f"qpsi shape {qpsi.shape} does not match {efit_time.size} EFIT slices")
+        chisq = params.mds_conn.get_data(r"\efit_a_eqdsk:chisq", tree_name="_efit_tree")
+        mask_q_finite = np.isfinite(qpsi).all(axis=1)
+        mask_efit_valid = (chisq <= config["efit"]["chisq_max"]) & mask_q_finite
 
-        prof = {}
-        for src, dst in [
-            ("T_e", "te_rho"),
-            ("T_e_err", "te_rho_error"),
-            ("n_e", "ne_rho"),
-            ("n_e_err", "ne_rho_error"),
-        ]:
-            vals = np.full((n_t, len(RHO_TOR_NORM_GRID)), np.nan, dtype=np.float32)
-            for i in range(n_t):
-                if np.isfinite(rho_tor_norm_ida[i]).all():
-                    vals[i] = np.interp(RHO_TOR_NORM_GRID, rho_tor_norm_ida[i], ida[src].values[i], left=np.nan, right=np.nan)
-            prof[dst] = vals
-        for var in ["te", "ne"]:
-            grad, grad_err = _gradient_and_error(prof[f"{var}_rho"], prof[f"{var}_rho_error"], RHO_TOR_NORM_GRID)
-            prof[f"{var}_rho_grad"], prof[f"{var}_rho_grad_error"] = grad, grad_err
-
-        # ffill onto params.times, NaN before the first IDA slice
-        idx_prev = np.searchsorted(ida_times, params.times, side="right") - 1
-
-        def onto_times(arr: np.ndarray) -> np.ndarray:
-            res = arr[np.clip(idx_prev, 0, None)].astype(np.float32)
-            res[idx_prev < 0] = np.nan
-            return res
-
-        return xr.Dataset(
-            data_vars={
-                "te_psi": (("idx", "psi_n"), onto_times(ida["T_e"].values)),
-                "ne_psi": (("idx", "psi_n"), onto_times(ida["n_e"].values)),
-                **{name: (("idx", RADIAL_DIM), onto_times(vals)) for name, vals in prof.items()},
-            },
-            coords={
-                **params.to_coords(),
-                "psi_n": psi_n_grid.astype(np.float32),
-                RADIAL_DIM: RHO_TOR_NORM_GRID.astype(np.float32),
-            },
-        )
+        ida_profiles = ida_profiles_on_grids(ida, efit_time, qpsi, mask_efit_valid, params.times)
+        idx_coords = params.to_coords()
+        return ida_profiles.assign_coords(idx_coords)
