@@ -7,7 +7,8 @@ import numpy as np
 import xarray as xr
 from matplotlib.backends.backend_pdf import PdfPages
 
-from transport_study import RADIAL_DIM
+from transport_study import RADIAL_DIM, TIME_DIM
+from transport_study.datasets import UNIFORM_TIMEBASE_DT_S
 from transport_study.plot_style import BACKGROUND_COLOR, FACE_COLOR, TEXT_COLOR
 from transport_study.signals import convert_to_working_units
 
@@ -233,19 +234,21 @@ def ds_profile_plot(
 
     Path(fig_dir).mkdir(parents=True, exist_ok=True)
 
+    panels = [
+        ("n_e_1e20", "viridis", r"$n_e$ [$10^{20}$ m$^{-3}$]"),
+        ("t_e_keV", "plasma", r"$T_e$ [keV]"),
+    ]
     for shot in ds["shot"].data[:num_shots]:
         shot_ds = ds.sel(shot=shot)
-
-        rho = shot_ds[RADIAL_DIM].values
-        time = shot_ds["time"].values
-
-        # Extract 2D arrays for density and temperature
-        ne_data = shot_ds["n_e_1e20"].transpose(RADIAL_DIM, ...).values  # shape: (rho, time)
-        te_data = shot_ds["t_e_keV"].transpose(RADIAL_DIM, ...).values  # shape: (rho, time)
-
-        # Create masks for timesteps with NaN values
-        ne_nan_mask = np.isnan(ne_data).any(axis=0)  # True if any NaN in that timestep
-        te_nan_mask = np.isnan(te_data).any(axis=0)  # True if any NaN in that timestep
+        # Store padding has NaN time.
+        # Valid columns go onto the uniform grid, so timeslices dropped by filtering show as NaN columns.
+        mask_time_valid = np.isfinite(shot_ds["time"].values)
+        shot_ds_valid = shot_ds.isel({TIME_DIM: mask_time_valid})
+        rho = shot_ds_valid[RADIAL_DIM].values
+        time_valid = shot_ds_valid["time"].values
+        grid_offset = (time_valid - time_valid.min()) / UNIFORM_TIMEBASE_DT_S
+        grid_idx = np.rint(grid_offset).astype(int)
+        time = time_valid.min() + np.arange(grid_idx.max() + 1) * UNIFORM_TIMEBASE_DT_S
 
         fig, axes = plt.subplots(2, 1, figsize=(16, 12), sharex=True)
         fig.patch.set_facecolor(BACKGROUND_COLOR)
@@ -255,74 +258,29 @@ def ds_profile_plot(
             color=TEXT_COLOR,
         )
 
-        ax_ne = axes[0]
-        ax_te = axes[1]
+        for ax, (name, cmap, panel_title) in zip(axes, panels, strict=True):
+            profile_data = np.full((rho.size, time.size), np.nan)
+            profile_data[:, grid_idx] = shot_ds_valid[name].transpose(RADIAL_DIM, ...).values
+            # Timesteps with any NaN are blanked and overlaid in red
+            mask_nan_timestep = np.isnan(profile_data).any(axis=0)
+            profile_plot_data = profile_data.copy()
+            profile_plot_data[:, mask_nan_timestep] = np.nan
+            mesh = ax.pcolormesh(time, rho, profile_plot_data, cmap=cmap, shading="nearest")
+            if np.any(mask_nan_timestep):
+                nan_overlay = np.full_like(profile_data, np.nan)
+                nan_overlay[:, mask_nan_timestep] = 1.0
+                ax.pcolormesh(time, rho, nan_overlay, cmap="Reds", alpha=0.8, shading="nearest")
 
-        # Plot density heatmap
-        ne_plot_data = ne_data.copy()
-        ne_plot_data[:, ne_nan_mask] = np.nan  # Set NaN timesteps to NaN for proper masking
-        im_ne = ax_ne.imshow(
-            ne_plot_data,
-            cmap="viridis",
-            aspect="auto",
-            origin="lower",
-            extent=[0, np.nanmax(time), rho.min(), rho.max()],
-        )
-
-        # Overlay bright pink for NaN timesteps
-        if np.any(ne_nan_mask):
-            ne_pink_data = np.full_like(ne_data, np.nan)
-            ne_pink_data[:, ne_nan_mask] = 1.0  # Use constant value for bright color
-            ax_ne.imshow(
-                ne_pink_data,
-                cmap="Reds",
-                aspect="auto",
-                origin="lower",
-                alpha=0.8,
-                extent=[0, np.nanmax(time), rho.min(), rho.max()],
-            )
-
-        ax_ne.set_ylabel(r"$\rho_{tor,N}$", fontsize=LABEL_FONTSIZE, color=TEXT_COLOR)
-        ax_ne.set_title(r"$n_e$ [$10^{20}$ m$^{-3}$]", fontsize=LABEL_FONTSIZE, color=TEXT_COLOR)
-        cbar_ne = plt.colorbar(im_ne, ax=ax_ne)
-        cbar_ne.ax.tick_params(labelsize=TICK_FONTSIZE, colors=TEXT_COLOR)
-
-        # Plot temperature heatmap
-        te_plot_data = te_data.copy()
-        te_plot_data[:, te_nan_mask] = np.nan  # Set NaN timesteps to NaN for proper masking
-        im_te = ax_te.imshow(
-            te_plot_data,
-            cmap="plasma",
-            aspect="auto",
-            origin="lower",
-            extent=[0, np.nanmax(time), rho.min(), rho.max()],
-        )
-
-        # Overlay bright pink for NaN timesteps
-        if np.any(te_nan_mask):
-            te_pink_data = np.full_like(te_data, np.nan)
-            te_pink_data[:, te_nan_mask] = 1.0  # Use constant value for bright color
-            ax_te.imshow(
-                te_pink_data,
-                cmap="Reds",
-                aspect="auto",
-                origin="lower",
-                alpha=0.8,
-                extent=[0, np.nanmax(time), rho.min(), rho.max()],
-            )
-
-        ax_te.set_ylabel(r"$\rho_{tor,N}$", fontsize=LABEL_FONTSIZE, color=TEXT_COLOR)
-        ax_te.set_xlabel("Time [s]", fontsize=LABEL_FONTSIZE, color=TEXT_COLOR)
-        ax_te.set_title(r"$T_e$ [keV]", fontsize=LABEL_FONTSIZE, color=TEXT_COLOR)
-        cbar_te = plt.colorbar(im_te, ax=ax_te)
-        cbar_te.ax.tick_params(labelsize=TICK_FONTSIZE, colors=TEXT_COLOR)
-
-        for ax in axes:
+            ax.set_ylabel(r"$\rho_{tor,N}$", fontsize=LABEL_FONTSIZE, color=TEXT_COLOR)
+            ax.set_title(panel_title, fontsize=LABEL_FONTSIZE, color=TEXT_COLOR)
+            cbar = plt.colorbar(mesh, ax=ax)
+            cbar.ax.tick_params(labelsize=TICK_FONTSIZE, colors=TEXT_COLOR)
             ax.set_facecolor(FACE_COLOR)
             ax.tick_params(axis="both", labelsize=TICK_FONTSIZE, colors=TEXT_COLOR)
-            ax.set_xlim(np.nanmin(time), np.nanmax(time))
+            ax.set_xlim(time.min(), time.max())
             for spine in ax.spines.values():
                 spine.set_color(TEXT_COLOR)
+        axes[-1].set_xlabel("Time [s]", fontsize=LABEL_FONTSIZE, color=TEXT_COLOR)
 
         fig.tight_layout()
         fig.savefig(Path(fig_dir) / f"{shot}_profiles.png", dpi=150)
