@@ -2,6 +2,7 @@
 
 import re
 from pathlib import Path
+from typing import ClassVar
 
 import netCDF4  # noqa: F401
 import numpy as np
@@ -13,14 +14,15 @@ from disruption_py.workflow import get_shots_data
 from dynaconf import Dynaconf
 from loguru import logger
 
-from transport_study import PACKAGE_ROOT
+from transport_study import PACKAGE_ROOT, RADIAL_DIM
 from transport_study.datasets.d3d.physics_methods import (
     D3DDatasetMethods,
     Uniform1kHzTimeSetting,
     find_ida_path,
 )
 from transport_study.datasets.dispy_utils import passive_log_settings
-from transport_study.datasets.workflow import DataWorkflow
+from transport_study.datasets.workflow import RawFileWorkflow
+from transport_study.signals import PREDICTION_STORE_NAME, STORE_SIGNALS
 
 INNER_WALL = 1.05  # Location of the inner wall, used to calculate minor radius from gapin and R0
 
@@ -37,43 +39,78 @@ RUN_METHODS = [
     "get_ip_parameters",  # ip, ip_prog
     "get_btor",  # btor
     # custom methods from physics_methods.py
-    "get_pedestal_parameters",  # wmhdf, betanf, betapf, dssneped
+    "get_pedestal_parameters",  # wmhdf, betanf, dssneped
     "get_programmed_parameters",  # PCS waveforms for predict-first
     "get_extended_efit_parameters",  # betat, aminor, tritop, tribot, rsurf, X points, gapin
-    "get_ida_profiles",  # Te/ne on psi_n and rho
+    "get_ida_profiles",  # Te/ne on psi_n and rho_tor_norm
 ]
 
+# Signals only the trajectory optimization reads. TODO(ZanderKeith): IMAS-equivalent names and units?
+# The PCS programmed targets (feedforward control) and the measured signals they are compared against.
+# They go in their own store, on the same shot / time_idx layout as the prediction store.
+TRAJOPT_STORE_NAME = "trajopt"
+D3D_TRAJOPT_STORE_SIGNALS = (
+    "Ip_MA_prog",
+    "B0_prog",
+    "betan_prog",
+    "ne20_edge_prog",
+    "R0_prog",
+    "gapin_prog",
+    "rxbot_prog",
+    "zxbot_prog",
+    "rxtop_prog",
+    "zxtop_prog",
+    "gapin",
+    "rxbot",
+    "zxbot",
+    "rxtop",
+    "zxtop",
+    "ne20_edge",
+    "Te_keV_psi",
+    "ne20_psi",
+)
 
-class D3DDataWorkflow(DataWorkflow):
+
+class D3DDataWorkflow(RawFileWorkflow):
     """DIII-D specific data workflow for creating and processing datasets.
 
     All signals come from disruption-py (branch zk/ptps) in a single
     get_shots_data call per shot: 1 kHz EFIT from the DISPY runtag trees,
     PTDATA and pedestal-tree signals via the custom physics methods in
-    physics_methods.py, and Te/ne profiles from the IDA database mapped onto
-    a uniform rho grid using the EFIT equilibrium.
+    physics_methods.py, and Te/ne profiles from the IDA database on its own rho_tor_norm.
+
+    Two stores: the prediction store (the shared IMAS schema, SI units)
+    and the trajopt store (D3D_TRAJOPT_STORE_SIGNALS),
+    which only the trajectory optimization reads.
 
     Note: raw data fetching requires numpy < 2 (MDSplus backend on OMEGA) and
     access to the DIII-D data servers, see make_d3d_venv.sh.
     Processing (--mode process) runs in the main uv venv.
 
-    SIGNAL MAP (standardized name: source):
-    Wtot_MJ: wmhdf (pedestal tree), filled from EFIT wmhd where missing
-    Ip_MA / Ip_MA_prog: ip / ip_prog (get_ip_parameters, PTDATA ip / iptipp)
-    B0 / B0_prog: btor (PTDATA bt) / PTDATA bttbt
-    betan / betan_prog: betanf (pedestal, fallbacks efsbetan, betat scaling,
-        EFIT beta_n) / PTDATA bmtpwrtar
-    ne20_line_avg, fGW: n_e, greenwald_fraction (get_density_parameters)
-    ne20_edge / ne20_edge_prog: PTDATA dssneped / dstdenp
-    R0 / R0_prog: EFIT rsurf / PTDATA idtrp
-    a_minor, kappa, delta_top, delta_bot: EFIT aminor, kappa, tritop, tribot
-    gapin / gapin_prog: EFIT gapin / PTDATA ieeseg07
+    SIGNAL MAP, prediction store (IMAS name: source):
+    energy_mhd: wmhdf (pedestal tree), filled from EFIT wmhd where missing
+    ip: ip (get_ip_parameters, PTDATA ip)
+    b0: btor (PTDATA bt)
+    beta_tor_norm: betanf (pedestal, fallbacks efsbetan, betat scaling, EFIT beta_n)
+    n_e_line_average: n_e (get_density_parameters)
+    geometric_axis_r, minor_radius, elongation, triangularity_upper / _lower:
+        EFIT rsurf, aminor, kappa, tritop, tribot
+    power_ohm, power_radiated, power_nbi, power_ec: p_ohm, p_rad, p_nbi, p_ech
+    t_e, n_e (+_error, _gradient, _gradient_error): IDA profiles on rho_tor_norm
+
+    SIGNAL MAP, trajopt store (standardized name: source):
+    Ip_MA_prog: ip_prog (PTDATA iptipp)
+    B0_prog, betan_prog, ne20_edge_prog, R0_prog, gapin_prog: PTDATA bttbt, bmtpwrtar, dstdenp, idtrp, ieeseg07
     rx,zx bot,top (+_prog): EFIT rxpt1, zxpt1, rxpt2, zxpt2 / PTDATA idtr,zx...
-    P_oh_MW, P_rad_MW, P_NBI_MW, P_ECRH_MW: p_ohm, p_rad, p_nbi, p_ech
+    gapin: EFIT gapin
+    ne20_edge: PTDATA dssneped, filled from ne20_psi at psi_n 0.9 where missing
     Te_keV_psi, ne20_psi: IDA T_e, n_e on the native psi_n grid
-    Te_keV_rho, ne20_rho (+_error, _grad, _grad_error): IDA profiles mapped
-        to rho (normalized midplane minor radius, same definition as C-Mod/MAST)
     """
+
+    STORE_VARIABLES: ClassVar[dict[str, tuple[str, ...]]] = {
+        PREDICTION_STORE_NAME: STORE_SIGNALS,
+        TRAJOPT_STORE_NAME: D3D_TRAJOPT_STORE_SIGNALS,
+    }
 
     def __init__(
         self,
@@ -108,23 +145,24 @@ class D3DDataWorkflow(DataWorkflow):
             max_num_shots=max_num_shots,
         )
 
-        # If any of these signals are out of range, drop the entire timeslice.
+        # If any of these signals are out of range, drop the entire timeslice. SI units.
         # Provisional bounds, tuned against the percentile scan of the HBP shots.
         self.filter_config = {
-            "Wtot_MJ": {"min": 0.01, "max": 4},
-            "Ip_MA": {"min": 0.2, "max": 2.5},
-            "ne20_line_avg": {"min": 0.01, "max": 2},
-            "Te_keV_core": {"min": 0.1, "max": 15},
-            "fGW": {"min": 0.0, "max": 2.0},
-            "betan": {"min": 0.01, "max": 6},
+            "energy_mhd": {"min": 1e4, "max": 4e6},
+            "ip": {"min": 2e5, "max": 2.5e6},
+            "n_e_line_average": {"min": 1e18, "max": 2e20},
+            "t_e_axis": {"min": 100, "max": 1.5e4},
+            "greenwald_fraction": {"min": 0.0, "max": 2.0},
+            "beta_tor_norm": {"min": 0.01, "max": 6},
         }
 
-        # Set signals outside this range to nan, but don't drop the entire timeslice
+        # Set signals outside this range to nan, but don't drop the entire timeslice.
+        # SI for the prediction store signals, pre-IMAS units for the trajopt ones.
         self.individual_filter_config = {
-            "P_ECRH_MW": {"min": 0, "max": 10},
-            "P_oh_MW": {"min": 0, "max": 7},  # 201849 P_oh spikes
-            "P_rad_MW": {"min": 0, "max": 10},  # 201855 P_rad far out of distribution
-            "P_NBI_MW": {"min": 0, "max": 25},
+            "power_ec": {"min": 0, "max": 1e7},
+            "power_ohm": {"min": 0, "max": 7e6},  # 201849 P_oh spikes
+            "power_radiated": {"min": 0, "max": 1e7},  # 201855 P_rad far out of distribution
+            "power_nbi": {"min": 0, "max": 2.5e7},
             "ne20_edge": {"min": 0, "max": 2},
             "Ip_MA_prog": {"min": 0, "max": 2.5},
             "B0_prog": {"min": 0, "max": 3},
@@ -176,7 +214,7 @@ class D3DDataWorkflow(DataWorkflow):
             num_processes=1,
         )
         result = result.set_index(idx=["shot", "time"]).unstack("idx")
-        return result.transpose("shot", "time", "psi_n", "rho", missing_dims="ignore")
+        return result.transpose("shot", "time", "psi_n", RADIAL_DIM, missing_dims="ignore")
 
     def make_raw_data_files(self):
         """Create raw data files from source for the DIII-D dataset.
@@ -225,10 +263,10 @@ class D3DDataWorkflow(DataWorkflow):
         logger.info("Finished making raw data files.")
 
     def standardize_signal_names(self, ds: xr.Dataset) -> xr.Dataset | None:
-        """Rename signals in the dataset to match the POPSIM convention.
+        """Build the on-disk schema (IMAS names, SI units) and the trajopt signals from the raw disruption-py columns.
 
-        This includes unit conversions (e.g., eV to keV, J to MJ) and creating
-        derived quantities. Also validates that critical signals are present.
+        Builds a fresh Dataset rather than renaming in place:
+        disruption-py's n_e column is the line-averaged density, not the IDA profile.
 
         Parameters
         ----------
@@ -267,7 +305,6 @@ class D3DDataWorkflow(DataWorkflow):
             "ne_rho_grad",
             "ne_rho_grad_error",
             "betanf",
-            "betapf",
             "dssneped",
             "tritop",
             "tribot",
@@ -286,7 +323,6 @@ class D3DDataWorkflow(DataWorkflow):
             "zxpt2",
             "gapin",
             "beta_n",
-            "beta_p",
             "betat",
         ]
         missing = [var for var in raw_required if var not in ds]
@@ -294,124 +330,71 @@ class D3DDataWorkflow(DataWorkflow):
             logger.warning(f"Shot {ds['shot'].item()}: missing raw signals {missing}, skipping shot.")
             return None
 
-        # POWER BALANCE TRAINING
-        ds["Wtot_MJ"] = ds["wmhdf"] / 1e6
-        ds["Wmhd_MJ"] = ds["wmhd"] / 1e6  # Convert J to MJ
-        ds["Ip_MA"] = np.abs(ds["ip"]) / 1e6  # Convert A to MA
-        ds["B0"] = np.abs(ds["btor"])
-        ds["R0"] = ds["rsurf"]
-        ds["a_minor"] = ds["aminor"]
-        ds["ne20_line_avg"] = ds["n_e"] / 1e20  # Convert to 10^20 m^-3
-        ds["fGW"] = ds["greenwald_fraction"]
-        ds["P_oh_MW"] = ds["p_ohm"] / 1e6
-        ds["P_rad_MW"] = ds["p_rad"] / 1e6
-        ds["P_NBI_MW"] = ds["p_nbi"] / 1e6
-        ds["P_ECRH_MW"] = ds["p_ech"] / 1e6
-        ds["P_ICRF_MW"] = xr.zeros_like(ds["Ip_MA"])  # fast wave unused in these campaigns
-        ds["P_LH_MW"] = xr.zeros_like(ds["Ip_MA"])  # DIII-D has no LHCD
-        # kappa passes through
-
-        # PROFILES (IDA: T_e in eV, n_e in m^-3)
-        ds["Te_keV_psi"] = ds["te_psi"] / 1e3  # Convert eV to keV
-        ds["ne20_psi"] = ds["ne_psi"] / 1e20  # Convert m^-3 to 10^20 m^-3
-        for src, dst, scale in [("te_rho", "Te_keV_rho", 1e3), ("ne_rho", "ne20_rho", 1e20)]:
-            for suffix in ["", "_error", "_grad", "_grad_error"]:
-                ds[f"{dst}{suffix}"] = ds[f"{src}{suffix}"] / scale
-
-        # PROFILE PREDICTOR TRAINING
-        ds["betan"] = ds["betanf"]  # Already unitless
-        ds["ne20_edge"] = ds["dssneped"] / 10  # assumes 10^19 m^-3, verified vs ne20_psi(0.9)
-        ds["delta_top"] = ds["tritop"]
-        ds["delta_bot"] = ds["tribot"]
-
-        # PROFILE PREDICTOR PREDICT-FIRST
-        ds["Ip_MA_prog"] = np.abs(ds["ip_prog"]) / 1e6  # Convert A to MA
-        ds["B0_prog"] = np.abs(ds["bttbt"])
-        ds["betan_prog"] = ds["bmtpwrtar"]
-        ds["ne20_edge_prog"] = ds["dstdenp"] / 10  # same unit assumption as dssneped
-        ds["R0_prog"] = ds["idtrp"]
-        ds["gapin_prog"] = ds["ieeseg07"]
-        ds["rxbot"] = ds["rxpt1"]
-        ds["rxbot_prog"] = ds["idtrxbot"]
-        ds["zxbot"] = ds["zxpt1"]
-        ds["zxbot_prog"] = ds["idtzxbot"]
-        ds["rxtop"] = ds["rxpt2"]
-        ds["rxtop_prog"] = ds["idtrxtop"]
-        ds["zxtop"] = ds["zxpt2"]
-        ds["zxtop_prog"] = ds["idtzxtop"]
-
-        # Only keep variables of interest
-        kept_vars = {
-            # POWER BALANCE TRAINING
-            "Wtot_MJ",
-            "Ip_MA",
-            "B0",
-            "R0",
-            "a_minor",
-            "kappa",
-            "ne20_line_avg",
-            "P_oh_MW",
-            "P_rad_MW",
-            "P_NBI_MW",
-            "P_ECRH_MW",
-            "P_ICRF_MW",
-            "P_LH_MW",
-            # PROFILE PREDICTOR TRAINING
-            "Te_keV_rho",
-            "Te_keV_rho_error",
-            "Te_keV_rho_grad",
-            "Te_keV_rho_grad_error",
-            "ne20_rho",
-            "ne20_rho_error",
-            "ne20_rho_grad",
-            "ne20_rho_grad_error",
-            "betan",
-            "ne20_edge",
-            "delta_top",
-            "delta_bot",
-            "fGW",
-            # PROFILE PREDICTOR PREDICT-FIRST
-            "Te_keV_psi",
-            "ne20_psi",
-            "Ip_MA_prog",
-            "B0_prog",
-            "betan_prog",
-            "ne20_edge_prog",
-            "R0_prog",
-            "gapin",
-            "gapin_prog",
-            "rxbot",
-            "rxbot_prog",
-            "zxbot",
-            "zxbot_prog",
-            "rxtop",
-            "rxtop_prog",
-            "zxtop",
-            "zxtop_prog",
-            # FALLBACK SOURCES
-            "betapf",  # pedestal
-            "beta_n",  # EFIT
-            "beta_p",  # EFIT
-            "betat",  # EFIT
-            "Wmhd_MJ",  # EFIT, fills in missing Wtot_MJ
+        # PREDICTION STORE, IMAS names in SI units (IDA: T_e in eV, n_e in m^-3)
+        signals = {
+            "ip": np.abs(ds["ip"]),
+            "b0": np.abs(ds["btor"]),
+            "energy_mhd": ds["wmhdf"],
+            "beta_tor_norm": ds["betanf"],
+            "n_e_line_average": ds["n_e"],
+            "minor_radius": ds["aminor"],
+            "geometric_axis_r": ds["rsurf"],
+            "elongation": ds["kappa"],
+            "triangularity_upper": ds["tritop"],
+            "triangularity_lower": ds["tribot"],
+            "power_ohm": ds["p_ohm"],
+            "power_radiated": ds["p_rad"],
+            "power_nbi": ds["p_nbi"],
+            "power_ec": ds["p_ech"],
+            "power_ic": xr.zeros_like(ds["p_ohm"]),  # fast wave unused in these campaigns
+            "power_lh": xr.zeros_like(ds["p_ohm"]),  # DIII-D has no LHCD
         }
+        for src, dst in [("te_rho", "t_e"), ("ne_rho", "n_e")]:
+            for src_suffix, dst_suffix in [("", ""), ("_error", "_error"), ("_grad", "_gradient"), ("_grad_error", "_gradient_error")]:
+                signals[f"{dst}{dst_suffix}"] = ds[f"{src}{src_suffix}"]
 
-        ds = ds[sorted(kept_vars)]
+        # PROCESSING ONLY: fallbacks and filter inputs
+        signals["energy_mhd_efit"] = ds["wmhd"]
+        signals["beta_tor_norm_efit"] = ds["beta_n"]
+        signals["beta_tor"] = ds["betat"]  # [%]
+        signals["greenwald_fraction"] = ds["greenwald_fraction"]
+
+        # TRAJOPT STORE, pre-IMAS names and units
+        signals["Te_keV_psi"] = ds["te_psi"] / 1e3  # Convert eV to keV
+        signals["ne20_psi"] = ds["ne_psi"] / 1e20  # Convert m^-3 to 10^20 m^-3
+        signals["ne20_edge"] = ds["dssneped"] / 10  # assumes 10^19 m^-3, verified vs ne20_psi(0.9)
+        signals["Ip_MA_prog"] = np.abs(ds["ip_prog"]) / 1e6  # Convert A to MA
+        signals["B0_prog"] = np.abs(ds["bttbt"])
+        signals["betan_prog"] = ds["bmtpwrtar"]
+        signals["ne20_edge_prog"] = ds["dstdenp"] / 10  # same unit assumption as dssneped
+        signals["R0_prog"] = ds["idtrp"]
+        signals["gapin"] = ds["gapin"]
+        signals["gapin_prog"] = ds["ieeseg07"]
+        signals["rxbot"] = ds["rxpt1"]
+        signals["rxbot_prog"] = ds["idtrxbot"]
+        signals["zxbot"] = ds["zxpt1"]
+        signals["zxbot_prog"] = ds["idtzxbot"]
+        signals["rxtop"] = ds["rxpt2"]
+        signals["rxtop_prog"] = ds["idtrxtop"]
+        signals["zxtop"] = ds["zxpt2"]
+        signals["zxtop_prog"] = ds["idtzxtop"]
+
+        ds_standardized = xr.Dataset(signals)
 
         # If any *important* signal is all NaN, return None to skip this shot
-        if self.has_all_nan_signal(ds, ["Te_keV_rho", "ne20_rho", "Te_keV_psi", "ne20_psi", "Ip_MA"]):
+        if self.has_all_nan_signal(ds_standardized, ["t_e", "n_e", "Te_keV_psi", "ne20_psi", "ip"]):
             return None
 
-        return self.standardize_dim_names(ds)
+        return self.standardize_dim_names(ds_standardized)
 
     def device_specific_processing(self, ds: xr.Dataset) -> xr.Dataset:
         """Apply DIII-D specific processing steps.
 
         This includes:
-        - Substituting Wmhd for Wtot when Wtot is missing or zero
-        - Filling betan from fallback sources
-        - Filling ne20_edge from the profile where the measurement is missing
-        - Deriving Te_keV_core so filter_config can range-check the profiles
+        - Substituting the EFIT stored energy where the pedestal-tree one is missing or zero
+        - Filling beta_tor_norm from fallback sources
+        - Filling ne20_edge from the psi_n profile where the measurement is missing
+        - Deriving t_e_axis so filter_config can range-check the profiles
 
         Parameters
         ----------
@@ -424,21 +407,22 @@ class D3DDataWorkflow(DataWorkflow):
             Processed dataset ready for general workflow
         """
 
-        # Wtot_MJ is close enough to Wmhd_MJ while being less available
-        # Have the Wtot_MJ signal take the Wmhd_MJ values when Wtot_MJ is missing or zero
-        wtot_missing_or_zero = ds["Wtot_MJ"].isnull() | (ds["Wtot_MJ"] == 0)
-        ds["Wtot_MJ"] = ds["Wtot_MJ"].where(~wtot_missing_or_zero, other=ds["Wmhd_MJ"])
+        # The pedestal-tree stored energy is close enough to EFIT's while being less available
+        # Take the EFIT values where it is missing or zero
+        mask_energy_missing = ds["energy_mhd"].isnull() | (ds["energy_mhd"] == 0)
+        ds["energy_mhd"] = ds["energy_mhd"].where(~mask_energy_missing, other=ds["energy_mhd_efit"])
 
-        # Similarly, we sometimes need to fill in betan (from pedestal) with betan from some other source
+        # Similarly, we sometimes need to fill in beta_tor_norm (from pedestal) from some other source
         # Our order of preference is as follows:
-        # 1: betan from the pedestal tree (betanf, with efsbetan fallback in the physics method)
-        betan = ds["betan"]
-        # 2: beta_n recomputed from betat
-        betan_fast = ds["betat"] * ds["a_minor"] * ds["B0"] / ds["Ip_MA"]
-        betan = betan.where(betan.notnull() & (betan > 0), betan_fast)
-        # 3: beta_n from EFIT
-        betan = betan.where(betan.notnull() & (betan > 0), ds["beta_n"])
-        ds["betan"] = betan
+        # 1: beta_tor_norm from the pedestal tree (betanf, with efsbetan fallback in the physics method)
+        beta_tor_norm = ds["beta_tor_norm"]
+        # 2: recomputed from beta_tor [%] with the Troyon normalization, ip in MA
+        ip_MA = ds["ip"] * 1e-6
+        beta_tor_norm_from_beta_tor = ds["beta_tor"] * ds["minor_radius"] * ds["b0"] / ip_MA
+        beta_tor_norm = beta_tor_norm.where(beta_tor_norm.notnull() & (beta_tor_norm > 0), beta_tor_norm_from_beta_tor)
+        # 3: beta_tor_norm from EFIT
+        beta_tor_norm = beta_tor_norm.where(beta_tor_norm.notnull() & (beta_tor_norm > 0), ds["beta_tor_norm_efit"])
+        ds["beta_tor_norm"] = beta_tor_norm
 
         # dssneped is often missing, so fill it in with density from the profile where need be
         ds["ne20_edge"] = ds["ne20_edge"].where(
@@ -446,7 +430,7 @@ class D3DDataWorkflow(DataWorkflow):
             ds["ne20_psi"].sel(psi_n=0.9, method="nearest"),
         )
 
-        # Scalar core temperature so the shared filter_ds can range-check the profile
-        ds["Te_keV_core"] = ds["Te_keV_rho"].sel(rho=0, method="nearest")
+        # Scalar axis temperature so the shared filter_ds can range-check the profile
+        ds["t_e_axis"] = ds["t_e"].sel({RADIAL_DIM: 0}, method="nearest")
 
         return ds

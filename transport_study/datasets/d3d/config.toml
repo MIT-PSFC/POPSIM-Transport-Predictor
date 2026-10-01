@@ -9,7 +9,7 @@ ida_path_patterns = [
 ]
 
 [profile_grid]
-# Uniform rho grid for the IDA profiles (rho = normalized midplane minor radius)
+# Uniform rho_tor_norm grid the IDA profiles are interpolated onto
 # rho_max 1.1 covers the usable part of IDA's psi_n <= 1.2 domain
 rho_min = 0.0
 rho_max = 1.1

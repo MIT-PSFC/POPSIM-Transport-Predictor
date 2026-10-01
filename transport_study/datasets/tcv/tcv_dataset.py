@@ -2,6 +2,7 @@
 
 import gc
 from pathlib import Path
+from typing import ClassVar
 
 import netCDF4  # noqa: F401
 import numpy as np
@@ -9,17 +10,20 @@ import xarray as xr
 from dynaconf import Dynaconf
 from loguru import logger
 
-from transport_study import PACKAGE_ROOT, TIME_COORD, TIME_DIM
+from transport_study import PACKAGE_ROOT, RADIAL_DIM, TIME_COORD, TIME_DIM
 from transport_study.datasets import make_uniform_1khz_timebase
-from transport_study.datasets.workflow import DataWorkflow
+from transport_study.datasets.workflow import RawFileWorkflow
+from transport_study.signals import (
+    PREDICTION_STORE_NAME,
+    STORE_PROFILE_COMPANIONS,
+    STORE_SIGNALS,
+)
 
 config = Dynaconf(settings_files=[Path(PACKAGE_ROOT) / "datasets/tcv/config.toml"])
 
 TCV_0D_SIGNALS = [
-    # Required by the transport predictor module
     "I_P",
     "BZERO",
-    "DELTA",
     "DELTA_TOP",
     "DELTA_BOTTOM",
     "ECRH",
@@ -29,15 +33,11 @@ TCV_0D_SIGNALS = [
     "NEavg",
     "Ne_edge_avg",
     "POHM",
-    "P_LH",
     "PradBulk",
     "R_geom",
     "Wtot",
     "a_minor",
-    # Extra things for comparison
-    "BETAP",
     "BETAN",
-    "TAU_conf_calc",
 ]
 
 # Raw DEFUSE signals that standardize_signal_names cannot do without
@@ -55,14 +55,19 @@ TCV_REQUIRED_RAW_SIGNALS = {
     "DELTA_TOP",
     "DELTA_BOTTOM",
     "BETAN",
-    "BETAP",
     "a_minor",
     "Ne_rho",
     "Te_rho",
 }
 
+# Edge line-averaged density, kept in the raw files for the edge-to-line-average check only
+EDGE_LINE_AVERAGE = "n_e_edge_line_average"
 
-class TCVDataWorkflow(DataWorkflow):
+# Smallest density step [m^-3] read as an interferometer fringe jump
+FRINGE_JUMP_MIN_M3 = 1e19
+
+
+class TCVDataWorkflow(RawFileWorkflow):
     """TCV specific data workflow for creating and processing datasets.
 
     This workflow reads from a pre-existing TCV dataset (e.g., from DEFUSE),
@@ -70,8 +75,16 @@ class TCVDataWorkflow(DataWorkflow):
     individual shot files on a uniform 1 kHz timebase suitable for POPSIM
     transport prediction studies.
 
+    DEFUSE has no profile error bars or gradients, so the store leaves the companions out
+    and organize_data.add_missing_profile_companions fills them on load.
+    DEFUSE profiles are on rho_tor_norm.
+
     Note: This workflow can execute on the present cluster with TCV data access.
     """
+
+    STORE_VARIABLES: ClassVar[dict[str, tuple[str, ...]]] = {
+        PREDICTION_STORE_NAME: tuple(name for name in STORE_SIGNALS if name not in STORE_PROFILE_COMPANIONS)
+    }
 
     def __init__(
         self,
@@ -102,23 +115,23 @@ class TCVDataWorkflow(DataWorkflow):
         # Use the TCV dataset config from datasets/tcv/config.toml
         self.config = config
 
-        # Dictionary for valid signal ranges for filtering
+        # Dictionary for valid signal ranges for filtering, SI units
         self.filter_config = {
-            "Wtot_MJ": {"min": 0.001, "max": 0.5},
-            "ne20_line_avg": {"min": 0.01, "max": 4},
-            "ne20_edge": {"min": 0.01, "max": 4},
-            "P_ECRH_MW": {"min": 0, "max": 10},
-            # Bad interferometer data can satisfy the absolute density cap at low Ip
+            "energy_mhd": {"min": 1e3, "max": 5e5},
+            "n_e_line_average": {"min": 1e18, "max": 4e20},
+            EDGE_LINE_AVERAGE: {"min": 1e18, "max": 4e20},
+            "power_ec": {"min": 0, "max": 1e7},
+            # Bad interferometer data can satisfy the absolute density cap at low ip
             # so stack another check based on the Greenwald fraction
-            "fGW": {"min": 0.0, "max": 2.0},
-            "Ip_MA": {"min": 0.05, "max": 0.5},
-            "betan": {"min": 0.01, "max": 10},
+            "greenwald_fraction": {"min": 0.0, "max": 2.0},
+            "ip": {"min": 5e4, "max": 5e5},
+            "beta_tor_norm": {"min": 0.01, "max": 10},
             # LIUQE geometry moments go nonphysical during the current ramp
-            # (a_minor down to 0.04 m, kappa below 1), which drives derived
+            # (minor_radius down to 0.04 m, elongation below 1), which drives derived
             # features like q_star far outside the physical range
-            "a_minor": {"min": 0.15, "max": 0.30},
-            "R0": {"min": 0.80, "max": 1.0},
-            "kappa": {"min": 0.9, "max": 3.0},
+            "minor_radius": {"min": 0.15, "max": 0.30},
+            "geometric_axis_r": {"min": 0.80, "max": 1.0},
+            "elongation": {"min": 0.9, "max": 3.0},
         }
         self.individual_filter_config = None
 
@@ -332,11 +345,11 @@ class TCVDataWorkflow(DataWorkflow):
                     # Store with proper dimensions
                     interp_vars[signal] = xr.DataArray(
                         interp_profile,
-                        dims=[TIME_DIM, "rho"],
+                        dims=[TIME_DIM, RADIAL_DIM],
                         coords={
                             TIME_DIM: np.arange(len(timebase)),
                             TIME_COORD: (TIME_DIM, timebase),
-                            "rho": profile_rho,
+                            RADIAL_DIM: profile_rho,
                         },
                     )
 
@@ -344,37 +357,30 @@ class TCVDataWorkflow(DataWorkflow):
                     logger.warning(f"Failed to interpolate {signal}: {e}")
 
         # Create the dataset
-        # Coords are already set in the DataArrays, so we just need to extract rho if present
+        # Coords are already set in the DataArrays, so we just need to extract the radial grid if present
         coords = {TIME_DIM: np.arange(len(timebase)), TIME_COORD: (TIME_DIM, timebase)}
-        if "rho" in interp_vars:
-            coords["rho"] = interp_vars.pop("rho")[1]
-        elif "Ne_rho" in interp_vars or "Te_rho" in interp_vars:
-            # Get rho from one of the profile variables
-            if "Ne_rho" in interp_vars:
-                coords["rho"] = interp_vars["Ne_rho"].coords["rho"]
-            elif "Te_rho" in interp_vars:
-                coords["rho"] = interp_vars["Te_rho"].coords["rho"]
+        if "Ne_rho" in interp_vars:
+            coords[RADIAL_DIM] = interp_vars["Ne_rho"].coords[RADIAL_DIM]
+        elif "Te_rho" in interp_vars:
+            coords[RADIAL_DIM] = interp_vars["Te_rho"].coords[RADIAL_DIM]
 
         ds_uniform = xr.Dataset(data_vars=interp_vars, coords=coords)
 
         return ds_uniform
 
     def standardize_signal_names(self, ds: xr.Dataset) -> xr.Dataset | None:
-        """Process raw TCV dataset and prepare it for uniform timebase.
-
-        The raw TCV dataset has each signal on its own timebase. This method
-        validates that critical signals are present but does NOT yet interpolate
-        onto a uniform timebase (that will happen in make_raw_data_files).
+        """Convert the uniform-timebase DEFUSE signals into the on-disk schema (IMAS names, SI units).
 
         Parameters
         ----------
         ds : xr.Dataset
-            Raw dataset with device-specific signal names and per-signal time coordinates
+            DEFUSE signals interpolated onto the uniform timebase
 
         Returns
         -------
         xr.Dataset | None
-            Dataset ready for interpolation, or None if critical signals are missing
+            Dataset in the on-disk schema plus the processing-only edge density,
+            or None if critical signals are missing
         """
 
         # A source file missing required signals (partial DEFUSE export) is
@@ -384,92 +390,55 @@ class TCVDataWorkflow(DataWorkflow):
             logger.warning(f"Missing required raw signals {sorted(missing)}, skipping shot (partial DEFUSE export?)")
             return None
 
-        # Simple renames
-        ds = ds.rename(
+        # DEFUSE is SI except NBI/NBI2/ECRH, which it stores in MW
+        ip = abs(ds["I_P"])
+        ds_standardized = xr.Dataset(
             {
-                "R_geom": "R0",
-                "KAPPA": "kappa",
-                "DELTA_TOP": "delta_top",
-                "DELTA_BOTTOM": "delta_bot",
-                "BETAN": "betan",
-                "BETAP": "beta_p",
+                "ip": ip,
+                "b0": abs(ds["BZERO"]),
+                "energy_mhd": ds["Wtot"],
+                "beta_tor_norm": ds["BETAN"],
+                "n_e_line_average": ds["NEavg"],
+                "minor_radius": ds["a_minor"],
+                "geometric_axis_r": ds["R_geom"],
+                "elongation": ds["KAPPA"],
+                "triangularity_upper": ds["DELTA_TOP"],
+                "triangularity_lower": ds["DELTA_BOTTOM"],
+                "power_ohm": ds["POHM"],
+                "power_radiated": ds["PradBulk"],
+                "t_e": ds["Te_rho"],
+                "n_e": ds["Ne_rho"],
+                EDGE_LINE_AVERAGE: ds["Ne_edge_avg"],
             }
         )
 
-        # Conversions
-        ds["B0"] = np.abs(ds["BZERO"])
-        ds["Ip_MA"] = np.abs(ds["I_P"]) * 1e-6
-        ds["P_oh_MW"] = ds["POHM"] * 1e-6
-        ds["P_rad_MW"] = ds["PradBulk"] * 1e-6
-        ds["ne20_line_avg"] = ds["NEavg"] * 1e-20
-        ds["ne20_edge"] = ds["Ne_edge_avg"] * 1e-20
-        ds["Wtot_MJ"] = ds["Wtot"] * 1e-6
-        if "P_LH" in ds:
-            ds["LH_transition_threshold_MW"] = ds["P_LH"] * 1e-6
-        else:
-            ds["LH_transition_threshold_MW"] = xr.full_like(ds["Ip_MA"], np.nan)
-
-        ds["ne20_rho"] = ds["Ne_rho"] * 1e-20
-        ds["Te_keV_rho"] = ds["Te_rho"] * 1e-3
-
         # Auxiliary heating
-        # DEFUSE stores NBI/NBI2/ECRH in MW already (everything else is SI)
         # Either beam and ECRH can be absent or (1,) in some shots
         # Missing heating means zero power where the plasma exists, NaN elsewhere.
-        valid_ip = ds["Ip_MA"].notnull()
-        nbi_total = xr.zeros_like(ds["Ip_MA"])
+        mask_valid_ip = ip.notnull()
+        power_nbi_MW = xr.zeros_like(ip)
         for beam in ["NBI", "NBI2"]:
             if beam in ds:
-                nbi_total = nbi_total + ds[beam].fillna(0.0)
-        ds["P_NBI_MW"] = xr.where(valid_ip, nbi_total, np.nan)
-        ecrh = ds["ECRH"].fillna(0.0) if "ECRH" in ds else xr.zeros_like(ds["Ip_MA"])
-        ds["P_ECRH_MW"] = xr.where(valid_ip, ecrh, np.nan)
+                power_nbi_MW = power_nbi_MW + ds[beam].fillna(0.0)
+        power_ec_MW = ds["ECRH"].fillna(0.0) if "ECRH" in ds else xr.zeros_like(ip)
+        ds_standardized["power_nbi"] = xr.where(mask_valid_ip, power_nbi_MW * 1e6, np.nan)
+        ds_standardized["power_ec"] = xr.where(mask_valid_ip, power_ec_MW * 1e6, np.nan)
         # TCV has no ICRF or LH heating systems
-        ds["P_ICRF_MW"] = xr.where(valid_ip, 0.0, np.nan)
-        ds["P_LH_MW"] = xr.where(valid_ip, 0.0, np.nan)
-
-        # Only keep variables of interest
-        kept_vars = {
-            # POWER BALANCE
-            "Wtot_MJ",
-            "P_oh_MW",
-            "P_rad_MW",
-            "P_ICRF_MW",
-            "P_LH_MW",
-            "P_NBI_MW",
-            "P_ECRH_MW",
-            # PROFILE PREDICTOR TRAINING
-            "Te_keV_rho",
-            "ne20_rho",
-            "Ip_MA",
-            "B0",
-            "betan",
-            "ne20_line_avg",
-            "R0",
-            "kappa",
-            "a_minor",
-            "delta_top",
-            "delta_bot",
-            # OTHER
-            "beta_p",  # LIUQE
-            "ne20_edge",
-            "LH_transition_threshold_MW",
-        }
-
-        ds = ds[list(kept_vars)]
+        ds_standardized["power_ic"] = xr.where(mask_valid_ip, 0.0, np.nan)
+        ds_standardized["power_lh"] = xr.where(mask_valid_ip, 0.0, np.nan)
 
         # If any *important* signal is all NaN, return None to skip this shot
-        if self.has_all_nan_signal(ds, ["Te_keV_rho", "ne20_rho", "Ip_MA"]):
+        if self.has_all_nan_signal(ds_standardized, ["t_e", "n_e", "ip"]):
             return None
 
-        return ds
+        return ds_standardized
 
     def device_specific_processing(self, ds: xr.Dataset) -> xr.Dataset:
         """Apply TCV specific processing steps.
 
         This includes:
-        - Greenwald fraction for the fGW range filter
-        - Simple fringe-jump correction for ne20_line_avg
+        - Greenwald fraction for the greenwald_fraction range filter
+        - Simple fringe-jump correction for the line-averaged densities
 
         Parameters
         ----------
@@ -482,38 +451,39 @@ class TCVDataWorkflow(DataWorkflow):
             Processed dataset ready for general workflow
         """
 
-        # Greenwald fraction for the fGW range filter
-        # n_GW = Ip/(pi a^2) in 1e20 m^-3 with Ip in MA.
-        if all(v in ds for v in ("ne20_line_avg", "Ip_MA", "a_minor")):
-            ds["fGW"] = ds["ne20_line_avg"] / (ds["Ip_MA"] / (np.pi * ds["a_minor"] ** 2))
+        # Greenwald fraction for the range filter
+        # n_GW [1e20 m^-3] = ip [MA] / (pi a^2)
+        n_e_line_average_1e20 = ds["n_e_line_average"] * 1e-20
+        ip_MA = ds["ip"] * 1e-6
+        n_greenwald_1e20 = ip_MA / (np.pi * ds["minor_radius"] ** 2)
+        ds["greenwald_fraction"] = n_e_line_average_1e20 / n_greenwald_1e20
 
-        # Simple fringe-jump correction for ne20_line_avg
+        # Simple fringe-jump correction for the line-averaged densities
         # Detect large step changes and remove the offset for the remainder of the trace
-        for density_var in ["ne20_line_avg", "ne20_edge"]:
-            if density_var in ds:
-                ne_values = ds[density_var].values[0, :]
-                if not np.all(np.isnan(ne_values)):
-                    trace = ne_values.copy()
-                    diff = np.diff(trace)
-                    median_abs_diff = np.nanmedian(np.abs(diff))
-                    jump_threshold = max(0.1, 5.0 * median_abs_diff)
+        for density_var in ["n_e_line_average", EDGE_LINE_AVERAGE]:
+            ne_values = ds[density_var].values[0, :]
+            if not np.all(np.isnan(ne_values)):
+                trace = ne_values.copy()
+                diff = np.diff(trace)
+                median_abs_diff = np.nanmedian(np.abs(diff))
+                jump_threshold = max(FRINGE_JUMP_MIN_M3, 5.0 * median_abs_diff)
 
-                    # Cumulative offset after each detected jump
-                    offset = 0.0
-                    corrected = trace.copy()
-                    for i in range(1, trace.size):
-                        if np.isnan(trace[i - 1]) or np.isnan(trace[i]):
-                            corrected[i] = trace[i] - offset
-                            continue
-                        step = trace[i] - trace[i - 1]
-                        if np.abs(step) >= jump_threshold:
-                            offset += step
+                # Cumulative offset after each detected jump
+                offset = 0.0
+                corrected = trace.copy()
+                for i in range(1, trace.size):
+                    if np.isnan(trace[i - 1]) or np.isnan(trace[i]):
                         corrected[i] = trace[i] - offset
+                        continue
+                    step = trace[i] - trace[i - 1]
+                    if np.abs(step) >= jump_threshold:
+                        offset += step
+                    corrected[i] = trace[i] - offset
 
-                    ds[density_var] = (
-                        ds[density_var].dims,
-                        corrected[np.newaxis, :],
-                    )
+                ds[density_var] = (
+                    ds[density_var].dims,
+                    corrected[np.newaxis, :],
+                )
 
         return ds
 
@@ -531,17 +501,17 @@ class TCVDataWorkflow(DataWorkflow):
             logger.info(f"Culling shot {ds.shot.values[0]} due to known data issues")
             return True
 
-        if "P_rad_MW" in ds:
-            p_rad_avg = ds["P_rad_MW"].mean().item()
-            if p_rad_avg < 0.02 or ds["P_rad_MW"].isnull().all():
-                logger.info(
-                    f"Culling shot {ds.shot.values[0]} due to consistently low or missing radiated power measurement (P_rad_MW.mean() < 0.02 MW)"
-                )
-                return True
+        power_radiated_mean = ds["power_radiated"].mean().item()
+        if power_radiated_mean < 2e4 or ds["power_radiated"].isnull().all():
+            logger.info(
+                f"Culling shot {ds.shot.values[0]} due to consistently low or missing radiated power measurement (mean power_radiated < 20 kW)"
+            )
+            return True
 
-        ne_line_avg = ds["ne20_line_avg"].mean().item()
-        ne_edge_avg = ds["ne20_edge"].mean().item()
-        if ne_edge_avg > (2 * ne_line_avg) or ds["ne20_line_avg"].isnull().all() or ds["ne20_edge"].isnull().all():
+        n_e_line_average_mean = ds["n_e_line_average"].mean().item()
+        n_e_edge_mean = ds[EDGE_LINE_AVERAGE].mean().item()
+        mask_edge_too_high = n_e_edge_mean > (2 * n_e_line_average_mean)
+        if mask_edge_too_high or ds["n_e_line_average"].isnull().all() or ds[EDGE_LINE_AVERAGE].isnull().all():
             logger.info(f"Culling shot {ds.shot.values[0]} due to edge density being significantly higher than line-avg density")
             return True
 

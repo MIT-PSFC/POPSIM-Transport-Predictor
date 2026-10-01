@@ -1,3 +1,5 @@
+"""Diagnostic plots of a device store, drawn in the study's working units."""
+
 from pathlib import Path
 
 import matplotlib.pyplot as plt
@@ -5,7 +7,9 @@ import numpy as np
 import xarray as xr
 from matplotlib.backends.backend_pdf import PdfPages
 
+from transport_study import RADIAL_DIM
 from transport_study.plot_style import BACKGROUND_COLOR, FACE_COLOR, TEXT_COLOR
+from transport_study.signals import convert_to_working_units
 
 TITLE_FONTSIZE = 20
 LABEL_FONTSIZE = 20
@@ -13,208 +17,26 @@ TICK_FONTSIZE = 18
 LEGEND_FONTSIZE = 18
 
 
-def ds_power_balance_time_plot(  # noqa: PLR0915
-    ds: str | xr.Dataset,
-    fig_dir: Path | str,
-    num_shots: int | None = 9999,
-    title: str = "Dataset Time Traces",
-):
-    """Plot time traces of signals from the dataset"""
+POWER_COLORS = {
+    "power_ohm_MW": "orange",
+    "power_radiated_MW": "red",
+    "power_nbi_MW": "cyan",
+    "power_ec_MW": "lime",
+    "power_lh_MW": "yellow",
+    "power_ic_MW": "magenta",
+}
+SHAPE_COLORS = {"minor_radius": "red", "elongation": "yellow", "triangularity_upper": "lime", "triangularity_lower": "green"}
+
+
+def _working_unit_dataset(ds: str | Path | xr.Dataset) -> xr.Dataset:
+    """A device store (path or dataset) in the study's working units."""
     if isinstance(ds, (str, Path)):
         ds_path = str(ds)
-        if ds_path.endswith(".zarr"):
-            ds = xr.open_zarr(ds_path)
-        else:
-            ds = xr.open_dataset(ds_path)
-
-    Path(fig_dir).mkdir(parents=True, exist_ok=True)
-
-    # Compute global y-limits across all shots for consistent axes
-    ylim_ip = (0, float(np.nanmax(np.abs(ds["Ip_MA"].values))) * 1.1)
-    ylim_wtot = (0, float(np.nanmax(ds["Wtot_MJ"].values)) * 1.1)
-
-    power_signals = [
-        "P_oh_MW",
-        "P_rad_MW",
-        "P_NBI_MW",
-        "P_ECRH_MW",
-        "P_LH_MW",
-        "P_ICRF_MW",
-    ]
-    power_max = min(max(float(np.nanmax(ds[sig].values)) for sig in power_signals), 10)
-    if "LH_transition_threshold_MW" in ds:
-        lh_thresh_max = float(np.nanmax(ds["LH_transition_threshold_MW"].values / 1e6))
-    else:
-        lh_thresh_max = 0
-    ylim_power = (0, max(power_max, lh_thresh_max) * 1.1)
-
-    density_signals = ["ne20_line_avg", "ne20_edge"]
-    density_max = min(max(float(np.nanmax(ds[sig].values)) for sig in density_signals), 5)
-    ylim_ne = (0, density_max * 1.1)
-
-    # B0 y-limits for density plot right axis
-    if "B0" in ds:
-        ylim_b0 = (0, float(np.nanmax(ds["B0"].values)) * 1.1)
-    else:
-        ylim_b0 = (0, 5)  # Default range
-
-    shape_signals = ["a_minor", "kappa", "delta_top", "delta_bot"]
-    shape_min = min(float(np.nanmin(ds[sig].values)) for sig in shape_signals)
-    shape_max = max(float(np.nanmax(ds[sig].values)) for sig in shape_signals)
-    ylim_shape = (
-        shape_min * 0.9 if shape_min > 0 else shape_min * 1.1,
-        shape_max * 1.1,
-    )
-
-    # R0 y-limits for shaping plot right axis
-    if "R0" in ds:
-        ylim_r0 = (0, float(np.nanmax(ds["R0"].values)) * 1.1)
-    else:
-        ylim_r0 = (0, 3)  # Default range
-
-    for shot in ds["shot"].data[:num_shots]:
-        shot_ds = ds.sel(shot=shot)
-
-        fig, axes = plt.subplots(4, 1, figsize=(16, 16), sharex=True)
-        fig.patch.set_facecolor(BACKGROUND_COLOR)
-
-        fig.suptitle(f"{title} - {shot}", fontsize=TITLE_FONTSIZE, color=TEXT_COLOR)
-
-        # Ip and Wtot
-        ax_ip = axes[0]
-        # Put Ip on the left y axis and Wtot on the right y axis
-        ax_ip.plot(shot_ds["time"], shot_ds["Ip_MA"], label="Ip [MA]", color="cyan")
-        ax_ip.set_ylabel("Ip [MA]", fontsize=LABEL_FONTSIZE, color="cyan")
-        ax_ip.set_ylim(ylim_ip)
-        ax_wtot = ax_ip.twinx()
-        if "Wtot_MJ" in shot_ds:
-            ax_wtot.plot(shot_ds["time"], shot_ds["Wtot_MJ"], label="Wtot [MJ]", color="red")
-        if "Wmhd_MJ" in shot_ds:
-            ax_wtot.plot(
-                shot_ds["time"],
-                shot_ds["Wmhd_MJ"],
-                label="Wmhd [MJ]",
-                color="orange",
-                linestyle="--",
-            )
-        ax_wtot.set_ylabel("Stored Energy [MJ]", fontsize=LABEL_FONTSIZE, color="red")
-        ax_wtot.set_ylim(ylim_wtot)
-        ax_wtot.tick_params(axis="y", labelsize=TICK_FONTSIZE, colors=TEXT_COLOR)
-
-        # powers
-        ax_power = axes[1]
-        ax_power.plot(shot_ds["time"], shot_ds["P_oh_MW"], label="P_oh [MW]", color="orange")
-        ax_power.plot(shot_ds["time"], shot_ds["P_rad_MW"], label="P_rad [MW]", color="red")
-        ax_power.plot(shot_ds["time"], shot_ds["P_NBI_MW"], label="P_NBI [MW]", color="cyan")
-        ax_power.plot(shot_ds["time"], shot_ds["P_ECRH_MW"], label="P_ECRH [MW]", color="lime")
-        if "LH_transition_threshold_MW" in shot_ds:
-            ax_power.plot(
-                shot_ds["time"],
-                shot_ds["LH_transition_threshold_MW"] / 1e6,
-                label="LH_Thresh [MW]",
-                color="white",
-                linestyle="--",
-            )
-        ax_power.set_ylabel("Power [MW]", fontsize=LABEL_FONTSIZE, color="white")
-        ax_power.set_ylim(ylim_power)
-        ax_power.legend(
-            fontsize=LEGEND_FONTSIZE,
-            facecolor=BACKGROUND_COLOR,
-            edgecolor=BACKGROUND_COLOR,
-            loc="upper left",
-        )
-
-        # line avg and edge density
-        ax_ne = axes[2]
-        ax_ne.plot(
-            shot_ds["time"],
-            shot_ds["ne20_line_avg"],
-            label="ne20_line_avg",
-            color="white",
-        )
-        ax_ne.plot(
-            shot_ds["time"],
-            shot_ds["ne20_edge"],
-            label="ne20_edge",
-            color="yellow",
-        )
-        ax_ne.set_ylabel("ne20 [m^-3]", fontsize=LABEL_FONTSIZE, color="white")
-        ax_ne.set_ylim(ylim_ne)
-
-        # Dots at 0 for fresh profiles
-        ax_ne.plot(
-            shot_ds["time"],
-            np.where(shot_ds["fresh_profiles"] > 0, 0, np.nan),
-            color="green",
-            marker="o",
-            linestyle="None",
-        )
-
-        # Add B0 on right axis
-        ax_b0 = ax_ne.twinx()
-        if "B0" in shot_ds:
-            ax_b0.plot(
-                shot_ds["time"],
-                shot_ds["B0"],
-                label="B0 [T]",
-                color="magenta",
-                linestyle="-",
-            )
-        ax_b0.set_ylabel("B0 [T]", fontsize=LABEL_FONTSIZE, color="magenta")
-        ax_b0.set_ylim(ylim_b0)
-        ax_b0.tick_params(axis="y", labelsize=TICK_FONTSIZE, colors=TEXT_COLOR)
-
-        # Shaping
-        ax_shape = axes[3]
-        ax_shape.plot(shot_ds["time"], shot_ds["a_minor"], label="a_minor", color="red")
-        ax_shape.plot(shot_ds["time"], shot_ds["kappa"], label="kappa", color="yellow")
-        ax_shape.plot(shot_ds["time"], shot_ds["delta_top"], label="delta_top", color="lime")
-        ax_shape.plot(
-            shot_ds["time"],
-            shot_ds["delta_bot"],
-            label="delta_bot",
-            color="green",
-        )
-        ax_shape.set_ylabel("Shaping", fontsize=LABEL_FONTSIZE, color="white")
-        ax_shape.set_ylim(ylim_shape)
-        ax_shape.set_xlabel("Time [s]", fontsize=LABEL_FONTSIZE, color="white")
-        ax_shape.legend(
-            fontsize=LEGEND_FONTSIZE,
-            facecolor=BACKGROUND_COLOR,
-            edgecolor=BACKGROUND_COLOR,
-            loc="upper left",
-        )
-
-        # Add R0 on right axis
-        ax_r0 = ax_shape.twinx()
-        if "R0" in shot_ds:
-            ax_r0.plot(
-                shot_ds["time"],
-                shot_ds["R0"],
-                label="R0 [m]",
-                color="cyan",
-                linestyle="--",
-            )
-        ax_r0.set_ylabel("R0 [m]", fontsize=LABEL_FONTSIZE, color="cyan")
-        ax_r0.set_ylim(ylim_r0)
-        ax_r0.tick_params(axis="y", labelsize=TICK_FONTSIZE, colors=TEXT_COLOR)
-
-        for ax in axes:
-            ax.set_facecolor(FACE_COLOR)
-            ax.grid(True, color="gray", linestyle="--", linewidth=0.1)
-            ax.tick_params(axis="both", labelsize=TICK_FONTSIZE, colors=TEXT_COLOR)
-            try:
-                for text in ax.get_legend().get_texts():
-                    text.set_color(TEXT_COLOR)
-            except AttributeError:
-                pass
-
-        fig.tight_layout()
-        fig.savefig(f"{fig_dir}/{shot}_trace.png")
-        plt.close(fig)
+        ds = xr.open_zarr(ds_path) if ds_path.endswith(".zarr") else xr.open_dataset(ds_path)
+    return convert_to_working_units(ds)
 
 
-def ds_profile_time_plot(  # noqa: PLR0915, PLR0912
+def ds_profile_time_plot(  # noqa: PLR0915
     ds: str | xr.Dataset,
     fig_dir: Path | str,
     num_shots: int | None = 9999,
@@ -223,76 +45,38 @@ def ds_profile_time_plot(  # noqa: PLR0915, PLR0912
     """Plot time traces of all signals of interest from the dataset.
 
     Four axes:
-    1. Ip_MA, Wtot_MJ, and betan
-    2. Line averaged density and B0
+    1. ip, energy_mhd, and beta_tor_norm
+    2. Line averaged density and b0
     3. All power sources and sinks
     4. Shaping parameters
     """
-    if isinstance(ds, (str, Path)):
-        ds_path = str(ds)
-        if ds_path.endswith(".zarr"):
-            ds = xr.open_zarr(ds_path)
-        else:
-            ds = xr.open_dataset(ds_path)
+    ds = _working_unit_dataset(ds)
 
     Path(fig_dir).mkdir(parents=True, exist_ok=True)
 
     # Compute global y-limits across all shots for consistent axes
-    ylim_ip = (0, float(np.nanmax(np.abs(ds["Ip_MA"].values))) * 1.1)
-    if "Wtot_MJ" in ds:
-        ylim_wtot = (0, float(np.nanmax(ds["Wtot_MJ"].values)) * 1.1)
-    else:
-        ylim_wtot = (0, 1)  # Default range
-    if "betan" in ds:
-        ylim_betan = (0, float(np.nanmax(ds["betan"].values)) * 1.1)
-    else:
-        ylim_betan = (0, 1)  # Default range
+    ylim_ip = (0, float(np.nanmax(np.abs(ds["ip_MA"].values))) * 1.1)
+    ylim_wtot = (0, float(np.nanmax(ds["energy_mhd_MJ"].values)) * 1.1)
+    ylim_betan = (0, float(np.nanmax(ds["beta_tor_norm"].values)) * 1.1)
 
-    density_signals = [sig for sig in ["ne20_line_avg", "ne20_edge"] if sig in ds]
-    density_max = min(max(float(np.nanmax(ds[sig].values)) for sig in density_signals), 5)
+    density_max = min(float(np.nanmax(ds["n_e_line_average_1e20"].values)), 5)
     ylim_ne = (0, density_max * 1.1)
 
-    # B0 y-limits for density plot right axis
-    if "B0" in ds:
-        ylim_b0 = (0, float(np.nanmax(ds["B0"].values)) * 1.1)
-    else:
-        ylim_b0 = (0, 5)  # Default range
+    # b0 y-limits for density plot right axis
+    ylim_b0 = (0, float(np.nanmax(ds["b0"].values)) * 1.1)
 
-    power_signals = [
-        sig
-        for sig in [
-            "P_oh_MW",
-            "P_rad_MW",
-            "P_NBI_MW",
-            "P_ECRH_MW",
-            "P_LH_MW",
-            "P_ICRF_MW",
-        ]
-        if sig in ds
-    ]
-    if power_signals:
-        power_max = min(max(float(np.nanmax(ds[sig].values)) for sig in power_signals), 10)
-    else:
-        power_max = 1
-    if "LH_transition_threshold_MW" in ds:
-        lh_thresh_max = float(np.nanmax(ds["LH_transition_threshold_MW"].values / 1e6))
-    else:
-        lh_thresh_max = 0
-    ylim_power = (0, max(power_max, lh_thresh_max) * 1.1)
+    power_max = min(max(float(np.nanmax(ds[sig].values)) for sig in POWER_COLORS), 10)
+    ylim_power = (0, power_max * 1.1)
 
-    shape_signals = ["a_minor", "kappa", "delta_top", "delta_bot"]
-    shape_min = min(float(np.nanmin(ds[sig].values)) for sig in shape_signals)
-    shape_max = max(float(np.nanmax(ds[sig].values)) for sig in shape_signals)
+    shape_min = min(float(np.nanmin(ds[sig].values)) for sig in SHAPE_COLORS)
+    shape_max = max(float(np.nanmax(ds[sig].values)) for sig in SHAPE_COLORS)
     ylim_shape = (
         shape_min * 0.9 if shape_min > 0 else shape_min * 1.1,
         shape_max * 1.1,
     )
 
-    # R0 y-limits for shaping plot right axis
-    if "R0" in ds:
-        ylim_r0 = (0, float(np.nanmax(ds["R0"].values)) * 1.1)
-    else:
-        ylim_r0 = (0, 3)  # Default range
+    # geometric_axis_r y-limits for shaping plot right axis
+    ylim_r0 = (0, float(np.nanmax(ds["geometric_axis_r"].values)) * 1.1)
 
     # If any ylim is NaN or infinite, set it to a default range
     if not np.isfinite(ylim_ip).all():
@@ -320,13 +104,12 @@ def ds_profile_time_plot(  # noqa: PLR0915, PLR0912
 
         fig.suptitle(f"{title} - {shot}", fontsize=TITLE_FONTSIZE, color=TEXT_COLOR)
 
-        # Ip, Wtot, and betan
+        # ip, energy_mhd, and beta_tor_norm
         ax_ip = axes[0]
-        # Put Ip and Wtot on the left y axis and betan on the right y axis
-        ax_ip.plot(shot_ds["time"], shot_ds["Ip_MA"], label="Ip [MA]", color="cyan")
-        if "Wtot_MJ" in shot_ds:
-            ax_ip.plot(shot_ds["time"], shot_ds["Wtot_MJ"], label="Wtot [MJ]", color="red")
-        ax_ip.set_ylabel("Ip [MA] / Wtot [MJ]", fontsize=LABEL_FONTSIZE, color="white")
+        # Put ip and energy_mhd on the left y axis and beta_tor_norm on the right y axis
+        ax_ip.plot(shot_ds["time"], shot_ds["ip_MA"], label="ip [MA]", color="cyan")
+        ax_ip.plot(shot_ds["time"], shot_ds["energy_mhd_MJ"], label="energy_mhd [MJ]", color="red")
+        ax_ip.set_ylabel("ip [MA] / energy_mhd [MJ]", fontsize=LABEL_FONTSIZE, color="white")
         ax_ip.set_ylim((0, max(ylim_ip[1], ylim_wtot[1])))
         ax_ip.legend(
             fontsize=LEGEND_FONTSIZE,
@@ -335,40 +118,30 @@ def ds_profile_time_plot(  # noqa: PLR0915, PLR0912
             loc="upper left",
         )
         ax_betan = ax_ip.twinx()
-        if "betan" in shot_ds:
-            ax_betan.plot(shot_ds["time"], shot_ds["betan"], label="betan", color="magenta")
+        ax_betan.plot(shot_ds["time"], shot_ds["beta_tor_norm"], label="beta_tor_norm", color="magenta")
         ax_betan.set_ylabel("Normalized Beta", fontsize=LABEL_FONTSIZE, color="magenta")
         ax_betan.set_ylim(ylim_betan)
         ax_betan.tick_params(axis="y", labelsize=TICK_FONTSIZE, colors=TEXT_COLOR)
 
-        # line avg and edge density
+        # line averaged density
         ax_ne = axes[1]
-        if "ne20_line_avg" in shot_ds:
-            ax_ne.plot(
-                shot_ds["time"],
-                shot_ds["ne20_line_avg"],
-                label="ne20_line_avg",
-                color="white",
-            )
-        if "ne20_edge" in shot_ds:
-            ax_ne.plot(
-                shot_ds["time"],
-                shot_ds["ne20_edge"],
-                label="ne20_edge",
-                color="yellow",
-            )
-        ax_ne.set_ylabel("ne20 [10^20 m^-3]", fontsize=LABEL_FONTSIZE, color="white")
+        ax_ne.plot(
+            shot_ds["time"],
+            shot_ds["n_e_line_average_1e20"],
+            label="n_e_line_average",
+            color="white",
+        )
+        ax_ne.set_ylabel("n_e [10^20 m^-3]", fontsize=LABEL_FONTSIZE, color="white")
         ax_ne.set_ylim(ylim_ne)
 
         # Dots at 0 for fresh profiles
-        if "fresh_profiles" in shot_ds:
-            ax_ne.plot(
-                shot_ds["time"],
-                np.where(shot_ds["fresh_profiles"] > 0, 0, np.nan),
-                color="green",
-                marker="o",
-                linestyle="None",
-            )
+        ax_ne.plot(
+            shot_ds["time"],
+            np.where(shot_ds["fresh_profile"] > 0, 0, np.nan),
+            color="green",
+            marker="o",
+            linestyle="None",
+        )
         ax_ne.legend(
             fontsize=LEGEND_FONTSIZE,
             facecolor=BACKGROUND_COLOR,
@@ -376,44 +149,27 @@ def ds_profile_time_plot(  # noqa: PLR0915, PLR0912
             loc="upper left",
         )
 
-        # Add B0 on right axis
+        # Add b0 on right axis
         ax_b0 = ax_ne.twinx()
-        if "B0" in shot_ds:
-            ax_b0.plot(
-                shot_ds["time"],
-                shot_ds["B0"],
-                label="B0 [T]",
-                color="magenta",
-                linestyle="-",
-            )
-        ax_b0.set_ylabel("B0 [T]", fontsize=LABEL_FONTSIZE, color="magenta")
+        ax_b0.plot(
+            shot_ds["time"],
+            shot_ds["b0"],
+            label="b0 [T]",
+            color="magenta",
+            linestyle="-",
+        )
+        ax_b0.set_ylabel("b0 [T]", fontsize=LABEL_FONTSIZE, color="magenta")
         ax_b0.set_ylim(ylim_b0)
         ax_b0.tick_params(axis="y", labelsize=TICK_FONTSIZE, colors=TEXT_COLOR)
 
         # All power sources and sinks
         ax_power = axes[2]
-        power_colors = {
-            "P_oh_MW": "orange",
-            "P_rad_MW": "red",
-            "P_NBI_MW": "cyan",
-            "P_ECRH_MW": "lime",
-            "P_LH_MW": "yellow",
-            "P_ICRF_MW": "magenta",
-        }
-        for sig in power_signals:
+        for sig, color in POWER_COLORS.items():
             ax_power.plot(
                 shot_ds["time"],
                 shot_ds[sig],
-                label=f"{sig.replace('_MW', '')} [MW]",
-                color=power_colors[sig],
-            )
-        if "LH_transition_threshold_MW" in shot_ds:
-            ax_power.plot(
-                shot_ds["time"],
-                shot_ds["LH_transition_threshold_MW"] / 1e6,
-                label="LH_Thresh [MW]",
-                color="white",
-                linestyle="--",
+                label=f"{sig.removesuffix('_MW')} [MW]",
+                color=color,
             )
         ax_power.set_ylabel("Power [MW]", fontsize=LABEL_FONTSIZE, color="white")
         ax_power.set_ylim(ylim_power)
@@ -426,15 +182,8 @@ def ds_profile_time_plot(  # noqa: PLR0915, PLR0912
 
         # Shaping
         ax_shape = axes[3]
-        ax_shape.plot(shot_ds["time"], shot_ds["a_minor"], label="a_minor", color="red")
-        ax_shape.plot(shot_ds["time"], shot_ds["kappa"], label="kappa", color="yellow")
-        ax_shape.plot(shot_ds["time"], shot_ds["delta_top"], label="delta_top", color="lime")
-        ax_shape.plot(
-            shot_ds["time"],
-            shot_ds["delta_bot"],
-            label="delta_bot",
-            color="green",
-        )
+        for sig, color in SHAPE_COLORS.items():
+            ax_shape.plot(shot_ds["time"], shot_ds[sig], label=sig, color=color)
         ax_shape.set_ylabel("Shaping", fontsize=LABEL_FONTSIZE, color="white")
         ax_shape.set_ylim(ylim_shape)
         ax_shape.set_xlabel("Time [s]", fontsize=LABEL_FONTSIZE, color="white")
@@ -445,17 +194,16 @@ def ds_profile_time_plot(  # noqa: PLR0915, PLR0912
             loc="upper left",
         )
 
-        # Add R0 on right axis
+        # Add geometric_axis_r on right axis
         ax_r0 = ax_shape.twinx()
-        if "R0" in shot_ds:
-            ax_r0.plot(
-                shot_ds["time"],
-                shot_ds["R0"],
-                label="R0 [m]",
-                color="cyan",
-                linestyle="--",
-            )
-        ax_r0.set_ylabel("R0 [m]", fontsize=LABEL_FONTSIZE, color="cyan")
+        ax_r0.plot(
+            shot_ds["time"],
+            shot_ds["geometric_axis_r"],
+            label="geometric_axis_r [m]",
+            color="cyan",
+            linestyle="--",
+        )
+        ax_r0.set_ylabel("geometric_axis_r [m]", fontsize=LABEL_FONTSIZE, color="cyan")
         ax_r0.set_ylim(ylim_r0)
         ax_r0.tick_params(axis="y", labelsize=TICK_FONTSIZE, colors=TEXT_COLOR)
 
@@ -481,24 +229,19 @@ def ds_profile_plot(
     title: str = "Dataset Time Traces",
 ):
     """Plot profile traces of signals from the dataset"""
-    if isinstance(ds, (str, Path)):
-        ds_path = str(ds)
-        if ds_path.endswith(".zarr"):
-            ds = xr.open_zarr(ds_path)
-        else:
-            ds = xr.open_dataset(ds_path)
+    ds = _working_unit_dataset(ds)
 
     Path(fig_dir).mkdir(parents=True, exist_ok=True)
 
     for shot in ds["shot"].data[:num_shots]:
         shot_ds = ds.sel(shot=shot)
 
-        rho = shot_ds["rho"].values
+        rho = shot_ds[RADIAL_DIM].values
         time = shot_ds["time"].values
 
         # Extract 2D arrays for density and temperature
-        ne_data = shot_ds["ne20_rho"].values.T  # shape: (rho, time) - transposed
-        te_data = shot_ds["Te_keV_rho"].values.T  # shape: (rho, time) - transposed
+        ne_data = shot_ds["n_e_1e20"].transpose(RADIAL_DIM, ...).values  # shape: (rho, time)
+        te_data = shot_ds["t_e_keV"].transpose(RADIAL_DIM, ...).values  # shape: (rho, time)
 
         # Create masks for timesteps with NaN values
         ne_nan_mask = np.isnan(ne_data).any(axis=0)  # True if any NaN in that timestep
@@ -539,7 +282,7 @@ def ds_profile_plot(
                 extent=[0, np.nanmax(time), rho.min(), rho.max()],
             )
 
-        ax_ne.set_ylabel(r"$\rho$", fontsize=LABEL_FONTSIZE, color=TEXT_COLOR)
+        ax_ne.set_ylabel(r"$\rho_{tor,N}$", fontsize=LABEL_FONTSIZE, color=TEXT_COLOR)
         ax_ne.set_title(r"$n_e$ [$10^{20}$ m$^{-3}$]", fontsize=LABEL_FONTSIZE, color=TEXT_COLOR)
         cbar_ne = plt.colorbar(im_ne, ax=ax_ne)
         cbar_ne.ax.tick_params(labelsize=TICK_FONTSIZE, colors=TEXT_COLOR)
@@ -568,7 +311,7 @@ def ds_profile_plot(
                 extent=[0, np.nanmax(time), rho.min(), rho.max()],
             )
 
-        ax_te.set_ylabel(r"$\rho$", fontsize=LABEL_FONTSIZE, color=TEXT_COLOR)
+        ax_te.set_ylabel(r"$\rho_{tor,N}$", fontsize=LABEL_FONTSIZE, color=TEXT_COLOR)
         ax_te.set_xlabel("Time [s]", fontsize=LABEL_FONTSIZE, color=TEXT_COLOR)
         ax_te.set_title(r"$T_e$ [keV]", fontsize=LABEL_FONTSIZE, color=TEXT_COLOR)
         cbar_te = plt.colorbar(im_te, ax=ax_te)
@@ -589,50 +332,43 @@ def ds_profile_plot(
 # Panel layout for the per-shot summary report: one row per dict, left/right axes
 _SUMMARY_PANEL_DEFS = [
     dict(
-        left_vars=["Ip_MA"],
-        left_label="Ip [MA]",
-        left_colors={"Ip_MA": "cyan"},
+        left_vars=["ip_MA"],
+        left_label="ip [MA]",
+        left_colors={"ip_MA": "cyan"},
         left_floor_zero=True,
         left_abs=True,
-        right_vars=["B0"],
-        right_label="B0 [T]",
-        right_colors={"B0": "magenta"},
+        right_vars=["b0"],
+        right_label="b0 [T]",
+        right_colors={"b0": "magenta"},
         right_floor_zero=True,
     ),
     dict(
-        left_vars=["Wtot_MJ"],
-        left_label="Wtot [MJ]",
-        left_colors={"Wtot_MJ": "red"},
+        left_vars=["energy_mhd_MJ"],
+        left_label="energy_mhd [MJ]",
+        left_colors={"energy_mhd_MJ": "red"},
         left_floor_zero=True,
-        right_vars=["betan"],
-        right_label="betan",
-        right_colors={"betan": "magenta"},
+        right_vars=["beta_tor_norm"],
+        right_label="beta_tor_norm",
+        right_colors={"beta_tor_norm": "magenta"},
         right_floor_zero=True,
     ),
     dict(
-        left_vars=["ne20_line_avg", "ne20_edge"],
-        left_label="ne20 [1e20 m^-3]",
-        left_colors={"ne20_line_avg": "white", "ne20_edge": "yellow"},
+        left_vars=["n_e_line_average_1e20"],
+        left_label="n_e [1e20 m^-3]",
+        left_colors={"n_e_line_average_1e20": "white"},
         left_floor_zero=True,
         left_cap=5,
         show_fresh_profiles=True,
     ),
     dict(
-        left_vars=["a_minor", "kappa", "delta_top", "delta_bot"],
+        left_vars=list(SHAPE_COLORS),
         left_label="Shaping",
-        left_colors={"a_minor": "red", "kappa": "yellow", "delta_top": "lime", "delta_bot": "green"},
+        left_colors=SHAPE_COLORS,
     ),
     dict(
-        left_vars=["P_oh_MW", "P_rad_MW", "P_NBI_MW", "P_ECRH_MW", "P_LH_MW", "P_ICRF_MW"],
+        left_vars=list(POWER_COLORS),
         left_label="Power [MW]",
-        left_colors={
-            "P_oh_MW": "orange",
-            "P_rad_MW": "red",
-            "P_NBI_MW": "cyan",
-            "P_ECRH_MW": "lime",
-            "P_LH_MW": "yellow",
-            "P_ICRF_MW": "magenta",
-        },
+        left_colors=POWER_COLORS,
         left_floor_zero=True,
         left_cap=10,
     ),
@@ -693,10 +429,10 @@ def _plot_summary_panel(ax, shot_ds, panel, ylims):
         ax.set_ylim(ylims["left"])
 
     # Green dots at 0 marking timesteps that have fresh profiles
-    if panel.get("show_fresh_profiles") and "fresh_profiles" in shot_ds:
+    if panel.get("show_fresh_profiles"):
         ax.plot(
             shot_ds["time"],
-            np.where(shot_ds["fresh_profiles"] > 0, 0, np.nan),
+            np.where(shot_ds["fresh_profile"] > 0, 0, np.nan),
             color="green",
             marker="o",
             linestyle="None",
@@ -797,18 +533,16 @@ def ds_summary_report(
     """Make a multi-page PDF report of time traces for all input signals, plus a summary stats page.
 
     One page per shot, each with 5 panels:
-    1. Ip_MA and B0
-    2. Wtot_MJ and betan
-    3. ne20 (line-average and edge), with green dots marking fresh-profile timesteps
-    4. Shaping parameters (a_minor, kappa, delta_top, delta_bot)
+    1. ip and b0
+    2. energy_mhd and beta_tor_norm
+    3. Line averaged density, with green dots marking fresh-profile timesteps
+    4. Shaping parameters (minor_radius, elongation, triangularity_upper, triangularity_lower)
     5. Power sources and sinks
 
     Y-limits are computed once across the whole dataset so axes are consistent between shots.
     A final page has summary statistics (min / max / mean / std) for every variable.
     """
-    if isinstance(ds, (str, Path)):
-        ds_path = str(ds)
-        ds = xr.open_zarr(ds_path) if ds_path.endswith(".zarr") else xr.open_dataset(ds_path)
+    ds = _working_unit_dataset(ds)
 
     Path(pdf_path).parent.mkdir(parents=True, exist_ok=True)
     shots = ds["shot"].data if num_shots is None else ds["shot"].data[:num_shots]
@@ -823,140 +557,3 @@ def ds_summary_report(
         fig = _summary_stats_page(ds, title)
         pdf.savefig(fig)
         plt.close(fig)
-
-
-def fit_mean_ylim(fit_mean: np.ndarray, fallback: float, pad: float = 1.05) -> float:
-    """Top y-limit for a TS fit panel: a little over the largest GP fit mean.
-
-    Computed across the whole shot so every page shares the same axis. Returns
-    fallback when the fit is all-NaN or non-positive.
-    """
-    hi = float(np.nanmax(fit_mean)) if np.isfinite(fit_mean).any() else np.nan
-    if not np.isfinite(hi) or hi <= 0:
-        return fallback
-    return hi * pad
-
-
-# Panel labels for the TS fit diagnostic, keyed by the fit_output variable prefix
-_TS_FIT_PANELS = (
-    ("te", "Te [keV]", "dTe/drho [keV]", 5.0),
-    ("ne", "ne [1e20 m^-3]", "dne/drho [1e20 m^-3]", 1.8),
-)
-
-
-def ts_fit_pdf(
-    pdf_path: Path | str,
-    shot: int,
-    ts_time: np.ndarray,
-    rho_ch: np.ndarray,
-    channel_data: dict[str, tuple[np.ndarray, np.ndarray]],
-    fit_output,
-    rho_fit: np.ndarray,
-    channel_groups: list[tuple[np.ndarray, str, str]] | None = None,
-    max_pages: int = 20,
-) -> int:
-    """Save a PDF comparing the GP fits to the raw TS measurements for one shot.
-
-    One page per sampled measurement time, 2x2 panels: Te (top left) and ne (top
-    right) with the channel data, GP fit mean and +-1 sigma predictive band, then
-    the GP gradients d/drho with their +-1 sigma bands below. Fitted
-    hyperparameters [var, l1, l2, lw, x0] are annotated on the profile panels.
-
-    Parameters
-    ----------
-    ts_time : (n_t,) measurement times [s]
-    rho_ch : (n_t, n_ch) channel rho locations, NaN where invalid
-    channel_data : {"te": (y, err), "ne": (y, err)}, each (n_t, n_ch), in the
-        same units the fit consumed (Te [keV], ne [1e20 m^-3])
-    fit_output : ShotFitOutput whose rows align with ts_time
-    rho_fit : (n_x,) rho grid the fits were predicted on
-    channel_groups : optional (mask (n_ch,), color, label) triples to split the
-        channels by diagnostic (C-Mod core vs edge Thomson); one blue "raw TS"
-        group when None.
-
-    Returns the number of pages written; a shot with no fitted slice writes no
-    file at all.
-    """
-    import matplotlib
-
-    matplotlib.use("Agg")
-
-    pdf_path = Path(pdf_path)
-    pdf_path.parent.mkdir(parents=True, exist_ok=True)
-
-    # Only page over slices where the fit produced a real profile. Times outside
-    # the plasma have no valid TS channels, so the fit is all-NaN and the panels
-    # come out blank.
-    has_fit = np.isfinite(fit_output.te_fit).any(axis=-1) | np.isfinite(fit_output.ne_fit).any(axis=-1)
-    live = np.flatnonzero(has_fit)[:: max(1, np.count_nonzero(has_fit) // max_pages)]
-
-    n_ch = rho_ch.shape[1]
-    groups = channel_groups if channel_groups is not None else [(np.ones(n_ch, dtype=bool), "tab:blue", "raw TS")]
-    ylims = {var: fit_mean_ylim(getattr(fit_output, f"{var}_fit"), fallback=fallback) for var, _, _, fallback in _TS_FIT_PANELS}
-
-    with PdfPages(pdf_path) as pdf:
-        for i_time in live:
-            fig, axes = plt.subplots(2, 2, figsize=(12, 10))
-            title = f"shot {shot}  t={ts_time[i_time]:.3f} s"
-            for i_var, (var, label, grad_label, _) in enumerate(_TS_FIT_PANELS):
-                data_y, err_y = (arr[i_time, :] for arr in channel_data[var])
-                rho_at_t = rho_ch[i_time, :]
-
-                ax = axes[0, i_var]
-                for mask, color, name in groups:
-                    valid = mask & np.isfinite(rho_at_t) & np.isfinite(data_y) & np.isfinite(err_y)
-                    if valid.any():
-                        ax.errorbar(rho_at_t[valid], data_y[valid], yerr=err_y[valid], fmt="o", ms=4, color=color, label=name, zorder=3)
-                _plot_fit_band(
-                    ax, rho_fit, getattr(fit_output, f"{var}_fit")[i_time, :], getattr(fit_output, f"{var}_std")[i_time, :], "GP fit"
-                )
-                ax.set_ylim(bottom=0, top=ylims[var])
-                _style_ts_panel(ax, label, title)
-                hyps = getattr(fit_output, f"{var}_hyps")[i_time]
-                if np.isfinite(hyps).all():
-                    var_h, l1, l2, lw, x0 = hyps
-                    ax.text(
-                        0.98,
-                        0.98,
-                        f"var={var_h:.2f}  l1={l1:.2f}  l2={l2:.2f}\nlw={lw:.2f}  x0={x0:.2f}",
-                        transform=ax.transAxes,
-                        ha="right",
-                        va="top",
-                        fontsize=7,
-                        family="monospace",
-                    )
-
-                ax = axes[1, i_var]
-                _plot_fit_band(
-                    ax,
-                    rho_fit,
-                    getattr(fit_output, f"{var}_grad")[i_time, :],
-                    getattr(fit_output, f"{var}_grad_std")[i_time, :],
-                    "GP gradient",
-                )
-                ax.axhline(0.0, color="gray", lw=0.8, alpha=0.5)
-                _style_ts_panel(ax, grad_label, title)
-
-            fig.tight_layout()
-            pdf.savefig(fig)
-            plt.close(fig)
-
-    return len(live)
-
-
-def _plot_fit_band(ax, x: np.ndarray, y: np.ndarray, err: np.ndarray, label: str) -> None:
-    """Fit mean plus its +-1 sigma band, over the finite part of the grid."""
-    valid = np.isfinite(y)
-    if not valid.any():
-        return
-    ax.plot(x[valid], y[valid], color="black", label=label)
-    ax.fill_between(x[valid], (y - err)[valid], (y + err)[valid], color="black", alpha=0.2, label="GP +-1 sigma")
-
-
-def _style_ts_panel(ax, ylabel: str, title: str) -> None:
-    ax.set_xlabel("rho")
-    ax.set_ylabel(ylabel)
-    ax.set_title(title)
-    ax.grid(alpha=0.3)
-    if ax.get_legend_handles_labels()[0]:
-        ax.legend(fontsize=8)
