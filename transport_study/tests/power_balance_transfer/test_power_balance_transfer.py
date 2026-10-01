@@ -58,12 +58,11 @@ def _clean_case(study: PowerBalanceStudy, case: PowerBalanceStudy.Case):
 
     Without this, orbax keeps the old "best" checkpoint (max_to_keep=1,
     best_mode=min), so restore_best_checkpoint=True would load stale weights
-    from a broken training run. The _latest resume dir must go too, otherwise
-    launch_train resumes at max_epochs and trains for zero epochs, never
-    writing a fresh best checkpoint.
+    from a broken training run.
+    The same dir holds the latest checkpoint, so launch_train would also resume at max_epochs
+    and train for zero epochs, never writing a fresh best checkpoint.
     """
     shutil.rmtree(study.trained_model_dir(case), ignore_errors=True)
-    shutil.rmtree(Path(f"{study.trained_model_dir(case)}_latest"), ignore_errors=True)
     if study.result_path(case).exists():
         os.remove(study.result_path(case))
 

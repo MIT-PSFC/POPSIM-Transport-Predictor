@@ -7,6 +7,7 @@ from typing import Any
 import wandb
 from loguru import logger
 from popsim.ml import TrainConfig
+from popsim.ml.loggers import STOP_REQUESTED_SUMMARY_KEY
 from requests.exceptions import HTTPError
 
 from transport_study.config import config
@@ -96,18 +97,26 @@ def get_completed_runs(project: str) -> list[Any]:
     return completed_runs
 
 
+def is_trained_to_completion(run) -> bool:
+    """Whether a trial ran until training itself ended it.
+
+    That is max_epochs, early stopping, divergence or the wall-clock budget.
+    A trial the sweep stopped (hyperband pruning) still ends "finished" on the server,
+    so popsim marks it in the run summary.
+    """
+    return run.state == "finished" and not run.summary.get(STOP_REQUESTED_SUMMARY_KEY, False)
+
+
 @retry_rate_limited
 def get_best_train_config(project: str) -> TrainConfig | None:
     """Gets several pieces related to the final model for this case, if it exists.
 
-    Only "finished" runs are eligible. A crashed or hyperband-pruned trial can
-    log a low val/loss.mean in an early epoch and then diverge to NaN and die,
-    its summary keeps that pre-divergence dip, so ranking those runs would pick
-    a config that cannot complete a full training run. Restricting to finished
-    runs guarantees the selected config trained to completion at least once.
+    Only trials trained to completion are eligible.
+    A crashed or hyperband-pruned trial's summary keeps its val/loss.mean from when it died or was pruned,
+    so ranking those runs would pick a config that never completed a full training run.
     """
     completed_runs = get_completed_runs(project)
-    finished_runs = [r for r in completed_runs if r.state == "finished"]
+    finished_runs = [r for r in completed_runs if is_trained_to_completion(r)]
     if len(finished_runs) == 0:
         return None
 

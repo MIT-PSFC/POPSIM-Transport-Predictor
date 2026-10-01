@@ -552,9 +552,9 @@ class PublishedStoreWorkflow(DataWorkflow):
     def load_shot(self, shot: int) -> xr.Dataset | None:
         """One shot of the published store in the on-disk schema."""
         shot_ds = self.published_ds.sel({EPISODE_DIM: [shot]})
-        # The published store pads only at the end of each shot
-        n_valid_times = int(shot_ds[TIME_COORD].notnull().sum())
-        shot_ds = shot_ds.isel({TIME_DIM: slice(0, n_valid_times)}).set_coords(TIME_COORD)
+        # The published store pads the end of each shot with NaN times
+        mask_time_valid = shot_ds[TIME_COORD].notnull().squeeze(EPISODE_DIM).values
+        shot_ds = shot_ds.isel({TIME_DIM: mask_time_valid}).set_coords(TIME_COORD)
 
         # The C-Mod store keeps the source sign of ip and b0, the study uses magnitudes
         for name in ["ip", "b0"]:

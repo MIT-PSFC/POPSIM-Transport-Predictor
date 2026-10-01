@@ -49,29 +49,46 @@ def aggregate_topk_results(per_step: dict[int, xr.Dataset], best_step: int) -> x
     return out
 
 
+def topk_checkpoint_steps(manager, num_checkpoints: int) -> list[int]:
+    """The num_checkpoints retained steps with the lowest validation loss, in epoch order.
+
+    The checkpoint dir also keeps the latest step for resuming,
+    which only counts when it ranks in the top num_checkpoints.
+    Steps saved without a validation loss never rank.
+    """
+    step_losses = {}
+    for step in manager.all_steps():
+        step_metrics = manager.metrics(step)
+        if step_metrics is None:
+            continue
+        step_losses[step] = step_metrics["loss"]
+    steps_by_loss = sorted(step_losses, key=step_losses.__getitem__)
+    return sorted(steps_by_loss[:num_checkpoints])
+
+
 def compute_topk_study_results(
     trainer: Trainer,
     test_dl: DataLoader,
     train_config: TrainConfig,
     result_dict: dict,
 ) -> xr.Dataset:
-    """Evaluate the test suite on every retained checkpoint and aggregate.
+    """Evaluate the test suite on the top-K checkpoints and aggregate.
 
+    K is the train config's checkpoint_max_to_keep.
     The trainer already evaluated the best checkpoint at the end of
     Trainer.train (result_dict["test/study_results"]), so that dataset is
-    reused and only the remaining retained checkpoints are evaluated. With
-    a single retained checkpoint this returns the best-checkpoint result
-    unchanged.
+    reused and only the remaining top-K checkpoints are evaluated.
+    With K = 1 this returns the best-checkpoint result unchanged.
     """
     best_ds = result_dict["test/study_results"]
     manager = trainer.checkpoint_manager
-    steps = sorted(manager.all_steps())
+    steps = topk_checkpoint_steps(manager, train_config.checkpoint_max_to_keep)
     if len(steps) <= 1:
         return best_ds
     best_step = manager.best_step()
     train_run_builder = get_train_run_builder_class(train_config.train_run_builder)
     eval_suite = train_run_builder.get_test_eval_suite(train_config.test_eval_suite_config)
-    logger.info(f"Evaluating test suite on {len(steps)} retained checkpoints (epochs {steps}, best {best_step})")
+    logger.info(f"Evaluating test suite on the top {len(steps)} checkpoints (epochs {steps}, best {best_step})")
     per_step = {best_step: best_ds}
     for step in steps:
         if step == best_step:

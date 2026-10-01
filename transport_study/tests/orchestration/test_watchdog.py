@@ -14,9 +14,14 @@ The pending-watchdog bodies are blocked out as docstring stubs.
 
 import os
 import time
-from pathlib import Path
 
+import jax.numpy as jnp
 import pytest
+from popsim.ml.checkpointing import (
+    TrainState,
+    create_default_checkpoint_manager,
+    save_train_state,
+)
 
 from transport_study.orchestration import study as study_module
 from transport_study.orchestration.study import (
@@ -52,8 +57,8 @@ def set_job_elapsed(monkeypatch, study, case, elapsed_s: float | None):
 
 
 def write_checkpoint(study: Study, case, epoch: int, age_s: float):
-    """Create a latest-checkpoint epoch dir, backdated by age_s seconds."""
-    epoch_dir = Path(f"{study.trained_model_dir(case)}_latest") / str(epoch)
+    """Create a checkpoint epoch dir, backdated by age_s seconds."""
+    epoch_dir = study.trained_model_dir(case) / str(epoch)
     epoch_dir.mkdir(parents=True, exist_ok=True)
     mtime = time.time() - age_s
     os.utime(epoch_dir, (mtime, mtime))
@@ -111,6 +116,21 @@ def test_job_absent_from_elapsed_map_not_killed(study, case, killed, monkeypatch
     study.kill_stuck_jobs([case])
 
     assert killed == []
+
+
+def test_latest_checkpoint_epoch_reads_real_checkpoint_layout(study, case):
+    """Checkpoints saved by popsim itself must be visible to latest_checkpoint_epoch.
+
+    The stall watchdog and the launch_train resume counter both read it,
+    so a layout mismatch kills every healthy job and never resets the counter.
+    With max_to_keep 1 and the best loss at epoch 1, the newest dir left is the unvalidated latest one.
+    """
+    manager = create_default_checkpoint_manager(study.trained_model_dir(case), max_to_keep=1)
+    for epoch, loss in {1: 0.2, 2: 0.9, 3: None}.items():
+        state = TrainState(step=epoch, epoch=epoch, model={"w": jnp.zeros(2)}, opt_state={"dummy": jnp.zeros(1)})
+        save_train_state(state, manager, loss=loss)
+
+    assert study.latest_checkpoint_epoch(case) == 3
 
 
 # ----------------------------------------------------------------------

@@ -52,6 +52,7 @@ from transport_study.orchestration.wandb_utils import (
     get_completed_runs,
     get_sweep_id,
     has_live_agent_run,
+    is_trained_to_completion,
     run_clean_sweeps,
 )
 
@@ -65,7 +66,8 @@ HYPERPARAM_TARGET_SHOTS = 0
 # Abort the run once a single case has been launched this many times without a result file, guards against deterministically failing jobs being resubmitted forever
 MAX_TRAIN_ATTEMPTS = 3
 
-# A sweep is done once the trial target is met AND this fraction of it finished, since the tuned config is picked from finished runs only
+# A sweep is done once the trial target is met AND this fraction of it trained to completion,
+# since the tuned config is picked from those runs only (see wandb_utils.is_trained_to_completion)
 # Hyperband with eta 3 lets only a few percent of trials run to completion, so demanding much more than that forces extra trials far past the count target
 MIN_FINISHED_FRACTION = 0.05
 
@@ -448,18 +450,19 @@ class Study:
         return Path(self.result_dir) / str(case) / "result_data.nc"
 
     def _latest_checkpoint_dir_info(self, case: Case) -> tuple[int, float] | None:
-        """(epoch, mtime) of the newest resume checkpoint of the case,
+        """(epoch, mtime) of the newest checkpoint of the case,
         or None if there is none yet.
 
+        The case's checkpoint dir keeps the best checkpoints plus the latest one, which training resumes from.
         Orbax names each checkpoint directory after its step (here the epoch)
-        and renames it into place atomically once fully written, so the dir's
-        mtime marks the moment that epoch's checkpoint became visible.
+        and renames it into place atomically once fully written,
+        so the newest dir's mtime marks the moment that epoch's checkpoint became visible.
         In-progress saves get a non-numeric tmp suffix and are skipped.
         """
-        latest_dir = Path(f"{self.trained_model_dir(case)}_latest")
-        if not latest_dir.exists():
+        checkpoint_dir = self.trained_model_dir(case)
+        if not checkpoint_dir.exists():
             return None
-        epoch_dirs = [p for p in latest_dir.iterdir() if p.is_dir() and p.name.isdigit()]
+        epoch_dirs = [p for p in checkpoint_dir.iterdir() if p.is_dir() and p.name.isdigit()]
         if not epoch_dirs:
             return None
         newest = max(epoch_dirs, key=lambda p: int(p.name))
@@ -1077,7 +1080,7 @@ class Study:
             self._write_tuned_config(case, self.make_train_config(case))
             return True
         completed_runs = get_completed_runs(self.wandb_project_name(case))
-        finished_runs = [r for r in completed_runs if r.state == "finished"]
+        finished_runs = [r for r in completed_runs if is_trained_to_completion(r)]
         min_finished = math.ceil(MIN_FINISHED_FRACTION * config.hyperparam_sweeps)
         if len(completed_runs) < config.hyperparam_sweeps or len(finished_runs) < min_finished:
             logger.info(
@@ -1115,7 +1118,7 @@ class Study:
             raise RuntimeError(
                 f"Hyperparameter sweep for case {case} reports {len(completed_runs)} completed runs "
                 f"but no best config could be recovered from wandb project {self.wandb_project_name(case)}. "
-                "Only 'finished' runs are eligible, check the project for runs stuck crashing/pruning "
+                "Only runs trained to completion are eligible, check the project for runs stuck crashing/pruning "
                 "before logging val/loss.mean."
             )
         self._write_tuned_config(case, best_train_config)

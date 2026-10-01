@@ -25,6 +25,7 @@ import transport_study.orchestration.study as study_module
 from transport_study.orchestration.topk_results import (
     aggregate_topk_results,
     compute_topk_study_results,
+    topk_checkpoint_steps,
 )
 from transport_study.tests.stubs import StubCase, StubConfig
 
@@ -117,14 +118,35 @@ def test_aggregate_nan_handling():
 
 
 def test_compute_topk_single_checkpoint_passthrough():
-    """With a checkpoint manager retaining a single step (or max_to_keep 1),
-    compute_topk_study_results must return result_dict['test/study_results']
+    """With max_to_keep 1 the manager retains the best step plus the latest one,
+    and compute_topk_study_results must return result_dict['test/study_results']
     unchanged without restoring anything, recovering the old best-only
     behavior byte for byte."""
     best_ds = _result_ds(0.0, 7.0)
-    trainer = SimpleNamespace(checkpoint_manager=SimpleNamespace(all_steps=lambda: [7]))
-    out = compute_topk_study_results(trainer, None, None, {"test/study_results": best_ds})
+    step_losses = {7: 0.1, 9: 0.5}
+    manager = SimpleNamespace(all_steps=lambda: list(step_losses), metrics=lambda step: {"loss": step_losses[step]})
+    trainer = SimpleNamespace(checkpoint_manager=manager)
+    train_config = SimpleNamespace(checkpoint_max_to_keep=1)
+    out = compute_topk_study_results(trainer, None, train_config, {"test/study_results": best_ds})
     assert out is best_ds
+
+
+def test_topk_steps_exclude_latest_outside_top_k(tmp_path: Path):
+    """The checkpoint dir keeps the best max_to_keep steps plus the latest one.
+    Save 5 epochs through a max_to_keep=2 manager with the final epoch outside the best 2,
+    and topk_checkpoint_steps must return only the 2 lowest-loss epochs.
+    An unvalidated latest step (saved with no loss) must never rank either."""
+    manager = create_default_checkpoint_manager(tmp_path / "ckpt", max_to_keep=2)
+    for epoch, loss in {1: 0.9, 2: 0.2, 3: 0.4, 4: 0.3, 5: 0.8}.items():
+        state = TrainState(step=epoch, epoch=epoch, model=_TinyModel(w=jnp.zeros(2)), opt_state={"dummy": jnp.zeros(1)})
+        save_train_state(state, manager, loss=loss)
+    assert sorted(manager.all_steps()) == [2, 4, 5]
+    assert topk_checkpoint_steps(manager, 2) == [2, 4]
+
+    state = TrainState(step=6, epoch=6, model=_TinyModel(w=jnp.zeros(2)), opt_state={"dummy": jnp.zeros(1)})
+    save_train_state(state, manager, loss=None)
+    assert 6 in manager.all_steps()
+    assert topk_checkpoint_steps(manager, 2) == [2, 4]
 
 
 def test_launch_train_wires_num_result_checkpoints(make_stub_study, monkeypatch):
