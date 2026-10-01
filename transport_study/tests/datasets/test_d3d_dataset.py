@@ -12,6 +12,8 @@ from pathlib import Path
 import numpy as np
 import pytest
 import xarray as xr
+from disruption_py.core.physics_method.params import PhysicsMethodParams
+from disruption_py.inout.mds import mdsExceptions
 from disruption_py.machine.tokamak import Tokamak
 from disruption_py.settings import TimeSettingParams
 from disruption_py.settings.nickname_setting import NicknameSettingParams
@@ -27,7 +29,9 @@ from transport_study.datasets.d3d.d3d_dataset import (
     TRAJOPT_STORE_NAME,
     D3DDataWorkflow,
 )
+from transport_study.datasets.d3d.dispy_utils import register_verbose_level
 from transport_study.datasets.d3d.physics_methods import (
+    D3DDatasetMethods,
     DispyEfitNicknameSetting,
     Uniform1kHzTimeSetting,
 )
@@ -264,6 +268,38 @@ def test_time_setting_is_1khz_and_rejects_slow_efit():
     atime_50hz_ms = np.arange(100.0, 5001.0, 20.0)
     with pytest.raises(ValueError, match="not a 1 kHz reconstruction"):
         Uniform1kHzTimeSetting().get_times(_time_params(atime_50hz_ms))
+
+
+class _StubDensityConnection:
+    """Serves \\density [cm^-3] (or raises TreeNODATA when it is None) and PTDATA dssdenest [1e19 m^-3], both on 0-1000 ms."""
+
+    def __init__(self, density_cm3):
+        self.density_cm3 = density_cm3
+        self.time_ms = np.linspace(0.0, 1000.0, 11)
+
+    def get_data_with_dims(self, path, tree_name=None):
+        if path == r"\density":
+            if self.density_cm3 is None:
+                raise mdsExceptions.TreeNODATA()
+            return np.full(self.time_ms.size, self.density_cm3), self.time_ms
+        assert "dssdenest" in path
+        return np.full(self.time_ms.size, 5.0), self.time_ms
+
+
+def _line_average_density(density_cm3) -> np.ndarray:
+    # disruption-py's physics_method decorator logs at the VERBOSE level
+    register_verbose_level()
+    times = np.linspace(0.1, 0.9, 5)
+    connection = _StubDensityConnection(density_cm3)
+    params = PhysicsMethodParams(shot_id=199264, tokamak=Tokamak.D3D, disruption_time=None, mds_conn=connection, times=times)
+    return D3DDatasetMethods.get_line_average_density(params=params)["n_e_line_average"]
+
+
+def test_line_average_density_falls_back_to_pcs_estimate():
+    """\\density [cm^-3] where the DISPY tree has it, else dssdenest [1e19 m^-3] (199264 has no \\density)."""
+    np.testing.assert_allclose(_line_average_density(4e13), 4e19)
+    np.testing.assert_allclose(_line_average_density(None), 5e19)
+    np.testing.assert_allclose(_line_average_density(np.nan), 5e19)
 
 
 N_TIME = 700  # 0.7 s, over min_shot_duration once the end margin is cut

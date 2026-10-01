@@ -134,7 +134,7 @@ D3D_SIGNAL_ATTRS = {
         "ref": "/equilibrium/time_slice(itime)/global_quantities/beta_tor_norm",
     },
     "n_e_line_average": {
-        "description": "Line-averaged electron density from the DISPY EFIT tree (density)",
+        "description": "Line-averaged electron density from the DISPY EFIT tree (density), else the PCS estimate (PTDATA dssdenest)",
         "ref": "/summary/line_average/n_e/value",
     },
     "minor_radius": {
@@ -447,7 +447,7 @@ class D3DDataWorkflow(RawFileWorkflow):
         """
         sources = {**PREDICTION_SOURCES, **TRAJOPT_SOURCES}
         raw_required = {raw_name for raw_name, _ in sources.values()}
-        missing = sorted(raw_required - set(ds.data_vars))
+        missing = sorted(raw_name for raw_name in raw_required if raw_name not in ds)
         if missing:
             logger.warning(f"Shot {ds['shot'].item()}: missing raw signals {missing}, skipping shot.")
             return None
@@ -456,7 +456,7 @@ class D3DDataWorkflow(RawFileWorkflow):
         for store_name, (raw_name, factor) in sources.items():
             signal = ds[raw_name] * factor
             if store_name in MAGNITUDE_SIGNALS:
-                signal = np.abs(signal)
+                signal = abs(signal)
             signals[store_name] = signal
         signals["power_ic"] = xr.zeros_like(ds["p_ohm"])
         signals["power_lh"] = xr.zeros_like(ds["p_ohm"])

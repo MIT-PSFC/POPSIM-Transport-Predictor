@@ -89,9 +89,10 @@ class DataWorkflow(ABC):
         store_ds = shot_ds[list(variables)]
         store_ds.attrs.update(self.STORE_ATTRS)
         for name, variable in store_ds.variables.items():
-            variable.attrs.update(self.SIGNAL_ATTRS.get(name, {}))
-            if name in STORE_SIGNAL_UNITS:
-                variable.attrs["units"] = STORE_SIGNAL_UNITS[name]
+            name_str = str(name)
+            variable.attrs.update(self.SIGNAL_ATTRS.get(name_str, {}))
+            if name_str in STORE_SIGNAL_UNITS:
+                variable.attrs["units"] = STORE_SIGNAL_UNITS[name_str]
         return store_ds
 
     def log_ds_details(self, ds: xr.Dataset):

@@ -40,8 +40,10 @@ plus the custom ones in `d3d/physics_methods.py`:
   The profiles go onto rho_tor_norm = linspace(0, 1.1, 56), the published C-Mod grid (MAST's has 67 points over the same range),
   and each slice is held onto the 1 kHz timebase until the next one, for at most 3 median IDA steps.
   IDA gives no point covariance, so the gradient errors assume independent points.
-- `n_e_line_average` is `\density` of the DISPY tree. disruption-py's `get_density_parameters` is not used,
-  since it falls back to `\denv2`, which reads about 3x higher.
+- `n_e_line_average` is `\density` of the DISPY tree, or the PCS estimate `dssdenest` where the tree has none (199264),
+  which matches `\density` within 1 percent where both exist.
+  disruption-py's `get_density_parameters` is not used, since it falls back to `\denv2`, which reads about 3x higher.
+  Interferometer fringe jumps (201907, 199126) are dropped by the `n_e_line_average` range filter.
 
 Processing writes two stores on the same shot / time_idx layout, both in IMAS names and SI units, with description,
 units, and ref (IMAS path) attributes on every variable: `ds.zarr`, the shared schema, and `trajopt.zarr`,

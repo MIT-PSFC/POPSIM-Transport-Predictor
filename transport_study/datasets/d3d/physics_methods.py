@@ -133,13 +133,20 @@ class D3DDatasetMethods:
     @staticmethod
     @physics_method(columns=["n_e_line_average"], tokamak=Tokamak.D3D)
     def get_line_average_density(params: PhysicsMethodParams):
-        """Line-averaged electron density [m^-3], \\density of the DISPY EFIT tree.
+        """Line-averaged electron density [m^-3], \\density of the DISPY EFIT tree, else the PCS estimate dssdenest.
 
-        Replaces the built-in get_density_parameters, which silently falls back to \\d3d::denv2
-        when the EFIT tree lacks \\density, and that reads about 3x higher.
+        Replaces the built-in get_density_parameters, which falls back to \\d3d::denv2,
+        and that reads about 3x higher. dssdenest [1e19 m^-3] matches \\density within 1 percent where both exist.
         """
-        density_cm3, density_time_ms = params.mds_conn.get_data_with_dims(r"\density", tree_name="_efit_tree")
-        density = density_cm3 * 1e6
+        try:
+            density_cm3, density_time_ms = params.mds_conn.get_data_with_dims(r"\density", tree_name="_efit_tree")
+            density = density_cm3 * 1e6
+        except mdsExceptions.MdsException:
+            density = np.array([np.nan])
+        if not np.isfinite(density).any():
+            params.logger.warning("EFIT tree has no density, using PCS dssdenest")
+            density_1e19, density_time_ms = params.mds_conn.get_data_with_dims(f"ptdata('dssdenest', {params.shot_id})")
+            density = density_1e19 * 1e19
         density_time = density_time_ms / 1e3
         n_e_line_average = interp1(density_time, density, params.times)
         return {"n_e_line_average": n_e_line_average}

@@ -130,11 +130,11 @@ This was briefly attempted on DIII-D in March 2026, though results were inconclu
 
 I am not completely satisfied with how things are set up right now. The workflows are a consequence of my development environment and as such might be tricky to adapt. I've attempted to make the structure general where possible, but as it stands this is a project I made to facilitate my own work on a tight schedule. This whole thing could be iterated upon to smooth out the sharp edges, I simply do not have the bandwidth to do so. I'm still going ahead and releasing this on the off chance someone finds it useful. If you do, please cite the [POPSIM Repo](https://github.com/MIT-PSFC/POPSIM-Public) and its related [arXiv publication](https://arxiv.org/abs/2509.10244).
 
-I run the dataset creation on a local workstation, where it has access to C-Mod/DIII-D/TCV data (private) and MAST data (public). However, this workstation is too small to do the computationally intensive GP fitting routines for C-Mod and MAST. To get around this, it packages the raw TS data, ships it off to a remote cluster with srunx, and pulls back the results for assembly.
+The C-Mod and MAST datasets are built from the published stores of [transport-validation-datasets](https://github.com/MIT-PSFC/transport-validation-datasets), which is where the computationally intensive GP fitting of their Thomson scattering data now lives. DIII-D is pulled on OMEGA, which has the DIII-D data servers and the IDA profile database, and TCV is built from DEFUSE exports.
 
 I run the training orchestration on an interactive node on a compute cluster (either Engaging or OMEGA). This is convenient for testing because whenever something breaks I can just run the study serially to step through the logic with a debugger.
 
-For installation, a simple `uv sync` should work. However, there might be some finagling you have to do to get the GPU dependencies to function. (For the ORCD cluster in particular, the required dependency can be installed with `uv sync --group gpu-orcd`.) I think this is a symptom of POPSIM having an older JAX dependency. I will get around to fixing that at some point in the future.
+For installation, a simple `uv sync` should work, and `uv sync --group gpu` adds the CUDA 13 JAX plugin for GPU nodes. With that plugin installed, anything that imports JAX hangs on a node without a GPU unless `JAX_PLATFORMS=cpu` is set (the test suite's conftest sets it automatically).
 
 # Generative AI Disclosure
 

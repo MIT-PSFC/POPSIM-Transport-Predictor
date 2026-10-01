@@ -198,9 +198,9 @@ def ida_profiles_on_grids(
 
     sol_extension = config["profile_grid"]["sol_extension"]
     rho_tor_norm_slices = np.full((num_slices, psi_n.size), np.nan)
-    for i in np.flatnonzero(mask_slice_mapped):
-        qpsi_slice = qpsi[efit_nearest[i]]
-        rho_tor_norm_slices[i] = rho_tor_norm_from_psi_n(psi_n, qpsi_slice, sol_extension)
+    for i_mapped in np.flatnonzero(mask_slice_mapped):
+        qpsi_slice = qpsi[efit_nearest[i_mapped]]
+        rho_tor_norm_slices[i_mapped] = rho_tor_norm_from_psi_n(psi_n, qpsi_slice, sol_extension)
 
     # Slice profiles, interpolated per slice. np.interp's default left clamps at the axis.
     slice_profiles = {}
