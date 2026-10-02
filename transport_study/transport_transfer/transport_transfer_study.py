@@ -13,10 +13,10 @@ import netCDF4  # noqa: F401
 import xarray as xr
 from loguru import logger
 from pydantic import Field, field_validator
+from transport_validation_datasets.machine.generic import UNIFORM_TIMEBASE_DT
 
 from transport_study import PACKAGE_ROOT
 from transport_study.config import config
-from transport_study.datasets import UNIFORM_TIMEBASE_DT_S
 from transport_study.modules.transport_predictor.train_configs import (
     make_transport_torax_config,
 )
@@ -645,7 +645,7 @@ class TransportStudy(Study):
                     "geometry_builder": case.geometry_builder,
                     "delta_exponent": 2.0,
                     # One TORAX solver step per dataset timestep
-                    "sim_dt": UNIFORM_TIMEBASE_DT_S,
+                    "sim_dt": UNIFORM_TIMEBASE_DT,
                     "prng_seed": 42,
                 },
             )

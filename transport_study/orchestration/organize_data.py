@@ -10,10 +10,13 @@ from loguru import logger
 from popsim.cfspopcon_jax.geometry import calc_plasma_volume
 from popsim.ml.split_utils import split_dataset_by_fracs
 from scipy.constants import mu_0
+from transport_validation_datasets.machine.generic import (
+    UNIFORM_TIMEBASE_DT,
+    make_uniform_1kHz_timebase,
+)
 
 from transport_study import EPISODE_DIM, RADIAL_DIM, TIME_COORD, TIME_DIM
 from transport_study.config import RHO_GRID, TRAIN_VAL_SPLIT, config
-from transport_study.datasets import UNIFORM_TIMEBASE_DT_S, make_uniform_1khz_timebase
 from transport_study.modules.normalization import (
     NORM_INPUT_VARS,
     PHYSICS_FEATURE_NAMES,
@@ -188,7 +191,7 @@ def concat_with_nan_padding(
 def reindex_to_uniform_timebase(ds: xr.Dataset) -> xr.Dataset:
     """Place every shot back on the canonical 1 kHz grid, NaN at missing times.
 
-    The device workflows build their timebases with make_uniform_1khz_timebase
+    The device workflows build their timebases with make_uniform_1kHz_timebase
     (an absolute grid anchored at t=0), but the stored shots are compacted and
     contain mid-shot gaps where time slices were dropped during acquisition or
     dataset generation. Downstream, the simple-Euler stepper integrates with
@@ -207,7 +210,7 @@ def reindex_to_uniform_timebase(ds: xr.Dataset) -> xr.Dataset:
     if not finite.any():
         return ds
 
-    slots = time2d / UNIFORM_TIMEBASE_DT_S
+    slots = time2d / UNIFORM_TIMEBASE_DT
     k = np.rint(np.where(finite, slots, 0)).astype(np.int64)
     k_finite = k[finite]
     if k_finite.min() < 0:
@@ -217,7 +220,7 @@ def reindex_to_uniform_timebase(ds: xr.Dataset) -> xr.Dataset:
     max_residual = float(residual.max())
     if max_residual > 0.25:
         logger.warning(
-            f"Time values deviate from the nominal {UNIFORM_TIMEBASE_DT_S} s grid by up to {max_residual:.2f} steps, "
+            f"Time values deviate from the nominal {UNIFORM_TIMEBASE_DT} s grid by up to {max_residual:.2f} steps, "
             "the stored timebase may not actually be uniform at this rate."
         )
 
@@ -229,7 +232,7 @@ def reindex_to_uniform_timebase(ds: xr.Dataset) -> xr.Dataset:
         dup_shots = np.unique(shot_i[np.isin(keys, keys[np.diff(np.sort(keys), prepend=-1) == 0])])
         raise ValueError(
             f"Multiple samples map to the same uniform-grid slot for shots {ds[EPISODE_DIM].values[dup_shots]}, "
-            f"the data is sampled faster than the {UNIFORM_TIMEBASE_DT_S} s grid."
+            f"the data is sampled faster than the {UNIFORM_TIMEBASE_DT} s grid."
         )
 
     k_first = np.full(n_shots, n_new, dtype=np.int64)
@@ -237,7 +240,7 @@ def reindex_to_uniform_timebase(ds: xr.Dataset) -> xr.Dataset:
     np.minimum.at(k_first, shot_i, grid_i)
     np.maximum.at(k_last, shot_i, grid_i)
 
-    grid = make_uniform_1khz_timebase(float(np.nanmax(time2d)))
+    grid = make_uniform_1kHz_timebase(float(np.nanmax(time2d)))
     if grid.size < n_new:
         raise ValueError(f"Canonical timebase has {grid.size} slots but the data spans {n_new}.")
     col = np.arange(n_new)[None, :]

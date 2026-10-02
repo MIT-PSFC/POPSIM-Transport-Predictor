@@ -14,11 +14,11 @@ from disruption_py.settings import RetrievalSettings
 from disruption_py.settings.output_setting import DatasetOutputSetting
 from disruption_py.workflow import get_shots_data
 from loguru import logger
+from transport_validation_datasets.dispy_utils import passive_log_settings
 from zarr.errors import ZarrUserWarning
 
 from transport_study import EPISODE_DIM, RADIAL_DIM, TIME_COORD
 from transport_study.datasets.d3d import config
-from transport_study.datasets.d3d.dispy_utils import passive_log_settings
 from transport_study.datasets.d3d.physics_methods import (
     D3DDatasetMethods,
     DispyEfitNicknameSetting,

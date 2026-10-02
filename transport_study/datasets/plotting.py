@@ -6,9 +6,9 @@ import matplotlib.pyplot as plt
 import numpy as np
 import xarray as xr
 from matplotlib.backends.backend_pdf import PdfPages
+from transport_validation_datasets.machine.generic import UNIFORM_TIMEBASE_DT
 
 from transport_study import RADIAL_DIM, TIME_DIM
-from transport_study.datasets import UNIFORM_TIMEBASE_DT_S
 from transport_study.plot_style import BACKGROUND_COLOR, FACE_COLOR, TEXT_COLOR
 from transport_study.signals import convert_to_working_units
 
@@ -246,9 +246,9 @@ def ds_profile_plot(
         shot_ds_valid = shot_ds.isel({TIME_DIM: mask_time_valid})
         rho = shot_ds_valid[RADIAL_DIM].values
         time_valid = shot_ds_valid["time"].values
-        grid_offset = (time_valid - time_valid.min()) / UNIFORM_TIMEBASE_DT_S
+        grid_offset = (time_valid - time_valid.min()) / UNIFORM_TIMEBASE_DT
         grid_idx = np.rint(grid_offset).astype(int)
-        time = time_valid.min() + np.arange(grid_idx.max() + 1) * UNIFORM_TIMEBASE_DT_S
+        time = time_valid.min() + np.arange(grid_idx.max() + 1) * UNIFORM_TIMEBASE_DT
 
         fig, axes = plt.subplots(2, 1, figsize=(16, 12), sharex=True)
         fig.patch.set_facecolor(BACKGROUND_COLOR)

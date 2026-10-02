@@ -20,8 +20,14 @@ from disruption_py.settings.nickname_setting import (
     NicknameSettingParams,
 )
 from loguru import logger
+from transport_validation_datasets.machine.generic import (
+    geqdsk_psi_n_grid,
+    injected_power_on_grid,
+    make_uniform_1kHz_timebase,
+    mappable_q_profiles,
+    signal_on_grid,
+)
 
-from transport_study.datasets import make_uniform_1khz_timebase
 from transport_study.datasets.d3d import config
 from transport_study.datasets.d3d.profiles import (
     IDA_PSI_COLUMNS,
@@ -29,8 +35,6 @@ from transport_study.datasets.d3d.profiles import (
     find_ida_path,
     ida_profiles_on_grids,
 )
-from transport_study.datasets.profile_grids import signal_on_grid
-from transport_study.datasets.rho_tor_norm import geqdsk_psi_n_grid, mappable_q_profiles
 
 # Programmed waveforms run past early plasma termination, keep them for predict-first [s]
 MIN_TIMEBASE_S = 8.0
@@ -70,7 +74,7 @@ class Uniform1kHzTimeSetting(TimeSetting):
             raise ValueError(f"Shot {params.shot_id}: median EFIT step {efit_step_median_ms:.1f} ms, not a 1 kHz reconstruction")
         efit_end_s = np.max(efit_time_ms) / 1e3
         timebase_end_s = max(efit_end_s, MIN_TIMEBASE_S)
-        return make_uniform_1khz_timebase(timebase_end_s)
+        return make_uniform_1kHz_timebase(timebase_end_s)
 
 
 def _efit_signals(params: PhysicsMethodParams, nodes: list[str]) -> tuple[np.ndarray, dict[str, np.ndarray]]:
@@ -92,9 +96,9 @@ def _efit_signals(params: PhysicsMethodParams, nodes: list[str]) -> tuple[np.nda
 
 
 def _injected_power(params: PhysicsMethodParams, node: str, tree_name: str) -> np.ndarray:
-    """An injected heating power record placed on the timebase (signal_on_grid), in the record's units.
+    """An injected heating power record on the timebase (injected_power_on_grid), in the record's units.
 
-    0 outside the record and when the shot has none (that heating system did not run).
+    0 when the shot has none (that heating system did not run).
     """
     try:
         power, power_time_ms = params.mds_conn.get_data_with_dims(node, tree_name=tree_name)
@@ -105,13 +109,8 @@ def _injected_power(params: PhysicsMethodParams, node: str, tree_name: str) -> n
     if power_time_ms.size > 1 and power_time_ms[-1] == 0:
         power_time_ms = power_time_ms[:-1]
         power = power[:-1]
-    if power_time_ms.size <= 2:
-        return np.zeros(len(params.times))
     power_time = power_time_ms / 1e3
-    power_on_timebase = signal_on_grid(power_time, power, params.times)
-    mask_outside_record = (params.times < power_time[0]) | (params.times > power_time[-1])
-    power_on_timebase[mask_outside_record] = 0.0
-    return power_on_timebase
+    return injected_power_on_grid(power_time, power, params.times)
 
 
 class D3DDatasetMethods:

@@ -6,19 +6,20 @@ from typing import ClassVar
 import numpy as np
 import xarray as xr
 from loguru import logger
-
-from transport_study import EPISODE_DIM, RADIAL_DIM, TIME_COORD, TIME_DIM
-from transport_study.datasets import UNIFORM_TIMEBASE_DT_S, read_shotlist
-from transport_study.datasets.plotting import (
-    ds_profile_plot,
-    ds_profile_time_plot,
-    ds_summary_report,
-)
-from transport_study.datasets.zero_d_signals import (
+from transport_validation_datasets.machine.generic import (
+    UNIFORM_TIMEBASE_DT,
     end_of_shot_index,
     greenwald_fraction,
     keep_longest_segment,
     kept_span,
+)
+
+from transport_study import EPISODE_DIM, RADIAL_DIM, TIME_COORD, TIME_DIM
+from transport_study.datasets import read_shotlist
+from transport_study.datasets.plotting import (
+    ds_profile_plot,
+    ds_profile_time_plot,
+    ds_summary_report,
 )
 from transport_study.signals import (
     PREDICTION_STORE_NAME,
@@ -648,7 +649,7 @@ def _centered_boxcar_mean(signal: xr.DataArray, window_s: float) -> xr.DataArray
 
     Averaged over the samples present near the ends and around NaNs.
     """
-    n_samples = max(1, round(window_s / UNIFORM_TIMEBASE_DT_S))
+    n_samples = max(1, round(window_s / UNIFORM_TIMEBASE_DT))
     if n_samples % 2 == 0:
         n_samples += 1
     return signal.rolling({TIME_DIM: n_samples}, center=True, min_periods=1).mean()

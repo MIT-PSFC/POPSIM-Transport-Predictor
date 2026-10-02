@@ -7,8 +7,8 @@ first to last kept slice, against min_pulse_length_s.
 import numpy as np
 import pytest
 import xarray as xr
+from transport_validation_datasets.machine.generic import UNIFORM_TIMEBASE_DT
 
-from transport_study.datasets import UNIFORM_TIMEBASE_DT_S
 from transport_study.signals import PREDICTION_STORE_NAME
 from transport_study.tests.datasets.synthetic_shot import SHOT, raw_shot
 
@@ -35,7 +35,7 @@ def _filtered_ds(times: np.ndarray) -> xr.Dataset:
 def test_segment_shorter_than_min_pulse_length_excluded(tcv_workflow, logged):
     """A kept segment spanning less than min_pulse_length_s is excluded."""
     tcv_workflow.min_pulse_length_s = 0.5
-    ds = _filtered_ds(np.arange(300) * UNIFORM_TIMEBASE_DT_S)  # 0.299 s
+    ds = _filtered_ds(np.arange(300) * UNIFORM_TIMEBASE_DT)  # 0.299 s
 
     assert tcv_workflow.is_too_short(ds) is True
     assert any("kept segment 0.299 s" in msg for msg in logged), logged
@@ -44,8 +44,8 @@ def test_segment_shorter_than_min_pulse_length_excluded(tcv_workflow, logged):
 def test_segment_exactly_at_min_pulse_length_kept(tcv_workflow):
     """A segment spanning min_pulse_length_s exactly is kept (the check is a strict less-than)."""
     n_valid = 501
-    tcv_workflow.min_pulse_length_s = (n_valid - 1) * UNIFORM_TIMEBASE_DT_S
-    ds = _filtered_ds(np.arange(n_valid) * UNIFORM_TIMEBASE_DT_S)
+    tcv_workflow.min_pulse_length_s = (n_valid - 1) * UNIFORM_TIMEBASE_DT
+    ds = _filtered_ds(np.arange(n_valid) * UNIFORM_TIMEBASE_DT)
 
     assert tcv_workflow.is_too_short(ds) is False
 

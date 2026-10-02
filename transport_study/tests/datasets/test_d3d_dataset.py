@@ -19,6 +19,7 @@ from disruption_py.machine.tokamak import Tokamak
 from disruption_py.settings import TimeSettingParams
 from disruption_py.settings.nickname_setting import NicknameSettingParams
 from loguru import logger
+from transport_validation_datasets.dispy_utils import register_verbose_level
 
 from transport_study import RADIAL_DIM
 from transport_study.datasets.d3d import config
@@ -32,7 +33,6 @@ from transport_study.datasets.d3d.d3d_dataset import (
     TRAJOPT_STORE_NAME,
     D3DDataWorkflow,
 )
-from transport_study.datasets.d3d.dispy_utils import register_verbose_level
 from transport_study.datasets.d3d.physics_methods import (
     D3DDatasetMethods,
     DispyEfitNicknameSetting,

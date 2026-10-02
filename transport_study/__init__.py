@@ -1,8 +1,8 @@
 from pathlib import Path
 
+from transport_validation_datasets import EPISODE_DIM, RADIAL_DIM, TIME_COORD, TIME_DIM
+
 PACKAGE_ROOT = Path(__file__).parent
 
-EPISODE_DIM = "shot"
-TIME_COORD = "time"
-TIME_DIM = "time_idx"
-RADIAL_DIM = "rho_tor_norm"
+# The store dimension names come from transport-validation-datasets, which builds the C-Mod and MAST stores
+__all__ = ["EPISODE_DIM", "PACKAGE_ROOT", "RADIAL_DIM", "TIME_COORD", "TIME_DIM"]

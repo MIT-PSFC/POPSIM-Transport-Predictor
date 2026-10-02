@@ -3,7 +3,7 @@ IMAS names in SI units on `(shot, time_idx[, rho_tor_norm])`, with `time` on `(s
 The studies convert to their working units on load (`signals.convert_to_working_units`).
 
 Every stored value is causal, no time draws on a later sample.
-A 0D signal is never interpolated onto the 1 kHz grid (`profile_grids.signal_on_grid`).
+A 0D signal is never interpolated onto the 1 kHz grid (`signal_on_grid`).
 One sampled faster than the grid is averaged over each grid step, time t taking the mean of (t - 1 ms, t].
 One sampled slower is held forward from its last finite sample for at most 1.5 of its own median sample steps.
 Smoothing is a trailing boxcar, and derivatives are backward differences.
@@ -11,15 +11,15 @@ The one exception is DIII-D `power_radiated`, smoothed non-causally at the sourc
 b0 is the vacuum field at geometric_axis_r on every device,
 power_radiated the total radiated power including the divertor,
 and power_ohm is Ip V_loop - dW_pol/dt.
-rho_tor_norm = sqrt(Phi_N), with Phi_N the integral of q over psi_N (`datasets/rho_tor_norm.py`),
-the same map, kept line for line, as transport-validation-datasets.
+rho_tor_norm = sqrt(Phi_N), with Phi_N the integral of q over psi_N (`phi_n_map`),
+imported from transport-validation-datasets like every helper the devices share (`machine/generic.py`).
 
 One filter spec, the same as transport-validation-datasets applies to C-Mod and MAST
 (`RawFileWorkflow.filter_ds` and `cull_shot` for DIII-D and TCV).
 Every check cuts the times it fails out as a gap:
 
 - the end of the shot: the plasma ends at the last time |ip| reaches its min threshold,
-  and everything after `end_margin` before that is cut (`zero_d_signals.end_of_shot_index`)
+  and everything after `end_margin` before that is cut (`end_of_shot_index`)
 - a 0D signal of `signals.STORE_0D_SIGNALS` that is not finite
 - a `min_filter` signal below its threshold (ip as |ip|), or a `max_filter` signal above it, on the raw samples.
   `greenwald_fraction` = n_e_line_average / n_GW with n_GW = Ip / (pi a^2) is derived for the max filter and not stored
@@ -152,7 +152,7 @@ and the LIUQE reconstructions of the MEQ databases (`TCV{shot}_meqdb.mat`), both
 - `power_radiated` is `PradTot`, the total including the divertor like DIII-D and MAST.
   `PradBulk`, the confined plasma only, is 0.43 of it at the median over 81 shots (0.27-0.69 for 5-95 percent).
 - `power_ohm` is computed, Ip V_loop - d/dt(mu0 R0 li Ip^2 / 4) from DEFUSE `I_P`, `Vloop`, `LI` and the geometric major radius `R_geom`
-  (`zero_d_signals.ohmic_power`), then smoothed by a trailing 5 ms boxcar, as on C-Mod.
+  (`ohmic_power`), then smoothed by a trailing 5 ms boxcar, as on C-Mod.
   DEFUSE `Vloop` has the opposite sign to `I_P` (Ip Vloop < 0 at flat-top on 39 of 39 shots of both polarities), so it is flipped.
   DEFUSE `POHM` has no documented definition and reads 0.9-1.0 of Ip Vloop at flat-top.
 - `b0` is `BZERO` (at 0.88 m) moved to the geometric axis, BZERO 0.88 / R_geom.

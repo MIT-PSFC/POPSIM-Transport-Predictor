@@ -7,9 +7,9 @@ No file access here, so all of it is testable offline.
 from dataclasses import dataclass
 
 import numpy as np
+from transport_validation_datasets.machine.generic import mappable_q_profiles, phi_n_map
 
 from transport_study.datasets.profile_grids import held_on_times, held_slice_index
-from transport_study.datasets.rho_tor_norm import mappable_q_profiles, phi_n_map
 from transport_study.datasets.tcv import config
 
 RHO_TOR_NORM_GRID = np.linspace(

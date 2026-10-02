@@ -7,10 +7,14 @@ import netCDF4  # noqa: F401
 import numpy as np
 import xarray as xr
 from loguru import logger
+from transport_validation_datasets.machine.generic import (
+    make_uniform_1kHz_timebase,
+    ohmic_power,
+    signal_on_grid,
+    trailing_boxcar_mean,
+)
 
 from transport_study import RADIAL_DIM, TIME_COORD
-from transport_study.datasets import make_uniform_1khz_timebase
-from transport_study.datasets.profile_grids import signal_on_grid
 from transport_study.datasets.tcv import config
 from transport_study.datasets.tcv.profiles import (
     RHO_TOR_NORM_DEFINITION,
@@ -26,7 +30,6 @@ from transport_study.datasets.tcv.sources import (
     read_liuqe,
 )
 from transport_study.datasets.workflow import RawFileWorkflow
-from transport_study.datasets.zero_d_signals import ohmic_power, trailing_boxcar_mean
 from transport_study.signals import STORE_PROFILES
 
 # Store signal -> (DEFUSE signal, factor to SI units). DEFUSE is SI apart from the heating powers.
@@ -285,7 +288,7 @@ class TCVDataWorkflow(RawFileWorkflow):
         if not mask_ip_valid.any():
             logger.warning(f"Shot {shot}: |I_P| never exceeds {IP_TIMEBASE_MIN_A:.0f} A, skipping shot.")
             return None
-        timebase = make_uniform_1khz_timebase(ip.time[mask_ip_valid].max())
+        timebase = make_uniform_1kHz_timebase(ip.time[mask_ip_valid].max())
 
         # Every signal is placed causally (signal_on_grid), so no time draws on a later one
         data_vars: dict[str, tuple[tuple[str, ...], np.ndarray]] = {}

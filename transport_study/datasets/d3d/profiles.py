@@ -10,12 +10,12 @@ from pathlib import Path
 import numpy as np
 import xarray as xr
 from loguru import logger
+from transport_validation_datasets.machine.generic import geqdsk_psi_n_grid, phi_n_map
 
 from transport_study import PACKAGE_ROOT, RADIAL_DIM
 from transport_study.datasets import read_shotlist
 from transport_study.datasets.d3d import config
 from transport_study.datasets.profile_grids import held_on_times, held_slice_index
-from transport_study.datasets.rho_tor_norm import geqdsk_psi_n_grid, phi_n_map
 
 D3D_DIR = Path(PACKAGE_ROOT) / "datasets" / "d3d"
 

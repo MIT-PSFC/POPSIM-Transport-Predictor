@@ -231,12 +231,14 @@ class TestReindexToUniformTimebase:
         assert np.allclose(t[1, 10:], [0.010, 0.011, 0.012], atol=1e-6)
 
     def test_time_values_come_from_canonical_timebase(self):
-        from transport_study.datasets import make_uniform_1khz_timebase
+        from transport_validation_datasets.machine.generic import (
+            make_uniform_1kHz_timebase,
+        )
 
         times = [[0.000, 0.001, 0.003]]
         values = [[1.0, 2.0, 3.0]]
         ds = reindex_to_uniform_timebase(self._make_ds(times, values))
-        expected = make_uniform_1khz_timebase(0.003)
+        expected = make_uniform_1kHz_timebase(0.003)
         assert np.array_equal(ds[TIME_COORD].values[0], expected)
 
     def test_uniform_input_is_unchanged(self):

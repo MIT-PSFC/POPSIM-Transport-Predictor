@@ -8,8 +8,7 @@ every TCV filter and cull, and each test breaks exactly the one thing it is abou
 
 import numpy as np
 import xarray as xr
-
-from transport_study.datasets import UNIFORM_TIMEBASE_DT_S
+from transport_validation_datasets.machine.generic import UNIFORM_TIMEBASE_DT
 
 SHOT = 70000
 N_T = 1500  # 1.5 s at 1 kHz, comfortably over min_pulse_length_s
@@ -27,7 +26,7 @@ def raw_shot(n_t: int = N_T, shot: int = SHOT, **overrides) -> xr.Dataset:
     matching the forward-filled layout of a real raw file. Overrides replace a
     variable's values in place, so they carry the (shot, time_idx[, rho_tor_norm]) shape.
     """
-    time = np.arange(n_t) * UNIFORM_TIMEBASE_DT_S
+    time = np.arange(n_t) * UNIFORM_TIMEBASE_DT
     n_blocks = int(np.ceil(n_t / TS_BLOCK))
     amplitude = 2.0 + 0.01 * np.repeat(np.arange(n_blocks), TS_BLOCK)[:n_t, None]
     profile_shape = amplitude * (1 - np.tanh((RHO - 0.9) / 0.08))[None, :] / 2 + 0.05

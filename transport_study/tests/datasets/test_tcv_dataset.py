@@ -10,9 +10,9 @@ import h5py
 import numpy as np
 import pytest
 import xarray as xr
+from transport_validation_datasets.machine.generic import phi_n_map
 
 from transport_study import RADIAL_DIM, TIME_COORD
-from transport_study.datasets.rho_tor_norm import phi_n_map
 from transport_study.datasets.tcv import config
 from transport_study.datasets.tcv.profiles import (
     RHO_TOR_NORM_GRID,

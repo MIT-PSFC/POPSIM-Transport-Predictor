@@ -2,7 +2,8 @@
 
 import copy
 
-from transport_study.datasets import UNIFORM_TIMEBASE_DT_S
+from transport_validation_datasets.machine.generic import UNIFORM_TIMEBASE_DT
+
 from transport_study.modules.profile_predictor.train_configs import (
     TORAX_CONFIG_BASE,
     TORAX_TRANSPORT_BLOCKS,
@@ -38,9 +39,9 @@ def make_transport_torax_config(transport_model: str) -> dict:
     torax_config["numerics"].update(
         {
             "t_initial": 0.0,
-            "t_final": UNIFORM_TIMEBASE_DT_S,
-            "fixed_dt": UNIFORM_TIMEBASE_DT_S,
-            "min_dt": UNIFORM_TIMEBASE_DT_S / 10,
+            "t_final": UNIFORM_TIMEBASE_DT,
+            "fixed_dt": UNIFORM_TIMEBASE_DT,
+            "min_dt": UNIFORM_TIMEBASE_DT / 10,
             "adaptive_dt": False,
         }
     )
