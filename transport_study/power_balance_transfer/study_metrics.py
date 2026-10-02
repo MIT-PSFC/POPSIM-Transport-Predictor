@@ -21,16 +21,13 @@ from pathlib import Path
 import numpy as np
 import xarray as xr
 from loguru import logger
+from transport_validation_datasets.store_schema import HEATING_POWERS
 
 from transport_study import EPISODE_DIM, TIME_COORD
 from transport_study.config import config
 from transport_study.orchestration.stages import STAGE_AGG_NAMES, segment_stages
 from transport_study.orchestration.study import PAD_TIME_STEP_S, Study
-from transport_study.signals import (
-    HEATING_POWERS_MW,
-    STORE_HEATING_POWERS,
-    convert_to_working_units,
-)
+from transport_study.signals import HEATING_POWERS_MW, convert_to_working_units
 
 # Joined dataset timeslice must be within this of the result timeslice.
 # Timebases are 1 kHz, so anything beyond half a sample is a bad join
@@ -63,7 +60,7 @@ def load_stage_dataset(device: str) -> xr.Dataset:
     """
     ds_path = Path(config.dataset_paths[device])
     ds_store = xr.open_dataset(ds_path)
-    ds_store_selected = ds_store[["ip", *STORE_HEATING_POWERS, TIME_COORD]]
+    ds_store_selected = ds_store[["ip", *HEATING_POWERS, TIME_COORD]]
     ds = convert_to_working_units(ds_store_selected)
     return ds[["ip_MA", *HEATING_POWERS_MW, TIME_COORD]].load()
 

@@ -7,9 +7,13 @@ No file access here, so all of it is testable offline.
 from dataclasses import dataclass
 
 import numpy as np
-from transport_validation_datasets.machine.generic import mappable_q_profiles, phi_n_map
+from transport_validation_datasets.machine.generic import (
+    hold_onto_grid,
+    mappable_q_profiles,
+    phi_n_map,
+    values_on_grid,
+)
 
-from transport_study.datasets.profile_grids import held_on_times, held_slice_index
 from transport_study.datasets.tcv import config
 
 RHO_TOR_NORM_GRID = np.linspace(
@@ -72,16 +76,16 @@ def liuqe_usable(equilibria: LiuqeEquilibria) -> np.ndarray:
 
 def defuse_profile_on_grid(
     profile: DefuseProfile, equilibria: LiuqeEquilibria, mask_eq_usable: np.ndarray, times: np.ndarray
-) -> tuple[np.ndarray, np.ndarray]:
-    """One DEFUSE profile and its d/drho_tor_norm gradient on RHO_TOR_NORM_GRID, held onto the timebase.
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """One DEFUSE profile and its d/drho_tor_norm gradient on RHO_TOR_NORM_GRID, held onto the timebase (hold_onto_grid).
 
-    Each slice maps to rho_tor_norm through the nearest usable reconstruction no farther than match_max_ms away,
-    otherwise it is NaN.
-    A slice with any NaN fit point inside the LCFS is a failed fit and NaN too.
+    Each slice maps to rho_tor_norm through the nearest usable reconstruction no farther than match_max_ms away.
     The gradient is taken on the DEFUSE points before interpolating,
     so it is one-sided and finite at the LCFS, where the fits end.
     Grid points past the LCFS are NaN.
-    Each slice is held until the next one, for at most max_hold_defuse_steps median DEFUSE steps.
+    Each slice is held until the next one, for at most max_hold_defuse_steps median steps of the usable slices.
+    A slice that does not map, or has a NaN fit point inside the LCFS (a failed fit), is dropped before the hold,
+    so the slice before it holds over it, as transport-validation-datasets does with its fits.
 
     Args:
         profile: The DEFUSE fit, at least two slices.
@@ -90,7 +94,8 @@ def defuse_profile_on_grid(
         times: (n_t,) timebase [s].
 
     Returns:
-        (n_t, n_grid) profile and gradient, float32.
+        (n_t, n_grid) profile and gradient, float32,
+        and (n_t,) True where a usable slice lands.
 
     Raises:
         ValueError: If the profile has fewer than two slices.
@@ -124,7 +129,9 @@ def defuse_profile_on_grid(
         values_grid[i_slice] = np.interp(RHO_TOR_NORM_GRID, rho_tor_norm_points, values_inside, right=np.nan)
         gradient_grid[i_slice] = np.interp(RHO_TOR_NORM_GRID, rho_tor_norm_points, gradient_inside, right=np.nan)
 
-    slice_index, mask_held = held_slice_index(profile.time, times, config["profile_grid"]["max_hold_defuse_steps"])
-    values_on_times = held_on_times(values_grid, slice_index, mask_held)
-    gradient_on_times = held_on_times(gradient_grid, slice_index, mask_held)
-    return values_on_times, gradient_on_times
+    mask_slice_usable = mask_slice_mapped & mask_slice_complete
+    max_hold_steps = config["profile_grid"]["max_hold_defuse_steps"]
+    slice_index, fresh = hold_onto_grid(times, profile.time[mask_slice_usable], True, max_hold_periods=max_hold_steps)
+    values_on_times = values_on_grid(values_grid[mask_slice_usable], slice_index)
+    gradient_on_times = values_on_grid(gradient_grid[mask_slice_usable], slice_index)
+    return values_on_times.astype(np.float32), gradient_on_times.astype(np.float32), fresh

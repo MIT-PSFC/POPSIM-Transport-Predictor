@@ -15,6 +15,7 @@ from disruption_py.settings.output_setting import DatasetOutputSetting
 from disruption_py.workflow import get_shots_data
 from loguru import logger
 from transport_validation_datasets.dispy_utils import passive_log_settings
+from transport_validation_datasets.store_schema import STORE_SIGNALS
 from zarr.errors import ZarrUserWarning
 
 from transport_study import EPISODE_DIM, RADIAL_DIM, TIME_COORD
@@ -31,7 +32,7 @@ from transport_study.datasets.d3d.profiles import (
     find_ida_shots,
 )
 from transport_study.datasets.workflow import RawFileWorkflow
-from transport_study.signals import PREDICTION_STORE_NAME, STORE_SIGNALS
+from transport_study.signals import PREDICTION_STORE_NAME
 
 INNER_WALL = 1.05  # Location of the inner wall, used to calculate minor radius from gapin and R0
 
@@ -71,6 +72,7 @@ PREDICTION_SOURCES = {
         for raw_profile, store_profile in [("te_rho", "t_e"), ("ne_rho", "n_e")]
         for raw_suffix, store_suffix in [("", ""), ("_error", "_error"), ("_grad", "_gradient"), ("_grad_error", "_gradient_error")]
     },
+    "fresh_profile": ("fresh_profile", 1.0),
 }
 TRAJOPT_SOURCES = {
     "ip_reference": ("ip_prog", 1.0),
@@ -133,8 +135,8 @@ IDA_SOURCE_ATTR = "ida_source"
 
 PCS_UNVERIFIED = "Raw PCS pointname whose meaning is unverified, see the TODO on D3D_TRAJOPT_STORE_SIGNALS. "
 
-# description and ref (IMAS path) of every store variable and coordinate. ref is absent where IMAS has no leaf.
-# The prediction store units come from signals.STORE_SIGNAL_UNITS.
+# description of every store variable and coordinate, with units and ref (IMAS path) where the shared schema has none.
+# The prediction store signals take their units and refs from transport-validation-datasets' STORE_SIGNAL_ATTRS.
 D3D_SIGNAL_ATTRS = {
     # Coordinates
     TIME_COORD: {"units": "s", "description": "Time on the uniform 1 kHz timebase"},
@@ -149,83 +151,59 @@ D3D_SIGNAL_ATTRS = {
         "ref": "/equilibrium/time_slice(itime)/profiles_1d/psi_norm",
     },
     # Prediction store
-    "ip": {"description": "Measured plasma current magnitude (PTDATA ip)", "ref": "/summary/global_quantities/ip/value"},
+    "ip": {"description": "Measured plasma current magnitude (PTDATA ip)"},
     "b0": {
         "description": "Vacuum toroidal field magnitude at geometric_axis_r, PTDATA bt (at 1.6955 m) scaled by 1/R",
-        "ref": "/summary/global_quantities/b0/value",
     },
     "energy_mhd": {
         "description": "Stored energy from the 1 kHz DISPY EFIT (wmhd)",
-        "ref": "/equilibrium/time_slice(itime)/global_quantities/energy_mhd",
     },
     "beta_tor_norm": {
         "description": "Normalized toroidal beta from the 1 kHz DISPY EFIT (betan)",
-        "ref": "/equilibrium/time_slice(itime)/global_quantities/beta_tor_norm",
     },
     "n_e_line_average": {
         "description": "Line-averaged electron density from the DISPY EFIT tree (density), else the PCS estimate (PTDATA dssdenest)",
-        "ref": "/summary/line_average/n_e/value",
     },
     "minor_radius": {
         "description": "Minor radius of the plasma boundary, DISPY EFIT aminor",
-        "ref": "/equilibrium/time_slice(itime)/boundary/minor_radius",
     },
     "geometric_axis_r": {
         "description": "Major radius of the geometric center of the boundary, DISPY EFIT rsurf",
-        "ref": "/equilibrium/time_slice(itime)/boundary/geometric_axis/r",
     },
     "elongation": {
         "description": "Elongation of the plasma boundary, DISPY EFIT kappa",
-        "ref": "/equilibrium/time_slice(itime)/boundary/elongation",
     },
     "triangularity_upper": {
         "description": "Upper triangularity of the plasma boundary, DISPY EFIT tritop",
-        "ref": "/equilibrium/time_slice(itime)/boundary/triangularity_upper",
     },
     "triangularity_lower": {
         "description": "Lower triangularity of the plasma boundary, DISPY EFIT tribot",
-        "ref": "/equilibrium/time_slice(itime)/boundary/triangularity_lower",
     },
     "power_ohm": {
         "description": "Ohmic heating power from the 1 kHz DISPY EFIT (poh = Ip V_surf - dW_pol/dt), clipped at 0",
-        "ref": "/summary/global_quantities/power_ohm/value",
     },
     "power_radiated": {
         "description": "Total radiated power including the divertor, bolometer analysis prad_tot (4 ms, 50 ms non-causal smoothing), clipped at 0",
-        "ref": "/summary/global_quantities/power_radiated/value",
     },
     "power_nbi": {
         "description": "Neutral beam power injected into the vessel (pinj)",
-        "ref": "/summary/heating_current_drive/power_launched_nbi/value",
     },
     "power_ic": {
         "description": "Ion cyclotron heating power, zero (fast wave unused in these campaigns)",
-        "ref": "/summary/heating_current_drive/power_ic/value",
     },
     "power_lh": {
         "description": "Lower hybrid heating power, zero (DIII-D has no LHCD)",
-        "ref": "/summary/heating_current_drive/power_lh/value",
     },
     "power_ec": {
         "description": "Electron cyclotron power injected into the vessel (echpwrc)",
-        "ref": "/summary/heating_current_drive/power_launched_ec/value",
     },
     "fresh_profile": {"description": "1 where the profiles are a new IDA slice, 0 where an earlier slice is held"},
     **{
         f"{store_profile}{suffix}": attrs
-        for store_profile, quantity, ref_leaf in [
-            ("t_e", "electron temperature", "temperature"),
-            ("n_e", "electron density", "density"),
-        ]
+        for store_profile, quantity in [("t_e", "electron temperature"), ("n_e", "electron density")]
         for suffix, attrs in [
-            ("", {"description": f"IDA {quantity} profile", "ref": f"/core_profiles/profiles_1d(itime)/electrons/{ref_leaf}"}),
-            (
-                "_error",
-                {
-                    "description": f"1-sigma uncertainty of the IDA {quantity} profile",
-                    "ref": f"/core_profiles/profiles_1d(itime)/electrons/{ref_leaf}_error_upper",
-                },
-            ),
+            ("", {"description": f"IDA {quantity} profile"}),
+            ("_error", {"description": f"1-sigma uncertainty of the IDA {quantity} profile"}),
             ("_gradient", {"description": f"d/drho_tor_norm gradient of the IDA {quantity} profile"}),
             (
                 "_gradient_error",

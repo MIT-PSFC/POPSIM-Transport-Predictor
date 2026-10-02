@@ -92,8 +92,8 @@ FRINGE_JUMP_MIN_M3 = 1e19
 
 ZERO_ERROR = "Zero, the no-uncertainty sentinel, since DEFUSE gives no uncertainty for its profile fits"
 
-# description and ref (IMAS path) of every store variable and coordinate. ref is absent where IMAS has no leaf.
-# The units come from signals.STORE_SIGNAL_UNITS.
+# description of every store variable and coordinate, with units and ref (IMAS path) where the shared schema has none.
+# The store signals take their units and refs from transport-validation-datasets' STORE_SIGNAL_ATTRS.
 TCV_SIGNAL_ATTRS = {
     # Coordinates
     TIME_COORD: {"units": "s", "description": "Time on the uniform 1 kHz timebase"},
@@ -103,86 +103,62 @@ TCV_SIGNAL_ATTRS = {
         "ref": "/core_profiles/profiles_1d(itime)/grid/rho_tor_norm",
     },
     # Prediction store
-    "ip": {"description": "Measured plasma current magnitude (DEFUSE I_P)", "ref": "/summary/global_quantities/ip/value"},
+    "ip": {"description": "Measured plasma current magnitude (DEFUSE I_P)"},
     "b0": {
         "description": "Vacuum toroidal field magnitude at geometric_axis_r, DEFUSE BZERO (at 0.88 m) scaled by 1/R",
-        "ref": "/summary/global_quantities/b0/value",
     },
     "energy_mhd": {
         "description": "Stored energy on the LIUQE timebase (DEFUSE Wtot)",
-        "ref": "/equilibrium/time_slice(itime)/global_quantities/energy_mhd",
     },
     "beta_tor_norm": {
         "description": "Normalized toroidal beta on the LIUQE timebase (DEFUSE BETAN)",
-        "ref": "/equilibrium/time_slice(itime)/global_quantities/beta_tor_norm",
     },
     "n_e_line_average": {
         "description": "Line-averaged electron density from the FIR interferometer (DEFUSE NEavg), fringe jumps removed",
-        "ref": "/summary/line_average/n_e/value",
     },
     "minor_radius": {
         "description": "Minor radius of the plasma boundary, LIUQE (DEFUSE a_minor)",
-        "ref": "/equilibrium/time_slice(itime)/boundary/minor_radius",
     },
     "geometric_axis_r": {
         "description": "Major radius of the geometric center of the boundary, LIUQE (DEFUSE R_geom)",
-        "ref": "/equilibrium/time_slice(itime)/boundary/geometric_axis/r",
     },
     "elongation": {
         "description": "Elongation of the plasma boundary, LIUQE (DEFUSE KAPPA)",
-        "ref": "/equilibrium/time_slice(itime)/boundary/elongation",
     },
     "triangularity_upper": {
         "description": "Upper triangularity of the plasma boundary, LIUQE (DEFUSE DELTA_TOP)",
-        "ref": "/equilibrium/time_slice(itime)/boundary/triangularity_upper",
     },
     "triangularity_lower": {
         "description": "Lower triangularity of the plasma boundary, LIUQE (DEFUSE DELTA_BOTTOM)",
-        "ref": "/equilibrium/time_slice(itime)/boundary/triangularity_lower",
     },
     "power_ohm": {
         "description": (
             "Ohmic heating power, Ip * V_loop minus the rate of change of the internal poloidal magnetic energy "
             "mu0 R0 li Ip^2 / 4 (DEFUSE I_P, Vloop, LI, R_geom), causal (backward difference, trailing 5 ms boxcar), clipped at 0"
         ),
-        "ref": "/summary/global_quantities/power_ohm/value",
     },
     "power_radiated": {
         "description": "Total radiated power including the divertor, bolometry (DEFUSE PradTot), clipped at 0",
-        "ref": "/summary/global_quantities/power_radiated/value",
     },
     "power_nbi": {
         "description": "Neutral beam power, summed over both beamlines (DEFUSE NBI + NBI2), zero where a beam is absent",
-        "ref": "/summary/heating_current_drive/power_launched_nbi/value",
     },
     "power_ic": {
         "description": "Ion cyclotron heating power, zero (TCV has no ICRH)",
-        "ref": "/summary/heating_current_drive/power_ic/value",
     },
     "power_lh": {
         "description": "Lower hybrid heating power, zero (TCV has no LHCD, DEFUSE P_LH is the L-H threshold power)",
-        "ref": "/summary/heating_current_drive/power_lh/value",
     },
     "power_ec": {
         "description": "Electron cyclotron power, summed over gyrotrons (DEFUSE ECRH), zero where absent",
-        "ref": "/summary/heating_current_drive/power_launched_ec/value",
     },
     "fresh_profile": {"description": "1 where the profiles are a new DEFUSE slice, 0 where an earlier slice is held"},
     **{
         f"{store_profile}{suffix}": attrs
-        for store_profile, quantity, ref_leaf in [
-            ("t_e", "electron temperature", "temperature"),
-            ("n_e", "electron density", "density"),
-        ]
+        for store_profile, quantity in [("t_e", "electron temperature"), ("n_e", "electron density")]
         for suffix, attrs in [
-            (
-                "",
-                {
-                    "description": f"DEFUSE {quantity} profile fit, mapped from rho_pol onto rho_tor_norm through LIUQE",
-                    "ref": f"/core_profiles/profiles_1d(itime)/electrons/{ref_leaf}",
-                },
-            ),
-            ("_error", {"description": ZERO_ERROR, "ref": f"/core_profiles/profiles_1d(itime)/electrons/{ref_leaf}_error_upper"}),
+            ("", {"description": f"DEFUSE {quantity} profile fit, mapped from rho_pol onto rho_tor_norm through LIUQE"}),
+            ("_error", {"description": ZERO_ERROR}),
             ("_gradient", {"description": f"d/drho_tor_norm gradient of the DEFUSE {quantity}, taken on the DEFUSE fit points"}),
             ("_gradient_error", {"description": ZERO_ERROR}),
         ]
@@ -299,18 +275,23 @@ class TCVDataWorkflow(RawFileWorkflow):
         # Each reconstruction builds a Phi_N map to be judged, so only once per shot
         mask_eq_usable = liuqe_usable(equilibria)
         profile_columns = {}
+        fresh_by_profile = {}
         for name, profile in profiles.items():
-            values_on_grid, gradient_on_grid = defuse_profile_on_grid(profile, equilibria, mask_eq_usable, timebase)
+            values_on_grid, gradient_on_grid, fresh = defuse_profile_on_grid(profile, equilibria, mask_eq_usable, timebase)
             profile_columns[name] = values_on_grid
             profile_columns[f"{name}{DEFUSE_GRADIENT_SUFFIX}"] = gradient_on_grid
+            fresh_by_profile[name] = fresh
         # A time keeps its profiles only where both fits exist,
-        # so fresh_profile (labelled from n_e) never marks a time without a Te
+        # so fresh_profile (from the n_e slices) never marks a time without a Te
         mask_both_fits = np.ones(timebase.size, dtype=bool)
         for name in DEFUSE_PROFILE_SIGNALS:
             mask_both_fits &= np.isfinite(profile_columns[name][:, 0])
         for name, values in profile_columns.items():
             values[~mask_both_fits] = np.nan
             data_vars[name] = (("time", RADIAL_DIM), values)
+        ne_raw_name, _ = PREDICTION_SOURCES["n_e"]
+        fresh_profile = fresh_by_profile[ne_raw_name] & mask_both_fits
+        data_vars["fresh_profile"] = (("time",), fresh_profile.astype(np.float32))
         coords = {"time": timebase, RADIAL_DIM: RHO_TOR_NORM_GRID.astype(np.float32)}
         ds = xr.Dataset(data_vars, coords=coords)
         return ds.expand_dims(shot=[shot])
@@ -369,7 +350,7 @@ class TCVDataWorkflow(RawFileWorkflow):
         xr.Dataset | None
             Store signals, or None if a required DEFUSE signal is missing or a critical signal is all NaN
         """
-        raw_required = {*PREDICTION_RAW_NAMES, *OHMIC_POWER_SOURCES}
+        raw_required = {*PREDICTION_RAW_NAMES, *OHMIC_POWER_SOURCES, "fresh_profile"}
         missing = sorted(raw_name for raw_name in raw_required if raw_name not in ds)
         if missing:
             logger.warning(f"Shot {ds['shot'].item()}: missing DEFUSE signals {missing}, skipping shot.")
@@ -384,6 +365,7 @@ class TCVDataWorkflow(RawFileWorkflow):
         # Vacuum field falls off as 1/R, so b0 at the geometric axis is BZERO R_ref / R_geo
         signals["b0"] = signals["b0"] * BZERO_REFERENCE_R / signals["geometric_axis_r"]
         signals["power_ohm"] = _ohmic_power(ds)
+        signals["fresh_profile"] = ds["fresh_profile"]
         power_zero = xr.zeros_like(ds["I_P"])
         for store_name, raw_names in HEATING_SOURCES_MW.items():
             power_MW = power_zero

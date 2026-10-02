@@ -48,6 +48,8 @@ def raw_shot(n_t: int = N_T, shot: int = SHOT, **overrides) -> xr.Dataset:
         "power_ic": np.zeros(n_t),
         "power_lh": np.zeros(n_t),
         "power_ec": np.zeros(n_t),
+        # The raw file's profile hold marks the first slice of each block
+        "fresh_profile": (np.arange(n_t) % TS_BLOCK == 0).astype(np.float32),
     }
     profile_shape_gradient = np.gradient(profile_shape, RHO, axis=-1)
     profiles = {

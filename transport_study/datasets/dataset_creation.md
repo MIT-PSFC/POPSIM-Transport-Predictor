@@ -1,4 +1,4 @@
-Every device store shares one on-disk schema (`transport_study/signals.py`, `STORE_SIGNALS`):
+Every device store shares one on-disk schema (transport-validation-datasets `store_schema.STORE_SIGNAL_ATTRS`):
 IMAS names in SI units on `(shot, time_idx[, rho_tor_norm])`, with `time` on `(shot, time_idx)`.
 The studies convert to their working units on load (`signals.convert_to_working_units`).
 
@@ -14,13 +14,13 @@ and power_ohm is Ip V_loop - dW_pol/dt.
 rho_tor_norm = sqrt(Phi_N), with Phi_N the integral of q over psi_N (`phi_n_map`),
 imported from transport-validation-datasets like every helper the devices share (`machine/generic.py`).
 
-One filter spec, the same as transport-validation-datasets applies to C-Mod and MAST
+One filter spec, imported from transport-validation-datasets (`filters.py`), which applies it to C-Mod and MAST
 (`RawFileWorkflow.filter_ds` and `cull_shot` for DIII-D and TCV).
 Every check cuts the times it fails out as a gap:
 
 - the end of the shot: the plasma ends at the last time |ip| reaches its min threshold,
   and everything after `end_margin` before that is cut (`end_of_shot_index`)
-- a 0D signal of `signals.STORE_0D_SIGNALS` that is not finite
+- a 0D signal of `DATASET_0D_SIGNALS` that is not finite
 - a `min_filter` signal below its threshold (ip as |ip|), or a `max_filter` signal above it, on the raw samples.
   `greenwald_fraction` = n_e_line_average / n_GW with n_GW = Ip / (pi a^2) is derived for the max filter and not stored
 - a `transient_filter` signal above its threshold after a centered 5 ms boxcar,
@@ -88,7 +88,9 @@ and every signal is placed on the timebase causally instead (`signal_on_grid`, a
   as the published C-Mod/MAST stores (`d3d/profiles.py`).
   IDA's psi_n comes from its own reconstruction, which the files do not name, while q comes from the DISPY EFIT.
   The profiles go onto rho_tor_norm = linspace(0, 1.1, 56), the published C-Mod grid (MAST's has 67 points over the same range),
-  and each slice is held onto the 1 kHz timebase until the next one, for at most 3 median IDA steps.
+  and each slice is held onto the 1 kHz timebase until the next one, for at most 3 median IDA steps (`hold_onto_grid`).
+  A slice with no valid EFIT nearby, or without both a Te and an ne fit, is dropped before the hold,
+  so the slice before it holds over it, and `fresh_profile` marks where the usable slices land.
   IDA gives no point covariance, so the gradient errors assume independent points.
 - `n_e_line_average` is `\density` of the DISPY tree, or the PCS estimate `dssdenest` where the tree has none (199264),
   which matches `\density` within 1 percent where both exist.
@@ -167,8 +169,10 @@ and the LIUQE reconstructions of the MEQ databases (`TCV{shot}_meqdb.mat`), both
   Only shots with a MEQ database are built, 964 shots from 60001 to 82878.
 - The profiles go onto rho_tor_norm = linspace(0, 1.1, 56), the DIII-D and C-Mod grid,
   and are NaN past the LCFS, where the DEFUSE fits end.
-  Each slice is held onto the 1 kHz timebase until the next one (every ~17 ms), for at most 1.5 median DEFUSE steps.
-  A slice with a NaN fit point, or without both a Te and an ne fit, is dropped.
+  Each slice is held onto the 1 kHz timebase until the next one (every ~17 ms), for at most 1.5 median DEFUSE steps (`hold_onto_grid`).
+  A slice with no usable reconstruction nearby or a NaN fit point is dropped before the hold,
+  so the slice before it holds over it, and `fresh_profile` marks where the usable n_e slices land.
+  A time without both a Te and an ne fit has no profiles.
 - The gradient companions are taken on the DEFUSE fit points before regridding.
   The DEFUSE fits wiggle on the scale of their own grid, so the gradients are noisy.
   DEFUSE gives no uncertainty, so the error companions are the 0 sentinel.

@@ -275,7 +275,7 @@ class D3DDatasetMethods:
         return {node: signal_on_grid(efit_time, values, params.times) for node, values in signals.items()}
 
     @staticmethod
-    @physics_method(columns=[*IDA_RHO_COLUMNS, *IDA_PSI_COLUMNS], tokamak=Tokamak.D3D)
+    @physics_method(columns=[*IDA_RHO_COLUMNS, *IDA_PSI_COLUMNS, "fresh_profile"], tokamak=Tokamak.D3D)
     def get_ida_profiles(params: PhysicsMethodParams):
         """IDA Te/ne on the rho_tor_norm grid (mapped through the DISPY EFIT q profile) and on the psi_norm grid."""
         ida_path = find_ida_path(params.shot_id)

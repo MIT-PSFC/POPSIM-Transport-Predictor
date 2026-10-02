@@ -20,6 +20,7 @@ from disruption_py.settings import TimeSettingParams
 from disruption_py.settings.nickname_setting import NicknameSettingParams
 from loguru import logger
 from transport_validation_datasets.dispy_utils import register_verbose_level
+from transport_validation_datasets.store_schema import STORE_SIGNALS
 
 from transport_study import RADIAL_DIM
 from transport_study.datasets.d3d import config
@@ -50,7 +51,7 @@ from transport_study.datasets.d3d.profiles import (
     gradient_and_error,
     ida_profiles_on_grids,
 )
-from transport_study.signals import PREDICTION_STORE_NAME, STORE_SIGNALS
+from transport_study.signals import PREDICTION_STORE_NAME
 
 IDA_DIR = Path("/fusion/projects/results/ida-results/HBP_database")
 
@@ -94,7 +95,7 @@ def test_ida_profiles_land_on_store_grids():
     psi_n_native = 1e-3 + (1.2 - 1e-3) * np.linspace(0.0, 1.0, 150) ** 1.2
     profiles, times = _profiles_on_grids(psi_n_native)
 
-    assert set(profiles.data_vars) == {*IDA_RHO_COLUMNS, *IDA_PSI_COLUMNS}
+    assert set(profiles.data_vars) == {*IDA_RHO_COLUMNS, *IDA_PSI_COLUMNS, "fresh_profile"}
     np.testing.assert_array_equal(profiles[RADIAL_DIM].values, RHO_TOR_NORM_GRID.astype(np.float32))
     te_rho = profiles["te_rho"].values[np.argmin(np.abs(times - 0.12))]
     mask_rho_inside = RHO_TOR_NORM_GRID**2 >= psi_n_native[0]
@@ -124,8 +125,11 @@ def test_differing_native_psi_grids_land_on_one_psi_norm_grid():
 
 
 def test_ida_hold_and_unmapped_slice():
-    """Slices hold across interior gaps, the hold ends max_hold_ida_steps median steps after the last slice,
-    and a slice with no valid EFIT within match_max_ms keeps its psi_norm profiles but no rho_tor_norm ones."""
+    """Slices hold across interior gaps, and the hold ends max_hold_ida_steps median steps after the last slice.
+
+    A slice with no valid EFIT within match_max_ms keeps its psi_norm profiles.
+    It is dropped from the rho_tor_norm hold, so the slice before holds over it and it is not fresh.
+    """
     psi_n_native = 1.2 * np.linspace(0.0, 1.0, 150) ** 1.2
     profiles, times = _profiles_on_grids(psi_n_native)
     te_rho_axis = profiles["te_rho"].values[:, 0]
@@ -133,11 +137,12 @@ def test_ida_hold_and_unmapped_slice():
     times_ms = np.round(times * 1e3)
 
     assert np.isnan(te_rho_axis[times_ms < 100]).all()
-    mask_mapped_held = ((times_ms >= 100) & (times_ms < 180)) | ((times_ms >= 260) & (times_ms <= 300))
-    assert np.isfinite(te_rho_axis[mask_mapped_held]).all()
-    mask_unmapped_held = (times_ms >= 180) & (times_ms < 260)
-    assert np.isnan(te_rho_axis[mask_unmapped_held]).all()
-    assert np.isfinite(te_psi_axis[mask_unmapped_held]).all()
+    mask_slices_held = (times_ms >= 100) & (times_ms <= 300)
+    assert np.isfinite(te_rho_axis[mask_slices_held]).all()
+    assert np.isfinite(te_psi_axis[mask_slices_held]).all()
+    mask_fresh = profiles["fresh_profile"].values == 1
+    mapped_times_ms = IDA_TIMES_MS[IDA_TIMES_MS != IDA_UNMAPPED_TIME_MS]
+    np.testing.assert_array_equal(times_ms[mask_fresh], mapped_times_ms)
 
     ida_step_median_ms = np.median(np.diff(IDA_TIMES_MS))
     hold_end_ms = IDA_TIMES_MS[-1] + config["profile_grid"]["max_hold_ida_steps"] * ida_step_median_ms
@@ -336,6 +341,9 @@ def _raw_dataset(shot: int = 199051) -> xr.Dataset:
     for name, value in RAW_PROFILE_VALUES.items():
         radial_dim, radial_grid = (PSI_NORM_DIM, PSI_NORM_GRID) if name in IDA_PSI_COLUMNS else (RADIAL_DIM, RHO_TOR_NORM_GRID)
         data_vars[name] = (("shot", "time", radial_dim), np.full((1, N_TIME, radial_grid.size), value))
+    # One IDA slice every 20 ms
+    fresh_profile = (np.arange(N_TIME) % 20 == 0).astype(np.float32)
+    data_vars["fresh_profile"] = (("shot", "time"), fresh_profile[np.newaxis, :])
     # float32 grids, as get_ida_profiles writes them
     coords = {
         "shot": [shot],
@@ -360,7 +368,7 @@ def test_standardize_builds_both_stores_in_si(workflow):
     dssneped [1e19 m^-3] becomes m^-3, and a missing column or an all-NaN profile skips the shot."""
     ds = workflow.standardize_signal_names(_raw_dataset())
 
-    assert set(STORE_SIGNALS) - {"fresh_profile"} <= set(ds.data_vars)
+    assert set(STORE_SIGNALS) <= set(ds.data_vars)
     assert set(D3D_TRAJOPT_STORE_SIGNALS) <= set(ds.data_vars)
     np.testing.assert_allclose(ds["ip"], 1.2e6)
     # bt is quoted at 1.6955 m, b0 at the 1.7 m geometric axis

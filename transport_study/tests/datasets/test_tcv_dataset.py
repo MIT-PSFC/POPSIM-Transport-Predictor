@@ -11,6 +11,7 @@ import numpy as np
 import pytest
 import xarray as xr
 from transport_validation_datasets.machine.generic import phi_n_map
+from transport_validation_datasets.store_schema import STORE_SIGNALS
 
 from transport_study import RADIAL_DIM, TIME_COORD
 from transport_study.datasets.tcv import config
@@ -29,7 +30,7 @@ from transport_study.datasets.tcv.tcv_dataset import (
     TCV_SIGNAL_ATTRS,
     TCVDataWorkflow,
 )
-from transport_study.signals import PREDICTION_STORE_NAME, STORE_SIGNALS
+from transport_study.signals import PREDICTION_STORE_NAME
 
 RHO_POL_SURFACES = np.linspace(0.0, 1.0, 41)
 LIVE_SHOT = 60001
@@ -58,8 +59,8 @@ def _profile_on_grid() -> tuple[np.ndarray, np.ndarray, np.ndarray]:
 
     times = np.arange(0, 400) * 1e-3
     mask_eq_usable = liuqe_usable(equilibria)
-    values_on_grid, gradient_on_grid = defuse_profile_on_grid(profile, equilibria, mask_eq_usable, times)
-    return values_on_grid, gradient_on_grid, times
+    values_on_grid, gradient_on_grid, fresh = defuse_profile_on_grid(profile, equilibria, mask_eq_usable, times)
+    return values_on_grid, gradient_on_grid, fresh, times
 
 
 def test_defuse_profiles_land_on_store_grid():
@@ -68,7 +69,7 @@ def test_defuse_profiles_land_on_store_grid():
     The gradient is taken on the DEFUSE points, so it is finite at the LCFS,
     and the grid points past the LCFS are NaN.
     """
-    values_on_grid, gradient_on_grid, times = _profile_on_grid()
+    values_on_grid, gradient_on_grid, _, times = _profile_on_grid()
     i_time = int(np.argmin(np.abs(times - 0.105)))
     mask_inside = RHO_TOR_NORM_GRID <= 1.0
 
@@ -85,23 +86,25 @@ def test_defuse_profiles_land_on_store_grid():
 
 
 def test_defuse_hold_and_unmapped_slice():
-    """Slices hold until the next one, the hold ends max_hold_defuse_steps median steps after the last slice,
-    and a slice with no usable reconstruction within match_max_ms, or with a NaN fit point, is NaN for its whole hold."""
-    values_on_grid, _, times = _profile_on_grid()
+    """Slices hold until the next one, and the hold ends max_hold_defuse_steps median steps after the last slice.
+
+    A slice with no usable reconstruction within match_max_ms, or with a NaN fit point, is dropped before the hold,
+    so the slice before it holds over it and it is not fresh.
+    """
+    values_on_grid, _, fresh, times = _profile_on_grid()
     te_axis = values_on_grid[:, 0]
     times_ms = np.round(times * 1e3)
     defuse_times_ms = np.round(DEFUSE_TIMES * 1e3)
+    mask_slice_usable = ~np.isin(DEFUSE_TIMES, [DEFUSE_UNMAPPED_TIME, DEFUSE_INCOMPLETE_TIME])
+    usable_times_ms = defuse_times_ms[mask_slice_usable]
 
     assert np.isnan(te_axis[times_ms < defuse_times_ms[0]]).all()
-    mask_unmapped_held = (times_ms >= 151) & (times_ms < 168)
-    mask_incomplete_held = (times_ms >= 117) & (times_ms < 134)
-    mask_dropped_held = mask_unmapped_held | mask_incomplete_held
-    assert np.isnan(values_on_grid[mask_dropped_held]).all()
-    mask_mapped_held = (times_ms >= defuse_times_ms[0]) & (times_ms <= defuse_times_ms[-1]) & ~mask_dropped_held
-    assert np.isfinite(te_axis[mask_mapped_held]).all()
+    mask_slices_held = (times_ms >= defuse_times_ms[0]) & (times_ms <= defuse_times_ms[-1])
+    assert np.isfinite(te_axis[mask_slices_held]).all()
+    np.testing.assert_array_equal(times_ms[fresh], usable_times_ms)
 
-    defuse_step_median_ms = np.median(np.diff(defuse_times_ms))
-    hold_end_ms = defuse_times_ms[-1] + config["profile_grid"]["max_hold_defuse_steps"] * defuse_step_median_ms
+    usable_step_median_ms = np.median(np.diff(usable_times_ms))
+    hold_end_ms = usable_times_ms[-1] + config["profile_grid"]["max_hold_defuse_steps"] * usable_step_median_ms
     # One slice of margin either side of the limit, where float round-off decides
     assert np.isfinite(te_axis[(times_ms > defuse_times_ms[-1]) & (times_ms < hold_end_ms - 1)]).all()
     assert np.isnan(te_axis[times_ms > hold_end_ms + 1]).all()
@@ -191,6 +194,8 @@ def _raw_dataset(shot: int = 70000) -> xr.Dataset:
     }
     data_vars = {name: (("time",), np.full(N_TIME, value)) for name, value in RAW_SCALAR_VALUES.items()}
     data_vars |= {name: (("time", RADIAL_DIM), values) for name, values in profiles.items()}
+    fresh_profile = (np.arange(N_TIME) % 17 == 0).astype(np.float32)
+    data_vars["fresh_profile"] = (("time",), fresh_profile)
     ds = xr.Dataset(data_vars, coords={"time": time, RADIAL_DIM: RHO_TOR_NORM_GRID.astype(np.float32)})
     return ds.expand_dims(shot=[shot])
 
@@ -210,7 +215,7 @@ def test_standardize_builds_store_signals_in_si(workflow):
     ds = workflow.standardize_signal_names(_raw_dataset())
 
     assert ds is not None
-    assert set(ds.data_vars) == set(STORE_SIGNALS) - {"fresh_profile"}
+    assert set(ds.data_vars) == set(STORE_SIGNALS)
     assert ds.sizes["time_idx"] == N_TIME
     assert ds["ip"].isel(time_idx=0).item() == pytest.approx(3e5)
     assert ds["b0"].isel(time_idx=0).item() == pytest.approx(1.4)

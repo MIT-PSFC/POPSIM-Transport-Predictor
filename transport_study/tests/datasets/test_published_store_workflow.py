@@ -8,12 +8,9 @@ These build a tiny store in the published layout and run the real build on it.
 import numpy as np
 import pytest
 import xarray as xr
+from transport_validation_datasets.store_schema import STORE_SIGNAL_ATTRS, STORE_SIGNALS
 
-from transport_study.signals import (
-    PREDICTION_STORE_NAME,
-    STORE_SIGNAL_UNITS,
-    STORE_SIGNALS,
-)
+from transport_study.signals import PREDICTION_STORE_NAME
 
 RHO = np.linspace(0.0, 1.1, 12)
 N_TIME_PADDED = 60
@@ -76,9 +73,9 @@ def _published_store(path) -> xr.Dataset:
     data_vars["cocos"] = (("shot",), np.full(n_shots, 7.0, dtype=np.float32))
     data_vars["psirz"] = (("shot", "time_idx", "r_grid", "z_grid"), padded(np.ones((n_shots, N_TIME_PADDED, 3, 3))))
     ds = xr.Dataset(data_vars, coords={"shot": shots, "rho_tor_norm": RHO, "r_grid": np.arange(3.0), "z_grid": np.arange(3.0)})
-    for name, unit in STORE_SIGNAL_UNITS.items():
+    for name, attrs in STORE_SIGNAL_ATTRS.items():
         if name in ds:
-            ds[name].attrs["units"] = unit
+            ds[name].attrs["units"] = attrs["units"]
     ds.to_zarr(path, mode="w")
     return ds
 
@@ -102,8 +99,8 @@ def test_store_holds_exactly_the_on_disk_schema(built_store):
 
     assert set(ds_built.data_vars) == {*STORE_SIGNALS, "time"}
     assert set(ds_built.dims) == {"shot", "time_idx", "rho_tor_norm"}
-    for name, unit in STORE_SIGNAL_UNITS.items():
-        assert ds_built[name].attrs["units"] == unit, name
+    for name, attrs in STORE_SIGNAL_ATTRS.items():
+        assert ds_built[name].attrs["units"] == attrs["units"], name
 
 
 def test_every_shot_kept_and_padding_trimmed(built_store):

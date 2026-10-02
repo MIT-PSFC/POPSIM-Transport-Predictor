@@ -10,12 +10,16 @@ from pathlib import Path
 import numpy as np
 import xarray as xr
 from loguru import logger
-from transport_validation_datasets.machine.generic import geqdsk_psi_n_grid, phi_n_map
+from transport_validation_datasets.machine.generic import (
+    geqdsk_psi_n_grid,
+    hold_onto_grid,
+    phi_n_map,
+    values_on_grid,
+)
 
 from transport_study import PACKAGE_ROOT, RADIAL_DIM
 from transport_study.datasets import read_shotlist
 from transport_study.datasets.d3d import config
-from transport_study.datasets.profile_grids import held_on_times, held_slice_index
 
 D3D_DIR = Path(PACKAGE_ROOT) / "datasets" / "d3d"
 
@@ -130,12 +134,15 @@ def ida_profiles_on_grids(
     mask_efit_valid: np.ndarray,
     times: np.ndarray,
 ) -> xr.Dataset:
-    """IDA Te/ne on RHO_TOR_NORM_GRID (with gradients) and PSI_NORM_GRID, held onto the timebase.
+    """IDA Te/ne on RHO_TOR_NORM_GRID (with gradients) and PSI_NORM_GRID, held onto the timebase (hold_onto_grid).
 
     Each IDA slice maps to rho_tor_norm through the q profile of the nearest valid EFIT slice no farther than
-    match_max_ms away, otherwise its rho_tor_norm profiles are NaN. The interpolation clamps to the innermost
-    IDA value at the axis and is NaN past the IDA psi_n domain. Each slice is held onto the timebase until the
-    next one, for at most max_hold_ida_steps median IDA steps, and the timebase is NaN before the first slice.
+    match_max_ms away. The interpolation clamps to the innermost IDA value at the axis and is NaN past the IDA
+    psi_n domain. Each slice is held onto the timebase until the next one, for at most max_hold_ida_steps median
+    IDA steps, and the timebase is NaN before the first slice.
+    A slice that does not map, or lacks a Te or ne fit, is dropped before the rho_tor_norm hold,
+    so the slice before it holds over it, as transport-validation-datasets does with its fits.
+    fresh_profile marks the grid times where a usable slice lands.
 
     Args:
         ida: IDA file contents, T_e [eV] and n_e [m^-3] with 1-sigma _err companions on (time [ms], psi_n).
@@ -145,7 +152,8 @@ def ida_profiles_on_grids(
         times: (n_t,) timebase [s].
 
     Returns:
-        IDA_RHO_COLUMNS on ("idx", RADIAL_DIM) and IDA_PSI_COLUMNS on ("idx", PSI_NORM_DIM).
+        IDA_RHO_COLUMNS on ("idx", RADIAL_DIM), IDA_PSI_COLUMNS on ("idx", PSI_NORM_DIM),
+        and fresh_profile on ("idx",), all float32.
 
     Raises:
         ValueError: If the IDA file has fewer than two slices.
@@ -197,13 +205,22 @@ def ida_profiles_on_grids(
         slice_profiles[f"{prefix}_rho_grad_error"] = gradient_error_rho
         slice_profiles[f"{prefix}_psi"] = values_psi
 
-    # Hold each slice forward onto the timebase
-    slice_index, mask_held = held_slice_index(ida_time, times, config["profile_grid"]["max_hold_ida_steps"])
+    # The psi_norm profiles need no map, so every slice holds them
+    max_hold_steps = config["profile_grid"]["max_hold_ida_steps"]
+    mask_te_fit = np.isfinite(slice_profiles["te_rho"]).any(axis=1)
+    mask_ne_fit = np.isfinite(slice_profiles["ne_rho"]).any(axis=1)
+    mask_slice_usable = mask_slice_mapped & mask_te_fit & mask_ne_fit
+    usable_index, fresh = hold_onto_grid(times, ida_time[mask_slice_usable], True, max_hold_periods=max_hold_steps)
+    slice_index, _ = hold_onto_grid(times, ida_time, True, max_hold_periods=max_hold_steps)
 
-    data_vars = {}
+    data_vars = {"fresh_profile": (("idx",), fresh.astype(np.float32))}
     for name, profiles in slice_profiles.items():
-        dim = PSI_NORM_DIM if name in IDA_PSI_COLUMNS else RADIAL_DIM
-        data_vars[name] = (("idx", dim), held_on_times(profiles, slice_index, mask_held))
+        if name in IDA_PSI_COLUMNS:
+            profiles_on_times = values_on_grid(profiles, slice_index)
+            data_vars[name] = (("idx", PSI_NORM_DIM), profiles_on_times.astype(np.float32))
+        else:
+            profiles_on_times = values_on_grid(profiles[mask_slice_usable], usable_index)
+            data_vars[name] = (("idx", RADIAL_DIM), profiles_on_times.astype(np.float32))
     coords = {
         RADIAL_DIM: RHO_TOR_NORM_GRID.astype(np.float32),
         PSI_NORM_DIM: PSI_NORM_GRID.astype(np.float32),
