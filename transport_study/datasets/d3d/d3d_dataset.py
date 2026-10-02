@@ -40,12 +40,13 @@ INNER_WALL = 1.05  # Location of the inner wall, used to calculate minor radius 
 RUN_METHODS = [
     # disruption-py 0.14 built-ins
     "get_efit_parameters",  # wmhd, beta_n, kappa
-    "get_power_parameters",  # p_rad, p_nbi, p_ech
-    "get_ohmic_parameters",  # p_ohm
     "get_ip_parameters",  # ip, ip_prog
     # custom methods from physics_methods.py
     "get_ptdata_parameters",  # bt, dssneped, PCS programmed waveforms
     "get_line_average_density",  # n_e_line_average
+    "get_ohmic_power",  # p_ohm
+    "get_radiated_power",  # p_rad
+    "get_heating_powers",  # p_nbi, p_ech
     "get_boundary_parameters",  # aminor, rsurf, tritop, tribot
     "get_xpoint_gap_parameters",  # gapin, X points
     "get_ida_profiles",  # Te/ne on rho_tor_norm and psi_norm
@@ -168,11 +169,11 @@ D3D_SIGNAL_ATTRS = {
         "ref": "/equilibrium/time_slice(itime)/boundary/triangularity_lower",
     },
     "power_ohm": {
-        "description": "Ohmic heating power, Ip * (V_loop - L dIp/dt), clipped at 0 (disruption-py)",
+        "description": "Ohmic heating power from the 1 kHz DISPY EFIT (poh = Ip V_surf - dW_pol/dt), clipped at 0",
         "ref": "/summary/global_quantities/power_ohm/value",
     },
     "power_radiated": {
-        "description": "Total radiated power including the divertor, causal 10 ms bolometer reconstruction (disruption-py)",
+        "description": "Total radiated power including the divertor, bolometer analysis prad_tot (4 ms, 50 ms non-causal smoothing), clipped at 0",
         "ref": "/summary/global_quantities/power_radiated/value",
     },
     "power_nbi": {
@@ -502,8 +503,8 @@ class D3DDataWorkflow(RawFileWorkflow):
         signals["power_lh"] = xr.zeros_like(ds["p_ohm"])
         ds_standardized = xr.Dataset(signals)
 
-        # p_nbi is only NaN when the whole get_power_parameters call failed, which also NaNs p_rad and p_ech
-        critical_signals = ["ip", "n_e_line_average", "power_nbi", "t_e", "n_e", "t_e_psi_norm"]
+        # p_nbi is 0 without beams, so it is only NaN when get_heating_powers itself failed
+        critical_signals = ["ip", "n_e_line_average", "power_ohm", "power_radiated", "power_nbi", "t_e", "n_e", "t_e_psi_norm"]
         if self.has_all_nan_signal(ds_standardized, critical_signals):
             return None
 

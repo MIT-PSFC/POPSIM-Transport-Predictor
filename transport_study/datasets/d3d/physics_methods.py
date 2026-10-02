@@ -89,8 +89,28 @@ def _efit_signals(params: PhysicsMethodParams, nodes: list[str]) -> tuple[np.nda
     return efit_time, signals
 
 
+def _injected_power(params: PhysicsMethodParams, node: str, tree_name: str) -> np.ndarray:
+    """An injected heating power record on the timebase, in the record's units.
+
+    0 outside the record and when the shot has none (that heating system did not run).
+    """
+    try:
+        power, power_time_ms = params.mds_conn.get_data_with_dims(node, tree_name=tree_name)
+    except mdsExceptions.MdsException:
+        params.logger.debug("no {node} record, taking 0", node=node)
+        return np.zeros(len(params.times))
+    # echpwrc can end with a stray t = 0 sample
+    if power_time_ms.size > 1 and power_time_ms[-1] == 0:
+        power_time_ms = power_time_ms[:-1]
+        power = power[:-1]
+    if power_time_ms.size <= 2:
+        return np.zeros(len(params.times))
+    power_time = power_time_ms / 1e3
+    return interp1(power_time, power, params.times, fill_value=0.0)
+
+
 class D3DDatasetMethods:
-    """Signals the transport study needs that disruption-py 0.14 has no built-in for."""
+    """Signals the transport study needs that disruption-py 0.14 has no built-in for, or no usable one."""
 
     # Measured: bt (vacuum toroidal field at R = 1.6955 m) and dssneped (PCS pedestal density estimate).
     # PCS targets: bmtpwrtar (beta_N), idtrp (R0), idtrxbot / idtzxbot / idtrxtop / idtzxtop (X points).
@@ -150,6 +170,46 @@ class D3DDatasetMethods:
         density_time = density_time_ms / 1e3
         n_e_line_average = interp1(density_time, density, params.times)
         return {"n_e_line_average": n_e_line_average}
+
+    @staticmethod
+    @physics_method(columns=["p_ohm"], tokamak=Tokamak.D3D)
+    def get_ohmic_power(params: PhysicsMethodParams):
+        """Ohmic power [W] from the DISPY EFIT: poh = Ip V_surf - dW_pol/dt, with V_surf = -2 pi dpsi_bdy/dt.
+
+        Replaces the built-in get_ohmic_parameters,
+        whose 20 kHz vloopb with a 0.55 ms median filter is noise at 1 kHz.
+        """
+        efit_time, signals = _efit_signals(params, ["poh"])
+        p_ohm = interp1(efit_time, signals["poh"], params.times)
+        return {"p_ohm": p_ohm}
+
+    @staticmethod
+    @physics_method(columns=["p_rad"], tokamak=Tokamak.D3D)
+    def get_radiated_power(params: PhysicsMethodParams):
+        """Total radiated power [W] including the divertor, \\bolom::prad_tot of the standard bolometer analysis.
+
+        Sampled every 4 ms and smoothed non-causally over 50 ms.
+        Its units label reads MW, but the values are W (they match the built-in pwrmix to a few percent).
+        Replaces the built-in pwrmix,
+        a causal 10 ms sum of the 48 raw channels that resolves ELMs and goes negative.
+        """
+        p_rad, p_rad_time_ms = params.mds_conn.get_data_with_dims(r"\top.prad_01.prad:prad_tot", tree_name="bolom")
+        p_rad_time = p_rad_time_ms / 1e3
+        p_rad_on_timebase = interp1(p_rad_time, p_rad, params.times)
+        return {"p_rad": p_rad_on_timebase}
+
+    @staticmethod
+    @physics_method(columns=["p_nbi", "p_ech"], tokamak=Tokamak.D3D)
+    def get_heating_powers(params: PhysicsMethodParams):
+        """Injected neutral beam and electron cyclotron powers [W], the nodes of the built-in get_power_parameters.
+
+        The built-in also rebuilds pwrmix from the 48 raw bolometer channels and P_oh from vloopb,
+        so a bolometer failure there would NaN p_nbi and skip the shot.
+        """
+        p_nbi_kW = _injected_power(params, r"\top.nb:pinj", "d3d")
+        p_nbi = p_nbi_kW * 1e3
+        p_ech = _injected_power(params, r"\top.ech.total:echpwrc", "rf")
+        return {"p_nbi": p_nbi, "p_ech": p_ech}
 
     @staticmethod
     @physics_method(columns=BOUNDARY_NODES, tokamak=Tokamak.D3D)
