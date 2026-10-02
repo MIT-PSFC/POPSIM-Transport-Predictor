@@ -13,7 +13,7 @@ from transport_validation_datasets.machine.generic import (
     make_uniform_1kHz_timebase,
     ohmic_power,
     signal_on_grid,
-    trailing_boxcar_mean,
+    smoothed_power,
 )
 
 from transport_study import RADIAL_DIM, TIME_COORD
@@ -77,10 +77,6 @@ OHMIC_POWER_SOURCES = ("I_P", "Vloop", "LI", "R_geom")
 # DEFUSE Vloop has the opposite sign convention to I_P:
 # Ip * Vloop is negative at flat-top on all 39 shots checked, of both current polarities
 DEFUSE_VLOOP_SIGN = -1.0
-# Width of the trailing boxcar the ohmic power is smoothed with [s], as on C-Mod.
-# Unsmoothed, the loop voltage and the dW_pol/dt difference make it noise-dominated at 1 kHz.
-OHMIC_POWER_SMOOTHING_WINDOW = 5e-3
-
 DEFUSE_PROFILE_SIGNALS = ("Te_rho", "Ne_rho")
 # The profile gradients are taken on the DEFUSE fit points, under the profile's name with this suffix
 DEFUSE_GRADIENT_SUFFIX = "_grad"
@@ -146,11 +142,12 @@ TCV_SIGNAL_ATTRS = {
     "power_ohm": {
         "description": (
             "Ohmic heating power, Ip * V_loop minus the rate of change of the internal poloidal magnetic energy "
-            "mu0 R_geo li Ip^2 / 4 (DEFUSE I_P, Vloop, LI, R_geom), causal (backward difference, trailing 5 ms boxcar), clipped at 0"
+            "mu0 R_geo li Ip^2 / 4 (DEFUSE I_P, Vloop, LI, R_geom, backward difference), "
+            "smoothed by a centered 50 ms boxcar applied twice (non-causal), clipped at 0"
         ),
     },
     "power_radiated": {
-        "description": "Total radiated power including the divertor, bolometry (DEFUSE PradTot), clipped at 0",
+        "description": "Total radiated power including the divertor, bolometry (DEFUSE PradTot, not smoothed further), clipped at 0",
     },
     "power_nbi": {
         "description": "Neutral beam power, summed over both beamlines (DEFUSE NBI + NBI2), zero where a beam is absent",
@@ -430,10 +427,10 @@ class TCVDataWorkflow(RawFileWorkflow):
 
 
 def _ohmic_power(ds: xr.Dataset) -> xr.DataArray:
-    """Ohmic power Ip V_loop - dW_pol/dt (ohmic_power) from the DEFUSE signals on the timebase, causal.
+    """Ohmic power Ip V_loop - dW_pol/dt (ohmic_power) from the DEFUSE signals on the timebase.
 
     Vloop is flipped onto the sign convention of I_P (DEFUSE_VLOOP_SIGN),
-    and the result is smoothed by a trailing OHMIC_POWER_SMOOTHING_WINDOW boxcar.
+    and the result is smoothed non-causally (smoothed_power), as on C-Mod and MAST.
     """
     times = ds["time"].values
     ip = ds["I_P"].isel(shot=0).values
@@ -444,7 +441,7 @@ def _ohmic_power(ds: xr.Dataset) -> xr.DataArray:
     p_ohm_raw = ohmic_power(times, ip, v_loop, li, major_radius)
     time_steps = np.diff(times)
     dt = float(np.median(time_steps))
-    p_ohm = trailing_boxcar_mean(p_ohm_raw, OHMIC_POWER_SMOOTHING_WINDOW, dt)
+    p_ohm = smoothed_power(p_ohm_raw, dt)
     return xr.DataArray(p_ohm[np.newaxis, :], dims=ds["I_P"].dims, coords=ds["I_P"].coords)
 
 

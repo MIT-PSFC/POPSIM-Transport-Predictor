@@ -223,6 +223,8 @@ class D3DDatasetMethods:
     def get_ohmic_power(params: PhysicsMethodParams):
         """Ohmic power [W] from the DISPY EFIT: poh = Ip V_surf - dW_pol/dt, with V_surf = -2 pi dpsi_bdy/dt.
 
+        EFIT takes both derivatives as centered least-squares slopes over +-100 ms,
+        so poh is smoothed non-causally at the source and is not smoothed further.
         Replaces the built-in get_ohmic_parameters,
         whose 20 kHz vloopb with a 0.55 ms median filter is noise at 1 kHz.
         """
@@ -235,7 +237,8 @@ class D3DDatasetMethods:
     def get_radiated_power(params: PhysicsMethodParams):
         """Total radiated power [W] including the divertor, \\bolom::prad_tot of the standard bolometer analysis.
 
-        Sampled every 4 ms and smoothed non-causally over 50 ms, the one stored signal that is not causal.
+        Sampled every 4 ms, from raw channels smoothed by a centered 50 ms boxcar applied twice (non-causal),
+        the kernel smoothed_power gives the other devices, so it is not smoothed further.
         Its units label reads MW, but the values are W (they match the built-in pwrmix to a few percent).
         Replaces the built-in pwrmix,
         a causal 10 ms sum of the 48 raw channels that resolves ELMs and goes negative.

@@ -2,15 +2,18 @@ Every device store shares one on-disk schema (transport-validation-datasets `sto
 IMAS names in SI units on `(shot, time_idx[, rho_tor_norm])`, with `time` on `(shot, time_idx)`.
 The studies convert to their working units on load (`signals.convert_to_working_units`).
 
-Every stored value is causal, no time draws on a later sample.
+Every stored value is causal, no time draws on a later sample, except power_ohm and power_radiated.
+Unsmoothed, both are noise-dominated at 1 kHz, so they are stored smoothed:
+DIII-D's at the source (below), TCV's `PradTot` as DEFUSE gives it,
+and the rest with the DIII-D bolometer kernel, a centered 50 ms boxcar applied twice
+(transport-validation-datasets `smoothed_power`, which TCV's computed `power_ohm` uses too).
 A 0D signal is never interpolated onto the 1 kHz grid (`signal_on_grid`).
 One sampled faster than the grid is averaged over each grid step, time t taking the mean of (t - 1 ms, t].
 One sampled slower is held forward from its last finite sample for at most 1.5 of its own median sample steps,
 or for at least 10 ms when it comes from the equilibrium reconstruction (`EQUILIBRIUM_HOLD_FLOOR`),
 so a few missing reconstructions do not cut the shot.
 `fresh_equilibrium` marks the grid times a usable reconstruction lands on.
-Smoothing is a trailing boxcar, and derivatives are backward differences.
-The one exception is DIII-D `power_radiated`, smoothed non-causally at the source.
+Derivatives are backward differences, apart from those DIII-D's EFIT takes for `poh`.
 b0 is the vacuum toroidal field at the fixed major radius r0 on every device, as IMAS defines it.
 The study derives the field at the geometric axis on load, b_geo = b0 r0 / geometric_axis_r (`convert_to_working_units`).
 power_radiated is the total radiated power including the divertor,
@@ -107,12 +110,17 @@ and every signal is placed on the timebase causally instead (`signal_on_grid`, a
   disruption-py's `get_density_parameters` is not used, since it falls back to `\denv2`, which reads about 3x higher.
   Interferometer fringe jumps (201907, 199126) were dropped by the old absolute range filter (2e20 m^-3),
   whether the Greenwald fraction max catches them is to be checked.
-- `power_ohm` is `poh` of the DISPY EFIT, Ip V_surf - dW_pol/dt with V_surf = -2 pi dpsi_bdy/dt, smooth at 1 kHz.
-  Whether EFIT takes dW_pol/dt as a backward difference is not verified.
+- `power_ohm` is `poh` of the DISPY EFIT, Ip V_surf - dW_pol/dt with V_surf = -2 pi dpsi_bdy/dt.
+  EFIT takes both derivatives (PSIBDYDOT, WBDOT) as centered least-squares slopes over +-100 ms,
+  so each sample draws on slices up to 100 ms later, and it is not smoothed further.
+  Rebuilt from PSIBDY, WB and IPMEAS with +-100 ms slopes, it is 0.995-1.014 of the node on 4 shots.
+  No shorter window works on beam-heated shots, where P_oh is ~0.05 MW and each term swings far more over 10 ms.
   disruption-py's `get_ohmic_parameters` is not used:
   its 20 kHz `vloopb` with a 0.55 ms median filter is noise at 1 kHz (p1 / p99 of -4 / +4.6 MW on a 0.05 MW median).
 - `power_radiated` is `\bolom::prad_tot`, the standard bolometer analysis total including the divertor,
-  sampled every 4 ms and smoothed non-causally over 50 ms, the one stored signal that is not causal.
+  sampled every 4 ms from raw channels smoothed by a centered 50 ms boxcar applied twice,
+  a triangle 100 ms wide at its base with a 50 ms FWHM, so it draws on raw data up to 50 ms later.
+  It is not smoothed further, and the other devices' powers get the same kernel.
   Its units label reads MW, but the values are W.
   disruption-py's `pwrmix` (`get_power_parameters`) is not used:
   it is a causal 10 ms sum of the 48 raw channels that resolves ELMs and goes negative,
@@ -168,7 +176,7 @@ and the LIUQE reconstructions of the MEQ databases (`TCV{shot}_meqdb.mat`), both
   so it is held for at least 60 ms (`PRAD_TOT_HOLD_FLOOR_S`), which bridges the skips that would cut the shot.
 - `fresh_equilibrium` marks the grid times a usable LIUQE reconstruction of the MEQ database lands on.
 - `power_ohm` is computed, Ip V_loop - d/dt(mu0 R_geo li Ip^2 / 4) from DEFUSE `I_P`, `Vloop`, `LI` and the geometric major radius `R_geom`
-  (`ohmic_power`), then smoothed by a trailing 5 ms boxcar, as on C-Mod.
+  (`ohmic_power`), then smoothed by the centered 50 ms boxcar applied twice (`smoothed_power`), as on C-Mod and MAST.
   DEFUSE `Vloop` has the opposite sign to `I_P` (Ip Vloop < 0 at flat-top on 39 of 39 shots of both polarities), so it is flipped.
   DEFUSE `POHM` has no documented definition and reads 0.9-1.0 of Ip Vloop at flat-top.
 - `b0` is `BZERO`, LIUQE's rBt / r0 with r0 = 0.88 m.

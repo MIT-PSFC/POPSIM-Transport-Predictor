@@ -187,10 +187,16 @@ D3D_SIGNAL_ATTRS = {
         "description": "Lower triangularity of the plasma boundary, DISPY EFIT tribot",
     },
     "power_ohm": {
-        "description": "Ohmic heating power from the 1 kHz DISPY EFIT (poh = Ip V_surf - dW_pol/dt), clipped at 0",
+        "description": (
+            "Ohmic heating power from the 1 kHz DISPY EFIT (poh = Ip V_surf - dW_pol/dt), "
+            "its derivatives centered least-squares slopes over +-100 ms (non-causal), clipped at 0"
+        ),
     },
     "power_radiated": {
-        "description": "Total radiated power including the divertor, bolometer analysis prad_tot (4 ms, 50 ms non-causal smoothing), clipped at 0",
+        "description": (
+            "Total radiated power including the divertor, bolometer analysis prad_tot (4 ms), "
+            "smoothed by a centered 50 ms boxcar applied twice to the raw channels (non-causal), clipped at 0"
+        ),
     },
     "power_nbi": {
         "description": "Neutral beam power injected into the vessel (pinj)",
