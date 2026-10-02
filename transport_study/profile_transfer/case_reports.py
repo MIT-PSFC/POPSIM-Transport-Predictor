@@ -34,6 +34,7 @@ from transport_study.profile_transfer.study_metrics import (
     compute_case_timeslice_metrics,
     load_eval_dataset,
 )
+from transport_study.signals import convert_to_working_units
 
 N_BEST_WORST = 10
 GIF_FRAME_DURATION_MS = 200
@@ -375,9 +376,12 @@ def torax_relaxation_report(study, metrics_ds: xr.Dataset, figure_dir: Path):
         logger.info(f"TORAX relaxation figure already exists at {plot_path}, skipping")
         return
 
-    # The raw device dataset carries the scalar input vars the module needs.
+    # The device store carries the scalar input vars the module needs, in SI under IMAS names.
     # load_eval_dataset keeps the same time_idx indexing (rows are never dropped)
-    timeslice = xr.open_dataset(config.dataset_paths[device]).sel({EPISODE_DIM: shot}).isel({TIME_DIM: eval_time_idx})
+    ds_store = xr.open_dataset(config.dataset_paths[device])
+    timeslice_store = ds_store.sel({EPISODE_DIM: shot}).isel({TIME_DIM: eval_time_idx})
+    # The module takes the working units (ip_MA, b_geo, ...), as in training
+    timeslice = convert_to_working_units(timeslice_store)
     # Raw device files lack the device index organize_data assigns, the
     # module's normalizer needs it to pick the right per-device statistics
     timeslice["ds_source_idx"] = float(config.ds_source_to_idx[device])

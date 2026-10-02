@@ -62,6 +62,7 @@ with the transients shaded red, the end-of-shot cut, the thresholds, and dots wh
 | max greenwald_fraction | 2.0 | 2.0 | 2.0 | 2.0 |
 | transient power_ohm | 5 MW | 5 MW | 2 MW | 2 MW |
 | transient power_radiated | 5.5 MW | 3 MW | 17 MW | 5 MW |
+| failure_margin (shared) | 20 ms | 20 ms | 20 ms | 20 ms |
 | end_margin | 20 ms | 40 ms | 50 ms | 50 ms |
 | min_pulse_length | 0.5 s | 0.2 s | 0.5 s | 0.5 s |
 | min_radiated_fraction | 0.01 | 0.025 | 0.025 | 0.025 |
