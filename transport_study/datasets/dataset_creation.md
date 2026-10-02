@@ -26,7 +26,7 @@ disruption-py 0.14.0 pins numpy < 2, which `[tool.uv] override-dependencies` in 
 (none of the code paths used here need numpy < 2).
 The OMEGA system MDSplus cannot import under numpy >= 2, so disruption-py falls back to the mdsthin thin client on its own,
 with the login PYTHONPATH left as it is.
-Everything comes from one `get_shots_data` call per shot, built-in methods (EFIT scalars, powers, Ip)
+Everything comes from one `get_shots_data` call per shot, built-in methods (EFIT scalars, Ip)
 plus the custom ones in `d3d/physics_methods.py`:
 
 - EFIT: every EFIT signal comes from the shot's latest code_rundb run tagged `DISPY` (the 1 kHz disruption-efit).
@@ -48,6 +48,15 @@ plus the custom ones in `d3d/physics_methods.py`:
   which matches `\density` within 1 percent where both exist.
   disruption-py's `get_density_parameters` is not used, since it falls back to `\denv2`, which reads about 3x higher.
   Interferometer fringe jumps (201907, 199126) are dropped by the `n_e_line_average` range filter.
+- `power_ohm` is `poh` of the DISPY EFIT, Ip V_surf - dW_pol/dt with V_surf = -2 pi dpsi_bdy/dt, smooth at 1 kHz.
+  disruption-py's `get_ohmic_parameters` is not used:
+  its 20 kHz `vloopb` with a 0.55 ms median filter is noise at 1 kHz (p1 / p99 of -4 / +4.6 MW on a 0.05 MW median).
+- `power_radiated` is `\bolom::prad_tot`, the standard bolometer analysis total including the divertor,
+  sampled every 4 ms and smoothed non-causally over 50 ms. Its units label reads MW, but the values are W.
+  disruption-py's `pwrmix` (`get_power_parameters`) is not used:
+  it is a causal 10 ms sum of the 48 raw channels that resolves ELMs and goes negative,
+  so after the clip at 0 it cycled between 0 and 4-9 MW in heated H-modes.
+  The NBI (`pinj`) and ECH (`echpwrc`) powers are read from the same nodes as `get_power_parameters` (`get_heating_powers`).
 
 Processing writes two stores on the same shot / time_idx layout, both in IMAS names and SI units, with description,
 units, and ref (IMAS path) attributes on every variable: `ds.zarr`, the shared schema, and `trajopt.zarr`,
@@ -56,6 +65,23 @@ Each raw file records the IDA file its profiles came from (`ida_path` attribute)
 a JSON object mapping every stored shot to the folder of its IDA file (`json.loads(ds.attrs["ida_source"])`).
 Three PCS pointnames of unverified meaning (`bttbt`, `dstdenp`, `ieeseg07`) are kept under their raw names and units,
 see the TODO in `d3d/d3d_dataset.py`.
+
+Filtering and culls in processing (`D3DDataWorkflow`, `RawFileWorkflow.filter_ds`):
+
+- The plasma ends at the last slice with ip >= 0.2 MA, and each shot is cut 50 ms before that.
+  DIII-D ip reads near 0 out to the 8 s end of the timebase, so the last finite ip is not the end.
+- A P_oh transient cuts the rest of the shot: its centered 5 ms boxcar above 2 MW.
+  The EFIT P_oh stays below 0.6 MW through the ramp-up and only crosses 2 MW at disruptive terminations.
+  P_rad has no such cut, since values up to 16 MW occur mid-shot in high-power shots.
+- Slices with elongation below 1.3 (deep limited rampdowns, the worst stored energy glitches)
+  or a triangularity at the EFIT saturation (|delta| > 0.99) are dropped.
+- `excluded_shots` in `d3d/config.toml` culls 203549, 203551 and 203554,
+  failed beam shots with HFS pellets from run 20250529 (see the logbook).
+- Known and kept as is:
+  - The DISPY EFIT scalars carry single-slice spikes (Wtot and triangularity).
+    EFIT chisq does not flag them, and they are not median-filtered.
+  - The first ~80 ms of the TMDB_V1c IDA-lite records (0.11-0.2 s, Ip ~0.4 MA) are often hollow in both Te and ne.
+    They are kept as ramp-up data.
 disruption-py writes no netCDF (its output setting has `path=False`), only a small `config.json` per call
 under `$LOCALSCRATCH/$USER/disruption-py/`.
 

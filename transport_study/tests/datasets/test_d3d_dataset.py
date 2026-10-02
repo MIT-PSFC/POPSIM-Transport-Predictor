@@ -511,6 +511,14 @@ def test_live_single_shot(tmp_path):
     assert 1e19 < float(ds["n_e_line_average"].median()) < 1.5e20
     t_e_axis = ds["t_e"].sel({RADIAL_DIM: 0}).values
     assert 500 < np.nanmax(t_e_axis) < 1e4
+    # The EFIT P_oh sits well under the 2 MW transient threshold, and prad_tot covers the whole plasma
+    mask_flattop = ds["ip"].values.squeeze() > 0.5 * ip_max
+    p_ohm_flattop = ds["power_ohm"].values.squeeze()[mask_flattop]
+    p_rad_flattop = ds["power_radiated"].values.squeeze()[mask_flattop]
+    assert 0 < np.nanmedian(p_ohm_flattop) < 2e6
+    assert np.nanpercentile(p_ohm_flattop, 95) < 2e6
+    assert np.isfinite(p_rad_flattop).all()
+    assert 1e5 < np.median(p_rad_flattop) < 1e7
     # Every held slice has a value at the axis (left clamp), otherwise the t_e_axis filter drops it
     t_e = ds["t_e"].values.squeeze()
     mask_held = np.isfinite(t_e).any(axis=-1)

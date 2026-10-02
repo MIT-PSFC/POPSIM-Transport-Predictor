@@ -224,6 +224,8 @@ class RawFileWorkflow(DataWorkflow):
        on a uniform 1 kHz timebase with signals in the on-disk schema.
     2. run_processed_data_workflow: each raw file goes through device_specific_processing,
        power clipping, fresh_profile labelling, filter_ds, and the culls, into the stores.
+       filter_ds cuts end_margin_s before the plasma current ends and from the first transient_filter_config transient,
+       then applies the range filters.
     """
 
     # Seconds of data cut before the plasma current ends (see filter_ds).
@@ -469,7 +471,9 @@ class RawFileWorkflow(DataWorkflow):
             logger.warning(f"Excluding shot {shot} because ip never reaches its filter_config minimum")
             return None
         last_plasma_idx = int(np.where(mask_plasma.values)[0][-1])
-        valid_mask = shot_ds[TIME_COORD] <= shot_ds[TIME_COORD][last_plasma_idx] - self.end_margin_s
+        # Half a sample of slack, so float rounding of the times never decides the slice at the margin
+        t_end = shot_ds[TIME_COORD][last_plasma_idx] - self.end_margin_s + UNIFORM_TIMEBASE_DT_S / 2
+        valid_mask = shot_ds[TIME_COORD] <= t_end
 
         # Cut from the first transient, where a smoothed signal exceeds its threshold while the plasma is on
         window_samples = round(self.transient_smoothing_window_s / UNIFORM_TIMEBASE_DT_S)

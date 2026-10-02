@@ -97,3 +97,34 @@ def test_process_fn_culls_shot_with_impossible_stored_energy(tcv_workflow):
     power_ohm = np.full((1, N_T), 1e4)
 
     assert _processed(tcv_workflow, raw_shot(energy_mhd=energy_mhd, power_ohm=power_ohm)) is None
+
+
+def test_filter_ds_ends_before_the_plasma_current_termination(tcv_workflow):
+    """A record whose ip stays finite but near 0 after the plasma (DIII-D reads it out to 8 s)
+    is cut end_margin_s before the last slice with ip at its filter_config minimum.
+    Measured from the last finite ip instead, the margin would never apply."""
+    idx_plasma_end = 1200
+    ip = np.full((1, N_T), 3e5)
+    ip[0, idx_plasma_end + 1 :] = 1e3
+
+    filtered = tcv_workflow.filter_ds(raw_shot(ip=ip))
+
+    time_ms = np.round(filtered["time"].values * 1000).astype(int)
+    assert time_ms[-1] == idx_plasma_end - round(tcv_workflow.end_margin_s * 1e3)
+
+
+def test_filter_ds_cuts_from_the_first_transient(tcv_workflow, monkeypatch):
+    """A sustained power_ohm excursion over its transient threshold ends the shot
+    at the first slice whose centered 5 ms boxcar crosses the threshold,
+    while a single-slice spike the boxcar averages under the threshold does not."""
+    monkeypatch.setattr(tcv_workflow, "transient_filter_config", {"power_ohm": 2e6})
+    power_ohm = np.full((1, N_T), 3e5)
+    power_ohm[0, 500] = 5e6
+    power_ohm[0, 1000:1100] = 5e6
+
+    filtered = tcv_workflow.filter_ds(raw_shot(power_ohm=power_ohm))
+
+    time_ms = np.round(filtered["time"].values * 1000).astype(int)
+    # The boxcar at 999 holds two excursion slices, (3 x 0.3 + 2 x 5) / 5 = 2.18 MW, the first crossing
+    assert time_ms[-1] == 998
+    assert 500 in time_ms
