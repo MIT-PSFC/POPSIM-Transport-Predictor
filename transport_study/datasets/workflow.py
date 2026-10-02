@@ -8,7 +8,7 @@ import xarray as xr
 from loguru import logger
 
 from transport_study import EPISODE_DIM, RADIAL_DIM, TIME_COORD, TIME_DIM
-from transport_study.datasets import UNIFORM_TIMEBASE_DT_S
+from transport_study.datasets import UNIFORM_TIMEBASE_DT_S, read_shotlist
 from transport_study.datasets.plotting import (
     ds_profile_plot,
     ds_profile_time_plot,
@@ -268,9 +268,7 @@ class RawFileWorkflow(DataWorkflow):
             self.shotlist = self._get_shotlist_from_source()
             logger.info(f"Retrieved {len(self.shotlist)} shots from source")
         else:
-            with open(shotlist_file) as f:
-                lines = f.readlines()
-                self.shotlist = [int(line.strip()) for line in lines if line.strip().isdigit()]
+            self.shotlist = read_shotlist(shotlist_file)
             logger.info(f"Loaded {len(self.shotlist)} shots from {shotlist_file}")
 
     @abstractmethod

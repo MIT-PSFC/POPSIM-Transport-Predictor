@@ -5,6 +5,7 @@ selection, signal standardization, and the IMAS attributes of both stores, all o
 The slow test pulls one real shot, so it needs the IDA database and the DIII-D data servers.
 """
 
+import json
 import os
 import sys
 from pathlib import Path
@@ -24,7 +25,9 @@ from transport_study.datasets.d3d import config
 from transport_study.datasets.d3d.d3d_dataset import (
     D3D_SIGNAL_ATTRS,
     D3D_TRAJOPT_STORE_SIGNALS,
+    IDA_SOURCE_ATTR,
     PREDICTION_SOURCES,
+    RAW_IDA_PATH_ATTR,
     TRAJOPT_SOURCES,
     TRAJOPT_STORE_NAME,
     D3DDataWorkflow,
@@ -41,6 +44,7 @@ from transport_study.datasets.d3d.profiles import (
     PSI_NORM_DIM,
     PSI_NORM_GRID,
     RHO_TOR_NORM_GRID,
+    IdaDatabase,
     find_ida_path,
     find_ida_shots,
     gradient_and_error,
@@ -194,24 +198,37 @@ def test_gradient_and_error():
     np.testing.assert_allclose(gradient_error[:, -1], gradient_error[:, -2])
 
 
-def test_ida_path_priority_wildcards_and_union(tmp_path):
-    """The first pattern with a file wins, wildcards match VVUQ-style names, and the shotlist is the union."""
-    primary, fallback, wild = tmp_path / "primary", tmp_path / "fallback", tmp_path / "wild"
-    for directory in [primary, fallback, wild]:
+def test_ida_databases_priority_wildcards_shotlists_and_union(tmp_path):
+    """The first database with a file wins, wildcards match VVUQ-style names, a database with a shotlist
+    serves only its shots, and the default shotlist is the union of what every database serves."""
+    primary, fallback, wild, general = tmp_path / "primary", tmp_path / "fallback", tmp_path / "wild", tmp_path / "general"
+    for directory in [primary, fallback, wild, general]:
         directory.mkdir()
-    patterns = [
-        str(primary / "IDA_{shot}_.cdf"),
-        str(fallback / "ida{shot}.nc"),
-        str(wild / "IDA_{shot}_*_.cdf"),
+    databases = [
+        IdaDatabase(str(primary / "IDA_{shot}_.cdf")),
+        IdaDatabase(str(fallback / "ida{shot}.nc")),
+        IdaDatabase(str(wild / "IDA_{shot}_*_.cdf")),
+        IdaDatabase(str(general / "IDA_{shot}_.cdf"), shots=frozenset({2, 5})),
     ]
-    for path in [primary / "IDA_2_.cdf", fallback / "ida1.nc", fallback / "ida2.nc", wild / "IDA_4_0.2_4.0_.cdf"]:
+    files = [
+        primary / "IDA_2_.cdf",
+        fallback / "ida1.nc",
+        fallback / "ida2.nc",
+        wild / "IDA_4_0.2_4.0_.cdf",
+        general / "IDA_2_.cdf",
+        general / "IDA_5_.cdf",
+        general / "IDA_6_.cdf",
+    ]
+    for path in files:
         path.touch()
 
-    assert find_ida_path(2, patterns) == primary / "IDA_2_.cdf"
-    assert find_ida_path(1, patterns) == fallback / "ida1.nc"
-    assert find_ida_path(3, patterns) is None
-    assert find_ida_path(4, patterns) == wild / "IDA_4_0.2_4.0_.cdf"
-    assert find_ida_shots(patterns) == [1, 2, 4]
+    assert find_ida_path(2, databases) == primary / "IDA_2_.cdf"
+    assert find_ida_path(1, databases) == fallback / "ida1.nc"
+    assert find_ida_path(3, databases) is None
+    assert find_ida_path(4, databases) == wild / "IDA_4_0.2_4.0_.cdf"
+    assert find_ida_path(5, databases) == general / "IDA_5_.cdf"
+    assert find_ida_path(6, databases) is None
+    assert find_ida_shots(databases) == [1, 2, 4, 5]
 
 
 class _StubDatabase:
@@ -406,12 +423,19 @@ def test_missing_efit_boundary_culls_the_shot(workflow):
     assert workflow.device_specific_culling(ds)
 
 
+SYNTHETIC_IDA_PATHS = {
+    199051: "/ida/HBP_database/IDA_199051_.cdf",
+    199052: "/ida/TMDB_V1c/Output/IDA_199052_.cdf",
+}
+
+
 @pytest.fixture
 def built_stores(workflow):
-    """Both stores built from two synthetic raw files."""
-    for shot in [199051, 199052]:
+    """Both stores built from two synthetic raw files, with profiles from different IDA databases."""
+    for shot, ida_path in SYNTHETIC_IDA_PATHS.items():
         raw = _raw_dataset(shot)
         raw_standardized = workflow.standardize_signal_names(raw)
+        raw_standardized.attrs[RAW_IDA_PATH_ATTR] = ida_path
         raw_standardized.to_netcdf(workflow.raw_data_dir / f"{shot}.nc")
     workflow.run_processed_data_workflow()
     ds_prediction = xr.open_zarr(workflow.store_path(PREDICTION_STORE_NAME))
@@ -437,6 +461,14 @@ def test_stores_carry_imas_attributes_and_grids(built_stores):
                 assert attrs["ref"] == D3D_SIGNAL_ATTRS[name]["ref"], name
     np.testing.assert_array_equal(ds_prediction[RADIAL_DIM].values, RHO_TOR_NORM_GRID.astype(np.float32))
     np.testing.assert_array_equal(ds_trajopt[PSI_NORM_DIM].values, PSI_NORM_GRID.astype(np.float32))
+
+
+def test_stores_record_each_shots_ida_folder(built_stores):
+    """Both stores map every stored shot to the folder of its IDA file, and no raw IDA path leaks into them."""
+    expected = {str(shot): str(Path(ida_path).parent) for shot, ida_path in SYNTHETIC_IDA_PATHS.items()}
+    for ds_store in built_stores:
+        assert json.loads(ds_store.attrs[IDA_SOURCE_ATTR]) == expected
+        assert RAW_IDA_PATH_ATTR not in ds_store.attrs
 
 
 def test_every_source_column_has_attrs():

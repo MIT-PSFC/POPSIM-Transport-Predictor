@@ -1,13 +1,29 @@
 # DIII-D Dataset Configuration
 
-[data_sources]
 # IDA profile databases, one file per shot. Searched in priority order:
-# a shot is read from the first pattern that has a file for it, and patterns may hold * wildcards.
-# The union across patterns also defines shot availability for the default shotlist.
-ida_path_patterns = [
-  "/fusion/projects/results/ida-results/HBP_database/IDA_{shot}_.cdf",
-  "/fusion/projects/xpsi/nelsonand/VVUQ/Output_KumarJul9/IDA_{shot}_*_.cdf",
-]
+# a shot is read from the first database that has a file for it, and patterns may hold * wildcards.
+# A database with a shotlist (a file in this directory) only serves the shots on it.
+# The union across databases is the default shotlist.
+# The first two are full IDA, the rest are IDA_LITE (fewer diagnostics) but the results are very similar.
+# The TMDB_V1c fits match HBP_database to a few percent on their 38 shared shots.
+[[data_sources.ida_databases]]
+pattern = "/fusion/projects/results/ida-results/HBP_database/IDA_{shot}_.cdf"
+
+[[data_sources.ida_databases]]
+pattern = "/fusion/projects/xpsi/nelsonand/VVUQ/Output_KumarJul9/IDA_{shot}_*_.cdf"
+
+# General-purpose databases (thousands of shots each), taken for HBP shots only
+[[data_sources.ida_databases]]
+pattern = "/fusion/projects/results/ida-results/TMDB_V1c/Output/IDA_{shot}_.cdf"
+shotlist = "HBP_shotlist_2013_2025"
+
+[[data_sources.ida_databases]]
+pattern = "/fusion/projects/results/ida-results/TMDB_V1a/Output/IDA_{shot}_.cdf"
+shotlist = "HBP_shotlist_2013_2025"
+
+[[data_sources.ida_databases]]
+pattern = "/fusion/projects/results/ida-results/TokaMaker_database/IDA_{shot}_.cdf"
+shotlist = "HBP_shotlist_2013_2025"
 
 [efit]
 # code_rundb runtag of the 1 kHz disruption-efit reconstructions. A shot without one is skipped.

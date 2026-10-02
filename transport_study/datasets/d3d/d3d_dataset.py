@@ -1,18 +1,23 @@
 """Makes the 'raw' DIII-D dataset on omega, to be processed later by POPSIM"""
 
+import json
+import warnings
+from collections import Counter
 from pathlib import Path
 from typing import ClassVar
 
 import netCDF4  # noqa: F401
 import numpy as np
 import xarray as xr
+import zarr
 from disruption_py.machine.tokamak import Tokamak
 from disruption_py.settings import RetrievalSettings
 from disruption_py.settings.output_setting import DatasetOutputSetting
 from disruption_py.workflow import get_shots_data
 from loguru import logger
+from zarr.errors import ZarrUserWarning
 
-from transport_study import RADIAL_DIM, TIME_COORD
+from transport_study import EPISODE_DIM, RADIAL_DIM, TIME_COORD
 from transport_study.datasets.d3d import config
 from transport_study.datasets.d3d.dispy_utils import passive_log_settings
 from transport_study.datasets.d3d.physics_methods import (
@@ -101,6 +106,11 @@ MAGNITUDE_SIGNALS = ("ip", "b0", "ip_reference")
 # They go in their own store, on the same shot / time_idx layout as the prediction store.
 TRAJOPT_STORE_NAME = "trajopt"
 D3D_TRAJOPT_STORE_SIGNALS = tuple(TRAJOPT_SOURCES)
+
+# Raw-file attribute holding the IDA file a shot's profiles came from
+RAW_IDA_PATH_ATTR = "ida_path"
+# Store attribute mapping every stored shot to its IDA folder, a JSON object keyed by shot
+IDA_SOURCE_ATTR = "ida_source"
 
 PCS_UNVERIFIED = "Raw PCS pointname whose meaning is unverified, see the TODO on D3D_TRAJOPT_STORE_SIGNALS. "
 
@@ -359,11 +369,10 @@ class D3DDataWorkflow(RawFileWorkflow):
         }
 
     def _get_shotlist_from_source(self) -> list[int]:
-        """Union of shots with an IDA profile file in any configured database."""
-        patterns = self.config["data_sources"]["ida_path_patterns"]
-        shots = find_ida_shots(patterns)
+        """Union of the shots every configured IDA database serves."""
+        shots = find_ida_shots()
         if not shots:
-            raise FileNotFoundError(f"No IDA files found for any pattern in {patterns}")
+            raise FileNotFoundError("No IDA files found in any configured IDA database")
         return shots
 
     def _get_shot_dataset(self, shot: int) -> xr.Dataset:
@@ -411,7 +420,8 @@ class D3DDataWorkflow(RawFileWorkflow):
                 processed_shots += 1
                 continue
 
-            if find_ida_path(shot) is None:
+            ida_path = find_ida_path(shot)
+            if ida_path is None:
                 logger.info(f"Skipping shot {shot} since IDA profiles are not available")
                 continue
 
@@ -426,11 +436,41 @@ class D3DDataWorkflow(RawFileWorkflow):
                 logger.warning(f"Standardization failed for shot {shot}, skipping")
                 continue
 
+            # get_ida_profiles resolves the same file, record_ida_sources reads it back into the stores
+            ds_standardized.attrs[RAW_IDA_PATH_ATTR] = str(ida_path)
             ds_standardized.to_netcdf(ds_path)
             logger.success(f"Saved raw dataset for shot {shot} to {ds_path}")
             processed_shots += 1
 
         logger.info("Finished making raw data files.")
+
+    def run_processed_data_workflow(self):
+        """Build the stores, then record each stored shot's IDA folder on them (record_ida_sources)."""
+        super().run_processed_data_workflow()
+        self.record_ida_sources()
+
+    def record_ida_sources(self):
+        """Set IDA_SOURCE_ATTR on every store: a JSON object from each stored shot to the folder of its IDA file.
+
+        Written after the build since the stores keep the dataset attributes of their first shot only.
+        """
+        ds_prediction = xr.open_zarr(self.store_path(PREDICTION_STORE_NAME))
+        ida_sources = {}
+        for shot in ds_prediction[EPISODE_DIM].values:
+            with xr.open_dataset(self.raw_data_dir / f"{int(shot)}.nc") as raw_file:
+                ida_path = Path(raw_file.attrs[RAW_IDA_PATH_ATTR])
+            ida_sources[str(int(shot))] = str(ida_path.parent)
+        ida_sources_json = json.dumps(ida_sources)
+        for store_name in self.STORE_VARIABLES:
+            store_path = self.store_path(store_name)
+            store_group = zarr.open_group(store_path, mode="r+")
+            store_group.attrs[IDA_SOURCE_ATTR] = ida_sources_json
+            # Consolidated metadata is a zarr v3 extension, the stores use it anyway
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", category=ZarrUserWarning)
+                zarr.consolidate_metadata(store_path)
+        ida_folder_counts = Counter(ida_sources.values())
+        logger.info(f"Recorded the IDA source of {len(ida_sources)} shots: {dict(ida_folder_counts)}")
 
     def standardize_signal_names(self, ds: xr.Dataset) -> xr.Dataset | None:
         """Build both stores' signals (IMAS names, SI units) from the raw disruption-py columns.
@@ -490,6 +530,9 @@ class D3DDataWorkflow(RawFileWorkflow):
         ds["greenwald_fraction"] = ds["n_e_line_average"] * 1e-20 / n_greenwald_1e20
 
         ds["t_e_axis"] = ds["t_e"].sel({RADIAL_DIM: 0}, method="nearest")
+
+        # Per-shot, so it must not become a store attribute through the first stored shot (see record_ida_sources)
+        del ds.attrs[RAW_IDA_PATH_ATTR]
         return ds
 
     def device_specific_culling(self, ds: xr.Dataset) -> bool:

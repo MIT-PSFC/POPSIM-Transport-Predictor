@@ -4,6 +4,7 @@ No disruption-py or MDSplus here, so all of it is testable offline.
 """
 
 import re
+from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
@@ -11,8 +12,11 @@ import xarray as xr
 from loguru import logger
 from scipy.integrate import cumulative_simpson
 
-from transport_study import RADIAL_DIM
+from transport_study import PACKAGE_ROOT, RADIAL_DIM
+from transport_study.datasets import read_shotlist
 from transport_study.datasets.d3d import config
+
+D3D_DIR = Path(PACKAGE_ROOT) / "datasets" / "d3d"
 
 RHO_TOR_NORM_GRID = np.linspace(
     config["profile_grid"]["rho_min"],
@@ -37,36 +41,72 @@ IDA_RHO_COLUMNS = [f"{prefix}{suffix}" for prefix in IDA_PROFILE_PREFIXES.values
 IDA_PSI_COLUMNS = [f"{prefix}_psi" for prefix in IDA_PROFILE_PREFIXES.values()]
 
 
-def find_ida_path(shot: int, patterns: list[str] | None = None) -> Path | None:
-    """First IDA file for the shot across the patterns, in priority order. Patterns may hold * wildcards."""
-    if patterns is None:
-        patterns = config["data_sources"]["ida_path_patterns"]
-    for pattern in patterns:
-        candidate_name = str(pattern).format(shot=shot)
+@dataclass(frozen=True)
+class IdaDatabase:
+    """An IDA profile database: a file pattern (may hold * wildcards) and, when set, the only shots it serves."""
+
+    pattern: str
+    shots: frozenset[int] | None = None
+
+    def serves(self, shot: int) -> bool:
+        return self.shots is None or shot in self.shots
+
+    def path(self, shot: int) -> Path | None:
+        """The shot's file in this database, None when it has none or does not serve the shot."""
+        if not self.serves(shot):
+            return None
+        candidate_name = self.pattern.format(shot=shot)
         candidate = Path(candidate_name)
         matches = sorted(candidate.parent.glob(candidate.name))
         if len(matches) > 1:
             logger.warning(f"Shot {shot}: {len(matches)} IDA files match {candidate}, using {matches[0]}")
-        if matches:
-            return matches[0]
-    return None
+        return matches[0] if matches else None
 
-
-def find_ida_shots(patterns: list[str] | None = None) -> list[int]:
-    """Every shot with an IDA file under any of the patterns, sorted."""
-    if patterns is None:
-        patterns = config["data_sources"]["ida_path_patterns"]
-    shots: set[int] = set()
-    for pattern in patterns:
-        pattern_path = Path(str(pattern))
+    def available_shots(self) -> set[int]:
+        """Every shot this database has a file for and serves."""
+        pattern_path = Path(self.pattern)
         name_escaped = re.escape(pattern_path.name)
         name_regex = name_escaped.replace(re.escape("{shot}"), r"(\d+)").replace(re.escape("*"), ".*")
         name_re = re.compile(name_regex)
         name_glob = pattern_path.name.format(shot="*")
+        shots = set()
         for path in pattern_path.parent.glob(name_glob):
             match = name_re.fullmatch(path.name)
             if match:
                 shots.add(int(match.group(1)))
+        if self.shots is not None:
+            shots &= self.shots
+        return shots
+
+
+def _ida_databases() -> list[IdaDatabase]:
+    """The configured IDA databases in priority order, shotlist names resolved in this directory."""
+    databases = []
+    for entry in config["data_sources"]["ida_databases"]:
+        shotlist_name = entry.get("shotlist")
+        shots = None if shotlist_name is None else frozenset(read_shotlist(D3D_DIR / shotlist_name))
+        databases.append(IdaDatabase(pattern=entry["pattern"], shots=shots))
+    return databases
+
+
+def find_ida_path(shot: int, databases: list[IdaDatabase] | None = None) -> Path | None:
+    """The shot's IDA file from the first database that has one, in priority order."""
+    if databases is None:
+        databases = _ida_databases()
+    for database in databases:
+        path = database.path(shot)
+        if path is not None:
+            return path
+    return None
+
+
+def find_ida_shots(databases: list[IdaDatabase] | None = None) -> list[int]:
+    """Every shot some database has a file for and serves, sorted."""
+    if databases is None:
+        databases = _ida_databases()
+    shots: set[int] = set()
+    for database in databases:
+        shots |= database.available_shots()
     return sorted(shots)
 
 

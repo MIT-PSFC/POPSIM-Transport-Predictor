@@ -1,3 +1,5 @@
+from pathlib import Path
+
 import numpy as np
 
 # Nominal step of the uniform timebase every device workflow builds with
@@ -19,3 +21,10 @@ def make_uniform_1khz_timebase(max_time: float) -> np.ndarray:
     last_ms = int(np.ceil(np.round(max_time * 1000, 6)))
     times = np.round(np.arange(last_ms + 1, dtype=np.float64) * 1e-3, 3).astype("float32")
     return times
+
+
+def read_shotlist(shotlist_file: Path | str) -> list[int]:
+    """Shots of a shotlist file, one per line, in file order. Lines that are not a shot number are skipped."""
+    with open(shotlist_file) as f:
+        lines = [line.strip() for line in f]
+    return [int(line) for line in lines if line.isdigit()]

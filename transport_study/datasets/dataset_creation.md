@@ -32,7 +32,11 @@ plus the custom ones in `d3d/physics_methods.py`:
 - EFIT: every EFIT signal comes from the shot's latest code_rundb run tagged `DISPY` (the 1 kHz disruption-efit).
   A shot without one, or whose EFIT is slower than 1 kHz, is skipped (`DispyEfitNicknameSetting`, `Uniform1kHzTimeSetting`).
   disruption-py's own EFIT selection falls back to the 50 Hz efit01 and forces runtag DIS under pytest, so it is not used.
-- Profiles: Te/ne from the IDA database (`IDA_{shot}_.cdf`, plus the VVUQ files, see `d3d/config.toml`).
+- Profiles: Te/ne from IDA, searched in the priority order of the databases in `d3d/config.toml`:
+  `HBP_database` (98 shots), the VVUQ files (4), then the general-purpose `TMDB_V1c`, `TMDB_V1a`, and `TokaMaker_database`,
+  which only serve shots on `d3d/HBP_shotlist_2013_2025` (105 more). The default shotlist is the union, 207 shots.
+  The first two are full IDA, the general-purpose ones are IDA-lite runs with fewer diagnostics.
+  On the 38 shots both `HBP_database` and `TMDB_V1c` have, the two agree to a few percent, well within the error bars.
   No GP fitting is needed since IDA profiles are already a Bayesian fit with errors.
   IDA files are on psi_n (poloidal flux) and carry no rho coordinate, so each IDA slice is mapped to rho_tor_norm
   through the q profile of the nearest DISPY EFIT slice, with the same definition and secant extension past the LCFS
@@ -48,6 +52,8 @@ plus the custom ones in `d3d/physics_methods.py`:
 Processing writes two stores on the same shot / time_idx layout, both in IMAS names and SI units, with description,
 units, and ref (IMAS path) attributes on every variable: `ds.zarr`, the shared schema, and `trajopt.zarr`,
 the PCS programmed targets (feedforward control) and the measured signals only the trajectory optimization reads.
+Each raw file records the IDA file its profiles came from (`ida_path` attribute), and both stores carry `ida_source`,
+a JSON object mapping every stored shot to the folder of its IDA file (`json.loads(ds.attrs["ida_source"])`).
 Three PCS pointnames of unverified meaning (`bttbt`, `dstdenp`, `ieeseg07`) are kept under their raw names and units,
 see the TODO in `d3d/d3d_dataset.py`.
 disruption-py writes no netCDF (its output setting has `path=False`), only a small `config.json` per call
