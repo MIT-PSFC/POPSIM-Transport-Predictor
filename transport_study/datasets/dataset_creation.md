@@ -94,8 +94,39 @@ Processing imports popsim and with it JAX, so on a node without a GPU it needs `
 
 3. TCV
 
-TCV has DEFUSE which is in Matlab. Take h5 files output from DEFUSE, convert them into an Xarray-friendly format,
-and do the remainder of the data preparation workflow from there.
-DEFUSE profiles are on rho_tor_norm and carry no error bars or gradients,
-so the TCV store leaves these out and the studies fill gradients and heuristic errors on load
-(`organize_data.add_missing_profile_companions`).
+Read straight from the DEFUSE exports (`TCVno{shot}.h5`, MATLAB v7.3, read with h5py)
+and the LIUQE reconstructions of the MEQ databases (`TCV{shot}_meqdb.mat`), both paths in `tcv/config.toml`.
+
+- 0D signals: DEFUSE, SI apart from NBI, NBI2 and ECRH, which it stores in MW.
+  Newer shots carry ECRH as one row per gyrotron, and the rows are summed.
+  A heating system a shot does not have is an empty placeholder in its export and counts as zero.
+- Profiles: the DEFUSE Te/ne fits, which are on rho_pol = sqrt(psi_N), not rho_tor_norm
+  (the raw Thomson positions match sqrt(psi_N) of LIUQE within 0.006, and miss rho_tor_norm by 0.05-0.08).
+  Each fit slice maps to rho_tor_norm through the q profile of the nearest LIUQE reconstruction within 2 ms (`tcv/profiles.py`).
+  Phi_N is the integral of q over psi_N, the same definition as the other stores.
+  q diverges at the LCFS of a diverted plasma,
+  so past the last surface of finite q it is integrated analytically as q = a - b ln(1 - psi_N), fit to the four surfaces inside it.
+  LIUQE's own enclosed toroidal flux (FtPQ) is not used,
+  it is quantized: staircased near the axis, and jittering 0.002-0.003 in Phi_N between 1 ms reconstructions at the edge.
+  Only shots with a MEQ database are built, 964 shots from 60001 to 82878.
+- The profiles go onto rho_tor_norm = linspace(0, 1.1, 56), the DIII-D and C-Mod grid,
+  and are NaN past the LCFS, where the DEFUSE fits end.
+  Each slice is held onto the 1 kHz timebase until the next one (every ~17 ms), for at most 1.5 median DEFUSE steps.
+  A slice with a NaN fit point, or without both a Te and an ne fit, is dropped.
+- The gradient companions are taken on the DEFUSE fit points before regridding.
+  The DEFUSE fits wiggle on the scale of their own grid, so the gradients are noisy.
+  DEFUSE gives no uncertainty, so the error companions are the 0 sentinel.
+
+Processing adds two shot culls to the DIII-D ones, both opt-in in `RawFileWorkflow`:
+a radiated fraction floor (a mean P_rad below 2.5 percent of the mean input power is a dead bolometer)
+and the density ratio check of the published stores
+(the shot median over fresh slices of mean(n_e for rho_tor_norm <= 1) / n_e_line_average must sit in 0.7-1.3).
+On a 20-shot sample the radiated fractions were 0.08-0.61 and the density ratios 0.88-1.12.
+
+```bash
+python -m transport_study.datasets.cli tcv <data_assembly_dir> --mode raw
+JAX_PLATFORMS=cpu python -m transport_study.datasets.cli tcv <data_assembly_dir> --mode process
+```
+
+The raw stage takes about 10 s per shot, most of it loading the MEQ database (about 250 MB in memory).
+Shots whose DEFUSE export has no profile fit (a uint64 [0 0] placeholder) are skipped.

@@ -261,11 +261,10 @@ def ds_profile_plot(
         for ax, (name, cmap, panel_title) in zip(axes, panels, strict=True):
             profile_data = np.full((rho.size, time.size), np.nan)
             profile_data[:, grid_idx] = shot_ds_valid[name].transpose(RADIAL_DIM, ...).values
-            # Timesteps with any NaN are blanked and overlaid in red
-            mask_nan_timestep = np.isnan(profile_data).any(axis=0)
-            profile_plot_data = profile_data.copy()
-            profile_plot_data[:, mask_nan_timestep] = np.nan
-            mesh = ax.pcolormesh(time, rho, profile_plot_data, cmap=cmap, shading="nearest")
+            # Timesteps without a profile are overlaid in red.
+            # Profiles may end inside the grid (TCV at the LCFS, DIII-D at the IDA domain), so only all-NaN columns count.
+            mask_nan_timestep = np.isnan(profile_data).all(axis=0)
+            mesh = ax.pcolormesh(time, rho, profile_data, cmap=cmap, shading="nearest")
             if np.any(mask_nan_timestep):
                 nan_overlay = np.full_like(profile_data, np.nan)
                 nan_overlay[:, mask_nan_timestep] = 1.0

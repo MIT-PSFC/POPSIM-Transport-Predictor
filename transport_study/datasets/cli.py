@@ -76,7 +76,6 @@ class DatasetCLI:
         data_assembly_dir: Path | str,
         ds_name: str = "tcv",
         shotlist_file: Path | str | None = None,
-        source_dataset_path: Path | str | None = None,
         max_num_shots: int | None = None,
         mode: str = "raw",
         clean: bool = False,
@@ -85,7 +84,6 @@ class DatasetCLI:
             ds_name=ds_name,
             shotlist_file=shotlist_file,
             data_assembly_dir=data_assembly_dir,
-            source_dataset_path=source_dataset_path,
             max_num_shots=max_num_shots,
         )
         self._execute(workflow, mode, clean)

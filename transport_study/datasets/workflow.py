@@ -234,6 +234,13 @@ class RawFileWorkflow(DataWorkflow):
     # Width of the centered boxcar the transient_filter_config signals are smoothed with [s]
     transient_smoothing_window_s = 5e-3
 
+    # Opt-in shot culls, the same checks as the transport-validation-datasets stores. 0 and None turn them off.
+    # Shot mean power_radiated over mean input power (ohmic plus heating) below this is a dead bolometer
+    min_radiated_fraction = 0.0
+    # Bounds on the shot median, over fresh profile slices, of mean(n_e for rho_tor_norm <= 1) / n_e_line_average.
+    # The ratio is a proxy for the chord integral, and the bounds absorb its offset on each device.
+    density_ratio_bounds: tuple[float, float] | None = None
+
     # Set by each device
     # filter_config: {signal: {"min", "max"}}, a slice with any signal out of range is dropped.
     # It must hold ip, whose minimum also marks where the plasma current ends.
@@ -354,13 +361,18 @@ class RawFileWorkflow(DataWorkflow):
         return mask_fresh.any(RADIAL_DIM).astype(np.float32)
 
     def cull_shot(self, shot_ds: xr.Dataset) -> bool:
-        """Device-specific, energy-sanity, and duration culls."""
+        """Device-specific, energy-sanity, radiated-fraction, density-ratio, and duration culls."""
         shot = int(shot_ds[EPISODE_DIM].values[0])
         if self.device_specific_culling(shot_ds):
             logger.warning(f"Excluding shot {shot} based on device-specific culling criteria")
             culled = True
         else:
-            culled = self.energy_sanity_cull(shot_ds) or self.is_too_short(shot_ds)
+            culled = (
+                self.energy_sanity_cull(shot_ds)
+                or self.radiated_fraction_cull(shot_ds)
+                or self.density_ratio_cull(shot_ds)
+                or self.is_too_short(shot_ds)
+            )
         if culled:
             self._debug_plots(shot_ds)
         return culled
@@ -414,6 +426,55 @@ class RawFileWorkflow(DataWorkflow):
             logger.info(
                 f"Culling shot {shot_id}: stored energy rise {energy_rise_J / 1e6:.3f} MJ exceeds "
                 f"integrated input energy {energy_input_J / 1e6:.3f} MJ, input power record is broken or missing"
+            )
+            return True
+        return False
+
+    def radiated_fraction_cull(self, ds: xr.Dataset) -> bool:
+        """True if the mean radiated power is below min_radiated_fraction of the mean input power, a dead bolometer.
+
+        Input power is ohmic plus heating, with missing samples counted as zero.
+        Off when min_radiated_fraction is 0, and a shot with no input power is never culled.
+        """
+        if self.min_radiated_fraction <= 0:
+            return False
+        shot_id = ds[EPISODE_DIM].values[0]
+        power_input = ds["power_ohm"].fillna(0.0)
+        for power in STORE_HEATING_POWERS:
+            power_input = power_input + ds[power].fillna(0.0)
+        power_input_mean = float(power_input.mean())
+        if power_input_mean <= 0:
+            return False
+        radiated_fraction = float(ds["power_radiated"].mean()) / power_input_mean
+        if radiated_fraction < self.min_radiated_fraction:
+            logger.info(
+                f"Culling shot {shot_id}: mean radiated power is {radiated_fraction:.3f} of the mean input power, "
+                f"below {self.min_radiated_fraction}, the bolometer record is broken or missing"
+            )
+            return True
+        return False
+
+    def density_ratio_cull(self, ds: xr.Dataset) -> bool:
+        """True if the profile density disagrees with the interferometer.
+
+        The shot median, over its fresh profile slices, of mean(n_e for rho_tor_norm <= 1) / n_e_line_average
+        must sit inside density_ratio_bounds. A shot without a single fresh slice to check is culled.
+        Off when density_ratio_bounds is None.
+        """
+        if self.density_ratio_bounds is None:
+            return False
+        shot_id = ds[EPISODE_DIM].values[0]
+        mask_inside_lcfs = ds[RADIAL_DIM] <= 1.0
+        n_e_mean_inside = ds["n_e"].where(mask_inside_lcfs).mean(RADIAL_DIM)
+        density_ratio = n_e_mean_inside / ds["n_e_line_average"]
+        mask_fresh = ds["fresh_profile"] == 1
+        density_ratio_median = float(density_ratio.where(mask_fresh).median())
+        logger.info(f"Shot {shot_id}: median profile to line-average density ratio {density_ratio_median:.3f}")
+        ratio_min, ratio_max = self.density_ratio_bounds
+        if not ratio_min <= density_ratio_median <= ratio_max:
+            logger.info(
+                f"Culling shot {shot_id}: median profile to line-average density ratio {density_ratio_median:.3f} "
+                f"is outside {self.density_ratio_bounds}, the profiles disagree with the interferometer"
             )
             return True
         return False

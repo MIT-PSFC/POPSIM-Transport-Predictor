@@ -1,10 +1,26 @@
 # TCV Dataset Configuration
 
 [data_sources]
-# Default path to directory containing individual TCV dataset files
-# Each file in this directory corresponds to a single shot
-default_source_dir = "/usr/local/mfe/ml_data_dump/TCV/DB_nc"
+# DEFUSE exports, one MATLAB v7.3 file per shot, TCVno{shot}.h5
+defuse_dir = "/usr/local/mfe/ml_data_dump/TCV/DEFUSE/DEFUSE_DB/DB_mat/TCV"
+# MEQ databases holding the LIUQE reconstructions, one MATLAB v5 file per shot, TCV{shot}_meqdb.mat.
+# The DEFUSE profiles are on rho_pol, and LIUQE is what maps them onto rho_tor_norm,
+# so only shots with a file here are built.
+meqdb_dir = "/usr/local/mfe/ml_data_dump/TCV/meq_data/databases"
 
 [shot_filters]
 # Minimum shot duration [s] after filtering to valid signal ranges
 min_duration = 0.5
+
+[equilibrium]
+# A DEFUSE profile slice maps to rho_tor_norm through the nearest usable LIUQE slice no farther away than this [ms]
+match_max_ms = 2.0
+
+[profile_grid]
+# Uniform rho_tor_norm grid the DEFUSE profiles are interpolated onto, the same grid as the DIII-D and C-Mod stores.
+# DEFUSE fits stop at the LCFS, so the points past rho_tor_norm 1 are NaN.
+rho_min = 0.0
+rho_max = 1.1
+num_rho_points = 56
+# Longest a DEFUSE slice is held onto the 1 kHz timebase, in median DEFUSE steps
+max_hold_defuse_steps = 1.5
