@@ -391,10 +391,12 @@ def test_standardize_builds_both_stores_in_si(workflow):
 def test_missing_efit_boundary_leaves_nothing_to_keep(workflow):
     """A shot with profiles but no EFIT geometry fails the finite filter at every time."""
     ds = workflow.standardize_signal_names(_raw_dataset())
-    assert workflow.filter_ds(ds.copy()) is not None
+    filtered, _ = workflow.filter_ds(ds.copy())
+    assert filtered is not None
 
     ds["geometric_axis_r"] = xr.full_like(ds["geometric_axis_r"], np.nan)
-    assert workflow.filter_ds(ds) is None
+    filtered, _ = workflow.filter_ds(ds)
+    assert filtered is None
 
 
 SYNTHETIC_IDA_PATHS = {

@@ -38,6 +38,10 @@ its mean P_rad is below `min_radiated_fraction` of its mean input power (a dead 
 its stored energy rises by more than 1.05 times the input energy (a broken power record),
 or the median over fresh slices of mean(n_e for rho_tor_norm <= 1) / n_e_line_average is outside `density_ratio_bounds`.
 Powers are clipped at 0 after filtering.
+Every shot's unfiltered 0D signals are plotted once, with transport-validation-datasets' `plot_unprocessed_data`, as for C-Mod and MAST:
+into `<dataset dir>/accepted_shots/` with the kept segment shaded green when the shot reaches the stores,
+into `<dataset dir>/rejected_shots/` when the filter or a cull drops it,
+with the transients shaded red, the end-of-shot cut, the thresholds, and dots where a profile is measured.
 
 | Threshold | C-Mod | MAST | DIII-D | TCV |
 | --- | --- | --- | --- | --- |

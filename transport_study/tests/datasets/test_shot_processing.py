@@ -48,7 +48,7 @@ def test_filter_ds_ends_before_the_plasma_current_termination(tcv_workflow):
     ip = np.full((1, N_T), 3e5)
     ip[0, idx_plasma_end + 1 :] = 1e3
 
-    filtered = tcv_workflow.filter_ds(raw_shot(ip=ip))
+    filtered, _ = tcv_workflow.filter_ds(raw_shot(ip=ip))
 
     time_ms = np.round(filtered["time"].values * 1000).astype(int)
     assert time_ms[-1] == idx_plasma_end - round(tcv_workflow.end_margin_s * 1e3)
@@ -63,7 +63,7 @@ def test_filter_ds_cuts_nan_and_max_failures_as_gaps(tcv_workflow):
     n_e_line_average = np.full((1, N_T), 4e19)
     n_e_line_average[0, 900:910] = 5e20
 
-    filtered = tcv_workflow.filter_ds(raw_shot(power_radiated=power_radiated, n_e_line_average=n_e_line_average))
+    filtered, _ = tcv_workflow.filter_ds(raw_shot(power_radiated=power_radiated, n_e_line_average=n_e_line_average))
 
     time_ms = np.round(filtered["time"].values * 1000).astype(int)
     assert time_ms[0] == 301
@@ -80,7 +80,7 @@ def test_filter_ds_cuts_a_transient_out_and_keeps_the_longest_segment(tcv_workfl
     power_ohm[0, 500] = 5e6
     power_ohm[0, 1000:1100] = 5e6
 
-    filtered = tcv_workflow.filter_ds(raw_shot(power_ohm=power_ohm))
+    filtered, _ = tcv_workflow.filter_ds(raw_shot(power_ohm=power_ohm))
 
     time_ms = np.round(filtered["time"].values * 1000).astype(int)
     # The boxcar at 999 holds two excursion slices, (3 x 0.3 + 2 x 5) / 5 = 2.18 MW, the first crossing
