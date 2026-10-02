@@ -196,6 +196,7 @@ def _raw_dataset(shot: int = 70000) -> xr.Dataset:
     data_vars |= {name: (("time", RADIAL_DIM), values) for name, values in profiles.items()}
     fresh_profile = (np.arange(N_TIME) % 17 == 0).astype(np.float32)
     data_vars["fresh_profile"] = (("time",), fresh_profile)
+    data_vars["fresh_equilibrium"] = (("time",), np.ones(N_TIME, dtype=np.float32))
     ds = xr.Dataset(data_vars, coords={"time": time, RADIAL_DIM: RHO_TOR_NORM_GRID.astype(np.float32)})
     return ds.expand_dims(shot=[shot])
 

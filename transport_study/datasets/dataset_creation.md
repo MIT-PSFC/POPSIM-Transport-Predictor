@@ -5,7 +5,10 @@ The studies convert to their working units on load (`signals.convert_to_working_
 Every stored value is causal, no time draws on a later sample.
 A 0D signal is never interpolated onto the 1 kHz grid (`signal_on_grid`).
 One sampled faster than the grid is averaged over each grid step, time t taking the mean of (t - 1 ms, t].
-One sampled slower is held forward from its last finite sample for at most 1.5 of its own median sample steps.
+One sampled slower is held forward from its last finite sample for at most 1.5 of its own median sample steps,
+or for at least 10 ms when it comes from the equilibrium reconstruction (`EQUILIBRIUM_HOLD_FLOOR`),
+so a few missing reconstructions do not cut the shot.
+`fresh_equilibrium` marks the grid times a usable reconstruction lands on.
 Smoothing is a trailing boxcar, and derivatives are backward differences.
 The one exception is DIII-D `power_radiated`, smoothed non-causally at the source.
 b0 is the vacuum toroidal field at the fixed major radius r0 on every device, as IMAS defines it.
@@ -78,6 +81,8 @@ and every signal is placed on the timebase causally instead (`signal_on_grid`, a
 - EFIT: every EFIT signal comes from the shot's latest code_rundb run tagged `DISPY` (the 1 kHz disruption-efit).
   A shot without one, or whose EFIT is slower than 1 kHz, is skipped (`DispyEfitNicknameSetting`, `Uniform1kHzTimeSetting`).
   disruption-py's own EFIT selection falls back to the 50 Hz efit01 and forces runtag DIS under pytest, so it is not used.
+  Failed reconstructions are missing or fail chisq > 50, so every EFIT signal is held for at least 10 ms,
+  and `fresh_equilibrium` marks the grid times a usable slice (chisq, mappable q) lands on.
 - Profiles: Te/ne from IDA, searched in the priority order of the databases in `d3d/config.toml`:
   `HBP_database` (98 shots), the VVUQ files (4), then the general-purpose `TMDB_V1c`, `TMDB_V1a`, and `TokaMaker_database`,
   which only serve shots on `d3d/HBP_shotlist_2013_2025` (105 more). The default shotlist is the union, 207 shots.
@@ -156,8 +161,12 @@ and the LIUQE reconstructions of the MEQ databases (`TCV{shot}_meqdb.mat`), both
 - 0D signals: DEFUSE, SI apart from NBI, NBI2 and ECRH, which it stores in MW.
   Newer shots carry ECRH as one row per gyrotron, and the rows are summed.
   A heating system a shot does not have is an empty placeholder in its export and counts as zero.
+  The LIUQE signals (Wtot, BETAN, a_minor, R_geom, KAPPA, DELTA_TOP, DELTA_BOTTOM, LI, BZERO) are held for at least 10 ms.
 - `power_radiated` is `PradTot`, the total including the divertor like DIII-D and MAST.
   `PradBulk`, the confined plasma only, is 0.43 of it at the median over 81 shots (0.27-0.69 for 5-95 percent).
+  It follows the Thomson cadence (~17 ms) but often skips one or two samples, or comes in bursts 50 ms apart,
+  so it is held for at least 60 ms (`PRAD_TOT_HOLD_FLOOR_S`), which bridges the skips that would cut the shot.
+- `fresh_equilibrium` marks the grid times a usable LIUQE reconstruction of the MEQ database lands on.
 - `power_ohm` is computed, Ip V_loop - d/dt(mu0 R_geo li Ip^2 / 4) from DEFUSE `I_P`, `Vloop`, `LI` and the geometric major radius `R_geom`
   (`ohmic_power`), then smoothed by a trailing 5 ms boxcar, as on C-Mod.
   DEFUSE `Vloop` has the opposite sign to `I_P` (Ip Vloop < 0 at flat-top on 39 of 39 shots of both polarities), so it is flipped.

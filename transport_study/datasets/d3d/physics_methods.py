@@ -21,7 +21,9 @@ from disruption_py.settings.nickname_setting import (
 )
 from loguru import logger
 from transport_validation_datasets.machine.generic import (
+    EQUILIBRIUM_HOLD_FLOOR,
     geqdsk_psi_n_grid,
+    hold_onto_grid,
     injected_power_on_grid,
     make_uniform_1kHz_timebase,
     mappable_q_profiles,
@@ -191,7 +193,8 @@ class D3DDatasetMethods:
         """
         efit_time, signals = _efit_signals(params, list(D3DDatasetMethods.EFIT_SCALAR_NODES.values()))
         return {
-            column: signal_on_grid(efit_time, signals[node], params.times) for column, node in D3DDatasetMethods.EFIT_SCALAR_NODES.items()
+            column: signal_on_grid(efit_time, signals[node], params.times, EQUILIBRIUM_HOLD_FLOOR)
+            for column, node in D3DDatasetMethods.EFIT_SCALAR_NODES.items()
         }
 
     @staticmethod
@@ -224,7 +227,7 @@ class D3DDatasetMethods:
         whose 20 kHz vloopb with a 0.55 ms median filter is noise at 1 kHz.
         """
         efit_time, signals = _efit_signals(params, ["poh"])
-        p_ohm = signal_on_grid(efit_time, signals["poh"], params.times)
+        p_ohm = signal_on_grid(efit_time, signals["poh"], params.times, EQUILIBRIUM_HOLD_FLOOR)
         return {"p_ohm": p_ohm}
 
     @staticmethod
@@ -260,7 +263,7 @@ class D3DDatasetMethods:
     def get_boundary_parameters(params: PhysicsMethodParams):
         """Plasma boundary minor radius, geometric axis R, elongation and triangularities from the DISPY EFIT."""
         efit_time, signals = _efit_signals(params, D3DDatasetMethods.BOUNDARY_NODES)
-        return {node: signal_on_grid(efit_time, values, params.times) for node, values in signals.items()}
+        return {node: signal_on_grid(efit_time, values, params.times, EQUILIBRIUM_HOLD_FLOOR) for node, values in signals.items()}
 
     @staticmethod
     @physics_method(columns=XPOINT_GAP_NODES, tokamak=Tokamak.D3D)
@@ -272,12 +275,15 @@ class D3DDatasetMethods:
             mask_no_xpoint = ~(signals[r_node] > 0)
             signals[r_node][mask_no_xpoint] = np.nan
             signals[z_node][mask_no_xpoint] = np.nan
-        return {node: signal_on_grid(efit_time, values, params.times) for node, values in signals.items()}
+        return {node: signal_on_grid(efit_time, values, params.times, EQUILIBRIUM_HOLD_FLOOR) for node, values in signals.items()}
 
     @staticmethod
-    @physics_method(columns=[*IDA_RHO_COLUMNS, *IDA_PSI_COLUMNS, "fresh_profile"], tokamak=Tokamak.D3D)
+    @physics_method(columns=[*IDA_RHO_COLUMNS, *IDA_PSI_COLUMNS, "fresh_profile", "fresh_equilibrium"], tokamak=Tokamak.D3D)
     def get_ida_profiles(params: PhysicsMethodParams):
-        """IDA Te/ne on the rho_tor_norm grid (mapped through the DISPY EFIT q profile) and on the psi_norm grid."""
+        """IDA Te/ne on the rho_tor_norm grid (mapped through the DISPY EFIT q profile) and on the psi_norm grid.
+
+        fresh_equilibrium marks the grid times a usable EFIT slice lands on, the slices the profiles map through.
+        """
         ida_path = find_ida_path(params.shot_id)
         if ida_path is None:
             raise CalculationError(f"no IDA file for shot {params.shot_id}")
@@ -294,5 +300,7 @@ class D3DDatasetMethods:
         mask_efit_valid = (chisq <= config["efit"]["chisq_max"]) & mask_q_mappable
 
         ida_profiles = ida_profiles_on_grids(ida, efit_time, qpsi, mask_efit_valid, params.times)
+        _, fresh_equilibrium = hold_onto_grid(params.times, efit_time[mask_efit_valid], False)
+        ida_profiles["fresh_equilibrium"] = ("idx", fresh_equilibrium.astype(np.float32))
         idx_coords = params.to_coords()
         return ida_profiles.assign_coords(idx_coords)

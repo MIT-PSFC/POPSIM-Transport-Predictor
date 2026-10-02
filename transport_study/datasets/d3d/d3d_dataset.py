@@ -81,6 +81,7 @@ PREDICTION_SOURCES = {
         for raw_suffix, store_suffix in [("", ""), ("_error", "_error"), ("_grad", "_gradient"), ("_grad_error", "_gradient_error")]
     },
     "fresh_profile": ("fresh_profile", 1.0),
+    "fresh_equilibrium": ("fresh_equilibrium", 1.0),
 }
 TRAJOPT_SOURCES = {
     "ip_reference": ("ip_prog", 1.0),
@@ -204,6 +205,12 @@ D3D_SIGNAL_ATTRS = {
         "description": "Electron cyclotron power injected into the vessel (echpwrc)",
     },
     "fresh_profile": {"description": "1 where the profiles are a new IDA slice, 0 where an earlier slice is held"},
+    "fresh_equilibrium": {
+        "description": (
+            "1 where a usable DISPY EFIT slice (chisq and q profile) lands, "
+            "0 where the equilibrium signals hold an earlier one (for at least 10 ms)"
+        )
+    },
     **{
         f"{store_profile}{suffix}": attrs
         for store_profile, quantity in [("t_e", "electron temperature"), ("n_e", "electron density")]

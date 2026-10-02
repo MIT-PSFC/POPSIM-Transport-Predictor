@@ -8,6 +8,8 @@ import numpy as np
 import xarray as xr
 from loguru import logger
 from transport_validation_datasets.machine.generic import (
+    EQUILIBRIUM_HOLD_FLOOR,
+    hold_onto_grid,
     make_uniform_1kHz_timebase,
     ohmic_power,
     signal_on_grid,
@@ -60,6 +62,15 @@ HEATING_SOURCES_MW = {
 MAGNITUDE_SIGNALS = ("ip", "b0")
 # Major radius DEFUSE BZERO is the vacuum toroidal field at, LIUQE's r0 and the store's r0 [m]
 R0 = 0.88
+
+# DEFUSE signals of the LIUQE reconstruction, BZERO (LIUQE rBt / r0) among them.
+# Each is held for at least EQUILIBRIUM_HOLD_FLOOR, so a few missing reconstructions are bridged.
+LIUQE_SOURCES = ("Wtot", "BETAN", "a_minor", "R_geom", "KAPPA", "DELTA_TOP", "DELTA_BOTTOM", "LI", "BZERO")
+# PradTot follows the Thomson cadence (~17 ms) but often skips one or two samples, or comes in bursts 50 ms apart,
+# and each skip would otherwise cut the shot
+PRAD_TOT_HOLD_FLOOR_S = 60e-3
+# DEFUSE signal -> shortest hold [s], 0 for the rest
+HOLD_FLOORS_S = {**dict.fromkeys(LIUQE_SOURCES, EQUILIBRIUM_HOLD_FLOOR), "PradTot": PRAD_TOT_HOLD_FLOOR_S}
 
 # DEFUSE signals power_ohm is computed from (ohmic_power), DEFUSE POHM has no documented definition
 OHMIC_POWER_SOURCES = ("I_P", "Vloop", "LI", "R_geom")
@@ -154,6 +165,12 @@ TCV_SIGNAL_ATTRS = {
         "description": "Electron cyclotron power, summed over gyrotrons (DEFUSE ECRH), zero where absent",
     },
     "fresh_profile": {"description": "1 where the profiles are a new DEFUSE slice, 0 where an earlier slice is held"},
+    "fresh_equilibrium": {
+        "description": (
+            "1 where a usable LIUQE reconstruction (MEQ database) lands, "
+            "0 where the equilibrium signals hold an earlier one (for at least 10 ms)"
+        )
+    },
     **{
         f"{store_profile}{suffix}": attrs
         for store_profile, quantity in [("t_e", "electron temperature"), ("n_e", "electron density")]
@@ -270,11 +287,15 @@ class TCVDataWorkflow(RawFileWorkflow):
         # Every signal is placed causally (signal_on_grid), so no time draws on a later one
         data_vars: dict[str, tuple[tuple[str, ...], np.ndarray]] = {}
         for name, signal in signals.items():
-            values_on_timebase = signal_on_grid(signal.time, signal.values, timebase)
+            hold_floor = HOLD_FLOORS_S.get(name, 0.0)
+            values_on_timebase = signal_on_grid(signal.time, signal.values, timebase, hold_floor)
             data_vars[name] = (("time",), values_on_timebase)
         equilibria = read_liuqe(meqdb_path(shot))
         # Each reconstruction builds a Phi_N map to be judged, so only once per shot
         mask_eq_usable = liuqe_usable(equilibria)
+        # The grid times a usable reconstruction lands on, the ones the profiles map through
+        _, fresh_equilibrium = hold_onto_grid(timebase, equilibria.time[mask_eq_usable], False)
+        data_vars["fresh_equilibrium"] = (("time",), fresh_equilibrium.astype(np.float32))
         profile_columns = {}
         fresh_by_profile = {}
         for name, profile in profiles.items():
@@ -351,7 +372,7 @@ class TCVDataWorkflow(RawFileWorkflow):
         xr.Dataset | None
             Store signals, or None if a required DEFUSE signal is missing or a critical signal is all NaN
         """
-        raw_required = {*PREDICTION_RAW_NAMES, *OHMIC_POWER_SOURCES, "fresh_profile"}
+        raw_required = {*PREDICTION_RAW_NAMES, *OHMIC_POWER_SOURCES, "fresh_profile", "fresh_equilibrium"}
         missing = sorted(raw_name for raw_name in raw_required if raw_name not in ds)
         if missing:
             logger.warning(f"Shot {ds['shot'].item()}: missing DEFUSE signals {missing}, skipping shot.")
@@ -366,6 +387,7 @@ class TCVDataWorkflow(RawFileWorkflow):
         signals["r0"] = xr.full_like(ds["shot"], R0, dtype=float)
         signals["power_ohm"] = _ohmic_power(ds)
         signals["fresh_profile"] = ds["fresh_profile"]
+        signals["fresh_equilibrium"] = ds["fresh_equilibrium"]
         power_zero = xr.zeros_like(ds["I_P"])
         for store_name, raw_names in HEATING_SOURCES_MW.items():
             power_MW = power_zero

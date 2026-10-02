@@ -344,6 +344,7 @@ def _raw_dataset(shot: int = 199051) -> xr.Dataset:
     # One IDA slice every 20 ms
     fresh_profile = (np.arange(N_TIME) % 20 == 0).astype(np.float32)
     data_vars["fresh_profile"] = (("shot", "time"), fresh_profile[np.newaxis, :])
+    data_vars["fresh_equilibrium"] = (("shot", "time"), np.ones((1, N_TIME), dtype=np.float32))
     # float32 grids, as get_ida_profiles writes them
     coords = {
         "shot": [shot],
