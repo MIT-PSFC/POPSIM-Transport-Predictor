@@ -8,10 +8,6 @@ defuse_dir = "/usr/local/mfe/ml_data_dump/TCV/DEFUSE/DEFUSE_DB/DB_mat/TCV"
 # so only shots with a file here are built.
 meqdb_dir = "/usr/local/mfe/ml_data_dump/TCV/meq_data/databases"
 
-[shot_filters]
-# Minimum shot duration [s] after filtering to valid signal ranges
-min_duration = 0.5
-
 [equilibrium]
 # A DEFUSE profile slice maps to rho_tor_norm through the nearest usable LIUQE slice no farther away than this [ms]
 match_max_ms = 2.0

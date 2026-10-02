@@ -10,12 +10,12 @@ from pathlib import Path
 import numpy as np
 import xarray as xr
 from loguru import logger
-from scipy.integrate import cumulative_simpson
 
 from transport_study import PACKAGE_ROOT, RADIAL_DIM
 from transport_study.datasets import read_shotlist
 from transport_study.datasets.d3d import config
 from transport_study.datasets.profile_grids import held_on_times, held_slice_index
+from transport_study.datasets.rho_tor_norm import geqdsk_psi_n_grid, phi_n_map
 
 D3D_DIR = Path(PACKAGE_ROOT) / "datasets" / "d3d"
 
@@ -30,10 +30,6 @@ RHO_TOR_NORM_DEFINITION = (
     "Outside the LCFS Phi_N continues linearly in psi_N, see the sol_extension attribute."
 )
 PSI_NORM_GRID = np.linspace(0.0, config["profile_grid"]["psi_norm_max"], config["profile_grid"]["num_psi_norm_points"])
-
-SOL_EXTENSIONS = ("secant", "tangent")
-# psi_n where the secant continuation of Phi_N past the LCFS starts, as in the published stores
-SECANT_PSI_N = 0.95
 
 # IDA file variable (with an _err companion) -> prefix of its raw columns
 IDA_PROFILE_PREFIXES = {"T_e": "te", "n_e": "ne"}
@@ -111,65 +107,6 @@ def find_ida_shots(databases: list[IdaDatabase] | None = None) -> list[int]:
     return sorted(shots)
 
 
-def cumulative_q_integral(qpsi: np.ndarray) -> np.ndarray:
-    """Integral of q over psi_N from the axis, the toroidal flux in units of (psi_boundary - psi_axis).
-
-    Args:
-        qpsi: (..., n_psi) safety factor on the uniform psi_N grid from 0 to 1.
-
-    Returns:
-        (..., n_psi) integral of q dpsi_N from 0 to each grid point, starting at 0.
-    """
-    psi_n_grid = np.linspace(0.0, 1.0, qpsi.shape[-1])
-    return cumulative_simpson(qpsi, x=psi_n_grid, initial=0.0)
-
-
-def _phi_n_table(qpsi: np.ndarray, sol_extension: str) -> tuple[np.ndarray, np.ndarray, float]:
-    """Phi_N on the qpsi grid, and the slope dPhi_N/dpsi_N it continues with past the LCFS.
-
-    q is undefined beyond the LCFS, so there Phi_N continues linearly in psi_N, with the secant slope
-    (1 - Phi_N(SECANT_PSI_N)) / (1 - SECANT_PSI_N) or the tangent slope q(1) / integral_0^1 q dpsi_N.
-
-    Raises:
-        ValueError: If sol_extension is not one of SOL_EXTENSIONS.
-    """
-    q_integral = cumulative_q_integral(qpsi)
-    phi_n_grid = q_integral / q_integral[-1]
-    psi_n_grid = np.linspace(0.0, 1.0, qpsi.size)
-    if sol_extension == "secant":
-        phi_n_start = np.interp(SECANT_PSI_N, psi_n_grid, phi_n_grid)
-        sol_slope = (1.0 - phi_n_start) / (1.0 - SECANT_PSI_N)
-    elif sol_extension == "tangent":
-        sol_slope = qpsi[-1] / q_integral[-1]
-    else:
-        raise ValueError(f"sol_extension must be one of {SOL_EXTENSIONS}, got {sol_extension!r}")
-    return psi_n_grid, phi_n_grid, float(sol_slope)
-
-
-def rho_tor_norm_from_psi_n(psi_n: np.ndarray, qpsi: np.ndarray, sol_extension: str) -> np.ndarray:
-    """Map normalized poloidal flux onto rho_tor_norm = sqrt(Phi_N) through one equilibrium's q profile.
-
-    Ported from transport-validation-datasets (machine/generic.py), so D3D shares the published C-Mod/MAST definition.
-    Inside the LCFS Phi_N is interpolated on the qpsi grid, outside it continues linearly in psi_N.
-    psi_N below 0 maps to 0. The sign of q cancels.
-
-    Args:
-        psi_n: Normalized poloidal flux, any shape, NaN where unknown.
-        qpsi: (n_psi,) safety factor on the uniform psi_N grid from 0 to 1.
-        sol_extension: One of SOL_EXTENSIONS.
-
-    Returns:
-        rho_tor_norm shaped like psi_n, NaN where psi_n is.
-    """
-    psi_n_grid, phi_n_grid, sol_slope = _phi_n_table(qpsi, sol_extension)
-    psi_n_clipped = np.maximum(psi_n, 0.0)
-    phi_n_inside = np.interp(psi_n_clipped, psi_n_grid, phi_n_grid)
-    phi_n_outside = 1.0 + sol_slope * (psi_n_clipped - 1.0)
-    with np.errstate(invalid="ignore"):
-        phi_n = np.where(psi_n_clipped <= 1.0, phi_n_inside, phi_n_outside)
-    return np.sqrt(phi_n)
-
-
 def gradient_and_error(values: np.ndarray, errors: np.ndarray, x: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     """Gradient along the last axis, with the central-difference error assuming independent points.
 
@@ -203,8 +140,8 @@ def ida_profiles_on_grids(
     Args:
         ida: IDA file contents, T_e [eV] and n_e [m^-3] with 1-sigma _err companions on (time [ms], psi_n).
         efit_time: (n_eq,) EFIT slice times [s].
-        qpsi: (n_eq, n_psi) safety factor on the uniform psi_N grid from 0 to 1.
-        mask_efit_valid: (n_eq,) True where the EFIT slice is usable.
+        qpsi: (n_eq, n_psi) safety factor on the GEQDSK psi_N grid.
+        mask_efit_valid: (n_eq,) True where the EFIT slice is usable, its q profile mappable (mappable_q_profiles).
         times: (n_t,) timebase [s].
 
     Returns:
@@ -231,10 +168,13 @@ def ida_profiles_on_grids(
     mask_slice_mapped = efit_nearest_distance <= match_max
 
     sol_extension = config["profile_grid"]["sol_extension"]
+    psi_n_grid_efit = geqdsk_psi_n_grid(qpsi.shape[1])
     rho_tor_norm_slices = np.full((num_slices, psi_n.size), np.nan)
     for i_mapped in np.flatnonzero(mask_slice_mapped):
         qpsi_slice = qpsi[efit_nearest[i_mapped]]
-        rho_tor_norm_slices[i_mapped] = rho_tor_norm_from_psi_n(psi_n, qpsi_slice, sol_extension)
+        phi_n_mapping = phi_n_map(psi_n_grid_efit, qpsi_slice, sol_extension)
+        phi_n_slice = phi_n_mapping.phi_n(psi_n)
+        rho_tor_norm_slices[i_mapped] = np.sqrt(phi_n_slice)
 
     # Slice profiles, interpolated per slice. np.interp's default left clamps at the axis.
     slice_profiles = {}

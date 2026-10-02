@@ -68,7 +68,7 @@ def _is_placeholder(dataset: h5py.Dataset) -> bool:
 
 
 def _unique_finite_times(time: np.ndarray) -> np.ndarray:
-    """Indices that sort the finite times and drop repeats, since np.interp needs increasing times."""
+    """Indices that sort the finite times and drop repeats, since the hold onto the timebase needs increasing times."""
     idx_finite = np.flatnonzero(np.isfinite(time))
     _, idx_unique = np.unique(time[idx_finite], return_index=True)
     return idx_finite[idx_unique]

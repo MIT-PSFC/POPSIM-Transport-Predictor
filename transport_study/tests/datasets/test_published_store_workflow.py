@@ -23,7 +23,7 @@ SIGNED_SHOT = 1160503002
 
 def _published_store(path) -> xr.Dataset:
     """A published-layout store: trailing NaN padding, time as a data variable, signed ip / b0 on one shot,
-    no power_ec, and variables the build must leave out."""
+    and variables the build must leave out."""
     shots = np.array(list(SHOT_LENGTHS))
     n_shots = shots.size
     mask_valid = np.zeros((n_shots, N_TIME_PADDED), dtype=bool)
@@ -54,6 +54,7 @@ def _published_store(path) -> xr.Dataset:
         "power_nbi": 0.0,
         "power_ic": 2e6,
         "power_lh": 0.0,
+        "power_ec": 0.0,
         "fresh_profile": 1.0,
         "fresh_equilibrium": 1.0,
         "t_e_fit_status": 0.0,
@@ -123,15 +124,6 @@ def test_signed_ip_and_b0_become_magnitudes(built_store):
         built = ds_built[name].sel(shot=SIGNED_SHOT).dropna("time_idx").values
         published = ds_published[name].sel(shot=SIGNED_SHOT).dropna("time_idx").values
         np.testing.assert_allclose(built, np.abs(published))
-
-
-def test_absent_heating_system_is_zero_power(built_store):
-    """power_ec is not in the published store, the device has no such system: zero in valid time."""
-    _, ds_built = built_store
-
-    mask_valid = ds_built["time"].notnull()
-    assert float(np.abs(ds_built["power_ec"].where(mask_valid)).max()) == 0.0
-    assert bool(ds_built["power_ec"].where(mask_valid).notnull().sum() == mask_valid.sum())
 
 
 def test_profiles_pass_through_unchanged(built_store):

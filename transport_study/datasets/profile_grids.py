@@ -1,11 +1,16 @@
-"""Profile slices held onto the 1 kHz timebase, shared by the raw-file devices (DIII-D, TCV).
+"""Slow samples held onto the 1 kHz timebase, shared by the raw-file devices (DIII-D, TCV).
 
-Profile diagnostics sample far slower than 1 kHz,
-so each slice is held forward over the grid times that follow it.
+Profile diagnostics, and many 0D signals, sample slower than 1 kHz,
+so each sample is held forward over the grid times that follow it, never interpolated,
+and no grid time draws on a later sample.
 A capped hold carries nothing across the end of a shot or a diagnostic dropping out.
 """
 
 import numpy as np
+
+# Longest a 0D sample is held onto the timebase, in median sample steps of its signal.
+# The same as transport-validation-datasets' MAX_HOLD_PERIODS.
+MAX_HOLD_STEPS_0D = 1.5
 
 
 def held_slice_index(slice_times: np.ndarray, times: np.ndarray, max_hold_steps: float) -> tuple[np.ndarray, np.ndarray]:
@@ -37,3 +42,27 @@ def held_on_times(slice_profiles: np.ndarray, slice_index: np.ndarray, mask_held
     profiles_on_times = slice_profiles[slice_index].astype(np.float32)
     profiles_on_times[~mask_held] = np.nan
     return profiles_on_times
+
+
+def held_signal_on_grid(source_times: np.ndarray, values: np.ndarray, grid: np.ndarray) -> np.ndarray:
+    """Place a 0D signal on the grid by holding each finite sample forward (held_slice_index).
+
+    Each grid time takes the last finite sample at or before it, held for at most MAX_HOLD_STEPS_0D
+    median steps of the finite samples, so a gap in the source stays NaN.
+
+    Args:
+        source_times: (n_source,) ascending sample times of the source [s].
+        values: (n_source,) the signal at those times, NaN where missing.
+        grid: (n_t,) the shot's 1 kHz timebase [s].
+
+    Returns:
+        (n_t,) the signal on the grid, NaN where nothing is held.
+    """
+    mask_finite = np.isfinite(values)
+    if mask_finite.sum() < 2:
+        return np.full(grid.size, np.nan)
+    sample_index, mask_held = held_slice_index(source_times[mask_finite], grid, MAX_HOLD_STEPS_0D)
+    values_finite = values[mask_finite]
+    values_on_grid = values_finite[sample_index].astype(float)
+    values_on_grid[~mask_held] = np.nan
+    return values_on_grid

@@ -77,13 +77,12 @@ def test_fewer_than_two_valid_slices_skip_check(tcv_workflow):
     assert tcv_workflow.energy_sanity_cull(_broken_power_shot(energy_mhd=no_valid)) is False
 
 
-def test_energy_check_runs_despite_device_culling_override(tcv_workflow):
-    """The check runs in cull_shot after device_specific_culling,
-    so a device overriding device_specific_culling (TCV) still gets it."""
+def test_energy_check_runs_after_device_culling(tcv_workflow):
+    """The check runs in cull_shot after device_specific_culling, which passes this shot."""
     ds = tcv_workflow.device_specific_processing(_broken_power_shot())
     filtered = tcv_workflow.filter_ds(ds)
 
-    assert tcv_workflow.device_specific_culling(filtered) is False, "TCV's own cull should pass this shot"
+    assert tcv_workflow.device_specific_culling(filtered) is False, "the profile cull should pass this shot"
     assert tcv_workflow.energy_sanity_cull(filtered) is True
 
     tcv_workflow.raw_data_dir.mkdir(parents=True, exist_ok=True)

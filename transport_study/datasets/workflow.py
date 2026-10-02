@@ -14,13 +14,26 @@ from transport_study.datasets.plotting import (
     ds_profile_time_plot,
     ds_summary_report,
 )
+from transport_study.datasets.zero_d_signals import (
+    end_of_shot_index,
+    greenwald_fraction,
+    keep_longest_segment,
+    kept_span,
+)
 from transport_study.signals import (
     PREDICTION_STORE_NAME,
+    STORE_0D_SIGNALS,
     STORE_HEATING_POWERS,
     STORE_POWERS,
     STORE_SIGNAL_UNITS,
     STORE_SIGNALS,
 )
+
+# Width of the centered boxcar the transient_filter signals are smoothed with [s], as in transport-validation-datasets.
+# Centered, since it only selects times and no stored value is smoothed by it.
+TRANSIENT_SMOOTHING_WINDOW_S = 5e-3
+# How far a shot's stored-energy rise may exceed the heating energy put in before it is culled
+ENERGY_SANITY_LEEWAY = 1.05
 
 
 class DataWorkflow(ABC):
@@ -223,32 +236,28 @@ class RawFileWorkflow(DataWorkflow):
     1. make_raw_data_files: one netCDF per shot under raw_data/,
        on a uniform 1 kHz timebase with signals in the on-disk schema.
     2. run_processed_data_workflow: each raw file goes through device_specific_processing,
-       power clipping, fresh_profile labelling, filter_ds, and the culls, into the stores.
-       filter_ds cuts end_margin_s before the plasma current ends and from the first transient_filter_config transient,
-       then applies the range filters.
+       fresh_profile labelling, filter_ds, power clipping, and the culls, into the stores.
+
+    filter_ds and the culls are the one filter spec of every device store,
+    the same as transport-validation-datasets applies to C-Mod and MAST.
     """
 
-    # Seconds of data cut before the plasma current ends (see filter_ds).
-    # Set per device since the same margin can land in completely different plasma states
-    end_margin_s = 0.05
-    # Width of the centered boxcar the transient_filter_config signals are smoothed with [s]
-    transient_smoothing_window_s = 5e-3
-
-    # Opt-in shot culls, the same checks as the transport-validation-datasets stores. 0 and None turn them off.
+    # The filter thresholds, set by each device. Every failure is a gap, see filter_ds.
+    # min_filter: {signal: threshold}, ip compared as |ip|, and its threshold also ends the shot (end_of_shot_index)
+    # max_filter: {signal: threshold}, on the raw samples, greenwald_fraction included
+    # transient_filter: {signal: threshold}, on the signal smoothed by a centered TRANSIENT_SMOOTHING_WINDOW_S boxcar
+    min_filter: ClassVar[dict[str, float]]
+    max_filter: ClassVar[dict[str, float]]
+    transient_filter: ClassVar[dict[str, float]]
+    # Seconds cut before the plasma current ends, set per device since the same margin can land in different plasma states
+    end_margin_s: ClassVar[float]
+    # Shortest kept segment [s]
+    min_pulse_length_s: ClassVar[float]
     # Shot mean power_radiated over mean input power (ohmic plus heating) below this is a dead bolometer
-    min_radiated_fraction = 0.0
+    min_radiated_fraction: ClassVar[float]
     # Bounds on the shot median, over fresh profile slices, of mean(n_e for rho_tor_norm <= 1) / n_e_line_average.
     # The ratio is a proxy for the chord integral, and the bounds absorb its offset on each device.
-    density_ratio_bounds: tuple[float, float] | None = None
-
-    # Set by each device
-    # filter_config: {signal: {"min", "max"}}, a slice with any signal out of range is dropped.
-    # It must hold ip, whose minimum also marks where the plasma current ends.
-    # individual_filter_config: {signal: {"min", "max"}}, an out-of-range value is NaNed
-    # transient_filter_config: {signal: threshold}, the shot is cut from the first slice whose smoothed signal exceeds it
-    filter_config: dict[str, dict[str, float]]
-    individual_filter_config: dict[str, dict[str, float]] | None
-    transient_filter_config: dict[str, float]
+    density_ratio_bounds: ClassVar[tuple[float, float]]
 
     def __init__(
         self,
@@ -256,7 +265,6 @@ class RawFileWorkflow(DataWorkflow):
         shotlist_file: Path | str | None,
         data_assembly_dir: Path | str,
         max_num_shots: int | None = None,
-        min_shot_duration: float = 0.5,
     ):
         """
         Parameters
@@ -270,12 +278,9 @@ class RawFileWorkflow(DataWorkflow):
             Directory where data files are stored and final dataset will be saved
         max_num_shots : int | None
             Maximum number of shots to process (for testing). If None, process all shots.
-        min_shot_duration : float
-            Minimum duration (in seconds) for a shot to be included in the dataset.
         """
         super().__init__(ds_name, data_assembly_dir, max_num_shots)
         self.raw_data_dir = self.data_assembly_dir / ds_name / "raw_data"
-        self.min_shot_duration = min_shot_duration
 
         if shotlist_file is None:
             logger.info("No shotlist file provided, retrieving shotlist from device-specific source")
@@ -327,7 +332,7 @@ class RawFileWorkflow(DataWorkflow):
         return dim_sizes
 
     def load_shot(self, shot: int) -> xr.Dataset | None:
-        """A raw file processed, power-clipped, fresh-labelled, and filtered."""
+        """A raw file processed, fresh-labelled, filtered, and power-clipped."""
         with xr.open_dataset(self.raw_data_dir / f"{shot}.nc") as raw_file:
             shot_ds = raw_file.load()
 
@@ -335,16 +340,18 @@ class RawFileWorkflow(DataWorkflow):
         if shot_ds is None:
             return None
 
-        # No heating or radiated power is physically negative
-        for power in STORE_POWERS:
-            shot_ds[power] = shot_ds[power].clip(min=0)
-
-        # Label where the profiles are fresh (not made by ffill), BEFORE filter_ds compacts the record
+        # Label where the profiles are fresh (not made by ffill), BEFORE filter_ds cuts the record down
         shot_ds["fresh_profile"] = self._fresh_profile_flags(shot_ds["n_e"])
 
         shot_ds_filtered = self.filter_ds(shot_ds.copy())
         if shot_ds_filtered is None:
             self._debug_plots(shot_ds)
+            return None
+
+        # No heating or radiated power is physically negative.
+        # Clipped after filtering, so the filters judge the values the device recorded.
+        for power in STORE_POWERS:
+            shot_ds_filtered[power] = shot_ds_filtered[power].clip(min=0)
         return shot_ds_filtered
 
     @staticmethod
@@ -361,7 +368,7 @@ class RawFileWorkflow(DataWorkflow):
         return mask_fresh.any(RADIAL_DIM).astype(np.float32)
 
     def cull_shot(self, shot_ds: xr.Dataset) -> bool:
-        """Device-specific, energy-sanity, radiated-fraction, density-ratio, and duration culls."""
+        """Device-specific, energy-sanity, radiated-fraction, density-ratio, and duration culls, the same on every device."""
         shot = int(shot_ds[EPISODE_DIM].values[0])
         if self.device_specific_culling(shot_ds):
             logger.warning(f"Excluding shot {shot} based on device-specific culling criteria")
@@ -400,7 +407,7 @@ class RawFileWorkflow(DataWorkflow):
         NBI power. The rise (not the absolute peak) is used because filtering
         can drop the ramp-up, and energy stored before the window start needs
         no input inside the window.
-        Give 5% of leeway to account for measurement noise and integration error.
+        ENERGY_SANITY_LEEWAY gives 5% of leeway to account for measurement noise and integration error.
         Note this ignores radiated power, so it's a conservative check.
         Missing power samples count as zero, which only lowers the input estimate,
         so a healthy shot (integrated input energy far above stored energy) is never culled.
@@ -422,7 +429,7 @@ class RawFileWorkflow(DataWorkflow):
         idx_peak = int(np.argmax(energy_valid))
         energy_input_J = float(np.trapezoid(power_valid[: idx_peak + 1], time_valid[: idx_peak + 1]))
         energy_rise_J = energy_valid[idx_peak] - energy_valid[0]
-        if energy_rise_J > (energy_input_J * 1.05):
+        if energy_rise_J > (energy_input_J * ENERGY_SANITY_LEEWAY):
             logger.info(
                 f"Culling shot {shot_id}: stored energy rise {energy_rise_J / 1e6:.3f} MJ exceeds "
                 f"integrated input energy {energy_input_J / 1e6:.3f} MJ, input power record is broken or missing"
@@ -433,11 +440,8 @@ class RawFileWorkflow(DataWorkflow):
     def radiated_fraction_cull(self, ds: xr.Dataset) -> bool:
         """True if the mean radiated power is below min_radiated_fraction of the mean input power, a dead bolometer.
 
-        Input power is ohmic plus heating, with missing samples counted as zero.
-        Off when min_radiated_fraction is 0, and a shot with no input power is never culled.
+        Input power is ohmic plus heating. A shot with no input power is never culled.
         """
-        if self.min_radiated_fraction <= 0:
-            return False
         shot_id = ds[EPISODE_DIM].values[0]
         power_input = ds["power_ohm"].fillna(0.0)
         for power in STORE_HEATING_POWERS:
@@ -459,10 +463,7 @@ class RawFileWorkflow(DataWorkflow):
 
         The shot median, over its fresh profile slices, of mean(n_e for rho_tor_norm <= 1) / n_e_line_average
         must sit inside density_ratio_bounds. A shot without a single fresh slice to check is culled.
-        Off when density_ratio_bounds is None.
         """
-        if self.density_ratio_bounds is None:
-            return False
         shot_id = ds[EPISODE_DIM].values[0]
         mask_inside_lcfs = ds[RADIAL_DIM] <= 1.0
         n_e_mean_inside = ds["n_e"].where(mask_inside_lcfs).mean(RADIAL_DIM)
@@ -480,24 +481,13 @@ class RawFileWorkflow(DataWorkflow):
         return False
 
     def is_too_short(self, shot_ds: xr.Dataset) -> bool:
-        """True if the shot's valid span or its accumulated valid time is below min_shot_duration.
-
-        filter_ds drops invalid slices outright, so holes show up as time jumps,
-        which the span check cannot see. The accumulated time (slice count on the 1 kHz grid) does.
-        """
+        """True if the one segment filter_ds keeps spans less than min_pulse_length_s (kept_span)."""
         shot = int(shot_ds[EPISODE_DIM].values[0])
-        cleaned_ds = shot_ds.dropna(TIME_DIM, how="all")
-        valid_time_duration = 0 if cleaned_ds[TIME_COORD].size == 0 else float(cleaned_ds[TIME_COORD].max() - cleaned_ds[TIME_COORD].min())
-        if valid_time_duration < self.min_shot_duration:
-            logger.warning(f"Excluding shot {shot} because duration after processing is only {valid_time_duration:.2f} seconds")
-            return True
-
-        valid_data_duration = cleaned_ds.sizes[TIME_DIM] * UNIFORM_TIMEBASE_DT_S
-        if valid_data_duration < self.min_shot_duration:
-            logger.warning(
-                f"Excluding shot {shot} because only {valid_data_duration:.3f} seconds of valid data "
-                f"remain after processing (span {valid_time_duration:.2f} seconds)"
-            )
+        times = shot_ds[TIME_COORD].values.reshape(-1)
+        mask_kept = np.isfinite(times)
+        pulse_length = kept_span(mask_kept, times)
+        if pulse_length < self.min_pulse_length_s:
+            logger.warning(f"Excluding shot {shot}: kept segment {pulse_length:.3f} s, shorter than {self.min_pulse_length_s} s")
             return True
         return False
 
@@ -521,57 +511,54 @@ class RawFileWorkflow(DataWorkflow):
         return ds
 
     def filter_ds(self, shot_ds: xr.Dataset) -> xr.Dataset | None:
-        """Apply filtering steps based on device config"""
+        """Cut a shot down to its one longest valid segment.
+
+        Every check cuts the times it fails out as a gap:
+        the end of the shot (end_of_shot_index on |ip| and its min_filter threshold),
+        a 0D signal of STORE_0D_SIGNALS that is not finite,
+        a min_filter signal below its threshold or a max_filter signal above it,
+        and a transient_filter signal above its threshold after a centered TRANSIENT_SMOOTHING_WINDOW_S boxcar.
+        Only the longest contiguous segment of what passes is kept (keep_longest_segment).
+        Returns None when |ip| never reaches its threshold or nothing passes.
+        """
         shot = shot_ds[EPISODE_DIM].values[0]
+        times = shot_ds[TIME_COORD].values.reshape(-1)
+        ds_filter_inputs = _filter_inputs(shot_ds)
 
-        # The plasma ends at the last slice with ip at or above its filter_config minimum.
-        # A record can hold ip near 0 out to the end of its timebase, so the last finite ip is not the end.
-        # Cut end_margin_s before the end to leave out the termination, which is often a disruption.
-        mask_plasma = (shot_ds["ip"] >= self.filter_config["ip"]["min"]).any(dim=EPISODE_DIM)
-        if not mask_plasma.any():
-            logger.warning(f"Excluding shot {shot} because ip never reaches its filter_config minimum")
+        # The plasma ends at the last time |ip| reaches its threshold, the margin is cut back from there
+        ip_magnitude = ds_filter_inputs["ip"].max(EPISODE_DIM).values
+        end_cut_index = end_of_shot_index(ip_magnitude, times, self.min_filter["ip"], self.end_margin_s)
+        if end_cut_index is None:
+            logger.warning(f"Excluding shot {shot} because |ip| never reaches {self.min_filter['ip']:g} A")
             return None
-        last_plasma_idx = int(np.where(mask_plasma.values)[0][-1])
-        # Half a sample of slack, so float rounding of the times never decides the slice at the margin
-        t_end = shot_ds[TIME_COORD][last_plasma_idx] - self.end_margin_s + UNIFORM_TIMEBASE_DT_S / 2
-        valid_mask = shot_ds[TIME_COORD] <= t_end
+        mask_valid = np.arange(times.size) < end_cut_index
 
-        # Cut from the first transient, where a smoothed signal exceeds its threshold while the plasma is on
-        window_samples = round(self.transient_smoothing_window_s / UNIFORM_TIMEBASE_DT_S)
-        for var, threshold in self.transient_filter_config.items():
-            smoothed = shot_ds[var].rolling({TIME_DIM: window_samples}, center=True, min_periods=1).mean()
-            mask_transient = (smoothed > threshold).any(dim=EPISODE_DIM) & mask_plasma & valid_mask
+        for signal in STORE_0D_SIGNALS:
+            mask_finite = np.isfinite(shot_ds[signal]).all(EPISODE_DIM).values
+            mask_valid = mask_valid & mask_finite
+        for signal, threshold in self.min_filter.items():
+            mask_above = (ds_filter_inputs[signal] >= threshold).all(EPISODE_DIM).values
+            mask_valid = mask_valid & mask_above
+        for signal, threshold in self.max_filter.items():
+            mask_below = (ds_filter_inputs[signal] <= threshold).all(EPISODE_DIM).values
+            mask_valid = mask_valid & mask_below
+        for signal, threshold in self.transient_filter.items():
+            smoothed = _centered_boxcar_mean(shot_ds[signal], TRANSIENT_SMOOTHING_WINDOW_S)
+            mask_transient = (smoothed > threshold).any(EPISODE_DIM).values
             if mask_transient.any():
-                first_transient_idx = int(np.where(mask_transient.values)[0][0])
-                t_transient = shot_ds[TIME_COORD][first_transient_idx]
-                logger.info(f"Shot {shot}: {var} transient at {float(t_transient):.3f} s, cutting the rest of the shot")
-                valid_mask = valid_mask & (shot_ds[TIME_COORD] < t_transient)
+                logger.debug(f"Shot {shot}: {signal} above {threshold:g} at {int(mask_transient.sum())} times")
+            mask_valid = mask_valid & ~mask_transient
 
-        # Apply full-timeslice filters
-        for var, valid_range in self.filter_config.items():
-            if var in shot_ds:
-                var_mask = shot_ds[var].notnull() & (shot_ds[var] >= valid_range["min"]) & (shot_ds[var] <= valid_range["max"])
-                valid_mask = valid_mask & var_mask
-            else:
-                logger.debug(f"Variable {var} specified in filter_config not found in dataset for shot {shot}")
-
-        if valid_mask.sum() == 0:
-            logger.warning(f"Excluding shot {shot} because all data points are invalid after filtering")
+        mask_kept, dropped_lengths = keep_longest_segment(mask_valid, times)
+        if not mask_kept.any():
+            logger.warning(f"Excluding shot {shot} because no time passes the filters")
             return None
-
-        # Apply individual filters that set out-of-range values to NaN, but don't drop the entire timeslice.
-        if self.individual_filter_config is not None:
-            for var, valid_range in self.individual_filter_config.items():
-                if var in shot_ds:
-                    shot_ds[var] = shot_ds[var].where(
-                        (shot_ds[var].notnull()) & (shot_ds[var] >= valid_range["min"]) & (shot_ds[var] <= valid_range["max"]),
-                        other=np.nan,
-                    )
-                else:
-                    logger.debug(f"Variable {var} specified in individual_filter_config not found in dataset for shot {shot}")
-
-        shot_ds = shot_ds.where(valid_mask, drop=True)
-        return shot_ds
+        if dropped_lengths:
+            logger.info(
+                f"Shot {shot}: kept the longest segment, dropped {len(dropped_lengths)} shorter one(s), "
+                f"the longest {1e3 * max(dropped_lengths):.0f} ms, {1e3 * sum(dropped_lengths):.0f} ms in all"
+            )
+        return shot_ds.isel({TIME_DIM: mask_kept})
 
     def _debug_plots(self, shot_ds: xr.Dataset):
         debug_fig_dir = self.final_ds_dir / "debug_plots"
@@ -617,11 +604,9 @@ class PublishedStoreWorkflow(DataWorkflow):
 
         Loaded once, since the profiles are chunked over many shots and reading
         them shot by shot would decompress every chunk once per shot.
-        A heating system the store does not carry is absent on the device, load_shot zero-fills it.
         """
         ds_store = xr.open_zarr(self.published_store_path)
-        published_signals = [name for name in STORE_SIGNALS if name not in STORE_HEATING_POWERS or name in ds_store]
-        ds_selected = ds_store[[*published_signals, TIME_COORD]].isel({EPISODE_DIM: slice(0, self.max_num_shots)})
+        ds_selected = ds_store[[*STORE_SIGNALS, TIME_COORD]].isel({EPISODE_DIM: slice(0, self.max_num_shots)})
         logger.info(f"Loading {ds_selected.sizes[EPISODE_DIM]} shots from {self.published_store_path}")
         ds_loaded = ds_selected.load()
         # Drop the published store's chunking and compressor encodings, the new stores set their own
@@ -648,9 +633,22 @@ class PublishedStoreWorkflow(DataWorkflow):
         for name in ["ip", "b0"]:
             magnitude = np.abs(shot_ds[name].values)
             shot_ds[name] = shot_ds[name].copy(data=magnitude)
-
-        for power in STORE_HEATING_POWERS:
-            if power not in shot_ds:
-                power_absent = np.zeros_like(shot_ds["power_ohm"].values)
-                shot_ds[power] = (shot_ds["power_ohm"].dims, power_absent)
         return shot_ds
+
+
+def _filter_inputs(ds: xr.Dataset) -> xr.Dataset:
+    """The signals min_filter and max_filter judge, with ip as its magnitude and the derived greenwald_fraction."""
+    ip_magnitude = abs(ds["ip"])
+    fraction = greenwald_fraction(ip_magnitude, ds["minor_radius"], ds["n_e_line_average"])
+    return ds.assign(ip=ip_magnitude, greenwald_fraction=fraction)
+
+
+def _centered_boxcar_mean(signal: xr.DataArray, window_s: float) -> xr.DataArray:
+    """A signal on the 1 kHz grid smoothed by a boxcar centered on each sample, odd so it stays centered.
+
+    Averaged over the samples present near the ends and around NaNs.
+    """
+    n_samples = max(1, round(window_s / UNIFORM_TIMEBASE_DT_S))
+    if n_samples % 2 == 0:
+        n_samples += 1
+    return signal.rolling({TIME_DIM: n_samples}, center=True, min_periods=1).mean()

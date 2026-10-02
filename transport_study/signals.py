@@ -18,6 +18,21 @@ STORE_PROFILE_COMPANIONS = tuple(f"{profile}{suffix}" for profile in STORE_PROFI
 STORE_HEATING_POWERS = ("power_nbi", "power_ic", "power_lh", "power_ec")
 STORE_POWERS = ("power_ohm", "power_radiated", *STORE_HEATING_POWERS)
 
+# The 0D signals of a device store, finite at every stored time (the finite filter of every device)
+STORE_0D_SIGNALS = (
+    "ip",
+    "b0",
+    "energy_mhd",
+    "beta_tor_norm",
+    "n_e_line_average",
+    "minor_radius",
+    "geometric_axis_r",
+    "elongation",
+    "triangularity_upper",
+    "triangularity_lower",
+    *STORE_POWERS,
+)
+
 # Every signal of a device store, in store order, with its SI unit.
 # Unit strings match the transport-validation-datasets published stores.
 STORE_SIGNAL_UNITS = {

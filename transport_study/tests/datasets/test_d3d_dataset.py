@@ -49,47 +49,10 @@ from transport_study.datasets.d3d.profiles import (
     find_ida_shots,
     gradient_and_error,
     ida_profiles_on_grids,
-    rho_tor_norm_from_psi_n,
 )
 from transport_study.signals import PREDICTION_STORE_NAME, STORE_SIGNALS
 
 IDA_DIR = Path("/fusion/projects/results/ida-results/HBP_database")
-
-
-def test_rho_map_constant_q_is_sqrt_psi_n():
-    """Constant q makes Phi_N = psi_N, and the secant continuation keeps slope 1 past the LCFS."""
-    psi_n = np.linspace(0.0, 1.2, 121)
-    qpsi = np.full(65, 3.0)
-
-    rho = rho_tor_norm_from_psi_n(psi_n, qpsi, "secant")
-    rho_flipped_q = rho_tor_norm_from_psi_n(psi_n, -qpsi, "secant")
-
-    np.testing.assert_allclose(rho, np.sqrt(psi_n), atol=1e-12)
-    np.testing.assert_allclose(rho_flipped_q, rho, atol=1e-12)
-    psi_n_edge_cases = np.array([-0.01, np.nan])
-    rho_edge_cases = rho_tor_norm_from_psi_n(psi_n_edge_cases, qpsi, "secant")
-    assert rho_edge_cases[0] == 0.0
-    assert np.isnan(rho_edge_cases[1])
-
-
-def test_rho_map_rising_q_matches_closed_form():
-    """q = 1 + 3 psi^2 gives Phi_N = (psi + psi^3) / 2 inside the LCFS, continued along the secant from 0.95."""
-    psi_n = np.linspace(0.0, 1.2, 241)
-    psi_n_q_grid = np.linspace(0.0, 1.0, 129)
-    qpsi = 1.0 + 3.0 * psi_n_q_grid**2
-
-    rho = rho_tor_norm_from_psi_n(psi_n, qpsi, "secant")
-
-    mask_inside = psi_n <= 1.0
-    phi_n_closed_form = (psi_n + psi_n**3) / 2
-    np.testing.assert_allclose(rho[mask_inside], np.sqrt(phi_n_closed_form[mask_inside]), atol=1e-4)
-    assert rho[psi_n == 1.0] == pytest.approx(1.0)
-    assert np.all(np.diff(rho) > 0)
-    phi_n_at_secant_start = (0.95 + 0.95**3) / 2
-    secant_slope = (1.0 - phi_n_at_secant_start) / 0.05
-    mask_outside = psi_n > 1.0
-    phi_n_outside = 1.0 + secant_slope * (psi_n[mask_outside] - 1.0)
-    np.testing.assert_allclose(rho[mask_outside], np.sqrt(phi_n_outside), rtol=1e-4)
 
 
 # Synthetic IDA slice times [ms]: a doubled interior gap (180 -> 260) inside the hold limit
@@ -319,13 +282,14 @@ def test_line_average_density_falls_back_to_pcs_estimate():
     np.testing.assert_allclose(_line_average_density(np.nan), 5e19)
 
 
-N_TIME = 700  # 0.7 s, over min_shot_duration once the end margin is cut
+N_TIME = 700  # 0.7 s, over min_pulse_length_s once the end margin is cut
 RAW_SCALAR_VALUES = {
     "ip": -1.2e6,
     "bt": -2.1,
     "wmhd": 8e5,
     "beta_n": 2.0,
-    "n_e_line_average": 4e19,
+    # The flat ne_rho profile over it, so the density ratio cull passes
+    "n_e_line_average": 6e19,
     "aminor": 0.6,
     "rsurf": 1.7,
     "kappa": 1.8,
@@ -399,7 +363,8 @@ def test_standardize_builds_both_stores_in_si(workflow):
     assert set(STORE_SIGNALS) - {"fresh_profile"} <= set(ds.data_vars)
     assert set(D3D_TRAJOPT_STORE_SIGNALS) <= set(ds.data_vars)
     np.testing.assert_allclose(ds["ip"], 1.2e6)
-    np.testing.assert_allclose(ds["b0"], 2.1)
+    # bt is quoted at 1.6955 m, b0 at the 1.7 m geometric axis
+    np.testing.assert_allclose(ds["b0"], 2.1 * 1.6955 / 1.7)
     np.testing.assert_allclose(ds["ip_reference"], 1.0e6)
     np.testing.assert_allclose(ds["n_e_pedestal"], 3.5e19)
     np.testing.assert_allclose(ds["energy_mhd"], 8e5)
@@ -414,13 +379,13 @@ def test_standardize_builds_both_stores_in_si(workflow):
     assert workflow.standardize_signal_names(raw_no_profile) is None
 
 
-def test_missing_efit_boundary_culls_the_shot(workflow):
-    """A shot with profiles but no EFIT geometry left after filtering is culled."""
+def test_missing_efit_boundary_leaves_nothing_to_keep(workflow):
+    """A shot with profiles but no EFIT geometry fails the finite filter at every time."""
     ds = workflow.standardize_signal_names(_raw_dataset())
-    assert not workflow.device_specific_culling(ds)
+    assert workflow.filter_ds(ds.copy()) is not None
 
     ds["geometric_axis_r"] = xr.full_like(ds["geometric_axis_r"], np.nan)
-    assert workflow.device_specific_culling(ds)
+    assert workflow.filter_ds(ds) is None
 
 
 SYNTHETIC_IDA_PATHS = {
@@ -519,7 +484,7 @@ def test_live_single_shot(tmp_path):
     assert np.nanpercentile(p_ohm_flattop, 95) < 2e6
     assert np.isfinite(p_rad_flattop).all()
     assert 1e5 < np.median(p_rad_flattop) < 1e7
-    # Every held slice has a value at the axis (left clamp), otherwise the t_e_axis filter drops it
+    # Every held slice has a value at the axis (left clamp)
     t_e = ds["t_e"].values.squeeze()
     mask_held = np.isfinite(t_e).any(axis=-1)
     assert np.isfinite(t_e[mask_held][:, 0]).all()

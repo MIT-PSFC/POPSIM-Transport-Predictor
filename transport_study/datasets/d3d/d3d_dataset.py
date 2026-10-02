@@ -7,7 +7,6 @@ from pathlib import Path
 from typing import ClassVar
 
 import netCDF4  # noqa: F401
-import numpy as np
 import xarray as xr
 import zarr
 from disruption_py.machine.tokamak import Tokamak
@@ -38,16 +37,15 @@ INNER_WALL = 1.05  # Location of the inner wall, used to calculate minor radius 
 
 # Everything is fetched through one disruption-py call per shot, all EFIT signals from the shot's DISPY run
 RUN_METHODS = [
-    # disruption-py 0.14 built-ins
-    "get_efit_parameters",  # wmhd, beta_n, kappa
-    "get_ip_parameters",  # ip, ip_prog
-    # custom methods from physics_methods.py
+    # custom methods from physics_methods.py, every one held onto the timebase rather than interpolated
+    "get_plasma_current",  # ip, ip_prog
+    "get_efit_scalars",  # wmhd, beta_n
     "get_ptdata_parameters",  # bt, dssneped, PCS programmed waveforms
     "get_line_average_density",  # n_e_line_average
     "get_ohmic_power",  # p_ohm
     "get_radiated_power",  # p_rad
     "get_heating_powers",  # p_nbi, p_ech
-    "get_boundary_parameters",  # aminor, rsurf, tritop, tribot
+    "get_boundary_parameters",  # aminor, rsurf, kappa, tritop, tribot
     "get_xpoint_gap_parameters",  # gapin, X points
     "get_ida_profiles",  # Te/ne on rho_tor_norm and psi_norm
 ]
@@ -101,6 +99,26 @@ TRAJOPT_SOURCES = {
 }
 # Signed in the source, stored as magnitudes
 MAGNITUDE_SIGNALS = ("ip", "b0", "ip_reference")
+# (min, max) of the trajopt signals, a value outside is NaN, see D3DDataWorkflow.device_specific_processing
+TRAJOPT_VALID_RANGES = {
+    # dssneped reads 0 when the PCS does not estimate the pedestal
+    "n_e_pedestal": (1e18, 2e20),
+    "ip_reference": (0, 2.5e6),
+    "beta_tor_norm_reference": (0, 6),
+    "geometric_axis_r_reference": (1.4, 2.0),
+    "gap_inner": (0, 0.5),
+    # X points, measured and programmed
+    "x_point_lower_r": (1.0, 2.0),
+    "x_point_lower_r_reference": (1.0, 2.0),
+    "x_point_upper_r": (1.0, 2.0),
+    "x_point_upper_r_reference": (1.0, 2.0),
+    "x_point_lower_z": (-1.5, 0.0),
+    "x_point_lower_z_reference": (-1.5, 0.0),
+    "x_point_upper_z": (0.0, 1.5),
+    "x_point_upper_z_reference": (0.0, 1.5),
+}
+# Major radius PTDATA bt is the vacuum toroidal field at [m]
+BT_REFERENCE_R = 1.6955
 
 # The PCS programmed targets (feedforward control) and the measured signals they are compared against,
 # read only by the trajectory optimization.
@@ -133,7 +151,7 @@ D3D_SIGNAL_ATTRS = {
     # Prediction store
     "ip": {"description": "Measured plasma current magnitude (PTDATA ip)", "ref": "/summary/global_quantities/ip/value"},
     "b0": {
-        "description": "Vacuum toroidal field magnitude at R0 = 1.6955 m (PTDATA bt)",
+        "description": "Vacuum toroidal field magnitude at geometric_axis_r, PTDATA bt (at 1.6955 m) scaled by 1/R",
         "ref": "/summary/global_quantities/b0/value",
     },
     "energy_mhd": {
@@ -302,6 +320,29 @@ class D3DDataWorkflow(RawFileWorkflow):
         "rho_tor_norm_definition": RHO_TOR_NORM_DEFINITION,
     }
 
+    # The filter spec of every device store (RawFileWorkflow.filter_ds), SI units
+    min_filter: ClassVar[dict[str, float]] = {
+        "ip": 2e5,
+        "energy_mhd": 1e4,
+        # Deep limited rampdowns (199243, 199244, 203460) carry the worst stored energy glitches
+        "elongation": 1.3,
+        # EFIT saturates at exactly 1 for runs of slices (204191, 203535, 203530)
+        "triangularity_upper": -0.99,
+        "triangularity_lower": -0.99,
+    }
+    max_filter: ClassVar[dict[str, float]] = {
+        "greenwald_fraction": 2.0,
+        "triangularity_upper": 0.99,
+        "triangularity_lower": 0.99,
+    }
+    # The EFIT P_oh stays below 0.6 MW through the ramp-up and above 2 MW only at disruptive terminations
+    transient_filter: ClassVar[dict[str, float]] = {"power_ohm": 2e6}
+    # ip reads near 0 out to the 8 s end of the timebase, so the end is the last ip above its threshold
+    end_margin_s: ClassVar[float] = 0.05
+    min_pulse_length_s: ClassVar[float] = 0.5
+    min_radiated_fraction: ClassVar[float] = 0.025
+    density_ratio_bounds: ClassVar[tuple[float, float]] = (0.7, 1.3)
+
     def __init__(
         self,
         ds_name: str,
@@ -334,46 +375,6 @@ class D3DDataWorkflow(RawFileWorkflow):
             data_assembly_dir,
             max_num_shots=max_num_shots,
         )
-
-        # If any of these signals are out of range, drop the entire timeslice. SI units.
-        # Provisional bounds, tuned against the percentile scan of the HBP shots.
-        self.filter_config = {
-            "energy_mhd": {"min": 1e4, "max": 4e6},
-            "ip": {"min": 2e5, "max": 2.5e6},
-            "n_e_line_average": {"min": 1e18, "max": 2e20},
-            "t_e_axis": {"min": 100, "max": 1.5e4},
-            "greenwald_fraction": {"min": 0.0, "max": 2.0},
-            "beta_tor_norm": {"min": 0.01, "max": 6},
-            # Deep limited rampdowns (199243, 199244, 203460) carry the worst stored energy glitches
-            "elongation": {"min": 1.3, "max": 2.5},
-            # EFIT saturates at exactly 1 for runs of slices (204191, 203535, 203530)
-            "triangularity_upper": {"min": -0.99, "max": 0.99},
-            "triangularity_lower": {"min": -0.99, "max": 0.99},
-        }
-
-        # Set signals outside this range to nan, but don't drop the entire timeslice. Store units.
-        self.individual_filter_config = {
-            "power_ec": {"min": 0, "max": 1e7},
-            "power_nbi": {"min": 0, "max": 2.5e7},
-            # dssneped reads 0 when the PCS does not estimate the pedestal
-            "n_e_pedestal": {"min": 1e18, "max": 2e20},
-            "ip_reference": {"min": 0, "max": 2.5e6},
-            "beta_tor_norm_reference": {"min": 0, "max": 6},
-            "geometric_axis_r_reference": {"min": 1.4, "max": 2.0},
-            "gap_inner": {"min": 0, "max": 0.5},
-            # X points, measured and programmed
-            "x_point_lower_r": {"min": 1.0, "max": 2.0},
-            "x_point_lower_r_reference": {"min": 1.0, "max": 2.0},
-            "x_point_upper_r": {"min": 1.0, "max": 2.0},
-            "x_point_upper_r_reference": {"min": 1.0, "max": 2.0},
-            "x_point_lower_z": {"min": -1.5, "max": 0.0},
-            "x_point_lower_z_reference": {"min": -1.5, "max": 0.0},
-            "x_point_upper_z": {"min": 0.0, "max": 1.5},
-            "x_point_upper_z_reference": {"min": 0.0, "max": 1.5},
-        }
-
-        # The EFIT P_oh stays below 0.6 MW through the ramp-up and above 2 MW only at disruptive terminations
-        self.transient_filter_config = {"power_ohm": 2e6}
 
     def _get_shotlist_from_source(self) -> list[int]:
         """Union of the shots every configured IDA database serves."""
@@ -505,6 +506,8 @@ class D3DDataWorkflow(RawFileWorkflow):
             if store_name in MAGNITUDE_SIGNALS:
                 signal = abs(signal)
             signals[store_name] = signal
+        # Vacuum field falls off as 1/R, so b0 at the geometric axis is bt R_ref / R_geo
+        signals["b0"] = signals["b0"] * BT_REFERENCE_R / signals["geometric_axis_r"]
         signals["power_ic"] = xr.zeros_like(ds["p_ohm"])
         signals["power_lh"] = xr.zeros_like(ds["p_ohm"])
         ds_standardized = xr.Dataset(signals)
@@ -517,9 +520,10 @@ class D3DDataWorkflow(RawFileWorkflow):
         return self.standardize_dim_names(ds_standardized)
 
     def device_specific_processing(self, ds: xr.Dataset) -> xr.Dataset:
-        """Derive the processing-only filter inputs.
+        """NaN the trajopt signals outside TRAJOPT_VALID_RANGES.
 
-        greenwald_fraction and t_e_axis are range-checked by filter_config and never stored.
+        The trajopt store is not part of the shared filter spec, so an out-of-range value is NaN
+        rather than a gap in the shot.
 
         Parameters
         ----------
@@ -531,21 +535,18 @@ class D3DDataWorkflow(RawFileWorkflow):
         xr.Dataset
             Processed dataset ready for general workflow
         """
-        # n_Greenwald [1e20 m^-3] = Ip [MA] / (pi a^2)
-        ip_MA = ds["ip"] * 1e-6
-        n_greenwald_1e20 = ip_MA / (np.pi * ds["minor_radius"] ** 2)
-        ds["greenwald_fraction"] = ds["n_e_line_average"] * 1e-20 / n_greenwald_1e20
-
-        ds["t_e_axis"] = ds["t_e"].sel({RADIAL_DIM: 0}, method="nearest")
+        for name, (valid_min, valid_max) in TRAJOPT_VALID_RANGES.items():
+            mask_in_range = (ds[name] >= valid_min) & (ds[name] <= valid_max)
+            ds[name] = ds[name].where(mask_in_range)
 
         # Per-shot, so it must not become a store attribute through the first stored shot (see record_ida_sources)
         del ds.attrs[RAW_IDA_PATH_ATTR]
         return ds
 
     def device_specific_culling(self, ds: xr.Dataset) -> bool:
-        """The config's excluded shots, the default profile cull, and shots whose EFIT boundary is entirely missing after filtering."""
+        """The config's excluded shots and the default profile cull."""
         shot = int(ds[EPISODE_DIM].values[0])
         if shot in config["culling"]["excluded_shots"]:
             logger.warning(f"Culling shot {shot}: listed in excluded_shots of d3d/config.toml")
             return True
-        return super().device_specific_culling(ds) or self.has_all_nan_signal(ds, ["geometric_axis_r", "minor_radius"])
+        return super().device_specific_culling(ds)

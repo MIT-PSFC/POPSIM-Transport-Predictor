@@ -10,6 +10,7 @@ from loguru import logger
 
 from transport_study import RADIAL_DIM, TIME_COORD
 from transport_study.datasets import make_uniform_1khz_timebase
+from transport_study.datasets.profile_grids import held_signal_on_grid
 from transport_study.datasets.tcv import config
 from transport_study.datasets.tcv.profiles import (
     RHO_TOR_NORM_DEFINITION,
@@ -24,6 +25,7 @@ from transport_study.datasets.tcv.sources import (
     read_liuqe,
 )
 from transport_study.datasets.workflow import RawFileWorkflow
+from transport_study.datasets.zero_d_signals import ohmic_power, trailing_boxcar_mean
 from transport_study.signals import STORE_PROFILES
 
 # Store signal -> (DEFUSE signal, factor to SI units). DEFUSE is SI apart from the heating powers.
@@ -38,8 +40,7 @@ PREDICTION_SOURCES = {
     "elongation": ("KAPPA", 1.0),
     "triangularity_upper": ("DELTA_TOP", 1.0),
     "triangularity_lower": ("DELTA_BOTTOM", 1.0),
-    "power_ohm": ("POHM", 1.0),
-    "power_radiated": ("PradBulk", 1.0),
+    "power_radiated": ("PradTot", 1.0),
     "t_e": ("Te_rho", 1.0),
     "n_e": ("Ne_rho", 1.0),
     "t_e_gradient": ("Te_rho_grad", 1.0),
@@ -53,10 +54,17 @@ HEATING_SOURCES_MW = {
 }
 # Signed in the source (negative in the usual TCV configuration), stored as magnitudes
 MAGNITUDE_SIGNALS = ("ip", "b0")
+# Major radius DEFUSE BZERO is the vacuum toroidal field at [m]
+BZERO_REFERENCE_R = 0.88
 
-# Edge line-averaged density, kept in the raw files for the edge-to-line-average check only
-EDGE_LINE_AVERAGE = "n_e_edge_line_average"
-EDGE_LINE_AVERAGE_SOURCE = "Ne_edge_avg"
+# DEFUSE signals power_ohm is computed from (ohmic_power), DEFUSE POHM has no documented definition
+OHMIC_POWER_SOURCES = ("I_P", "Vloop", "LI", "RMAG")
+# DEFUSE Vloop has the opposite sign convention to I_P:
+# Ip * Vloop is negative at flat-top on all 39 shots checked, of both current polarities
+DEFUSE_VLOOP_SIGN = -1.0
+# Width of the trailing boxcar the ohmic power is smoothed with [s], as on C-Mod.
+# Unsmoothed, the loop voltage and the dW_pol/dt difference make it noise-dominated at 1 kHz.
+OHMIC_POWER_SMOOTHING_WINDOW = 5e-3
 
 DEFUSE_PROFILE_SIGNALS = ("Te_rho", "Ne_rho")
 # The profile gradients are taken on the DEFUSE fit points, under the profile's name with this suffix
@@ -66,7 +74,7 @@ DEFUSE_PROFILE_COLUMNS = (*DEFUSE_PROFILE_SIGNALS, *(f"{name}{DEFUSE_GRADIENT_SU
 DEFUSE_SIGNALS = (
     *(raw_name for raw_name, _ in PREDICTION_SOURCES.values() if raw_name not in DEFUSE_PROFILE_COLUMNS),
     *(raw_name for raw_names in HEATING_SOURCES_MW.values() for raw_name in raw_names),
-    EDGE_LINE_AVERAGE_SOURCE,
+    *(raw_name for raw_name in OHMIC_POWER_SOURCES if raw_name != "I_P"),
 )
 
 # The raw timebase ends at the last time the plasma current magnitude exceeds this [A]
@@ -90,7 +98,7 @@ TCV_SIGNAL_ATTRS = {
     # Prediction store
     "ip": {"description": "Measured plasma current magnitude (DEFUSE I_P)", "ref": "/summary/global_quantities/ip/value"},
     "b0": {
-        "description": "Vacuum toroidal field magnitude at R0 = 0.88 m (DEFUSE BZERO)",
+        "description": "Vacuum toroidal field magnitude at geometric_axis_r, DEFUSE BZERO (at 0.88 m) scaled by 1/R",
         "ref": "/summary/global_quantities/b0/value",
     },
     "energy_mhd": {
@@ -126,11 +134,14 @@ TCV_SIGNAL_ATTRS = {
         "ref": "/equilibrium/time_slice(itime)/boundary/triangularity_lower",
     },
     "power_ohm": {
-        "description": "Ohmic heating power (DEFUSE POHM), clipped at 0",
+        "description": (
+            "Ohmic heating power, Ip * V_loop minus the rate of change of the internal poloidal magnetic energy "
+            "mu0 R li Ip^2 / 4 (DEFUSE I_P, Vloop, LI, RMAG), causal (backward difference, trailing 5 ms boxcar), clipped at 0"
+        ),
         "ref": "/summary/global_quantities/power_ohm/value",
     },
     "power_radiated": {
-        "description": "Radiated power from the confined plasma, bolometry (DEFUSE PradBulk), clipped at 0",
+        "description": "Total radiated power including the divertor, bolometry (DEFUSE PradTot), clipped at 0",
         "ref": "/summary/global_quantities/power_radiated/value",
     },
     "power_nbi": {
@@ -189,9 +200,26 @@ class TCVDataWorkflow(RawFileWorkflow):
         "equilibrium_source": "LIUQE, MEQ databases",
         "rho_tor_norm_definition": RHO_TOR_NORM_DEFINITION,
     }
+
+    # The filter spec of every device store (RawFileWorkflow.filter_ds), SI units
+    min_filter: ClassVar[dict[str, float]] = {
+        "ip": 5e4,
+        "energy_mhd": 1e3,
+        # LIUQE geometry moments go nonphysical during the current ramp (minor_radius down to 0.04 m, elongation below 1),
+        # which drives derived features like q_star far outside the physical range
+        "minor_radius": 0.15,
+        "elongation": 0.9,
+    }
+    max_filter: ClassVar[dict[str, float]] = {
+        # Bad interferometer data can pass an absolute density cap at low ip
+        "greenwald_fraction": 2.0,
+    }
+    transient_filter: ClassVar[dict[str, float]] = {}
+    end_margin_s: ClassVar[float] = 0.05
+    min_pulse_length_s: ClassVar[float] = 0.5
     # TCV bolometry reads a few percent of the input power or more, a dead bolometer far less
-    min_radiated_fraction = 0.025
-    density_ratio_bounds = (0.7, 1.3)
+    min_radiated_fraction: ClassVar[float] = 0.025
+    density_ratio_bounds: ClassVar[tuple[float, float]] = (0.7, 1.3)
 
     def __init__(
         self,
@@ -218,41 +246,13 @@ class TCVDataWorkflow(RawFileWorkflow):
         # Use the TCV dataset config from datasets/tcv/config.toml
         self.config = config
 
-        self.transient_filter_config = {}
-
         # Call parent init (which will call _get_shotlist_from_source if needed)
         super().__init__(
             ds_name,
             shotlist_file,
             data_assembly_dir,
             max_num_shots=max_num_shots,
-            min_shot_duration=self.config["shot_filters"]["min_duration"],
         )
-
-        # If any of these signals are out of range, drop the entire timeslice. SI units.
-        self.filter_config = {
-            "energy_mhd": {"min": 1e3, "max": 5e5},
-            "n_e_line_average": {"min": 1e18, "max": 4e20},
-            EDGE_LINE_AVERAGE: {"min": 1e18, "max": 4e20},
-            # Bad interferometer data can satisfy the absolute density cap at low ip
-            # so stack another check based on the Greenwald fraction
-            "greenwald_fraction": {"min": 0.0, "max": 2.0},
-            "ip": {"min": 5e4, "max": 5e5},
-            "beta_tor_norm": {"min": 0.01, "max": 10},
-            "t_e_axis": {"min": 100, "max": 2e4},
-            # LIUQE geometry moments go nonphysical during the current ramp
-            # (minor_radius down to 0.04 m, elongation below 1), which drives derived
-            # features like q_star far outside the physical range
-            "minor_radius": {"min": 0.15, "max": 0.30},
-            "geometric_axis_r": {"min": 0.80, "max": 1.0},
-            "elongation": {"min": 0.9, "max": 3.0},
-        }
-
-        # Set signals outside this range to nan, but don't drop the entire timeslice. SI units.
-        self.individual_filter_config = {
-            "power_ec": {"min": 0, "max": 1e7},
-            "power_nbi": {"min": 0, "max": 1e7},
-        }
 
     def _get_shotlist_from_source(self) -> list[int]:
         """Shots with both a DEFUSE export and a LIUQE MEQ database."""
@@ -283,9 +283,10 @@ class TCVDataWorkflow(RawFileWorkflow):
             return None
         timebase = make_uniform_1khz_timebase(ip.time[mask_ip_valid].max())
 
+        # Every signal is held from its last sample, so no time draws on a later one
         data_vars: dict[str, tuple[tuple[str, ...], np.ndarray]] = {}
         for name, signal in signals.items():
-            values_on_timebase = np.interp(timebase, signal.time, signal.values, left=np.nan, right=np.nan)
+            values_on_timebase = held_signal_on_grid(signal.time, signal.values, timebase)
             data_vars[name] = (("time",), values_on_timebase)
         equilibria = read_liuqe(meqdb_path(shot))
         profile_columns = {}
@@ -357,10 +358,9 @@ class TCVDataWorkflow(RawFileWorkflow):
         Returns
         -------
         xr.Dataset | None
-            Store signals plus the processing-only edge density,
-            or None if a required DEFUSE signal is missing or a critical signal is all NaN
+            Store signals, or None if a required DEFUSE signal is missing or a critical signal is all NaN
         """
-        raw_required = [raw_name for raw_name, _ in PREDICTION_SOURCES.values()] + [EDGE_LINE_AVERAGE_SOURCE]
+        raw_required = [raw_name for raw_name, _ in PREDICTION_SOURCES.values()] + list(OHMIC_POWER_SOURCES)
         missing = sorted(raw_name for raw_name in raw_required if raw_name not in ds)
         if missing:
             logger.warning(f"Shot {ds['shot'].item()}: missing DEFUSE signals {missing}, skipping shot.")
@@ -372,7 +372,10 @@ class TCVDataWorkflow(RawFileWorkflow):
             if store_name in MAGNITUDE_SIGNALS:
                 signal = abs(signal)
             signals[store_name] = signal
-        power_zero = xr.zeros_like(ds["POHM"])
+        # Vacuum field falls off as 1/R, so b0 at the geometric axis is BZERO R_ref / R_geo
+        signals["b0"] = signals["b0"] * BZERO_REFERENCE_R / signals["geometric_axis_r"]
+        signals["power_ohm"] = _ohmic_power(ds)
+        power_zero = xr.zeros_like(ds["I_P"])
         for store_name, raw_names in HEATING_SOURCES_MW.items():
             power_MW = power_zero
             for raw_name in raw_names:
@@ -386,7 +389,6 @@ class TCVDataWorkflow(RawFileWorkflow):
             error_zero = xr.zeros_like(signals[profile]).where(signals[profile].notnull())
             signals[f"{profile}_error"] = error_zero
             signals[f"{profile}_gradient_error"] = error_zero
-        signals[EDGE_LINE_AVERAGE] = ds[EDGE_LINE_AVERAGE_SOURCE]
         ds_standardized = xr.Dataset(signals)
 
         critical_signals = ["ip", "n_e_line_average", "t_e", "n_e"]
@@ -396,9 +398,7 @@ class TCVDataWorkflow(RawFileWorkflow):
         return self.standardize_dim_names(ds_standardized)
 
     def device_specific_processing(self, ds: xr.Dataset) -> xr.Dataset:
-        """Derive the processing-only filter inputs and remove interferometer fringe jumps.
-
-        greenwald_fraction and t_e_axis are range-checked by filter_config and never stored.
+        """Remove interferometer fringe jumps from the line-averaged density.
 
         Parameters
         ----------
@@ -410,33 +410,29 @@ class TCVDataWorkflow(RawFileWorkflow):
         xr.Dataset
             Processed dataset ready for general workflow
         """
-        # n_Greenwald [1e20 m^-3] = Ip [MA] / (pi a^2)
-        ip_MA = ds["ip"] * 1e-6
-        n_greenwald_1e20 = ip_MA / (np.pi * ds["minor_radius"] ** 2)
-        ds["greenwald_fraction"] = ds["n_e_line_average"] * 1e-20 / n_greenwald_1e20
-
-        ds["t_e_axis"] = ds["t_e"].sel({RADIAL_DIM: 0}, method="nearest")
-
-        for density_var in ["n_e_line_average", EDGE_LINE_AVERAGE]:
-            density_trace = ds[density_var].values[0, :]
-            density_corrected = _remove_fringe_jumps(density_trace)
-            ds[density_var] = (ds[density_var].dims, density_corrected[np.newaxis, :])
+        density_trace = ds["n_e_line_average"].values[0, :]
+        density_corrected = _remove_fringe_jumps(density_trace)
+        ds["n_e_line_average"] = (ds["n_e_line_average"].dims, density_corrected[np.newaxis, :])
         return ds
 
-    def device_specific_culling(self, ds: xr.Dataset) -> bool:
-        """The default profile cull, plus shots with a missing bolometer or interferometer record,
-        or an edge density far above the line average."""
-        if super().device_specific_culling(ds):
-            return True
-        if self.has_all_nan_signal(ds, ["power_radiated", "n_e_line_average", EDGE_LINE_AVERAGE]):
-            return True
 
-        n_e_line_average_mean = ds["n_e_line_average"].mean().item()
-        n_e_edge_mean = ds[EDGE_LINE_AVERAGE].mean().item()
-        if n_e_edge_mean > 2 * n_e_line_average_mean:
-            logger.info(f"Culling shot {ds.shot.values[0]} due to edge density being significantly higher than line-avg density")
-            return True
-        return False
+def _ohmic_power(ds: xr.Dataset) -> xr.DataArray:
+    """Ohmic power Ip V_loop - dW_pol/dt (ohmic_power) from the DEFUSE signals on the timebase, causal.
+
+    Vloop is flipped onto the sign convention of I_P (DEFUSE_VLOOP_SIGN),
+    and the result is smoothed by a trailing OHMIC_POWER_SMOOTHING_WINDOW boxcar.
+    """
+    times = ds["time"].values
+    ip = ds["I_P"].isel(shot=0).values
+    v_loop_defuse = ds["Vloop"].isel(shot=0).values
+    v_loop = DEFUSE_VLOOP_SIGN * v_loop_defuse
+    li = ds["LI"].isel(shot=0).values
+    r_axis = ds["RMAG"].isel(shot=0).values
+    p_ohm_raw = ohmic_power(times, ip, v_loop, li, r_axis)
+    time_steps = np.diff(times)
+    dt = float(np.median(time_steps))
+    p_ohm = trailing_boxcar_mean(p_ohm_raw, OHMIC_POWER_SMOOTHING_WINDOW, dt)
+    return xr.DataArray(p_ohm[np.newaxis, :], dims=ds["I_P"].dims, coords=ds["I_P"].coords)
 
 
 def _remove_fringe_jumps(density_trace: np.ndarray) -> np.ndarray:

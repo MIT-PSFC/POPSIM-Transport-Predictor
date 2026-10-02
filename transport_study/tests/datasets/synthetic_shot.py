@@ -12,7 +12,7 @@ import xarray as xr
 from transport_study.datasets import UNIFORM_TIMEBASE_DT_S
 
 SHOT = 70000
-N_T = 1500  # 1.5 s at 1 kHz, comfortably over min_shot_duration
+N_T = 1500  # 1.5 s at 1 kHz, comfortably over min_pulse_length_s
 RHO = np.linspace(0.0, 1.1, 12)
 # Thomson measures far slower than the 1 kHz grid, so each profile is forward-filled
 # over a block of timeslices
@@ -49,7 +49,6 @@ def raw_shot(n_t: int = N_T, shot: int = SHOT, **overrides) -> xr.Dataset:
         "power_ic": np.zeros(n_t),
         "power_lh": np.zeros(n_t),
         "power_ec": np.zeros(n_t),
-        "n_e_edge_line_average": np.full(n_t, 2e19),
     }
     profile_shape_gradient = np.gradient(profile_shape, RHO, axis=-1)
     profiles = {

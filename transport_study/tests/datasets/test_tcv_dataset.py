@@ -10,22 +10,21 @@ import h5py
 import numpy as np
 import pytest
 import xarray as xr
-from scipy.special import xlogy
 
 from transport_study import RADIAL_DIM, TIME_COORD
+from transport_study.datasets.rho_tor_norm import phi_n_map
 from transport_study.datasets.tcv import config
 from transport_study.datasets.tcv.profiles import (
     RHO_TOR_NORM_GRID,
     DefuseProfile,
     LiuqeEquilibria,
     defuse_profile_on_grid,
+    liuqe_q_profiles,
     liuqe_usable,
-    phi_n_from_liuqe,
 )
 from transport_study.datasets.tcv.sources import meqdb_path, read_defuse, read_liuqe
 from transport_study.datasets.tcv.tcv_dataset import (
     DEFUSE_SIGNALS,
-    EDGE_LINE_AVERAGE,
     PREDICTION_SOURCES,
     TCV_SIGNAL_ATTRS,
     TCVDataWorkflow,
@@ -34,61 +33,6 @@ from transport_study.signals import PREDICTION_STORE_NAME, STORE_SIGNALS
 
 RHO_POL_SURFACES = np.linspace(0.0, 1.0, 41)
 LIVE_SHOT = 60001
-
-
-def _log_q(psi_n: np.ndarray) -> np.ndarray:
-    """q = 1.2 - 0.8 ln(1 - psi_N), the form a diverted q takes near the LCFS."""
-    return 1.2 - 0.8 * np.log(1.0 - psi_n)
-
-
-def _log_q_integral(psi_n: np.ndarray) -> np.ndarray:
-    """Closed-form integral of _log_q from 0 to psi_N, finite at psi_N = 1."""
-    one_minus = 1.0 - psi_n
-    return 1.2 * psi_n + 0.8 * (xlogy(one_minus, one_minus) - one_minus + 1.0)
-
-
-def test_rho_map_constant_q_is_rho_pol():
-    """Constant q to the LCFS (a limited plasma) makes Phi_N = psi_N, so rho_tor_norm = rho_pol."""
-    inverse_q = np.full(RHO_POL_SURFACES.size, 1 / 3.0)
-    psi_n = np.linspace(0.0, 1.0, 101)
-
-    phi_n = phi_n_from_liuqe(RHO_POL_SURFACES, inverse_q, psi_n)
-
-    np.testing.assert_allclose(phi_n, psi_n, atol=1e-12)
-
-
-def test_rho_map_diverted_tail_matches_log_q():
-    """With q diverging at the LCFS (1/q = 0 there) and logarithmic near it,
-    the Simpson interior and the analytic tail reproduce the closed-form integral, and Phi_N is exactly 1 at the LCFS."""
-    psi_n_surfaces = RHO_POL_SURFACES**2
-    inverse_q = np.zeros_like(psi_n_surfaces)
-    inverse_q[:-1] = 1.0 / _log_q(psi_n_surfaces[:-1])
-    # Fine through the tail, between the last finite-q surface (psi_N ~ 0.95) and the LCFS
-    psi_n = np.concatenate([np.linspace(0.0, 0.9, 10), np.linspace(0.951, 0.9999, 50), [1.0]])
-
-    phi_n = phi_n_from_liuqe(RHO_POL_SURFACES, inverse_q, psi_n)
-
-    phi_n_expected = _log_q_integral(psi_n) / _log_q_integral(np.array(1.0))
-    # Simpson over 41 surfaces is good to a few 1e-4 against q steepening toward the LCFS
-    np.testing.assert_allclose(phi_n, phi_n_expected, rtol=1e-3)
-    assert phi_n[-1] == 1.0
-
-
-def test_rho_map_rejects_unusable_reconstructions():
-    """Non-finite 1/q, q diverging next to the axis, and a tail whose q falls toward the LCFS are unusable."""
-    psi_n_surfaces = RHO_POL_SURFACES**2
-    inverse_q_good = np.zeros_like(psi_n_surfaces)
-    inverse_q_good[:-1] = 1.0 / _log_q(psi_n_surfaces[:-1])
-
-    inverse_q_nan = inverse_q_good.copy()
-    inverse_q_nan[5] = np.nan
-    inverse_q_axis = inverse_q_good.copy()
-    inverse_q_axis[2:] = 0.0
-    inverse_q_falling = inverse_q_good.copy()
-    inverse_q_falling[-5:-1] = 1.0 / np.array([4.0, 3.5, 3.0, 2.5])
-
-    for inverse_q in [inverse_q_nan, inverse_q_axis, inverse_q_falling]:
-        assert phi_n_from_liuqe(RHO_POL_SURFACES, inverse_q, psi_n_surfaces) is None
 
 
 # DEFUSE slice times [s], with no usable reconstruction near DEFUSE_UNMAPPED_TIME
@@ -220,11 +164,13 @@ RAW_SCALAR_VALUES = {
     "KAPPA": 1.5,
     "DELTA_TOP": 0.3,
     "DELTA_BOTTOM": 0.2,
-    "POHM": 3e5,
-    "PradBulk": 1e5,
+    # Opposite sign to I_P, as DEFUSE stores it, so Ip * Vloop is 0.3 MW of ohmic power
+    "Vloop": 1.0,
+    "LI": 1.0,
+    "RMAG": 0.9,
+    "PradTot": 1e5,
     "NBI": 0.5,
     "ECRH": 1.2,
-    "Ne_edge_avg": 2e19,
 }
 
 
@@ -264,10 +210,12 @@ def test_standardize_builds_store_signals_in_si(workflow):
     ds = workflow.standardize_signal_names(_raw_dataset())
 
     assert ds is not None
-    assert set(ds.data_vars) == {*STORE_SIGNALS, EDGE_LINE_AVERAGE} - {"fresh_profile"}
+    assert set(ds.data_vars) == set(STORE_SIGNALS) - {"fresh_profile"}
     assert ds.sizes["time_idx"] == N_TIME
     assert ds["ip"].isel(time_idx=0).item() == pytest.approx(3e5)
     assert ds["b0"].isel(time_idx=0).item() == pytest.approx(1.4)
+    # Constant Ip, li and R leave Ip V_loop, from the second sample on (backward difference)
+    assert ds["power_ohm"].isel(time_idx=10).item() == pytest.approx(3e5)
     assert ds["power_nbi"].isel(time_idx=0).item() == pytest.approx(0.5e6)
     assert ds["power_ec"].isel(time_idx=0).item() == pytest.approx(1.2e6)
     assert float(np.abs(ds["power_ic"]).max()) == 0.0
@@ -276,7 +224,7 @@ def test_standardize_builds_store_signals_in_si(workflow):
         assert (ds[error].where(mask_profile) == 0).sum() == mask_profile.sum()
         assert ds[error].where(~mask_profile).isnull().all()
 
-    assert workflow.standardize_signal_names(_raw_dataset().drop_vars("POHM")) is None
+    assert workflow.standardize_signal_names(_raw_dataset().drop_vars("Vloop")) is None
     ds_no_te = _raw_dataset()
     ds_no_te["Te_rho"] = ds_no_te["Te_rho"] * np.nan
     assert workflow.standardize_signal_names(ds_no_te) is None
@@ -342,9 +290,9 @@ def test_live_single_shot(tmp_path):
     equilibria = read_liuqe(meqdb_path(LIVE_SHOT))
     mask_usable = liuqe_usable(equilibria)
     assert mask_usable.mean() > 0.9
-    psi_n_surfaces = equilibria.rho_pol**2
+    psi_n_surfaces, q_surfaces = liuqe_q_profiles(equilibria)
     mask_core = (equilibria.rho_pol > 0.05) & (equilibria.rho_pol < 0.8)
-    for inverse_q in equilibria.inverse_q[mask_usable][::50]:
-        phi_n = phi_n_from_liuqe(equilibria.rho_pol, inverse_q, psi_n_surfaces)
+    for q_slice in q_surfaces[mask_usable][::50]:
+        phi_n = phi_n_map(psi_n_surfaces, q_slice, "secant").phi_n(psi_n_surfaces)
         rho_tor_norm = np.sqrt(phi_n)
         assert (rho_tor_norm[mask_core] < equilibria.rho_pol[mask_core]).all()
