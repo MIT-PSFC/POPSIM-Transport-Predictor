@@ -12,11 +12,17 @@ import numpy as np
 # The same as transport-validation-datasets' MAX_HOLD_PERIODS.
 MAX_HOLD_STEPS_0D = 1.5
 
+# A time takes a slice this close after it as its own [s], the same as transport-validation-datasets' SAMPLE_TIME_TOL.
+# The timebase is float32, so a source sample at the same millisecond can sit just above its time.
+# float32 round-off stays under this below 16 s.
+SAMPLE_TIME_TOL_S = 1e-6
+
 
 def held_slice_index(slice_times: np.ndarray, times: np.ndarray, max_hold_steps: float) -> tuple[np.ndarray, np.ndarray]:
     """Which slice each time holds, and where that hold is valid.
 
     Each slice holds until the next one, for at most max_hold_steps median slice steps.
+    A slice within SAMPLE_TIME_TOL_S after a time counts as at that time.
     Times before the first slice hold nothing.
 
     Args:
@@ -30,9 +36,10 @@ def held_slice_index(slice_times: np.ndarray, times: np.ndarray, max_hold_steps:
     """
     slice_steps = np.diff(slice_times)
     max_hold = max_hold_steps * np.median(slice_steps)
-    slice_index = np.searchsorted(slice_times, times, side="right") - 1
+    times_float64 = times.astype(np.float64)
+    slice_index = np.searchsorted(slice_times, times_float64 + SAMPLE_TIME_TOL_S, side="right") - 1
     slice_index_clipped = np.clip(slice_index, 0, None)
-    hold_duration = times - slice_times[slice_index_clipped]
+    hold_duration = times_float64 - slice_times[slice_index_clipped]
     mask_held = (slice_index >= 0) & (hold_duration <= max_hold)
     return slice_index_clipped, mask_held
 

@@ -8,7 +8,11 @@ import numpy as np
 import pytest
 
 from transport_study.datasets.profile_grids import held_signal_on_grid
-from transport_study.datasets.zero_d_signals import MU0, ohmic_power, trailing_boxcar_mean
+from transport_study.datasets.zero_d_signals import (
+    MU0,
+    ohmic_power,
+    trailing_boxcar_mean,
+)
 
 
 def test_held_signal_takes_the_last_sample_at_or_before_and_leaves_gaps_nan():
@@ -29,6 +33,36 @@ def test_held_signal_takes_the_last_sample_at_or_before_and_leaves_gaps_nan():
     assert values_on_grid[32] == 6.0
     assert np.isnan(values_on_grid[33:45]).all()
     assert values_on_grid[45] == 7.0
+
+
+def test_held_signal_float64_source_on_a_float32_grid_is_held_at_its_own_grid_time():
+    # A float32 grid time can sit just below a float64 sample at the same millisecond,
+    # which must not leave it holding the sample before
+    grid = np.round(np.arange(1001) * 1e-3, 3).astype("float32")
+    source_times = np.arange(1001) * 1e-3
+    values = np.arange(1001, dtype=float)
+
+    values_on_grid = held_signal_on_grid(source_times, values, grid)
+
+    np.testing.assert_array_equal(values_on_grid, values)
+
+
+def test_held_signal_holds_on_the_clock_of_the_finite_samples():
+    # A 0.1 ms clock populated only every 5 ms, as the MAST esm group stores pphix
+    source_times = np.arange(500) * 1e-4
+    values = np.full(500, np.nan)
+    values[::50] = np.arange(10.0)
+    grid = np.round(np.arange(50) * 1e-3, 3)
+
+    values_on_grid = held_signal_on_grid(source_times, values, grid)
+
+    # Each 5 ms sample is held up to the next one
+    np.testing.assert_array_equal(values_on_grid, np.repeat(np.arange(10.0), 5))
+    # A lone finite sample has no period to hold for
+    values_lone = np.full(500, np.nan)
+    values_lone[100] = 1.0
+    values_lone_on_grid = held_signal_on_grid(source_times, values_lone, grid)
+    assert np.isnan(values_lone_on_grid).all()
 
 
 def test_trailing_boxcar_a_later_sample_does_not_change_earlier_ones():
