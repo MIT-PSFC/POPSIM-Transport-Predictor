@@ -20,7 +20,7 @@ from disruption_py.settings import TimeSettingParams
 from disruption_py.settings.nickname_setting import NicknameSettingParams
 from loguru import logger
 from transport_validation_datasets.dispy_utils import register_verbose_level
-from transport_validation_datasets.store_schema import STORE_SIGNALS
+from transport_validation_datasets.store_schema import STORE_SIGNAL_ATTRS, STORE_SIGNALS
 
 from transport_study import RADIAL_DIM
 from transport_study.datasets.d3d import config
@@ -290,7 +290,7 @@ def test_line_average_density_falls_back_to_pcs_estimate():
 N_TIME = 700  # 0.7 s, over min_pulse_length_s once the end margin is cut
 RAW_SCALAR_VALUES = {
     "ip": -1.2e6,
-    "bt": -2.1,
+    "bcoil": -1.2e5,
     "wmhd": 8e5,
     "beta_n": 2.0,
     # The flat ne_rho profile over it, so the density ratio cull passes
@@ -371,8 +371,8 @@ def test_standardize_builds_both_stores_in_si(workflow):
     assert set(STORE_SIGNALS) <= set(ds.data_vars)
     assert set(D3D_TRAJOPT_STORE_SIGNALS) <= set(ds.data_vars)
     np.testing.assert_allclose(ds["ip"], 1.2e6)
-    # bt is quoted at 1.6955 m, b0 at the 1.7 m geometric axis
-    np.testing.assert_allclose(ds["b0"], 2.1 * 1.6955 / 1.7)
+    # mu0 / (2 pi) = 2e-7 of the 144 turn TF coil, at r0 = 1.6955 m
+    np.testing.assert_allclose(ds["b0"], 1.2e5 * 2e-7 * 144 / 1.6955)
     np.testing.assert_allclose(ds["ip_reference"], 1.0e6)
     np.testing.assert_allclose(ds["n_e_pedestal"], 3.5e19)
     np.testing.assert_allclose(ds["energy_mhd"], 8e5)
@@ -430,8 +430,10 @@ def test_stores_carry_imas_attributes_and_grids(built_stores):
         for name in names:
             attrs = ds_store[name].attrs
             assert {"description", "units"} <= set(attrs), name
-            if "ref" in D3D_SIGNAL_ATTRS[name]:
-                assert attrs["ref"] == D3D_SIGNAL_ATTRS[name]["ref"], name
+            # The shared schema's ref wins over the device's own
+            expected_attrs = STORE_SIGNAL_ATTRS.get(name, D3D_SIGNAL_ATTRS[name])
+            if "ref" in expected_attrs:
+                assert attrs["ref"] == expected_attrs["ref"], name
     np.testing.assert_array_equal(ds_prediction[RADIAL_DIM].values, RHO_TOR_NORM_GRID.astype(np.float32))
     np.testing.assert_array_equal(ds_trajopt[PSI_NORM_DIM].values, PSI_NORM_GRID.astype(np.float32))
 

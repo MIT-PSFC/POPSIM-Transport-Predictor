@@ -754,7 +754,7 @@ class ProfilePredictorTorax(TimeIndepModule):
         if isinstance(inputs, xr.Dataset):
             inputs = Inputs(
                 ip_MA=inputs["ip_MA"].data,
-                b0=inputs["b0"].data,
+                b_geo=inputs["b_geo"].data,
                 beta_tor_norm=inputs["beta_tor_norm"].data,
                 n_e_line_average_1e20=inputs["n_e_line_average_1e20"].data,
                 geometric_axis_r=inputs["geometric_axis_r"].data,
@@ -908,7 +908,7 @@ class ProfilePredictorTorax(TimeIndepModule):
             geo = build_miller_geometry_jax(
                 R_major=inputs.geometric_axis_r,
                 a_minor=inputs.minor_radius,
-                B_0=inputs.b0,
+                B_0=inputs.b_geo,
                 elongation_LCFS=inputs.elongation,
                 triangularity_upper=inputs.triangularity_upper,
                 triangularity_lower=inputs.triangularity_lower,
@@ -920,7 +920,7 @@ class ProfilePredictorTorax(TimeIndepModule):
             geo = build_circular_geometry_jax(
                 R_major=inputs.geometric_axis_r,
                 a_minor=inputs.minor_radius,
-                B_0=inputs.b0,
+                B_0=inputs.b_geo,
                 elongation_LCFS=inputs.elongation,
                 torax_mesh=torax_mesh,
                 rho_hires_norm_np=rho_hires_norm_np,

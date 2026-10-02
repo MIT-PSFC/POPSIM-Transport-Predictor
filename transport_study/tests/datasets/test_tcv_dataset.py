@@ -11,7 +11,7 @@ import numpy as np
 import pytest
 import xarray as xr
 from transport_validation_datasets.machine.generic import phi_n_map
-from transport_validation_datasets.store_schema import STORE_SIGNALS
+from transport_validation_datasets.store_schema import STORE_SIGNAL_ATTRS, STORE_SIGNALS
 
 from transport_study import RADIAL_DIM, TIME_COORD
 from transport_study.datasets.tcv import config
@@ -247,7 +247,7 @@ def built_store(workflow):
 
 def test_store_carries_imas_attributes_and_grid(built_store):
     """The store holds the shared schema, companions included, every variable and coordinate has a description
-    and units, the ref (IMAS path) of TCV_SIGNAL_ATTRS wherever IMAS has a leaf, and the store grid."""
+    and units, the ref (IMAS path) of the shared schema or TCV_SIGNAL_ATTRS wherever IMAS has a leaf, and the store grid."""
     assert set(built_store.data_vars) == {*STORE_SIGNALS, TIME_COORD}
     assert list(built_store["shot"].values) == [70000, 70001]
     assert built_store.attrs["profile_source"] == "DEFUSE"
@@ -255,8 +255,10 @@ def test_store_carries_imas_attributes_and_grid(built_store):
     for name in names:
         attrs = built_store[name].attrs
         assert {"description", "units"} <= set(attrs), name
-        if "ref" in TCV_SIGNAL_ATTRS[name]:
-            assert attrs["ref"] == TCV_SIGNAL_ATTRS[name]["ref"], name
+        # The shared schema's ref wins over the device's own
+        expected_attrs = STORE_SIGNAL_ATTRS.get(name, TCV_SIGNAL_ATTRS[name])
+        if "ref" in expected_attrs:
+            assert attrs["ref"] == expected_attrs["ref"], name
     np.testing.assert_array_equal(built_store[RADIAL_DIM].values, RHO_TOR_NORM_GRID.astype(np.float32))
 
 

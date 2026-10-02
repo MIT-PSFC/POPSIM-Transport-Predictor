@@ -48,7 +48,7 @@ def _toy_dataset(n_shots: int = 6, n_time: int = 40) -> xr.Dataset:
     ds = xr.Dataset(
         {
             "ip_MA": _var(1.0, 0.2, 0.2, 0.1),
-            "b0": _var(5.0, 1.4, 0.5, 0.5),
+            "b_geo": _var(5.0, 1.4, 0.5, 0.5),
             "geometric_axis_r": _var(0.68, 0.88, 0.04, 0.04),
             "minor_radius": _var(0.22, 0.25, 0.02, 0.02),
             "elongation": _var(1.6, 1.4, 0.1, 0.1),
@@ -88,7 +88,7 @@ def test_physics_matches_normalize_domain():
     for shot, t in [(0, 5), (2, 10), (4, 0)]:
         out = norm(_sample_inputs(ds, shot, t, 0))
         assert np.isclose(float(out.ip_MA), float(ds["ip_MA"][shot, t]))
-        assert np.isclose(float(out.b0), float(ds_ref["q_star"][shot, t]), rtol=1e-5)
+        assert np.isclose(float(out.b_geo), float(ds_ref["q_star"][shot, t]), rtol=1e-5)
         assert np.isclose(float(out.geometric_axis_r), float(ds_ref["epsilon"][shot, t]), rtol=1e-5)
         assert np.isclose(float(out.minor_radius), float(ds_ref["aB0"][shot, t]), rtol=1e-5)
         assert np.isclose(float(out.elongation), float(ds["elongation"][shot, t]))

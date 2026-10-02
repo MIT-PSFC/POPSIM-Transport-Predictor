@@ -121,12 +121,12 @@ class D3DDatasetMethods:
     The disruption-py built-ins interpolate, so the EFIT scalars and the plasma current are read here too.
     """
 
-    # Measured: bt (vacuum toroidal field at R = 1.6955 m) and dssneped (PCS pedestal density estimate).
+    # Measured: bcoil (TF coil current [A], which sets the vacuum toroidal field) and dssneped (PCS pedestal density estimate).
     # PCS targets: bmtpwrtar (beta_N), idtrp (R0), idtrxbot / idtzxbot / idtrxtop / idtzxtop (X points).
     # Unverified, see D3D_TRAJOPT_STORE_SIGNALS: bttbt, dstdenp, ieeseg07.
     # iptipp (Ip) comes from the built-in get_ip_parameters as ip_prog.
     PTDATA_POINTNAMES: ClassVar[list[str]] = [
-        "bt",
+        "bcoil",
         "dssneped",
         "bttbt",
         "bmtpwrtar",

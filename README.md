@@ -38,7 +38,7 @@ To answer this question, for each model we do training with an increasing number
 ### 4: How should we be normalizing our input features?
 
 The raw input features (plasma current, toroidal field, major and minor radii, etc.) from different devices are wildly different, which can be problematic for data-driven models. There are many ways to process the input features to maintain the same dimensionality but have better domain overlap, and we will compare the results for the following:
-- Raw: No normalization. Ip, Wtot, R0, a_minor, etc. are in their original units
+- Raw: No normalization. Ip, Wtot, R_geo, a_minor, etc. are in their original units
 - Physics: Convert to dimensionless parameters like q95, betan, epsilon, etc.
 - Z-Score: Within each device, normalize each variable to zero mean and unit variance.
 - CORAL: Correlation alignment algorithm (https://arxiv.org/abs/1612.01939) to align the covariances of source and target domains
@@ -54,7 +54,7 @@ Many methods exist to take a data-driven model trained in one domain and adapt i
 
 Time-dependent stored energy prediction. Given the present timestep's stored energy and controllable input signals, predict the change in stored energy to the next timestep.
 
-The input signals are Ip_MA, B0, ne20, P_aux_MW, and shaping (R0, a_minor, kappa).
+The input signals are Ip_MA, B_geo, ne20, P_aux_MW, and shaping (R_geo, a_minor, kappa).
 These signals were chosen since they are present in the H89/H98 scaling laws which we are comparing against.
 
 Four model architectures investigated:
@@ -71,7 +71,7 @@ We also compare the different data normalization methods, where normalization is
 
 ## Study 2: Time-independent profile prediction
 
-For this study, the inputs are Ip_MA, B0, ne20, beta, and shaping (R0, a_minor, kappa, delta_top, delta_bot).
+For this study, the inputs are Ip_MA, B_geo, ne20, beta, and shaping (R_geo, a_minor, kappa, delta_top, delta_bot).
 This is similar to the plasma control system setup you might see on a present-day experimental device like DIII-D.
 Feedforward targets are given for each of the above quantities, so you have a reasonably good idea of what they will be in the future.
 The goal of the model is then to predict what the 1D profiles of temperature and density will be for a given set of inputs.

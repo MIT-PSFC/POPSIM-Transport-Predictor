@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import ClassVar
 
 import netCDF4  # noqa: F401
+import numpy as np
 import xarray as xr
 import zarr
 from disruption_py.machine.tokamak import Tokamak
@@ -15,6 +16,7 @@ from disruption_py.settings.output_setting import DatasetOutputSetting
 from disruption_py.workflow import get_shots_data
 from loguru import logger
 from transport_validation_datasets.dispy_utils import passive_log_settings
+from transport_validation_datasets.machine.generic import MU0
 from transport_validation_datasets.store_schema import STORE_SIGNALS
 from zarr.errors import ZarrUserWarning
 
@@ -35,13 +37,19 @@ from transport_study.datasets.workflow import RawFileWorkflow
 from transport_study.signals import PREDICTION_STORE_NAME
 
 INNER_WALL = 1.05  # Location of the inner wall, used to calculate minor radius from gapin and R0
+# Major radius EFIT gives the vacuum toroidal field at (rcentr), the store's r0 [m]
+R0 = 1.6955
+# b0 = mu0 N I / (2 pi R0) of the N = 144 turn TF coil from its current bcoil [A], the EFIT bcentr formula.
+# PTDATA bt is not used, it reads 2.4-2.8 percent above this at a reference radius nowhere documented.
+TF_COIL_TURNS = 144
+BCOIL_TO_B0 = MU0 * TF_COIL_TURNS / (2 * np.pi * R0)
 
 # Everything is fetched through one disruption-py call per shot, all EFIT signals from the shot's DISPY run
 RUN_METHODS = [
     # custom methods from physics_methods.py, every one placed on the timebase causally (signal_on_grid) rather than interpolated
     "get_plasma_current",  # ip, ip_prog
     "get_efit_scalars",  # wmhd, beta_n
-    "get_ptdata_parameters",  # bt, dssneped, PCS programmed waveforms
+    "get_ptdata_parameters",  # bcoil, dssneped, PCS programmed waveforms
     "get_line_average_density",  # n_e_line_average
     "get_ohmic_power",  # p_ohm
     "get_radiated_power",  # p_rad
@@ -54,7 +62,7 @@ RUN_METHODS = [
 # Store signal -> (raw disruption-py column, factor to SI units)
 PREDICTION_SOURCES = {
     "ip": ("ip", 1.0),
-    "b0": ("bt", 1.0),
+    "b0": ("bcoil", BCOIL_TO_B0),
     "energy_mhd": ("wmhd", 1.0),
     "beta_tor_norm": ("beta_n", 1.0),
     "n_e_line_average": ("n_e_line_average", 1.0),
@@ -119,9 +127,6 @@ TRAJOPT_VALID_RANGES = {
     "x_point_upper_z": (0.0, 1.5),
     "x_point_upper_z_reference": (0.0, 1.5),
 }
-# Major radius PTDATA bt is the vacuum toroidal field at [m]
-BT_REFERENCE_R = 1.6955
-
 # The PCS programmed targets (feedforward control) and the measured signals they are compared against,
 # read only by the trajectory optimization.
 # They go in their own store, on the same shot / time_idx layout as the prediction store.
@@ -153,8 +158,9 @@ D3D_SIGNAL_ATTRS = {
     # Prediction store
     "ip": {"description": "Measured plasma current magnitude (PTDATA ip)"},
     "b0": {
-        "description": "Vacuum toroidal field magnitude at geometric_axis_r, PTDATA bt (at 1.6955 m) scaled by 1/R",
+        "description": "Vacuum toroidal field magnitude at r0, mu0 144 bcoil / (2 pi r0) from the TF coil current (PTDATA bcoil)",
     },
+    "r0": {"description": "Reference major radius b0 is given at, the EFIT rcentr"},
     "energy_mhd": {
         "description": "Stored energy from the 1 kHz DISPY EFIT (wmhd)",
     },
@@ -484,8 +490,7 @@ class D3DDataWorkflow(RawFileWorkflow):
             if store_name in MAGNITUDE_SIGNALS:
                 signal = abs(signal)
             signals[store_name] = signal
-        # Vacuum field falls off as 1/R, so b0 at the geometric axis is bt R_ref / R_geo
-        signals["b0"] = signals["b0"] * BT_REFERENCE_R / signals["geometric_axis_r"]
+        signals["r0"] = xr.full_like(ds["shot"], R0, dtype=float)
         signals["power_ic"] = xr.zeros_like(ds["p_ohm"])
         signals["power_lh"] = xr.zeros_like(ds["p_ohm"])
         ds_standardized = xr.Dataset(signals)

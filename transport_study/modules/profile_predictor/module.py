@@ -154,7 +154,7 @@ NN_INPUT_NAMES = (
 # Dataset variables Inputs.nn_inputs is derived from
 NN_INPUT_SOURCE_VARS = (
     "ip_MA",
-    "b0",
+    "b_geo",
     "beta_tor_norm",
     "n_e_line_average_1e20",
     "geometric_axis_r",
@@ -168,7 +168,7 @@ NN_INPUT_SOURCE_VARS = (
 @chex.dataclass
 class Inputs:
     ip_MA: float  # Plasma current [MA]
-    b0: float  # On-axis toroidal field [T]
+    b_geo: float  # Vacuum toroidal field at the geometric axis [T]
     beta_tor_norm: float  # Normalized beta [-]
     n_e_line_average_1e20: float  # line-averaged electron density [10^20 m^-3]
     geometric_axis_r: float  # Geometric major radius [m]
@@ -185,7 +185,7 @@ class Inputs:
     def from_dataset(cls, ds: xr.Dataset, rho: Array) -> "Inputs":
         return cls(
             ip_MA=ds["ip_MA"].data,
-            b0=ds["b0"].data,
+            b_geo=ds["b_geo"].data,
             beta_tor_norm=ds["beta_tor_norm"].data,
             n_e_line_average_1e20=ds["n_e_line_average_1e20"].data,
             geometric_axis_r=ds["geometric_axis_r"].data,
@@ -209,7 +209,7 @@ class Inputs:
             self.elongation,
             delta,
         )
-        q_star = calc_q_star(self.b0, self.geometric_axis_r, self.epsilon, self.ip_MA, f_shaping)
+        q_star = calc_q_star(self.b_geo, self.geometric_axis_r, self.epsilon, self.ip_MA, f_shaping)
         return q_star
 
     @property
@@ -219,7 +219,7 @@ class Inputs:
 
     @property
     def aB0(self):
-        return self.minor_radius * self.b0
+        return self.minor_radius * self.b_geo
 
     @property
     def volume_approx(self):
@@ -231,13 +231,13 @@ class Inputs:
 
     @property
     def beta(self):
-        # beta_tor_norm follows the percent Troyon convention (beta[%] * a*B0/Ip)
+        # beta_tor_norm follows the percent Troyon convention (beta[%] * a*B_geo/Ip)
         # divide by 100 to return beta as a true fraction
-        return self.beta_tor_norm * self.ip_MA / (self.minor_radius * self.b0) / 100.0
+        return self.beta_tor_norm * self.ip_MA / (self.minor_radius * self.b_geo) / 100.0
 
     @property
     def te_approx(self):
-        pressure_Pa = self.beta * self.b0**2 / (2 * mu_0)
+        pressure_Pa = self.beta * self.b_geo**2 / (2 * mu_0)
         pressure_eV = pressure_Pa / eV
         pressure_keV20 = pressure_eV / 1e3 / 1e20
         temp_keV = pressure_keV20 / self.n_e_line_average_1e20
@@ -246,7 +246,7 @@ class Inputs:
     @property
     def w_approx(self):
         # Beta-derived stored energy estimate [MJ], W = (3/2) p V
-        pressure_Pa = self.beta * self.b0**2 / (2 * mu_0)
+        pressure_Pa = self.beta * self.b_geo**2 / (2 * mu_0)
         return 1.5 * pressure_Pa * self.volume_approx / 1e6
 
     @property
@@ -302,7 +302,7 @@ def nn_input_matrix(ds: xr.Dataset) -> np.ndarray:
 
     inputs = Inputs(
         ip_MA=col("ip_MA"),
-        b0=col("b0"),
+        b_geo=col("b_geo"),
         beta_tor_norm=col("beta_tor_norm"),
         n_e_line_average_1e20=col("n_e_line_average_1e20"),
         geometric_axis_r=col("geometric_axis_r"),

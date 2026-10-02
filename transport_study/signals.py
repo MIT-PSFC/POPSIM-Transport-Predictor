@@ -16,8 +16,9 @@ STORE_PROFILES = ("t_e", "n_e")
 PROFILE_COMPANION_SUFFIXES = ("_error", "_gradient", "_gradient_error")
 STORE_PROFILE_COMPANIONS = tuple(f"{profile}{suffix}" for profile in STORE_PROFILES for suffix in PROFILE_COMPANION_SUFFIXES)
 
-# Study (working-unit) names for the summed heating power and the converted profiles
+# Study (working-unit) names for the summed heating power, the field at the geometric axis and the converted profiles
 POWER_ADDITIONAL_MW = "power_additional_MW"
+B_GEO = "b_geo"
 T_E_KEV = "t_e_keV"
 N_E_1E20 = "n_e_1e20"
 
@@ -44,10 +45,13 @@ def convert_to_working_units(ds: xr.Dataset) -> xr.Dataset:
 
     Converts whichever WORKING_UNIT_CONVERSIONS signals are present,
     so a store whose radial dim was dropped converts too.
+    Adds b_geo when b0 is there, the vacuum toroidal field at the geometric axis,
+    where TORAX, q_star, beta_N (as EFIT normalizes it) and the confinement scalings quote it.
+    The vacuum field falls off as 1/R, so b_geo = b0 r0 / geometric_axis_r.
     Adds power_additional_MW when the heating powers are there, which needs all four of them.
 
     Raises:
-        ValueError: If only some of the heating powers are present.
+        ValueError: If b0 is present without r0, or only some of the heating powers are present.
     """
     conversions_present = {name: conversion for name, conversion in WORKING_UNIT_CONVERSIONS.items() if name in ds}
     renames = {name: study_name for name, (study_name, _, _) in conversions_present.items()}
@@ -55,6 +59,12 @@ def convert_to_working_units(ds: xr.Dataset) -> xr.Dataset:
     for study_name, factor, unit in conversions_present.values():
         da_scaled = ds_working[study_name] * factor
         ds_working[study_name] = da_scaled.assign_attrs(ds_working[study_name].attrs | {"units": unit})
+
+    if "b0" in ds_working:
+        if "r0" not in ds_working:
+            raise ValueError(f"Deriving {B_GEO} needs r0, the major radius b0 is given at")
+        b_geo = ds_working["b0"] * ds_working["r0"] / ds_working["geometric_axis_r"]
+        ds_working[B_GEO] = b_geo.assign_attrs(units="T", description="Vacuum toroidal field at geometric_axis_r, b0 r0 / geometric_axis_r")
 
     heating_present = [power for power in HEATING_POWERS_MW if power in ds_working]
     if not heating_present:

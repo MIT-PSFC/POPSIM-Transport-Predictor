@@ -52,7 +52,7 @@ class BoundedNNPredictor(eqx.Module):
         """Inputs for NN predictor"""
 
         ip_MA: float
-        b0: float
+        b_geo: float
         geometric_axis_r: float
         minor_radius: float
         elongation: float
@@ -61,7 +61,15 @@ class BoundedNNPredictor(eqx.Module):
 
     def __call__(self, inp: "Inputs") -> TauePredictorOutputs:
         arr = jnp.array(
-            [inp.ip_MA, inp.b0, inp.geometric_axis_r, inp.minor_radius, inp.elongation, inp.n_e_line_average_1e20, inp.power_additional_MW]
+            [
+                inp.ip_MA,
+                inp.b_geo,
+                inp.geometric_axis_r,
+                inp.minor_radius,
+                inp.elongation,
+                inp.n_e_line_average_1e20,
+                inp.power_additional_MW,
+            ]
         )
         nn_out = self.nn(arr)
         width = BOUND_CLAMP_WIDTH_FRAC * (self.max_val - self.min_val)
@@ -95,7 +103,7 @@ class ScalingLawPredictor(eqx.Module):
         """Inputs for scaling law predictor, MUST BE IN REAL UNITS"""
 
         ip_MA: float  # [MA]
-        b0: float  # On axis magnetic field [T]
+        b_geo: float  # Vacuum toroidal field at the geometric axis [T]
         geometric_axis_r: float  # Major radius [m]
         minor_radius: float  # Minor radius [m]
         elongation: float  # Elongation [-]
@@ -137,7 +145,7 @@ class ScalingLawPredictor(eqx.Module):
     def __call__(self, inp: Inputs) -> TauePredictorOutputs:
         # Ensure each of the input values is strictly greater than 0.001 to avoid numerical instability.
         ip_MA = jnp.clip(inp.ip_MA, 0.001, None)
-        b0 = jnp.clip(inp.b0, 0.001, None)
+        b_geo = jnp.clip(inp.b_geo, 0.001, None)
         ne19 = jnp.clip(inp.n_e_line_average_1e20 * 10, 0.001, None)
         ne20 = jnp.clip(inp.n_e_line_average_1e20, 0.001, None)
         P_abs_MW = jnp.clip(inp.P_abs_MW, 0.001, None)
@@ -147,13 +155,13 @@ class ScalingLawPredictor(eqx.Module):
 
         p_thresh = self.scaling_lh_transition["coeff"] * (
             (ne20 ** self.scaling_lh_transition["alpha_N"])
-            * (b0 ** self.scaling_lh_transition["alpha_B"])
+            * (b_geo ** self.scaling_lh_transition["alpha_B"])
             * (geometric_axis_r ** self.scaling_lh_transition["alpha_R"])
         )
 
         taue_lmode = self.scaling_lmode["coeff"] * (
             (ip_MA ** self.scaling_lmode["alpha_I"])
-            * (b0 ** self.scaling_lmode["alpha_B"])
+            * (b_geo ** self.scaling_lmode["alpha_B"])
             * (ne19 ** self.scaling_lmode["alpha_N"])
             * (P_abs_MW ** self.scaling_lmode["alpha_P"])
             * (geometric_axis_r ** self.scaling_lmode["alpha_R"])
@@ -164,7 +172,7 @@ class ScalingLawPredictor(eqx.Module):
 
         taue_hmode = self.scaling_hmode["coeff"] * (
             (ip_MA ** self.scaling_hmode["alpha_I"])
-            * (b0 ** self.scaling_hmode["alpha_B"])
+            * (b_geo ** self.scaling_hmode["alpha_B"])
             * (ne19 ** self.scaling_hmode["alpha_N"])
             * (P_abs_MW ** self.scaling_hmode["alpha_P"])
             * (geometric_axis_r ** self.scaling_hmode["alpha_R"])
@@ -259,7 +267,7 @@ class PowerBalance(TimeDepModule):
     class Inputs:
         # Real-valued inputs in physical units
         ip_MA: float
-        b0: float
+        b_geo: float
         geometric_axis_r: float
         minor_radius: float
         elongation: float
@@ -271,7 +279,7 @@ class PowerBalance(TimeDepModule):
         def to_normalizer_inputs(self) -> InputNormalizer.Inputs:
             return InputNormalizer.Inputs(
                 ip_MA=self.ip_MA,
-                b0=self.b0,
+                b_geo=self.b_geo,
                 geometric_axis_r=self.geometric_axis_r,
                 minor_radius=self.minor_radius,
                 elongation=self.elongation,
@@ -355,7 +363,7 @@ class PowerBalanceScalingLaw(PowerBalance):
         # The scaling law is dimensional physics, it MUST see physical units.
         taue_predictor_inputs = ScalingLawPredictor.Inputs(
             ip_MA=inputs.ip_MA,
-            b0=inputs.b0,
+            b_geo=inputs.b_geo,
             geometric_axis_r=inputs.geometric_axis_r,
             minor_radius=inputs.minor_radius,
             elongation=inputs.elongation,
@@ -437,7 +445,7 @@ class PowerBalanceSciML(PowerBalance):
         features = self.normalizer(normalizer_inputs)
         taue_predictor_inputs = BoundedNNPredictor.Inputs(
             ip_MA=features.ip_MA,
-            b0=features.b0,
+            b_geo=features.b_geo,
             geometric_axis_r=features.geometric_axis_r,
             minor_radius=features.minor_radius,
             elongation=features.elongation,
@@ -624,7 +632,7 @@ class PowerBalanceEnv(ModuleTrainingEnv):
             inputs = {var: inputs[var].data for var in inputs.data_vars}
         return PowerBalance.Inputs(
             ip_MA=inputs["ip_MA"],
-            b0=inputs["b0"],
+            b_geo=inputs["b_geo"],
             geometric_axis_r=inputs["geometric_axis_r"],
             minor_radius=inputs["minor_radius"],
             elongation=inputs["elongation"],

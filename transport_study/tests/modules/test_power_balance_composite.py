@@ -145,7 +145,7 @@ def test_anchor_terms_respect_device_weights():
 def _scalar_inputs() -> PowerBalance.Inputs:
     return PowerBalance.Inputs(
         ip_MA=jnp.asarray(1.0),
-        b0=jnp.asarray(5.0),
+        b_geo=jnp.asarray(5.0),
         geometric_axis_r=jnp.asarray(1.7),
         minor_radius=jnp.asarray(0.5),
         elongation=jnp.asarray(1.7),

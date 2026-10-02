@@ -45,7 +45,7 @@ from popsim.module_base import TimeIndepModule
 
 NORM_INPUT_VARS = (
     "ip_MA",
-    "b0",
+    "b_geo",
     "geometric_axis_r",
     "minor_radius",
     "elongation",
@@ -92,7 +92,7 @@ class InputNormalizer(TimeIndepModule):
     @chex.dataclass
     class Inputs:
         ip_MA: float
-        b0: float
+        b_geo: float
         geometric_axis_r: float
         minor_radius: float
         elongation: float
@@ -103,7 +103,7 @@ class InputNormalizer(TimeIndepModule):
     @chex.dataclass
     class Output:
         ip_MA: float
-        b0: float
+        b_geo: float
         geometric_axis_r: float
         minor_radius: float
         elongation: float
@@ -114,7 +114,7 @@ class InputNormalizer(TimeIndepModule):
             return jnp.stack(
                 [
                     self.ip_MA,
-                    self.b0,
+                    self.b_geo,
                     self.geometric_axis_r,
                     self.minor_radius,
                     self.elongation,
@@ -130,7 +130,7 @@ class InputNormalizer(TimeIndepModule):
             data = {var: data[var].data for var in data.data_vars}
         return cls.Inputs(
             ip_MA=data["ip_MA"],
-            b0=data["b0"],
+            b_geo=data["b_geo"],
             geometric_axis_r=data["geometric_axis_r"],
             minor_radius=data["minor_radius"],
             elongation=data["elongation"],
@@ -146,7 +146,7 @@ class InputNormalizer(TimeIndepModule):
         vec = jnp.stack(
             [
                 inputs.ip_MA,
-                inputs.b0,
+                inputs.b_geo,
                 inputs.geometric_axis_r,
                 inputs.minor_radius,
                 inputs.elongation,
@@ -157,7 +157,7 @@ class InputNormalizer(TimeIndepModule):
         out = self._normalize_vec(vec, inputs.ds_source_idx)
         return self.Output(
             ip_MA=out[0],
-            b0=out[1],
+            b_geo=out[1],
             geometric_axis_r=out[2],
             minor_radius=out[3],
             elongation=out[4],
@@ -190,9 +190,9 @@ def physics_feature_vec(vec: jnp.ndarray) -> jnp.ndarray:
 
     Slot mapping (slot name -> feature):
     - ip_MA                  -> ip_MA (kept raw, sufficiently device-invariant)
-    - b0                     -> q_star (zero triangularity, consistent with H89/H98)
+    - b_geo                  -> q_star (zero triangularity, consistent with H89/H98)
     - geometric_axis_r       -> epsilon = minor_radius / geometric_axis_r
-    - minor_radius           -> aB0 = minor_radius * b0 (dimensional, but the dimensionless
+    - minor_radius           -> aB0 = minor_radius * b_geo (dimensional, but the dimensionless
                                 alternatives like normalized gyroradius need a temperature,
                                 which the scaling-law baselines do not have.
                                 A fair comparison keeps the same information budget)
@@ -200,14 +200,14 @@ def physics_feature_vec(vec: jnp.ndarray) -> jnp.ndarray:
     - n_e_line_average_1e20  -> Greenwald fraction f_G
     - power_additional_MW    -> P_aux / plasma surface area
     """
-    ip_ma, b0, r0, a_minor, kappa, ne20, p_aux = vec
-    epsilon = a_minor / r0
+    ip_ma, b_geo, r_geo, a_minor, kappa, ne20, p_aux = vec
+    epsilon = a_minor / r_geo
     f_shaping = calc_f_shaping(epsilon, kappa, jnp.zeros_like(epsilon))
-    q_star = calc_q_star(b0, r0, epsilon, ip_ma, f_shaping)
+    q_star = calc_q_star(b_geo, r_geo, epsilon, ip_ma, f_shaping)
     greenwald_limit = ip_ma / (jnp.pi * a_minor**2)
     f_g = ne20 / greenwald_limit
-    a_b0 = a_minor * b0
-    surface_area = calc_plasma_surface_area(r0, epsilon, kappa)
+    a_b0 = a_minor * b_geo
+    surface_area = calc_plasma_surface_area(r_geo, epsilon, kappa)
     surface_power_density = p_aux / surface_area
     return jnp.stack([ip_ma, q_star, epsilon, a_b0, kappa, f_g, surface_power_density])
 

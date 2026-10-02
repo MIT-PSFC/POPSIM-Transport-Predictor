@@ -8,8 +8,9 @@ One sampled faster than the grid is averaged over each grid step, time t taking 
 One sampled slower is held forward from its last finite sample for at most 1.5 of its own median sample steps.
 Smoothing is a trailing boxcar, and derivatives are backward differences.
 The one exception is DIII-D `power_radiated`, smoothed non-causally at the source.
-b0 is the vacuum field at geometric_axis_r on every device,
-power_radiated the total radiated power including the divertor,
+b0 is the vacuum toroidal field at the fixed major radius r0 on every device, as IMAS defines it.
+The study derives the field at the geometric axis on load, b_geo = b0 r0 / geometric_axis_r (`convert_to_working_units`).
+power_radiated is the total radiated power including the divertor,
 and power_ohm is Ip V_loop - dW_pol/dt.
 rho_tor_norm = sqrt(Phi_N), with Phi_N the integral of q over psi_N (`phi_n_map`),
 imported from transport-validation-datasets like every helper the devices share (`machine/generic.py`).
@@ -55,7 +56,7 @@ Both are built from the published Zarr stores of
 which handles the source pulls (MDSplus through disruption-py for C-Mod, the STFC S3 store for MAST),
 the filtering, and the GP profile fitting on rho_tor_norm.
 The build only selects the stored signals, trims each shot's trailing NaN padding,
-and takes ip and b0 as magnitudes (published datasets keeps the source sign, which isn't needed here).
+and takes ip and b0 as magnitudes (the published stores keep the source sign, which isn't needed here).
 Shot quality is the published store's responsibility, so nothing is culled here.
 
 ```bash
@@ -92,6 +93,10 @@ and every signal is placed on the timebase causally instead (`signal_on_grid`, a
   A slice with no valid EFIT nearby, or without both a Te and an ne fit, is dropped before the hold,
   so the slice before it holds over it, and `fresh_profile` marks where the usable slices land.
   IDA gives no point covariance, so the gradient errors assume independent points.
+- `b0` is mu0 144 bcoil / (2 pi r0) from the TF coil current (PTDATA `bcoil`), with r0 = 1.6955 m.
+  That is how EFIT computes `bcentr`, and the two agree to 0.01 percent,
+  but `bcoil` has no EFIT dropouts.
+  PTDATA `bt` reads 2.4-2.8 percent above it, at a reference radius nowhere documented.
 - `n_e_line_average` is `\density` of the DISPY tree, or the PCS estimate `dssdenest` where the tree has none (199264),
   which matches `\density` within 1 percent where both exist.
   disruption-py's `get_density_parameters` is not used, since it falls back to `\denv2`, which reads about 3x higher.
@@ -153,11 +158,11 @@ and the LIUQE reconstructions of the MEQ databases (`TCV{shot}_meqdb.mat`), both
   A heating system a shot does not have is an empty placeholder in its export and counts as zero.
 - `power_radiated` is `PradTot`, the total including the divertor like DIII-D and MAST.
   `PradBulk`, the confined plasma only, is 0.43 of it at the median over 81 shots (0.27-0.69 for 5-95 percent).
-- `power_ohm` is computed, Ip V_loop - d/dt(mu0 R0 li Ip^2 / 4) from DEFUSE `I_P`, `Vloop`, `LI` and the geometric major radius `R_geom`
+- `power_ohm` is computed, Ip V_loop - d/dt(mu0 R_geo li Ip^2 / 4) from DEFUSE `I_P`, `Vloop`, `LI` and the geometric major radius `R_geom`
   (`ohmic_power`), then smoothed by a trailing 5 ms boxcar, as on C-Mod.
   DEFUSE `Vloop` has the opposite sign to `I_P` (Ip Vloop < 0 at flat-top on 39 of 39 shots of both polarities), so it is flipped.
   DEFUSE `POHM` has no documented definition and reads 0.9-1.0 of Ip Vloop at flat-top.
-- `b0` is `BZERO` (at 0.88 m) moved to the geometric axis, BZERO 0.88 / R_geom.
+- `b0` is `BZERO`, LIUQE's rBt / r0 with r0 = 0.88 m.
 - Profiles: the DEFUSE Te/ne fits, which are on rho_pol = sqrt(psi_N), not rho_tor_norm
   (the raw Thomson positions match sqrt(psi_N) of LIUQE within 0.006, and miss rho_tor_norm by 0.05-0.08).
   Each fit slice maps to rho_tor_norm through the q profile of the nearest LIUQE reconstruction within 2 ms (`tcv/profiles.py`).

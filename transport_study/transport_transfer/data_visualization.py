@@ -21,7 +21,7 @@ class DataVisualization(DataVisualizationBase):
         "raw": [
             ["ip_MA", "energy_mhd_MJ"],
             ["geometric_axis_r", "minor_radius"],
-            ["n_e_line_average_1e20", "b0"],
+            ["n_e_line_average_1e20", "b_geo"],
             ["power_additional_MW", "elongation"],
         ],
         "physics": [

@@ -34,7 +34,7 @@ def test_confinement_laws_match_published_units():
     predictor = ScalingLawPredictor()
     inputs = ScalingLawPredictor.Inputs(
         ip_MA=IP_MA,
-        b0=B0_T,
+        b_geo=B0_T,
         geometric_axis_r=R0_M,
         minor_radius=A_MINOR_M,
         elongation=KAPPA,

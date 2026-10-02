@@ -71,6 +71,7 @@ def _published_store(path) -> xr.Dataset:
     data_vars |= {name: (("shot", "time_idx", "rho_tor_norm"), padded(values)) for name, values in profiles.items()}
     data_vars["time"] = (("shot", "time_idx"), time)
     data_vars["cocos"] = (("shot",), np.full(n_shots, 7.0, dtype=np.float32))
+    data_vars["r0"] = (("shot",), np.full(n_shots, 0.66, dtype=np.float32))
     data_vars["psirz"] = (("shot", "time_idx", "r_grid", "z_grid"), padded(np.ones((n_shots, N_TIME_PADDED, 3, 3))))
     ds = xr.Dataset(data_vars, coords={"shot": shots, "rho_tor_norm": RHO, "r_grid": np.arange(3.0), "z_grid": np.arange(3.0)})
     for name, attrs in STORE_SIGNAL_ATTRS.items():

@@ -100,6 +100,9 @@ class DataWorkflow(ABC):
         logger.info(f"Final dataset variables: {list(ds.data_vars)}")
         # For each variable, log the maximum value and the shot in which it occurs, to check for any outliers that might indicate issues with the processing
         for var in ds.data_vars:
+            # A per-shot constant (r0) has no time to take statistics over
+            if TIME_DIM not in ds[var].dims:
+                continue
             # Compute statistics (needed for dask arrays)
             max_per_shot = ds[var].max(dim=TIME_DIM, skipna=True)
             if len(max_per_shot.sizes) > 1:  # Handle multidimensional case
@@ -536,7 +539,7 @@ class PublishedStoreWorkflow(DataWorkflow):
         mask_time_valid = shot_ds[TIME_COORD].notnull().squeeze(EPISODE_DIM).values
         shot_ds = shot_ds.isel({TIME_DIM: mask_time_valid}).set_coords(TIME_COORD)
 
-        # The C-Mod store keeps the source sign of ip and b0, the study uses magnitudes
+        # The C-Mod and MAST stores keep the source sign of ip and b0, the study uses magnitudes
         for name in ["ip", "b0"]:
             magnitude = np.abs(shot_ds[name].values)
             shot_ds[name] = shot_ds[name].copy(data=magnitude)

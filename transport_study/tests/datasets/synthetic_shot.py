@@ -63,6 +63,7 @@ def raw_shot(n_t: int = N_T, shot: int = SHOT, **overrides) -> xr.Dataset:
     data_vars |= {name: (("time_idx", "rho_tor_norm"), vals) for name, vals in profiles.items()}
     ds = xr.Dataset(data_vars, coords={"time_idx": np.arange(n_t), "time": ("time_idx", time), "rho_tor_norm": RHO})
     ds = ds.expand_dims(shot=[shot])
+    ds["r0"] = (("shot",), [0.88])
     for name, vals in overrides.items():
         ds[name] = vals if isinstance(vals, xr.DataArray) else (ds[name].dims, vals)
     return ds

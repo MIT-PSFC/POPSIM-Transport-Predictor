@@ -58,8 +58,8 @@ HEATING_SOURCES_MW = {
 }
 # Signed in the source (negative in the usual TCV configuration), stored as magnitudes
 MAGNITUDE_SIGNALS = ("ip", "b0")
-# Major radius DEFUSE BZERO is the vacuum toroidal field at [m]
-BZERO_REFERENCE_R = 0.88
+# Major radius DEFUSE BZERO is the vacuum toroidal field at, LIUQE's r0 and the store's r0 [m]
+R0 = 0.88
 
 # DEFUSE signals power_ohm is computed from (ohmic_power), DEFUSE POHM has no documented definition
 OHMIC_POWER_SOURCES = ("I_P", "Vloop", "LI", "R_geom")
@@ -105,8 +105,9 @@ TCV_SIGNAL_ATTRS = {
     # Prediction store
     "ip": {"description": "Measured plasma current magnitude (DEFUSE I_P)"},
     "b0": {
-        "description": "Vacuum toroidal field magnitude at geometric_axis_r, DEFUSE BZERO (at 0.88 m) scaled by 1/R",
+        "description": "Vacuum toroidal field magnitude at r0, DEFUSE BZERO (LIUQE rBt / r0)",
     },
+    "r0": {"description": "Reference major radius b0 is given at, LIUQE's r0"},
     "energy_mhd": {
         "description": "Stored energy on the LIUQE timebase (DEFUSE Wtot)",
     },
@@ -134,7 +135,7 @@ TCV_SIGNAL_ATTRS = {
     "power_ohm": {
         "description": (
             "Ohmic heating power, Ip * V_loop minus the rate of change of the internal poloidal magnetic energy "
-            "mu0 R0 li Ip^2 / 4 (DEFUSE I_P, Vloop, LI, R_geom), causal (backward difference, trailing 5 ms boxcar), clipped at 0"
+            "mu0 R_geo li Ip^2 / 4 (DEFUSE I_P, Vloop, LI, R_geom), causal (backward difference, trailing 5 ms boxcar), clipped at 0"
         ),
     },
     "power_radiated": {
@@ -362,8 +363,7 @@ class TCVDataWorkflow(RawFileWorkflow):
             if store_name in MAGNITUDE_SIGNALS:
                 signal = abs(signal)
             signals[store_name] = signal
-        # Vacuum field falls off as 1/R, so b0 at the geometric axis is BZERO R_ref / R_geo
-        signals["b0"] = signals["b0"] * BZERO_REFERENCE_R / signals["geometric_axis_r"]
+        signals["r0"] = xr.full_like(ds["shot"], R0, dtype=float)
         signals["power_ohm"] = _ohmic_power(ds)
         signals["fresh_profile"] = ds["fresh_profile"]
         power_zero = xr.zeros_like(ds["I_P"])
