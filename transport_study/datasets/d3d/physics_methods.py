@@ -285,7 +285,9 @@ class D3DDatasetMethods:
     def get_ida_profiles(params: PhysicsMethodParams):
         """IDA Te/ne on the rho_tor_norm grid (mapped through the DISPY EFIT q profile) and on the psi_norm grid.
 
-        fresh_equilibrium marks the grid times a usable EFIT slice lands on, the slices the profiles map through.
+        fresh_equilibrium marks the grid times a usable EFIT slice lands on (chisq and a mappable q),
+        the slices the profiles map through.
+        The EFIT 0D signals need chisq alone (_efit_signals), so they can update where it is 0.
         """
         ida_path = find_ida_path(params.shot_id)
         if ida_path is None:

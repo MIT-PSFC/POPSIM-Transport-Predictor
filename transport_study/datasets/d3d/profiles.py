@@ -138,8 +138,9 @@ def ida_profiles_on_grids(
 
     Each IDA slice maps to rho_tor_norm through the q profile of the nearest valid EFIT slice no farther than
     match_max_ms away. The interpolation clamps to the innermost IDA value at the axis and is NaN past the IDA
-    psi_n domain. Each slice is held onto the timebase until the next one, for at most max_hold_ida_steps median
-    IDA steps, and the timebase is NaN before the first slice.
+    psi_n domain. Each slice is held onto the timebase until the next one,
+    for at most max_hold_ida_steps median steps of the usable slices,
+    and the timebase is NaN before the first slice.
     A slice that does not map, or lacks a Te or ne fit, is dropped before the rho_tor_norm hold,
     so the slice before it holds over it, as transport-validation-datasets does with its fits.
     fresh_profile marks the grid times where a usable slice lands.
@@ -148,7 +149,8 @@ def ida_profiles_on_grids(
         ida: IDA file contents, T_e [eV] and n_e [m^-3] with 1-sigma _err companions on (time [ms], psi_n).
         efit_time: (n_eq,) EFIT slice times [s].
         qpsi: (n_eq, n_psi) safety factor on the GEQDSK psi_N grid.
-        mask_efit_valid: (n_eq,) True where the EFIT slice is usable, its q profile mappable (mappable_q_profiles).
+        mask_efit_valid: (n_eq,) True where the EFIT slice is usable,
+            chisq within its maximum and the q profile mappable (mappable_q_profiles).
         times: (n_t,) timebase [s].
 
     Returns:

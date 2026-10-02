@@ -18,5 +18,5 @@ match_max_ms = 2.0
 rho_min = 0.0
 rho_max = 1.1
 num_rho_points = 56
-# Longest a DEFUSE slice is held onto the 1 kHz timebase, in median DEFUSE steps
+# Longest a DEFUSE slice is held onto the 1 kHz timebase, in median steps of the usable DEFUSE slices
 max_hold_defuse_steps = 1.5

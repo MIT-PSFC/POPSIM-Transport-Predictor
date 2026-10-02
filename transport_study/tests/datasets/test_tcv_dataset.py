@@ -29,7 +29,7 @@ from transport_study.datasets.tcv.tcv_dataset import (
     PREDICTION_SOURCES,
     TCV_SIGNAL_ATTRS,
     TCVDataWorkflow,
-    _remove_fringe_jumps,
+    remove_fringe_jumps,
 )
 from transport_study.signals import PREDICTION_STORE_NAME
 
@@ -141,7 +141,7 @@ def test_fringe_jumps_removed_and_real_changes_kept():
     density_true = density_true - real_drop
     density_trace = density_trace - real_drop
 
-    density_corrected, cut_time = _remove_fringe_jumps(sample_time, density_trace)
+    density_corrected, cut_time = remove_fringe_jumps(sample_time, density_trace)
 
     assert cut_time is None
     mask_off_spike = ~((sample_time >= 0.5995) & (sample_time < 0.605))
@@ -152,7 +152,7 @@ def test_fringe_burst_cuts_the_rest_of_the_record():
     """Three slips within FRINGE_BURST_WINDOW_S mean the interferometer lost count, NaN from the first on."""
     sample_time, density_true, density_trace = _fir_trace([(0.2, -2e19), (0.22, -2e19), (0.24, 2e19)])
 
-    density_corrected, cut_time = _remove_fringe_jumps(sample_time, density_trace)
+    density_corrected, cut_time = remove_fringe_jumps(sample_time, density_trace)
 
     assert cut_time == pytest.approx(0.2, abs=1e-3)
     mask_before = sample_time < 0.199

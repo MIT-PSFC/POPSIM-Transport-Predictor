@@ -4,15 +4,19 @@ The studies convert to their working units on load (`signals.convert_to_working_
 
 Every stored value is causal, no time draws on a later sample, except power_ohm and power_radiated.
 Unsmoothed, both are noise-dominated at 1 kHz, so they are stored smoothed:
-DIII-D's at the source (below), TCV's `PradTot` as DEFUSE gives it,
+DIII-D's at the source (below),
 and the rest with the DIII-D bolometer kernel, a centered 50 ms boxcar applied twice
 (transport-validation-datasets `smoothed_power`, which TCV's computed `power_ohm` uses too).
+TCV `PradTot` is the exception, it already reads smooth at its ~17 ms DEFUSE cadence and is not smoothed further.
+It is held causally for at least 60 ms over its skipped samples (TCV section below),
+a zero-order hold rather than the 50 ms triangle.
 A 0D signal is never interpolated onto the 1 kHz grid (`signal_on_grid`).
 One sampled faster than the grid is averaged over each grid step, time t taking the mean of (t - 1 ms, t].
 One sampled slower is held forward from its last finite sample for at most 1.5 of its own median sample steps,
 or for at least 10 ms when it comes from the equilibrium reconstruction (`EQUILIBRIUM_HOLD_FLOOR`),
 so a few missing reconstructions do not cut the shot.
-`fresh_equilibrium` marks the grid times a usable reconstruction lands on.
+`fresh_equilibrium` marks the grid times a reconstruction usable for the profile mapping lands on.
+The 0D equilibrium signals are placed from their own samples, so they can update where it is 0.
 Derivatives are backward differences, apart from those DIII-D's EFIT takes for `poh`.
 b0 is the vacuum toroidal field at the fixed major radius r0 on every device, as IMAS defines it.
 The study derives the field at the geometric axis on load, b_geo = b0 r0 / geometric_axis_r (`convert_to_working_units`).
@@ -52,10 +56,8 @@ with the transients shaded red, the end-of-shot cut, the thresholds, and dots wh
 | min energy_mhd | 2.7 kJ | 5 kJ | 10 kJ | 1 kJ |
 | min n_e_line_average | 1e19 m^-3 | 3e18 m^-3 | 5e17 m^-3 | 2e18 m^-3 |
 | max greenwald_fraction | 2.0 | 2.0 | 2.0 | 2.0 |
-| max power_radiated | | 4 MW | | |
 | transient power_ohm | 5 MW | 5 MW | 2 MW | |
 | transient power_radiated | 5.5 MW | 3 MW | | |
-| device geometry | | | | minor_radius >= 0.15 m, elongation >= 0.9 |
 | end_margin | 20 ms | 40 ms | 50 ms | 50 ms |
 | min_pulse_length | 0.5 s | 0.2 s | 0.5 s | 0.5 s |
 | min_radiated_fraction | 0.01 | 0.025 | 0.025 | 0.025 |
@@ -94,7 +96,8 @@ and every signal is placed on the timebase causally instead (`signal_on_grid`, a
   A shot without one, or whose EFIT is slower than 1 kHz, is skipped (`DispyEfitNicknameSetting`, `Uniform1kHzTimeSetting`).
   disruption-py's own EFIT selection falls back to the 50 Hz efit01 and forces runtag DIS under pytest, so it is not used.
   Failed reconstructions are missing or fail chisq > 50, so every EFIT signal is held for at least 10 ms,
-  and `fresh_equilibrium` marks the grid times a usable slice (chisq, mappable q) lands on.
+  and `fresh_equilibrium` marks the grid times a usable slice (chisq, mappable q) lands on,
+  while the EFIT 0D signals take every slice that passes chisq.
 - Profiles: Te/ne from IDA, searched in the priority order of the databases in `d3d/config.toml`:
   `HBP_database` (98 shots), the VVUQ files (4), then the general-purpose `TMDB_V1c`, `TMDB_V1a`, and `TokaMaker_database`,
   which only serve shots on `d3d/HBP_shotlist_2013_2025` (105 more). The default shotlist is the union, 207 shots.
@@ -106,7 +109,7 @@ and every signal is placed on the timebase causally instead (`signal_on_grid`, a
   as the published C-Mod/MAST stores (`d3d/profiles.py`).
   IDA's psi_n comes from its own reconstruction, which the files do not name, while q comes from the DISPY EFIT.
   The profiles go onto rho_tor_norm = linspace(0, 1.1, 56), the published C-Mod grid (MAST's has 67 points over the same range),
-  and each slice is held onto the 1 kHz timebase until the next one, for at most 3 median IDA steps (`hold_onto_grid`).
+  and each slice is held onto the 1 kHz timebase until the next one, for at most 3 median steps of the usable slices (`hold_onto_grid`).
   A slice with no valid EFIT nearby, or without both a Te and an ne fit, is dropped before the hold,
   so the slice before it holds over it, and `fresh_profile` marks where the usable slices land.
   IDA gives no point covariance, so the gradient errors assume independent points.
@@ -185,9 +188,14 @@ and the LIUQE reconstructions of the MEQ databases (`TCV{shot}_meqdb.mat`), both
   The LIUQE signals (Wtot, BETAN, a_minor, R_geom, KAPPA, DELTA_TOP, DELTA_BOTTOM, LI, BZERO) are held for at least 10 ms.
 - `power_radiated` is `PradTot`, the total including the divertor like DIII-D and MAST.
   `PradBulk`, the confined plasma only, is 0.43 of it at the median over 81 shots (0.27-0.69 for 5-95 percent).
-  It follows the Thomson cadence (~17 ms) but often skips one or two samples, or comes in bursts 50 ms apart,
-  so it is held for at least 60 ms (`PRAD_TOT_HOLD_FLOOR_S`), which bridges the skips that would cut the shot.
-- `fresh_equilibrium` marks the grid times a usable LIUQE reconstruction of the MEQ database lands on.
+  It follows the Thomson cadence (~17 ms) but often skips one or two samples, leaving 33-50 ms steps,
+  and 61056 comes in bursts of three samples every 50 ms.
+  The 1.5-step hold (25.5 ms) left NaN gaps that cut ~10 percent of the kept time (5.5 s) and all of 61056,
+  so it is held for at least 60 ms (`PRAD_TOT_HOLD_FLOOR_S`), which bridges both.
+  The hold is causal, a zero-order hold rather than the 50 ms triangle of the other devices' P_rad.
+  PradTot is not smoothed further, since it already reads smooth at its own cadence (DEFUSE documents no kernel).
+- `fresh_equilibrium` marks the grid times a usable LIUQE reconstruction of the MEQ database lands on,
+  while the LIUQE 0D signals come from the DEFUSE export on its own times.
 - `power_ohm` is computed, Ip V_loop - d/dt(mu0 R_geo li Ip^2 / 4) from DEFUSE `I_P`, `Vloop`, `LI` and the geometric major radius `R_geom`
   (`ohmic_power`), then smoothed by the centered 50 ms boxcar applied twice (`smoothed_power`), as on C-Mod and MAST.
   DEFUSE `Vloop` has the opposite sign to `I_P` (Ip Vloop < 0 at flat-top on 39 of 39 shots of both polarities), so it is flipped.
@@ -204,7 +212,7 @@ and the LIUQE reconstructions of the MEQ databases (`TCV{shot}_meqdb.mat`), both
   Only shots with a MEQ database are built, 964 shots from 60001 to 82878.
 - The profiles go onto rho_tor_norm = linspace(0, 1.1, 56), the DIII-D and C-Mod grid,
   and are NaN past the LCFS, where the DEFUSE fits end.
-  Each slice is held onto the 1 kHz timebase until the next one (every ~17 ms), for at most 1.5 median DEFUSE steps (`hold_onto_grid`).
+  Each slice is held onto the 1 kHz timebase until the next one (every ~17 ms), for at most 1.5 median steps of the usable slices (`hold_onto_grid`).
   A slice with no usable reconstruction nearby or a NaN fit point is dropped before the hold,
   so the slice before it holds over it, and `fresh_profile` marks where the usable n_e slices land.
   A time without both a Te and an ne fit has no profiles.
@@ -214,8 +222,6 @@ and the LIUQE reconstructions of the MEQ databases (`TCV{shot}_meqdb.mat`), both
 
 TCV specifics of the filter spec (`TCVDataWorkflow`):
 
-- LIUQE geometry moments go nonphysical during the current ramp (minor_radius down to 0.04 m, elongation below 1),
-  so minor_radius below 0.15 m and elongation below 0.9 are gaps.
 - No transient threshold.
   In 246 shots only 75026 has a 5 ms P_rad peak above 3 MW (12 MW),
   and it radiates 4.1x its input, which `max_radiated_fraction` culls.

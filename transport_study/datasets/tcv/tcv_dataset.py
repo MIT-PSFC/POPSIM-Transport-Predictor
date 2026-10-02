@@ -68,8 +68,10 @@ R0 = 0.88
 # DEFUSE signals of the LIUQE reconstruction, BZERO (LIUQE rBt / r0) among them.
 # Each is held for at least EQUILIBRIUM_HOLD_FLOOR, so a few missing reconstructions are bridged.
 LIUQE_SOURCES = ("Wtot", "BETAN", "a_minor", "R_geom", "KAPPA", "DELTA_TOP", "DELTA_BOTTOM", "LI", "BZERO")
-# PradTot follows the Thomson cadence (~17 ms) but often skips one or two samples, or comes in bursts 50 ms apart,
-# and each skip would otherwise cut the shot
+# PradTot follows the Thomson cadence (~17 ms) but often skips one or two samples (33-50 ms steps),
+# or comes in bursts 50 ms apart (61056).
+# The 1.5-step hold left gaps that cut ~10 percent of the kept time, and 60 ms bridges both.
+# A causal zero-order hold, not the 50 ms triangle of smoothed_power, since PradTot already reads smooth.
 PRAD_TOT_HOLD_FLOOR_S = 60e-3
 # DEFUSE signal -> shortest hold [s], 0 for the rest
 HOLD_FLOORS_S = {**dict.fromkeys(LIUQE_SOURCES, EQUILIBRIUM_HOLD_FLOOR), "PradTot": PRAD_TOT_HOLD_FLOOR_S}
@@ -96,7 +98,7 @@ DEFUSE_SIGNALS = (
 # The raw timebase ends at the last time the plasma current magnitude exceeds this [A]
 IP_TIMEBASE_MIN_A = 50e3
 
-# Fringe jumps of the FIR interferometer, removed from the raw NEavg samples (_remove_fringe_jumps).
+# Fringe jumps of the FIR interferometer, removed from the raw NEavg samples (remove_fringe_jumps).
 # Smallest level shift read as a fringe jump [m^-3]. The clean jumps in 185 shots are 1.1-2.5e19.
 FRINGE_JUMP_MIN_M3 = 1e19
 # A fringe jump completes within a few raw samples, and no real density change is that fast.
@@ -166,7 +168,10 @@ TCV_SIGNAL_ATTRS = {
         ),
     },
     "power_radiated": {
-        "description": "Total radiated power including the divertor, bolometry (DEFUSE PradTot, not smoothed further), clipped at 0",
+        "description": (
+            "Total radiated power including the divertor, bolometry (DEFUSE PradTot on its ~17 ms cadence, "
+            "not smoothed further, held causally for at least 60 ms over skipped samples), clipped at 0"
+        ),
     },
     "power_nbi": {
         "description": "Neutral beam power, summed over both beamlines (DEFUSE NBI + NBI2), zero where a beam is absent",
@@ -183,8 +188,9 @@ TCV_SIGNAL_ATTRS = {
     "fresh_profile": {"description": "1 where the profiles are a new DEFUSE slice, 0 where an earlier slice is held"},
     "fresh_equilibrium": {
         "description": (
-            "1 where a usable LIUQE reconstruction (MEQ database) lands, "
-            "0 where the equilibrium signals hold an earlier one (for at least 10 ms)"
+            "1 where a LIUQE reconstruction usable for the profile mapping (a mappable q, MEQ database) lands, 0 otherwise. "
+            "The LIUQE 0D signals come from the DEFUSE export on its own times and hold for at least 10 ms, "
+            "so they can update where it is 0"
         )
     },
     **{
@@ -225,10 +231,6 @@ class TCVDataWorkflow(RawFileWorkflow):
         # A broken FIR record reads ~0 or negative, and Thomson calibrated to it reads ~0 too (70353, 70356).
         # The lowest real plasma in 280 shots is 3.4e18 (74082, where Thomson agrees).
         "n_e_line_average": 2e18,
-        # LIUQE geometry moments go nonphysical during the current ramp (minor_radius down to 0.04 m, elongation below 1),
-        # which drives derived features like q_star far outside the physical range
-        "minor_radius": 0.15,
-        "elongation": 0.9,
     }
     max_filter: ClassVar[dict[str, float]] = {
         # Bad interferometer data can pass an absolute density cap at low ip
@@ -308,7 +310,7 @@ class TCVDataWorkflow(RawFileWorkflow):
         density_raw_name, _ = PREDICTION_SOURCES["n_e_line_average"]
         if density_raw_name in signals:
             density = signals[density_raw_name]
-            density_corrected, cut_time = _remove_fringe_jumps(density.time, density.values)
+            density_corrected, cut_time = remove_fringe_jumps(density.time, density.values)
             signals[density_raw_name] = DefuseSignal(time=density.time, values=density_corrected)
             if cut_time is not None:
                 logger.info(f"Shot {shot}: the FIR interferometer lost count, {density_raw_name} cut from {cut_time:.3f} s")
@@ -496,7 +498,7 @@ def _level_samples(idx_settled: np.ndarray, idx_adjacent: np.ndarray, n_sharp: i
     return idx_adjacent
 
 
-def _remove_fringe_jumps(sample_time: np.ndarray, density: np.ndarray) -> tuple[np.ndarray, float | None]:
+def remove_fringe_jumps(sample_time: np.ndarray, density: np.ndarray) -> tuple[np.ndarray, float | None]:
     """The raw NEavg samples with the interferometer fringe jumps removed, non-causally.
 
     A sharp shift is a sample after which the median of the next FRINGE_SHARP_WINDOW_S

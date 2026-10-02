@@ -51,7 +51,7 @@ def convert_to_working_units(ds: xr.Dataset) -> xr.Dataset:
     Adds power_additional_MW when the heating powers are there, which needs all four of them.
 
     Raises:
-        ValueError: If b0 is present without r0, or only some of the heating powers are present.
+        ValueError: If b0 is present without r0 or geometric_axis_r, or only some of the heating powers are present.
     """
     conversions_present = {name: conversion for name, conversion in WORKING_UNIT_CONVERSIONS.items() if name in ds}
     renames = {name: study_name for name, (study_name, _, _) in conversions_present.items()}
@@ -61,8 +61,9 @@ def convert_to_working_units(ds: xr.Dataset) -> xr.Dataset:
         ds_working[study_name] = da_scaled.assign_attrs(ds_working[study_name].attrs | {"units": unit})
 
     if "b0" in ds_working:
-        if "r0" not in ds_working:
-            raise ValueError(f"Deriving {B_GEO} needs r0, the major radius b0 is given at")
+        missing_geometry = {"r0", "geometric_axis_r"} - set(ds_working.variables)
+        if missing_geometry:
+            raise ValueError(f"Deriving {B_GEO} needs r0 and geometric_axis_r, the dataset lacks {sorted(missing_geometry)}")
         b_geo = ds_working["b0"] * ds_working["r0"] / ds_working["geometric_axis_r"]
         ds_working[B_GEO] = b_geo.assign_attrs(units="T", description="Vacuum toroidal field at geometric_axis_r, b0 r0 / geometric_axis_r")
 

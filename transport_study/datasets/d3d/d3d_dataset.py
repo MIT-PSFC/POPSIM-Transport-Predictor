@@ -213,8 +213,9 @@ D3D_SIGNAL_ATTRS = {
     "fresh_profile": {"description": "1 where the profiles are a new IDA slice, 0 where an earlier slice is held"},
     "fresh_equilibrium": {
         "description": (
-            "1 where a usable DISPY EFIT slice (chisq and q profile) lands, "
-            "0 where the equilibrium signals hold an earlier one (for at least 10 ms)"
+            "1 where a DISPY EFIT slice usable for the profile mapping (chisq <= 50 and a mappable q) lands, 0 otherwise. "
+            "The EFIT 0D signals take every slice that passes chisq and hold for at least 10 ms, "
+            "so they can update where it is 0"
         )
     },
     **{

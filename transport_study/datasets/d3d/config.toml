@@ -51,6 +51,6 @@ sol_extension = "secant"
 # Uniform psi_norm grid for the trajopt store profiles, inside IDA's psi_n <= 1.2 domain
 psi_norm_max = 1.18
 num_psi_norm_points = 60
-# Longest an IDA slice is held onto the 1 kHz timebase, in median IDA steps.
+# Longest an IDA slice is held onto the 1 kHz timebase, in median steps of the usable IDA slices.
 # Interior IDA gaps reach 2.6 median steps, so this only cuts the hold after the last slice.
 max_hold_ida_steps = 3.0
