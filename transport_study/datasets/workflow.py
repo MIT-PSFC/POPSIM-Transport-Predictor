@@ -226,15 +226,20 @@ class RawFileWorkflow(DataWorkflow):
        power clipping, fresh_profile labelling, filter_ds, and the culls, into the stores.
     """
 
-    # Seconds of data cut from the end of the ip record (see filter_ds).
+    # Seconds of data cut before the plasma current ends (see filter_ds).
     # Set per device since the same margin can land in completely different plasma states
     end_margin_s = 0.05
+    # Width of the centered boxcar the transient_filter_config signals are smoothed with [s]
+    transient_smoothing_window_s = 5e-3
 
     # Set by each device
-    # filter_config: {signal: {"min", "max"}}, a slice with any signal out of range is dropped
+    # filter_config: {signal: {"min", "max"}}, a slice with any signal out of range is dropped.
+    # It must hold ip, whose minimum also marks where the plasma current ends.
     # individual_filter_config: {signal: {"min", "max"}}, an out-of-range value is NaNed
+    # transient_filter_config: {signal: threshold}, the shot is cut from the first slice whose smoothed signal exceeds it
     filter_config: dict[str, dict[str, float]]
     individual_filter_config: dict[str, dict[str, float]] | None
+    transient_filter_config: dict[str, float]
 
     def __init__(
         self,
@@ -454,11 +459,28 @@ class RawFileWorkflow(DataWorkflow):
 
     def filter_ds(self, shot_ds: xr.Dataset) -> xr.Dataset | None:
         """Apply filtering steps based on device config"""
+        shot = shot_ds[EPISODE_DIM].values[0]
 
-        # Cut all data end_margin_s before ip is NaN to avoid including obviously disruptive data
-        valid_time = shot_ds["ip"].notnull().any(dim=EPISODE_DIM)
-        last_valid_idx = int(np.where(valid_time.values)[0][-1])
-        valid_mask = shot_ds[TIME_COORD] <= shot_ds[TIME_COORD][last_valid_idx] - self.end_margin_s
+        # The plasma ends at the last slice with ip at or above its filter_config minimum.
+        # A record can hold ip near 0 out to the end of its timebase, so the last finite ip is not the end.
+        # Cut end_margin_s before the end to leave out the termination, which is often a disruption.
+        mask_plasma = (shot_ds["ip"] >= self.filter_config["ip"]["min"]).any(dim=EPISODE_DIM)
+        if not mask_plasma.any():
+            logger.warning(f"Excluding shot {shot} because ip never reaches its filter_config minimum")
+            return None
+        last_plasma_idx = int(np.where(mask_plasma.values)[0][-1])
+        valid_mask = shot_ds[TIME_COORD] <= shot_ds[TIME_COORD][last_plasma_idx] - self.end_margin_s
+
+        # Cut from the first transient, where a smoothed signal exceeds its threshold while the plasma is on
+        window_samples = round(self.transient_smoothing_window_s / UNIFORM_TIMEBASE_DT_S)
+        for var, threshold in self.transient_filter_config.items():
+            smoothed = shot_ds[var].rolling({TIME_DIM: window_samples}, center=True, min_periods=1).mean()
+            mask_transient = (smoothed > threshold).any(dim=EPISODE_DIM) & mask_plasma & valid_mask
+            if mask_transient.any():
+                first_transient_idx = int(np.where(mask_transient.values)[0][0])
+                t_transient = shot_ds[TIME_COORD][first_transient_idx]
+                logger.info(f"Shot {shot}: {var} transient at {float(t_transient):.3f} s, cutting the rest of the shot")
+                valid_mask = valid_mask & (shot_ds[TIME_COORD] < t_transient)
 
         # Apply full-timeslice filters
         for var, valid_range in self.filter_config.items():
@@ -466,10 +488,10 @@ class RawFileWorkflow(DataWorkflow):
                 var_mask = shot_ds[var].notnull() & (shot_ds[var] >= valid_range["min"]) & (shot_ds[var] <= valid_range["max"])
                 valid_mask = valid_mask & var_mask
             else:
-                logger.debug(f"Variable {var} specified in filter_config not found in dataset for shot {shot_ds.shot.values[0]}")
+                logger.debug(f"Variable {var} specified in filter_config not found in dataset for shot {shot}")
 
         if valid_mask.sum() == 0:
-            logger.warning(f"Excluding shot {shot_ds.shot.values[0]} because all data points are invalid after filtering")
+            logger.warning(f"Excluding shot {shot} because all data points are invalid after filtering")
             return None
 
         # Apply individual filters that set out-of-range values to NaN, but don't drop the entire timeslice.
@@ -481,9 +503,7 @@ class RawFileWorkflow(DataWorkflow):
                         other=np.nan,
                     )
                 else:
-                    logger.debug(
-                        f"Variable {var} specified in individual_filter_config not found in dataset for shot {shot_ds.shot.values[0]}"
-                    )
+                    logger.debug(f"Variable {var} specified in individual_filter_config not found in dataset for shot {shot}")
 
         shot_ds = shot_ds.where(valid_mask, drop=True)
         return shot_ds

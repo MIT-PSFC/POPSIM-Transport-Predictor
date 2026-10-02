@@ -25,6 +25,12 @@ shotlist = "HBP_shotlist_2013_2025"
 pattern = "/fusion/projects/results/ida-results/TokaMaker_database/IDA_{shot}_.cdf"
 shotlist = "HBP_shotlist_2013_2025"
 
+[culling]
+# Shots left out of the stores.
+# 203549, 203551, 203554: failed shots of run 20250529 (density limit with HFS pellets).
+# The beams did not fire ("No beams" in the logbook), so they are ohmic, pellet-perturbed, and 203554 disrupts.
+excluded_shots = [203549, 203551, 203554]
+
 [efit]
 # code_rundb runtag of the 1 kHz disruption-efit reconstructions. A shot without one is skipped.
 runtag = "DISPY"

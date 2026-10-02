@@ -344,13 +344,16 @@ class D3DDataWorkflow(RawFileWorkflow):
             "t_e_axis": {"min": 100, "max": 1.5e4},
             "greenwald_fraction": {"min": 0.0, "max": 2.0},
             "beta_tor_norm": {"min": 0.01, "max": 6},
+            # Deep limited rampdowns (199243, 199244, 203460) carry the worst stored energy glitches
+            "elongation": {"min": 1.3, "max": 2.5},
+            # EFIT saturates at exactly 1 for runs of slices (204191, 203535, 203530)
+            "triangularity_upper": {"min": -0.99, "max": 0.99},
+            "triangularity_lower": {"min": -0.99, "max": 0.99},
         }
 
         # Set signals outside this range to nan, but don't drop the entire timeslice. Store units.
         self.individual_filter_config = {
             "power_ec": {"min": 0, "max": 1e7},
-            "power_ohm": {"min": 0, "max": 7e6},  # 201849 P_oh spikes
-            "power_radiated": {"min": 0, "max": 1e7},  # 201855 P_rad far out of distribution
             "power_nbi": {"min": 0, "max": 2.5e7},
             # dssneped reads 0 when the PCS does not estimate the pedestal
             "n_e_pedestal": {"min": 1e18, "max": 2e20},
@@ -368,6 +371,9 @@ class D3DDataWorkflow(RawFileWorkflow):
             "x_point_upper_z": {"min": 0.0, "max": 1.5},
             "x_point_upper_z_reference": {"min": 0.0, "max": 1.5},
         }
+
+        # The EFIT P_oh stays below 0.6 MW through the ramp-up and above 2 MW only at disruptive terminations
+        self.transient_filter_config = {"power_ohm": 2e6}
 
     def _get_shotlist_from_source(self) -> list[int]:
         """Union of the shots every configured IDA database serves."""
@@ -537,5 +543,9 @@ class D3DDataWorkflow(RawFileWorkflow):
         return ds
 
     def device_specific_culling(self, ds: xr.Dataset) -> bool:
-        """The default profile cull, plus shots whose EFIT boundary is entirely missing after filtering."""
+        """The config's excluded shots, the default profile cull, and shots whose EFIT boundary is entirely missing after filtering."""
+        shot = int(ds[EPISODE_DIM].values[0])
+        if shot in config["culling"]["excluded_shots"]:
+            logger.warning(f"Culling shot {shot}: listed in excluded_shots of d3d/config.toml")
+            return True
         return super().device_specific_culling(ds) or self.has_all_nan_signal(ds, ["geometric_axis_r", "minor_radius"])

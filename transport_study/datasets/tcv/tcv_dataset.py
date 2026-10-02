@@ -134,6 +134,7 @@ class TCVDataWorkflow(RawFileWorkflow):
             "elongation": {"min": 0.9, "max": 3.0},
         }
         self.individual_filter_config = None
+        self.transient_filter_config = {}
 
         # Set source directory path
         if source_dataset_path is not None:
