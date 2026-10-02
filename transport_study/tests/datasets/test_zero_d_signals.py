@@ -1,4 +1,4 @@
-"""Tests for the causality of the 0D signal helpers (datasets/zero_d_signals.py, profile_grids.held_signal_on_grid).
+"""Tests for the causality of the 0D signal helpers (datasets/zero_d_signals.py, profile_grids.signal_on_grid).
 
 No stored value may draw on a later sample.
 The cases are kept identical to transport-validation-datasets' tests/test_generic.py.
@@ -7,7 +7,7 @@ The cases are kept identical to transport-validation-datasets' tests/test_generi
 import numpy as np
 import pytest
 
-from transport_study.datasets.profile_grids import held_signal_on_grid
+from transport_study.datasets.profile_grids import signal_on_grid
 from transport_study.datasets.zero_d_signals import (
     MU0,
     ohmic_power,
@@ -21,7 +21,7 @@ def test_held_signal_takes_the_last_sample_at_or_before_and_leaves_gaps_nan():
     source_times = np.array([0.0, 0.005, 0.010, 0.015, 0.020, 0.025, 0.045, 0.050])
     values = np.array([1.0, 2.0, 3.0, np.nan, 5.0, 6.0, 7.0, 8.0])
 
-    values_on_grid = held_signal_on_grid(source_times, values, grid)
+    values_on_grid = signal_on_grid(source_times, values, grid)
 
     # 12 ms holds the 10 ms sample, never the 15 ms or 20 ms one
     assert values_on_grid[12] == 3.0
@@ -42,7 +42,7 @@ def test_held_signal_float64_source_on_a_float32_grid_is_held_at_its_own_grid_ti
     source_times = np.arange(1001) * 1e-3
     values = np.arange(1001, dtype=float)
 
-    values_on_grid = held_signal_on_grid(source_times, values, grid)
+    values_on_grid = signal_on_grid(source_times, values, grid)
 
     np.testing.assert_array_equal(values_on_grid, values)
 
@@ -54,15 +54,30 @@ def test_held_signal_holds_on_the_clock_of_the_finite_samples():
     values[::50] = np.arange(10.0)
     grid = np.round(np.arange(50) * 1e-3, 3)
 
-    values_on_grid = held_signal_on_grid(source_times, values, grid)
+    values_on_grid = signal_on_grid(source_times, values, grid)
 
     # Each 5 ms sample is held up to the next one
     np.testing.assert_array_equal(values_on_grid, np.repeat(np.arange(10.0), 5))
     # A lone finite sample has no period to hold for
     values_lone = np.full(500, np.nan)
     values_lone[100] = 1.0
-    values_lone_on_grid = held_signal_on_grid(source_times, values_lone, grid)
+    values_lone_on_grid = signal_on_grid(source_times, values_lone, grid)
     assert np.isnan(values_lone_on_grid).all()
+
+
+def test_signal_averages_a_faster_source_over_each_grid_step():
+    # 0.2 ms source on the 1 kHz grid, so grid time t takes the mean of the samples in (t - 1 ms, t]
+    grid = np.round(np.arange(10) * 1e-3, 3).astype("float32")
+    source_times = np.arange(50) * 2e-4
+    values = np.arange(50.0)
+    values[16:22] = np.nan
+
+    values_on_grid = signal_on_grid(source_times, values, grid)
+
+    # 1 ms averages samples 1 to 5, the one at 1 ms itself included, never the 1.2 ms one
+    # 4 ms has no finite sample, and 5 ms averages the finite 22 to 25
+    expected = np.array([0.0, 3.0, 8.0, 13.0, np.nan, 23.5, 28.0, 33.0, 38.0, 43.0])
+    np.testing.assert_array_equal(values_on_grid, expected)
 
 
 def test_trailing_boxcar_a_later_sample_does_not_change_earlier_ones():

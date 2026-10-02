@@ -29,7 +29,7 @@ from transport_study.datasets.d3d.profiles import (
     find_ida_path,
     ida_profiles_on_grids,
 )
-from transport_study.datasets.profile_grids import held_signal_on_grid
+from transport_study.datasets.profile_grids import signal_on_grid
 from transport_study.datasets.rho_tor_norm import geqdsk_psi_n_grid, mappable_q_profiles
 
 # Programmed waveforms run past early plasma termination, keep them for predict-first [s]
@@ -92,7 +92,7 @@ def _efit_signals(params: PhysicsMethodParams, nodes: list[str]) -> tuple[np.nda
 
 
 def _injected_power(params: PhysicsMethodParams, node: str, tree_name: str) -> np.ndarray:
-    """An injected heating power record held onto the timebase (held_signal_on_grid), in the record's units.
+    """An injected heating power record placed on the timebase (signal_on_grid), in the record's units.
 
     0 outside the record and when the shot has none (that heating system did not run).
     """
@@ -108,7 +108,7 @@ def _injected_power(params: PhysicsMethodParams, node: str, tree_name: str) -> n
     if power_time_ms.size <= 2:
         return np.zeros(len(params.times))
     power_time = power_time_ms / 1e3
-    power_on_timebase = held_signal_on_grid(power_time, power, params.times)
+    power_on_timebase = signal_on_grid(power_time, power, params.times)
     mask_outside_record = (params.times < power_time[0]) | (params.times > power_time[-1])
     power_on_timebase[mask_outside_record] = 0.0
     return power_on_timebase
@@ -117,7 +117,7 @@ def _injected_power(params: PhysicsMethodParams, node: str, tree_name: str) -> n
 class D3DDatasetMethods:
     """Signals the transport study needs that disruption-py 0.14 has no built-in for, or no usable one.
 
-    Every signal is held onto the timebase from its last sample (held_signal_on_grid), never interpolated,
+    Every signal is placed on the timebase causally (signal_on_grid), never interpolated,
     so no grid time draws on a later sample.
     The disruption-py built-ins interpolate, so the EFIT scalars and the plasma current are read here too.
     """
@@ -159,7 +159,7 @@ class D3DDatasetMethods:
                 signals[pointname] = np.full(len(params.times), np.nan)
                 continue
             times_s = times_ms / 1e3
-            signals[pointname] = held_signal_on_grid(times_s, values, params.times)
+            signals[pointname] = signal_on_grid(times_s, values, params.times)
         return signals
 
     @staticmethod
@@ -171,13 +171,13 @@ class D3DDatasetMethods:
         """
         ip, ip_time_ms = params.mds_conn.get_data_with_dims(f"ptdata('ip', {params.shot_id})")
         ip_time = ip_time_ms / 1e3
-        ip_on_timebase = held_signal_on_grid(ip_time, ip, params.times)
+        ip_on_timebase = signal_on_grid(ip_time, ip, params.times)
         try:
             ip_prog, ip_prog_time_ms = params.mds_conn.get_data_with_dims(f"ptdata('iptipp', {params.shot_id})")
             polarity = D3DUtilMethods.get_polarity(params)
             ip_prog_signed = ip_prog * polarity
             ip_prog_time = ip_prog_time_ms / 1e3
-            ip_prog_on_timebase = held_signal_on_grid(ip_prog_time, ip_prog_signed, params.times)
+            ip_prog_on_timebase = signal_on_grid(ip_prog_time, ip_prog_signed, params.times)
         except mdsExceptions.MdsException:
             params.logger.warning("ptdata iptipp missing")
             ip_prog_on_timebase = np.full(len(params.times), np.nan)
@@ -192,8 +192,7 @@ class D3DDatasetMethods:
         """
         efit_time, signals = _efit_signals(params, list(D3DDatasetMethods.EFIT_SCALAR_NODES.values()))
         return {
-            column: held_signal_on_grid(efit_time, signals[node], params.times)
-            for column, node in D3DDatasetMethods.EFIT_SCALAR_NODES.items()
+            column: signal_on_grid(efit_time, signals[node], params.times) for column, node in D3DDatasetMethods.EFIT_SCALAR_NODES.items()
         }
 
     @staticmethod
@@ -214,7 +213,7 @@ class D3DDatasetMethods:
             density_1e19, density_time_ms = params.mds_conn.get_data_with_dims(f"ptdata('dssdenest', {params.shot_id})")
             density = density_1e19 * 1e19
         density_time = density_time_ms / 1e3
-        n_e_line_average = held_signal_on_grid(density_time, density, params.times)
+        n_e_line_average = signal_on_grid(density_time, density, params.times)
         return {"n_e_line_average": n_e_line_average}
 
     @staticmethod
@@ -226,7 +225,7 @@ class D3DDatasetMethods:
         whose 20 kHz vloopb with a 0.55 ms median filter is noise at 1 kHz.
         """
         efit_time, signals = _efit_signals(params, ["poh"])
-        p_ohm = held_signal_on_grid(efit_time, signals["poh"], params.times)
+        p_ohm = signal_on_grid(efit_time, signals["poh"], params.times)
         return {"p_ohm": p_ohm}
 
     @staticmethod
@@ -241,7 +240,7 @@ class D3DDatasetMethods:
         """
         p_rad, p_rad_time_ms = params.mds_conn.get_data_with_dims(r"\top.prad_01.prad:prad_tot", tree_name="bolom")
         p_rad_time = p_rad_time_ms / 1e3
-        p_rad_on_timebase = held_signal_on_grid(p_rad_time, p_rad, params.times)
+        p_rad_on_timebase = signal_on_grid(p_rad_time, p_rad, params.times)
         return {"p_rad": p_rad_on_timebase}
 
     @staticmethod
@@ -262,7 +261,7 @@ class D3DDatasetMethods:
     def get_boundary_parameters(params: PhysicsMethodParams):
         """Plasma boundary minor radius, geometric axis R, elongation and triangularities from the DISPY EFIT."""
         efit_time, signals = _efit_signals(params, D3DDatasetMethods.BOUNDARY_NODES)
-        return {node: held_signal_on_grid(efit_time, values, params.times) for node, values in signals.items()}
+        return {node: signal_on_grid(efit_time, values, params.times) for node, values in signals.items()}
 
     @staticmethod
     @physics_method(columns=XPOINT_GAP_NODES, tokamak=Tokamak.D3D)
@@ -274,7 +273,7 @@ class D3DDatasetMethods:
             mask_no_xpoint = ~(signals[r_node] > 0)
             signals[r_node][mask_no_xpoint] = np.nan
             signals[z_node][mask_no_xpoint] = np.nan
-        return {node: held_signal_on_grid(efit_time, values, params.times) for node, values in signals.items()}
+        return {node: signal_on_grid(efit_time, values, params.times) for node, values in signals.items()}
 
     @staticmethod
     @physics_method(columns=[*IDA_RHO_COLUMNS, *IDA_PSI_COLUMNS], tokamak=Tokamak.D3D)

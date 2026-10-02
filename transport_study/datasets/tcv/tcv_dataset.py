@@ -10,7 +10,7 @@ from loguru import logger
 
 from transport_study import RADIAL_DIM, TIME_COORD
 from transport_study.datasets import make_uniform_1khz_timebase
-from transport_study.datasets.profile_grids import held_signal_on_grid
+from transport_study.datasets.profile_grids import signal_on_grid
 from transport_study.datasets.tcv import config
 from transport_study.datasets.tcv.profiles import (
     RHO_TOR_NORM_DEFINITION,
@@ -283,10 +283,10 @@ class TCVDataWorkflow(RawFileWorkflow):
             return None
         timebase = make_uniform_1khz_timebase(ip.time[mask_ip_valid].max())
 
-        # Every signal is held from its last sample, so no time draws on a later one
+        # Every signal is placed causally (signal_on_grid), so no time draws on a later one
         data_vars: dict[str, tuple[tuple[str, ...], np.ndarray]] = {}
         for name, signal in signals.items():
-            values_on_timebase = held_signal_on_grid(signal.time, signal.values, timebase)
+            values_on_timebase = signal_on_grid(signal.time, signal.values, timebase)
             data_vars[name] = (("time",), values_on_timebase)
         equilibria = read_liuqe(meqdb_path(shot))
         profile_columns = {}

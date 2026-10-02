@@ -37,7 +37,7 @@ INNER_WALL = 1.05  # Location of the inner wall, used to calculate minor radius 
 
 # Everything is fetched through one disruption-py call per shot, all EFIT signals from the shot's DISPY run
 RUN_METHODS = [
-    # custom methods from physics_methods.py, every one held onto the timebase rather than interpolated
+    # custom methods from physics_methods.py, every one placed on the timebase causally (signal_on_grid) rather than interpolated
     "get_plasma_current",  # ip, ip_prog
     "get_efit_scalars",  # wmhd, beta_n
     "get_ptdata_parameters",  # bt, dssneped, PCS programmed waveforms

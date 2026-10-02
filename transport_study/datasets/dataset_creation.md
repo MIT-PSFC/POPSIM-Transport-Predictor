@@ -3,9 +3,10 @@ IMAS names in SI units on `(shot, time_idx[, rho_tor_norm])`, with `time` on `(s
 The studies convert to their working units on load (`signals.convert_to_working_units`).
 
 Every stored value is causal, no time draws on a later sample.
-A 0D signal slower than the 1 kHz grid is held forward from its last finite sample
-for at most 1.5 of its own median sample steps (`profile_grids.held_signal_on_grid`), never interpolated,
-smoothing is a trailing boxcar, and derivatives are backward differences.
+A 0D signal is never interpolated onto the 1 kHz grid (`profile_grids.signal_on_grid`).
+One sampled faster than the grid is averaged over each grid step, time t taking the mean of (t - 1 ms, t].
+One sampled slower is held forward from its last finite sample for at most 1.5 of its own median sample steps.
+Smoothing is a trailing boxcar, and derivatives are backward differences.
 The one exception is DIII-D `power_radiated`, smoothed non-causally at the source.
 b0 is the vacuum field at geometric_axis_r on every device,
 power_radiated the total radiated power including the divertor,
@@ -71,7 +72,7 @@ The OMEGA system MDSplus cannot import under numpy >= 2, so disruption-py falls 
 with the login PYTHONPATH left as it is.
 Everything comes from one `get_shots_data` call per shot, through the custom methods in `d3d/physics_methods.py`.
 The disruption-py built-ins interpolate onto the timebase, so the EFIT scalars and Ip are read by custom methods too,
-and every signal is held onto the timebase instead:
+and every signal is placed on the timebase causally instead (`signal_on_grid`, averaged per grid step when faster, held when slower):
 
 - EFIT: every EFIT signal comes from the shot's latest code_rundb run tagged `DISPY` (the 1 kHz disruption-efit).
   A shot without one, or whose EFIT is slower than 1 kHz, is skipped (`DispyEfitNicknameSetting`, `Uniform1kHzTimeSetting`).
