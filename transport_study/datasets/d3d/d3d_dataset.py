@@ -321,20 +321,8 @@ class D3DDataWorkflow(RawFileWorkflow):
     }
 
     # The filter spec of every device store (RawFileWorkflow.filter_ds), SI units
-    min_filter: ClassVar[dict[str, float]] = {
-        "ip": 2e5,
-        "energy_mhd": 1e4,
-        # Deep limited rampdowns (199243, 199244, 203460) carry the worst stored energy glitches
-        "elongation": 1.3,
-        # EFIT saturates at exactly 1 for runs of slices (204191, 203535, 203530)
-        "triangularity_upper": -0.99,
-        "triangularity_lower": -0.99,
-    }
-    max_filter: ClassVar[dict[str, float]] = {
-        "greenwald_fraction": 2.0,
-        "triangularity_upper": 0.99,
-        "triangularity_lower": 0.99,
-    }
+    min_filter: ClassVar[dict[str, float]] = {"ip": 2e5, "energy_mhd": 1e4}
+    max_filter: ClassVar[dict[str, float]] = {"greenwald_fraction": 2.0}
     # The EFIT P_oh stays below 0.6 MW through the ramp-up and above 2 MW only at disruptive terminations
     transient_filter: ClassVar[dict[str, float]] = {"power_ohm": 2e6}
     # ip reads near 0 out to the 8 s end of the timebase, so the end is the last ip above its threshold

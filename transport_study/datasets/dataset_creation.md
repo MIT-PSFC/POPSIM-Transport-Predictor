@@ -40,7 +40,7 @@ Powers are clipped at 0 after filtering.
 | max power_radiated | | 4 MW | | |
 | transient power_ohm | 5 MW | 5 MW | 2 MW | |
 | transient power_radiated | 5.5 MW | 3 MW | | |
-| device geometry | | | elongation >= 1.3, \|triangularity\| <= 0.99 | minor_radius >= 0.15 m, elongation >= 0.9 |
+| device geometry | | | | minor_radius >= 0.15 m, elongation >= 0.9 |
 | end_margin | 20 ms | 40 ms | 50 ms | 50 ms |
 | min_pulse_length | 0.5 s | 0.2 s | 0.5 s | 0.5 s |
 | min_radiated_fraction | 0.01 | 0.025 | 0.025 | 0.025 |
@@ -122,13 +122,14 @@ DIII-D specifics of the filter spec (`D3DDataWorkflow`):
 - The P_oh transient is a 5 ms boxcar above 2 MW.
   The EFIT P_oh stays below 0.6 MW through the ramp-up and only crosses 2 MW at disruptive terminations.
   P_rad has no transient threshold, since values up to 16 MW occur mid-shot in high-power shots.
-- Elongation below 1.3 (deep limited rampdowns 199243, 199244, 203460, the worst stored energy glitches)
-  and a triangularity at the EFIT saturation (|delta| > 0.99, 204191, 203535, 203530) are gaps.
 - `excluded_shots` in `d3d/config.toml` culls 203549, 203551 and 203554,
   failed beam shots with HFS pellets from run 20250529 (see the logbook).
 - Known and kept as is:
   - The DISPY EFIT scalars carry single-slice spikes (Wtot and triangularity).
     EFIT chisq does not flag them, and they are not median-filtered.
+    Triangularity also saturates at exactly 1 for a few ms at a time (runs up to 138 ms in 204191),
+    and deep limited rampdowns (elongation ~1.2, 199243, 199244, 203460) carry the largest Wtot spikes.
+    Neither is filtered, since every filtered slice is a gap that splits the shot.
   - The first ~80 ms of the TMDB_V1c IDA-lite records (0.11-0.2 s, Ip ~0.4 MA) are often hollow in both Te and ne.
     They are kept as ramp-up data.
 disruption-py writes no netCDF (its output setting has `path=False`), only a small `config.json` per call
