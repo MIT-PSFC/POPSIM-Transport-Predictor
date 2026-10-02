@@ -16,6 +16,7 @@ from transport_study.datasets.tcv.profiles import (
     RHO_TOR_NORM_DEFINITION,
     RHO_TOR_NORM_GRID,
     defuse_profile_on_grid,
+    liuqe_usable,
 )
 from transport_study.datasets.tcv.sources import (
     defuse_path,
@@ -58,7 +59,7 @@ MAGNITUDE_SIGNALS = ("ip", "b0")
 BZERO_REFERENCE_R = 0.88
 
 # DEFUSE signals power_ohm is computed from (ohmic_power), DEFUSE POHM has no documented definition
-OHMIC_POWER_SOURCES = ("I_P", "Vloop", "LI", "RMAG")
+OHMIC_POWER_SOURCES = ("I_P", "Vloop", "LI", "R_geom")
 # DEFUSE Vloop has the opposite sign convention to I_P:
 # Ip * Vloop is negative at flat-top on all 39 shots checked, of both current polarities
 DEFUSE_VLOOP_SIGN = -1.0
@@ -70,11 +71,14 @@ DEFUSE_PROFILE_SIGNALS = ("Te_rho", "Ne_rho")
 # The profile gradients are taken on the DEFUSE fit points, under the profile's name with this suffix
 DEFUSE_GRADIENT_SUFFIX = "_grad"
 DEFUSE_PROFILE_COLUMNS = (*DEFUSE_PROFILE_SIGNALS, *(f"{name}{DEFUSE_GRADIENT_SUFFIX}" for name in DEFUSE_PROFILE_SIGNALS))
+# Every DEFUSE signal a store signal is read from
+PREDICTION_RAW_NAMES = tuple(raw_name for raw_name, _ in PREDICTION_SOURCES.values())
 # Every DEFUSE 0D signal read from an export
 DEFUSE_SIGNALS = (
-    *(raw_name for raw_name, _ in PREDICTION_SOURCES.values() if raw_name not in DEFUSE_PROFILE_COLUMNS),
+    *(raw_name for raw_name in PREDICTION_RAW_NAMES if raw_name not in DEFUSE_PROFILE_COLUMNS),
     *(raw_name for raw_names in HEATING_SOURCES_MW.values() for raw_name in raw_names),
-    *(raw_name for raw_name in OHMIC_POWER_SOURCES if raw_name != "I_P"),
+    # I_P and R_geom are store signals already
+    *(raw_name for raw_name in OHMIC_POWER_SOURCES if raw_name not in PREDICTION_RAW_NAMES),
 )
 
 # The raw timebase ends at the last time the plasma current magnitude exceeds this [A]
@@ -136,7 +140,7 @@ TCV_SIGNAL_ATTRS = {
     "power_ohm": {
         "description": (
             "Ohmic heating power, Ip * V_loop minus the rate of change of the internal poloidal magnetic energy "
-            "mu0 R li Ip^2 / 4 (DEFUSE I_P, Vloop, LI, RMAG), causal (backward difference, trailing 5 ms boxcar), clipped at 0"
+            "mu0 R0 li Ip^2 / 4 (DEFUSE I_P, Vloop, LI, R_geom), causal (backward difference, trailing 5 ms boxcar), clipped at 0"
         ),
         "ref": "/summary/global_quantities/power_ohm/value",
     },
@@ -289,9 +293,11 @@ class TCVDataWorkflow(RawFileWorkflow):
             values_on_timebase = signal_on_grid(signal.time, signal.values, timebase)
             data_vars[name] = (("time",), values_on_timebase)
         equilibria = read_liuqe(meqdb_path(shot))
+        # Each reconstruction builds a Phi_N map to be judged, so only once per shot
+        mask_eq_usable = liuqe_usable(equilibria)
         profile_columns = {}
         for name, profile in profiles.items():
-            values_on_grid, gradient_on_grid = defuse_profile_on_grid(profile, equilibria, timebase)
+            values_on_grid, gradient_on_grid = defuse_profile_on_grid(profile, equilibria, mask_eq_usable, timebase)
             profile_columns[name] = values_on_grid
             profile_columns[f"{name}{DEFUSE_GRADIENT_SUFFIX}"] = gradient_on_grid
         # A time keeps its profiles only where both fits exist,
@@ -360,7 +366,7 @@ class TCVDataWorkflow(RawFileWorkflow):
         xr.Dataset | None
             Store signals, or None if a required DEFUSE signal is missing or a critical signal is all NaN
         """
-        raw_required = [raw_name for raw_name, _ in PREDICTION_SOURCES.values()] + list(OHMIC_POWER_SOURCES)
+        raw_required = {*PREDICTION_RAW_NAMES, *OHMIC_POWER_SOURCES}
         missing = sorted(raw_name for raw_name in raw_required if raw_name not in ds)
         if missing:
             logger.warning(f"Shot {ds['shot'].item()}: missing DEFUSE signals {missing}, skipping shot.")
@@ -427,8 +433,8 @@ def _ohmic_power(ds: xr.Dataset) -> xr.DataArray:
     v_loop_defuse = ds["Vloop"].isel(shot=0).values
     v_loop = DEFUSE_VLOOP_SIGN * v_loop_defuse
     li = ds["LI"].isel(shot=0).values
-    r_axis = ds["RMAG"].isel(shot=0).values
-    p_ohm_raw = ohmic_power(times, ip, v_loop, li, r_axis)
+    major_radius = ds["R_geom"].isel(shot=0).values
+    p_ohm_raw = ohmic_power(times, ip, v_loop, li, major_radius)
     time_steps = np.diff(times)
     dt = float(np.median(time_steps))
     p_ohm = trailing_boxcar_mean(p_ohm_raw, OHMIC_POWER_SMOOTHING_WINDOW, dt)

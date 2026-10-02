@@ -57,7 +57,8 @@ def _profile_on_grid() -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     equilibria = LiuqeEquilibria(time=eq_time, rho_pol=RHO_POL_SURFACES, inverse_q=inverse_q)
 
     times = np.arange(0, 400) * 1e-3
-    values_on_grid, gradient_on_grid = defuse_profile_on_grid(profile, equilibria, times)
+    mask_eq_usable = liuqe_usable(equilibria)
+    values_on_grid, gradient_on_grid = defuse_profile_on_grid(profile, equilibria, mask_eq_usable, times)
     return values_on_grid, gradient_on_grid, times
 
 
@@ -167,7 +168,6 @@ RAW_SCALAR_VALUES = {
     # Opposite sign to I_P, as DEFUSE stores it, so Ip * Vloop is 0.3 MW of ohmic power
     "Vloop": 1.0,
     "LI": 1.0,
-    "RMAG": 0.9,
     "PradTot": 1e5,
     "NBI": 0.5,
     "ECRH": 1.2,

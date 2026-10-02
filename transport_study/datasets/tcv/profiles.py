@@ -70,7 +70,9 @@ def liuqe_usable(equilibria: LiuqeEquilibria) -> np.ndarray:
     return mappable_q_profiles(psi_n_surfaces, q_surfaces)
 
 
-def defuse_profile_on_grid(profile: DefuseProfile, equilibria: LiuqeEquilibria, times: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+def defuse_profile_on_grid(
+    profile: DefuseProfile, equilibria: LiuqeEquilibria, mask_eq_usable: np.ndarray, times: np.ndarray
+) -> tuple[np.ndarray, np.ndarray]:
     """One DEFUSE profile and its d/drho_tor_norm gradient on RHO_TOR_NORM_GRID, held onto the timebase.
 
     Each slice maps to rho_tor_norm through the nearest usable reconstruction no farther than match_max_ms away,
@@ -84,6 +86,7 @@ def defuse_profile_on_grid(profile: DefuseProfile, equilibria: LiuqeEquilibria, 
     Args:
         profile: The DEFUSE fit, at least two slices.
         equilibria: The shot's LIUQE reconstructions.
+        mask_eq_usable: (n_eq,) liuqe_usable of equilibria, computed once per shot.
         times: (n_t,) timebase [s].
 
     Returns:
@@ -97,7 +100,6 @@ def defuse_profile_on_grid(profile: DefuseProfile, equilibria: LiuqeEquilibria, 
         raise ValueError(f"DEFUSE profile has {num_slices} slice(s), at least two are needed to set the hold")
 
     # Nearest usable reconstruction of each slice
-    mask_eq_usable = liuqe_usable(equilibria)
     eq_distance = np.abs(equilibria.time[np.newaxis, :] - profile.time[:, np.newaxis])
     eq_distance[:, ~mask_eq_usable] = np.inf
     eq_nearest = np.argmin(eq_distance, axis=1)

@@ -35,11 +35,12 @@ def ohmic_power(
     ip: np.ndarray,
     v_loop: np.ndarray,
     li: np.ndarray,
-    r_axis: np.ndarray,
+    major_radius: np.ndarray,
 ) -> np.ndarray:
     """Ohmic power P_oh = Ip V_loop - dW_pol/dt, causal.
 
-    The internal poloidal field energy is W_pol = L_i Ip^2 / 2 with L_i = mu0 R li / 2.
+    The internal poloidal field energy is W_pol = L_i Ip^2 / 2 with L_i = mu0 R0 li / 2,
+    R0 the geometric major radius.
     dW_pol/dt is a backward difference, so no sample draws on a later one,
     and the first sample is NaN.
     The sign of Ip and V_loop cancels as long as they share a convention.
@@ -49,12 +50,12 @@ def ohmic_power(
         ip: (n,) plasma current [A].
         v_loop: (n,) loop voltage [V].
         li: (n,) internal inductance.
-        r_axis: (n,) major radius of the magnetic axis [m].
+        major_radius: (n,) major radius of the geometric center of the boundary [m].
 
     Returns:
         (n,) ohmic power [W].
     """
-    w_pol = MU0 * r_axis * li * ip**2 / 4.0
+    w_pol = MU0 * major_radius * li * ip**2 / 4.0
     dw_pol = np.diff(w_pol, prepend=np.nan)
     dt = np.diff(times, prepend=np.nan)
     dw_pol_dt = dw_pol / dt

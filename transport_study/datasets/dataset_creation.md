@@ -151,7 +151,7 @@ and the LIUQE reconstructions of the MEQ databases (`TCV{shot}_meqdb.mat`), both
   A heating system a shot does not have is an empty placeholder in its export and counts as zero.
 - `power_radiated` is `PradTot`, the total including the divertor like DIII-D and MAST.
   `PradBulk`, the confined plasma only, is 0.43 of it at the median over 81 shots (0.27-0.69 for 5-95 percent).
-- `power_ohm` is computed, Ip V_loop - d/dt(mu0 R li Ip^2 / 4) from DEFUSE `I_P`, `Vloop`, `LI` and `RMAG`
+- `power_ohm` is computed, Ip V_loop - d/dt(mu0 R0 li Ip^2 / 4) from DEFUSE `I_P`, `Vloop`, `LI` and the geometric major radius `R_geom`
   (`zero_d_signals.ohmic_power`), then smoothed by a trailing 5 ms boxcar, as on C-Mod.
   DEFUSE `Vloop` has the opposite sign to `I_P` (Ip Vloop < 0 at flat-top on 39 of 39 shots of both polarities), so it is flipped.
   DEFUSE `POHM` has no documented definition and reads 0.9-1.0 of Ip Vloop at flat-top.

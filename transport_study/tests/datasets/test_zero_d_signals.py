@@ -102,9 +102,9 @@ def test_ohmic_power_current_ramp_matches_the_backward_difference_closed_form():
     ip = 5e5 + ip_ramp_rate * times
     v_loop = np.full(times.size, 1.5)
     li = np.full(times.size, 1.2)
-    r_axis = np.full(times.size, 0.68)
+    major_radius = np.full(times.size, 0.68)
 
-    p_ohm = ohmic_power(times, ip, v_loop, li, r_axis)
+    p_ohm = ohmic_power(times, ip, v_loop, li, major_radius)
 
     dw_pol_dt = MU0 * 0.68 * 1.2 / 4.0 * ip_ramp_rate * (ip[1:] + ip[:-1])
     expected = ip[1:] * v_loop[1:] - dw_pol_dt
