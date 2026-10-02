@@ -338,6 +338,8 @@ class D3DDataWorkflow(RawFileWorkflow):
     end_margin_s: ClassVar[float] = 0.05
     min_pulse_length_s: ClassVar[float] = 0.5
     min_radiated_fraction: ClassVar[float] = 0.025
+    # More radiated than put in, the same physical ceiling as the other devices (not checked on DIII-D data)
+    max_radiated_fraction: ClassVar[float] = 1.0
     density_ratio_bounds: ClassVar[tuple[float, float]] = (0.7, 1.3)
 
     def __init__(

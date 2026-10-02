@@ -257,8 +257,10 @@ class RawFileWorkflow(DataWorkflow):
     end_margin_s: ClassVar[float]
     # Shortest kept segment [s]
     min_pulse_length_s: ClassVar[float]
-    # Shot mean power_radiated over mean input power (ohmic plus heating) below this is a dead bolometer
+    # Shot mean power_radiated over mean input power (ohmic plus heating) below this is a dead bolometer,
+    # and above max_radiated_fraction more is radiated than put in
     min_radiated_fraction: ClassVar[float]
+    max_radiated_fraction: ClassVar[float]
     # Bounds on the shot median, over fresh profile slices, of mean(n_e for rho_tor_norm <= 1) / n_e_line_average.
     # The ratio is a proxy for the chord integral, and the bounds absorb its offset on each device.
     density_ratio_bounds: ClassVar[tuple[float, float]]
@@ -447,13 +449,14 @@ class RawFileWorkflow(DataWorkflow):
         return True
 
     def radiated_fraction_cull(self, ds: xr.Dataset) -> bool:
-        """True if the radiated power is too far below the input power, a dead bolometer (radiated_fraction_reason)."""
+        """True if the radiated power is too far below the input power, a dead bolometer,
+        or above it, more radiated than put in (radiated_fraction_reason)."""
         shot_id = ds[EPISODE_DIM].values[0]
         ds_shot = ds.squeeze(EPISODE_DIM, drop=True)
-        reason = radiated_fraction_reason(ds_shot, self.min_radiated_fraction)
+        reason = radiated_fraction_reason(ds_shot, self.min_radiated_fraction, self.max_radiated_fraction)
         if reason is None:
             return False
-        logger.info(f"Culling shot {shot_id}: {reason}, the bolometer record is broken or missing")
+        logger.info(f"Culling shot {shot_id}: {reason}, a bolometer or input power record is broken or missing")
         return True
 
     def density_ratio_cull(self, ds: xr.Dataset) -> bool:

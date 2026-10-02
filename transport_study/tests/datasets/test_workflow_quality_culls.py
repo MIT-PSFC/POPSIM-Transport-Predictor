@@ -1,6 +1,6 @@
 """Tests for the quality culls of the raw-file workflows.
 
-radiated_fraction_cull catches a dead bolometer,
+radiated_fraction_cull catches a dead bolometer and more radiated than put in,
 and density_ratio_cull catches profiles that disagree with the interferometer.
 Both run in RawFileWorkflow.cull_shot on every device, with per-device thresholds.
 """
@@ -30,12 +30,17 @@ def _processed(workflow, ds):
 
 
 def test_dead_bolometer_culled_and_live_one_kept(tcv_workflow, logged):
-    """1 kW radiated on 300 kW of ohmic input is a dead bolometer, 100 kW is a live one."""
+    """1 kW radiated on 300 kW of ohmic input is a dead bolometer, 100 kW is a live one,
+    and 400 kW radiates more than is put in."""
     assert tcv_workflow.radiated_fraction_cull(raw_shot()) is False
 
     shot_dead_bolometer = raw_shot(power_radiated=np.full((1, N_T), 1e3))
     assert tcv_workflow.radiated_fraction_cull(shot_dead_bolometer) is True
-    assert any("bolometer record is broken or missing" in msg for msg in logged), logged
+    assert any("below the 2.5 percent floor" in msg for msg in logged), logged
+
+    shot_over_radiating = raw_shot(power_radiated=np.full((1, N_T), 4e5))
+    assert tcv_workflow.radiated_fraction_cull(shot_over_radiating) is True
+    assert any("above the 100 percent ceiling" in msg for msg in logged), logged
 
 
 def test_profiles_disagreeing_with_interferometer_culled(tcv_workflow, logged):
