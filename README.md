@@ -134,7 +134,7 @@ The C-Mod and MAST datasets are built from the published stores of [transport-va
 
 I run the training orchestration on an interactive node on a compute cluster (either Engaging or OMEGA). This is convenient for testing because whenever something breaks I can just run the study serially to step through the logic with a debugger.
 
-For installation, a simple `uv sync` should work, and `uv sync --group gpu` adds the CUDA 13 JAX plugin for GPU nodes. With that plugin installed, anything that imports JAX hangs on a node without a GPU unless `JAX_PLATFORMS=cpu` is set (the test suite's conftest sets it automatically).
+For installation, run `git submodule update --init` (popsim, torax and transport-validation-datasets install from their submodules), then a simple `uv sync` should work, and `uv sync --group gpu` adds the CUDA 13 JAX plugin for GPU nodes. With that plugin installed, anything that imports JAX hangs on a node without a GPU unless `JAX_PLATFORMS=cpu` is set (the test suite's conftest sets it automatically).
 
 # Generative AI Disclosure
 

@@ -50,7 +50,7 @@ Device sources
     -> organize_data.py
         - get_ds(source, study_type) converts to working units and selects per-study signal prep
         - Concatenate shots, train/val/test split (80/20)
-    -> POPSIM module training (submodules/popsim/)
+    -> POPSIM module training (submodules/popsim-public/)
         - Input normalization happens INSIDE the modules (see below)
     -> study.py orchestration (cases, W&B sweeps, SLURM)
     -> analysis / plotting
@@ -105,13 +105,14 @@ Two kinds of device workflow: `PublishedStoreWorkflow` (C-Mod, MAST) builds the 
 - `transport_study/modules/profile_trajectory/`, `transport_study/trajectory_optimization/` - OUT OF SCOPE, do not extend
 - `submodules/popsim-public/` - Core ML framework (TimeDep/TimeIndep modules, trainer, envs, checkpointing)
 - `submodules/torax/` - Google TORAX transport model integration
+- `submodules/transport-validation-datasets/` - Builds the C-Mod and MAST stores, and holds the dataset logic every device shares (time grid, holds, rho_tor_norm map, 0D helpers, filter spec), which `transport_study/datasets/` imports
 
 ### Config
 
 - `transport_study/config.py`: `StudyConfig` (Pydantic, frozen, global one-shot proxy `config`), reads `PTPS_*` env vars
 - `orchestration/study.py`: `CaseGridConfig(StudyConfig)` shared base for study configs (training_datasets, domain_adaptation_methods, target_test_set_size, hyperparam_domain_adaptation, hyperparam_num_target_shots, dataset_fractions, from_toml/save) plus the shared `is_compatible` config-lock check, which compares study identity and the hyperparam fields listed in the per-study `COMPAT_HYPERPARAM_FIELDS` ClassVar (case-grid axes like model_types may differ between runs); each study nests its own `Config(CaseGridConfig)` adding model_types and its study-specific hyperparam fields. `HYPERPARAM_TARGET_SHOTS` also lives in study.py (power_balance_study re-exports it)
 - Per-device `config.toml` files in each dataset subfolder
-- `pyproject.toml`: dependencies, build (hatchling), tooling config. disruption-py is pinned to the PyPI 0.14.0, and `[tool.uv] override-dependencies` sets numpy to popsim's range over disruption-py's numpy<2 pin
+- `pyproject.toml`: dependencies, build (hatchling), tooling config. popsim, torax and transport-validation-datasets install editable from their submodules (`[tool.uv.sources]`), so a clone needs `git submodule update --init` before `uv sync`. disruption-py is pinned to the PyPI 0.14.0, and `[tool.uv] override-dependencies` sets numpy to popsim's range over disruption-py's numpy<2 pin
 - GPU group: `uv sync --group gpu` for JAX CUDA 13 support
 
 ### Data Schema

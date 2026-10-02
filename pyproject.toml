@@ -18,6 +18,7 @@ dependencies = [
     "dynaconf>=3.2.12",
     "wandb>=0.25.0",
     "toml>=0.10.2",
+    "transport-validation-datasets",
 ]
 
 [dependency-groups]
@@ -49,6 +50,7 @@ packages = ["transport_study"]
 [tool.uv.sources]
 popsim = { path = "./submodules/popsim-public", editable = true }
 torax = { path = "./submodules/torax", editable = true }
+transport-validation-datasets = { path = "./submodules/transport-validation-datasets", editable = true }
 
 [tool.hatch.build.targets.sdist]
 include = ["transport_study"]

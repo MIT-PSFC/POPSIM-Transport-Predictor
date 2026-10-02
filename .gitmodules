@@ -4,3 +4,7 @@
 [submodule "submodules/popsim-public"]
 	path = submodules/popsim-public
 	url = git@github.com:MIT-PSFC/POPSIM-Public.git
+[submodule "submodules/transport-validation-datasets"]
+	path = submodules/transport-validation-datasets
+	url = git@github.com:MIT-PSFC/transport-validation-datasets.git
+	branch = zk/uniform
