@@ -32,6 +32,8 @@ Every check cuts the times it fails out as a gap:
   `greenwald_fraction` = n_e_line_average / n_GW with n_GW = Ip / (pi a^2) is derived for the max filter and not stored
 - a `transient_filter` signal above its threshold after a centered 5 ms boxcar,
   which only selects times and smooths no stored value
+- the 20 ms before any failed time short of the end-of-shot cut (`FAILURE_MARGIN`),
+  since the non-causally smoothed P_oh and P_rad rise ahead of the event that ends a segment
 
 Only the longest contiguous segment is kept, and a shot is culled when that segment spans less than `min_pulse_length`,
 its mean P_rad is below `min_radiated_fraction` of its mean input power (a dead bolometer),
@@ -47,11 +49,12 @@ with the transients shaded red, the end-of-shot cut, the thresholds, and dots wh
 | --- | --- | --- | --- | --- |
 | min ip | 100 kA | 210 kA | 200 kA | 50 kA |
 | min energy_mhd | 2.7 kJ | 5 kJ | 10 kJ | 1 kJ |
+| min n_e_line_average | | | 5e17 m^-3 | |
 | max greenwald_fraction | 2.0 | 2.0 | 2.0 | 2.0 |
 | max power_radiated | | 4 MW | | |
 | transient power_ohm | 5 MW | 5 MW | 2 MW | |
 | transient power_radiated | 5.5 MW | 3 MW | | |
-| device geometry | | | elongation >= 1.3, \|triangularity\| <= 0.99 | minor_radius >= 0.15 m, elongation >= 0.9 |
+| device geometry | | | | minor_radius >= 0.15 m, elongation >= 0.9 |
 | end_margin | 20 ms | 40 ms | 50 ms | 50 ms |
 | min_pulse_length | 0.5 s | 0.2 s | 0.5 s | 0.5 s |
 | min_radiated_fraction | 0.01 | 0.025 | 0.025 | 0.025 |
@@ -112,8 +115,8 @@ and every signal is placed on the timebase causally instead (`signal_on_grid`, a
 - `n_e_line_average` is `\density` of the DISPY tree, or the PCS estimate `dssdenest` where the tree has none (199264),
   which matches `\density` within 1 percent where both exist.
   disruption-py's `get_density_parameters` is not used, since it falls back to `\denv2`, which reads about 3x higher.
-  Interferometer fringe jumps (201907, 199126) were dropped by the old absolute range filter (2e20 m^-3),
-  whether the Greenwald fraction max catches them is to be checked.
+  A gained fringe count (201907, up to 3.9e20) is caught by the Greenwald fraction max,
+  and a lost one (199126, down to -1.7e20) by the 5e17 floor.
 - `power_ohm` is `poh` of the DISPY EFIT, Ip V_surf - dW_pol/dt with V_surf = -2 pi dpsi_bdy/dt.
   EFIT takes both derivatives (PSIBDYDOT, WBDOT) as centered least-squares slopes over +-100 ms,
   so each sample draws on slices up to 100 ms later, and it is not smoothed further.
@@ -146,13 +149,17 @@ DIII-D specifics of the filter spec (`D3DDataWorkflow`):
 - The P_oh transient is a 5 ms boxcar above 2 MW.
   The EFIT P_oh stays below 0.6 MW through the ramp-up and only crosses 2 MW at disruptive terminations.
   P_rad has no transient threshold, since values up to 16 MW occur mid-shot in high-power shots.
-- Elongation below 1.3 (deep limited rampdowns 199243, 199244, 203460, the worst stored energy glitches)
-  and a triangularity at the EFIT saturation (|delta| > 0.99, 204191, 203535, 203530) are gaps.
+- n_e_line_average below 5e17 m^-3 is a gap.
+  Ramp-ups reach 1e18 (199121), single-slice dropouts in the rampdown read below 3e17 (201914, 201935, 203836, 204188),
+  and a lost fringe count drives it negative (199126 after 4.41 s), which the Greenwald fraction max lets through.
 - `excluded_shots` in `d3d/config.toml` culls 203549, 203551 and 203554,
   failed beam shots with HFS pellets from run 20250529 (see the logbook).
 - Known and kept as is:
   - The DISPY EFIT scalars carry single-slice spikes (Wtot and triangularity).
     EFIT chisq does not flag them, and they are not median-filtered.
+    Triangularity also saturates at exactly 1 for a few ms at a time (runs up to 138 ms in 204191),
+    and deep limited rampdowns (elongation ~1.2, 199243, 199244, 203460) carry the largest Wtot spikes.
+    Neither is filtered, since every filtered slice is a gap that splits the shot.
   - The first ~80 ms of the TMDB_V1c IDA-lite records (0.11-0.2 s, Ip ~0.4 MA) are often hollow in both Te and ne.
     They are kept as ramp-up data.
 disruption-py writes no netCDF (its output setting has `path=False`), only a small `config.json` per call

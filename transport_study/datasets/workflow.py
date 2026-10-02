@@ -512,6 +512,7 @@ class RawFileWorkflow(DataWorkflow):
         """Cut a shot down to its one longest valid segment.
 
         The grid times that fail the per-time checks of the filter spec (slice_filter_mask) are gaps,
+        each with the FAILURE_MARGIN before it,
         and only the longest contiguous segment of what passes is kept (keep_longest_segment).
 
         Returns:

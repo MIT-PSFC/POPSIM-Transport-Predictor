@@ -8,6 +8,7 @@ so these build a synthetic raw shot instead and exercise the TCV implementation 
 
 import numpy as np
 import pytest
+from transport_validation_datasets.filters import FAILURE_MARGIN
 
 from transport_study.signals import PREDICTION_STORE_NAME
 from transport_study.tests.datasets.synthetic_shot import N_T, SHOT, raw_shot
@@ -56,7 +57,8 @@ def test_filter_ds_ends_before_the_plasma_current_termination(tcv_workflow):
 
 def test_filter_ds_cuts_nan_and_max_failures_as_gaps(tcv_workflow):
     """A NaN power_radiated sample and a Greenwald fraction over its maximum are gaps,
-    and only the longest segment between them is kept."""
+    and only the longest segment between them is kept.
+    It ends FAILURE_MARGIN before the Greenwald failure, and its start after the NaN is not moved."""
     power_radiated = np.full((1, N_T), 1e5)
     power_radiated[0, 300] = np.nan
     # n_GW of 0.3 MA in a 0.24 m minor radius is ~1.7e20 m^-3, so 5e20 is a Greenwald fraction near 3
@@ -67,13 +69,13 @@ def test_filter_ds_cuts_nan_and_max_failures_as_gaps(tcv_workflow):
 
     time_ms = np.round(filtered["time"].values * 1000).astype(int)
     assert time_ms[0] == 301
-    assert time_ms[-1] == 899
+    assert time_ms[-1] == 899 - round(FAILURE_MARGIN * 1e3)
     assert np.all(np.diff(time_ms) == 1)
 
 
 def test_filter_ds_cuts_a_transient_out_and_keeps_the_longest_segment(tcv_workflow, monkeypatch):
     """A sustained power_ohm excursion over its transient threshold is a gap from the first slice
-    whose centered 5 ms boxcar crosses the threshold, and the longer stretch before it is kept,
+    whose centered 5 ms boxcar crosses the threshold, and the longer stretch before it is kept up to FAILURE_MARGIN before that,
     while a single-slice spike the boxcar averages under the threshold is not a gap."""
     monkeypatch.setattr(tcv_workflow, "transient_filter", {"power_ohm": 2e6})
     power_ohm = np.full((1, N_T), 3e5)
@@ -84,5 +86,5 @@ def test_filter_ds_cuts_a_transient_out_and_keeps_the_longest_segment(tcv_workfl
 
     time_ms = np.round(filtered["time"].values * 1000).astype(int)
     # The boxcar at 999 holds two excursion slices, (3 x 0.3 + 2 x 5) / 5 = 2.18 MW, the first crossing
-    assert time_ms[-1] == 998
+    assert time_ms[-1] == 998 - round(FAILURE_MARGIN * 1e3)
     assert 500 in time_ms

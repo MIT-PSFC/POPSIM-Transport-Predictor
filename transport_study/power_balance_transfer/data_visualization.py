@@ -27,13 +27,13 @@ class DataVisualization(DataVisualizationBase):
         "zscore": [
             ["ip_MA_z", "energy_mhd_MJ_z"],
             ["geometric_axis_r_z", "minor_radius_z"],
-            ["n_e_line_average_1e20_z", "b0_z"],
+            ["n_e_line_average_1e20_z", "b_geo_z"],
             ["power_additional_MW_z", "elongation_z"],
         ],
         "coral": [
             ["ip_MA_coral", "elongation_coral"],
             ["geometric_axis_r_coral", "minor_radius_coral"],
-            ["n_e_line_average_1e20_coral", "b0_coral"],
+            ["n_e_line_average_1e20_coral", "b_geo_coral"],
             ["power_additional_MW_coral", "ip_MA_coral"],
         ],
         "physics-coral": [
