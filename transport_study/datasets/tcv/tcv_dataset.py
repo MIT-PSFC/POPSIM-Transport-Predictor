@@ -10,6 +10,7 @@ from loguru import logger
 from numpy.lib.stride_tricks import sliding_window_view
 from transport_validation_datasets.machine.generic import (
     EQUILIBRIUM_HOLD_FLOOR,
+    MU0,
     hold_onto_grid,
     make_uniform_1kHz_timebase,
     ohmic_power,
@@ -41,7 +42,6 @@ PREDICTION_SOURCES = {
     "ip": ("I_P", 1.0),
     "b0": ("BZERO", 1.0),
     "energy_mhd": ("Wtot", 1.0),
-    "beta_tor_norm": ("BETAN", 1.0),
     "n_e_line_average": ("NEavg", 1.0),
     "minor_radius": ("a_minor", 1.0),
     "geometric_axis_r": ("R_geom", 1.0),
@@ -67,7 +67,7 @@ R0 = 0.88
 
 # DEFUSE signals of the LIUQE reconstruction, BZERO (LIUQE rBt / r0) among them.
 # Each is held for at least EQUILIBRIUM_HOLD_FLOOR, so a few missing reconstructions are bridged.
-LIUQE_SOURCES = ("Wtot", "BETAN", "a_minor", "R_geom", "KAPPA", "DELTA_TOP", "DELTA_BOTTOM", "LI", "BZERO")
+LIUQE_SOURCES = ("Wtot", "Vol", "a_minor", "R_geom", "KAPPA", "DELTA_TOP", "DELTA_BOTTOM", "LI", "BZERO")
 # PradTot follows the Thomson cadence (~17 ms) but often skips one or two samples (33-50 ms steps),
 # or comes in bursts 50 ms apart (61056).
 # The 1.5-step hold left gaps that cut ~10 percent of the kept time, and 60 ms bridges both.
@@ -78,6 +78,10 @@ HOLD_FLOORS_S = {**dict.fromkeys(LIUQE_SOURCES, EQUILIBRIUM_HOLD_FLOOR), "PradTo
 
 # DEFUSE signals power_ohm is computed from (ohmic_power), DEFUSE POHM has no documented definition
 OHMIC_POWER_SOURCES = ("I_P", "Vloop", "LI", "R_geom")
+# DEFUSE signals beta_tor_norm is computed from (_normalized_beta) in the B_geo convention of every store.
+# DEFUSE BETAN normalizes beta_tor by the volume-averaged vacuum field and multiplies by |BZERO| at r0,
+# which reads a median 5.6 percent below it.
+NORMALIZED_BETA_SOURCES = ("Wtot", "Vol", "a_minor", "R_geom", "BZERO", "I_P")
 # DEFUSE Vloop has the opposite sign convention to I_P:
 # Ip * Vloop is negative at flat-top on all 39 shots checked, of both current polarities
 DEFUSE_VLOOP_SIGN = -1.0
@@ -91,8 +95,8 @@ PREDICTION_RAW_NAMES = tuple(raw_name for raw_name, _ in PREDICTION_SOURCES.valu
 DEFUSE_SIGNALS = (
     *(raw_name for raw_name in PREDICTION_RAW_NAMES if raw_name not in DEFUSE_PROFILE_COLUMNS),
     *(raw_name for raw_names in HEATING_SOURCES_MW.values() for raw_name in raw_names),
-    # I_P and R_geom are store signals already
-    *(raw_name for raw_name in OHMIC_POWER_SOURCES if raw_name not in PREDICTION_RAW_NAMES),
+    # The store signals among them are read already
+    *(raw_name for raw_name in (*OHMIC_POWER_SOURCES, *NORMALIZED_BETA_SOURCES) if raw_name not in PREDICTION_RAW_NAMES),
 )
 
 # The raw timebase ends at the last time the plasma current magnitude exceeds this [A]
@@ -137,7 +141,11 @@ TCV_SIGNAL_ATTRS = {
         "description": "Stored energy on the LIUQE timebase (DEFUSE Wtot)",
     },
     "beta_tor_norm": {
-        "description": "Normalized toroidal beta on the LIUQE timebase (DEFUSE BETAN)",
+        "description": (
+            "Normalized toroidal beta with B_geo, 100 beta_tor a B_geo / Ip[MA] with beta_tor = 2 mu0 <p> / B_geo^2, "
+            "<p> = 2 Wtot / (3 Vol) and B_geo = |BZERO| r0 / R_geom (DEFUSE Wtot, Vol, a_minor, R_geom, BZERO, I_P), "
+            "not DEFUSE BETAN"
+        ),
     },
     "n_e_line_average": {
         "description": (
@@ -236,13 +244,14 @@ class TCVDataWorkflow(RawFileWorkflow):
         # Bad interferometer data can pass an absolute density cap at low ip
         "greenwald_fraction": 2.0,
     }
-    transient_filter: ClassVar[dict[str, float]] = {}
+    # P_oh as on DIII-D. In 246 shots only 75026 has a 5 ms P_rad peak above 3 MW (12 MW).
+    transient_filter: ClassVar[dict[str, float]] = {"power_ohm": 2e6, "power_radiated": 5e6}
     end_margin_s: ClassVar[float] = 0.05
     min_pulse_length_s: ClassVar[float] = 0.5
     # TCV bolometry reads a few percent of the input power or more, a dead bolometer far less
     min_radiated_fraction: ClassVar[float] = 0.025
     # 5 of 246 shots radiate more than is put in, two by far (75026 4.1x with a 12 MW PradTot spike, 78926 1.7x),
-    # while the 99th percentile is 1.17. No transient threshold, it would only catch 75026.
+    # while the 99th percentile is 1.17.
     max_radiated_fraction: ClassVar[float] = 1.0
     density_ratio_bounds: ClassVar[tuple[float, float]] = (0.7, 1.3)
 
@@ -403,7 +412,7 @@ class TCVDataWorkflow(RawFileWorkflow):
         xr.Dataset | None
             Store signals, or None if a required DEFUSE signal is missing or a critical signal is all NaN
         """
-        raw_required = {*PREDICTION_RAW_NAMES, *OHMIC_POWER_SOURCES, "fresh_profile", "fresh_equilibrium"}
+        raw_required = {*PREDICTION_RAW_NAMES, *OHMIC_POWER_SOURCES, *NORMALIZED_BETA_SOURCES, "fresh_profile", "fresh_equilibrium"}
         missing = sorted(raw_name for raw_name in raw_required if raw_name not in ds)
         if missing:
             logger.warning(f"Shot {ds['shot'].item()}: missing DEFUSE signals {missing}, skipping shot.")
@@ -417,6 +426,7 @@ class TCVDataWorkflow(RawFileWorkflow):
             signals[store_name] = signal
         signals["r0"] = xr.full_like(ds["shot"], R0, dtype=float)
         signals["power_ohm"] = _ohmic_power(ds)
+        signals["beta_tor_norm"] = _normalized_beta(ds)
         signals["fresh_profile"] = ds["fresh_profile"]
         signals["fresh_equilibrium"] = ds["fresh_equilibrium"]
         power_zero = xr.zeros_like(ds["I_P"])
@@ -463,6 +473,22 @@ def _ohmic_power(ds: xr.Dataset) -> xr.DataArray:
     dt = float(np.median(time_steps))
     p_ohm = smoothed_power(p_ohm_raw, dt)
     return xr.DataArray(p_ohm[np.newaxis, :], dims=ds["I_P"].dims, coords=ds["I_P"].coords)
+
+
+def _normalized_beta(ds: xr.Dataset) -> xr.DataArray:
+    """Normalized toroidal beta with B_geo, from the LIUQE signals and I_P on the timebase.
+
+    beta_tor = 2 mu0 <p> / B_geo^2 with the volume-averaged pressure <p> = 2 Wtot / (3 Vol),
+    and beta_N = 100 beta_tor a B_geo / Ip[MA], the convention every store holds.
+    B_geo = |BZERO| R0 / R_geom carries LIUQE's vacuum field at R0 out to the geometric axis.
+    """
+    pressure_mean = 2.0 * ds["Wtot"] / (3.0 * ds["Vol"])
+    b_center_magnitude = abs(ds["BZERO"])
+    b_geo = b_center_magnitude * R0 / ds["R_geom"]
+    beta_tor = 2.0 * MU0 * pressure_mean / b_geo**2
+    ip_magnitude = abs(ds["I_P"])
+    ip_magnitude_ma = ip_magnitude / 1e6
+    return 100.0 * beta_tor * ds["a_minor"] * b_geo / ip_magnitude_ma
 
 
 def _sharp_shift_samples(density: np.ndarray, n_sharp: int) -> np.ndarray:

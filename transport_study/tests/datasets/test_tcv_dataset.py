@@ -211,10 +211,11 @@ RAW_SCALAR_VALUES = {
     "I_P": -3e5,
     "BZERO": -1.4,
     "Wtot": 3e4,
-    "BETAN": 1.5,
+    "Vol": 1.0,
     "NEavg": 3e19,
     "a_minor": 0.24,
-    "R_geom": 0.88,
+    # Off r0 = 0.88 m, so B_geo differs from |BZERO|
+    "R_geom": 0.85,
     "KAPPA": 1.5,
     "DELTA_TOP": 0.3,
     "DELTA_BOTTOM": 0.2,
@@ -261,8 +262,8 @@ def workflow(tmp_path) -> TCVDataWorkflow:
 
 
 def test_standardize_builds_store_signals_in_si(workflow):
-    """Magnitudes, MW heating to W with absent beams as zero, zero errors only where the profile exists,
-    and None when a DEFUSE signal is missing or a profile is all NaN."""
+    """Magnitudes, MW heating to W with absent beams as zero, beta_tor_norm with B_geo,
+    zero errors only where the profile exists, and None when a DEFUSE signal is missing or a profile is all NaN."""
     ds = workflow.standardize_signal_names(_raw_dataset())
 
     assert ds is not None
@@ -270,6 +271,8 @@ def test_standardize_builds_store_signals_in_si(workflow):
     assert ds.sizes["time_idx"] == N_TIME
     assert ds["ip"].isel(time_idx=0).item() == pytest.approx(3e5)
     assert ds["b0"].isel(time_idx=0).item() == pytest.approx(1.4)
+    # beta_N = 400 mu0 Wtot a / (3 Vol B_geo Ip[MA]) with B_geo = 1.4 T * 0.88 / 0.85
+    assert ds["beta_tor_norm"].isel(time_idx=0).item() == pytest.approx(2.7744, rel=1e-4)
     # Constant Ip, li and R leave Ip V_loop, from the second sample on (backward difference)
     assert ds["power_ohm"].isel(time_idx=10).item() == pytest.approx(3e5)
     assert ds["power_nbi"].isel(time_idx=0).item() == pytest.approx(0.5e6)

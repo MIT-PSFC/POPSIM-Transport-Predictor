@@ -20,6 +20,10 @@ The 0D equilibrium signals are placed from their own samples, so they can update
 Derivatives are backward differences, apart from those DIII-D's EFIT takes for `poh`.
 b0 is the vacuum toroidal field at the fixed major radius r0 on every device, as IMAS defines it.
 The study derives the field at the geometric axis on load, b_geo = b0 r0 / geometric_axis_r (`convert_to_working_units`).
+beta_tor_norm is normalized with B_geo on every device, in beta_tor = 2 mu0 <p> / B_geo^2 and in a B_geo / Ip,
+which is what the study's beta inversions assume, and not the IMAS b0 at r0.
+MAST efm and DIII-D EFIT store it so, C-Mod rebuilds it from EFIT betat (its betan takes the total field at the axis),
+and TCV computes it from LIUQE Wtot and Vol (DEFUSE BETAN normalizes by the volume-averaged vacuum field and BZERO).
 power_radiated is the total radiated power including the divertor,
 and power_ohm is Ip V_loop - dW_pol/dt.
 rho_tor_norm = sqrt(Phi_N), with Phi_N the integral of q over psi_N (`phi_n_map`),
@@ -56,8 +60,8 @@ with the transients shaded red, the end-of-shot cut, the thresholds, and dots wh
 | min energy_mhd | 2.7 kJ | 5 kJ | 10 kJ | 1 kJ |
 | min n_e_line_average | 1e19 m^-3 | 3e18 m^-3 | 5e17 m^-3 | 2e18 m^-3 |
 | max greenwald_fraction | 2.0 | 2.0 | 2.0 | 2.0 |
-| transient power_ohm | 5 MW | 5 MW | 2 MW | |
-| transient power_radiated | 5.5 MW | 3 MW | | |
+| transient power_ohm | 5 MW | 5 MW | 2 MW | 2 MW |
+| transient power_radiated | 5.5 MW | 3 MW | 17 MW | 5 MW |
 | end_margin | 20 ms | 40 ms | 50 ms | 50 ms |
 | min_pulse_length | 0.5 s | 0.2 s | 0.5 s | 0.5 s |
 | min_radiated_fraction | 0.01 | 0.025 | 0.025 | 0.025 |
@@ -153,7 +157,7 @@ DIII-D specifics of the filter spec (`D3DDataWorkflow`):
 - DIII-D ip reads near 0 out to the 8 s end of the timebase, which is why the end of the shot is the last |ip| above its threshold.
 - The P_oh transient is a 5 ms boxcar above 2 MW.
   The EFIT P_oh stays below 0.6 MW through the ramp-up and only crosses 2 MW at disruptive terminations.
-  P_rad has no transient threshold, since values up to 16 MW occur mid-shot in high-power shots.
+  The P_rad transient is a 5 ms boxcar above 17 MW, above the 16.0 MW the iteration_3 store reaches.
 - n_e_line_average below 5e17 m^-3 is a gap.
   Ramp-ups reach 1e18 (199121), single-slice dropouts in the rampdown read below 3e17 (201914, 201935, 203836, 204188),
   and a lost fringe count drives it negative (199126 after 4.41 s), which the Greenwald fraction max lets through.
@@ -185,7 +189,7 @@ and the LIUQE reconstructions of the MEQ databases (`TCV{shot}_meqdb.mat`), both
 - 0D signals: DEFUSE, SI apart from NBI, NBI2 and ECRH, which it stores in MW.
   Newer shots carry ECRH as one row per gyrotron, and the rows are summed.
   A heating system a shot does not have is an empty placeholder in its export and counts as zero.
-  The LIUQE signals (Wtot, BETAN, a_minor, R_geom, KAPPA, DELTA_TOP, DELTA_BOTTOM, LI, BZERO) are held for at least 10 ms.
+  The LIUQE signals (Wtot, Vol, a_minor, R_geom, KAPPA, DELTA_TOP, DELTA_BOTTOM, LI, BZERO) are held for at least 10 ms.
 - `power_radiated` is `PradTot`, the total including the divertor like DIII-D and MAST.
   `PradBulk`, the confined plasma only, is 0.43 of it at the median over 81 shots (0.27-0.69 for 5-95 percent).
   It follows the Thomson cadence (~17 ms) but often skips one or two samples, leaving 33-50 ms steps,
@@ -201,6 +205,10 @@ and the LIUQE reconstructions of the MEQ databases (`TCV{shot}_meqdb.mat`), both
   DEFUSE `Vloop` has the opposite sign to `I_P` (Ip Vloop < 0 at flat-top on 39 of 39 shots of both polarities), so it is flipped.
   DEFUSE `POHM` has no documented definition and reads 0.9-1.0 of Ip Vloop at flat-top.
 - `b0` is `BZERO`, LIUQE's rBt / r0 with r0 = 0.88 m.
+- `beta_tor_norm` is computed on the timebase, 100 beta_tor a B_geo / Ip[MA] with beta_tor = 2 mu0 <p> / B_geo^2,
+  <p> = 2 Wtot / (3 Vol) and B_geo = |BZERO| r0 / R_geom (`_normalized_beta`).
+  DEFUSE `BETAN` is LIUQE's, which normalizes beta_tor by the volume-averaged vacuum field and multiplies by |BZERO| at r0,
+  and reads a median 5.6 percent below the B_geo value.
 - Profiles: the DEFUSE Te/ne fits, which are on rho_pol = sqrt(psi_N), not rho_tor_norm
   (the raw Thomson positions match sqrt(psi_N) of LIUQE within 0.006, and miss rho_tor_norm by 0.05-0.08).
   Each fit slice maps to rho_tor_norm through the q profile of the nearest LIUQE reconstruction within 2 ms (`tcv/profiles.py`).
@@ -222,10 +230,10 @@ and the LIUQE reconstructions of the MEQ databases (`TCV{shot}_meqdb.mat`), both
 
 TCV specifics of the filter spec (`TCVDataWorkflow`):
 
-- No transient threshold.
+- The transients are 5 ms boxcars above 2 MW for P_oh, as on DIII-D, and above 5 MW for P_rad.
   In 246 shots only 75026 has a 5 ms P_rad peak above 3 MW (12 MW),
-  and it radiates 4.1x its input, which `max_radiated_fraction` culls.
-- The raw stage removes the FIR fringe jumps from the 20-25 kHz NEavg samples before they go onto the grid (`_remove_fringe_jumps`, non-causal).
+  and it also radiates 4.1x its input, which `max_radiated_fraction` culls.
+- The raw stage removes the FIR fringe jumps from the 20-25 kHz NEavg samples before they go onto the grid (`remove_fringe_jumps`, non-causal).
   A jump is a shift of at least 1e19 m^-3 between the medians of the 0.25 ms on either side of a sample,
   which no real density change is fast enough for.
   Shifts within 5 ms of each other are one episode (a dropout and its recovery).

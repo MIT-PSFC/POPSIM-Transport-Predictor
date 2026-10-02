@@ -166,7 +166,7 @@ D3D_SIGNAL_ATTRS = {
         "description": "Stored energy from the 1 kHz DISPY EFIT (wmhd)",
     },
     "beta_tor_norm": {
-        "description": "Normalized toroidal beta from the 1 kHz DISPY EFIT (betan)",
+        "description": "Normalized toroidal beta from the 1 kHz DISPY EFIT (betan), with B_geo, the vacuum field at rout",
     },
     "n_e_line_average": {
         "description": "Line-averaged electron density from the DISPY EFIT tree (density), else the PCS estimate (PTDATA dssdenest)",
@@ -327,8 +327,9 @@ class D3DDataWorkflow(RawFileWorkflow):
         "n_e_line_average": 5e17,
     }
     max_filter: ClassVar[dict[str, float]] = {"greenwald_fraction": 2.0}
-    # The EFIT P_oh stays below 0.6 MW through the ramp-up and above 2 MW only at disruptive terminations
-    transient_filter: ClassVar[dict[str, float]] = {"power_ohm": 2e6}
+    # The EFIT P_oh stays below 0.6 MW through the ramp-up and above 2 MW only at disruptive terminations.
+    # P_rad reaches 16.0 MW in the iteration_3 store, so 17 MW only catches collapses.
+    transient_filter: ClassVar[dict[str, float]] = {"power_ohm": 2e6, "power_radiated": 17e6}
     # ip reads near 0 out to the 8 s end of the timebase, so the end is the last ip above its threshold
     end_margin_s: ClassVar[float] = 0.05
     min_pulse_length_s: ClassVar[float] = 0.5
