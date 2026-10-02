@@ -2,7 +2,7 @@
 
 The processing chain (RawFileWorkflow.load_shot and cull_shot) runs on real device data in
 production, so the tests feed it a hand-built raw file instead. This one is a TCV raw
-file in the on-disk schema (IMAS names, SI units, no profile companions), it passes
+file in the on-disk schema (IMAS names, SI units, zero-error profile companions), it passes
 every TCV filter and cull, and each test breaks exactly the one thing it is about.
 """
 
@@ -36,7 +36,8 @@ def raw_shot(n_t: int = N_T, shot: int = SHOT, **overrides) -> xr.Dataset:
         "b0": np.full(n_t, 1.4),
         "energy_mhd": np.full(n_t, 3e4),
         "beta_tor_norm": np.full(n_t, 1.5),
-        "n_e_line_average": np.full(n_t, 3e19),
+        # Puts the median of mean(n_e, rho <= 1) / n_e_line_average at ~1.05, inside the TCV density ratio bounds
+        "n_e_line_average": np.full(n_t, 4e19),
         "minor_radius": np.full(n_t, 0.24),
         "geometric_axis_r": np.full(n_t, 0.88),
         "elongation": np.full(n_t, 1.5),
@@ -50,9 +51,13 @@ def raw_shot(n_t: int = N_T, shot: int = SHOT, **overrides) -> xr.Dataset:
         "power_ec": np.zeros(n_t),
         "n_e_edge_line_average": np.full(n_t, 2e19),
     }
+    profile_shape_gradient = np.gradient(profile_shape, RHO, axis=-1)
     profiles = {
         "t_e": 1e3 * profile_shape,
         "n_e": 2e19 * profile_shape,
+        "t_e_gradient": 1e3 * profile_shape_gradient,
+        "n_e_gradient": 2e19 * profile_shape_gradient,
+        **{f"{profile}{suffix}": np.zeros_like(profile_shape) for profile in ("t_e", "n_e") for suffix in ("_error", "_gradient_error")},
     }
     data_vars = {name: (("time_idx",), vals) for name, vals in scalars.items()}
     data_vars |= {name: (("time_idx", "rho_tor_norm"), vals) for name, vals in profiles.items()}

@@ -88,9 +88,9 @@ REQUIRED_SIGNALS_POWER_BALANCE = [
 ]
 
 
-# Profile channels that carry GP-fit gradient and error-bar companions.
+# Profile channels and the gradient and error-bar companions every device store carries.
 # For each base signal <v> the companions are <v>_gradient, <v>_error and <v>_gradient_error.
-# An error of 0 is the sentinel for "no rigorous error quantification",
+# An error of 0 is the sentinel for "no rigorous error quantification" (TCV),
 # the loss treats it as a zero-width error bar
 PROFILE_BASE_SIGNALS = ["t_e_keV", "n_e_1e20"]
 PROFILE_GRAD_SIGNALS = [f"{v}_gradient" for v in PROFILE_BASE_SIGNALS]
@@ -99,22 +99,6 @@ PROFILE_ERROR_SIGNALS = [f"{v}_error" for v in PROFILE_BASE_SIGNALS] + [f"{v}_gr
 # Everything the profile-predictor loss reads from the target side:
 # the profiles themselves plus their gradients and error-bars
 PROFILE_TARGET_VARS = [*PROFILE_BASE_SIGNALS, *PROFILE_GRAD_SIGNALS, *PROFILE_ERROR_SIGNALS]
-
-
-def add_missing_profile_companions(ds: xr.Dataset) -> xr.Dataset:
-    """Fill in gradient and error-bar companions for datasets that lack them.
-
-    Some device workflows (TCV) produce no GP-fit gradients or error bars.
-    Missing gradients fall back to finite differences of the values, missing
-    errors get the 0 sentinel (no rigorous error quantification).
-    """
-    for base in PROFILE_BASE_SIGNALS:
-        if f"{base}_gradient" not in ds:
-            ds[f"{base}_gradient"] = ds[base].differentiate(RADIAL_DIM)
-        for err in (f"{base}_error", f"{base}_gradient_error"):
-            if err not in ds:
-                ds[err] = xr.zeros_like(ds[base])
-    return ds
 
 
 REQUIRED_SIGNALS_PROFILE_TRANSFER = [
@@ -321,7 +305,6 @@ def get_ds(
     ds = ds.isel({EPISODE_DIM: slice(0, config.max_ds_size)})
 
     def _profile_transfer(ds: xr.Dataset) -> xr.Dataset:
-        ds = add_missing_profile_companions(ds)
         ds = ds[REQUIRED_SIGNALS_PROFILE_TRANSFER]
 
         # Only keep fresh profiles for training
@@ -362,7 +345,6 @@ def get_ds(
         return ds
 
     def _transport_transfer(ds: xr.Dataset) -> xr.Dataset:
-        ds = add_missing_profile_companions(ds)
         ds = ds[REQUIRED_SIGNALS_TRANSPORT_TRANSFER]
 
         # Unlike the profile branch there is NO fresh-profile filter here: the

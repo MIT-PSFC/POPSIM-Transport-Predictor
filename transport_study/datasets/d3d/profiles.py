@@ -13,6 +13,7 @@ from scipy.integrate import cumulative_simpson
 
 from transport_study import RADIAL_DIM
 from transport_study.datasets.d3d import config
+from transport_study.datasets.profile_grids import held_on_times, held_slice_index
 
 RHO_TOR_NORM_GRID = np.linspace(
     config["profile_grid"]["rho_min"],
@@ -145,13 +146,6 @@ def gradient_and_error(values: np.ndarray, errors: np.ndarray, x: np.ndarray) ->
     return gradient, gradient_error
 
 
-def _held_on_times(slice_profiles: np.ndarray, slice_index: np.ndarray, mask_held: np.ndarray) -> np.ndarray:
-    """Per-slice profiles picked onto the timebase by slice index, NaN where no slice holds."""
-    profiles_on_times = slice_profiles[slice_index].astype(np.float32)
-    profiles_on_times[~mask_held] = np.nan
-    return profiles_on_times
-
-
 def ida_profiles_on_grids(
     ida: xr.Dataset,
     efit_time: np.ndarray,
@@ -224,18 +218,12 @@ def ida_profiles_on_grids(
         slice_profiles[f"{prefix}_psi"] = values_psi
 
     # Hold each slice forward onto the timebase
-    ida_steps = np.diff(ida_time)
-    ida_step_median = np.median(ida_steps)
-    max_hold = config["profile_grid"]["max_hold_ida_steps"] * ida_step_median
-    slice_index = np.searchsorted(ida_time, times, side="right") - 1
-    slice_index_clipped = np.clip(slice_index, 0, None)
-    hold_duration = times - ida_time[slice_index_clipped]
-    mask_held = (slice_index >= 0) & (hold_duration <= max_hold)
+    slice_index, mask_held = held_slice_index(ida_time, times, config["profile_grid"]["max_hold_ida_steps"])
 
     data_vars = {}
     for name, profiles in slice_profiles.items():
         dim = PSI_NORM_DIM if name in IDA_PSI_COLUMNS else RADIAL_DIM
-        data_vars[name] = (("idx", dim), _held_on_times(profiles, slice_index_clipped, mask_held))
+        data_vars[name] = (("idx", dim), held_on_times(profiles, slice_index, mask_held))
     coords = {
         RADIAL_DIM: RHO_TOR_NORM_GRID.astype(np.float32),
         PSI_NORM_DIM: PSI_NORM_GRID.astype(np.float32),

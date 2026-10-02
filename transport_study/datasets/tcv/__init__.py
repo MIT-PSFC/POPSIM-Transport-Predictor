@@ -1,3 +1,8 @@
-# Eventually need to add the DEFUSE h5 conversion here to make sure
-# it's actually 100% good
-# Presently lives under mfews-zkeith:/home/zkeith/proj/POPSIM_dirs/tcv-dataset
+from pathlib import Path
+
+from dynaconf import Dynaconf
+
+from transport_study import PACKAGE_ROOT
+
+# TCV dataset settings, shared by every module of this package
+config = Dynaconf(settings_files=[Path(PACKAGE_ROOT) / "datasets/tcv/config.toml"])

@@ -31,7 +31,6 @@ from transport_study.modules.profile_predictor.trb import ProfilePredictorTRB
 from transport_study.orchestration.organize_data import (
     PROFILE_ERROR_SIGNALS,
     PROFILE_TARGET_VARS,
-    add_missing_profile_companions,
 )
 from transport_study.orchestration.stages import (
     STAGE_AGG_NAMES,
@@ -63,8 +62,7 @@ def load_eval_dataset(device: str) -> xr.Dataset:
     ds_path = Path(config.dataset_paths[device])
     ds_store = xr.open_dataset(ds_path)
     ds_working = convert_to_working_units(ds_store)
-    ds_with_companions = add_missing_profile_companions(ds_working)
-    ds = ds_with_companions[[*PROFILE_TARGET_VARS, *HEATING_POWERS_MW, "ip_MA", TIME_COORD]]
+    ds = ds_working[[*PROFILE_TARGET_VARS, *HEATING_POWERS_MW, "ip_MA", TIME_COORD]]
 
     ds = ds.interp({RADIAL_DIM: RHO_GRID}, kwargs={"fill_value": "extrapolate"})
     for err_sig in PROFILE_ERROR_SIGNALS:

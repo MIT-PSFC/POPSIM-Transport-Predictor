@@ -71,7 +71,7 @@ def convert_to_working_units(ds: xr.Dataset) -> xr.Dataset:
     """A device store (or a selection of one) renamed and rescaled to the study's working units.
 
     Converts whichever WORKING_UNIT_CONVERSIONS signals are present,
-    so a store whose radial dim was dropped, or one without profile companions (TCV), converts too.
+    so a store whose radial dim was dropped converts too.
     Adds power_additional_MW when the heating powers are there, which needs all four of them.
 
     Raises:
