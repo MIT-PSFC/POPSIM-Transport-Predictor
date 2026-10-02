@@ -36,7 +36,8 @@ Every check cuts the times it fails out as a gap:
   since the non-causally smoothed P_oh and P_rad rise ahead of the event that ends a segment
 
 Only the longest contiguous segment is kept, and a shot is culled when that segment spans less than `min_pulse_length`,
-its mean P_rad is below `min_radiated_fraction` of its mean input power (a dead bolometer),
+its mean P_rad is below `min_radiated_fraction` of its mean input power (a dead bolometer)
+or above `max_radiated_fraction` of it (more radiated than put in),
 its stored energy rises by more than 1.05 times the input energy (a broken power record),
 or the median over fresh slices of mean(n_e for rho_tor_norm <= 1) / n_e_line_average is outside `density_ratio_bounds`.
 Powers are clipped at 0 after filtering.
@@ -49,7 +50,7 @@ with the transients shaded red, the end-of-shot cut, the thresholds, and dots wh
 | --- | --- | --- | --- | --- |
 | min ip | 100 kA | 210 kA | 200 kA | 50 kA |
 | min energy_mhd | 2.7 kJ | 5 kJ | 10 kJ | 1 kJ |
-| min n_e_line_average | | | 5e17 m^-3 | |
+| min n_e_line_average | 1e19 m^-3 | 3e18 m^-3 | 5e17 m^-3 | 2e18 m^-3 |
 | max greenwald_fraction | 2.0 | 2.0 | 2.0 | 2.0 |
 | max power_radiated | | 4 MW | | |
 | transient power_ohm | 5 MW | 5 MW | 2 MW | |
@@ -58,6 +59,7 @@ with the transients shaded red, the end-of-shot cut, the thresholds, and dots wh
 | end_margin | 20 ms | 40 ms | 50 ms | 50 ms |
 | min_pulse_length | 0.5 s | 0.2 s | 0.5 s | 0.5 s |
 | min_radiated_fraction | 0.01 | 0.025 | 0.025 | 0.025 |
+| max_radiated_fraction | 1.0 | 1.0 | 1.0 | 1.0 |
 | density_ratio_bounds | 0.72-1.3 | 0.7-1.3 | 0.7-1.3 | 0.7-1.3 |
 
 Dataset creation is done in slightly different ways for each device:
@@ -214,9 +216,21 @@ TCV specifics of the filter spec (`TCVDataWorkflow`):
 
 - LIUQE geometry moments go nonphysical during the current ramp (minor_radius down to 0.04 m, elongation below 1),
   so minor_radius below 0.15 m and elongation below 0.9 are gaps.
-- No transient threshold yet.
-- The line-averaged density has its interferometer fringe jumps removed first (`_remove_fringe_jumps`).
-  The jump threshold uses the median step of the whole shot.
+- No transient threshold.
+  In 246 shots only 75026 has a 5 ms P_rad peak above 3 MW (12 MW),
+  and it radiates 4.1x its input, which `max_radiated_fraction` culls.
+- The raw stage removes the FIR fringe jumps from the 20-25 kHz NEavg samples before they go onto the grid (`_remove_fringe_jumps`, non-causal).
+  A jump is a shift of at least 1e19 m^-3 between the medians of the 0.25 ms on either side of a sample,
+  which no real density change is fast enough for.
+  Shifts within 5 ms of each other are one episode (a dropout and its recovery).
+  The level change across an episode is taken between the medians from 2 to 10 ms on either side,
+  so a spike that decays back is not removed as a jump, and the samples inside the episode become a straight line.
+  Three corrected episodes within 50 ms, or one episode longer than that, means the FIR lost count,
+  and NEavg is NaN from there on, which the filter cuts.
+  Against Thomson `TS_nel` on 185 shots, the times more than 25 percent off drop from 3.9 to 2.0 percent
+  (the earlier correction on the 1 kHz grid split a jump across two grid times and subtracted decaying spikes).
+  A slip spread over ~3 ms (74207) looks like a real fast density drop and is left in.
+  The density ratio cull catches that shot.
 
 ```bash
 python -m transport_study.datasets.cli tcv <data_assembly_dir> --mode raw

@@ -1,6 +1,6 @@
 """Tests for the TCV dataset workflow.
 
-The fast tests cover the LIUQE rho_pol -> rho_tor_norm map, the DEFUSE regridding and hold,
+The fast tests cover the LIUQE rho_pol -> rho_tor_norm map, the DEFUSE regridding and hold, the fringe-jump correction,
 reading the MATLAB v7.3 layout of a DEFUSE export, signal standardization, and the IMAS attributes of the store,
 all on synthetic data.
 The slow test builds one real shot, so it needs the DEFUSE exports and the MEQ databases.
@@ -29,6 +29,7 @@ from transport_study.datasets.tcv.tcv_dataset import (
     PREDICTION_SOURCES,
     TCV_SIGNAL_ATTRS,
     TCVDataWorkflow,
+    _remove_fringe_jumps,
 )
 from transport_study.signals import PREDICTION_STORE_NAME
 
@@ -108,6 +109,55 @@ def test_defuse_hold_and_unmapped_slice():
     # One slice of margin either side of the limit, where float round-off decides
     assert np.isfinite(te_axis[(times_ms > defuse_times_ms[-1]) & (times_ms < hold_end_ms - 1)]).all()
     assert np.isnan(te_axis[times_ms > hold_end_ms + 1]).all()
+
+
+FIR_SAMPLE_STEP = 40e-6
+FIR_DENSITY = 3e19
+
+
+def _fir_trace(steps: list[tuple[float, float]], seed: int = 0) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """1 s of NEavg at 25 kHz with 2e17 noise: (times, true density, trace with a fringe jump of each size at each time)."""
+    sample_time = np.arange(0.0, 1.0, FIR_SAMPLE_STEP)
+    rng = np.random.default_rng(seed)
+    density_true = FIR_DENSITY + 2e17 * rng.standard_normal(sample_time.size)
+    density_trace = density_true.copy()
+    for jump_time, jump_size in steps:
+        density_trace[sample_time >= jump_time] += jump_size
+    return sample_time, density_true, density_trace
+
+
+def test_fringe_jumps_removed_and_real_changes_kept():
+    """A fringe slip is removed, a dropout that recovers and a spike that decays leave the level where it was,
+    and a real 1.5e19 drop over 3 ms is kept."""
+    sample_time, density_true, density_trace = _fir_trace([(0.2, -2e19)])
+    mask_dropout = (sample_time >= 0.400) & (sample_time < 0.404)
+    density_trace[mask_dropout] = -1e19
+    time_since_spike = sample_time - 0.6
+    mask_spike = time_since_spike >= 0
+    spike_decay = np.exp(-time_since_spike[mask_spike] / 1e-3)
+    density_trace[mask_spike] += 1.5e19 * spike_decay
+    drop_fraction = np.clip((sample_time - 0.8) / 3e-3, 0.0, 1.0)
+    real_drop = 1.5e19 * drop_fraction
+    density_true = density_true - real_drop
+    density_trace = density_trace - real_drop
+
+    density_corrected, cut_time = _remove_fringe_jumps(sample_time, density_trace)
+
+    assert cut_time is None
+    mask_off_spike = ~((sample_time >= 0.5995) & (sample_time < 0.605))
+    np.testing.assert_allclose(density_corrected[mask_off_spike], density_true[mask_off_spike], atol=1.5e18)
+
+
+def test_fringe_burst_cuts_the_rest_of_the_record():
+    """Three slips within FRINGE_BURST_WINDOW_S mean the interferometer lost count, NaN from the first on."""
+    sample_time, density_true, density_trace = _fir_trace([(0.2, -2e19), (0.22, -2e19), (0.24, 2e19)])
+
+    density_corrected, cut_time = _remove_fringe_jumps(sample_time, density_trace)
+
+    assert cut_time == pytest.approx(0.2, abs=1e-3)
+    mask_before = sample_time < 0.199
+    np.testing.assert_allclose(density_corrected[mask_before], density_true[mask_before])
+    assert np.isnan(density_corrected[sample_time >= 0.2]).all()
 
 
 def _write_matlab(group: h5py.Group, name: str, data: np.ndarray, matlab_class: str = "single", empty: bool = False):

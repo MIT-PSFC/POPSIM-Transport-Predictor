@@ -7,6 +7,7 @@ import netCDF4  # noqa: F401
 import numpy as np
 import xarray as xr
 from loguru import logger
+from numpy.lib.stride_tricks import sliding_window_view
 from transport_validation_datasets.machine.generic import (
     EQUILIBRIUM_HOLD_FLOOR,
     hold_onto_grid,
@@ -25,6 +26,7 @@ from transport_study.datasets.tcv.profiles import (
     liuqe_usable,
 )
 from transport_study.datasets.tcv.sources import (
+    DefuseSignal,
     defuse_path,
     find_tcv_shots,
     meqdb_path,
@@ -94,8 +96,22 @@ DEFUSE_SIGNALS = (
 # The raw timebase ends at the last time the plasma current magnitude exceeds this [A]
 IP_TIMEBASE_MIN_A = 50e3
 
-# Smallest density step [m^-3] read as an interferometer fringe jump
+# Fringe jumps of the FIR interferometer, removed from the raw NEavg samples (_remove_fringe_jumps).
+# Smallest level shift read as a fringe jump [m^-3]. The clean jumps in 185 shots are 1.1-2.5e19.
 FRINGE_JUMP_MIN_M3 = 1e19
+# A fringe jump completes within a few raw samples, and no real density change is that fast.
+# So a jump is looked for between the medians of this long on either side of each sample [s].
+FRINGE_SHARP_WINDOW_S = 0.25e-3
+# Sharp shifts closer together than this are one episode, such as a dropout and its recovery [s]
+FRINGE_EPISODE_GAP_S = 5e-3
+# The levels on either side of an episode are the medians from FRINGE_SETTLE_S to FRINGE_LEVEL_WINDOW_S away from it,
+# so a spike decaying back to the level it left is not read as a jump [s]
+FRINGE_SETTLE_S = 2e-3
+FRINGE_LEVEL_WINDOW_S = 10e-3
+# An episode longer than FRINGE_BURST_WINDOW_S, or this many corrected episodes within it,
+# means the interferometer has lost count, and the rest of the record is cut
+FRINGE_BURST_EPISODES = 3
+FRINGE_BURST_WINDOW_S = 0.05
 
 ZERO_ERROR = "Zero, the no-uncertainty sentinel, since DEFUSE gives no uncertainty for its profile fits"
 
@@ -122,7 +138,10 @@ TCV_SIGNAL_ATTRS = {
         "description": "Normalized toroidal beta on the LIUQE timebase (DEFUSE BETAN)",
     },
     "n_e_line_average": {
-        "description": "Line-averaged electron density from the FIR interferometer (DEFUSE NEavg), fringe jumps removed",
+        "description": (
+            "Line-averaged electron density from the FIR interferometer (DEFUSE NEavg), "
+            "fringe jumps removed from the raw samples (non-causal), NaN from where the interferometer lost count"
+        ),
     },
     "minor_radius": {
         "description": "Minor radius of the plasma boundary, LIUQE (DEFUSE a_minor)",
@@ -203,6 +222,9 @@ class TCVDataWorkflow(RawFileWorkflow):
     min_filter: ClassVar[dict[str, float]] = {
         "ip": 5e4,
         "energy_mhd": 1e3,
+        # A broken FIR record reads ~0 or negative, and Thomson calibrated to it reads ~0 too (70353, 70356).
+        # The lowest real plasma in 280 shots is 3.4e18 (74082, where Thomson agrees).
+        "n_e_line_average": 2e18,
         # LIUQE geometry moments go nonphysical during the current ramp (minor_radius down to 0.04 m, elongation below 1),
         # which drives derived features like q_star far outside the physical range
         "minor_radius": 0.15,
@@ -217,6 +239,9 @@ class TCVDataWorkflow(RawFileWorkflow):
     min_pulse_length_s: ClassVar[float] = 0.5
     # TCV bolometry reads a few percent of the input power or more, a dead bolometer far less
     min_radiated_fraction: ClassVar[float] = 0.025
+    # 5 of 246 shots radiate more than is put in, two by far (75026 4.1x with a 12 MW PradTot spike, 78926 1.7x),
+    # while the 99th percentile is 1.17. No transient threshold, it would only catch 75026.
+    max_radiated_fraction: ClassVar[float] = 1.0
     density_ratio_bounds: ClassVar[tuple[float, float]] = (0.7, 1.3)
 
     def __init__(
@@ -280,6 +305,13 @@ class TCVDataWorkflow(RawFileWorkflow):
             logger.warning(f"Shot {shot}: |I_P| never exceeds {IP_TIMEBASE_MIN_A:.0f} A, skipping shot.")
             return None
         timebase = make_uniform_1kHz_timebase(ip.time[mask_ip_valid].max())
+        density_raw_name, _ = PREDICTION_SOURCES["n_e_line_average"]
+        if density_raw_name in signals:
+            density = signals[density_raw_name]
+            density_corrected, cut_time = _remove_fringe_jumps(density.time, density.values)
+            signals[density_raw_name] = DefuseSignal(time=density.time, values=density_corrected)
+            if cut_time is not None:
+                logger.info(f"Shot {shot}: the FIR interferometer lost count, {density_raw_name} cut from {cut_time:.3f} s")
 
         # Every signal is placed causally (signal_on_grid), so no time draws on a later one
         data_vars: dict[str, tuple[tuple[str, ...], np.ndarray]] = {}
@@ -408,21 +440,7 @@ class TCVDataWorkflow(RawFileWorkflow):
         return self.standardize_dim_names(ds_standardized)
 
     def device_specific_processing(self, ds: xr.Dataset) -> xr.Dataset:
-        """Remove interferometer fringe jumps from the line-averaged density.
-
-        Parameters
-        ----------
-        ds : xr.Dataset
-            Standardized dataset
-
-        Returns
-        -------
-        xr.Dataset
-            Processed dataset ready for general workflow
-        """
-        density_trace = ds["n_e_line_average"].values[0, :]
-        density_corrected = _remove_fringe_jumps(density_trace)
-        ds["n_e_line_average"] = (ds["n_e_line_average"].dims, density_corrected[np.newaxis, :])
+        """Nothing TCV-specific, the fringe jumps are removed from the raw NEavg samples in the raw stage."""
         return ds
 
 
@@ -445,26 +463,120 @@ def _ohmic_power(ds: xr.Dataset) -> xr.DataArray:
     return xr.DataArray(p_ohm[np.newaxis, :], dims=ds["I_P"].dims, coords=ds["I_P"].coords)
 
 
-def _remove_fringe_jumps(density_trace: np.ndarray) -> np.ndarray:
-    """A line-averaged density trace with interferometer fringe jumps removed.
+def _sharp_shift_samples(density: np.ndarray, n_sharp: int) -> np.ndarray:
+    """Samples after which the median of the next n_sharp samples differs from the median of the n_sharp up to it
+    by FRINGE_JUMP_MIN_M3 or more, in order."""
+    sample_windows = sliding_window_view(density, n_sharp)
+    window_medians = np.median(sample_windows, axis=1)
+    # Shift across the boundary after sample k, for k from n_sharp - 1 to n - n_sharp - 1
+    sharp_shift = window_medians[n_sharp:] - window_medians[:-n_sharp]
+    sharp_shift_magnitude = np.abs(sharp_shift)
+    idx_window_pair = np.flatnonzero(sharp_shift_magnitude >= FRINGE_JUMP_MIN_M3)
+    return idx_window_pair + n_sharp - 1
 
-    A step larger than max(FRINGE_JUMP_MIN_M3, 5 x the median step) is read as a fringe jump,
-    and its offset is removed from the rest of the trace.
+
+def _fringe_episode_spans(sample_time: np.ndarray, idx_sharp: np.ndarray, n_sharp: int) -> tuple[np.ndarray, np.ndarray]:
+    """First and last sample of each episode: sharp shifts within FRINGE_EPISODE_GAP_S, with their sharp windows."""
+    sharp_times = sample_time[idx_sharp]
+    sharp_gaps = np.diff(sharp_times)
+    mask_episode_start = np.r_[True, sharp_gaps > FRINGE_EPISODE_GAP_S]
+    episode_start = np.flatnonzero(mask_episode_start)
+    episode_stop = np.r_[episode_start[1:], idx_sharp.size]
+    idx_first_shift = idx_sharp[episode_start]
+    idx_last_shift = idx_sharp[episode_stop - 1]
+    span_first = np.maximum(idx_first_shift - n_sharp + 1, 0)
+    span_last = np.minimum(idx_last_shift + n_sharp, sample_time.size - 1)
+    return span_first, span_last
+
+
+def _level_samples(idx_settled: np.ndarray, idx_adjacent: np.ndarray, n_sharp: int) -> np.ndarray:
+    """The settled samples on one side of an episode, or the ones next to it when a neighbor leaves too few."""
+    if idx_settled.size >= n_sharp:
+        return idx_settled
+    return idx_adjacent
+
+
+def _remove_fringe_jumps(sample_time: np.ndarray, density: np.ndarray) -> tuple[np.ndarray, float | None]:
+    """The raw NEavg samples with the interferometer fringe jumps removed, non-causally.
+
+    A sharp shift is a sample after which the median of the next FRINGE_SHARP_WINDOW_S
+    differs from the median of the FRINGE_SHARP_WINDOW_S up to it by FRINGE_JUMP_MIN_M3 or more.
+    Sharp shifts within FRINGE_EPISODE_GAP_S of each other form one episode.
+    When the settled levels on either side of an episode differ by FRINGE_JUMP_MIN_M3 or more,
+    the difference is removed from everything after it.
+    The samples inside every episode are replaced by a straight line between its edges.
+    So a spike that decays back, or a dropout that recovers, only loses its inside.
+    An episode longer than FRINGE_BURST_WINDOW_S, or FRINGE_BURST_EPISODES corrections within it,
+    means the interferometer has lost count, and every sample from the start of the first such episode on is NaN.
+
+    Args:
+        sample_time: (n,) sorted, unique sample times [s].
+        density: (n,) NEavg [m^-3].
+
+    Returns:
+        (n,) the corrected samples, and the time the record is cut from, None when it is not.
     """
-    if np.isnan(density_trace).all():
-        return density_trace
-    density_steps = np.diff(density_trace)
-    median_abs_step = np.nanmedian(np.abs(density_steps))
-    jump_threshold = max(FRINGE_JUMP_MIN_M3, 5.0 * median_abs_step)
+    density_corrected = density.copy()
+    sample_steps = np.diff(sample_time)
+    sample_step = float(np.median(sample_steps))
+    n_sharp_window = round(FRINGE_SHARP_WINDOW_S / sample_step)
+    n_sharp = max(3, n_sharp_window)
+    if density.size < 2 * n_sharp + 1:
+        return density_corrected, None
+    idx_sharp = _sharp_shift_samples(density, n_sharp)
+    if idx_sharp.size == 0:
+        return density_corrected, None
+    span_first, span_last = _fringe_episode_spans(sample_time, idx_sharp, n_sharp)
 
-    offset = 0.0
-    density_corrected = density_trace.copy()
-    for i in range(1, density_trace.size):
-        if np.isnan(density_trace[i - 1]) or np.isnan(density_trace[i]):
-            density_corrected[i] = density_trace[i] - offset
+    idx_samples = np.arange(density.size)
+    corrected_episode_times = []
+    lost_count_time = np.inf
+    for i_episode in range(span_first.size):
+        first = span_first[i_episode]
+        last = span_last[i_episode]
+        # The levels stop short of the neighboring episodes
+        previous_last = span_last[i_episode - 1] if i_episode > 0 else -1
+        next_first = span_first[i_episode + 1] if i_episode + 1 < span_first.size else density.size
+        time_first = sample_time[first]
+        time_last = sample_time[last]
+        if time_last - time_first > FRINGE_BURST_WINDOW_S:
+            lost_count_time = time_first
+            break
+        mask_before = (sample_time >= time_first - FRINGE_LEVEL_WINDOW_S) & (sample_time < time_first - FRINGE_SETTLE_S)
+        mask_after = (sample_time > time_last + FRINGE_SETTLE_S) & (sample_time <= time_last + FRINGE_LEVEL_WINDOW_S)
+        mask_before &= idx_samples > previous_last
+        mask_after &= idx_samples < next_first
+        adjacent_before_first = max(previous_last + 1, first - n_sharp)
+        adjacent_after_stop = min(next_first, last + 1 + n_sharp)
+        idx_adjacent_before = np.arange(adjacent_before_first, first)
+        idx_adjacent_after = np.arange(last + 1, adjacent_after_stop)
+        if idx_adjacent_before.size == 0 or idx_adjacent_after.size == 0:
             continue
-        step = density_trace[i] - density_trace[i - 1]
-        if np.abs(step) >= jump_threshold:
-            offset += step
-        density_corrected[i] = density_trace[i] - offset
-    return density_corrected
+        idx_settled_before = np.flatnonzero(mask_before)
+        idx_settled_after = np.flatnonzero(mask_after)
+        idx_before = _level_samples(idx_settled_before, idx_adjacent_before, n_sharp)
+        idx_after = _level_samples(idx_settled_after, idx_adjacent_after, n_sharp)
+        level_before = np.nanmedian(density_corrected[idx_before])
+        level_after = np.nanmedian(density_corrected[idx_after])
+        level_shift = level_after - level_before
+        if np.abs(level_shift) >= FRINGE_JUMP_MIN_M3:
+            density_corrected[last + 1 :] -= level_shift
+            corrected_episode_times.append(time_first)
+
+        # A straight line across the episode, between the samples next to it
+        edge_before = np.nanmedian(density_corrected[idx_adjacent_before])
+        edge_after = np.nanmedian(density_corrected[idx_adjacent_after])
+        edge_times = [sample_time[first - 1], sample_time[last + 1]]
+        span_times = sample_time[first : last + 1]
+        density_corrected[first : last + 1] = np.interp(span_times, edge_times, [edge_before, edge_after])
+
+    episode_times = np.asarray(corrected_episode_times)
+    for episode_time in episode_times:
+        mask_burst = (episode_times >= episode_time) & (episode_times <= episode_time + FRINGE_BURST_WINDOW_S)
+        if mask_burst.sum() >= FRINGE_BURST_EPISODES:
+            lost_count_time = min(lost_count_time, episode_time)
+            break
+    if not np.isfinite(lost_count_time):
+        return density_corrected, None
+    density_corrected[sample_time >= lost_count_time] = np.nan
+    return density_corrected, float(lost_count_time)
