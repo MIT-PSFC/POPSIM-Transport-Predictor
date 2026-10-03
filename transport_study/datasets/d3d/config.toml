@@ -38,6 +38,9 @@ runtag = "DISPY"
 max_step_ms = 1.5
 # EFIT slices with a chi-squared above this are invalid, same cut as disruption-py's get_efit_parameters
 chisq_max = 50
+# EFIT slices with either triangularity at this bound are invalid.
+# The boundary search saturates there and flips between two solutions (tritop 0.65 <-> 1.0 in 2035xx).
+triangularity_bound = 1.0
 # An IDA slice maps to rho_tor_norm through the nearest valid EFIT slice no farther away than this [ms]
 match_max_ms = 2.0
 
@@ -54,3 +57,6 @@ num_psi_norm_points = 60
 # Longest an IDA slice is held onto the 1 kHz timebase, in median steps of the usable IDA slices.
 # Interior IDA gaps reach 2.6 median steps, so this only cuts the hold after the last slice.
 max_hold_ida_steps = 3.0
+# An IDA slice whose Te error at the axis exceeds this fraction of Te there is an unconstrained core fit and is dropped.
+# Ramp-up IDA-lite fits reach Te(0) = 47 +- 30 keV at n_e_line 5e18 (204180).
+max_core_te_relative_error = 0.5

@@ -63,7 +63,7 @@ with the transients shaded red, the end-of-shot cut, the thresholds, and dots wh
 | transient power_ohm | 5 MW | 5 MW | 2 MW | 2 MW |
 | transient power_radiated | 5.5 MW | 3 MW | 17 MW | 5 MW |
 | failure_margin (shared) | 20 ms | 20 ms | 20 ms | 20 ms |
-| end_margin | 20 ms | 40 ms | 50 ms | 50 ms |
+| end_margin | 20 ms | 40 ms | 100 ms | 50 ms |
 | min_pulse_length | 0.5 s | 0.2 s | 0.5 s | 0.5 s |
 | min_radiated_fraction | 0.01 | 0.025 | 0.025 | 0.025 |
 | max_radiated_fraction | 1.0 | 1.0 | 1.0 | 1.0 |
@@ -100,9 +100,12 @@ and every signal is placed on the timebase causally instead (`signal_on_grid`, a
 - EFIT: every EFIT signal comes from the shot's latest code_rundb run tagged `DISPY` (the 1 kHz disruption-efit).
   A shot without one, or whose EFIT is slower than 1 kHz, is skipped (`DispyEfitNicknameSetting`, `Uniform1kHzTimeSetting`).
   disruption-py's own EFIT selection falls back to the 50 Hz efit01 and forces runtag DIS under pytest, so it is not used.
-  Failed reconstructions are missing or fail chisq > 50, so every EFIT signal is held for at least 10 ms,
-  and `fresh_equilibrium` marks the grid times a usable slice (chisq, mappable q) lands on,
-  while the EFIT 0D signals take every slice that passes chisq.
+  A slice is invalid when it fails chisq > 50 or either triangularity sits at the bound of 1,
+  where the boundary search saturates and flips between two solutions (tritop 0.65 <-> 1.0 in 2035xx).
+  Every EFIT signal is held for at least 10 ms over missing and invalid slices,
+  and `fresh_equilibrium` marks the grid times a usable slice (valid, mappable q) lands on,
+  while the EFIT 0D signals take every valid slice.
+  A saturated run longer than the hold is a gap that splits the shot.
 - Profiles: Te/ne from IDA, searched in the priority order of the databases in `d3d/config.toml`:
   `HBP_database` (98 shots), the VVUQ files (4), then the general-purpose `TMDB_V1c`, `TMDB_V1a`, and `TokaMaker_database`,
   which only serve shots on `d3d/HBP_shotlist_2013_2025` (105 more). The default shotlist is the union, 207 shots.
@@ -115,7 +118,8 @@ and every signal is placed on the timebase causally instead (`signal_on_grid`, a
   IDA's psi_n comes from its own reconstruction, which the files do not name, while q comes from the DISPY EFIT.
   The profiles go onto rho_tor_norm = linspace(0, 1.1, 56), the published C-Mod grid (MAST's has 67 points over the same range),
   and each slice is held onto the 1 kHz timebase until the next one, for at most 3 median steps of the usable slices (`hold_onto_grid`).
-  A slice with no valid EFIT nearby, or without both a Te and an ne fit, is dropped before the hold,
+  A slice with no valid EFIT nearby, without both a Te and an ne fit,
+  or with a Te error at the axis above half of Te there (`max_core_te_relative_error`), is dropped before the hold,
   so the slice before it holds over it, and `fresh_profile` marks where the usable slices land.
   IDA gives no point covariance, so the gradient errors assume independent points.
 - `b0` is mu0 144 bcoil / (2 pi r0) from the TF coil current (PTDATA `bcoil`), with r0 = 1.6955 m.
@@ -156,6 +160,8 @@ A trajopt signal outside its range in `TRAJOPT_VALID_RANGES` is NaN, it is not p
 DIII-D specifics of the filter spec (`D3DDataWorkflow`):
 
 - DIII-D ip reads near 0 out to the 8 s end of the timebase, which is why the end of the shot is the last |ip| above its threshold.
+  The end margin is 100 ms, since a disruption's thermal quench can land ~60 ms before that end
+  (199122, Wtot 630 -> 240 kJ in 5 ms with the beams on), and the transient filters miss it.
 - The P_oh transient is a 5 ms boxcar above 2 MW.
   The EFIT P_oh stays below 0.6 MW through the ramp-up and only crosses 2 MW at disruptive terminations.
   The P_rad transient is a 5 ms boxcar above 17 MW, above the 16.0 MW the iteration_3 store reaches.
@@ -167,11 +173,10 @@ DIII-D specifics of the filter spec (`D3DDataWorkflow`):
 - Known and kept as is:
   - The DISPY EFIT scalars carry single-slice spikes (Wtot and triangularity).
     EFIT chisq does not flag them, and they are not median-filtered.
-    Triangularity also saturates at exactly 1 for a few ms at a time (runs up to 138 ms in 204191),
-    and deep limited rampdowns (elongation ~1.2, 199243, 199244, 203460) carry the largest Wtot spikes.
-    Neither is filtered, since every filtered slice is a gap that splits the shot.
+    Deep limited rampdowns (elongation ~1.2, 199243, 199244, 203460) carry the largest Wtot spikes.
+    They are not filtered, since every filtered slice is a gap that splits the shot.
   - The first ~80 ms of the TMDB_V1c IDA-lite records (0.11-0.2 s, Ip ~0.4 MA) are often hollow in both Te and ne.
-    They are kept as ramp-up data.
+    They are kept as ramp-up data, except the slices whose core Te is unconstrained (204180 reaches 47 +- 30 keV).
 disruption-py writes no netCDF (its output setting has `path=False`), only a small `config.json` per call
 under `$LOCALSCRATCH/$USER/disruption-py/`.
 

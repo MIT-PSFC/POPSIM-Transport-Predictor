@@ -79,20 +79,36 @@ class Uniform1kHzTimeSetting(TimeSetting):
         return make_uniform_1kHz_timebase(timebase_end_s)
 
 
-def _efit_signals(params: PhysicsMethodParams, nodes: list[str]) -> tuple[np.ndarray, dict[str, np.ndarray]]:
-    """A-eqdsk nodes on the EFIT timebase [s], NaN on slices whose chi-squared exceeds chisq_max.
+def _efit_slices(params: PhysicsMethodParams) -> tuple[np.ndarray, np.ndarray]:
+    """EFIT slice times [s] and the mask of the valid slices.
 
-    Reads DIII-D's own a-eqdsk node names only. The a-file-format names in the same tree are NID
-    aliases, and about half of them point at a different quantity.
+    A slice is invalid when its chi-squared exceeds chisq_max,
+    or when either triangularity sits at triangularity_bound,
+    where the boundary search saturates and flips between two solutions.
     """
     efit_time_ms = params.mds_conn.get_data(r"\efit_a_eqdsk:atime", tree_name="_efit_tree")
     efit_time = efit_time_ms / 1e3
     chisq = params.mds_conn.get_data(r"\efit_a_eqdsk:chisq", tree_name="_efit_tree")
-    mask_invalid = chisq > config["efit"]["chisq_max"]
+    triangularity_upper = params.mds_conn.get_data(r"\efit_a_eqdsk:tritop", tree_name="_efit_tree")
+    triangularity_lower = params.mds_conn.get_data(r"\efit_a_eqdsk:tribot", tree_name="_efit_tree")
+    triangularity_bound = config["efit"]["triangularity_bound"]
+    mask_chisq_valid = chisq <= config["efit"]["chisq_max"]
+    mask_triangularity_saturated = (triangularity_upper >= triangularity_bound) | (triangularity_lower >= triangularity_bound)
+    mask_valid = mask_chisq_valid & ~mask_triangularity_saturated
+    return efit_time, mask_valid
+
+
+def _efit_signals(params: PhysicsMethodParams, nodes: list[str]) -> tuple[np.ndarray, dict[str, np.ndarray]]:
+    """A-eqdsk nodes on the EFIT timebase [s], NaN on the invalid slices (_efit_slices).
+
+    Reads DIII-D's own a-eqdsk node names only. The a-file-format names in the same tree are NID
+    aliases, and about half of them point at a different quantity.
+    """
+    efit_time, mask_valid = _efit_slices(params)
     signals = {}
     for node in nodes:
         values = params.mds_conn.get_data(rf"\efit_a_eqdsk:{node}", tree_name="_efit_tree")
-        values[mask_invalid] = np.nan
+        values[~mask_valid] = np.nan
         signals[node] = values
     return efit_time, signals
 
@@ -187,7 +203,7 @@ class D3DDatasetMethods:
     @staticmethod
     @physics_method(columns=["wmhd", "beta_n"], tokamak=Tokamak.D3D)
     def get_efit_scalars(params: PhysicsMethodParams):
-        """Stored energy and normalized beta of the DISPY EFIT, NaN on slices with chi-squared above chisq_max.
+        """Stored energy and normalized beta of the DISPY EFIT, held over the invalid slices (_efit_slices).
 
         The nodes of the built-in get_efit_parameters, which interpolates them.
         """
@@ -285,24 +301,22 @@ class D3DDatasetMethods:
     def get_ida_profiles(params: PhysicsMethodParams):
         """IDA Te/ne on the rho_tor_norm grid (mapped through the DISPY EFIT q profile) and on the psi_norm grid.
 
-        fresh_equilibrium marks the grid times a usable EFIT slice lands on (chisq and a mappable q),
+        fresh_equilibrium marks the grid times a usable EFIT slice lands on (valid per _efit_slices, and a mappable q),
         the slices the profiles map through.
-        The EFIT 0D signals need chisq alone (_efit_signals), so they can update where it is 0.
+        The EFIT 0D signals need a valid slice alone (_efit_signals), so they can update where it is 0.
         """
         ida_path = find_ida_path(params.shot_id)
         if ida_path is None:
             raise CalculationError(f"no IDA file for shot {params.shot_id}")
         ida = xr.load_dataset(ida_path)
 
-        efit_time_ms = params.mds_conn.get_data(r"\efit_a_eqdsk:atime", tree_name="_efit_tree")
-        efit_time = efit_time_ms / 1e3
+        efit_time, mask_efit_slice_valid = _efit_slices(params)
         qpsi = params.mds_conn.get_data(r"\top.results.geqdsk:qpsi", tree_name="_efit_tree")
         if qpsi.shape[0] != efit_time.size:
             raise CalculationError(f"qpsi shape {qpsi.shape} does not match {efit_time.size} EFIT slices")
-        chisq = params.mds_conn.get_data(r"\efit_a_eqdsk:chisq", tree_name="_efit_tree")
         psi_n_grid_efit = geqdsk_psi_n_grid(qpsi.shape[1])
         mask_q_mappable = mappable_q_profiles(psi_n_grid_efit, qpsi)
-        mask_efit_valid = (chisq <= config["efit"]["chisq_max"]) & mask_q_mappable
+        mask_efit_valid = mask_efit_slice_valid & mask_q_mappable
 
         ida_profiles = ida_profiles_on_grids(ida, efit_time, qpsi, mask_efit_valid, params.times)
         _, fresh_equilibrium = hold_onto_grid(params.times, efit_time[mask_efit_valid], False)

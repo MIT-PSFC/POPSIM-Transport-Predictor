@@ -75,14 +75,13 @@ def _synthetic_ida(psi_n: np.ndarray) -> xr.Dataset:
     return xr.Dataset(data_vars, coords={"time": IDA_TIMES_MS, "psi_n": psi_n})
 
 
-def _profiles_on_grids(psi_n: np.ndarray) -> tuple[xr.Dataset, np.ndarray]:
-    """IDA profiles of the synthetic file on the store grids, with no valid EFIT near IDA_UNMAPPED_TIME_MS."""
+def _profiles_on_grids(ida: xr.Dataset) -> tuple[xr.Dataset, np.ndarray]:
+    """IDA profiles of a synthetic file on the store grids, with no valid EFIT near IDA_UNMAPPED_TIME_MS."""
     efit_time = np.arange(50, 501) * 1e-3
     qpsi = np.full((efit_time.size, 65), 2.0)
     efit_unmapped_offset = np.abs(efit_time - IDA_UNMAPPED_TIME_MS / 1e3)
     mask_efit_valid = efit_unmapped_offset > 0.005
     times = np.arange(0, 600) * 1e-3
-    ida = _synthetic_ida(psi_n)
     return ida_profiles_on_grids(ida, efit_time, qpsi, mask_efit_valid, times), times
 
 
@@ -93,7 +92,8 @@ def test_ida_profiles_land_on_store_grids():
     and grid points past the IDA domain (sqrt(1.2) ~ 1.095) are NaN.
     """
     psi_n_native = 1e-3 + (1.2 - 1e-3) * np.linspace(0.0, 1.0, 150) ** 1.2
-    profiles, times = _profiles_on_grids(psi_n_native)
+    ida = _synthetic_ida(psi_n_native)
+    profiles, times = _profiles_on_grids(ida)
 
     assert set(profiles.data_vars) == {*IDA_RHO_COLUMNS, *IDA_PSI_COLUMNS, "fresh_profile"}
     np.testing.assert_array_equal(profiles[RADIAL_DIM].values, RHO_TOR_NORM_GRID.astype(np.float32))
@@ -118,7 +118,8 @@ def test_differing_native_psi_grids_land_on_one_psi_norm_grid():
     te_psi_expected = (1000.0 * (1.2 - PSI_NORM_GRID)).astype(np.float32)
 
     for psi_n_native in [psi_n_native_a, psi_n_native_b]:
-        profiles, times = _profiles_on_grids(psi_n_native)
+        ida = _synthetic_ida(psi_n_native)
+        profiles, times = _profiles_on_grids(ida)
         np.testing.assert_array_equal(profiles[PSI_NORM_DIM].values, PSI_NORM_GRID.astype(np.float32))
         te_psi = profiles["te_psi"].values[np.argmin(np.abs(times - 0.12))]
         np.testing.assert_allclose(te_psi, te_psi_expected, rtol=1e-5)
@@ -131,7 +132,8 @@ def test_ida_hold_and_unmapped_slice():
     It is dropped from the rho_tor_norm hold, so the slice before holds over it and it is not fresh.
     """
     psi_n_native = 1.2 * np.linspace(0.0, 1.0, 150) ** 1.2
-    profiles, times = _profiles_on_grids(psi_n_native)
+    ida = _synthetic_ida(psi_n_native)
+    profiles, times = _profiles_on_grids(ida)
     te_rho_axis = profiles["te_rho"].values[:, 0]
     te_psi_axis = profiles["te_psi"].values[:, 0]
     times_ms = np.round(times * 1e3)
@@ -149,6 +151,27 @@ def test_ida_hold_and_unmapped_slice():
     # One slice of margin either side of the limit, where float round-off decides
     assert np.isfinite(te_psi_axis[(times_ms > 300) & (times_ms < hold_end_ms)]).all()
     assert np.isnan(te_psi_axis[times_ms > hold_end_ms]).all()
+
+
+def test_ida_slice_with_unconstrained_core_te_is_dropped():
+    """A slice whose Te error at the axis exceeds max_core_te_relative_error of Te there is not fresh.
+
+    The slice before it holds over it, error bars included.
+    """
+    psi_n_native = 1.2 * np.linspace(0.0, 1.0, 150) ** 1.2
+    ida = _synthetic_ida(psi_n_native)
+    idx_unconstrained = 1
+    te_axis = ida["T_e"].values[idx_unconstrained, 0]
+    ida["T_e_err"].values[idx_unconstrained, 0] = 0.6 * te_axis
+    profiles, times = _profiles_on_grids(ida)
+    times_ms = np.round(times * 1e3)
+
+    mask_fresh = profiles["fresh_profile"].values == 1
+    mask_usable_slices = (IDA_TIMES_MS != IDA_UNMAPPED_TIME_MS) & (IDA_TIMES_MS != IDA_TIMES_MS[idx_unconstrained])
+    np.testing.assert_array_equal(times_ms[mask_fresh], IDA_TIMES_MS[mask_usable_slices])
+    te_error_axis = profiles["te_rho_error"].values[:, 0]
+    mask_held_from_first = (times_ms >= IDA_TIMES_MS[0]) & (times_ms < IDA_TIMES_MS[3])
+    np.testing.assert_allclose(te_error_axis[mask_held_from_first], 50.0)
 
 
 def test_gradient_and_error():
@@ -253,6 +276,45 @@ def test_time_setting_is_1khz_and_rejects_slow_efit():
     atime_50hz_ms = np.arange(100.0, 5001.0, 20.0)
     with pytest.raises(ValueError, match="not a 1 kHz reconstruction"):
         Uniform1kHzTimeSetting().get_times(_time_params(atime_50hz_ms))
+
+
+class _StubEfitScalarConnection:
+    """Serves 1 kHz a-eqdsk nodes over 100-200 ms, with wmhd counting the slices.
+
+    Slice 20 fails chisq and slice 40 has tritop at the triangularity bound.
+    """
+
+    def __init__(self):
+        n_slices = 101
+        self.nodes = {
+            "atime": np.arange(100.0, 201.0),
+            "chisq": np.full(n_slices, 5.0),
+            "tritop": np.full(n_slices, 0.6),
+            "tribot": np.full(n_slices, 0.7),
+            "wmhd": np.arange(n_slices, dtype=float),
+            "betan": np.full(n_slices, 2.0),
+        }
+        self.nodes["chisq"][20] = 100.0
+        self.nodes["tritop"][40] = config["efit"]["triangularity_bound"]
+
+    def get_data(self, path, tree_name=None):
+        node = path.split(":")[-1]
+        return self.nodes[node].copy()
+
+
+def test_invalid_efit_slices_are_held_over():
+    """A slice failing chisq or with a triangularity at its bound never reaches the grid, the slice before holds over it."""
+    register_verbose_level()
+    connection = _StubEfitScalarConnection()
+    times = connection.nodes["atime"] / 1e3
+    params = PhysicsMethodParams(shot_id=199051, tokamak=Tokamak.D3D, disruption_time=None, mds_conn=connection, times=times)
+
+    wmhd = D3DDatasetMethods.get_efit_scalars(params=params)["wmhd"]
+
+    wmhd_expected = np.arange(101.0)
+    wmhd_expected[20] = 19.0
+    wmhd_expected[40] = 39.0
+    np.testing.assert_allclose(wmhd, wmhd_expected)
 
 
 class _StubDensityConnection:

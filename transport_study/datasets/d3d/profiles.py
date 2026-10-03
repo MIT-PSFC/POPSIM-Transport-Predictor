@@ -141,7 +141,9 @@ def ida_profiles_on_grids(
     psi_n domain. Each slice is held onto the timebase until the next one,
     for at most max_hold_ida_steps median steps of the usable slices,
     and the timebase is NaN before the first slice.
-    A slice that does not map, or lacks a Te or ne fit, is dropped before the rho_tor_norm hold,
+    A slice that does not map, lacks a Te or ne fit,
+    or has a Te error at the axis above max_core_te_relative_error of Te there (an unconstrained core fit),
+    is dropped before the rho_tor_norm hold,
     so the slice before it holds over it, as transport-validation-datasets does with its fits.
     fresh_profile marks the grid times where a usable slice lands.
 
@@ -211,7 +213,11 @@ def ida_profiles_on_grids(
     max_hold_steps = config["profile_grid"]["max_hold_ida_steps"]
     mask_te_fit = np.isfinite(slice_profiles["te_rho"]).any(axis=1)
     mask_ne_fit = np.isfinite(slice_profiles["ne_rho"]).any(axis=1)
-    mask_slice_usable = mask_slice_mapped & mask_te_fit & mask_ne_fit
+    te_axis = slice_profiles["te_rho"][:, 0]
+    te_error_axis = slice_profiles["te_rho_error"][:, 0]
+    te_error_axis_max = config["profile_grid"]["max_core_te_relative_error"] * te_axis
+    mask_te_core_constrained = te_error_axis <= te_error_axis_max
+    mask_slice_usable = mask_slice_mapped & mask_te_fit & mask_ne_fit & mask_te_core_constrained
     usable_index, fresh = hold_onto_grid(times, ida_time[mask_slice_usable], True, max_hold_periods=max_hold_steps)
     slice_index, _ = hold_onto_grid(times, ida_time, True, max_hold_periods=max_hold_steps)
 

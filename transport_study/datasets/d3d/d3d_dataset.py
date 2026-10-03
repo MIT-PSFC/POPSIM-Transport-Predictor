@@ -213,8 +213,9 @@ D3D_SIGNAL_ATTRS = {
     "fresh_profile": {"description": "1 where the profiles are a new IDA slice, 0 where an earlier slice is held"},
     "fresh_equilibrium": {
         "description": (
-            "1 where a DISPY EFIT slice usable for the profile mapping (chisq <= 50 and a mappable q) lands, 0 otherwise. "
-            "The EFIT 0D signals take every slice that passes chisq and hold for at least 10 ms, "
+            "1 where a DISPY EFIT slice usable for the profile mapping "
+            "(chisq <= 50, neither triangularity at 1, and a mappable q) lands, 0 otherwise. "
+            "The EFIT 0D signals take every slice that passes chisq and the triangularity bound and hold for at least 10 ms, "
             "so they can update where it is 0"
         )
     },
@@ -330,8 +331,10 @@ class D3DDataWorkflow(RawFileWorkflow):
     # The EFIT P_oh stays below 0.6 MW through the ramp-up and above 2 MW only at disruptive terminations.
     # P_rad reaches 16.0 MW in the iteration_3 store, so 17 MW only catches collapses.
     transient_filter: ClassVar[dict[str, float]] = {"power_ohm": 2e6, "power_radiated": 17e6}
-    # ip reads near 0 out to the 8 s end of the timebase, so the end is the last ip above its threshold
-    end_margin_s: ClassVar[float] = 0.05
+    # ip reads near 0 out to the 8 s end of the timebase, so the end is the last ip above its threshold.
+    # A disruption's thermal quench can land ~60 ms before that end (199122),
+    # and the EFIT P_oh smooths the quench out of reach of its transient filter.
+    end_margin_s: ClassVar[float] = 0.1
     min_pulse_length_s: ClassVar[float] = 0.5
     min_radiated_fraction: ClassVar[float] = 0.025
     # More radiated than put in, the same physical ceiling as the other devices (not checked on DIII-D data)
