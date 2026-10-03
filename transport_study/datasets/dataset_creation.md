@@ -249,6 +249,18 @@ TCV specifics of the filter spec (`TCVDataWorkflow`):
   (the earlier correction on the 1 kHz grid split a jump across two grid times and subtracted decaying spikes).
   A slip spread over ~3 ms (74207) looks like a real fast density drop and is left in.
   The density ratio cull catches that shot.
+- NEavg follows a single FIR chord at R ~0.90 m, so a fringe count error the jump removal misses stays in it,
+  such as an offset from the start of the shot (82875-82878 read 0.1-1.9x Thomson).
+  The three core chords next to it (DEFUSE `FIR_LADs` at R = 0.856, 0.876 and 0.932 m, 10 kHz) are fringe corrected the same way and placed on the grid.
+  Where all three read above the density floor and agree within 5 percent,
+  and NEavg is more than 10 percent off their median, their median replaces it (`core_chord_fallback`).
+  Against Thomson on 715 shots it replaces 0.9 percent of the grid times,
+  and the shots whose median is more than 25 percent off Thomson drop from 30 to 25.
+  The plain median of all four core chords is worse (52 shots), since the other chords break more often than NEavg.
+- NEavg reads high against Thomson when the magnetic axis sits outboard of ~0.91 m
+  (median 1.12 at RMAG 0.91-0.93 m against 1.02-1.05 inside 0.91 m), equally on all four core chords.
+  So it is not one chord's line of sight, and it stays inside the density ratio bounds.
+  There is no trend with the vertical position.
 
 ```bash
 python -m transport_study.datasets.cli tcv <data_assembly_dir> --mode raw

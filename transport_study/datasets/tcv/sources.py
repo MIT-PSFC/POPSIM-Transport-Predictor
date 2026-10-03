@@ -32,6 +32,15 @@ class DefuseSignal:
     values: np.ndarray  # (n,)
 
 
+@dataclass(frozen=True)
+class FirChords:
+    """Line-averaged densities of the vertical FIR chords (DEFUSE FIR_LADs) on their shared timebase."""
+
+    chord_r: np.ndarray  # (n_chords,) major radius of each chord [m]
+    time: np.ndarray  # (n,) sorted, unique times [s]
+    values: np.ndarray  # (n_chords, n) line-averaged density [m^-3]
+
+
 def defuse_path(shot: int) -> Path:
     return Path(config["data_sources"]["defuse_dir"]) / f"TCVno{shot}.h5"
 
@@ -143,6 +152,26 @@ def read_defuse(
                 if profile is not None:
                     profiles[name] = profile
     return signals, profiles
+
+
+def read_fir_chords(path: Path) -> FirChords | None:
+    """The line-averaged density of every FIR chord of one DEFUSE export (FIR_LADs), None when absent or empty."""
+    with h5py.File(path, "r") as defuse_file:
+        chords = defuse_file["SIG"].get("FIR_LADs/signal")
+        if not isinstance(chords, h5py.Group) or not all(key in chords for key in ("t", "x", "z")):
+            return None
+        if any(_is_placeholder(chords[key]) for key in ("t", "x", "z")):
+            return None
+        time = np.asarray(chords["t"][()], dtype=np.float64).ravel()
+        chord_r = np.asarray(chords["x"][()], dtype=np.float64).ravel()
+        values = np.asarray(chords["z"][()], dtype=np.float64)
+    if values.shape == (time.size, chord_r.size) and time.size != chord_r.size:
+        values = values.T
+    if values.shape != (chord_r.size, time.size):
+        logger.warning(f"DEFUSE FIR_LADs has shape {values.shape} against {chord_r.size} chords and {time.size} times")
+        return None
+    idx_keep = _unique_finite_times(time)
+    return FirChords(chord_r=chord_r, time=time[idx_keep], values=values[:, idx_keep])
 
 
 def read_liuqe(path: Path) -> LiuqeEquilibria:

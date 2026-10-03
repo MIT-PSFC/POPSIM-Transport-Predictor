@@ -28,10 +28,12 @@ from transport_study.datasets.tcv.profiles import (
 )
 from transport_study.datasets.tcv.sources import (
     DefuseSignal,
+    FirChords,
     defuse_path,
     find_tcv_shots,
     meqdb_path,
     read_defuse,
+    read_fir_chords,
     read_liuqe,
 )
 from transport_study.datasets.workflow import RawFileWorkflow
@@ -119,6 +121,19 @@ FRINGE_LEVEL_WINDOW_S = 10e-3
 FRINGE_BURST_EPISODES = 3
 FRINGE_BURST_WINDOW_S = 0.05
 
+# NEavg follows the FIR chord at R ~0.90 m alone, so a fringe count error the jump removal misses stays in it (82876-82878).
+# Where the three core chords next to it (DEFUSE FIR_LADs) agree and NEavg alone is off, their median replaces it (core_chord_fallback).
+# Against Thomson on 715 shots it replaces 0.9 percent of the times,
+# and the shots whose median is more than 25 percent off Thomson drop from 30 to 25.
+# The median of all four core chords is worse (52), the other chords break more often than NEavg.
+FIR_FALLBACK_CHORDS_R_M = (0.932, 0.876, 0.856)
+# A FIR_LADs chord within this of a FIR_FALLBACK_CHORDS_R_M radius is that chord [m]
+FIR_CHORD_MATCH_M = 5e-3
+# The fallback chords agree when their largest reads at most this ratio of their smallest
+FIR_FALLBACK_MAX_SPREAD = 1.05
+# NEavg is off when it is further than this fraction from their median
+FIR_FALLBACK_MIN_DEVIATION = 0.1
+
 ZERO_ERROR = "Zero, the no-uncertainty sentinel, since DEFUSE gives no uncertainty for its profile fits"
 
 # description of every store variable and coordinate, with units and ref (IMAS path) where the shared schema has none.
@@ -150,7 +165,9 @@ TCV_SIGNAL_ATTRS = {
     "n_e_line_average": {
         "description": (
             "Line-averaged electron density from the FIR interferometer (DEFUSE NEavg), "
-            "fringe jumps removed from the raw samples (non-causal), NaN from where the interferometer lost count"
+            "fringe jumps removed from the raw samples (non-causal), NaN from where the interferometer lost count. "
+            "Where the core chords at R = 0.856, 0.876 and 0.932 m (DEFUSE FIR_LADs, fringe jumps removed) agree within 5 percent "
+            "and NEavg is more than 10 percent off their median, their median"
         ),
     },
     "minor_radius": {
@@ -330,6 +347,17 @@ class TCVDataWorkflow(RawFileWorkflow):
             hold_floor = HOLD_FLOORS_S.get(name, 0.0)
             values_on_timebase = signal_on_grid(signal.time, signal.values, timebase, hold_floor)
             data_vars[name] = (("time",), values_on_timebase)
+        fir_chords = read_fir_chords(defuse_path(shot))
+        chords_on_timebase = _fallback_chords_on_timebase(fir_chords, timebase)
+        if density_raw_name in data_vars and chords_on_timebase is not None:
+            _, density_on_timebase = data_vars[density_raw_name]
+            density_floor = self.min_filter["n_e_line_average"]
+            density_on_timebase, mask_fallback = core_chord_fallback(density_on_timebase, chords_on_timebase, density_floor)
+            data_vars[density_raw_name] = (("time",), density_on_timebase)
+            if mask_fallback.any():
+                logger.info(
+                    f"Shot {shot}: {density_raw_name} replaced by the median of the core FIR chords at {mask_fallback.sum()} grid times"
+                )
         equilibria = read_liuqe(meqdb_path(shot))
         # Each reconstruction builds a Phi_N map to be judged, so only once per shot
         mask_eq_usable = liuqe_usable(equilibria)
@@ -525,7 +553,7 @@ def _level_samples(idx_settled: np.ndarray, idx_adjacent: np.ndarray, n_sharp: i
 
 
 def remove_fringe_jumps(sample_time: np.ndarray, density: np.ndarray) -> tuple[np.ndarray, float | None]:
-    """The raw NEavg samples with the interferometer fringe jumps removed, non-causally.
+    """The raw samples of one FIR line average (NEavg or a FIR_LADs chord) with the fringe jumps removed, non-causally.
 
     A sharp shift is a sample after which the median of the next FRINGE_SHARP_WINDOW_S
     differs from the median of the FRINGE_SHARP_WINDOW_S up to it by FRINGE_JUMP_MIN_M3 or more.
@@ -539,7 +567,7 @@ def remove_fringe_jumps(sample_time: np.ndarray, density: np.ndarray) -> tuple[n
 
     Args:
         sample_time: (n,) sorted, unique sample times [s].
-        density: (n,) NEavg [m^-3].
+        density: (n,) line-averaged density [m^-3].
 
     Returns:
         (n,) the corrected samples, and the time the record is cut from, None when it is not.
@@ -608,3 +636,52 @@ def remove_fringe_jumps(sample_time: np.ndarray, density: np.ndarray) -> tuple[n
         return density_corrected, None
     density_corrected[sample_time >= lost_count_time] = np.nan
     return density_corrected, float(lost_count_time)
+
+
+def _fallback_chords_on_timebase(fir_chords: FirChords | None, timebase: np.ndarray) -> np.ndarray | None:
+    """The FIR_FALLBACK_CHORDS_R_M line averages, fringe jumps removed, placed on the timebase (signal_on_grid).
+
+    Returns:
+        (3, n_time), or None when the export has no FIR_LADs or lacks one of the chords.
+    """
+    if fir_chords is None:
+        return None
+    chords_on_timebase = []
+    for chord_r in FIR_FALLBACK_CHORDS_R_M:
+        chord_distance = np.abs(fir_chords.chord_r - chord_r)
+        idx_chord = int(np.argmin(chord_distance))
+        if chord_distance[idx_chord] > FIR_CHORD_MATCH_M:
+            return None
+        chord_corrected, _ = remove_fringe_jumps(fir_chords.time, fir_chords.values[idx_chord])
+        chord_on_timebase = signal_on_grid(fir_chords.time, chord_corrected, timebase, 0.0)
+        chords_on_timebase.append(chord_on_timebase)
+    return np.stack(chords_on_timebase)
+
+
+def core_chord_fallback(density: np.ndarray, chords: np.ndarray, density_floor: float) -> tuple[np.ndarray, np.ndarray]:
+    """NEavg, outvoted by the fallback chords where they agree with each other and it alone is off.
+
+    At each time, the chords agree when all read above density_floor
+    and the largest is at most FIR_FALLBACK_MAX_SPREAD times the smallest.
+    NEavg is off when it is further than FIR_FALLBACK_MIN_DEVIATION from their median, which then replaces it.
+    A time where a chord or NEavg is NaN keeps NEavg.
+
+    Args:
+        density: (n,) NEavg on the timebase [m^-3].
+        chords: (n_chords, n) the fallback chords on the timebase [m^-3].
+        density_floor: Lowest density a chord is trusted at [m^-3].
+
+    Returns:
+        (n,) the density, and (n,) the times their median replaced NEavg.
+    """
+    chords_min = np.min(chords, axis=0)
+    chords_max = np.max(chords, axis=0)
+    chords_median = np.median(chords, axis=0)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        chords_spread = chords_max / chords_min
+        density_over_chords = density / chords_median
+    density_deviation = np.abs(density_over_chords - 1.0)
+    mask_chords_agree = (chords_min > density_floor) & (chords_spread <= FIR_FALLBACK_MAX_SPREAD)
+    mask_fallback = mask_chords_agree & (density_deviation > FIR_FALLBACK_MIN_DEVIATION)
+    density_fallback = np.where(mask_fallback, chords_median, density)
+    return density_fallback, mask_fallback

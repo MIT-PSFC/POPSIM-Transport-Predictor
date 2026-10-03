@@ -29,6 +29,7 @@ from transport_study.datasets.tcv.tcv_dataset import (
     PREDICTION_SOURCES,
     TCV_SIGNAL_ATTRS,
     TCVDataWorkflow,
+    core_chord_fallback,
     remove_fringe_jumps,
 )
 from transport_study.signals import PREDICTION_STORE_NAME
@@ -158,6 +159,26 @@ def test_fringe_burst_cuts_the_rest_of_the_record():
     mask_before = sample_time < 0.199
     np.testing.assert_allclose(density_corrected[mask_before], density_true[mask_before])
     assert np.isnan(density_corrected[sample_time >= 0.2]).all()
+
+
+def test_core_chords_outvote_neavg_only_where_they_agree():
+    """NEavg off chords that agree takes their median.
+    It is kept where it is close, NaN, or the chords disagree or read below the floor."""
+    chords = np.array(
+        [
+            [4.0e19, 4.0e19, 4.0e19, 3.0e19, 1e18, 4.0e19],
+            [4.1e19, 4.1e19, 4.1e19, 4.0e19, 4.0e19, 4.1e19],
+            [3.95e19, 3.95e19, 3.95e19, 5.0e19, 4.0e19, 3.95e19],
+        ]
+    )
+    density = np.array([4.0e19, 6.0e19, np.nan, 6.0e19, 6.0e19, 4.3e19])
+
+    density_fallback, mask_fallback = core_chord_fallback(density, chords, density_floor=2e18)
+
+    np.testing.assert_array_equal(mask_fallback, [False, True, False, False, False, False])
+    expected = density.copy()
+    expected[1] = 4.0e19
+    np.testing.assert_allclose(density_fallback, expected)
 
 
 def _write_matlab(group: h5py.Group, name: str, data: np.ndarray, matlab_class: str = "single", empty: bool = False):
