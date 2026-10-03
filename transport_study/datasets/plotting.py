@@ -262,7 +262,7 @@ def ds_profile_plot(
             profile_data = np.full((rho.size, time.size), np.nan)
             profile_data[:, grid_idx] = shot_ds_valid[name].transpose(RADIAL_DIM, ...).values
             # Timesteps without a profile are overlaid in red.
-            # Profiles may end inside the grid (TCV at the LCFS, DIII-D at the IDA domain), so only all-NaN columns count.
+            # Profiles may end inside the grid (DIII-D at the IDA domain), so only all-NaN columns count.
             mask_nan_timestep = np.isnan(profile_data).all(axis=0)
             mesh = ax.pcolormesh(time, rho, profile_data, cmap=cmap, shading="nearest")
             if np.any(mask_nan_timestep):

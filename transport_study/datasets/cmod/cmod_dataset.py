@@ -1,7 +1,7 @@
 """C-Mod dataset, built from a transport-validation-datasets published store."""
 
-from transport_study.datasets.workflow import PublishedStoreWorkflow
+from transport_study.datasets.workflow import StoreWorkflow
 
 
-class CModDataWorkflow(PublishedStoreWorkflow):
+class CModDataWorkflow(StoreWorkflow):
     """C-Mod stores from a published store, nothing C-Mod specific beyond the base."""

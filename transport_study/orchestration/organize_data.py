@@ -92,9 +92,8 @@ REQUIRED_SIGNALS_POWER_BALANCE = [
 
 
 # Profile channels and the gradient and error-bar companions every device store carries.
-# For each base signal <v> the companions are <v>_gradient, <v>_error and <v>_gradient_error.
-# An error of 0 is the sentinel for "no rigorous error quantification" (TCV),
-# the loss treats it as a zero-width error bar
+# For each base signal <v> the companions are <v>_gradient, <v>_error and <v>_gradient_error,
+# the GP fit's (C-Mod, MAST, TCV) or IDA's (DIII-D) 1-sigma uncertainties.
 PROFILE_BASE_SIGNALS = ["t_e_keV", "n_e_1e20"]
 PROFILE_GRAD_SIGNALS = [f"{v}_gradient" for v in PROFILE_BASE_SIGNALS]
 PROFILE_ERROR_SIGNALS = [f"{v}_error" for v in PROFILE_BASE_SIGNALS] + [f"{v}_gradient_error" for v in PROFILE_BASE_SIGNALS]
@@ -312,7 +311,6 @@ def get_ds(
 
         # Only keep fresh profiles for training
         ds = ds.where(ds["fresh_profile"] == 1, drop=True)
-        # TCV only has profile data out to rho=1
         # Put all the datasets on the shared uniform rho grid for consistency
         ds = ds.interp({RADIAL_DIM: RHO_GRID}, kwargs={"fill_value": "extrapolate"})
 

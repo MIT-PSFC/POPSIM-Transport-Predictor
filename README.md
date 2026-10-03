@@ -98,8 +98,8 @@ For humans, read on. (or check out `.ua/`)
 
 ## `transport_study/datasets`
 
-Creation of the datasets for C-Mod, MAST, DIII-D, and TCV.
-There's a general `DataWorkflow` class which organizes the steps in making these datasets, however running it for a particular machine requires data access.
+Creation of the study datasets for C-Mod, MAST, DIII-D, and TCV.
+Every device is built by [transport-validation-datasets](https://github.com/MIT-PSFC/transport-validation-datasets), and `StoreWorkflow` here only selects the signals the studies read from its store, so running it needs the device's transport-validation-datasets store.
 
 MAST is publicly hosted so anyone can create the dataset for that device.
 In the near future `TODO(ZanderKeith)` I will be releasing the full C-Mod and MAST datasets used in the studies presented at ICDDPS 2026.
@@ -130,7 +130,7 @@ This was briefly attempted on DIII-D in March 2026, though results were inconclu
 
 I am not completely satisfied with how things are set up right now. The workflows are a consequence of my development environment and as such might be tricky to adapt. I've attempted to make the structure general where possible, but as it stands this is a project I made to facilitate my own work on a tight schedule. This whole thing could be iterated upon to smooth out the sharp edges, I simply do not have the bandwidth to do so. I'm still going ahead and releasing this on the off chance someone finds it useful. If you do, please cite the [POPSIM Repo](https://github.com/MIT-PSFC/POPSIM-Public) and its related [arXiv publication](https://arxiv.org/abs/2509.10244).
 
-The C-Mod and MAST datasets are built from the published stores of [transport-validation-datasets](https://github.com/MIT-PSFC/transport-validation-datasets), which is where the computationally intensive GP fitting of their Thomson scattering data now lives. DIII-D is pulled on OMEGA, which has the DIII-D data servers and the IDA profile database, and TCV is built from DEFUSE exports.
+Every dataset is built by [transport-validation-datasets](https://github.com/MIT-PSFC/transport-validation-datasets), which is where the computationally intensive GP fitting of the C-Mod, MAST and TCV Thomson scattering data lives. The C-Mod and MAST studies read its published stores, TCV and DIII-D its internal ones (no release permission). DIII-D is pulled on OMEGA, which has the DIII-D data servers and the IDA profile database, and TCV from the DEFUSE exports and LIUQE databases on the PSFC NFS.
 
 I run the training orchestration on an interactive node on a compute cluster (either Engaging or OMEGA). This is convenient for testing because whenever something breaks I can just run the study serially to step through the logic with a debugger.
 

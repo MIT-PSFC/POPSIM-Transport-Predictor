@@ -8,13 +8,14 @@ In the study a bare IMAS name always means SI, and any other unit is a suffix on
 """
 
 import xarray as xr
-from transport_validation_datasets.store_schema import HEATING_POWERS, POWER_SIGNALS
+from transport_validation_datasets.store_schema import (
+    HEATING_POWERS,
+    POWER_SIGNALS,
+    STORE_SIGNALS,
+)
 
-PREDICTION_STORE_NAME = "ds"
-
-STORE_PROFILES = ("t_e", "n_e")
-PROFILE_COMPANION_SUFFIXES = ("_error", "_gradient", "_gradient_error")
-STORE_PROFILE_COMPANIONS = tuple(f"{profile}{suffix}" for profile in STORE_PROFILES for suffix in PROFILE_COMPANION_SUFFIXES)
+# The shared schema's signals the studies read, every one but fresh_equilibrium
+STUDY_STORE_SIGNALS = tuple(name for name in STORE_SIGNALS if name != "fresh_equilibrium")
 
 # Study (working-unit) names for the summed heating power, the field at the geometric axis and the converted profiles
 POWER_ADDITIONAL_MW = "power_additional_MW"

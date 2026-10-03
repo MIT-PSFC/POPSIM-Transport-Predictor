@@ -1,16 +1,17 @@
-"""Tests for the C-Mod / MAST store build from a transport-validation-datasets published store.
+"""Tests for the study store build from a transport-validation-datasets store.
 
-PublishedStoreWorkflow is what every C-Mod and MAST study dataset is built from,
-so the store it writes must be exactly the on-disk schema whatever else the published store carries.
-These build a tiny store in the published layout and run the real build on it.
+StoreWorkflow is what every device's study dataset is built from,
+so the store it writes must hold exactly the study signals whatever else the source store carries.
+These build a tiny store in the internal layout (raw Thomson channels, the equilibrium, fit statuses)
+and run the real build on it.
 """
 
 import numpy as np
 import pytest
 import xarray as xr
-from transport_validation_datasets.store_schema import STORE_SIGNAL_ATTRS, STORE_SIGNALS
+from transport_validation_datasets.store_schema import STORE_SIGNAL_ATTRS
 
-from transport_study.signals import PREDICTION_STORE_NAME
+from transport_study.signals import STUDY_STORE_SIGNALS
 
 RHO = np.linspace(0.0, 1.1, 12)
 N_TIME_PADDED = 60
@@ -18,8 +19,8 @@ SHOT_LENGTHS = {1160503001: 50, 1160503002: 30, 1160503003: 40}
 SIGNED_SHOT = 1160503002
 
 
-def _published_store(path) -> xr.Dataset:
-    """A published-layout store: trailing NaN padding, time as a data variable, signed ip / b0 on one shot,
+def _internal_store(path) -> xr.Dataset:
+    """An internal-layout store: trailing NaN padding, time as a data variable, signed ip / b0 on one shot,
     and variables the build must leave out."""
     shots = np.array(list(SHOT_LENGTHS))
     n_shots = shots.size
@@ -73,7 +74,9 @@ def _published_store(path) -> xr.Dataset:
     data_vars["cocos"] = (("shot",), np.full(n_shots, 7.0, dtype=np.float32))
     data_vars["r0"] = (("shot",), np.full(n_shots, 0.66, dtype=np.float32))
     data_vars["psirz"] = (("shot", "time_idx", "r_grid", "z_grid"), padded(np.ones((n_shots, N_TIME_PADDED, 3, 3))))
-    ds = xr.Dataset(data_vars, coords={"shot": shots, "rho_tor_norm": RHO, "r_grid": np.arange(3.0), "z_grid": np.arange(3.0)})
+    data_vars["ts_channel_t_e"] = (("shot", "time_idx", "ts_channel"), padded(np.full((n_shots, N_TIME_PADDED, 4), 1e3)))
+    coords = {"shot": shots, "rho_tor_norm": RHO, "r_grid": np.arange(3.0), "z_grid": np.arange(3.0), "ts_channel": np.arange(4)}
+    ds = xr.Dataset(data_vars, coords=coords)
     for name, attrs in STORE_SIGNAL_ATTRS.items():
         if name in ds:
             ds[name].attrs["units"] = attrs["units"]
@@ -83,25 +86,26 @@ def _published_store(path) -> xr.Dataset:
 
 @pytest.fixture(scope="module")
 def built_store(tmp_path_factory):
-    """The source store and the prediction store the C-Mod workflow builds from it."""
-    from transport_study.datasets.cmod.cmod_dataset import CModDataWorkflow
+    """The source store and the study store the TCV workflow builds from it."""
+    from transport_study.datasets.tcv.tcv_dataset import TCVDataWorkflow
 
-    tmp = tmp_path_factory.mktemp("published_store")
-    ds_published = _published_store(tmp / "published.zarr")
-    workflow = CModDataWorkflow(ds_name="cmod_test", data_assembly_dir=tmp, published_store_path=tmp / "published.zarr")
+    tmp = tmp_path_factory.mktemp("internal_store")
+    ds_source = _internal_store(tmp / "internal.zarr")
+    workflow = TCVDataWorkflow(ds_name="tcv_test", data_assembly_dir=tmp, source_store_path=tmp / "internal.zarr")
     workflow.run_processed_data_workflow()
-    ds_built = xr.open_zarr(workflow.store_path(PREDICTION_STORE_NAME)).load()
-    return ds_published, ds_built
+    ds_built = xr.open_zarr(workflow.study_store_path).load()
+    return ds_source, ds_built
 
 
-def test_store_holds_exactly_the_on_disk_schema(built_store):
-    """Every stored signal with its SI unit, nothing the published store carries beyond it."""
+def test_store_holds_exactly_the_study_signals(built_store):
+    """Every study signal with its SI unit, nothing the source store carries beyond them."""
     _, ds_built = built_store
 
-    assert set(ds_built.data_vars) == {*STORE_SIGNALS, "time"}
+    assert set(ds_built.data_vars) == {*STUDY_STORE_SIGNALS, "time"}
+    assert "fresh_equilibrium" not in ds_built
     assert set(ds_built.dims) == {"shot", "time_idx", "rho_tor_norm"}
-    for name, attrs in STORE_SIGNAL_ATTRS.items():
-        assert ds_built[name].attrs["units"] == attrs["units"], name
+    for name in STUDY_STORE_SIGNALS:
+        assert ds_built[name].attrs["units"] == STORE_SIGNAL_ATTRS[name]["units"], name
 
 
 def test_every_shot_kept_and_padding_trimmed(built_store):
@@ -115,21 +119,21 @@ def test_every_shot_kept_and_padding_trimmed(built_store):
 
 
 def test_signed_ip_and_b0_become_magnitudes(built_store):
-    """The C-Mod store keeps the source sign, the study uses magnitudes."""
-    ds_published, ds_built = built_store
+    """The source store keeps the source sign, the study uses magnitudes."""
+    ds_source, ds_built = built_store
 
     for name in ["ip", "b0"]:
         built = ds_built[name].sel(shot=SIGNED_SHOT).dropna("time_idx").values
-        published = ds_published[name].sel(shot=SIGNED_SHOT).dropna("time_idx").values
-        np.testing.assert_allclose(built, np.abs(published))
+        source = ds_source[name].sel(shot=SIGNED_SHOT).dropna("time_idx").values
+        np.testing.assert_allclose(built, np.abs(source))
 
 
 def test_profiles_pass_through_unchanged(built_store):
     """The profiles and their companions are copied, not resampled or rescaled."""
-    ds_published, ds_built = built_store
+    ds_source, ds_built = built_store
 
     for name in ["t_e", "n_e_gradient_error"]:
         for shot, n_valid in SHOT_LENGTHS.items():
             built = ds_built[name].sel(shot=shot).isel(time_idx=slice(0, n_valid)).values
-            published = ds_published[name].sel(shot=shot).isel(time_idx=slice(0, n_valid)).values
-            np.testing.assert_array_equal(built, published)
+            source = ds_source[name].sel(shot=shot).isel(time_idx=slice(0, n_valid)).values
+            np.testing.assert_array_equal(built, source)

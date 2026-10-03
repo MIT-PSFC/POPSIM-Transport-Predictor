@@ -5,17 +5,13 @@ description = "Benchmarking model architectures on tasks related to particle tra
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
-    "disruption-py==0.14.0",
-    "mdsthin>=1.7.1",
     "popsim",
     "torax",
     "pre-commit>=4.3.0",
     "xarray",
     "netcdf4",
-    "h5py>=3.14.0",
     "fire>=0.7.1",
     "pydantic-settings>=2.12.0",
-    "dynaconf>=3.2.12",
     "wandb>=0.25.0",
     "toml>=0.10.2",
     "transport-validation-datasets",
@@ -41,7 +37,7 @@ gpu = ["jax[cuda13]>=0.11.1,<0.12"]
 profile = "black"
 
 [tool.uv]
-# disruption-py 0.14.0 pins numpy<2, but none of the code paths the DIII-D workflow uses need it.
+# transport-validation-datasets pins disruption-py 0.14.0, which pins numpy<2, and nothing the study imports needs it.
 override-dependencies = ["numpy>=2.4.4,<3"]
 
 [tool.setuptools]
