@@ -211,7 +211,7 @@ RAW_SCALAR_VALUES = {
     "I_P": -3e5,
     "BZERO": -1.4,
     "Wtot": 3e4,
-    "Vol": 1.0,
+    "VOL": 1.0,
     "NEavg": 3e19,
     "a_minor": 0.24,
     # Off r0 = 0.88 m, so B_geo differs from |BZERO|
@@ -271,7 +271,7 @@ def test_standardize_builds_store_signals_in_si(workflow):
     assert ds.sizes["time_idx"] == N_TIME
     assert ds["ip"].isel(time_idx=0).item() == pytest.approx(3e5)
     assert ds["b0"].isel(time_idx=0).item() == pytest.approx(1.4)
-    # beta_N = 400 mu0 Wtot a / (3 Vol B_geo Ip[MA]) with B_geo = 1.4 T * 0.88 / 0.85
+    # beta_N = 400 mu0 Wtot a / (3 VOL B_geo Ip[MA]) with B_geo = 1.4 T * 0.88 / 0.85
     assert ds["beta_tor_norm"].isel(time_idx=0).item() == pytest.approx(2.7744, rel=1e-4)
     # Constant Ip, li and R leave Ip V_loop, from the second sample on (backward difference)
     assert ds["power_ohm"].isel(time_idx=10).item() == pytest.approx(3e5)

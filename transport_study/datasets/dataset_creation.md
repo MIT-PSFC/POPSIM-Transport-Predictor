@@ -23,7 +23,7 @@ The study derives the field at the geometric axis on load, b_geo = b0 r0 / geome
 beta_tor_norm is normalized with B_geo on every device, in beta_tor = 2 mu0 <p> / B_geo^2 and in a B_geo / Ip,
 which is what the study's beta inversions assume, and not the IMAS b0 at r0.
 MAST efm and DIII-D EFIT store it so, C-Mod rebuilds it from EFIT betat (its betan takes the total field at the axis),
-and TCV computes it from LIUQE Wtot and Vol (DEFUSE BETAN normalizes by the volume-averaged vacuum field and BZERO).
+and TCV computes it from LIUQE Wtot and VOL (DEFUSE BETAN normalizes by the volume-averaged vacuum field and BZERO).
 power_radiated is the total radiated power including the divertor,
 and power_ohm is Ip V_loop - dW_pol/dt.
 rho_tor_norm = sqrt(Phi_N), with Phi_N the integral of q over psi_N (`phi_n_map`),
@@ -190,7 +190,7 @@ and the LIUQE reconstructions of the MEQ databases (`TCV{shot}_meqdb.mat`), both
 - 0D signals: DEFUSE, SI apart from NBI, NBI2 and ECRH, which it stores in MW.
   Newer shots carry ECRH as one row per gyrotron, and the rows are summed.
   A heating system a shot does not have is an empty placeholder in its export and counts as zero.
-  The LIUQE signals (Wtot, Vol, a_minor, R_geom, KAPPA, DELTA_TOP, DELTA_BOTTOM, LI, BZERO) are held for at least 10 ms.
+  The LIUQE signals (Wtot, VOL, a_minor, R_geom, KAPPA, DELTA_TOP, DELTA_BOTTOM, LI, BZERO) are held for at least 10 ms.
 - `power_radiated` is `PradTot`, the total including the divertor like DIII-D and MAST.
   `PradBulk`, the confined plasma only, is 0.43 of it at the median over 81 shots (0.27-0.69 for 5-95 percent).
   It follows the Thomson cadence (~17 ms) but often skips one or two samples, leaving 33-50 ms steps,
@@ -207,7 +207,7 @@ and the LIUQE reconstructions of the MEQ databases (`TCV{shot}_meqdb.mat`), both
   DEFUSE `POHM` has no documented definition and reads 0.9-1.0 of Ip Vloop at flat-top.
 - `b0` is `BZERO`, LIUQE's rBt / r0 with r0 = 0.88 m.
 - `beta_tor_norm` is computed on the timebase, 100 beta_tor a B_geo / Ip[MA] with beta_tor = 2 mu0 <p> / B_geo^2,
-  <p> = 2 Wtot / (3 Vol) and B_geo = |BZERO| r0 / R_geom (`_normalized_beta`).
+  <p> = 2 Wtot / (3 VOL) and B_geo = |BZERO| r0 / R_geom (`_normalized_beta`).
   DEFUSE `BETAN` is LIUQE's, which normalizes beta_tor by the volume-averaged vacuum field and multiplies by |BZERO| at r0,
   and reads a median 5.6 percent below the B_geo value.
 - Profiles: the DEFUSE Te/ne fits, which are on rho_pol = sqrt(psi_N), not rho_tor_norm

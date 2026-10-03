@@ -67,7 +67,7 @@ R0 = 0.88
 
 # DEFUSE signals of the LIUQE reconstruction, BZERO (LIUQE rBt / r0) among them.
 # Each is held for at least EQUILIBRIUM_HOLD_FLOOR, so a few missing reconstructions are bridged.
-LIUQE_SOURCES = ("Wtot", "Vol", "a_minor", "R_geom", "KAPPA", "DELTA_TOP", "DELTA_BOTTOM", "LI", "BZERO")
+LIUQE_SOURCES = ("Wtot", "VOL", "a_minor", "R_geom", "KAPPA", "DELTA_TOP", "DELTA_BOTTOM", "LI", "BZERO")
 # PradTot follows the Thomson cadence (~17 ms) but often skips one or two samples (33-50 ms steps),
 # or comes in bursts 50 ms apart (61056).
 # The 1.5-step hold left gaps that cut ~10 percent of the kept time, and 60 ms bridges both.
@@ -81,7 +81,7 @@ OHMIC_POWER_SOURCES = ("I_P", "Vloop", "LI", "R_geom")
 # DEFUSE signals beta_tor_norm is computed from (_normalized_beta) in the B_geo convention of every store.
 # DEFUSE BETAN normalizes beta_tor by the volume-averaged vacuum field and multiplies by |BZERO| at r0,
 # which reads a median 5.6 percent below it.
-NORMALIZED_BETA_SOURCES = ("Wtot", "Vol", "a_minor", "R_geom", "BZERO", "I_P")
+NORMALIZED_BETA_SOURCES = ("Wtot", "VOL", "a_minor", "R_geom", "BZERO", "I_P")
 # DEFUSE Vloop has the opposite sign convention to I_P:
 # Ip * Vloop is negative at flat-top on all 39 shots checked, of both current polarities
 DEFUSE_VLOOP_SIGN = -1.0
@@ -143,7 +143,7 @@ TCV_SIGNAL_ATTRS = {
     "beta_tor_norm": {
         "description": (
             "Normalized toroidal beta with B_geo, 100 beta_tor a B_geo / Ip[MA] with beta_tor = 2 mu0 <p> / B_geo^2, "
-            "<p> = 2 Wtot / (3 Vol) and B_geo = |BZERO| r0 / R_geom (DEFUSE Wtot, Vol, a_minor, R_geom, BZERO, I_P), "
+            "<p> = 2 Wtot / (3 VOL) and B_geo = |BZERO| r0 / R_geom (DEFUSE Wtot, VOL, a_minor, R_geom, BZERO, I_P), "
             "not DEFUSE BETAN"
         ),
     },
@@ -478,11 +478,11 @@ def _ohmic_power(ds: xr.Dataset) -> xr.DataArray:
 def _normalized_beta(ds: xr.Dataset) -> xr.DataArray:
     """Normalized toroidal beta with B_geo, from the LIUQE signals and I_P on the timebase.
 
-    beta_tor = 2 mu0 <p> / B_geo^2 with the volume-averaged pressure <p> = 2 Wtot / (3 Vol),
+    beta_tor = 2 mu0 <p> / B_geo^2 with the volume-averaged pressure <p> = 2 Wtot / (3 VOL),
     and beta_N = 100 beta_tor a B_geo / Ip[MA], the convention every store holds.
     B_geo = |BZERO| R0 / R_geom carries LIUQE's vacuum field at R0 out to the geometric axis.
     """
-    pressure_mean = 2.0 * ds["Wtot"] / (3.0 * ds["Vol"])
+    pressure_mean = 2.0 * ds["Wtot"] / (3.0 * ds["VOL"])
     b_center_magnitude = abs(ds["BZERO"])
     b_geo = b_center_magnitude * R0 / ds["R_geom"]
     beta_tor = 2.0 * MU0 * pressure_mean / b_geo**2
