@@ -51,9 +51,6 @@ sol_extension = "secant"
 # Uniform psi_norm grid for the trajopt store profiles, inside IDA's psi_n <= 1.2 domain
 psi_norm_max = 1.18
 num_psi_norm_points = 60
-# Longest an IDA slice is held onto the 1 kHz timebase, in median steps of the usable IDA slices.
-# Interior IDA gaps reach 2.6 median steps, so this only cuts the hold after the last slice.
-max_hold_ida_steps = 3.0
 # An IDA slice whose Te error at the axis exceeds this fraction of Te there is an unconstrained core fit and is dropped.
 # Ramp-up IDA-lite fits reach Te(0) = 47 +- 30 keV at n_e_line 5e18 (204180).
 max_core_te_relative_error = 0.5

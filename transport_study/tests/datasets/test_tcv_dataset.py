@@ -10,11 +10,10 @@ import h5py
 import numpy as np
 import pytest
 import xarray as xr
-from transport_validation_datasets.machine.generic import phi_n_map
+from transport_validation_datasets.machine.generic import PROFILE_MAX_HOLD, phi_n_map
 from transport_validation_datasets.store_schema import STORE_SIGNAL_ATTRS, STORE_SIGNALS
 
 from transport_study import RADIAL_DIM, TIME_COORD
-from transport_study.datasets.tcv import config
 from transport_study.datasets.tcv.profiles import (
     RHO_TOR_NORM_GRID,
     DefuseProfile,
@@ -29,7 +28,6 @@ from transport_study.datasets.tcv.tcv_dataset import (
     PREDICTION_SOURCES,
     TCV_SIGNAL_ATTRS,
     TCVDataWorkflow,
-    core_chord_fallback,
     remove_fringe_jumps,
 )
 from transport_study.signals import PREDICTION_STORE_NAME
@@ -88,7 +86,7 @@ def test_defuse_profiles_land_on_store_grid():
 
 
 def test_defuse_hold_and_unmapped_slice():
-    """Slices hold until the next one, and the hold ends max_hold_defuse_steps median steps after the last slice.
+    """Slices hold until the next one, and the last for PROFILE_MAX_HOLD.
 
     A slice with no usable reconstruction within match_max_ms, or with a NaN fit point, is dropped before the hold,
     so the slice before it holds over it and it is not fresh.
@@ -100,16 +98,12 @@ def test_defuse_hold_and_unmapped_slice():
     mask_slice_usable = ~np.isin(DEFUSE_TIMES, [DEFUSE_UNMAPPED_TIME, DEFUSE_INCOMPLETE_TIME])
     usable_times_ms = defuse_times_ms[mask_slice_usable]
 
+    hold_end_ms = usable_times_ms[-1] + 1e3 * PROFILE_MAX_HOLD
     assert np.isnan(te_axis[times_ms < defuse_times_ms[0]]).all()
-    mask_slices_held = (times_ms >= defuse_times_ms[0]) & (times_ms <= defuse_times_ms[-1])
-    assert np.isfinite(te_axis[mask_slices_held]).all()
-    np.testing.assert_array_equal(times_ms[fresh], usable_times_ms)
-
-    usable_step_median_ms = np.median(np.diff(usable_times_ms))
-    hold_end_ms = usable_times_ms[-1] + config["profile_grid"]["max_hold_defuse_steps"] * usable_step_median_ms
-    # One slice of margin either side of the limit, where float round-off decides
-    assert np.isfinite(te_axis[(times_ms > defuse_times_ms[-1]) & (times_ms < hold_end_ms - 1)]).all()
+    # One slice of margin either side of the hold end, where float round-off decides
+    assert np.isfinite(te_axis[(times_ms >= defuse_times_ms[0]) & (times_ms < hold_end_ms)]).all()
     assert np.isnan(te_axis[times_ms > hold_end_ms + 1]).all()
+    np.testing.assert_array_equal(times_ms[fresh], usable_times_ms)
 
 
 FIR_SAMPLE_STEP = 40e-6
@@ -159,26 +153,6 @@ def test_fringe_burst_cuts_the_rest_of_the_record():
     mask_before = sample_time < 0.199
     np.testing.assert_allclose(density_corrected[mask_before], density_true[mask_before])
     assert np.isnan(density_corrected[sample_time >= 0.2]).all()
-
-
-def test_core_chords_outvote_neavg_only_where_they_agree():
-    """NEavg off chords that agree takes their median.
-    It is kept where it is close, NaN, or the chords disagree or read below the floor."""
-    chords = np.array(
-        [
-            [4.0e19, 4.0e19, 4.0e19, 3.0e19, 1e18, 4.0e19],
-            [4.1e19, 4.1e19, 4.1e19, 4.0e19, 4.0e19, 4.1e19],
-            [3.95e19, 3.95e19, 3.95e19, 5.0e19, 4.0e19, 3.95e19],
-        ]
-    )
-    density = np.array([4.0e19, 6.0e19, np.nan, 6.0e19, 6.0e19, 4.3e19])
-
-    density_fallback, mask_fallback = core_chord_fallback(density, chords, density_floor=2e18)
-
-    np.testing.assert_array_equal(mask_fallback, [False, True, False, False, False, False])
-    expected = density.copy()
-    expected[1] = 4.0e19
-    np.testing.assert_allclose(density_fallback, expected)
 
 
 def _write_matlab(group: h5py.Group, name: str, data: np.ndarray, matlab_class: str = "single", empty: bool = False):

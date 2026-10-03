@@ -16,6 +16,9 @@ One sampled slower is held forward from its last finite sample for at most 1.5 o
 or for at least 10 ms when it comes from the equilibrium reconstruction (`EQUILIBRIUM_HOLD_FLOOR`),
 so a few missing reconstructions do not cut the shot.
 `fresh_equilibrium` marks the grid times a reconstruction usable for the profile mapping lands on.
+A profile slice is held until the next one on every device, for at most 100 ms whatever the Thomson cadence
+(transport-validation-datasets `PROFILE_MAX_HOLD`), which bridges dropped slices and burst-mode gaps.
+`fresh_profile` marks the grid times a slice lands on, and is what tells a fresh profile from a held one.
 The 0D equilibrium signals are placed from their own samples, so they can update where it is 0.
 Derivatives are backward differences, apart from those DIII-D's EFIT takes for `poh`.
 b0 is the vacuum toroidal field at the fixed major radius r0 on every device, as IMAS defines it.
@@ -114,7 +117,7 @@ and every signal is placed on the timebase causally instead (`signal_on_grid`, a
   as the published C-Mod/MAST stores (`d3d/profiles.py`).
   IDA's psi_n comes from its own reconstruction, which the files do not name, while q comes from the DISPY EFIT.
   The profiles go onto rho_tor_norm = linspace(0, 1.1, 56), the published C-Mod grid (MAST's has 67 points over the same range),
-  and each slice is held onto the 1 kHz timebase until the next one, for at most 3 median steps of the usable slices (`hold_onto_grid`).
+  and each slice is held onto the 1 kHz timebase until the next one, for at most 100 ms (`hold_onto_grid`).
   A slice with no valid EFIT nearby, without both a Te and an ne fit,
   or with a Te error at the axis above half of Te there (`max_core_te_relative_error`), is dropped before the hold,
   so the slice before it holds over it, and `fresh_profile` marks where the usable slices land.
@@ -224,7 +227,7 @@ and the LIUQE reconstructions of the MEQ databases (`TCV{shot}_meqdb.mat`), both
   Only shots with a MEQ database are built, 964 shots from 60001 to 82878.
 - The profiles go onto rho_tor_norm = linspace(0, 1.1, 56), the DIII-D and C-Mod grid,
   and are NaN past the LCFS, where the DEFUSE fits end.
-  Each slice is held onto the 1 kHz timebase until the next one (every ~17 ms), for at most 1.5 median steps of the usable slices (`hold_onto_grid`).
+  Each slice is held onto the 1 kHz timebase until the next one (every ~17 ms), for at most 100 ms (`hold_onto_grid`).
   A slice with no usable reconstruction nearby or a NaN fit point is dropped before the hold,
   so the slice before it holds over it, and `fresh_profile` marks where the usable n_e slices land.
   A time without both a Te and an ne fit has no profiles.
@@ -251,12 +254,9 @@ TCV specifics of the filter spec (`TCVDataWorkflow`):
   The density ratio cull catches that shot.
 - NEavg follows a single FIR chord at R ~0.90 m, so a fringe count error the jump removal misses stays in it,
   such as an offset from the start of the shot (82875-82878 read 0.1-1.9x Thomson).
-  The three core chords next to it (DEFUSE `FIR_LADs` at R = 0.856, 0.876 and 0.932 m, 10 kHz) are fringe corrected the same way and placed on the grid.
-  Where all three read above the density floor and agree within 5 percent,
-  and NEavg is more than 10 percent off their median, their median replaces it (`core_chord_fallback`).
-  Against Thomson on 715 shots it replaces 0.9 percent of the grid times,
-  and the shots whose median is more than 25 percent off Thomson drop from 30 to 25.
-  The plain median of all four core chords is worse (52 shots), since the other chords break more often than NEavg.
+  The density ratio cull removes those shots.
+  Replacing NEavg by the median of the neighboring core chords (DEFUSE `FIR_LADs`) where it alone disagreed was tried and dropped,
+  since it switched on and off within a shot (median 13 percent steps).
 - NEavg reads high against Thomson when the magnetic axis sits outboard of ~0.91 m
   (median 1.12 at RMAG 0.91-0.93 m against 1.02-1.05 inside 0.91 m), equally on all four core chords.
   So it is not one chord's line of sight, and it stays inside the density ratio bounds.

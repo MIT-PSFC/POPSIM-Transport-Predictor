@@ -20,6 +20,7 @@ from disruption_py.settings import TimeSettingParams
 from disruption_py.settings.nickname_setting import NicknameSettingParams
 from loguru import logger
 from transport_validation_datasets.dispy_utils import register_verbose_level
+from transport_validation_datasets.machine.generic import PROFILE_MAX_HOLD
 from transport_validation_datasets.store_schema import STORE_SIGNAL_ATTRS, STORE_SIGNALS
 
 from transport_study import RADIAL_DIM
@@ -56,7 +57,8 @@ from transport_study.signals import PREDICTION_STORE_NAME
 IDA_DIR = Path("/fusion/projects/results/ida-results/HBP_database")
 
 
-# Synthetic IDA slice times [ms]: a doubled interior gap (180 -> 260) inside the hold limit
+# Synthetic IDA slice times [ms], with a doubled interior gap (180 -> 260).
+# Without the unmapped 180 ms slice, the rho_tor_norm hold faces a 120 ms gap (140 -> 260), past PROFILE_MAX_HOLD.
 IDA_TIMES_MS = np.array([100.0, 140.0, 180.0, 260.0, 300.0])
 IDA_UNMAPPED_TIME_MS = 180.0
 
@@ -126,10 +128,11 @@ def test_differing_native_psi_grids_land_on_one_psi_norm_grid():
 
 
 def test_ida_hold_and_unmapped_slice():
-    """Slices hold across interior gaps, and the hold ends max_hold_ida_steps median steps after the last slice.
+    """Slices hold until the next one for at most PROFILE_MAX_HOLD.
 
     A slice with no valid EFIT within match_max_ms keeps its psi_norm profiles.
-    It is dropped from the rho_tor_norm hold, so the slice before holds over it and it is not fresh.
+    It is dropped from the rho_tor_norm hold, so the slice before holds over it, up to PROFILE_MAX_HOLD,
+    and it is not fresh.
     """
     psi_n_native = 1.2 * np.linspace(0.0, 1.0, 150) ** 1.2
     ida = _synthetic_ida(psi_n_native)
@@ -138,25 +141,27 @@ def test_ida_hold_and_unmapped_slice():
     te_psi_axis = profiles["te_psi"].values[:, 0]
     times_ms = np.round(times * 1e3)
 
+    max_hold_ms = 1e3 * PROFILE_MAX_HOLD
+    hold_end_ms = IDA_TIMES_MS[-1] + max_hold_ms
+    # One slice of margin either side of each hold end, where float round-off decides
+    mask_held = (times_ms >= 100) & (times_ms < hold_end_ms)
+    mask_rho_held = mask_held & ((times_ms < 140 + max_hold_ms) | (times_ms >= 260))
+    mask_rho_gap = (times_ms > 140 + max_hold_ms + 1) & (times_ms < 260)
     assert np.isnan(te_rho_axis[times_ms < 100]).all()
-    mask_slices_held = (times_ms >= 100) & (times_ms <= 300)
-    assert np.isfinite(te_rho_axis[mask_slices_held]).all()
-    assert np.isfinite(te_psi_axis[mask_slices_held]).all()
+    assert np.isfinite(te_psi_axis[mask_held]).all()
+    assert np.isfinite(te_rho_axis[mask_rho_held]).all()
+    assert np.isnan(te_rho_axis[mask_rho_gap]).all()
+    assert np.isnan(te_psi_axis[times_ms > hold_end_ms + 1]).all()
     mask_fresh = profiles["fresh_profile"].values == 1
     mapped_times_ms = IDA_TIMES_MS[IDA_TIMES_MS != IDA_UNMAPPED_TIME_MS]
     np.testing.assert_array_equal(times_ms[mask_fresh], mapped_times_ms)
-
-    ida_step_median_ms = np.median(np.diff(IDA_TIMES_MS))
-    hold_end_ms = IDA_TIMES_MS[-1] + config["profile_grid"]["max_hold_ida_steps"] * ida_step_median_ms
-    # One slice of margin either side of the limit, where float round-off decides
-    assert np.isfinite(te_psi_axis[(times_ms > 300) & (times_ms < hold_end_ms)]).all()
-    assert np.isnan(te_psi_axis[times_ms > hold_end_ms]).all()
 
 
 def test_ida_slice_with_unconstrained_core_te_is_dropped():
     """A slice whose Te error at the axis exceeds max_core_te_relative_error of Te there is not fresh.
 
-    The slice before it holds over it, error bars included.
+    The slice before it holds over it, error bars included, for at most PROFILE_MAX_HOLD,
+    so the 160 ms gap left by dropping it and the unmapped slice is held 100 ms into.
     """
     psi_n_native = 1.2 * np.linspace(0.0, 1.0, 150) ** 1.2
     ida = _synthetic_ida(psi_n_native)
@@ -170,8 +175,10 @@ def test_ida_slice_with_unconstrained_core_te_is_dropped():
     mask_usable_slices = (IDA_TIMES_MS != IDA_UNMAPPED_TIME_MS) & (IDA_TIMES_MS != IDA_TIMES_MS[idx_unconstrained])
     np.testing.assert_array_equal(times_ms[mask_fresh], IDA_TIMES_MS[mask_usable_slices])
     te_error_axis = profiles["te_rho_error"].values[:, 0]
-    mask_held_from_first = (times_ms >= IDA_TIMES_MS[0]) & (times_ms < IDA_TIMES_MS[3])
+    hold_end_ms = IDA_TIMES_MS[0] + 1e3 * PROFILE_MAX_HOLD
+    mask_held_from_first = (times_ms >= IDA_TIMES_MS[0]) & (times_ms < hold_end_ms)
     np.testing.assert_allclose(te_error_axis[mask_held_from_first], 50.0)
+    assert np.isnan(te_error_axis[(times_ms > hold_end_ms + 1) & (times_ms < IDA_TIMES_MS[3])]).all()
 
 
 def test_gradient_and_error():

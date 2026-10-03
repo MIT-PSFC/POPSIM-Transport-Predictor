@@ -11,6 +11,7 @@ import numpy as np
 import xarray as xr
 from loguru import logger
 from transport_validation_datasets.machine.generic import (
+    PROFILE_MAX_HOLD,
     geqdsk_psi_n_grid,
     hold_onto_grid,
     phi_n_map,
@@ -138,8 +139,7 @@ def ida_profiles_on_grids(
 
     Each IDA slice maps to rho_tor_norm through the q profile of the nearest valid EFIT slice no farther than
     match_max_ms away. The interpolation clamps to the innermost IDA value at the axis and is NaN past the IDA
-    psi_n domain. Each slice is held onto the timebase until the next one,
-    for at most max_hold_ida_steps median steps of the usable slices,
+    psi_n domain. Each slice is held onto the timebase until the next one, for at most PROFILE_MAX_HOLD (100 ms),
     and the timebase is NaN before the first slice.
     A slice that does not map, lacks a Te or ne fit,
     or has a Te error at the axis above max_core_te_relative_error of Te there (an unconstrained core fit),
@@ -158,16 +158,11 @@ def ida_profiles_on_grids(
     Returns:
         IDA_RHO_COLUMNS on ("idx", RADIAL_DIM), IDA_PSI_COLUMNS on ("idx", PSI_NORM_DIM),
         and fresh_profile on ("idx",), all float32.
-
-    Raises:
-        ValueError: If the IDA file has fewer than two slices.
     """
     ida_sorted = ida.sortby("time")
     ida_time = ida_sorted["time"].values / 1e3
     psi_n = ida_sorted["psi_n"].values
     num_slices = ida_time.size
-    if num_slices < 2:
-        raise ValueError(f"IDA has {num_slices} slice(s), at least two are needed to set the hold")
 
     # Nearest valid EFIT slice of each IDA slice
     efit_offset = efit_time[np.newaxis, :] - ida_time[:, np.newaxis]
@@ -210,7 +205,6 @@ def ida_profiles_on_grids(
         slice_profiles[f"{prefix}_psi"] = values_psi
 
     # The psi_norm profiles need no map, so every slice holds them
-    max_hold_steps = config["profile_grid"]["max_hold_ida_steps"]
     mask_te_fit = np.isfinite(slice_profiles["te_rho"]).any(axis=1)
     mask_ne_fit = np.isfinite(slice_profiles["ne_rho"]).any(axis=1)
     te_axis = slice_profiles["te_rho"][:, 0]
@@ -218,8 +212,8 @@ def ida_profiles_on_grids(
     te_error_axis_max = config["profile_grid"]["max_core_te_relative_error"] * te_axis
     mask_te_core_constrained = te_error_axis <= te_error_axis_max
     mask_slice_usable = mask_slice_mapped & mask_te_fit & mask_ne_fit & mask_te_core_constrained
-    usable_index, fresh = hold_onto_grid(times, ida_time[mask_slice_usable], True, max_hold_periods=max_hold_steps)
-    slice_index, _ = hold_onto_grid(times, ida_time, True, max_hold_periods=max_hold_steps)
+    usable_index, fresh = hold_onto_grid(times, ida_time[mask_slice_usable], True, max_hold_time=PROFILE_MAX_HOLD)
+    slice_index, _ = hold_onto_grid(times, ida_time, True, max_hold_time=PROFILE_MAX_HOLD)
 
     data_vars = {"fresh_profile": (("idx",), fresh.astype(np.float32))}
     for name, profiles in slice_profiles.items():
