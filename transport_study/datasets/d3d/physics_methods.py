@@ -80,21 +80,11 @@ class Uniform1kHzTimeSetting(TimeSetting):
 
 
 def _efit_slices(params: PhysicsMethodParams) -> tuple[np.ndarray, np.ndarray]:
-    """EFIT slice times [s] and the mask of the valid slices.
-
-    A slice is invalid when its chi-squared exceeds chisq_max,
-    or when either triangularity sits at triangularity_bound,
-    where the boundary search saturates and flips between two solutions.
-    """
+    """EFIT slice times [s] and the mask of the valid slices, those with a chi-squared within chisq_max."""
     efit_time_ms = params.mds_conn.get_data(r"\efit_a_eqdsk:atime", tree_name="_efit_tree")
     efit_time = efit_time_ms / 1e3
     chisq = params.mds_conn.get_data(r"\efit_a_eqdsk:chisq", tree_name="_efit_tree")
-    triangularity_upper = params.mds_conn.get_data(r"\efit_a_eqdsk:tritop", tree_name="_efit_tree")
-    triangularity_lower = params.mds_conn.get_data(r"\efit_a_eqdsk:tribot", tree_name="_efit_tree")
-    triangularity_bound = config["efit"]["triangularity_bound"]
-    mask_chisq_valid = chisq <= config["efit"]["chisq_max"]
-    mask_triangularity_saturated = (triangularity_upper >= triangularity_bound) | (triangularity_lower >= triangularity_bound)
-    mask_valid = mask_chisq_valid & ~mask_triangularity_saturated
+    mask_valid = chisq <= config["efit"]["chisq_max"]
     return efit_time, mask_valid
 
 

@@ -281,7 +281,7 @@ def test_time_setting_is_1khz_and_rejects_slow_efit():
 class _StubEfitScalarConnection:
     """Serves 1 kHz a-eqdsk nodes over 100-200 ms, with wmhd counting the slices.
 
-    Slice 20 fails chisq and slice 40 has tritop at the triangularity bound.
+    Slice 20 fails chisq.
     """
 
     def __init__(self):
@@ -289,13 +289,10 @@ class _StubEfitScalarConnection:
         self.nodes = {
             "atime": np.arange(100.0, 201.0),
             "chisq": np.full(n_slices, 5.0),
-            "tritop": np.full(n_slices, 0.6),
-            "tribot": np.full(n_slices, 0.7),
             "wmhd": np.arange(n_slices, dtype=float),
             "betan": np.full(n_slices, 2.0),
         }
         self.nodes["chisq"][20] = 100.0
-        self.nodes["tritop"][40] = config["efit"]["triangularity_bound"]
 
     def get_data(self, path, tree_name=None):
         node = path.split(":")[-1]
@@ -303,7 +300,7 @@ class _StubEfitScalarConnection:
 
 
 def test_invalid_efit_slices_are_held_over():
-    """A slice failing chisq or with a triangularity at its bound never reaches the grid, the slice before holds over it."""
+    """A slice failing chisq never reaches the grid, the slice before holds over it."""
     register_verbose_level()
     connection = _StubEfitScalarConnection()
     times = connection.nodes["atime"] / 1e3
@@ -313,7 +310,6 @@ def test_invalid_efit_slices_are_held_over():
 
     wmhd_expected = np.arange(101.0)
     wmhd_expected[20] = 19.0
-    wmhd_expected[40] = 39.0
     np.testing.assert_allclose(wmhd, wmhd_expected)
 
 

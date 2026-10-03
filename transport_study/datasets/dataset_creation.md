@@ -100,12 +100,9 @@ and every signal is placed on the timebase causally instead (`signal_on_grid`, a
 - EFIT: every EFIT signal comes from the shot's latest code_rundb run tagged `DISPY` (the 1 kHz disruption-efit).
   A shot without one, or whose EFIT is slower than 1 kHz, is skipped (`DispyEfitNicknameSetting`, `Uniform1kHzTimeSetting`).
   disruption-py's own EFIT selection falls back to the 50 Hz efit01 and forces runtag DIS under pytest, so it is not used.
-  A slice is invalid when it fails chisq > 50 or either triangularity sits at the bound of 1,
-  where the boundary search saturates and flips between two solutions (tritop 0.65 <-> 1.0 in 2035xx).
-  Every EFIT signal is held for at least 10 ms over missing and invalid slices,
-  and `fresh_equilibrium` marks the grid times a usable slice (valid, mappable q) lands on,
-  while the EFIT 0D signals take every valid slice.
-  A saturated run longer than the hold is a gap that splits the shot.
+  Failed reconstructions are missing or fail chisq > 50, so every EFIT signal is held for at least 10 ms,
+  and `fresh_equilibrium` marks the grid times a usable slice (chisq, mappable q) lands on,
+  while the EFIT 0D signals take every slice that passes chisq.
 - Profiles: Te/ne from IDA, searched in the priority order of the databases in `d3d/config.toml`:
   `HBP_database` (98 shots), the VVUQ files (4), then the general-purpose `TMDB_V1c`, `TMDB_V1a`, and `TokaMaker_database`,
   which only serve shots on `d3d/HBP_shotlist_2013_2025` (105 more). The default shotlist is the union, 207 shots.
@@ -173,8 +170,9 @@ DIII-D specifics of the filter spec (`D3DDataWorkflow`):
 - Known and kept as is:
   - The DISPY EFIT scalars carry single-slice spikes (Wtot and triangularity).
     EFIT chisq does not flag them, and they are not median-filtered.
-    Deep limited rampdowns (elongation ~1.2, 199243, 199244, 203460) carry the largest Wtot spikes.
-    They are not filtered, since every filtered slice is a gap that splits the shot.
+    Triangularity also saturates at exactly 1 for a few ms at a time (runs up to 138 ms in 204191),
+    and deep limited rampdowns (elongation ~1.2, 199243, 199244, 203460) carry the largest Wtot spikes.
+    Neither is filtered, since every filtered slice is a gap that splits the shot.
   - The first ~80 ms of the TMDB_V1c IDA-lite records (0.11-0.2 s, Ip ~0.4 MA) are often hollow in both Te and ne.
     They are kept as ramp-up data, except the slices whose core Te is unconstrained (204180 reaches 47 +- 30 keV).
 disruption-py writes no netCDF (its output setting has `path=False`), only a small `config.json` per call
