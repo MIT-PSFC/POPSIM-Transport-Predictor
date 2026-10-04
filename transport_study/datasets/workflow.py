@@ -1,40 +1,49 @@
-"""Builds one device's POPSIM store from its transport-validation-datasets store.
+"""Builds one device's study store from its transport-validation-datasets store.
 
 transport-validation-datasets (TVD) builds every device: C-Mod and MAST up to a published store,
 TCV and DIII-D up to an internal one, since their data has no release permission.
 Either holds the shared schema, IMAS names in SI units on (shot, time_idx[, rho_tor_norm]) with time on (shot, time_idx),
-already filtered and fitted, and the internal one also carries the raw readings and the equilibrium.
-A shot here only needs the signals the studies read (signals.STUDY_STORE_SIGNALS) selected,
-its trailing NaN padding trimmed, and ip and b0 taken as magnitudes.
-Shot quality is the TVD store's responsibility, nothing is culled here.
-
-A store is not uniform in time: filtering drops interior timeslices,
-so consumers needing a uniform grid reindex it (see organize_data.reindex_to_uniform_timebase).
+already filtered and fitted, one contiguous 1 kHz segment per shot padded with NaN to the longest shot,
+and the internal one also carries the raw readings and the equilibrium.
+The build here is a lazy xarray pass: it selects the signals the studies read (signals.STUDY_STORE_SIGNALS),
+cuts the time axis back to the longest shot and rechunks into ds.zarr.
+Shot quality is the TVD store's responsibility, nothing is culled here,
+and the studies convert units and take the ip and b0 magnitudes on load (signals.convert_to_working_units).
 """
 
-from functools import cached_property
+import shutil
 from pathlib import Path
+from typing import TYPE_CHECKING
 
-import numpy as np
 import xarray as xr
 from loguru import logger
+from transport_validation_datasets.dataset_utils import (
+    episode_chunk_specs,
+    write_rechunked_store,
+)
 
-from transport_study import EPISODE_DIM, RADIAL_DIM, TIME_COORD, TIME_DIM
+from transport_study import EPISODE_DIM, TIME_COORD, TIME_DIM
 from transport_study.datasets.plotting import (
     ds_profile_plot,
     ds_profile_time_plot,
     ds_summary_report,
+    variable_stats,
 )
 from transport_study.signals import STUDY_STORE_SIGNALS
 
+if TYPE_CHECKING:
+    from collections.abc import Callable
+
 # The study store's name under final_ds_dir, <name>.zarr
 STUDY_STORE_NAME = "ds"
-# Signals TVD keeps signed, the studies use magnitudes
-MAGNITUDE_SIGNALS = ("ip", "b0")
+# The TVD fit mode whose stores hold one contiguous segment per shot, the windowed modes do not
+CONTIGUOUS_FIT_MODE = "sample"
+# Target chunk size of every variable in the written store
+MB_PER_CHUNK = 100
 
 
 class StoreWorkflow:
-    """One device's POPSIM store, built from a TVD published or internal store."""
+    """One device's study store, built from a TVD published or internal store."""
 
     def __init__(
         self,
@@ -67,133 +76,80 @@ class StoreWorkflow:
         """Path of the Zarr store this workflow writes."""
         return self.final_ds_dir / f"{STUDY_STORE_NAME}.zarr"
 
-    @cached_property
-    def source_ds(self) -> xr.Dataset:
-        """The source store's study signals and times, loaded into memory.
+    @property
+    def partial_store_path(self) -> Path:
+        """Where the store is written before it is complete, so a crashed run leaves nothing at study_store_path."""
+        return self.final_ds_dir / f"{STUDY_STORE_NAME}.partial.zarr"
 
-        Loaded once, since the profiles are chunked over many shots and reading
-        them shot by shot would decompress every chunk once per shot.
-        """
+    def select_source(self) -> xr.Dataset:
+        """The source store's study signals and times, lazily, cut to max_num_shots and to the longest shot."""
         ds_store = xr.open_zarr(self.source_store_path)
-        ds_selected = ds_store[[*STUDY_STORE_SIGNALS, TIME_COORD]].isel({EPISODE_DIM: slice(0, self.max_num_shots)})
-        logger.info(f"Loading {ds_selected.sizes[EPISODE_DIM]} shots from {self.source_store_path}")
-        ds_loaded = ds_selected.load()
-        # Drop the source store's chunking and compressor encodings, the new store sets its own
-        for variable in ds_loaded.variables.values():
-            variable.encoding = {}
-        return ds_loaded
+        fit_mode = ds_store.attrs.get("fit_mode")
+        if fit_mode != CONTIGUOUS_FIT_MODE:
+            raise ValueError(
+                f"{self.source_store_path} has fit_mode {fit_mode!r}, only {CONTIGUOUS_FIT_MODE!r} stores are one contiguous segment per shot"
+            )
+        ds_selected = ds_store[[*STUDY_STORE_SIGNALS, TIME_COORD]]
+        # time is written as a data variable, the store writer keeps only the index coordinates in memory.
+        # The source encoding would still list it as a coordinate on read-back, so it goes
+        if TIME_COORD in ds_selected.coords:
+            ds_selected = ds_selected.reset_coords(TIME_COORD)
+        for variable in ds_selected.variables.values():
+            variable.encoding.pop("coordinates", None)
+        ds_selected = ds_selected.isel({EPISODE_DIM: slice(0, self.max_num_shots)})
+        # Every shot is padded with NaN times to the longest shot of the source store
+        n_time_longest = int(ds_selected[TIME_COORD].notnull().sum(TIME_DIM).max())
+        return ds_selected.isel({TIME_DIM: slice(0, n_time_longest)})
 
-    def shot_identifiers(self) -> list[int]:
-        """Every shot in the source store, truncated to max_num_shots."""
-        return [int(shot) for shot in self.source_ds[EPISODE_DIM].values]
-
-    def max_dim_sizes(self) -> dict[str, int]:
-        """The source store's padded sizes, upper bounds on every shot."""
-        return {TIME_DIM: self.source_ds.sizes[TIME_DIM], RADIAL_DIM: self.source_ds.sizes[RADIAL_DIM]}
-
-    def load_shot(self, shot: int) -> xr.Dataset:
-        """One shot of the source store in the study store's schema, with time as a coordinate."""
-        shot_ds = self.source_ds.sel({EPISODE_DIM: [shot]})
-        # The source store pads the end of each shot with NaN times
-        mask_time_valid = shot_ds[TIME_COORD].notnull().squeeze(EPISODE_DIM).values
-        shot_ds = shot_ds.isel({TIME_DIM: mask_time_valid}).set_coords(TIME_COORD)
-        for name in MAGNITUDE_SIGNALS:
-            magnitude = np.abs(shot_ds[name].values)
-            shot_ds[name] = shot_ds[name].copy(data=magnitude)
-        return shot_ds
+    def write_store(self, ds_selected: xr.Dataset) -> None:
+        """Write the selection to the partial store, check its shot count, then move it into place."""
+        if self.partial_store_path.exists():
+            logger.warning(f"Removing the partial store of an earlier run at {self.partial_store_path}")
+            shutil.rmtree(self.partial_store_path)
+        chunk_specs = episode_chunk_specs(ds_selected, EPISODE_DIM, mb_per_chunk=MB_PER_CHUNK)
+        write_rechunked_store(ds_selected, self.partial_store_path, EPISODE_DIM, chunk_specs)
+        n_shots_source = ds_selected.sizes[EPISODE_DIM]
+        n_shots_written = xr.open_zarr(self.partial_store_path).sizes[EPISODE_DIM]
+        if n_shots_written != n_shots_source:
+            raise RuntimeError(f"Wrote {n_shots_written} shots to {self.partial_store_path}, the source selection has {n_shots_source}")
+        self.partial_store_path.rename(self.study_store_path)
 
     def log_ds_details(self, ds: xr.Dataset):
         logger.info(f"Final dataset dimensions: {ds.dims}")
         logger.info(f"Final dataset variables: {list(ds.data_vars)}")
-        # For each variable, log the maximum value and the shot in which it occurs, to check for any outliers that might indicate issues with the processing
-        for var in ds.data_vars:
-            # A per-shot constant (r0) has no time to take statistics over
-            if TIME_DIM not in ds[var].dims:
-                continue
-            # Compute statistics (needed for dask arrays)
-            max_per_shot = ds[var].max(dim=TIME_DIM, skipna=True)
-            if len(max_per_shot.sizes) > 1:  # Handle multidimensional case
-                collapse_dims = [dim for dim in max_per_shot.dims if dim != EPISODE_DIM]
-                max_per_shot = max_per_shot.max(dim=collapse_dims, skipna=True)
+        # The extreme shot of every variable points at outliers the processing let through
+        for name, stats in variable_stats(ds).items():
+            logger.info(f"Stats for {name}")
+            logger.info(f"  Max is {stats['max']:.6g} at shot {stats['shot_max']}")
+            logger.info(f"  Min is {stats['min']:.6g} at shot {stats['shot_min']}")
+            logger.info(f"  Mean is {stats['mean']:.6g}")
+            logger.info(f"  Std is {stats['std']:.6g}")
+
+    def plot_store(self) -> None:
+        """Diagnostic plots of the written store, each logged with its traceback when it fails."""
+        plots: list[tuple[Callable[..., None], Path, str]] = [
+            (ds_profile_time_plot, self.final_ds_dir / "time_traces", f"{self.ds_name.upper()} Dataset Time Traces"),
+            (ds_profile_plot, self.final_ds_dir / "profile_traces", f"{self.ds_name.upper()} Dataset Profile Traces"),
+            (ds_summary_report, self.final_ds_dir / "summary_report.pdf", f"{self.ds_name.upper()} Dataset"),
+        ]
+        for plot_fn, out_path, title in plots:
             try:
-                max_shot_idx = np.nanargmax(max_per_shot.values)
-            except ValueError:
-                logger.warning(f"Variable {var} has no valid values, skipping stats logging")
-                continue
-            max_shot = ds[EPISODE_DIM].values[max_shot_idx]
-            max_val = max_per_shot.values[max_shot_idx]
-
-            min_per_shot = ds[var].min(dim=TIME_DIM, skipna=True)
-            if len(min_per_shot.sizes) > 1:  # Handle multidimensional case
-                collapse_dims = [dim for dim in min_per_shot.dims if dim != EPISODE_DIM]
-                min_per_shot = min_per_shot.min(dim=collapse_dims, skipna=True)
-            min_shot_idx = np.nanargmin(min_per_shot.values)
-            min_shot = ds[EPISODE_DIM].values[min_shot_idx]
-            min_val = min_per_shot.values[min_shot_idx]
-
-            # float64, since SI densities squared overflow float32
-            da_var_f64 = ds[var].astype(np.float64)
-            mean = da_var_f64.mean(skipna=True).compute()
-            std = da_var_f64.std(skipna=True).compute()
-
-            logger.info(f"Stats for {var}")
-            logger.info(f"  Max is {max_val:.6g} at shot {max_shot}")
-            logger.info(f"  Min is {min_val:.6g} at shot {min_shot}")
-            logger.info(f"  Mean is {mean:.6g}")
-            logger.info(f"  Std is {std:.6g}")
+                plot_fn(self.study_store_path, out_path, title=title)
+            except Exception:
+                logger.opt(exception=True).error(f"{plot_fn.__name__} failed for {self.study_store_path}")
 
     def run_processed_data_workflow(self):
         """Build the study store, then log and plot it."""
-        from popsim.data.dataset_utils import build_tensorized_dataset
-
         if self.study_store_path.exists():
             logger.info(f"Dataset already exists at {self.study_store_path}, skipping processing.")
             return
 
-        identifiers = self.shot_identifiers()
-        logger.info(f"Processing {len(identifiers)} shots to build dataset")
-        # Passing upper bounds lets every shot be padded to a fixed shape up front,
-        # so the store never needs to be extended when a later shot is larger
-        dim_sizes = self.max_dim_sizes()
-        logger.info(f"Maximum dimension sizes across shots: {dim_sizes}")
-        build_tensorized_dataset(
-            process_fn=self.load_shot,
-            identifiers=identifiers,
-            zarr_path=str(self.study_store_path),
-            time_dim=TIME_DIM,
-            episode_dim=EPISODE_DIM,
-            extend_existing=False,
-            mb_per_chunk=100,
-            dim_sizes=dim_sizes,
-        )
+        ds_selected = self.select_source()
+        logger.info(f"Writing {ds_selected.sizes[EPISODE_DIM]} shots of {self.source_store_path} to {self.study_store_path}")
+        self.final_ds_dir.mkdir(parents=True, exist_ok=True)
+        self.write_store(ds_selected)
         logger.info(f"Saved the study store to {self.study_store_path}")
 
         ds = xr.open_zarr(self.study_store_path)
         self.log_ds_details(ds)
-
-        # Diagnostic plots to sanity-check the resulting dataset (signal ranges,
-        # profile coverage, remaining issues)
-        try:
-            ds_profile_time_plot(
-                self.study_store_path,
-                self.final_ds_dir / "time_traces",
-                title=f"{self.ds_name.upper()} Dataset Time Traces",
-            )
-        except Exception as e:
-            logger.error(f"Error generating time trace plots: {e}")
-        try:
-            ds_profile_plot(
-                self.study_store_path,
-                self.final_ds_dir / "profile_traces",
-                title=f"{self.ds_name.upper()} Dataset Profile Traces",
-            )
-        except Exception as e:
-            logger.error(f"Error generating profile plots: {e}")
-        try:
-            ds_summary_report(
-                self.study_store_path,
-                self.final_ds_dir / "summary_report.pdf",
-                title=f"{self.ds_name.upper()} Dataset",
-            )
-        except Exception as e:
-            logger.error(f"Error generating summary report: {e}")
+        self.plot_store()

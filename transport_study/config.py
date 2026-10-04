@@ -14,10 +14,10 @@ import toml
 from loguru import logger
 from pydantic import BaseModel, ConfigDict, Field, field_serializer, model_validator
 
-# 80/20 between train/val
+# 80/20 between train/val, by a deterministic hazard sort: the highest-hazard fifth of each source is its validation set
 TRAIN_VAL_SPLIT = (0.8, 0.2)
 
-# Uniform normalized-minor-radius grid the profile transfer workflow puts every
+# Uniform rho_tor_norm grid the profile and transport studies put every
 # dataset on and every profile predictor family predicts on
 # Changing this changes the structure of the modules, cannot restore from checkpoints trained on a different grid
 N_RHO_POINTS = 51
@@ -68,7 +68,8 @@ class StudyConfig(BaseModel):
     # carries it and the lock is reloaded through this frozen model
     # TODO(ZanderKeith): Remove this for APS study
     dry_run: bool = False
-    max_ds_size: int = 1000
+    # Keep only the most recent shots of each device, every shot when None (get_ds logs a truncation)
+    max_ds_size: int | None = None
     hyperparam_sweeps: int = 200
     max_epochs: int = 1000
     epochs_per_val: int = 20
@@ -222,10 +223,11 @@ def load_config(cfg: "StudyConfig | Path | str") -> "StudyConfig":
     """Load study config from a StudyConfig object or a path to a TOML file."""
     if _ConfigProxy.initialized:
         raise RuntimeError("Config already loaded. Multiple calls to load_config() are not allowed.")
-    _ConfigProxy.initialized = True
     if isinstance(cfg, (Path, str)):
         cfg = StudyConfig.from_toml(cfg)
+    # Only a loaded config counts, a failed TOML parse leaves the proxy loadable
     _ConfigProxy._cfg = cfg
+    _ConfigProxy.initialized = True
     return cfg
 
 

@@ -6,9 +6,8 @@ import matplotlib.pyplot as plt
 import numpy as np
 import xarray as xr
 from matplotlib.backends.backend_pdf import PdfPages
-from transport_validation_datasets.machine.generic import UNIFORM_TIMEBASE_DT
 
-from transport_study import RADIAL_DIM, TIME_DIM
+from transport_study import EPISODE_DIM, RADIAL_DIM, TIME_DIM
 from transport_study.plot_style import BACKGROUND_COLOR, FACE_COLOR, TEXT_COLOR
 from transport_study.signals import convert_to_working_units
 
@@ -16,6 +15,10 @@ TITLE_FONTSIZE = 20
 LABEL_FONTSIZE = 20
 TICK_FONTSIZE = 18
 LEGEND_FONTSIZE = 18
+
+# Y-axis caps so a few outlying shots do not flatten every other trace
+DENSITY_YLIM_CAP_1E20 = 5
+POWER_YLIM_CAP_MW = 10
 
 
 POWER_COLORS = {
@@ -37,13 +40,43 @@ def _working_unit_dataset(ds: str | Path | xr.Dataset) -> xr.Dataset:
     return convert_to_working_units(ds)
 
 
+def variable_stats(ds: xr.Dataset) -> dict[str, dict[str, float]]:
+    """min / max / mean / std of every numeric data variable, NaN ignored, and the shots the extremes sit in.
+
+    Statistics in float64, since SI densities squared overflow float32.
+    """
+    stats = {}
+    for name in ds.data_vars:
+        da_var = ds[name]
+        if da_var.dtype.kind not in "fiu" or EPISODE_DIM not in da_var.dims:
+            continue
+        da_var_f64 = da_var.astype(np.float64)
+        dims_within_shot = [dim for dim in da_var.dims if dim != EPISODE_DIM]
+        max_per_shot = da_var_f64.max(dim=dims_within_shot, skipna=True).values
+        min_per_shot = da_var_f64.min(dim=dims_within_shot, skipna=True).values
+        if np.isnan(max_per_shot).all():
+            continue
+        shots = ds[EPISODE_DIM].values
+        idx_shot_max = np.nanargmax(max_per_shot)
+        idx_shot_min = np.nanargmin(min_per_shot)
+        stats[str(name)] = {
+            "min": float(min_per_shot[idx_shot_min]),
+            "max": float(max_per_shot[idx_shot_max]),
+            "mean": float(da_var_f64.mean(skipna=True).compute()),
+            "std": float(da_var_f64.std(skipna=True).compute()),
+            "shot_min": shots[idx_shot_min],
+            "shot_max": shots[idx_shot_max],
+        }
+    return stats
+
+
 def ds_profile_time_plot(  # noqa: PLR0915
     ds: str | xr.Dataset,
     fig_dir: Path | str,
-    num_shots: int | None = 9999,
+    num_shots: int | None = None,
     title: str = "Profile dataset Time Traces",
 ):
-    """Plot time traces of all signals of interest from the dataset.
+    """Plot time traces of all signals of interest from the dataset, the first num_shots shots or every one.
 
     Four axes:
     1. ip, energy_mhd, and beta_tor_norm
@@ -60,13 +93,13 @@ def ds_profile_time_plot(  # noqa: PLR0915
     ylim_wtot = (0, float(np.nanmax(ds["energy_mhd_MJ"].values)) * 1.1)
     ylim_betan = (0, float(np.nanmax(ds["beta_tor_norm"].values)) * 1.1)
 
-    density_max = min(float(np.nanmax(ds["n_e_line_average_1e20"].values)), 5)
+    density_max = min(float(np.nanmax(ds["n_e_line_average_1e20"].values)), DENSITY_YLIM_CAP_1E20)
     ylim_ne = (0, density_max * 1.1)
 
     # b0 y-limits for density plot right axis
     ylim_b0 = (0, float(np.nanmax(ds["b0"].values)) * 1.1)
 
-    power_max = min(max(float(np.nanmax(ds[sig].values)) for sig in POWER_COLORS), 10)
+    power_max = min(max(float(np.nanmax(ds[sig].values)) for sig in POWER_COLORS), POWER_YLIM_CAP_MW)
     ylim_power = (0, power_max * 1.1)
 
     shape_min = min(float(np.nanmin(ds[sig].values)) for sig in SHAPE_COLORS)
@@ -77,7 +110,7 @@ def ds_profile_time_plot(  # noqa: PLR0915
     )
 
     # geometric_axis_r y-limits for shaping plot right axis
-    ylim_r0 = (0, float(np.nanmax(ds["geometric_axis_r"].values)) * 1.1)
+    ylim_geometric_axis_r = (0, float(np.nanmax(ds["geometric_axis_r"].values)) * 1.1)
 
     # If any ylim is NaN or infinite, set it to a default range
     if not np.isfinite(ylim_ip).all():
@@ -94,8 +127,8 @@ def ds_profile_time_plot(  # noqa: PLR0915
         ylim_power = (0, 1)
     if not np.isfinite(ylim_shape).all():
         ylim_shape = (0, 1)
-    if not np.isfinite(ylim_r0).all():
-        ylim_r0 = (0, 1)
+    if not np.isfinite(ylim_geometric_axis_r).all():
+        ylim_geometric_axis_r = (0, 1)
 
     for shot in ds["shot"].data[:num_shots]:
         shot_ds = ds.sel(shot=shot)
@@ -196,17 +229,17 @@ def ds_profile_time_plot(  # noqa: PLR0915
         )
 
         # Add geometric_axis_r on right axis
-        ax_r0 = ax_shape.twinx()
-        ax_r0.plot(
+        ax_geometric_axis_r = ax_shape.twinx()
+        ax_geometric_axis_r.plot(
             shot_ds["time"],
             shot_ds["geometric_axis_r"],
             label="geometric_axis_r [m]",
             color="cyan",
             linestyle="--",
         )
-        ax_r0.set_ylabel("geometric_axis_r [m]", fontsize=LABEL_FONTSIZE, color="cyan")
-        ax_r0.set_ylim(ylim_r0)
-        ax_r0.tick_params(axis="y", labelsize=TICK_FONTSIZE, colors=TEXT_COLOR)
+        ax_geometric_axis_r.set_ylabel("geometric_axis_r [m]", fontsize=LABEL_FONTSIZE, color="cyan")
+        ax_geometric_axis_r.set_ylim(ylim_geometric_axis_r)
+        ax_geometric_axis_r.tick_params(axis="y", labelsize=TICK_FONTSIZE, colors=TEXT_COLOR)
 
         for ax in axes:
             ax.set_facecolor(FACE_COLOR)
@@ -226,10 +259,10 @@ def ds_profile_time_plot(  # noqa: PLR0915
 def ds_profile_plot(
     ds: str | xr.Dataset,
     fig_dir: Path | str,
-    num_shots: int | None = 9999,
-    title: str = "Dataset Time Traces",
+    num_shots: int | None = None,
+    title: str = "Dataset Profile Traces",
 ):
-    """Plot profile traces of signals from the dataset"""
+    """Heatmaps of the n_e and t_e profiles over time, the first num_shots shots or every one."""
     ds = _working_unit_dataset(ds)
 
     Path(fig_dir).mkdir(parents=True, exist_ok=True)
@@ -240,15 +273,11 @@ def ds_profile_plot(
     ]
     for shot in ds["shot"].data[:num_shots]:
         shot_ds = ds.sel(shot=shot)
-        # Store padding has NaN time.
-        # Valid columns go onto the uniform grid, so timeslices dropped by filtering show as NaN columns.
+        # Every shot is one contiguous segment, the store padding after it has NaN time
         mask_time_valid = np.isfinite(shot_ds["time"].values)
         shot_ds_valid = shot_ds.isel({TIME_DIM: mask_time_valid})
         rho = shot_ds_valid[RADIAL_DIM].values
-        time_valid = shot_ds_valid["time"].values
-        grid_offset = (time_valid - time_valid.min()) / UNIFORM_TIMEBASE_DT
-        grid_idx = np.rint(grid_offset).astype(int)
-        time = time_valid.min() + np.arange(grid_idx.max() + 1) * UNIFORM_TIMEBASE_DT
+        time = shot_ds_valid["time"].values
 
         fig, axes = plt.subplots(2, 1, figsize=(16, 12), sharex=True)
         fig.patch.set_facecolor(BACKGROUND_COLOR)
@@ -259,9 +288,8 @@ def ds_profile_plot(
         )
 
         for ax, (name, cmap, panel_title) in zip(axes, panels, strict=True):
-            profile_data = np.full((rho.size, time.size), np.nan)
-            profile_data[:, grid_idx] = shot_ds_valid[name].transpose(RADIAL_DIM, ...).values
-            # Timesteps without a profile are overlaid in red.
+            profile_data = shot_ds_valid[name].transpose(RADIAL_DIM, ...).values
+            # Timesteps without a profile (beyond the store's forward-fill hold) are overlaid in red.
             # Profiles may end inside the grid (DIII-D at the IDA domain), so only all-NaN columns count.
             mask_nan_timestep = np.isnan(profile_data).all(axis=0)
             mesh = ax.pcolormesh(time, rho, profile_data, cmap=cmap, shading="nearest")
@@ -314,7 +342,7 @@ _SUMMARY_PANEL_DEFS = [
         left_label="n_e [1e20 m^-3]",
         left_colors={"n_e_line_average_1e20": "white"},
         left_floor_zero=True,
-        left_cap=5,
+        left_cap=DENSITY_YLIM_CAP_1E20,
         show_fresh_profiles=True,
     ),
     dict(
@@ -327,7 +355,7 @@ _SUMMARY_PANEL_DEFS = [
         left_label="Power [MW]",
         left_colors=POWER_COLORS,
         left_floor_zero=True,
-        left_cap=10,
+        left_cap=POWER_YLIM_CAP_MW,
     ),
 ]
 
@@ -444,18 +472,19 @@ def _shot_summary_page(shot_ds, shot, title, all_ylims):
 
 
 def _summary_stats_page(ds, title):
-    """Build a table figure of min / max / mean / std for every data variable"""
-    rows = []
-    for var in ds.data_vars:
-        values = ds[var]
-        try:
-            var_min = float(values.min(skipna=True).compute())
-            var_max = float(values.max(skipna=True).compute())
-            var_mean = float(values.mean(skipna=True).compute())
-            var_std = float(values.std(skipna=True).compute())
-        except (ValueError, TypeError):
-            continue  # No valid values, or a non-numeric variable
-        rows.append([var, f"{var_min:.4g}", f"{var_max:.4g}", f"{var_mean:.4g}", f"{var_std:.4g}"])
+    """Build a table figure of min / max / mean / std for every data variable, with the shots of the extremes"""
+    rows = [
+        [
+            name,
+            f"{stats['min']:.4g}",
+            f"{stats['max']:.4g}",
+            f"{stats['mean']:.4g}",
+            f"{stats['std']:.4g}",
+            str(stats["shot_min"]),
+            str(stats["shot_max"]),
+        ]
+        for name, stats in variable_stats(ds).items()
+    ]
 
     fig, ax = plt.subplots(figsize=(11, 8.5))
     fig.patch.set_facecolor(BACKGROUND_COLOR)
@@ -465,7 +494,7 @@ def _summary_stats_page(ds, title):
 
     table = ax.table(
         cellText=rows,
-        colLabels=["Variable", "Min", "Max", "Mean", "Std"],
+        colLabels=["Variable", "Min", "Max", "Mean", "Std", "Shot of min", "Shot of max"],
         loc="center",
         cellLoc="center",
     )
@@ -497,7 +526,7 @@ def ds_summary_report(
     5. Power sources and sinks
 
     Y-limits are computed once across the whole dataset so axes are consistent between shots.
-    A final page has summary statistics (min / max / mean / std) for every variable.
+    A final page has summary statistics (min / max / mean / std, the shots of the extremes) for every variable.
     """
     ds = _working_unit_dataset(ds)
 

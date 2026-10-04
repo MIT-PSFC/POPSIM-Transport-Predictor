@@ -11,13 +11,11 @@ from jaxtyping import Array
 from loguru import logger
 from popsim import TimeIndepModule
 from popsim.basis import Basis1DProtocol, BSplineBasis, InterpedLinearBasis
-from popsim.cfspopcon_jax.current_drive import calc_f_shaping, calc_q_star
-from popsim.cfspopcon_jax.geometry import calc_plasma_volume
 from popsim.math_utils import safe_log
 from popsim.ml.rtd_mlp import Activation, RtdMLP
-from scipy.constants import epsilon_0, eV, mu_0
 
 from transport_study import RADIAL_DIM
+from transport_study.modules import plasma_parameters
 from transport_study.modules.normalization import (
     FeatureNormalizer,
     feature_fit_arrays,
@@ -202,74 +200,66 @@ class Inputs:
 
     @property
     def epsilon(self):
-        return self.minor_radius / self.geometric_axis_r
+        return plasma_parameters.inverse_aspect_ratio(self.minor_radius, self.geometric_axis_r)
 
     @property
     def q_star(self):
-        delta = (self.triangularity_upper + self.triangularity_lower) / 2
-        f_shaping = calc_f_shaping(
-            self.epsilon,
+        return plasma_parameters.q_star(
+            self.ip_MA,
+            self.b_geo,
+            self.geometric_axis_r,
+            self.minor_radius,
             self.elongation,
-            delta,
+            self.triangularity_upper,
+            self.triangularity_lower,
         )
-        q_star = calc_q_star(self.b_geo, self.geometric_axis_r, self.epsilon, self.ip_MA, f_shaping)
-        return q_star
 
     @property
     def fGW(self):
-        greenwald_limit = self.ip_MA / (jnp.pi * self.minor_radius**2)
-        return self.n_e_line_average_1e20 / greenwald_limit
+        return plasma_parameters.greenwald_fraction(self.n_e_line_average_1e20, self.ip_MA, self.minor_radius)
 
     @property
     def aB0(self):
-        return self.minor_radius * self.b_geo
+        return plasma_parameters.a_b0(self.minor_radius, self.b_geo)
 
     @property
     def volume_approx(self):
-        return calc_plasma_volume(
-            major_radius=self.geometric_axis_r,
-            inverse_aspect_ratio=self.epsilon,
-            areal_elongation=self.elongation,
-        )
+        return plasma_parameters.volume_approx(self.geometric_axis_r, self.minor_radius, self.elongation)
 
     @property
     def beta(self):
-        # beta_tor_norm follows the IMAS percent convention (beta[%] * a*b0/Ip) with b0 at r0
-        # divide by 100 to return beta_tor as a true fraction
-        return self.beta_tor_norm * self.ip_MA / (self.minor_radius * self.b0) / 100.0
+        """Toroidal beta as a fraction, from the IMAS percent beta_tor_norm with b0 at r0."""
+        return plasma_parameters.beta_tor_from_beta_tor_norm(self.beta_tor_norm, self.ip_MA, self.minor_radius, self.b0)
 
     @property
     def te_approx(self):
-        pressure_Pa = self.beta * self.b0**2 / (2 * mu_0)
-        pressure_eV = pressure_Pa / eV
-        pressure_keV20 = pressure_eV / 1e3 / 1e20
-        temp_keV = pressure_keV20 / self.n_e_line_average_1e20
-        return temp_keV
+        """Single-fluid temperature estimate <p> / n_e [keV]."""
+        return plasma_parameters.te_approx_keV(self.beta, self.b0, self.n_e_line_average_1e20)
 
     @property
     def w_approx(self):
-        # Beta-derived stored energy estimate [MJ], W = (3/2) p V
-        pressure_Pa = self.beta * self.b0**2 / (2 * mu_0)
-        return 1.5 * pressure_Pa * self.volume_approx / 1e6
+        """Stored energy [MJ] of beta_tor_norm through the store's own inverse, with volume_approx as the volume.
+
+        The store's betan used the reconstruction volume,
+        so this carries the volume_approx / reconstruction volume ratio.
+        """
+        return plasma_parameters.energy_mhd_MJ_from_beta_tor_norm(
+            self.beta_tor_norm,
+            self.volume_approx,
+            self.minor_radius,
+            self.b0,
+            self.ip_MA,
+        )
 
     @property
     def nu_star(self):
-        # characteristic collisionality, from https://arxiv.org/pdf/2406.18442 eqn 2
-        # SI formula with temperature in joules, rearranged so the physical
-        # constants and unit conversions fold into python-float coefficients
-        # before touching the arrays
-        # float32 array intermediates would otherwise overflow (ne_m3 / te_J^2 ~ 1e49)
-        # or underflow (eV^4 ~ 6.6e-76) and produce inf * 0 = nan
-        te_eV = self.te_approx * 1e3
-        # coulomb logarithm of debye_length over b90, which expands to
-        # log of 4 pi eps0^1.5 te_J^1.5 / (e^3 ne_m3^0.5) with te_J = te_eV * e
-        lambda_coeff = 4 * jnp.pi * epsilon_0**1.5 / (eV**1.5 * 1e10)
-        ln_lambda = safe_log(lambda_coeff * te_eV**1.5 / jnp.sqrt(self.n_e_line_average_1e20))
-        # e^4 / (2 pi eps0^2) * ne_m3 / te_J^2
-        collision_coeff = eV**2 / (2 * jnp.pi * epsilon_0**2) * 1e20
-        collision_term = collision_coeff * self.n_e_line_average_1e20 / te_eV**2
-        geometry_term = self.q_star * self.geometric_axis_r / (self.epsilon**1.5)
-        return collision_term * geometry_term * ln_lambda
+        return plasma_parameters.nu_star(
+            self.te_approx,
+            self.n_e_line_average_1e20,
+            self.q_star,
+            self.geometric_axis_r,
+            self.epsilon,
+        )
 
     @property
     def nn_inputs(self):

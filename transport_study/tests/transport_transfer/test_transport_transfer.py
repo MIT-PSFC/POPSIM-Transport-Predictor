@@ -15,8 +15,7 @@ def test_get_ds_transport_transfer():
     from the zero-filled per-system aux power signals, retains energy_mhd_MJ,
     power_ohm_MW/power_radiated_MW (anchor targets for the sciml training loss),
     triangularity_upper/triangularity_lower, fresh_profile, and the t_e_shape/n_e_shape variables,
-    clips the profile error signals at zero, and is reindexed to the uniform
-    1 kHz timebase (mid-shot gaps become NaN slices). Also belongs as a
+    and carries the hazard metric per shot. Also belongs as a
     parametrization of TestGetDs in tests/orchestration/test_organize_data.py."""
 
 

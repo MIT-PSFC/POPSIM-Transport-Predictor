@@ -43,6 +43,8 @@ from popsim.cfspopcon_jax.current_drive import calc_f_shaping, calc_q_star
 from popsim.cfspopcon_jax.geometry import calc_plasma_surface_area
 from popsim.module_base import TimeIndepModule
 
+from transport_study.modules.plasma_parameters import greenwald_fraction
+
 NORM_INPUT_VARS = (
     "ip_MA",
     "b_geo",
@@ -204,8 +206,7 @@ def physics_feature_vec(vec: jnp.ndarray) -> jnp.ndarray:
     epsilon = a_minor / r_geo
     f_shaping = calc_f_shaping(epsilon, kappa, jnp.zeros_like(epsilon))
     q_star = calc_q_star(b_geo, r_geo, epsilon, ip_ma, f_shaping)
-    greenwald_limit = ip_ma / (jnp.pi * a_minor**2)
-    f_g = ne20 / greenwald_limit
+    f_g = greenwald_fraction(ne20, ip_ma, a_minor)
     a_b0 = a_minor * b_geo
     surface_area = calc_plasma_surface_area(r_geo, epsilon, kappa)
     surface_power_density = p_aux / surface_area

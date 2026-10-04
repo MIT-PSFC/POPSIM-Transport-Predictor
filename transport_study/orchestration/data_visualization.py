@@ -12,7 +12,6 @@ from scipy.spatial import ConvexHull
 from transport_study.config import config
 from transport_study.orchestration.organize_data import (
     TrainingData,
-    add_hazard,
     concat_with_nan_padding,
     get_ds,
     get_train_test_datasets,
@@ -79,7 +78,7 @@ def hazard_extrapolation_plot(
     Scatter each shot in x_var-y_var (hazard) space.
 
     Color encodes the data source device, marker encodes the dataset split
-    (train/val/test). Uses the per-shot p95 values added by `add_hazard`.
+    (train/val/test). Uses the per-shot p95 values get_ds adds through `add_hazard`.
 
     Args:
         save_path: Path to save the generated figure.
@@ -320,12 +319,11 @@ def domain_plot(
 
 def _combined_raw_dataset(study_type: str) -> tuple[xr.Dataset, str]:
     """Concatenate every device (sources + target) into one dataset with a per-shot
-    ds_source coordinate and hazard/p95 metrics added."""
+    ds_source coordinate, the hazard/p95 metrics come with get_ds."""
     datasets = []
     episode_coord = None
     for device in _all_devices():
         ds, episode_coord = get_ds(device, study_type=study_type)
-        ds = add_hazard(ds, episode_coord)
         # Profile-transfer datasets have no aux-power signal, but zscore/coral
         # normalization iterate over it unconditionally. Zero-fill so they run
         # (a no-op for power-balance datasets, which always carry power_additional_MW).

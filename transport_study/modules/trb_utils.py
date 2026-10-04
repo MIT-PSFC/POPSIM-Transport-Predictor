@@ -260,12 +260,10 @@ def get_time_dep_dataloaders(
     ds_train, ds_val, input_vars, normalizer_fit_ds = resolve_case_datasets(dataloader_config, study_type)
 
     if "state_vars" in dataloader_config.keys():
-        # Validation samples are whole episodes, so a mid-shot time gap
-        # (NaN slices after the uniform-timebase reindex) would either be
-        # stitched over, handing the Euler stepper a huge dt, or drop the
-        # whole episode under drop_segment. Keep only each episode's
-        # longest contiguous non-NaN run so val simulates a single
-        # gap-free window
+        # Validation samples are whole episodes.
+        # The stores are contiguous in time, but a profile NaN beyond the store's
+        # forward-fill hold would either be stitched over or drop the whole episode under drop_segment.
+        # Keep only each episode's longest contiguous non-NaN run so val simulates a single window
         val_vars = sorted(
             v
             for v in {
@@ -304,13 +302,11 @@ def get_time_dep_dataloaders(
         segment_overlap=segment_overlap,
         shuffle=[True, False],
         convert_xr_to_jnp=False,  # Needed to keep the coords for calculating loss
-        # The datasets are reindexed to a uniform 1 kHz grid with NaN at
-        # missing times (organize_data.reindex_to_uniform_timebase), so
-        # drop_segment discards train segments spanning a time gap and the
-        # Euler stepper never sees dt larger than the nominal timebase.
-        # Val episodes were already masked to their longest contiguous
-        # run above, drop_slice_any there only clears the leading and
-        # trailing padding.
+        # Every shot is one contiguous 1 kHz segment (organize_data.check_uniform_timebase),
+        # so NaN only marks the trailing padding and the profile slices beyond the store's forward-fill hold.
+        # drop_segment discards the train segments touching those,
+        # val episodes were already masked to their longest contiguous run above,
+        # drop_slice_any there only clears the leading and trailing padding.
         nan_handling=["drop_segment", "drop_slice_any"],
         # Keep every batch the same shape so the jitted train step never
         # retraces on a ragged final batch (whose static xr metadata is not

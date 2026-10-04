@@ -8,19 +8,18 @@ import numpy as np
 import xarray as xr
 from jaxtyping import Array, ArrayLike, PyTree
 from popsim import TimeDepModule, discrete_no_save_field
-from popsim.cfspopcon_jax.current_drive import calc_f_shaping, calc_q_star
-from popsim.cfspopcon_jax.geometry import calc_plasma_volume
 from popsim.math_utils import safe_log
 from popsim.ml.envs import ModuleTrainingEnv
 from popsim.ml.rtd_mlp import Activation, RtdMLP
 from popsim.simulate import StepperType
-from scipy.constants import epsilon_0, eV, mu_0
+from scipy.constants import eV
 from torax import ToraxConfig
 from torax import experimental as torax_experimental
 from torax._src.geometry import geometry_provider as geometry_provider_lib
 from torax._src.orchestration.step_function import SimulationStepFn
 from torax._src.torax_pydantic import torax_pydantic
 
+from transport_study.modules import plasma_parameters
 from transport_study.modules.normalization import (
     FeatureNormalizer,
     feature_fit_arrays,
@@ -105,6 +104,9 @@ class Inputs:
     the stored energy is part of the predicted state, so every beta-derived
     quantity is computed from the state stored energy via the *_from_energy_mhd methods
     instead of a prescribed input.
+    Those use the store's own betan formula with volume_approx as the volume,
+    where the store used the reconstruction volume,
+    so a measured energy_mhd_MJ does not give back the store's beta_tor_norm exactly.
     """
 
     ip_MA: float  # Plasma current [MA]
@@ -121,68 +123,61 @@ class Inputs:
 
     @property
     def epsilon(self):
-        return self.minor_radius / self.geometric_axis_r
+        return plasma_parameters.inverse_aspect_ratio(self.minor_radius, self.geometric_axis_r)
 
     @property
     def q_star(self):
-        delta = (self.triangularity_upper + self.triangularity_lower) / 2
-        f_shaping = calc_f_shaping(
-            self.epsilon,
+        return plasma_parameters.q_star(
+            self.ip_MA,
+            self.b_geo,
+            self.geometric_axis_r,
+            self.minor_radius,
             self.elongation,
-            delta,
+            self.triangularity_upper,
+            self.triangularity_lower,
         )
-        q_star = calc_q_star(self.b_geo, self.geometric_axis_r, self.epsilon, self.ip_MA, f_shaping)
-        return q_star
 
     @property
     def fGW(self):
-        greenwald_limit = self.ip_MA / (jnp.pi * self.minor_radius**2)
-        return self.n_e_line_average_1e20 / greenwald_limit
+        return plasma_parameters.greenwald_fraction(self.n_e_line_average_1e20, self.ip_MA, self.minor_radius)
 
     @property
     def aB0(self):
-        return self.minor_radius * self.b_geo
+        return plasma_parameters.a_b0(self.minor_radius, self.b_geo)
 
     @property
     def volume_approx(self):
-        return calc_plasma_volume(
-            major_radius=self.geometric_axis_r,
-            inverse_aspect_ratio=self.epsilon,
-            areal_elongation=self.elongation,
+        return plasma_parameters.volume_approx(self.geometric_axis_r, self.minor_radius, self.elongation)
+
+    def beta_tor_norm_from_energy_mhd(self, energy_mhd_MJ: ArrayLike) -> ArrayLike:
+        """IMAS beta_tor_norm of a stored energy through the store's own formula, volume_approx as the volume."""
+        return plasma_parameters.beta_tor_norm_from_energy_mhd_MJ(
+            energy_mhd_MJ,
+            self.volume_approx,
+            self.minor_radius,
+            self.b0,
+            self.ip_MA,
         )
 
     def beta_from_energy_mhd(self, energy_mhd_MJ: ArrayLike) -> ArrayLike:
-        # Inverse of W = (3/2) * beta_tor * b0^2 / (2 mu_0) * V / 1e6, beta_tor as IMAS defines it with b0 at r0
-        pressure_Pa = energy_mhd_MJ * 1e6 / (1.5 * self.volume_approx)
-        return 2.0 * mu_0 * pressure_Pa / self.b0**2
-
-    def beta_tor_norm_from_energy_mhd(self, energy_mhd_MJ: ArrayLike) -> ArrayLike:
-        # beta_tor_norm follows the IMAS percent convention (beta[%] * a*b0/Ip) with b0 at r0
-        return self.beta_from_energy_mhd(energy_mhd_MJ) * 100.0 * self.minor_radius * self.b0 / self.ip_MA
+        """Toroidal beta as a fraction of a stored energy."""
+        beta_tor_norm = self.beta_tor_norm_from_energy_mhd(energy_mhd_MJ)
+        return plasma_parameters.beta_tor_from_beta_tor_norm(beta_tor_norm, self.ip_MA, self.minor_radius, self.b0)
 
     def te_approx_from_energy_mhd(self, energy_mhd_MJ: ArrayLike) -> ArrayLike:
-        # Single-fluid pressure p = ne * Te, so Te = p / ne
-        pressure_Pa = energy_mhd_MJ * 1e6 / (1.5 * self.volume_approx)
-        pressure_keV20 = pressure_Pa / eV / 1e3 / 1e20
-        return pressure_keV20 / self.n_e_line_average_1e20
+        """Single-fluid temperature estimate <p> / n_e [keV] of a stored energy."""
+        beta_tor = self.beta_from_energy_mhd(energy_mhd_MJ)
+        return plasma_parameters.te_approx_keV(beta_tor, self.b0, self.n_e_line_average_1e20)
 
     def nu_star_from_energy_mhd(self, energy_mhd_MJ: ArrayLike) -> ArrayLike:
-        # characteristic collisionality, from https://arxiv.org/pdf/2406.18442 eqn 2
-        # SI formula with temperature in joules, rearranged so the physical
-        # constants and unit conversions fold into python-float coefficients
-        # before touching the arrays: float32 array intermediates would
-        # otherwise overflow (ne_m3 / te_J^2 ~ 1e49) or underflow (eV^4 ~ 6.6e-76)
-        # and produce inf * 0 = nan
-        te_eV = self.te_approx_from_energy_mhd(energy_mhd_MJ) * 1e3
-        # coulomb logarithm of debye_length over b90, which expands to
-        # log of 4 pi eps0^1.5 te_J^1.5 / (e^3 ne_m3^0.5) with te_J = te_eV * e
-        lambda_coeff = 4 * jnp.pi * epsilon_0**1.5 / (eV**1.5 * 1e10)
-        ln_lambda = safe_log(lambda_coeff * te_eV**1.5 / jnp.sqrt(self.n_e_line_average_1e20))
-        # e^4 / (2 pi eps0^2) * ne_m3 / te_J^2
-        collision_coeff = eV**2 / (2 * jnp.pi * epsilon_0**2) * 1e20
-        collision_term = collision_coeff * self.n_e_line_average_1e20 / te_eV**2
-        geometry_term = self.q_star * self.geometric_axis_r / (self.epsilon**1.5)
-        return collision_term * geometry_term * ln_lambda
+        te_keV = self.te_approx_from_energy_mhd(energy_mhd_MJ)
+        return plasma_parameters.nu_star(
+            te_keV,
+            self.n_e_line_average_1e20,
+            self.q_star,
+            self.geometric_axis_r,
+            self.epsilon,
+        )
 
     def transport_nn_inputs(self, energy_mhd_MJ: ArrayLike) -> Array:
         # The 10 profile predictor feature slots in the same order, with every
@@ -473,10 +468,11 @@ class TransportPredictorSciML(TransportPredictor):
     time-independent profile predictor.
 
     The power balance evolves the stored energy state. Each step the evolving
-    Wtot is converted to a normalized beta (the exact inverse of the beta to
-    stored-energy estimate) and fed to the profile predictor, so profile-loss
-    gradients flow into the power balance networks and the profiles follow
-    the predicted dynamics.
+    Wtot is converted to a normalized beta through the store's own betan formula
+    with volume_approx as the volume, exact up to the volume_approx / reconstruction
+    volume ratio since the store used the reconstruction volume,
+    and fed to the profile predictor, so profile-loss gradients flow into
+    the power balance networks and the profiles follow the predicted dynamics.
 
     The Output surfaces the power balance's Wtot / P_oh / P_rad predictions
     so the training loss can anchor them to the measured signals while the

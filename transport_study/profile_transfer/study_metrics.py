@@ -26,11 +26,11 @@ import xarray as xr
 from loguru import logger
 
 from transport_study import EPISODE_DIM, RADIAL_DIM, TIME_COORD, TIME_DIM
-from transport_study.config import RHO_GRID, config
+from transport_study.config import config
 from transport_study.modules.profile_predictor.trb import ProfilePredictorTRB
 from transport_study.orchestration.organize_data import (
-    PROFILE_ERROR_SIGNALS,
     PROFILE_TARGET_VARS,
+    to_rho_grid,
 )
 from transport_study.orchestration.stages import (
     STAGE_AGG_NAMES,
@@ -54,8 +54,8 @@ def load_eval_dataset(device: str) -> xr.Dataset:
     """Device dataset with the signals needed to score result timeslices.
 
     Profile signals and their gradient / error-bar companions are put on the
-    same uniform 51-point rho grid as training (mirrors the preprocessing in
-    organize_data.get_ds). ip_MA, the heating powers, and the time coord are
+    same uniform 51-point rho grid as training (organize_data.to_rho_grid,
+    the prep of get_ds). ip_MA, the heating powers, and the time coord are
     kept for stage segmentation. Non-fresh timeslices are kept: the join is by
     time, so only timeslices that appear in a result file are ever read.
     """
@@ -63,12 +63,8 @@ def load_eval_dataset(device: str) -> xr.Dataset:
     ds_store = xr.open_dataset(ds_path)
     ds_working = convert_to_working_units(ds_store)
     ds = ds_working[[*PROFILE_TARGET_VARS, *HEATING_POWERS_MW, "ip_MA", TIME_COORD]]
-
-    ds = ds.interp({RADIAL_DIM: RHO_GRID}, kwargs={"fill_value": "extrapolate"})
-    for err_sig in PROFILE_ERROR_SIGNALS:
-        ds[err_sig] = ds[err_sig].clip(min=0.0)
-
-    return ds.load()
+    ds_rho = to_rho_grid(ds)
+    return ds_rho.load()
 
 
 def _to_mid(arr: np.ndarray) -> np.ndarray:
