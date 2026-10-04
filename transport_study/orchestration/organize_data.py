@@ -573,10 +573,12 @@ def get_train_val_datasets(
 
     for source in training_data.sources:
         ds, episode_coord = get_ds(source, study_type)
+        # popsim requires a seed, the hazard sort makes the split deterministic and leaves it unused
         train_src, val_src = split_dataset_by_fracs(
             ds,
             fracs=TRAIN_VAL_SPLIT,
             dim=episode_coord,
+            seed=0,
             sortby="hazard",
         )
         src_idx = config.ds_source_to_idx[source]

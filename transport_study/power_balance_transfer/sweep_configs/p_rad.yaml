@@ -37,6 +37,11 @@ parameters:
         distribution: uniform
         min: 0.5
         max: 0.999
-# huber_delta is NOT swept here: the submodules have no delta-free validation
-# suite, so their sweep metric depends on the delta and sweeping it would let
-# the sweep shrink the reported loss instead of improving predictions
+  loss_config:
+    parameters:
+      # Sweeping the delta is safe, the sweep metric val/loss.mean is the
+      # delta-free validation loss (ScalarPowerTRB.get_val_loss_fn)
+      huber_delta:
+        distribution: log_uniform_values
+        min: 0.01
+        max: 1.0

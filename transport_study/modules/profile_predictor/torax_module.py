@@ -29,7 +29,6 @@ from transport_study.modules.profile_predictor.module import (
 # the coefficients predicted by the transport network, in the order of the network outputs.
 TRANSPORT_COEFFICIENT_NAMES = {
     "constant": ("chi_i", "chi_e", "D_e", "V_e"),
-    "cgm": ("chi_e_i_ratio", "chi_D_ratio", "VR_D_ratio", "alpha", "chi_stiff"),
     "gyrobohm": ("chi_bohm_multiplier", "chi_gyrobohm_multiplier", "D_face_c1", "D_face_c2", "V_face_coeff"),
     "qlknn": ("ITG_flux_ratio_correction", "ETG_correction_factor", "collisionality_multiplier"),
 }
@@ -52,7 +51,6 @@ TAU_REF_S = 0.05
 # at torax_config.transport.core_transport_models[transport_model]
 TORAX_TRANSPORT_MODEL_NAMES = {
     "constant": "prescribed",
-    "cgm": "CGM",
     "gyrobohm": "bohm-gyrobohm",
     "qlknn": "qlknn",
 }
@@ -350,8 +348,7 @@ def build_miller_geometry_jax(
     return torax_geometry.Geometry(
         # Deliberately kept CIRCULAR even though the metric is shaped
         # a non-CIRCULAR type would set q_correction_factor to 1.0 instead of 1.25 (geometry.py property),
-        # which shrinks q, inflates the 2|s|/q term in the CGM critical gradient,
-        # and pushes samples subcritical where the NN gradient dies
+        # which shrinks q and with it the Bohm diffusivity and the q input of QLKNN
         geometry_type=torax_geometry.GeometryType.CIRCULAR,
         torax_mesh=torax_mesh,
         Phi=Phi,
@@ -506,24 +503,6 @@ def bound_transport_coefficients(transport_model: str, nn_transport_out: jax.Arr
             "D_e": 0.1 + 1.9 * jax.nn.sigmoid(nn_transport_out[2:3]),
             "V_e": 5.0 * jnp.tanh(nn_transport_out[3:4]),
         }
-    elif transport_model == "cgm":
-        # Free parameters of the Critical Gradient Model.
-        # The critical gradient itself is computed by TORAX
-        # from the evolving state and geometry (known inputs),
-        # only the dimensionless ratios are learned.
-        #   chi_e_i_ratio: 0.2 - 5   (chi_e = chi_i / ratio, ITG turbulence > 1,
-        #                            if electron transport dominates then < 1)
-        #   chi_D_ratio:   1 - 20    (D_e = chi_i / ratio, must stay positive)
-        #   VR_D_ratio:    -5 - 5    (R0*V_e/D_e, negative peaks the density profile)
-        #   alpha:      1.8 - 2.2    (critical gradient exponent, TORAX default 2)
-        #   chi_stiff:     0.5 - 3   (stiffness parameter, TORAX default 2)
-        return {
-            "chi_e_i_ratio": 0.2 + 4.8 * jax.nn.sigmoid(nn_transport_out[0:1]),
-            "chi_D_ratio": 1.0 + 19.0 * jax.nn.sigmoid(nn_transport_out[1:2]),
-            "VR_D_ratio": 5.0 * jnp.tanh(nn_transport_out[2:3]),
-            "alpha": 1.8 + 0.4 * jax.nn.sigmoid(nn_transport_out[3:4]),
-            "chi_stiff": 0.5 + 2.5 * jax.nn.sigmoid(nn_transport_out[4:5]),
-        }
     elif transport_model == "gyrobohm":
         # Free parameters of the Bohm-GyroBohm model. The Bohm and GyroBohm
         # chi terms are computed by TORAX from the evolving state and geometry,
@@ -613,16 +592,6 @@ def transport_provider_mapping(transport_model: str, coeffs: dict) -> dict:
             "D_e": flat_profile("D_e"),
             "V_e": flat_profile("V_e"),
         }
-    elif transport_model == "cgm":
-        updates = {
-            "chi_e_i_ratio": scalar("chi_e_i_ratio"),
-            "chi_D_ratio": scalar("chi_D_ratio"),
-            "VR_D_ratio": scalar("VR_D_ratio"),
-            # Plain float leaves in the provider: replaced with traced scalars
-            # directly rather than via TimeVaryingScalarUpdate
-            "alpha": jnp.squeeze(coeffs["alpha"]),
-            "chi_stiff": jnp.squeeze(coeffs["chi_stiff"]),
-        }
     elif transport_model == "gyrobohm":
         # Same NN multiplier applied to both species: the BGB model already
         # fixes chi_i_B = 2 * chi_e_B and chi_i_gB = 0.5 * chi_e_gB
@@ -636,8 +605,8 @@ def transport_provider_mapping(transport_model: str, coeffs: dict) -> dict:
             "V_face_coeff": scalar("V_face_coeff"),
         }
     else:  # qlknn
-        # Plain float leaves in the provider (like cgm alpha and chi_stiff):
-        # replaced with traced scalars directly
+        # Plain float leaves in the provider:
+        # replaced with traced scalars directly rather than via TimeVaryingScalarUpdate
         updates = {
             "ITG_flux_ratio_correction": jnp.squeeze(coeffs["ITG_flux_ratio_correction"]),
             "ETG_correction_factor": jnp.squeeze(coeffs["ETG_correction_factor"]),
@@ -649,7 +618,7 @@ def transport_provider_mapping(transport_model: str, coeffs: dict) -> dict:
 class ProfilePredictorTorax(TimeIndepModule):
     rhogrid: tuple = eqx.field(static=True)
     # Which TORAX transport model the transport network parameterizes:
-    # "constant", "cgm", "gyrobohm", or "qlknn"
+    # "constant", "gyrobohm", or "qlknn"
     transport_model: str = eqx.field(static=True)
     # Which per-sample geometry builder to use: "circular" or "miller"
     geometry_builder: str = eqx.field(static=True)
@@ -679,7 +648,7 @@ class ProfilePredictorTorax(TimeIndepModule):
         torax_config: ToraxConfig | dict,
         key: jax.random.PRNGKey,
         normalizer: FeatureNormalizer,
-        transport_model: str = "cgm",
+        transport_model: str = "gyrobohm",
         geometry_builder: str = "circular",
         delta_exponent: float = 2.0,
     ):
@@ -801,7 +770,7 @@ class ProfilePredictorTorax(TimeIndepModule):
         # The negative bias on the temperature fraction makes random-init edge
         # temperatures small (a few tens of eV): te_approx is a beta-derived
         # overestimate, and a hot edge BC flattens the profile relative to
-        # itself, which keeps the critical gradient model subcritical
+        # itself, which keeps a threshold model like QLKNN subcritical
         # (chi = chi_min) and kills the gradient to the transport network.
         nn_edge_out = self.nn_edge(nn_inputs)
         ne_right_bc = (0.01 + 0.94 * jax.nn.sigmoid(nn_edge_out[0:1])) * inputs.n_e_line_average_1e20
@@ -851,7 +820,7 @@ class ProfilePredictorTorax(TimeIndepModule):
         # so most of the few fixed steps get burned on the transient).
         # The clip keeps a 0.3 keV floor where te_approx is small or unreliable.
         # Core = edge + positive keeps the initial state strictly decreasing and continuous with the BC for any NN output
-        # A discontinuity at the LCFS or an exactly-flat profile both NaN the solver under the critical gradient model
+        # A discontinuity at the LCFS or an exactly-flat profile can NaN the solver
         te_core_init = te_right_bc + jnp.clip(2.0 * inputs.te_approx, 0.3, 10.0)
         t_init_value = (te_right_bc + (te_core_init - te_right_bc) * ic_shape)[jnp.newaxis, :]
         t_init_update = torax_experimental.TimeVaryingArrayUpdate(
@@ -1076,7 +1045,7 @@ class ProfilePredictorTorax(TimeIndepModule):
         nn_depth: int,
         prng_seed: int,
         normalizer: FeatureNormalizer,
-        transport_model: str = "cgm",
+        transport_model: str = "gyrobohm",
         geometry_builder: str = "circular",
         delta_exponent: float = 2.0,
     ):

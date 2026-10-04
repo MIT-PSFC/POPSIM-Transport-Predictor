@@ -51,8 +51,8 @@ def test_exnihilo_case_name(loaded_config):
 
 
 def test_domain_adaptation_case_name(loaded_config):
-    case = _case(model_type="torax-cgm", domain_adaptation="addition", num_target_shots=10)
-    assert str(case) == "case.torax-cgm.td_cmod-low1.norm_physics.freeze_True.geom_circular.targ_10.da_addition"
+    case = _case(model_type="torax-gyrobohm", domain_adaptation="addition", num_target_shots=10)
+    assert str(case) == "case.torax-gyrobohm.td_cmod-low1.norm_physics.freeze_True.geom_circular.targ_10.da_addition"
 
 
 def test_weighted_case_name(loaded_config):
@@ -70,7 +70,7 @@ def test_weighted_case_name(loaded_config):
     [
         {},
         {"model_type": "mlp", "training_data": "exnihilo", "num_target_shots": 7},
-        {"model_type": "torax-cgm", "domain_adaptation": "transfer", "num_target_shots": 3},
+        {"model_type": "torax-gyrobohm", "domain_adaptation": "transfer", "num_target_shots": 3},
     ],
 )
 def test_checkpoint_parser_round_trip(loaded_config, overrides):

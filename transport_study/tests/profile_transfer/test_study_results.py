@@ -47,7 +47,6 @@ class TestCmodToCmod:
                 "mlp",
                 "reservoir",
                 "torax-constant",
-                "torax-cgm",
                 "torax-gyrobohm",
                 "torax-qlknn",
             ],

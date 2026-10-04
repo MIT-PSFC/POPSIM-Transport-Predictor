@@ -28,19 +28,12 @@ from transport_study.modules.profile_predictor.trb import resolve_relaxation_ove
 from transport_study.orchestration.organize_data import PROFILE_TARGET_VARS
 from transport_study.tests.sample_data import SAMPLE_DIR, requires_sample_data
 
-TRANSPORT_MODELS = ("constant", "cgm", "gyrobohm", "qlknn")
+TRANSPORT_MODELS = ("constant", "gyrobohm", "qlknn")
 
 # TORAX runtime-param field -> the bounded NN coefficient that must land in it.
 # gyrobohm applies one multiplier to both species
 RUNTIME_FIELD_TO_COEFFICIENT = {
     "constant": {"chi_i": "chi_i", "chi_e": "chi_e", "D_e": "D_e", "V_e": "V_e"},
-    "cgm": {
-        "chi_e_i_ratio": "chi_e_i_ratio",
-        "chi_D_ratio": "chi_D_ratio",
-        "VR_D_ratio": "VR_D_ratio",
-        "alpha": "alpha",
-        "chi_stiff": "chi_stiff",
-    },
     "gyrobohm": {
         "chi_e_bohm_multiplier": "chi_bohm_multiplier",
         "chi_i_bohm_multiplier": "chi_bohm_multiplier",
@@ -117,17 +110,25 @@ def test_transport_provider_mapping_reaches_runtime_params(transport_model):
 @pytest.mark.parametrize(
     ("transport", "transport_model"),
     [
-        (TORAX_TRANSPORT_BLOCKS["cgm"], "gyrobohm"),
+        (TORAX_TRANSPORT_BLOCKS["qlknn"], "gyrobohm"),
         # No core models: TORAX silently injects a single prescribed one
-        ({}, "cgm"),
-        ({"core_transport_models": {"other": {"model_name": "CGM"}}}, "cgm"),
+        ({}, "gyrobohm"),
+        ({"core_transport_models": {"other": {"model_name": "bohm-gyrobohm"}}}, "gyrobohm"),
         (
-            {"core_transport_models": {"cgm": {"model_name": "CGM"}, "extra": {"model_name": "prescribed", "rho_min": 0.9}}},
-            "cgm",
+            {
+                "core_transport_models": {
+                    "gyrobohm": {"model_name": "bohm-gyrobohm"},
+                    "extra": {"model_name": "prescribed", "rho_min": 0.9},
+                }
+            },
+            "gyrobohm",
         ),
         (
-            {"core_transport_models": {"cgm": {"model_name": "CGM"}}, "pedestal_transport_models": {"ped": {"model_name": "prescribed"}}},
-            "cgm",
+            {
+                "core_transport_models": {"gyrobohm": {"model_name": "bohm-gyrobohm"}},
+                "pedestal_transport_models": {"ped": {"model_name": "prescribed"}},
+            },
+            "gyrobohm",
         ),
     ],
     ids=["wrong_model", "default_prescribed", "wrong_key", "extra_core_model", "pedestal_model"],
@@ -141,7 +142,7 @@ def test_validate_transport_model_name_rejects_mismatch(transport, transport_mod
 
 @pytest.mark.slow
 @requires_sample_data
-@pytest.mark.parametrize("transport_model", ["constant", "cgm", "gyrobohm", "qlknn"])
+@pytest.mark.parametrize("transport_model", ["constant", "gyrobohm", "qlknn"])
 def test_torax_predictor(transport_model):
     config = StudyConfig(
         study_name=f"test_torax_predictor_{transport_model}",
@@ -183,11 +184,11 @@ def test_torax_predictor(transport_model):
     _trainer, _train_dl, _val_dl, _test_dl, _ = launch_train(train_config)
 
 
-# cgm and qlknn are the models whose training blew up on MAST samples with
-# the circular geometry, so they are the smoke coverage for the miller builder
+# qlknn training blew up on MAST samples with the circular geometry,
+# so it and gyrobohm, the other stiff model, are the smoke coverage for the miller builder
 @pytest.mark.slow
 @requires_sample_data
-@pytest.mark.parametrize("transport_model", ["cgm", "qlknn"])
+@pytest.mark.parametrize("transport_model", ["gyrobohm", "qlknn"])
 def test_torax_predictor_mast_miller(transport_model):
     config = StudyConfig(
         study_name=f"test_torax_predictor_mast_miller_{transport_model}",
@@ -233,7 +234,7 @@ def test_torax_predictor_mast_miller(transport_model):
 def test_torax_heat_source_response(make_torax_module, sample_timeslices):
     # Pins the generic_heat wiring end to end: prescribing more auxiliary
     # power through the NN-controlled source must heat the relaxed profile
-    module = make_torax_module("cgm")
+    module = make_torax_module("gyrobohm")
     timeslice = sample_timeslices("cmod-high.nc")[0]
 
     steps_cold, coeffs_cold = module.evolve(timeslice, prescribed={"P_aux_total": 0.0})
@@ -254,7 +255,7 @@ def test_torax_heat_source_response(make_torax_module, sample_timeslices):
 @pytest.mark.slow
 @requires_sample_data
 def test_torax_output_hits_edge_bc_and_smooth_init(make_torax_module, sample_timeslices):
-    module = make_torax_module("cgm")
+    module = make_torax_module("gyrobohm")
     timeslice = sample_timeslices("cmod-high.nc")[0]
 
     # The 51-point output must pass through the exact Dirichlet edge BC at
@@ -301,7 +302,7 @@ def test_resolve_relaxation_overrides():
 def test_torax_max_steps_from_n_solver_steps(make_torax_module):
     # The module derives max_steps = ceil(t_final / fixed_dt) + 1, so an
     # n_solver_steps override must bound the scan length to n_solver_steps + 1
-    module = make_torax_module("cgm", numerics_overrides=resolve_relaxation_overrides({"t_final": 0.4, "n_solver_steps": 10}))
+    module = make_torax_module("gyrobohm", numerics_overrides=resolve_relaxation_overrides({"t_final": 0.4, "n_solver_steps": 10}))
     assert module.max_steps == 11
 
 
@@ -334,8 +335,6 @@ def test_torax_batched_gradients_finite(make_torax_module, transport_model):
 
     Production training differentiates the vmapped forward, which exercises the
     bounded while loop's batching rule and custom VJP rather than a single sample.
-    torax-cgm is excluded: upstream TORAX evaluates a negative base to the traced alpha power
-    in the dead branch of the critical gradient (see CLAUDE.md).
     """
     module = make_torax_module(transport_model, geometry_builder="miller")
     inputs = _batch_inputs()

@@ -36,7 +36,7 @@ from transport_study.orchestration.stages import (
     STAGE_AGG_NAMES,
     segment_stages,
 )
-from transport_study.orchestration.study import Study
+from transport_study.orchestration.study import Study, write_netcdf_atomic
 from transport_study.signals import HEATING_POWERS_MW, convert_to_working_units
 
 # Joined eval timeslice must be within this of the result timeslice.
@@ -328,8 +328,7 @@ def compute_and_save_case_metrics(study, case) -> xr.Dataset:
         case_ds = aggregate_case_metrics(ts_metrics)
         logger.info(f"Computed stage-resolved metrics for case {case} ({len(ts_metrics)} timeslices)")
 
-    cache_path.parent.mkdir(parents=True, exist_ok=True)
-    case_ds.to_netcdf(cache_path)
+    write_netcdf_atomic(case_ds, cache_path)
     return case_ds
 
 
@@ -361,9 +360,9 @@ def collect_metrics(study) -> xr.Dataset:
         logger.warning("No finished cases with valid metrics, stage-resolved metrics are empty")
         return xr.Dataset()
 
-    # coords="different" stacks the per-case scalar coords (model_type, ...)
-    metrics_ds = xr.concat(results, dim="case_idx", coords="different")
-    cache_path.parent.mkdir(parents=True, exist_ok=True)
-    metrics_ds.to_netcdf(cache_path)
+    # coords="different" stacks the per-case scalar coords (model_type, ...).
+    # compat is pinned, the xarray default is changing to "override", which coords="different" rejects
+    metrics_ds = xr.concat(results, dim="case_idx", coords="different", compat="equals")
+    write_netcdf_atomic(metrics_ds, cache_path)
     logger.info(f"Saved stage-resolved metrics to {cache_path}")
     return metrics_ds

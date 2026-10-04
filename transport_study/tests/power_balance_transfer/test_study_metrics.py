@@ -93,6 +93,24 @@ def test_compute_case_timeslice_metrics(ts_metrics):
     assert np.allclose(ts_metrics.err_abs[~shot_101], 0.3)
 
 
+def test_first_real_timeslice_after_leading_padding_is_kept(monkeypatch, device_ds, result_ds):
+    """A shot whose result starts with NaN times keeps its first real timeslice.
+
+    Same rule as real_timeslice_mask: a timeslice after a NaN time is real, only clock-stalled repeats are padding.
+    """
+    monkeypatch.setattr(study_metrics, "load_stage_dataset", lambda device: device_ds)
+    n_leading_nan = 10
+    time = result_ds["time"].values.copy()
+    time[:n_leading_nan, 1] = np.nan
+    result_ds = result_ds.assign_coords(time=(("time_idx", "shot"), time))
+
+    ts_metrics = compute_case_timeslice_metrics(result_ds)
+
+    times_102 = ts_metrics.time[ts_metrics.shot == 102]
+    assert times_102.min() == pytest.approx(time[n_leading_nan, 1])
+    assert len(times_102) == 80 - n_leading_nan
+
+
 def test_aggregate_case_metrics(ts_metrics):
     case_ds = aggregate_case_metrics(ts_metrics)
 

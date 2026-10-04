@@ -115,6 +115,18 @@ def real_timeslice_mask(time_2d: xr.DataArray, time_dim: str = TIME_DIM) -> xr.D
     return time_2d.notnull() & (prev.isnull() | ((time_2d - prev) > PAD_TIME_STEP_S))
 
 
+def write_netcdf_atomic(ds: xr.Dataset, path: Path | str) -> None:
+    """Write ds to path through a temporary file, so a partial file is never visible at path.
+
+    Result and metric files mark work as done by existing, and other processes poll for them.
+    """
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_name(path.name + ".tmp")
+    ds.to_netcdf(tmp_path)
+    tmp_path.replace(path)
+
+
 def configure_jax_platforms(enable_parallelism: bool) -> None:
     """Pick the jax backend for the orchestrator process before jax initializes it.
 
@@ -1299,12 +1311,7 @@ class Study:
                 logger.info("Training stopped at the wall-clock budget before finishing, relaunch to resume from the latest checkpoint.")
                 return
             ds = compute_topk_study_results(trainer, test_dl, train_config, result_dict)
-            result_path.parent.mkdir(parents=True, exist_ok=True)
-            # Write to a temp name then rename so a partially written file is
-            # never visible at the result path, whose existence marks the case done
-            tmp_path = result_path.with_name(result_path.name + ".tmp")
-            ds.to_netcdf(tmp_path)
-            tmp_path.replace(result_path)
+            write_netcdf_atomic(ds, result_path)
 
     ##############
     # COLLECTION #
@@ -1531,7 +1538,7 @@ class Study:
             logger.opt(colors=True).info("<bold><magenta>ORCHESTRATION</magenta></bold>")
             study.run_unfinished_cases(skip_tuning=skip_tuning, enable_parallelism=enable_parallelism)
             ds_final = study.collect_results()
-            ds_final.to_netcdf(study.collected_results_path())
+            write_netcdf_atomic(ds_final, study.collected_results_path())
 
         study._run_analysis(enable_parallelism=bool(enable_parallelism))
 

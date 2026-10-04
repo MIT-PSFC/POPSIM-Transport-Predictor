@@ -553,7 +553,7 @@ class TransportPredictorToraxBase(TransportPredictor):
 
     rhogrid: tuple = eqx.field(static=True)
     # Which TORAX transport model the transport network parameterizes:
-    # "constant", "cgm", "gyrobohm", or "qlknn"
+    # "constant", "gyrobohm", or "qlknn"
     transport_model: str = eqx.field(static=True)
     # Which per-sample geometry builder to use: "circular" or "miller"
     geometry_builder: str = eqx.field(static=True)
@@ -584,7 +584,7 @@ class TransportPredictorToraxBase(TransportPredictor):
         key: jax.random.PRNGKey,
         normalizer: FeatureNormalizer,
         sim_dt: float,
-        transport_model: str = "cgm",
+        transport_model: str = "gyrobohm",
         geometry_builder: str = "circular",
         delta_exponent: float = 2.0,
     ):
@@ -666,7 +666,7 @@ class TransportPredictorToraxBase(TransportPredictor):
         prng_seed: int,
         normalizer: FeatureNormalizer,
         sim_dt: float,
-        transport_model: str = "cgm",
+        transport_model: str = "gyrobohm",
         geometry_builder: str = "circular",
         delta_exponent: float = 2.0,
     ):
@@ -889,7 +889,7 @@ class TransportPredictorTorax(TransportPredictorToraxBase):
         coeffs = self.nn_coefficients(inputs, energy_mhd_MJ)
 
         # Initial condition from the stored profiles, edge point pinned to the NN Dirichlet BC
-        # a discontinuity at the LCFS NaNs the solver under the critical gradient model
+        # a discontinuity at the LCFS can NaN the solver
         te_ic = te_state.at[-1].set(jnp.squeeze(coeffs["T_e_right_bc"]))
         ne_ic = ne_state.at[-1].set(jnp.squeeze(coeffs["n_e_right_bc"]))
         provider, geo_provider = self.build_provider_and_geo(inputs, coeffs, ne_ic=ne_ic, te_ic=te_ic)

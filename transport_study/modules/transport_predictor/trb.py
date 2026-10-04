@@ -395,11 +395,9 @@ class TransportPredictorTRB(TrainRunBuilder):
 
     @staticmethod
     def get_test_eval_suite(suite_config) -> EvaluationSuite:
-        """Evaluation suite for testing after training.
+        """The profile study's test suite, scored on fresh profile timeslices only like the losses.
 
-        The profile study's study_results already handles time-dependent
-        outputs (it renames the stepper's time_idx_input dim back) and emits
-        exactly the per-channel and combined error variables the analysis
-        stack reads, so it is reused as-is.
+        It already handles the time-dependent outputs (renaming the stepper's _input dims back)
+        and emits the per-channel and combined error variables the analysis stack reads.
         """
-        return ProfilePredictorTRB.get_test_eval_suite(suite_config)
+        return ProfilePredictorTRB.make_test_eval_suite(suite_config, fresh_only=True)

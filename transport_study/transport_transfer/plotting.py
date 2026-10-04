@@ -40,7 +40,6 @@ MODEL_COLORS = {
     "transformer": "#ffb347",
     "sciml": "#0095ff",
     "torax-constant": "#c0c0c0",
-    "torax-cgm": "#8dff36",
     "torax-gyrobohm": "#ff60ec",
     "torax-qlknn": "#ff4d4d",
 }
@@ -49,7 +48,6 @@ MODEL_LABELS = {
     "transformer": "Transformer",
     "sciml": "SciML",
     "torax-constant": "TORAX constant",
-    "torax-cgm": "TORAX CGM",
     "torax-gyrobohm": "TORAX Bohm-GyroBohm",
     "torax-qlknn": "TORAX QLKNN",
 }

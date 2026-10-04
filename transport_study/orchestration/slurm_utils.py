@@ -739,6 +739,7 @@ from pathlib import Path
 from loguru import logger
 from popsim.ml import TrainConfig
 from popsim.ml.launch import launch_train
+from transport_study.orchestration.study import write_netcdf_atomic
 from transport_study.orchestration.topk_results import compute_topk_study_results
 {_config_reload_script(study_config_path)}
 with open({config_path!r}) as f:
@@ -752,13 +753,7 @@ if result_dict is None:
     logger.info("Training stopped at the wall-clock budget before finishing, resubmitted job will resume.")
 else:
     ds = compute_topk_study_results(trainer, test_dl, train_config, result_dict)
-    result_path = Path({str(result_path)!r})
-    result_path.parent.mkdir(parents=True, exist_ok=True)
-    # Write to a temp name then rename so a partially written file is never
-    # visible at the result path, whose existence marks the case done
-    tmp_path = result_path.with_name(result_path.name + ".tmp")
-    ds.to_netcdf(tmp_path)
-    tmp_path.replace(result_path)
+    write_netcdf_atomic(ds, {str(result_path)!r})
 Path({str(config_path)!r}).unlink()
 Path({str(study_config_path)!r}).unlink()
 """

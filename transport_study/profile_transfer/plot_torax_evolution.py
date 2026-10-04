@@ -6,11 +6,11 @@ temperature evolution against the measured target profiles.
 
 Example:
     python -m transport_study.profile_transfer.plot_torax_evolution \
-        --dataset $PTPS_TEST_SAMPLE_DIR/cmod-low1.nc \
-        --shot 1160824011 --timestep 800 \
-        --transport_model cgm \
+        --dataset transport_study/datasets/sample/cmod-low.nc \
+        --shot 1160920013 --timestep 264 \
+        --transport_model gyrobohm \
         --checkpoint /path/to/trained/torax/checkpoint \
-        --prescribed '{"chi_e_i_ratio": 2.0, "S_total": 1.0}'
+        --prescribed '{"chi_bohm_multiplier": 2.0, "S_total": 1.0}'
 """
 
 from pathlib import Path
@@ -194,7 +194,7 @@ def plot_torax_evolution(
     dataset: str,
     shot: int,
     timestep: int,
-    transport_model: str = "cgm",
+    transport_model: str = "gyrobohm",
     checkpoint: str | None = None,
     n_devices: int = 1,
     data_normalization: str = "physics",
@@ -208,7 +208,7 @@ def plot_torax_evolution(
         dataset: Path to a device store (on-disk IMAS schema) with dims (shot, time_idx, rho_tor_norm).
         shot: Shot number to select.
         timestep: time_idx index of the timeslice to predict.
-        transport_model: TORAX transport model: "constant", "cgm", "gyrobohm", or "qlknn".
+        transport_model: TORAX transport model: "constant", "gyrobohm", or "qlknn".
         checkpoint: Optional checkpoint directory of a trained torax profile predictor
             (must have been trained with the same transport_model).
         n_devices: Number of devices the checkpoint was trained with (sizes the
@@ -222,7 +222,6 @@ def plot_torax_evolution(
         prescribed: Optional dict of coefficients bypassing the NN outputs.
             Valid keys are the transport coefficients of the chosen model
             (constant: chi_i, chi_e, D_e [m^2/s], V_e [m/s];
-            cgm: chi_e_i_ratio, chi_D_ratio, VR_D_ratio, alpha, chi_stiff;
             gyrobohm: chi_bohm_multiplier, chi_gyrobohm_multiplier, D_face_c1,
             D_face_c2, V_face_coeff,
             qlknn: ITG_flux_ratio_correction, ETG_correction_factor, collisionality_multiplier)

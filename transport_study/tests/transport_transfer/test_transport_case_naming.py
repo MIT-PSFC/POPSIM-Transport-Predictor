@@ -32,21 +32,21 @@ def test_domain_adaptation_case_name():
 
 
 def test_torax_miller_case_name():
-    """str of a torax-cgm case with geometry_builder="miller" is exactly
-    "case.torax-cgm.td_cmod-low1.freeze_True.geom_miller": the non-default
+    """str of a torax-gyrobohm case with geometry_builder="miller" is exactly
+    "case.torax-gyrobohm.td_cmod-low1.freeze_True.geom_miller": the non-default
     geometry gets its token, the default torax_state stays suppressed."""
 
 
 def test_torax_carry_case_name():
-    """str of a torax-cgm case with torax_state="carry" is exactly
-    "case.torax-cgm.td_cmod-low1.freeze_True.tstate_carry": the non-default
+    """str of a torax-gyrobohm case with torax_state="carry" is exactly
+    "case.torax-gyrobohm.td_cmod-low1.freeze_True.tstate_carry": the non-default
     state carry gets its token, the default geometry stays suppressed."""
 
 
 def test_torax_miller_carry_token_order():
     """A torax case with both geometry_builder="miller" and torax_state="carry"
     emits the tokens in STR_TOKEN_FIELDS order:
-    "case.torax-cgm.td_cmod-low1.freeze_True.geom_miller.tstate_carry"."""
+    "case.torax-gyrobohm.td_cmod-low1.freeze_True.geom_miller.tstate_carry"."""
 
 
 def test_submodule_prereq_case_names():

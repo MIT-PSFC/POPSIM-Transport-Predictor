@@ -58,7 +58,6 @@ def _run_every_case(study: ProfileStudy, skip_tuning: bool):
         "shape-init-kmeans",
         "mlp",
         "torax-constant",
-        "torax-cgm",
         "torax-gyrobohm",
         "torax-qlknn",
     ],

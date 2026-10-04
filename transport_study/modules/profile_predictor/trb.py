@@ -17,6 +17,7 @@ from popsim.ml.eval import EvalData, EvaluationSuite
 from transport_study import EPISODE_DIM, RADIAL_DIM, TIME_COORD, TIME_DIM
 from transport_study.config import config
 from transport_study.modules.profile_predictor.module import (
+    MODEL_TYPES_WITH_SHAPES,
     ProfilePredictorReservoir,
     ProfilePredictorShapeInit,
     ProfilePredictorUnstructuredNN,
@@ -128,7 +129,7 @@ class ProfilePredictorTRB(TrainRunBuilder):
             fit_ds = getattr(train_dl, "normalizer_fit_ds", train_dl.ds)
         normalizer = make_nn_input_normalizer(model_init_config["data_normalization"], fit_ds, n_devices)
 
-        if model_init_config["model_type"] in ["shape-init-pca", "shape-init-kmeans"]:
+        if model_init_config["model_type"] in MODEL_TYPES_WITH_SHAPES:
             te_shape_var = model_init_config["te_shape_var"]
             ne_shape_var = model_init_config["ne_shape_var"]
             n_shapes = model_init_config["n_shapes"]
@@ -192,7 +193,7 @@ class ProfilePredictorTRB(TrainRunBuilder):
                 normalizer=normalizer,
             )
         elif model_init_config["model_type"].startswith("torax-"):
-            # model_type is "torax-<transport_model>", e.g. "torax-cgm"
+            # model_type is "torax-<transport_model>", e.g. "torax-gyrobohm"
             torax_config = model_init_config["torax_config"]
             numerics_overrides = resolve_relaxation_overrides(model_init_config)
             if numerics_overrides:
@@ -493,7 +494,7 @@ class ProfilePredictorTRB(TrainRunBuilder):
             ids_of_last_layer_leaves = [id(x) for x in jax.tree.leaves(last_layers)]
             return [x for x in jax.tree.leaves(module) if id(x) in ids_of_last_layer_leaves]
 
-        if model_init_config["model_type"] in ["shape-init-pca", "shape-init-kmeans"]:
+        if model_init_config["model_type"] in MODEL_TYPES_WITH_SHAPES:
             getter = get_trainable_shape_init
         elif model_init_config["model_type"] in ["mlp", "reservoir"]:
             # For the reservoir, only the readout (module.nn) is trainable, the
@@ -522,6 +523,15 @@ class ProfilePredictorTRB(TrainRunBuilder):
     @staticmethod
     def get_test_eval_suite(suite_config) -> EvaluationSuite:
         """Evaluation suite for testing after training."""
+        return ProfilePredictorTRB.make_test_eval_suite(suite_config, fresh_only=False)
+
+    @staticmethod
+    def make_test_eval_suite(suite_config, fresh_only: bool) -> EvaluationSuite:
+        """The test suite, with fresh_only scoring only the timeslices whose target is a fresh profile.
+
+        The transport study keeps forward-filled timeslices for contiguous rollouts,
+        its targets there are stale measurements, so it scores with fresh_only.
+        """
 
         def study_results(eval_data: EvalData) -> xr.Dataset:
             """Calculate final study results for profile prediction.
@@ -589,6 +599,11 @@ class ProfilePredictorTRB(TrainRunBuilder):
             # Per-point profile errors
             ne_error_abs_profile = xr.apply_ufunc(np.abs, ne_pred - ne_targ)
             te_error_abs_profile = xr.apply_ufunc(np.abs, te_pred - te_targ)
+            if fresh_only:
+                # Stale timeslices score NaN, every error below and the shot integrals then skip them
+                mask_fresh = _unstack_and_rename_time(eval_data.input_ds["fresh_profile"]) == 1
+                ne_error_abs_profile = ne_error_abs_profile.where(mask_fresh)
+                te_error_abs_profile = te_error_abs_profile.where(mask_fresh)
 
             # Softening floor scales with each profile's own peak (per timeslice)
             # instead of a fixed absolute value, so it means the same relative

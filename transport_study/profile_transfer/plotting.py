@@ -21,6 +21,7 @@ import numpy as np
 import xarray as xr
 from loguru import logger
 
+from transport_study.modules.profile_predictor.module import MODEL_TYPES_WITH_SHAPES
 from transport_study.plot_style import BACKGROUND_COLOR, TEXT_COLOR, style_axis
 from transport_study.profile_transfer.study_metrics import METRIC_NAMES, STAGE_AGG_NAMES
 
@@ -35,7 +36,6 @@ MODEL_COLORS = {
     "mlp": "#ff4d4d",
     "reservoir": "#ffb347",
     "torax-constant": "#8dff36",
-    "torax-cgm": "#2fbf71",
     "torax-gyrobohm": "#b4ff9e",
     "torax-qlknn": "#0e8a5f",
 }
@@ -46,7 +46,6 @@ MODEL_LABELS = {
     "mlp": "MLP",
     "reservoir": "Reservoir",
     "torax-constant": "TORAX constant",
-    "torax-cgm": "TORAX CGM",
     "torax-gyrobohm": "TORAX GyroBohm",
     "torax-qlknn": "TORAX QLKNN",
 }
@@ -106,9 +105,6 @@ STAGE_LABELS = {
 
 # Metric value above which a case is treated as diverged and masked out
 DIVERGED_THRESHOLD = 1e3
-
-# Model families with shape bases that can be frozen or trained
-MODELS_WITH_SHAPES = ("shape-init-pca", "shape-init-kmeans", "torax-constant", "torax-cgm", "torax-gyrobohm", "torax-qlknn")
 
 
 def _training_data_colors(training_datasets: list[str]) -> dict[str, tuple]:
@@ -425,7 +421,7 @@ def freeze_shapes_comparison(metrics_ds: xr.Dataset, figure_dir: Path):
     da_linestyles = {"none": ":", "weighted": "-", "addition": (0, (3, 1, 1, 1)), "transfer": "--", "transfer_pretrain": "-."}
 
     for model_type in _coord_values(metrics_ds, "model_type"):
-        if model_type not in MODELS_WITH_SHAPES:
+        if model_type not in MODEL_TYPES_WITH_SHAPES:
             continue
         model_sub = _mask_select(metrics_ds, metrics_ds["model_type"] == model_type)
         norms = _coord_values(model_sub, "data_normalization")

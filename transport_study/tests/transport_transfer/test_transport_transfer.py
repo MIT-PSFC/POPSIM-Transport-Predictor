@@ -8,6 +8,66 @@ Test implementations are deliberately blocked out as stubs, see the
 repository convention.
 """
 
+from pathlib import Path
+
+import pytest
+
+from transport_study.config import load_config
+from transport_study.orchestration.study import HYPERPARAM_TARGET_SHOTS
+from transport_study.transport_transfer.transport_transfer_study import TransportStudy
+
+
+def _load_transport_config(**overrides):
+    return load_config(
+        TransportStudy.Config(
+            study_name="test-transport-transfer",
+            dataset_paths={"cmod-low1": Path("path/to/cmod_low1.nc"), "cmod-high": Path("path/to/cmod_high.nc")},
+            target_device="cmod-high",
+            target_test_set_size=5,
+            training_datasets=("cmod-low1",),
+            **overrides,
+        )
+    )
+
+
+@pytest.mark.parametrize(
+    ("data_normalization", "power_balance_data_normalization", "twin_targ"),
+    [
+        # Stateless power balance normalization under a stat study-wide one: one shared twin
+        ("physics-coral", "physics", HYPERPARAM_TARGET_SHOTS),
+        # Stat power balance normalization under a stateless study-wide one: the twin keeps n
+        ("physics", "coral", 3),
+    ],
+)
+@pytest.mark.parametrize("model_type", ["power_balance", "p_oh", "p_rad"])
+def test_power_balance_submodule_twins_follow_their_own_normalization(
+    model_type, data_normalization, power_balance_data_normalization, twin_targ
+):
+    """The power balance submodule cases train with power_balance_data_normalization,
+    so their transfer twin keeps num_target_shots exactly when that method fits statistics,
+    whatever the study-wide data_normalization is."""
+    _load_transport_config(
+        data_normalization=data_normalization,
+        power_balance_data_normalization=power_balance_data_normalization,
+    )
+    case = TransportStudy.Case(
+        model_type=model_type,
+        training_data="cmod-low1",
+        domain_adaptation="transfer",
+        freeze_submodules=True,
+        num_target_shots=3,
+    )
+
+    twin = case.transfer_pretrain_case()
+
+    assert twin.domain_adaptation == "transfer_pretrain"
+    assert twin.num_target_shots == twin_targ
+
+
+def test_power_balance_data_normalization_is_validated():
+    with pytest.raises(ValueError, match="power balance data normalization"):
+        _load_transport_config(power_balance_data_normalization="bogus")
+
 
 def test_get_ds_transport_transfer():
     """get_ds(source, "transport_transfer") returns a dataset that keeps the
@@ -156,7 +216,7 @@ def test_torax_absorption_fraction_nn():
 
 
 def test_torax_rebuild_and_carry_smoke():
-    """A torax-cgm case with torax_state rebuild and one with carry both
+    """A torax-gyrobohm case with torax_state rebuild and one with carry both
     advance a few training steps without NaN loss (the carry variant
     exercises the TORAX initial-state construction in the env)."""
 

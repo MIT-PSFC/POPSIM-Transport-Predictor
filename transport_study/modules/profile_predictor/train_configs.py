@@ -48,8 +48,8 @@ PROFILE_PREDICTOR_SHAPE_INIT_CONFIG = {
     },
 }
 
-# Top-level TORAX transport clipping shared by the cgm, gyrobohm, and qlknn blocks.
-# Subcritical CGM / BGB / QLKNN drops chi to chi_min.
+# Top-level TORAX transport clipping shared by the gyrobohm and qlknn blocks.
+# Flat-gradient BGB and subcritical QLKNN drop chi to chi_min.
 # The TORAX default of 0.05 m^2/s is near-zero transport,
 # so ohmic heating in low-density plasmas runs away within a 20 ms step and NaNs the solver.
 # A floor of 0.3 keeps some background transport, the cap bounds the stiff side.
@@ -79,22 +79,6 @@ TORAX_TRANSPORT_BLOCKS = {
         # No stability clipping here:
         # the NN bounds already floor chi and D (bound_transport_coefficients),
         # so the TORAX defaults (chi_min 0.05, chi_max 100, D_e_min 0.05) never bind.
-    },
-    "cgm": {
-        "core_transport_models": {
-            "cgm": {
-                # Critical Gradient Model:
-                # TORAX computes the critical ion temperature gradient from the evolving state and geometry,
-                # the NN predicts the dimensionless free parameters.
-                "model_name": "CGM",
-                "alpha": 2.0,  # Predicted by NN
-                "chi_stiff": 2.0,  # Predicted by NN
-                "chi_e_i_ratio": 2.0,  # Predicted by NN
-                "chi_D_ratio": 5.0,  # Predicted by NN
-                "VR_D_ratio": 0.0,  # Predicted by NN
-            },
-        },
-        **_STABILITY_CLIPPING,
     },
     "gyrobohm": {
         "core_transport_models": {
@@ -216,7 +200,7 @@ TORAX_CONFIG_BASE: dict[str, Any] = {
     },
     "solver": {
         # Active for the linear theta solver this config selects,
-        # TORAX warns when a nonlinear transport model (CGM, qlknn) runs on a linear solver without it
+        # TORAX warns when a nonlinear transport model like qlknn runs on a linear solver without it
         "use_pereverzev": True,
         # One linearized solve per step, no fixed-point corrector iterations.
         # Benchmarked at the 20 ms dt above, 1/2/4/8 corrector steps all reach the same val loss within the seed spread.
@@ -242,7 +226,7 @@ _PROFILE_PREDICTOR_TORAX_CONFIG_BASE: dict[str, Any] = {
         "target_vars": [*PROFILE_TARGET_VARS, "ds_source_idx"],
     },
     "model_init_config": {
-        "model_type": "torax-cgm",  # Overridden per transport model by the builder below
+        "model_type": "torax-gyrobohm",  # Overridden per transport model by the builder below
         "nn_depth": 2,
         "nn_width": 16,
         # The builder deep-copies the whole config, so the shared skeleton
@@ -282,7 +266,7 @@ def make_profile_predictor_torax_config(
 ) -> dict:
     """Train config for the torax profile predictor with the given transport model.
 
-    transport_model is one of "constant", "cgm", "gyrobohm", "qlknn"
+    transport_model is one of "constant", "gyrobohm", "qlknn"
     the corresponding model_type is "torax-<transport_model>".
     """
     if transport_model not in TORAX_TRANSPORT_BLOCKS:

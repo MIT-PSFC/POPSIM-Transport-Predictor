@@ -170,4 +170,6 @@ def generate_case_report(study, case, figure_dir: Path):
         logger.warning(f"No valid test timeslices for case {case}, skipping case report")
         return
 
-    best_worst_pdf(result_ds, ts_metrics, case_dir / "best_worst_shots.pdf", page_fn=_shot_page)
+    # The power_balance / p_oh / p_rad prereq cases write scalar result files, which get the power balance page
+    page_fn = _shot_page if all(f"{signal}_targ" in result_ds for signal in PROFILE_CMAPS) else None
+    best_worst_pdf(result_ds, ts_metrics, case_dir / "best_worst_shots.pdf", page_fn=page_fn)

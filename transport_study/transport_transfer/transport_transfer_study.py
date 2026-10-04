@@ -17,6 +17,7 @@ from transport_validation_datasets.machine.generic import UNIFORM_TIMEBASE_DT
 
 from transport_study import PACKAGE_ROOT
 from transport_study.config import config
+from transport_study.modules.profile_predictor.module import MODEL_TYPES_WITH_SHAPES
 from transport_study.modules.transport_predictor.train_configs import (
     make_transport_torax_config,
 )
@@ -31,6 +32,9 @@ from transport_study.orchestration.study import (
 from transport_study.power_balance_transfer.power_balance_study import (
     POWER_BALANCE_INPUT_VARS,
     SCALAR_SUBMODULE_SETTINGS,
+)
+from transport_study.power_balance_transfer.power_balance_study import (
+    VALID_DATA_NORMALIZATIONS as VALID_POWER_BALANCE_DATA_NORMALIZATIONS,
 )
 from transport_study.profile_transfer.profile_study import (
     PROFILE_INPUT_VARS,
@@ -85,12 +89,14 @@ TRANSPORT_TARGET_VARS = [
 TRANSPORT_STATE_VARS = ["energy_mhd_MJ", *TRANSPORT_PROFILE_TARGETS, *TRANSPORT_INPUT_VARS, "ds_source_idx"]
 
 # The TORAX-backed model types (one per TORAX transport model)
-TORAX_MODEL_TYPES = ("torax-constant", "torax-cgm", "torax-gyrobohm", "torax-qlknn")
+TORAX_MODEL_TYPES = ("torax-constant", "torax-gyrobohm", "torax-qlknn")
 # Model types that appear on the study's case grid
 TOP_LEVEL_MODEL_TYPES = ("transformer", "sciml", *TORAX_MODEL_TYPES)
 # Submodule pseudo-model-types, they appear as prereq cases of sciml:
 # sciml -> power_balance + profile, power_balance -> p_oh + p_rad
 SUBMODULE_MODEL_TYPES = ("power_balance", "profile", "p_oh", "p_rad")
+# The submodule cases that train with power_balance_data_normalization instead of the study-wide data_normalization
+POWER_BALANCE_SUBMODULE_TYPES = ("power_balance", "p_oh", "p_rad")
 
 # How the TORAX-backed models carry state between steps (see
 # modules/transport_predictor/module.py): "rebuild" re-seeds a TORAX initial
@@ -101,7 +107,7 @@ VALID_TORAX_STATES = ("rebuild", "carry")
 # structured ones, so profile-loss gradients flow into physical parameters)
 VALID_POWER_BALANCE_MODEL_TYPES = ("sciml-taue-nn", "sciml-taue-scalinglaw")
 # Profile predictor variants allowed as the sciml profile submodule
-VALID_PROFILE_MODEL_TYPES = ("shape-init-pca", "shape-init-kmeans", "mlp")
+VALID_PROFILE_MODEL_TYPES = (*MODEL_TYPES_WITH_SHAPES, "mlp")
 
 
 class TransportStudy(Study):
@@ -203,6 +209,15 @@ class TransportStudy(Study):
                 raise ValueError(f"Invalid data normalization method: {v}. Must be one of {valid}.")
             return v
 
+        @field_validator("power_balance_data_normalization")
+        @classmethod
+        def _validate_power_balance_data_normalization(cls, v: str) -> str:
+            if v not in VALID_POWER_BALANCE_DATA_NORMALIZATIONS:
+                raise ValueError(
+                    f"Invalid power balance data normalization method: {v}. Must be one of {VALID_POWER_BALANCE_DATA_NORMALIZATIONS}."
+                )
+            return v
+
         @field_validator("power_balance_model_type")
         @classmethod
         def _validate_power_balance_model_type(cls, v: str) -> str:
@@ -224,7 +239,7 @@ class TransportStudy(Study):
         - transformer: recurrent causal attention over a rolling buffer of past profiles
         - sciml: a time-dependent power balance evolves the stored energy, a
           time-independent profile predictor maps the state-implied beta_tor_norm to profiles
-        - torax-constant / torax-cgm / torax-gyrobohm / torax-qlknn: one-step
+        - torax-constant / torax-gyrobohm / torax-qlknn: one-step
           differentiable TORAX simulation with NN-predicted transport, source
           shape, and edge parameters
         - power_balance / profile / p_oh / p_rad: submodule predictors, appear
@@ -299,7 +314,9 @@ class TransportStudy(Study):
             self._init_common(model_type, training_data, domain_adaptation, num_target_shots)
 
         def _normalization_method(self) -> str | None:
-            # One study-wide setting, not a case axis
+            # Study-wide settings, not case axes
+            if self.model_type in POWER_BALANCE_SUBMODULE_TYPES:
+                return config.power_balance_data_normalization
             return config.data_normalization
 
         def _validate(self):
@@ -663,7 +680,7 @@ class TransportStudy(Study):
             updates["d_model"] = tuned_config.model_init_config["d_model"]
             updates["num_heads"] = tuned_config.model_init_config["num_heads"]
             updates["history_len"] = tuned_config.model_init_config["history_len"]
-        if case.model_type == "profile" and config.profile_model_type in ("shape-init-pca", "shape-init-kmeans"):
+        if case.model_type == "profile" and config.profile_model_type in MODEL_TYPES_WITH_SHAPES:
             updates["n_shapes"] = tuned_config.model_init_config["n_shapes"]
             updates["softmax_temp"] = tuned_config.model_init_config["softmax_temp"]
         return updates

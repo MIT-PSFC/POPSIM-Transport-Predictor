@@ -323,6 +323,18 @@ class TestGetDsSyntheticStore:
         time_shot = ds[TIME_COORD].isel({EPISODE_DIM: 0}).dropna(TIME_DIM).values
         np.testing.assert_allclose(time_shot[:3], T_START + DT * np.arange(3), atol=1e-6)
 
+    @pytest.mark.parametrize("study_type", list(REQUIRED_SIGNALS))
+    def test_train_val_split_holds_out_the_highest_hazard_shots(self, synthetic_store_config, study_type):
+        """The 80/20 split runs end to end on a real store and the val shots are the top-hazard fifth."""
+        train_ds, val_ds = get_train_val_datasets(TrainingData(sources_unsorted=["synthetic"]), study_type=study_type)
+
+        shots_train = set(train_ds[EPISODE_DIM].values.tolist())
+        shots_val = set(val_ds[EPISODE_DIM].values.tolist())
+        assert shots_train | shots_val == set(SHOT_LENGTHS)
+        assert shots_train.isdisjoint(shots_val)
+        # The synthetic hazard grows with the listed shot order, so the last listed shot is the val shot
+        assert shots_val == {list(SHOT_LENGTHS)[-1]}
+
     @pytest.mark.parametrize("study_type", ["profile_transfer", "transport_transfer"])
     def test_profiles_on_rho_grid_with_shapes(self, synthetic_store_config, study_type):
         ds, _ = get_ds("synthetic", study_type)

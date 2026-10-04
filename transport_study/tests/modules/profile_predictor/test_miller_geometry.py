@@ -257,7 +257,7 @@ def test_miller_geometry_differentiable():
 
 @pytest.mark.slow
 @requires_sample_data
-@pytest.mark.parametrize("transport_model", ["cgm", "qlknn"])
+@pytest.mark.parametrize("transport_model", ["gyrobohm", "qlknn"])
 def test_miller_evolve_mast_no_nan(transport_model, make_torax_module, sample_timeslices):
     # Direct replay of the failure mode behind the NaN/Inf training
     # retries: run MAST samples through the full TORAX relaxation with

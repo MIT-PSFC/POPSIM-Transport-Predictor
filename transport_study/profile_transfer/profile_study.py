@@ -17,7 +17,10 @@ from pydantic import Field, field_validator
 
 from transport_study import PACKAGE_ROOT, TIME_DIM
 from transport_study.config import config
-from transport_study.modules.profile_predictor.module import NN_INPUT_SOURCE_VARS
+from transport_study.modules.profile_predictor.module import (
+    MODEL_TYPES_WITH_SHAPES,
+    NN_INPUT_SOURCE_VARS,
+)
 from transport_study.modules.profile_predictor.train_configs import (
     PROFILE_PREDICTOR_TORAX_CONFIGS,
 )
@@ -45,9 +48,8 @@ from transport_study.profile_transfer.plotting import (
 from transport_study.profile_transfer.study_metrics import collect_metrics
 from transport_study.profile_transfer.tables import write_comparison_tables
 
-# Model families: the shape-init predictors have freezable shape bases, the rest do not
-MODEL_TYPES_WITH_SHAPES = ("shape-init-pca", "shape-init-kmeans")
-MODEL_TYPES_WITHOUT_SHAPES = ("mlp", "reservoir", "torax-constant", "torax-cgm", "torax-gyrobohm", "torax-qlknn")
+# Model families without freezable shape bases (the shape-init ones are MODEL_TYPES_WITH_SHAPES)
+MODEL_TYPES_WITHOUT_SHAPES = ("mlp", "reservoir", "torax-constant", "torax-gyrobohm", "torax-qlknn")
 
 # Per-sample geometry builders the torax model types can be benchmarked with
 # (see modules/profile_predictor/torax_module.py). Only meaningful for
@@ -142,8 +144,8 @@ class ProfileStudy(Study):
         model_type: The type of profile_predictor model to use
         - shape-init-pca / shape-init-kmeans: B-spline shape bases (PCA or k-means initialized) weighted by an NN
         - mlp: a single neural network directly predicts profiles at certain points
-        - torax-constant / torax-cgm / torax-gyrobohm / torax-qlknn: TORAX simulation with
-          NN-predicted parameters for the constant, critical gradient, Bohm-GyroBohm,
+        - torax-constant / torax-gyrobohm / torax-qlknn: TORAX simulation with
+          NN-predicted parameters for the constant, Bohm-GyroBohm,
           or QLKNN surrogate transport model
 
         training_data: The dataset(s) used for training
@@ -249,8 +251,14 @@ class ProfileStudy(Study):
                     continue  # Invalid case, skip
             if model_type in MODEL_TYPES_WITHOUT_SHAPES and not freeze_shapes:
                 continue  # No shapes to freeze, just do one of the two
-            if not model_type.startswith("torax-") and geometry_builder != "circular":
-                continue  # geometry_builder only applies to torax model types
+            case_geometry = geometry_builder
+            if not model_type.startswith("torax-"):
+                # geometry_builder only applies to torax model types, the rest are pinned to circular.
+                # Emit each non-torax case once, on the first configured geometry,
+                # so a study without "circular" still keeps its non-torax cases
+                if geometry_builder != config.geometry_builders[0]:
+                    continue
+                case_geometry = "circular"
 
             case = self.Case(
                 model_type=model_type,
@@ -259,7 +267,7 @@ class ProfileStudy(Study):
                 domain_adaptation=domain_adaptation,
                 freeze_shapes=freeze_shapes,
                 num_target_shots=num_target_shots,
-                geometry_builder=geometry_builder,
+                geometry_builder=case_geometry,
             )
 
             cases.append(case)

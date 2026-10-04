@@ -334,6 +334,10 @@ class ShapeType(IntEnum):
     CONVEX_COMBINATION = 1
 
 
+# Model types built as ProfilePredictorShapeInit, the only ones with shape bases to freeze
+MODEL_TYPES_WITH_SHAPES = ("shape-init-pca", "shape-init-kmeans")
+
+
 def kmeans_initial_guess(
     n_shapes: int,
     te_data: xr.DataArray,

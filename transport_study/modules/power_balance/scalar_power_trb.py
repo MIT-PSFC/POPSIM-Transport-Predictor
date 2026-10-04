@@ -76,7 +76,13 @@ class ScalarPowerTRB(TrainRunBuilder):
         return module
 
     @classmethod
-    def get_loss_fn(cls, loss_config: dict) -> Callable[[Any, Any], jnp.ndarray]:
+    def _make_loss_fn(cls, loss_config: dict, use_huber: bool) -> Callable[[Any, Any], jnp.ndarray]:
+        """Device-weighted error on the predicted power.
+
+        use_huber selects the training loss (huber with the swept huber_delta)
+        or the delta-free validation loss (plain absolute error),
+        so the sweep metric val/loss.mean cannot be gamed by shrinking delta.
+        """
         if "device_weights" not in loss_config:
             device_weights = dict.fromkeys(config.dataset_paths, 1.0)
         else:
@@ -85,14 +91,23 @@ class ScalarPowerTRB(TrainRunBuilder):
         signal = cls.SIGNAL
 
         def loss_fn(pred, targ):
-            absolute_error = jnp.abs(getattr(pred, f"{signal}_pred") - targ[signal].data)
+            residual = getattr(pred, f"{signal}_pred") - targ[signal].data
+            errors = optax.huber_loss(residual, delta=loss_config["huber_delta"]) if use_huber else jnp.abs(residual)
+            ds_source_idx = targ["ds_source_idx"].data
+            sample_weights = jnp.ones(ds_source_idx.shape, dtype=errors.dtype)
             for device, weight in device_weights.items():
-                device_mask = targ["ds_source_idx"].data == config.ds_source_to_idx[device]
-                absolute_error = jnp.where(device_mask, weight * absolute_error, absolute_error)
-            huber_loss = optax.huber_loss(absolute_error, delta=loss_config["huber_delta"])
-            return jnp.mean(huber_loss)
+                sample_weights = jnp.where(ds_source_idx == config.ds_source_to_idx[device], weight, sample_weights)
+            return jnp.mean(sample_weights * errors)
 
         return loss_fn
+
+    @classmethod
+    def get_loss_fn(cls, loss_config: dict) -> Callable[[Any, Any], jnp.ndarray]:
+        return cls._make_loss_fn(loss_config, use_huber=True)
+
+    @classmethod
+    def get_val_loss_fn(cls, loss_config: dict) -> Callable[[Any, Any], jnp.ndarray]:
+        return cls._make_loss_fn(loss_config, use_huber=False)
 
     @staticmethod
     def get_optimizer(config: dict) -> optax.GradientTransformation:
@@ -100,10 +115,10 @@ class ScalarPowerTRB(TrainRunBuilder):
 
     @classmethod
     def get_val_eval_suite(cls, suite_config) -> EvaluationSuite | None:
-        """Validation suite computing the loss (sweep metric val/loss.mean)."""
+        """Validation suite computing the delta-free loss (sweep metric val/loss.mean)."""
         if suite_config is None:
             return None
-        return make_loss_eval_suite(cls.get_loss_fn(suite_config["loss_config"]))
+        return make_loss_eval_suite(cls.get_val_loss_fn(suite_config["loss_config"]))
 
     @classmethod
     def get_test_eval_suite(cls, config) -> EvaluationSuite:

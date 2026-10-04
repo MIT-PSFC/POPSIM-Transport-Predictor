@@ -26,7 +26,11 @@ from transport_validation_datasets.store_schema import HEATING_POWERS
 from transport_study import EPISODE_DIM, TIME_COORD
 from transport_study.config import config
 from transport_study.orchestration.stages import STAGE_AGG_NAMES, segment_stages
-from transport_study.orchestration.study import PAD_TIME_STEP_S, Study
+from transport_study.orchestration.study import (
+    Study,
+    real_timeslice_mask,
+    write_netcdf_atomic,
+)
 from transport_study.signals import HEATING_POWERS_MW, convert_to_working_units
 
 # Joined dataset timeslice must be within this of the result timeslice.
@@ -116,12 +120,8 @@ def compute_case_timeslice_metrics(result_ds: xr.Dataset) -> CaseTimesliceMetric
         res_time = shot_res["time"].values
         err_abs = shot_res["error_abs_ts"].values
         err_rel = shot_res["error_rel_ts"].values
-        valid = np.isfinite(res_time) & np.isfinite(err_rel)
-        # The rollout batches pad every shot to a common length by repeating its
-        # final timeslice with a clamped time value (not NaN). Keep only rows that
-        # advance the shot clock, otherwise the shot-end error is counted hundreds
-        # of times in the stage aggregates and time averages
-        valid[1:] &= np.diff(res_time) > PAD_TIME_STEP_S
+        # Only clock-advancing rows count, the padded rollout tail would weight the shot-end error hundreds of times
+        valid = real_timeslice_mask(shot_res["time"]).values & np.isfinite(err_rel)
         result_idxs = np.flatnonzero(valid)
         if len(result_idxs) == 0:
             continue
@@ -274,8 +274,7 @@ def compute_and_save_case_metrics(study, case) -> xr.Dataset:
         case_ds = aggregate_case_metrics(ts_metrics)
         logger.info(f"Computed stage-resolved metrics for case {case} ({len(ts_metrics)} timeslices)")
 
-    cache_path.parent.mkdir(parents=True, exist_ok=True)
-    case_ds.to_netcdf(cache_path)
+    write_netcdf_atomic(case_ds, cache_path)
     return case_ds
 
 
@@ -306,9 +305,9 @@ def collect_metrics(study) -> xr.Dataset:
         logger.warning("No finished cases with valid metrics, stage-resolved metrics are empty")
         return xr.Dataset()
 
-    # coords="different" stacks the per-case scalar coords (model_type, ...)
-    metrics_ds = xr.concat(results, dim="case_idx", coords="different")
-    cache_path.parent.mkdir(parents=True, exist_ok=True)
-    metrics_ds.to_netcdf(cache_path)
+    # coords="different" stacks the per-case scalar coords (model_type, ...).
+    # compat is pinned, the xarray default is changing to "override", which coords="different" rejects
+    metrics_ds = xr.concat(results, dim="case_idx", coords="different", compat="equals")
+    write_netcdf_atomic(metrics_ds, cache_path)
     logger.info(f"Saved stage-resolved metrics to {cache_path}")
     return metrics_ds
