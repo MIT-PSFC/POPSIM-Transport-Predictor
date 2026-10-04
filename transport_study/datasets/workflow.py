@@ -1,8 +1,8 @@
 """Builds one device's study store from its transport-validation-datasets store.
 
-transport-validation-datasets (TVD) builds every device: C-Mod and MAST up to a published store,
-TCV and DIII-D up to an internal one, since their data has no release permission.
-Either holds the shared schema, IMAS names in SI units on (shot, time_idx[, rho_tor_norm]) with time on (shot, time_idx),
+transport-validation-datasets (TVD) builds every device:
+C-Mod and MAST up to a published store, TCV and DIII-D up to an internal one.
+Each holds the shared schema, IMAS names in SI units on (shot, time_idx[, rho_tor_norm]) with time on (shot, time_idx),
 already filtered and fitted, one contiguous 1 kHz segment per shot padded with NaN to the longest shot,
 and the internal one also carries the raw readings and the equilibrium.
 The build here is a lazy xarray pass: it selects the signals the studies read (signals.STUDY_STORE_SIGNALS),

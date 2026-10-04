@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Tokamak plasma transport prediction study using POPSIM ML framework. Trains models to predict plasma profiles and power balance on three devices (C-Mod, DIII-D, TCV) with transfer learning between devices. Three active studies: `profile_transfer` (complete, the template for study structure), `power_balance_transfer` (refactored to match it), and `transport_transfer` (time-dependent profile evolution, reuses machinery from both). `trajectory_optimization` is out of scope (briefly attempted March 2026, inconclusive) - do not extend it.
+Tokamak plasma transport prediction study using POPSIM ML framework. Trains models to predict plasma profiles and power balance on four devices (C-Mod, MAST, DIII-D, TCV) with transfer learning between devices. Three active studies: `profile_transfer` (complete, the template for study structure), `power_balance_transfer` (refactored to match it), and `transport_transfer` (time-dependent profile evolution, reuses machinery from both). `trajectory_optimization` is out of scope (briefly attempted March 2026, inconclusive) - do not extend it.
 
 ## Commands
 
@@ -43,7 +43,8 @@ Device sources
         - C-Mod, MAST: GP fit Thomson (zk), up to <ds>_published.zarr
         - TCV: DEFUSE 0D + raw Thomson, LIUQE GEQDSK, GP fit (zk), up to <ds>_internal.zarr only
         - DIII-D: disruption-py (DISPY EFIT 0D + GEQDSK), IDA GP fits carried over (ida), up to <ds>_internal.zarr only
-        - One filter spec and one rho_tor_norm map on all four devices, every stored value causal except P_oh and P_rad
+        - One filter spec and one rho_tor_norm map on all four devices, every stored value causal except the smoothed P_oh and P_rad,
+          the TCV n_e fringe-jump correction, and the EFIT and Thomson slices snapped to the nearest grid time (up to 0.5 ms early)
         - power_ohm = Ip V_loop - dW_pol/dt from the GEQDSK block alone on every device (DataWorkflow.add_ohmic_power):
           V_loop = sigma_Bp 2 pi dpsi_boundary/dt at the LCFS, W_pol the psirz integral, no measured flux loop
         - 1 kHz uniform timebase, profiles on rho_tor_norm, IMAS names in SI units

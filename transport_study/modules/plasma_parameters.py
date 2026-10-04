@@ -12,13 +12,9 @@ so a round trip through these functions carries the volume_approx / reconstructi
 import jax.numpy as jnp
 from popsim.cfspopcon_jax.current_drive import calc_f_shaping, calc_q_star
 from popsim.cfspopcon_jax.geometry import calc_plasma_volume
-from popsim.cfspopcon_jax.operational_limits import calc_greenwald_density_limit
 from popsim.math_utils import safe_log
 from scipy.constants import epsilon_0, eV, mu_0
-from transport_validation_datasets.machine.generic import (
-    energy_mhd_from_normalized_beta,
-    normalized_beta,
-)
+from transport_validation_datasets.machine import generic
 
 
 def inverse_aspect_ratio(minor_radius, geometric_axis_r):
@@ -35,9 +31,10 @@ def q_star(ip_MA, b_geo, geometric_axis_r, minor_radius, elongation, triangulari
 
 
 def greenwald_fraction(n_e_line_average_1e20, ip_MA, minor_radius):
-    """f_GW = n_e_line_average / (Ip / (pi a^2)), both densities in 1e20 m^-3."""
-    greenwald_limit_1e20 = calc_greenwald_density_limit(ip_MA, minor_radius)
-    return n_e_line_average_1e20 / greenwald_limit_1e20
+    """f_GW = n_e_line_average / (Ip / (pi a^2)), transport-validation-datasets' greenwald_fraction, the one the filters use."""
+    ip_A = ip_MA * 1e6
+    n_e_line_average_m3 = n_e_line_average_1e20 * 1e20
+    return generic.greenwald_fraction(ip_A, minor_radius, n_e_line_average_m3)
 
 
 def a_b0(minor_radius, b_geo):
@@ -62,12 +59,12 @@ def beta_tor_from_beta_tor_norm(beta_tor_norm, ip_MA, minor_radius, b0):
 
 def beta_tor_norm_from_energy_mhd_MJ(energy_mhd_MJ, volume_m3, minor_radius, b0, ip_MA):
     """IMAS beta_tor_norm of a stored energy, the store's own formula in J and A."""
-    return normalized_beta(energy_mhd_MJ * 1e6, volume_m3, minor_radius, b0, ip_MA * 1e6)
+    return generic.normalized_beta(energy_mhd_MJ * 1e6, volume_m3, minor_radius, b0, ip_MA * 1e6)
 
 
 def energy_mhd_MJ_from_beta_tor_norm(beta_tor_norm, volume_m3, minor_radius, b0, ip_MA):
     """Stored energy [MJ] of an IMAS beta_tor_norm, the store's own inverse in J and A."""
-    energy_mhd_J = energy_mhd_from_normalized_beta(beta_tor_norm, volume_m3, minor_radius, b0, ip_MA * 1e6)
+    energy_mhd_J = generic.energy_mhd_from_normalized_beta(beta_tor_norm, volume_m3, minor_radius, b0, ip_MA * 1e6)
     return energy_mhd_J / 1e6
 
 

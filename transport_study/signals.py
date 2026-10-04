@@ -2,7 +2,7 @@
 
 Every tensorized device store (and every sample dataset) uses IMAS names in SI units,
 the shared schema of transport-validation-datasets (store_schema.STORE_SIGNAL_ATTRS).
-The study works in engineering units instead, so organize_data converts each store once on load.
+The study works in engineering units, so organize_data converts each store once on load.
 In the study a bare IMAS name always means SI, and any other unit is a suffix on the name
 (ip_MA, energy_mhd_MJ, t_e_keV, n_e_1e20, ...).
 The stores keep the source sign of ip and b0 (their cocos variable records the convention),

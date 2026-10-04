@@ -49,6 +49,8 @@ def _toy_dataset(n_shots: int = 6, n_time: int = 40) -> xr.Dataset:
         {
             "ip_MA": _var(1.0, 0.2, 0.2, 0.1),
             "b_geo": _var(5.0, 1.4, 0.5, 0.5),
+            # The field at r0, which the visualization beta of normalize_domain normalizes with
+            "b0": _var(5.2, 1.4, 0.5, 0.5),
             "geometric_axis_r": _var(0.68, 0.88, 0.04, 0.04),
             "minor_radius": _var(0.22, 0.25, 0.02, 0.02),
             "elongation": _var(1.6, 1.4, 0.1, 0.1),

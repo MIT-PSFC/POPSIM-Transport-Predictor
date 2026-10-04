@@ -59,6 +59,11 @@ NE_SEED_FLOOR_20 = 0.02
 # so a near-empty plasma turns a normal beam power into an out-of-distribution feature
 MIN_W_MJ = 3e-3
 
+# Total over electron pressure in the stored energy implied by the profiles, ions at n_i T_i = n_e T_e.
+# The measured W_MHD the normalizers are fit on counts ions and electrons alike,
+# so an electron-only W would put the run-time beta features at about half the fitted distribution.
+TOTAL_TO_ELECTRON_PRESSURE = 2.0
+
 # The 10 profile predictor feature slots plus one aux power feature
 N_TRANSPORT_NN_INPUTS = N_NN_INPUTS + 1
 
@@ -285,12 +290,14 @@ def make_transport_nn_input_normalizer(method: str, fit_ds: xr.Dataset | None, n
 
 
 def energy_mhd_from_profiles(ne20: Array, te_keV: Array, rho: Array, volume_m3: ArrayLike) -> ArrayLike:
-    """Stored energy [MJ] implied by ne/te profiles on rho.
+    """Stored energy [MJ] implied by ne/te profiles on rho, ions included (TOTAL_TO_ELECTRON_PRESSURE).
 
-    Same single-fluid p = ne * Te convention as the Inputs beta conversions,
+    p = TOTAL_TO_ELECTRON_PRESSURE n_e T_e, as the measured W_MHD counts the ions too,
     with dV = V d(rho^2) so a flat profile recovers W = (3/2) p V exactly.
+    Fast ions, dilution and T_i != T_e are left out.
     """
-    pressure_Pa = ne20 * 1e20 * te_keV * 1e3 * eV
+    pressure_electron_Pa = ne20 * 1e20 * te_keV * 1e3 * eV
+    pressure_Pa = TOTAL_TO_ELECTRON_PRESSURE * pressure_electron_Pa
     return 1.5 * jnp.trapezoid(pressure_Pa * 2.0 * rho, rho) * volume_m3 / 1e6
 
 
