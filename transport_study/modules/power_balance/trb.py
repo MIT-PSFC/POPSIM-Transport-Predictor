@@ -30,6 +30,7 @@ from transport_study.modules.trb_utils import (  # noqa: F401 re-exported, histo
     make_grouped_exponential_adamw,
     make_loss_eval_suite,
     mask_to_largest_contiguous_segment,
+    target_device_idx,
 )
 
 STUDY_TYPE = "power_balance_transfer"
@@ -74,7 +75,7 @@ class PowerBalanceTRB(TrainRunBuilder):
                 fit_ds = None
             else:
                 fit_ds = getattr(train_dl, "normalizer_fit_ds", train_dl.ds)
-            normalizer = make_normalizer(model_init_config["data_normalization"], fit_ds, n_devices)
+            normalizer = make_normalizer(model_init_config["data_normalization"], fit_ds, n_devices, target_device_idx())
             if model_type in ("sciml-taue-scalinglaw", "sciml-taue-nn"):
                 p_oh_config = model_init_config["submodules"]["p_oh_predictor"]
                 if isinstance(p_oh_config, TrainConfig):

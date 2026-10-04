@@ -20,6 +20,7 @@ from transport_study.modules.trb_utils import (
     integrate_error_over_time,
     make_exponential_adamw,
     make_loss_eval_suite,
+    target_device_idx,
 )
 
 
@@ -57,7 +58,7 @@ class ScalarPowerTRB(TrainRunBuilder):
             fit_ds = None
         else:
             fit_ds = getattr(train_dl, "normalizer_fit_ds", train_dl.ds)
-        normalizer = make_normalizer(model_init_config["data_normalization"], fit_ds, len(config.ds_source_to_idx))
+        normalizer = make_normalizer(model_init_config["data_normalization"], fit_ds, len(config.ds_source_to_idx), target_device_idx())
 
         module = cls.MODULE_CLS.init(
             in_size=model_init_config["in_size"],

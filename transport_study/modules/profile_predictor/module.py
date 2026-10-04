@@ -310,7 +310,7 @@ def nn_input_matrix(ds: xr.Dataset) -> np.ndarray:
     return np.asarray(inputs.nn_inputs).T
 
 
-def make_nn_input_normalizer(method: str, fit_ds: xr.Dataset | None, n_devices: int) -> FeatureNormalizer:
+def make_nn_input_normalizer(method: str, fit_ds: xr.Dataset | None, n_devices: int, target_idx: int) -> FeatureNormalizer:
     """Build the per-device stat stage over the 10 dimensionless nn_inputs.
 
     Thin wrapper around normalization.make_feature_normalizer
@@ -319,7 +319,7 @@ def make_nn_input_normalizer(method: str, fit_ds: xr.Dataset | None, n_devices: 
     for callers about to overwrite the buffers from a checkpoint.
     """
     fit_data = None if fit_ds is None else feature_fit_arrays(fit_ds, nn_input_matrix(fit_ds))
-    return make_feature_normalizer(method, fit_data, n_devices, N_NN_INPUTS)
+    return make_feature_normalizer(method, fit_data, n_devices, N_NN_INPUTS, target_idx)
 
 
 @chex.dataclass

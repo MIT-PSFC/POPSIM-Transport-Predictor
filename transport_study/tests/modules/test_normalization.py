@@ -23,16 +23,16 @@ from transport_study.orchestration.organize_data import normalize_domain
 
 RNG = np.random.default_rng(7)
 N_DEVICES = 3  # global device registry size, device 2 is never fitted
+TARGET_IDX = 1  # the device CORAL aligns the others to
 
 
 def _toy_dataset(n_shots: int = 6, n_time: int = 40) -> xr.Dataset:
     """Two-device dataset with distinct distributions and a few NaNs.
 
-    Shots split evenly between devices 0 and 1. CORAL fits gate on
-    MIN_CORAL_SHOTS distinct shots per device, so coral tests must request
-    n_shots >= 16. The within-device stds are kept well above
-    CORAL_DEGENERATE_STD_FRAC of the pooled spread so every feature is live
-    and the full-covariance alignment property holds exactly.
+    Shots split evenly between devices 0 and 1. CORAL fits gate source devices on
+    MIN_CORAL_SHOTS distinct shots, so coral tests must request n_shots >= 16.
+    The within-device stds are kept well above CORAL_DEGENERATE_STD_FRAC of the target spread,
+    so every feature is live and the full-covariance alignment property holds exactly.
     """
     shape = (n_shots, n_time)
     device_of_shot = np.repeat([0, 1], n_shots // 2)
@@ -124,155 +124,129 @@ def test_z_score_unfitted_device_passthrough():
         assert np.isclose(float(getattr(out, var)), float(getattr(inp, var)))
 
 
-def test_coral_aligns_covariance():
+def test_coral_aligns_source_covariance_to_target():
+    """Device 0 is recolored to the target device's covariance, the target and the unfitted device pass through."""
     ds = _toy_dataset(n_shots=16, n_time=400)
-    norm = CoralNormalizer.fit(ds, n_devices=N_DEVICES)
+    norm = CoralNormalizer.fit(ds, n_devices=N_DEVICES, target_idx=TARGET_IDX)
 
-    # Reference covariance over pooled complete rows
     features = np.column_stack([ds[var].values.ravel() for var in NORM_INPUT_VARS])
     idx = np.repeat(ds["ds_source_idx"].values, ds.sizes["time_idx"])
     valid = ~np.any(np.isnan(features), axis=1)
-    cov_ref = np.cov(features[valid], rowvar=False)
+    cov_target = np.cov(features[valid & (idx == TARGET_IDX)], rowvar=False)
 
-    for device in (0, 1):
-        rows = features[valid & (idx == device)]
-        transformed = (rows - np.asarray(norm.means[device])) @ np.asarray(norm.transforms[device]) + np.asarray(norm.means[device])
-        cov_t = np.cov(transformed, rowvar=False)
-        # Covariance is aligned to the pooled reference (up to regularization)
-        np.testing.assert_allclose(cov_t, cov_ref, atol=0.05 * np.abs(cov_ref).max())
+    rows = features[valid & (idx == 0)]
+    transformed = (rows - np.asarray(norm.means[0])) @ np.asarray(norm.transforms[0]) + np.asarray(norm.means[0])
+    np.testing.assert_allclose(np.cov(transformed, rowvar=False), cov_target, atol=1e-6 * np.abs(cov_target).max())
+    # CORAL is second order only, the device keeps its own mean
+    np.testing.assert_allclose(transformed.mean(axis=0), rows.mean(axis=0), rtol=1e-9)
 
-    # Unfitted device: identity transform
-    inp = _sample_inputs(ds, 0, 1, device=2)
-    out = norm(inp)
-    for var in NORM_INPUT_VARS:
-        assert np.isclose(float(getattr(out, var)), float(getattr(inp, var)))
+    for device in (TARGET_IDX, 2):
+        inp = _sample_inputs(ds, 0, 1, device=device)
+        out = norm(inp)
+        for var in NORM_INPUT_VARS:
+            assert np.isclose(float(getattr(out, var)), float(getattr(inp, var)))
 
 
-def test_coral_degenerate_feature_keeps_identity_slot():
-    """fit_coral_stats with one feature near-constant within a device (std
-    below CORAL_DEGENERATE_STD_FRAC of the pooled std, e.g. B0 fixed per
-    device with only measurement jitter):
-    - the device transform has an identity row/col for that feature (value 1
-      on the diagonal, zero cross terms), so the feature passes through raw
-    - the remaining live features still align to the pooled covariance
-    - the same feature with healthy spread on the other device is transformed
-      normally there (the guard is per device, not global)
+def _three_feature_rows(rng, n_shots: int, n_time: int, means: list, stds: list) -> np.ndarray:
+    return rng.normal(means, stds, size=(n_shots * n_time, 3))
+
+
+def test_coral_identity_slots():
+    """Identity slots, with device 1 as the target:
+    - device 0 is near-constant in feature 1 (std below CORAL_DEGENERATE_STD_FRAC of the target's),
+      so feature 1 keeps an identity row and column on device 0 while its live features still align
+    - device 2 has healthy spread in feature 1 and aligns in full (the guard is per device)
+    - the target is constant in feature 2, which has nothing to align to and stays identity on every device
     """
     rng = np.random.default_rng(11)
     n_shots, n_time = 20, 30
-    n_rows = n_shots * n_time
+    rows0 = _three_feature_rows(rng, n_shots, n_time, [1.0, 5.0, 2.0], [0.5, 0.001, 0.7])
+    rows_target = _three_feature_rows(rng, n_shots, n_time, [2.0, 1.0, 3.0], [0.4, 0.8, 0.0])
+    rows2 = _three_feature_rows(rng, n_shots, n_time, [0.0, 2.0, 1.0], [1.0, 2.0, 0.5])
+    features = np.concatenate([rows0, rows_target, rows2])
+    source_idx = np.repeat([0, 1, 2], n_shots * n_time)
+    shot_idx = np.repeat(np.arange(3 * n_shots), n_time)
 
-    rows0 = rng.normal([1.0, 5.0, 2.0], [0.5, 1.0, 0.7], size=(n_rows, 3))
-    # Feature 1 is fixed on device 1 up to tiny jitter, healthy on device 0
-    rows1 = rng.normal([2.0, 1.0, 3.0], [0.4, 0.001, 0.6], size=(n_rows, 3))
-    features = np.concatenate([rows0, rows1])
-    source_idx = np.repeat([0, 1], n_rows)
-    shot_idx = np.repeat(np.arange(2 * n_shots), n_time)
-
-    stats = fit_coral_stats(features, source_idx, n_devices=2, shot_idx=shot_idx)
+    stats = fit_coral_stats(features, source_idx, n_devices=3, shot_idx=shot_idx, target_idx=1)
     assert stats is not None
     means, transforms = (np.asarray(arr) for arr in stats)
-    cov_ref = np.cov(features, rowvar=False)
+    cov_target = np.cov(rows_target, rowvar=False)
 
-    # Degenerate slot: identity row and column, zero cross terms
-    np.testing.assert_allclose(transforms[1][1, :], np.eye(3)[1])
-    np.testing.assert_allclose(transforms[1][:, 1], np.eye(3)[1])
-    # so the feature passes through raw
-    transformed1 = (rows1 - means[1]) @ transforms[1] + means[1]
-    np.testing.assert_allclose(transformed1[:, 1], rows1[:, 1])
-    # while the live features still align to the pooled covariance
-    cov_live = np.cov(transformed1[:, [0, 2]], rowvar=False)
-    np.testing.assert_allclose(cov_live, cov_ref[np.ix_([0, 2], [0, 2])], atol=0.05 * np.abs(cov_ref).max())
+    np.testing.assert_allclose(transforms[1], np.eye(3))
+    for device in (0, 2):
+        np.testing.assert_allclose(transforms[device][2, :], np.eye(3)[2])
+        np.testing.assert_allclose(transforms[device][:, 2], np.eye(3)[2])
+    np.testing.assert_allclose(transforms[0][1, :], np.eye(3)[1])
+    np.testing.assert_allclose(transforms[0][:, 1], np.eye(3)[1])
 
-    # Device 0 has healthy spread in feature 1, so it is transformed normally
-    # there: full-covariance alignment holds and the slot is not identity
-    assert abs(transforms[0][1, 1] - 1.0) > 0.1
     transformed0 = (rows0 - means[0]) @ transforms[0] + means[0]
-    np.testing.assert_allclose(np.cov(transformed0, rowvar=False), cov_ref, atol=0.05 * np.abs(cov_ref).max())
+    np.testing.assert_allclose(transformed0[:, 1:], rows0[:, 1:])
+    np.testing.assert_allclose(np.var(transformed0[:, 0], ddof=1), cov_target[0, 0], rtol=1e-9)
+    transformed2 = (rows2 - means[2]) @ transforms[2] + means[2]
+    np.testing.assert_allclose(np.cov(transformed2[:, :2], rowvar=False), cov_target[:2, :2], atol=1e-9)
 
 
 def test_coral_whitening_gain_bounded():
-    """No entry of any fitted transform, expressed in pooled-std units
-    (scale[i] * T[i, j] / scale[j]), exceeds ~1/CORAL_DEGENERATE_STD_FRAC even
-    when a device covariance is near-singular from collinear features (two
-    features that are near-copies of each other within one device).
-    This pins the CORAL_EIGVAL_FLOOR backstop for non-axis-aligned degeneracy
+    """No entry of a fitted transform in target-std units (scale[i] * T[i, j] / scale[j]) exceeds ~1/CORAL_DEGENERATE_STD_FRAC,
+    even when a source covariance is near-singular from two collinear features that each pass the per-feature guard.
+    This pins the CORAL_EIGVAL_FLOOR backstop for non-axis-aligned degeneracy.
     """
     rng = np.random.default_rng(13)
     n_shots, n_time = 20, 30
     n_rows = n_shots * n_time
-
-    # Device 0: feature 1 is a near-copy of feature 0 (collinear, both
-    # individually healthy so the per-feature guard does not fire)
     base = rng.normal(1.0, 1.0, n_rows)
     rows0 = np.column_stack([base, base + rng.normal(0.0, 0.001, n_rows), rng.normal(0.0, 1.0, n_rows)])
-    # Device 1: independent features, so the pooled reference is well spread
-    # in the direction device 0 is degenerate in
-    rows1 = rng.normal([2.0, 0.5, 1.0], [1.0, 1.0, 1.0], size=(n_rows, 3))
-    features = np.concatenate([rows0, rows1])
+    # The target is well spread in the direction device 0 is degenerate in
+    rows_target = _three_feature_rows(rng, n_shots, n_time, [2.0, 0.5, 1.0], [1.0, 1.0, 1.0])
+    features = np.concatenate([rows0, rows_target])
     source_idx = np.repeat([0, 1], n_rows)
     shot_idx = np.repeat(np.arange(2 * n_shots), n_time)
 
-    stats = fit_coral_stats(features, source_idx, n_devices=2, shot_idx=shot_idx)
+    stats = fit_coral_stats(features, source_idx, n_devices=2, shot_idx=shot_idx, target_idx=1)
     assert stats is not None
     _, transforms = (np.asarray(arr) for arr in stats)
 
-    scale = np.std(features, axis=0)
+    scale = np.std(rows_target, axis=0)
     gains = np.abs(scale[:, None] * transforms / scale[None, :])
     assert np.all(np.isfinite(gains))
-    # The eigenvalue floor caps the whitening gain of the collinear direction
-    # at 1/CORAL_DEGENERATE_STD_FRAC (small slack for the recoloring step)
     assert gains.max() <= 1.5 / CORAL_DEGENERATE_STD_FRAC
-    # The scenario really exercises the cap: device 0 does get whitened hard
+    # The scenario really exercises the cap, device 0 does get whitened hard
     assert gains[0].max() > 5.0
 
 
-def test_coral_shot_count_gate():
-    """The MIN_CORAL_SHOTS gate counts distinct shots, not timeslices:
-    - a device with 1 shot and 1000 timeslices keeps the identity transform
-      (the old MIN_CORAL_SAMPLES=8 row count let it pass)
-    - a device with MIN_CORAL_SHOTS shots of a few slices each is fitted
-    - a pooled set below MIN_CORAL_SHOTS distinct shots returns None so the
-      normalizer falls back to full identity stats
+def test_coral_shot_gates():
+    """Source devices need MIN_CORAL_SHOTS distinct shots, the target needs only one:
+    - a source with 1 shot of 1000 timeslices keeps the identity transform
+    - a source with MIN_CORAL_SHOTS shots of a few slices each is fitted, against a 1-shot target
+    - no target rows, or a target without spread (a single timeslice), returns None
     """
     rng = np.random.default_rng(17)
 
     def block(n_shots: int, n_time: int, first_shot: int, device: int, stds: list) -> tuple:
-        rows = rng.normal([1.0, 2.0, 0.5], stds, size=(n_shots * n_time, 3))
-        return (
-            rows,
-            np.full(n_shots * n_time, device),
-            np.repeat(np.arange(first_shot, first_shot + n_shots), n_time),
-        )
+        rows = _three_feature_rows(rng, n_shots, n_time, [1.0, 2.0, 0.5], stds)
+        return rows, np.full(n_shots * n_time, device), np.repeat(np.arange(first_shot, first_shot + n_shots), n_time)
 
-    # Distinct stds per device so a fitted transform is clearly not identity
-    rows0, src0, shots0 = block(1, 1000, 0, 0, [0.5, 1.0, 0.3])
-    rows1, src1, shots1 = block(MIN_CORAL_SHOTS, 5, 1, 1, [1.0, 2.0, 0.6])
-    stats = fit_coral_stats(
-        np.concatenate([rows0, rows1]),
-        np.concatenate([src0, src1]),
-        n_devices=2,
-        shot_idx=np.concatenate([shots0, shots1]),
-    )
+    blocks = [
+        block(1, 1000, 0, 0, [0.5, 1.0, 0.3]),
+        block(MIN_CORAL_SHOTS, 5, 1, 1, [1.0, 2.0, 0.6]),
+        block(1, 50, 100, 2, [0.2, 0.4, 0.1]),
+    ]
+    features, source_idx, shot_idx = (np.concatenate(parts) for parts in zip(*blocks, strict=True))
+    stats = fit_coral_stats(features, source_idx, n_devices=3, shot_idx=shot_idx, target_idx=2)
     assert stats is not None
     means, transforms = (np.asarray(arr) for arr in stats)
-    # One shot keeps identity no matter how many timeslices it has
     np.testing.assert_allclose(transforms[0], np.eye(3))
     np.testing.assert_allclose(means[0], np.zeros(3))
-    # MIN_CORAL_SHOTS shots of a few slices each are fitted
-    assert np.abs(means[1]).max() > 0
     assert not np.allclose(transforms[1], np.eye(3), atol=0.01)
 
-    # Pooled set below MIN_CORAL_SHOTS distinct shots: no stats at all
-    rows2, src2, shots2 = block(3, 100, 100, 0, [0.5, 1.0, 0.3])
-    rows3, src3, shots3 = block(3, 100, 103, 1, [1.0, 2.0, 0.6])
+    mask_without_target = source_idx != 2
     assert (
-        fit_coral_stats(
-            np.concatenate([rows2, rows3]),
-            np.concatenate([src2, src3]),
-            n_devices=2,
-            shot_idx=np.concatenate([shots2, shots3]),
-        )
+        fit_coral_stats(features[mask_without_target], source_idx[mask_without_target], 3, shot_idx[mask_without_target], target_idx=2)
+        is None
+    )
+    mask_one_target_row = mask_without_target | (np.arange(len(source_idx)) == np.flatnonzero(source_idx == 2)[0])
+    assert (
+        fit_coral_stats(features[mask_one_target_row], source_idx[mask_one_target_row], 3, shot_idx[mask_one_target_row], target_idx=2)
         is None
     )
 
@@ -296,16 +270,16 @@ def test_make_normalizer_identity_without_data():
         ("physics-coral", PhysicsCoralNormalizer),
         ("physics-zscore", PhysicsZScoreNormalizer),
     ]:
-        norm = make_normalizer(method, train_ds=None, n_devices=N_DEVICES)
+        norm = make_normalizer(method, train_ds=None, n_devices=N_DEVICES, target_idx=TARGET_IDX)
         assert isinstance(norm, cls)
-        fitted = make_normalizer(method, train_ds=_toy_dataset(), n_devices=N_DEVICES)
+        fitted = make_normalizer(method, train_ds=_toy_dataset(), n_devices=N_DEVICES, target_idx=TARGET_IDX)
         # Identity and fitted instances share pytree structure (checkpoint restore relies on it)
         assert jnp.asarray(norm.means).shape == jnp.asarray(fitted.means).shape
 
 
 def test_make_normalizer_rejects_unknown():
     with pytest.raises(ValueError, match="Unknown normalization method"):
-        make_normalizer("bogus", train_ds=None, n_devices=N_DEVICES)
+        make_normalizer("bogus", train_ds=None, n_devices=N_DEVICES, target_idx=TARGET_IDX)
 
 
 def test_stats_are_arrays_not_trainable_by_selectors():
@@ -316,7 +290,7 @@ def test_stats_are_arrays_not_trainable_by_selectors():
     array leaves, so any selector using a broad eqx.filter WOULD pick them up.
     """
     ds = _toy_dataset()
-    norm = CoralNormalizer.fit(ds, n_devices=N_DEVICES)
+    norm = CoralNormalizer.fit(ds, n_devices=N_DEVICES, target_idx=TARGET_IDX)
     leaves = eqx.filter(norm, eqx.is_inexact_array)
     # Both stats arrays are pytree leaves (they checkpoint/restore with the model)
     assert leaves.means is not None

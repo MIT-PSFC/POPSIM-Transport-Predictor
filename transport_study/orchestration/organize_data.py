@@ -413,8 +413,10 @@ def normalize_domain(
           (q_star, epsilon, aB0, f_G, surface_power_density) plus beta as a visualization-only extra,
           in the profile space the nn_inputs themselves (which carry their own beta)
         - "zscore": Within each device, normalize each variable to zero mean and unit variance. Variable gets a `_z` suffix after normalization. energy_mhd_MJ is a visualization-only extra column (harmless, z-scoring is per-variable)
-        - "coral": Use the CORAL method to align covariances of various devices over exactly the model's 7 input vars. Variable gets a `_coral` suffix after normalization.
-        - "physics-coral": CORAL alignment over the physics features of the selected feature space. Variable gets a `_pcoral` suffix (a `_coral` suffix would collide with the raw coral vars).
+        - "coral": CORAL alignment of every device's covariance to the target device's, over exactly the model's 7 input vars.
+          Variable gets a `_coral` suffix after normalization.
+        - "physics-coral": The same CORAL alignment over the physics features of the selected feature space.
+          Variable gets a `_pcoral` suffix (a `_coral` suffix would collide with the raw coral vars).
         - "physics-zscore": Per-device z-score over the physics features of the selected feature space. Variable gets a `_pz` suffix.
 
     Args:
@@ -536,10 +538,18 @@ def normalize_domain(
         return np.asarray(ds.coords["shot"].broadcast_like(_reference(ds)).values).ravel()
 
     def _coral_normalization(variables: tuple[str, ...], suffix: str, matrix_fn) -> None:
-        # Devices below MIN_CORAL_SHOTS (or absent from ds_source) keep the
-        # identity transform, so their features pass through raw. Rows with any
-        # NaN feature come out all-NaN (the joint transform needs complete rows).
-        stats = fit_coral_stats(matrix_fn(ds_source), _source_idx_for(ds_source), len(registry), _shot_idx_for(ds_source))
+        # Every device aligns to the target device's covariance, all keep the identity transform without the target.
+        # Source devices below MIN_CORAL_SHOTS keep the identity transform, so their features pass through raw.
+        # Rows with any NaN feature come out all-NaN (the joint transform needs complete rows).
+        stats = None
+        if config.target_device in registry:
+            stats = fit_coral_stats(
+                matrix_fn(ds_source),
+                _source_idx_for(ds_source),
+                len(registry),
+                _shot_idx_for(ds_source),
+                registry[config.target_device],
+            )
         means, transforms = identity_coral_stats(len(registry), len(variables)) if stats is None else stats
         batched_apply = jax.vmap(apply_coral, in_axes=(0, 0, None, None))
         for ds in datasets:

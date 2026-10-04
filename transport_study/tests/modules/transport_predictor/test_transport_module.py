@@ -133,7 +133,7 @@ def transformer_module() -> TransportPredictorTransformer:
         nn_width=8,
         nn_depth=1,
         rhogrid=RHO,
-        normalizer=make_transport_nn_input_normalizer("physics", None, 2),
+        normalizer=make_transport_nn_input_normalizer("physics", None, 2, target_idx=0),
         prng_seed=0,
     )
 
@@ -169,7 +169,7 @@ def torax_rebuild_module() -> TransportPredictorTorax:
         nn_width=8,
         nn_depth=2,
         prng_seed=0,
-        normalizer=make_transport_nn_input_normalizer("physics", None, 2),
+        normalizer=make_transport_nn_input_normalizer("physics", None, 2, target_idx=0),
         sim_dt=0.001,
         transport_model="constant",
         geometry_builder="circular",
@@ -184,7 +184,7 @@ def torax_carry_module() -> TransportPredictorToraxSimState:
         nn_width=8,
         nn_depth=2,
         prng_seed=0,
-        normalizer=make_transport_nn_input_normalizer("physics", None, 2),
+        normalizer=make_transport_nn_input_normalizer("physics", None, 2, target_idx=0),
         sim_dt=0.001,
         transport_model="constant",
         geometry_builder="circular",
@@ -497,7 +497,7 @@ def test_torax_rebuild_step_gradients_finite(transport_model):
         nn_width=8,
         nn_depth=2,
         prng_seed=0,
-        normalizer=make_transport_nn_input_normalizer("physics", None, 2),
+        normalizer=make_transport_nn_input_normalizer("physics", None, 2, target_idx=0),
         sim_dt=0.001,
         transport_model=transport_model,
         geometry_builder="miller",
@@ -613,8 +613,8 @@ def test_torax_absorbed_power_matches_absorption_fraction(torax_carry_module):
 def test_normalizer_fit_features():
     """make_transport_nn_input_normalizer builds an (N, 11) feature matrix
     whose columns match Inputs.transport_nn_inputs evaluated with the
-    measured energy_mhd_MJ, drops rows with NaN device index, and returns identity
-    stats for devices with too few samples."""
+    measured energy_mhd_MJ, drops rows with NaN device index,
+    and aligns the populated device to the few-shot target under physics-coral."""
     assert N_TRANSPORT_NN_INPUTS == 11
     assert len(TRANSPORT_NN_INPUT_NAMES) == N_TRANSPORT_NN_INPUTS
     assert TRANSPORT_NN_INPUT_NAMES[-1] == "paux_norm"
@@ -622,7 +622,7 @@ def test_normalizer_fit_features():
     ds_sample = xr.open_dataset(SAMPLE_DIR / "cmod-low1.nc").isel(shot=slice(0, 40), time_idx=slice(0, 600, 3))
     ds = convert_to_working_units(ds_sample)
     source_idx_per_shot = np.zeros(ds.sizes["shot"])
-    source_idx_per_shot[30:35] = 1.0  # a device with too few shots for CORAL
+    source_idx_per_shot[30:35] = 1.0  # the target, too few shots for a CORAL source but enough as the reference
     source_idx_per_shot[35:] = np.nan  # unattributed shots (NaN-padded concat)
     ds["ds_source_idx"] = ("shot", source_idx_per_shot)
     n_devices = 3  # device 2 is registered but absent from the fit data
@@ -673,21 +673,21 @@ def test_normalizer_fit_features():
     assert not np.isnan(source_idx).any()
     assert set(np.unique(source_idx)) == {0, 1}
 
-    # physics-coral: the well-populated device gets fitted stats, the
-    # low-shot device and the absent device keep identity rows
-    normalizer = make_transport_nn_input_normalizer("physics-coral", ds, n_devices)
+    # physics-coral aligns to the target, device 1 (its few shots are enough for the reference).
+    # The well-populated device gets fitted stats, the target and the absent device keep identity rows
+    normalizer = make_transport_nn_input_normalizer("physics-coral", ds, n_devices, target_idx=1)
     assert isinstance(normalizer, CoralFeatureNormalizer)
     eye = np.eye(N_TRANSPORT_NN_INPUTS)
     assert not np.allclose(np.asarray(normalizer.transforms[0]), eye)
     complete = ~np.isnan(features).any(axis=1)
     device0 = complete & (source_idx == 0)
     np.testing.assert_allclose(np.asarray(normalizer.means[0]), features[device0].mean(axis=0), rtol=1e-6)
-    for low_count_device in (1, 2):
-        np.testing.assert_array_equal(np.asarray(normalizer.transforms[low_count_device]), eye)
-        np.testing.assert_array_equal(np.asarray(normalizer.means[low_count_device]), 0.0)
+    for identity_device in (1, 2):
+        np.testing.assert_array_equal(np.asarray(normalizer.transforms[identity_device]), eye)
+        np.testing.assert_array_equal(np.asarray(normalizer.means[identity_device]), 0.0)
 
     # physics-zscore: fitted for present devices, identity for the absent one
-    zscore = make_transport_nn_input_normalizer("physics-zscore", ds, n_devices)
+    zscore = make_transport_nn_input_normalizer("physics-zscore", ds, n_devices, target_idx=1)
     assert isinstance(zscore, ZScoreFeatureNormalizer)
     assert not np.allclose(np.asarray(zscore.means[0]), 0.0)
     np.testing.assert_array_equal(np.asarray(zscore.means[2]), 0.0)
@@ -696,12 +696,12 @@ def test_normalizer_fit_features():
     # physics keeps identity buffers, and fit_ds None yields identity stats
     # with the checkpoint's pytree structure
     for identity_normalizer in (
-        make_transport_nn_input_normalizer("physics", ds, n_devices),
-        make_transport_nn_input_normalizer("physics-coral", None, n_devices),
+        make_transport_nn_input_normalizer("physics", ds, n_devices, target_idx=1),
+        make_transport_nn_input_normalizer("physics-coral", None, n_devices, target_idx=1),
     ):
         assert isinstance(identity_normalizer, CoralFeatureNormalizer)
         np.testing.assert_array_equal(
             np.asarray(identity_normalizer.transforms),
             np.tile(eye, (n_devices, 1, 1)),
         )
-    assert isinstance(make_transport_nn_input_normalizer("physics-zscore", None, n_devices), ZScoreFeatureNormalizer)
+    assert isinstance(make_transport_nn_input_normalizer("physics-zscore", None, n_devices, target_idx=1), ZScoreFeatureNormalizer)

@@ -98,8 +98,9 @@ def _build_module(
         # Identity buffers, restore_model overwrites them with the trained
         # statistics when a checkpoint is given. Both n_devices and
         # data_normalization must match the checkpoint: the stat method picks
-        # the normalizer class, and the classes have different pytrees
-        normalizer=make_nn_input_normalizer(data_normalization, None, n_devices),
+        # the normalizer class, and the classes have different pytrees.
+        # Identity buffers have no alignment reference, so target_idx is unused
+        normalizer=make_nn_input_normalizer(data_normalization, None, n_devices, target_idx=0),
         transport_model=transport_model,
         geometry_builder=model_cfg.get("geometry_builder", "circular"),
         delta_exponent=model_cfg.get("delta_exponent", 2.0),

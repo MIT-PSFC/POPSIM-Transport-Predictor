@@ -32,6 +32,7 @@ from transport_study.modules.trb_utils import (
     make_exponential_adamw,
     make_loss_eval_suite,
     resolve_case_datasets,
+    target_device_idx,
 )
 
 
@@ -127,7 +128,7 @@ class ProfilePredictorTRB(TrainRunBuilder):
             fit_ds = None
         else:
             fit_ds = getattr(train_dl, "normalizer_fit_ds", train_dl.ds)
-        normalizer = make_nn_input_normalizer(model_init_config["data_normalization"], fit_ds, n_devices)
+        normalizer = make_nn_input_normalizer(model_init_config["data_normalization"], fit_ds, n_devices, target_device_idx())
 
         if model_init_config["model_type"] in MODEL_TYPES_WITH_SHAPES:
             te_shape_var = model_init_config["te_shape_var"]

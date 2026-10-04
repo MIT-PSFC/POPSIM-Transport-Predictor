@@ -27,6 +27,7 @@ from transport_study.modules.trb_utils import (
     get_time_dep_dataloaders,
     make_grouped_exponential_adamw,
     make_loss_eval_suite,
+    target_device_idx,
 )
 
 STUDY_TYPE = "transport_transfer"
@@ -74,7 +75,7 @@ class TransportPredictorTRB(TrainRunBuilder):
                 fit_ds = None
             else:
                 fit_ds = getattr(train_dl, "normalizer_fit_ds", train_dl.ds)
-            normalizer = make_transport_nn_input_normalizer(model_init_config["data_normalization"], fit_ds, n_devices)
+            normalizer = make_transport_nn_input_normalizer(model_init_config["data_normalization"], fit_ds, n_devices, target_device_idx())
 
             if model_type == "sciml":
                 # Submodule skeletons come from their own TRBs, then their

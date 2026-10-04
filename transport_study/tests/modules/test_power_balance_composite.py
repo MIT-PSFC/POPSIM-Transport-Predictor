@@ -156,8 +156,12 @@ def _scalar_inputs() -> PowerBalance.Inputs:
 
 
 def _make_submodules() -> tuple[OhmicPower, RadiatedPower]:
-    p_oh = OhmicPower.init(in_size=7, out_size=1, nn_width=4, nn_depth=1, prng_seed=1, normalizer=make_normalizer("raw", None, 1))
-    p_rad = RadiatedPower.init(in_size=7, out_size=1, nn_width=4, nn_depth=1, prng_seed=2, normalizer=make_normalizer("raw", None, 1))
+    p_oh = OhmicPower.init(
+        in_size=7, out_size=1, nn_width=4, nn_depth=1, prng_seed=1, normalizer=make_normalizer("raw", None, 1, target_idx=0)
+    )
+    p_rad = RadiatedPower.init(
+        in_size=7, out_size=1, nn_width=4, nn_depth=1, prng_seed=2, normalizer=make_normalizer("raw", None, 1, target_idx=0)
+    )
     return p_oh, p_rad
 
 
@@ -176,7 +180,7 @@ def test_structured_outputs_carry_submodule_predictions():
         nn_depth=1,
         p_oh_predictor=p_oh,
         p_rad_predictor=p_rad,
-        normalizer=make_normalizer("raw", None, 1),
+        normalizer=make_normalizer("raw", None, 1, target_idx=0),
     )
     scalinglaw = PowerBalanceScalingLaw.init(p_oh_predictor=p_oh, p_rad_predictor=p_rad)
     for module in (sciml, scalinglaw):
@@ -184,13 +188,15 @@ def test_structured_outputs_carry_submodule_predictions():
         assert np.isclose(float(output.power_ohm_MW_pred), float(expected_p_oh))
         assert np.isclose(float(output.power_radiated_MW_pred), float(expected_p_rad))
 
-    mlp = PowerBalanceUnstructuredNN.init(in_size=7, out_size=1, nn_width=4, nn_depth=1, normalizer=make_normalizer("raw", None, 1))
+    mlp = PowerBalanceUnstructuredNN.init(
+        in_size=7, out_size=1, nn_width=4, nn_depth=1, normalizer=make_normalizer("raw", None, 1, target_idx=0)
+    )
     _, output = mlp(state, inputs)
     assert np.isnan(float(output.power_ohm_MW_pred))
     assert np.isnan(float(output.power_radiated_MW_pred))
 
     transformer = PowerBalanceTransformer.init(
-        d_model=8, num_heads=2, history_len=4, nn_width=4, nn_depth=1, normalizer=make_normalizer("raw", None, 1)
+        d_model=8, num_heads=2, history_len=4, nn_width=4, nn_depth=1, normalizer=make_normalizer("raw", None, 1, target_idx=0)
     )
     transformer_state = PowerBalanceTransformer.State(energy_mhd_MJ=jnp.asarray(0.1), history=jnp.full((4,), 0.1))
     _, output = transformer(transformer_state, inputs)

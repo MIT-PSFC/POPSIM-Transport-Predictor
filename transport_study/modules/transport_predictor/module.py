@@ -277,7 +277,7 @@ def transport_nn_input_matrix(ds: xr.Dataset) -> np.ndarray:
     return np.asarray(inputs.transport_nn_inputs(col("energy_mhd_MJ"))).T
 
 
-def make_transport_nn_input_normalizer(method: str, fit_ds: xr.Dataset | None, n_devices: int) -> FeatureNormalizer:
+def make_transport_nn_input_normalizer(method: str, fit_ds: xr.Dataset | None, n_devices: int, target_idx: int) -> FeatureNormalizer:
     """Build the per-device stat stage over the 11 transport features.
 
     Thin wrapper around normalization.make_feature_normalizer (which holds the
@@ -286,7 +286,7 @@ def make_transport_nn_input_normalizer(method: str, fit_ds: xr.Dataset | None, n
     overwrite the buffers from a checkpoint.
     """
     fit_data = None if fit_ds is None else feature_fit_arrays(fit_ds, transport_nn_input_matrix(fit_ds))
-    return make_feature_normalizer(method, fit_data, n_devices, N_TRANSPORT_NN_INPUTS)
+    return make_feature_normalizer(method, fit_data, n_devices, N_TRANSPORT_NN_INPUTS, target_idx)
 
 
 def energy_mhd_from_profiles(ne20: Array, te_keV: Array, rho: Array, volume_m3: ArrayLike) -> ArrayLike:

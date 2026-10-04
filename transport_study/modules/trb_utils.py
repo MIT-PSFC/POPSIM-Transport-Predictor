@@ -22,6 +22,11 @@ from transport_study.orchestration.organize_data import (
 )
 
 
+def target_device_idx() -> int:
+    """Global device index of the target device, the reference the CORAL methods align every device to."""
+    return config.ds_source_to_idx[config.target_device]
+
+
 def trapezoid_dropna(y, x):
     """Trapezoid-integrate y over x ignoring NaN pairs, NaN when fewer than 2 valid points."""
     mask = ~np.isnan(x) & ~np.isnan(y)
