@@ -14,7 +14,7 @@ import wandb
 import xarray as xr
 import yaml
 from loguru import logger
-from popsim.ml import DataLoader, TrainConfig, Trainer
+from popsim.ml import DataLoader, TrainConfig, Trainer, TrainRunBuilder
 from popsim.ml.launch import (
     get_train_run_builder_class,
     launch_agent,
@@ -48,6 +48,7 @@ from transport_study.orchestration.slurm_utils import (
 )
 from transport_study.orchestration.topk_results import compute_topk_study_results
 from transport_study.orchestration.wandb_utils import (
+    SweepReadError,
     get_best_train_config,
     get_completed_runs,
     get_sweep_id,
@@ -246,7 +247,7 @@ class CaseGridConfig(StudyConfig):
         return data
 
 
-def data_train_run_builder(train_config: TrainConfig) -> type:
+def data_train_run_builder(train_config: TrainConfig) -> type[TrainRunBuilder]:
     """The TRB that builds a train config's dataloaders, as popsim launch resolves it.
 
     Submodule cases load their data through dataloader_config["data_train_run_builder"], every other case through its own TRB.
@@ -1141,8 +1142,8 @@ class Study:
             raise RuntimeError(
                 f"Hyperparameter sweep for case {case} reports {len(completed_runs)} completed runs "
                 f"but no best config could be recovered from wandb project {self.wandb_project_name(case)}. "
-                "Only runs trained to completion are eligible, check the project for runs stuck crashing/pruning "
-                "before logging val/loss.mean."
+                "Only runs trained to completion with a finite val/loss.mean are eligible, "
+                "check the project for runs stuck crashing, pruning or diverging."
             )
         self._write_tuned_config(case, best_train_config)
         logger.success(f"Saved best hyperparameter config for {case}")
@@ -1210,14 +1211,19 @@ class Study:
             }
         )
         wandb_project_name = self.wandb_project_name(case)
-        sweep_id = get_sweep_id(wandb_project_name)
-        kwargs_agent = {"count": 1}  # One training run per agent
+        try:
+            sweep_id = get_sweep_id(wandb_project_name)
+        except SweepReadError as e:
+            logger.warning(f"{e}\nHolding the agent launches for case {case} until the next pass")
+            return
+        # One training run per agent
+        kwargs_agent = {"count": 1, "entity": config.wandb_entity}
 
         if not sweep_id:
             logger.info(f"No existing sweep found for case {case}, creating a new sweep")
             sweep_config_path = Path(self.SWEEP_CONFIG_DIR) / f"{case.model_type}.yaml"
             sweep_config = load_dict(str(sweep_config_path))
-            sweep_id = wandb.sweep(sweep_config, project=wandb_project_name)
+            sweep_id = wandb.sweep(sweep_config, entity=config.wandb_entity, project=wandb_project_name)
 
         if enable_parallelism:
             if partition is None:
@@ -1245,7 +1251,7 @@ class Study:
                 return
             logger.info(f"Launching {sweep_jobs} agent job(s) {agent_job_name} on {partition} for case\n{case}")
             for _ in range(sweep_jobs):
-                launch_agent_parallel(
+                submitted = launch_agent_parallel(
                     train_config,
                     sweep_id,
                     kwargs_agent,
@@ -1253,6 +1259,8 @@ class Study:
                     Path(self.log_dir) / "logs_sweep",
                     partition=partition,
                 )
+                if not submitted:
+                    break
         else:
             logger.info("Launching agent serially")
             launch_agent(train_config, sweep_id, kwargs_agent=kwargs_agent)
@@ -1308,13 +1316,16 @@ class Study:
         if enable_parallelism:
             train_job_name = self.train_job_name(case)
             logger.info(f"Launching training job {train_job_name} for case\n{case}")
-            launch_train_parallel(
+            submitted = launch_train_parallel(
                 train_config,
                 train_job_name,
                 result_path,
                 Path(self.log_dir) / "logs_train",
                 partition=partition,
             )
+            # Nothing ran, so a rejected submission does not count toward MAX_TRAIN_ATTEMPTS
+            if not submitted:
+                self.train_attempts[str(case)] = attempts
         else:
             logger.info("Launching training serially")
             trainer, _, _, test_dl, result_dict = launch_train(train_config)

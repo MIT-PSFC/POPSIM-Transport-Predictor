@@ -6,6 +6,7 @@ import subprocess
 import sys
 import tempfile
 from collections.abc import Callable
+from datetime import timedelta
 from pathlib import Path
 
 import yaml
@@ -84,6 +85,26 @@ def _slurm_stdout(cmd: list[str], level: str = "CRITICAL") -> str | None:
 
 def _count_lines(stdout: str) -> int:
     return len(stdout.strip().split("\n")) if stdout.strip() else 0
+
+
+def _cache_resolved(fn):
+    """Cache fn per argument tuple, except a None result (a failed SLURM query), which the next call retries.
+
+    The partition inventory and limits are static for a study run,
+    but a cached failure would disable the spillover limits or the GPU type exclusion for the rest of it.
+    """
+    resolved: dict[tuple, object] = {}
+
+    @functools.wraps(fn)
+    def wrapper(*args):
+        if args not in resolved:
+            result = fn(*args)
+            if result is None:
+                return None
+            resolved[args] = result
+        return resolved[args]
+
+    return wrapper
 
 
 def sbatch_script(
@@ -372,22 +393,13 @@ def count_user_jobs() -> int:
     return _count_lines(stdout)
 
 
-_partition_info_cache: dict[str, dict[str, str]] = {}
-
-
-def _partition_info(partition: str) -> dict[str, str]:
-    """key=value fields from scontrol show partition. Partition limits are
-    static for the lifetime of a study run, so successful lookups are cached.
-    Failures are NOT cached: a transient scontrol failure cached here would
-    silently disable QOS-capped spillover for the process lifetime."""
-    if partition in _partition_info_cache:
-        return _partition_info_cache[partition]
+@_cache_resolved
+def _partition_info(partition: str) -> dict[str, str] | None:
+    """key=value fields from scontrol show partition, None if scontrol failed."""
     stdout = _slurm_stdout(["scontrol", "show", "partition", partition], level="WARNING")
     if not stdout or not stdout.strip():
-        return {}
-    info = dict(token.split("=", 1) for token in stdout.split() if "=" in token)
-    _partition_info_cache[partition] = info
-    return info
+        return None
+    return dict(token.split("=", 1) for token in stdout.split() if "=" in token)
 
 
 _partition_user_gpu_cap_cache: dict[str, int | None] = {}
@@ -425,19 +437,25 @@ def partition_user_gpu_cap(partition: str) -> int | None:
     return cap
 
 
+# Clock fields of a SLURM time string by field count, without and with a day prefix (the sbatch --time grammar)
+SLURM_CLOCK_FIELDS = {1: ("minutes",), 2: ("minutes", "seconds"), 3: ("hours", "minutes", "seconds")}
+SLURM_DAY_CLOCK_FIELDS = {1: ("hours",), 2: ("hours", "minutes"), 3: ("hours", "minutes", "seconds")}
+
+
 def parse_slurm_time_s(time_str: str | None) -> int | None:
-    """Seconds from a SLURM time string like 06:00:00 or 2-00:00:00, None if unlimited."""
-    if not time_str or time_str.upper() in ("UNLIMITED", "NONE", "N/A"):
+    """Seconds from a SLURM time string, None if unlimited.
+
+    Takes every sbatch --time form: M, M:S, H:M:S, D-H, D-H:M and D-H:M:S.
+    squeue and scontrol print a subset of these.
+    """
+    if not time_str or time_str.upper() in ("UNLIMITED", "INFINITE", "NONE", "N/A"):
         return None
-    days = 0
-    if "-" in time_str:
-        day_str, time_str = time_str.split("-", 1)
-        days = int(day_str)
-    parts = [int(p) for p in time_str.split(":")]
-    while len(parts) < 3:
-        parts.insert(0, 0)
-    hours, minutes, seconds = parts
-    return ((days * 24 + hours) * 60 + minutes) * 60 + seconds
+    day_str, _, clock_str = time_str.rpartition("-")
+    clock_values = [int(value) for value in clock_str.split(":")]
+    clock_fields = SLURM_DAY_CLOCK_FIELDS if day_str else SLURM_CLOCK_FIELDS
+    clock = dict(zip(clock_fields[len(clock_values)], clock_values, strict=True))
+    duration = timedelta(days=int(day_str or 0), **clock)
+    return int(duration.total_seconds())
 
 
 def format_slurm_time(seconds: int) -> str:
@@ -448,7 +466,10 @@ def format_slurm_time(seconds: int) -> str:
 
 def partition_time_limit_s(partition: str) -> int | None:
     """Partition MaxTime in seconds, None if unlimited or unknown."""
-    return parse_slurm_time_s(_partition_info(partition).get("MaxTime"))
+    info = _partition_info(partition)
+    if info is None:
+        return None
+    return parse_slurm_time_s(info.get("MaxTime"))
 
 
 def count_user_gpus(partition: str) -> int:
@@ -502,20 +523,19 @@ def pick_partition() -> str | None:
     return None
 
 
-@functools.cache
-def gpu_type_exclude_nodes(partition: str, allowed_gpu_types: tuple[str, ...]) -> str:
+@_cache_resolved
+def gpu_type_exclude_nodes(partition: str, allowed_gpu_types: tuple[str, ...]) -> str | None:
     """Comma-separated nodes in the partition whose GPUs are not all in allowed_gpu_types.
 
     Node features on this cluster do not tag GPU models, so sbatch
     --constraint cannot select card types and gres cannot request an OR of
     them. An explicit --exclude list is the only way to keep a job on the
-    allowed cards. Cached per (partition, types), the hardware inventory is
-    static. Returns "" (exclude nothing) if sinfo fails: a job that lands on
-    a disallowed card still trains, just slowly.
+    allowed cards. Returns None (exclude nothing) if sinfo fails:
+    a job that lands on a disallowed card still trains, just slowly.
     """
     stdout = _slurm_stdout(["sinfo", "-p", partition, "-N", "--noheader", "-o", "%N %G"], level="WARNING")
     if stdout is None:
-        return ""
+        return None
     nodes = set()
     for line in stdout.splitlines():
         node, _, gres = line.strip().partition(" ")
@@ -546,15 +566,12 @@ def _gpu_exclude_directive(partition: str, typed: bool = False) -> str:
 GRES_UNAVAILABLE_ERROR = "Requested node configuration is not available"
 
 
-@functools.cache
-def partition_gpu_type_counts(partition: str) -> tuple[tuple[str, int], ...]:
-    """(gpu_type, total GPU count) pairs in the partition, most plentiful first.
-
-    Cached per partition, the hardware inventory is static. Empty if sinfo fails.
-    """
+@_cache_resolved
+def partition_gpu_type_counts(partition: str) -> tuple[tuple[str, int], ...] | None:
+    """(gpu_type, total GPU count) pairs in the partition, most plentiful first, None if sinfo fails."""
     stdout = _slurm_stdout(["sinfo", "-p", partition, "-N", "--noheader", "-o", "%G"], level="WARNING")
     if stdout is None:
-        return ()
+        return None
     counts: dict[str, int] = {}
     for line in stdout.splitlines():
         for gpu_type, count in re.findall(r"gpu:([\w.]+):(\d+)", line):
@@ -577,14 +594,15 @@ def _gres_fragments(partition: str) -> list[str]:
     fragments = [f"gpu:1{_gpu_exclude_directive(partition)}"]
     if config.gpu_types:
         allowed = {t.lower() for t in config.gpu_types}
-        for gpu_type, _ in partition_gpu_type_counts(partition):
+        gpu_type_counts = partition_gpu_type_counts(partition) or ()
+        for gpu_type, _ in gpu_type_counts:
             if gpu_type in allowed:
                 fragments.append(f"gpu:{gpu_type}:1{_gpu_exclude_directive(partition, typed=True)}")
     return fragments
 
 
-def _sbatch_gpu_job(build_script: Callable[[str], str], job_name: str, partition: str, kind: str) -> None:
-    """Submit build_script(gres_fragment) via sbatch, falling back to typed gres.
+def _sbatch_gpu_job(build_script: Callable[[str], str], job_name: str, partition: str, kind: str) -> bool:
+    """Submit build_script(gres_fragment) via sbatch, falling back to typed gres, returns whether SLURM accepted it.
 
     Only the "Requested node configuration is not available" rejection moves
     on to the next gres fragment, any other sbatch failure is final.
@@ -594,15 +612,16 @@ def _sbatch_gpu_job(build_script: Callable[[str], str], job_name: str, partition
         script = build_script(gres_fragment)
         result = _run_slurm(["sbatch"], stdin=script)
         if result is None:
-            return
+            return False
         if result.returncode == 0:
             logger.info(f"Submitted {kind} job {job_name}: {result.stdout.strip()}")
-            return
+            return True
         if GRES_UNAVAILABLE_ERROR not in result.stderr:
             break
         logger.info(f"{partition} rejected gres request {gres_fragment.splitlines()[0]!r} for {job_name}, trying next GPU type")
     if result is not None:
-        logger.error(f"sbatch failed for job {job_name}: {result.stderr}")
+        logger.error(f"sbatch failed for {kind} job {job_name}: {result.stderr}")
+    return False
 
 
 def clamp_time_for_partition(partition: str, train_config: TrainConfig) -> tuple[str, TrainConfig]:
@@ -634,8 +653,8 @@ def launch_train_parallel(
     result_path: Path | str,
     log_dir: Path | str,
     partition: str | None = None,
-) -> None:
-    """Submit a SLURM job that runs training serially and saves results to result_path.
+) -> bool:
+    """Submit a SLURM job that runs training serially and saves results to result_path, returns whether SLURM accepted it.
 
     Args:
         train_config: The training configuration.
@@ -706,7 +725,7 @@ Path({str(study_config_path)!r}).unlink()
     def build_script(gres_fragment: str) -> str:
         return sbatch_script(job_name, partition, time_limit, log_path, script_path, setup, gres=gres_fragment, requeue=True)
 
-    _sbatch_gpu_job(build_script, job_name, partition, "training")
+    return _sbatch_gpu_job(build_script, job_name, partition, "training")
 
 
 def launch_agent_parallel(
@@ -716,8 +735,8 @@ def launch_agent_parallel(
     job_name: str,
     log_dir: Path | str,
     partition: str | None = None,
-) -> None:
-    """Submit a SLURM job that launches a W&B agent for an existing sweep.
+) -> bool:
+    """Submit a SLURM job that launches a W&B agent for an existing sweep, returns whether SLURM accepted it.
 
     Args:
         train_config: The training configuration.
@@ -773,7 +792,7 @@ Path({str(study_config_path)!r}).unlink()
     def build_script(gres_fragment: str) -> str:
         return sbatch_script(job_name, partition, time_limit, log_path, script_path, setup, gres=gres_fragment, requeue=True)
 
-    _sbatch_gpu_job(build_script, job_name, partition, "agent")
+    return _sbatch_gpu_job(build_script, job_name, partition, "agent")
 
 
 def launch_case_analysis_parallel(study, case) -> None:

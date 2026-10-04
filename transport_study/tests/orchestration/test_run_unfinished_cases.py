@@ -8,6 +8,7 @@ being visited (which previously spammed the logs every pass).
 from types import SimpleNamespace
 
 import pytest
+from popsim.ml import TrainConfig
 
 from transport_study.orchestration import study as study_module
 from transport_study.orchestration.study import Study
@@ -155,3 +156,26 @@ def test_case_in_flight_ignores_agent_jobs(make_stub_study):
 
     assert not study.case_in_flight(case_a, {study.agent_job_name(case_a)})
     assert study.case_in_flight(case_a, {study.train_job_name(case_a)})
+
+
+@pytest.mark.parametrize(("submitted", "expected_attempts"), [(False, 0), (True, 1)])
+def test_rejected_submission_refunds_train_attempt(make_stub_study, monkeypatch, submitted, expected_attempts):
+    """A training job SLURM never accepted must not count toward MAX_TRAIN_ATTEMPTS."""
+    case = StubCase("case.a")
+    study = make_stub_study([case])
+    train_config = TrainConfig(
+        project="stub_project",
+        train_run_builder="stub.module.StubTRB",
+        max_epochs=1,
+        epochs_per_val=1,
+        dataloader_config={},
+        model_init_config={},
+        loss_config={},
+        optimizer_config={},
+    )
+    monkeypatch.setattr(study, "make_train_config", lambda _case: train_config)
+    monkeypatch.setattr(study_module, "launch_train_parallel", lambda *args, **kwargs: submitted)
+
+    study.launch_train(case, enable_parallelism=True, partition="test_partition")
+
+    assert study.train_attempts.get(str(case), 0) == expected_attempts
