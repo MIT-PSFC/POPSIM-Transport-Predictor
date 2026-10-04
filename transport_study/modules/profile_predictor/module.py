@@ -7,7 +7,7 @@ import jax.numpy as jnp
 import matplotlib.pyplot as plt
 import numpy as np
 import xarray as xr
-from jaxtyping import Array
+from jaxtyping import Array, ArrayLike
 from loguru import logger
 from popsim import TimeIndepModule
 from popsim.basis import Basis1DProtocol, BSplineBasis, InterpedLinearBasis
@@ -19,6 +19,7 @@ from transport_study.modules import plasma_parameters
 from transport_study.modules.normalization import (
     FeatureNormalizer,
     feature_fit_arrays,
+    flat_columns,
     make_feature_normalizer,
 )
 
@@ -164,8 +165,51 @@ NN_INPUT_SOURCE_VARS = (
 )
 
 
+class DerivedPlasmaParameters:
+    """Dimensionless parameters shared by the profile and transport Inputs, which both carry the fields read here."""
+
+    @property
+    def epsilon(self):
+        return plasma_parameters.inverse_aspect_ratio(self.minor_radius, self.geometric_axis_r)
+
+    @property
+    def q_star(self):
+        return plasma_parameters.q_star(
+            self.ip_MA,
+            self.b_geo,
+            self.geometric_axis_r,
+            self.minor_radius,
+            self.elongation,
+            self.triangularity_upper,
+            self.triangularity_lower,
+        )
+
+    @property
+    def fGW(self):
+        return plasma_parameters.greenwald_fraction(self.n_e_line_average_1e20, self.ip_MA, self.minor_radius)
+
+    @property
+    def aB0(self):
+        return plasma_parameters.a_b0(self.minor_radius, self.b_geo)
+
+    @property
+    def volume_approx(self):
+        return plasma_parameters.volume_approx(self.geometric_axis_r, self.minor_radius, self.elongation)
+
+    def beta_tor_of(self, beta_tor_norm: ArrayLike) -> ArrayLike:
+        """Toroidal beta as a fraction, from the IMAS percent beta_tor_norm with b0 at r0."""
+        return plasma_parameters.beta_tor_from_beta_tor_norm(beta_tor_norm, self.ip_MA, self.minor_radius, self.b0)
+
+    def te_approx_of(self, beta_tor: ArrayLike) -> ArrayLike:
+        """Single-fluid temperature estimate <p> / n_e [keV] of a toroidal beta."""
+        return plasma_parameters.te_approx_keV(beta_tor, self.b0, self.n_e_line_average_1e20)
+
+    def nu_star_of(self, te_keV: ArrayLike) -> ArrayLike:
+        return plasma_parameters.nu_star(te_keV, self.n_e_line_average_1e20, self.q_star, self.geometric_axis_r, self.epsilon)
+
+
 @chex.dataclass
-class Inputs:
+class Inputs(DerivedPlasmaParameters):
     ip_MA: float  # Plasma current [MA]
     b0: float  # Vacuum toroidal field at r0, the one IMAS normalizes beta_tor_norm with [T]
     b_geo: float  # Vacuum toroidal field at the geometric axis [T]
@@ -199,42 +243,14 @@ class Inputs:
         )
 
     @property
-    def epsilon(self):
-        return plasma_parameters.inverse_aspect_ratio(self.minor_radius, self.geometric_axis_r)
-
-    @property
-    def q_star(self):
-        return plasma_parameters.q_star(
-            self.ip_MA,
-            self.b_geo,
-            self.geometric_axis_r,
-            self.minor_radius,
-            self.elongation,
-            self.triangularity_upper,
-            self.triangularity_lower,
-        )
-
-    @property
-    def fGW(self):
-        return plasma_parameters.greenwald_fraction(self.n_e_line_average_1e20, self.ip_MA, self.minor_radius)
-
-    @property
-    def aB0(self):
-        return plasma_parameters.a_b0(self.minor_radius, self.b_geo)
-
-    @property
-    def volume_approx(self):
-        return plasma_parameters.volume_approx(self.geometric_axis_r, self.minor_radius, self.elongation)
-
-    @property
     def beta(self):
-        """Toroidal beta as a fraction, from the IMAS percent beta_tor_norm with b0 at r0."""
-        return plasma_parameters.beta_tor_from_beta_tor_norm(self.beta_tor_norm, self.ip_MA, self.minor_radius, self.b0)
+        """Toroidal beta as a fraction of the measured beta_tor_norm."""
+        return self.beta_tor_of(self.beta_tor_norm)
 
     @property
     def te_approx(self):
         """Single-fluid temperature estimate <p> / n_e [keV]."""
-        return plasma_parameters.te_approx_keV(self.beta, self.b0, self.n_e_line_average_1e20)
+        return self.te_approx_of(self.beta)
 
     @property
     def w_approx(self):
@@ -253,13 +269,7 @@ class Inputs:
 
     @property
     def nu_star(self):
-        return plasma_parameters.nu_star(
-            self.te_approx,
-            self.n_e_line_average_1e20,
-            self.q_star,
-            self.geometric_axis_r,
-            self.epsilon,
-        )
+        return self.nu_star_of(self.te_approx)
 
     @property
     def nn_inputs(self):
@@ -281,32 +291,31 @@ class Inputs:
         return inp_array
 
 
+# Inputs fields nn_input_matrix reads from a dataset
+_NN_INPUT_MATRIX_VARS = (
+    "ip_MA",
+    "b0",
+    "b_geo",
+    "beta_tor_norm",
+    "n_e_line_average_1e20",
+    "geometric_axis_r",
+    "minor_radius",
+    "elongation",
+    "triangularity_upper",
+    "triangularity_lower",
+)
+
+
 def nn_input_matrix(ds: xr.Dataset) -> np.ndarray:
-    """(N, N_NN_INPUTS) matrix of the dimensionless nn_inputs over a flattened dataset.
+    """(N, N_NN_INPUTS) matrix of the dimensionless nn_inputs over a flattened dataset (see flat_columns).
 
-    Every column is broadcast against ip_MA first, so per-shot variables line up
-    with the per-timeslice ones. Shared by the normalizer fit and the data
-    visualization so both see exactly the feature space the modules consume.
+    Shared by the normalizer fit and the data visualization,
+    so both see exactly the feature space the modules consume.
     """
-    reference = ds["ip_MA"]
-
-    def col(var: str) -> np.ndarray:
-        return np.asarray(ds[var].broadcast_like(reference).values, dtype=float).ravel()
-
-    inputs = Inputs(
-        ip_MA=col("ip_MA"),
-        b0=col("b0"),
-        b_geo=col("b_geo"),
-        beta_tor_norm=col("beta_tor_norm"),
-        n_e_line_average_1e20=col("n_e_line_average_1e20"),
-        geometric_axis_r=col("geometric_axis_r"),
-        minor_radius=col("minor_radius"),
-        elongation=col("elongation"),
-        triangularity_upper=col("triangularity_upper"),
-        triangularity_lower=col("triangularity_lower"),
-        ds_source_idx=np.zeros(reference.size),  # Unused by nn_inputs
-        rho=jnp.zeros(1),  # Unused by nn_inputs
-    )
+    columns = flat_columns(ds, _NN_INPUT_MATRIX_VARS)
+    input_columns = dict(zip(_NN_INPUT_MATRIX_VARS, columns.T, strict=True))
+    # ds_source_idx and rho are unused by nn_inputs
+    inputs = Inputs(**input_columns, ds_source_idx=np.zeros(len(columns)), rho=jnp.zeros(1))
     return np.asarray(inputs.nn_inputs).T
 
 
@@ -327,6 +336,19 @@ class Outputs:
     ne: xr.DataArray  # Electron density profile [10^20 m^-3]
     te: xr.DataArray  # Electron temperature profile [keV]
     debug_info: dict | None = None
+
+
+def static_rhogrid(rhogrid: ArrayLike) -> tuple:
+    """The rho grid as a tuple of floats, since arrays in static fields break pytree metadata equality."""
+    return tuple(np.asarray(rhogrid).tolist())
+
+
+def profile_outputs(rhogrid: tuple, ne: Array, te: Array, debug_info: dict | None = None) -> Outputs:
+    """Outputs holding the ne and te profiles labeled with the rho grid."""
+    rho_coords = {RADIAL_DIM: list(rhogrid)}
+    ne_da = xr.DataArray(data=ne, dims=(RADIAL_DIM,), coords=rho_coords)
+    te_da = xr.DataArray(data=te, dims=(RADIAL_DIM,), coords=rho_coords)
+    return Outputs(ne=ne_da, te=te_da, debug_info=debug_info)
 
 
 class ShapeType(IntEnum):
@@ -417,6 +439,20 @@ class ProfilePredictor(TimeIndepModule):
     # Frozen like every normalizer, the trainable getters never include it
     normalizer: FeatureNormalizer
 
+    def outputs_from_points(self, nn_outputs: Array, inputs: Inputs) -> Outputs:
+        """Profiles from an output vector of ne points, te points, then the te and ne scale corrections.
+
+        The points are scaled by the line-averaged density and the beta-implied temperature.
+        """
+        n_pred_points = len(self.rhogrid)
+        ne_points = nn_outputs[:n_pred_points]
+        te_points = nn_outputs[n_pred_points : 2 * n_pred_points]
+        ne_correction = jnp.abs(nn_outputs[-1])
+        te_correction = jnp.abs(nn_outputs[-2])
+        ne = ne_points * inputs.n_e_line_average_1e20 * ne_correction
+        te = te_points * inputs.te_approx * te_correction
+        return profile_outputs(self.rhogrid, ne, te)
+
 
 class ProfilePredictorShapeInit(ProfilePredictor):
     te_shapes: list[ProfileShape]
@@ -502,13 +538,7 @@ class ProfilePredictorShapeInit(ProfilePredictor):
         else:
             debug_info = None
 
-        out = Outputs(
-            ne=xr.DataArray(data=ne, dims=(RADIAL_DIM,), coords={RADIAL_DIM: list(self.rhogrid)}),
-            te=xr.DataArray(data=te, dims=(RADIAL_DIM,), coords={RADIAL_DIM: list(self.rhogrid)}),
-            debug_info=debug_info,
-        )
-
-        return out
+        return profile_outputs(self.rhogrid, ne, te, debug_info)
 
     @classmethod
     def init(
@@ -524,7 +554,7 @@ class ProfilePredictorShapeInit(ProfilePredictor):
         normalizer: FeatureNormalizer,
     ) -> "ProfilePredictor":
         rhogrid_jax = jnp.array(rhogrid)
-        rhogrid_tuple = tuple(rhogrid.tolist())
+        rhogrid_tuple = static_rhogrid(rhogrid)
         te_shapes = [
             ProfileShape.make_points(points=jnp.zeros_like(rhogrid_jax), grid=rhogrid_jax, normalize=False) for _ in range(n_shapes)
         ]
@@ -573,7 +603,7 @@ class ProfilePredictorReservoir(ProfilePredictor):
         leak_rate: float = 1.0,
         n_steps: int = 20,
     ):
-        rhogrid_tuple = tuple(rhogrid.tolist()) if hasattr(rhogrid, "tolist") else tuple(rhogrid)
+        rhogrid_tuple = static_rhogrid(rhogrid)
         self.normalizer = normalizer
 
         key_in, key_res, key_bias, key_out = jax.random.split(key, 4)
@@ -616,26 +646,10 @@ class ProfilePredictorReservoir(ProfilePredictor):
             inputs = Inputs.from_dataset(inputs, jnp.array(self.rhogrid))
 
         nn_inputs = self.normalizer(inputs.nn_inputs, inputs.ds_source_idx)
-        n_pred_points = len(self.rhogrid)
-
-        # Predict profile values directly on the rhogrid
         state = self.reservoir_state(nn_inputs)
-        outputs = self.nn(state)
-        ne_points = outputs[:n_pred_points]
-        te_points = outputs[n_pred_points : 2 * n_pred_points]
-        ne_correction = jnp.abs(outputs[-1])
-        te_correction = jnp.abs(outputs[-2])
-
-        ne = ne_points * inputs.n_e_line_average_1e20 * ne_correction
-        te = te_points * inputs.te_approx * te_correction
-
-        out = Outputs(
-            ne=xr.DataArray(data=ne, dims=(RADIAL_DIM,), coords={RADIAL_DIM: list(self.rhogrid)}),
-            te=xr.DataArray(data=te, dims=(RADIAL_DIM,), coords={RADIAL_DIM: list(self.rhogrid)}),
-            debug_info=None,
-        )
-
-        return out
+        # Profile values directly on the rhogrid
+        nn_outputs = self.nn(state)
+        return self.outputs_from_points(nn_outputs, inputs)
 
 
 class ProfilePredictorUnstructuredNN(ProfilePredictor):
@@ -647,7 +661,7 @@ class ProfilePredictorUnstructuredNN(ProfilePredictor):
         key: jax.random.PRNGKey,
         normalizer: FeatureNormalizer,
     ):
-        rhogrid_tuple = tuple(rhogrid.tolist()) if hasattr(rhogrid, "tolist") else tuple(rhogrid)
+        rhogrid_tuple = static_rhogrid(rhogrid)
         self.normalizer = normalizer
 
         key, subkey = jax.random.split(key)
@@ -667,22 +681,6 @@ class ProfilePredictorUnstructuredNN(ProfilePredictor):
             inputs = Inputs.from_dataset(inputs, jnp.array(self.rhogrid))
 
         nn_inputs = self.normalizer(inputs.nn_inputs, inputs.ds_source_idx)
-        n_pred_points = len(self.rhogrid)
-
-        # Predict the profile values directly on the rhogrid.
-        outputs = self.nn(nn_inputs)
-        ne_points = outputs[:n_pred_points]
-        te_points = outputs[n_pred_points : 2 * n_pred_points]
-        ne_correction = jnp.abs(outputs[-1])
-        te_correction = jnp.abs(outputs[-2])
-
-        ne = ne_points * inputs.n_e_line_average_1e20 * ne_correction
-        te = te_points * inputs.te_approx * te_correction
-
-        out = Outputs(
-            ne=xr.DataArray(data=ne, dims=(RADIAL_DIM,), coords={RADIAL_DIM: list(self.rhogrid)}),
-            te=xr.DataArray(data=te, dims=(RADIAL_DIM,), coords={RADIAL_DIM: list(self.rhogrid)}),
-            debug_info=None,
-        )
-
-        return out
+        # Profile values directly on the rhogrid
+        nn_outputs = self.nn(nn_inputs)
+        return self.outputs_from_points(nn_outputs, inputs)

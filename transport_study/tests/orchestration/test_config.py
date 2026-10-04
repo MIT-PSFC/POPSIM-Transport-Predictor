@@ -27,6 +27,9 @@ def test_config_load():
     # After loading, should be able to access config values
     assert config.study_name == "test_study"
     assert config.debug is True
+    # debug caps the epochs and the sweep size
+    assert config.max_epochs == 100
+    assert config.hyperparam_sweeps == 1
 
 
 def test_config_immutable():

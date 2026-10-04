@@ -324,11 +324,6 @@ def _combined_raw_dataset(study_type: str) -> tuple[xr.Dataset, str]:
     episode_coord = None
     for device in _all_devices():
         ds, episode_coord = get_ds(device, study_type=study_type)
-        # Profile-transfer datasets have no aux-power signal, but zscore/coral
-        # normalization iterate over it unconditionally. Zero-fill so they run
-        # (a no-op for power-balance datasets, which always carry power_additional_MW).
-        if "power_additional_MW" not in ds:
-            ds["power_additional_MW"] = xr.zeros_like(ds["ip_MA"])
         ds = ds.assign_coords(ds_source=device)
         datasets.append(ds)
 
@@ -441,7 +436,7 @@ class DataVisualizationBase:
             if fig_path.exists():
                 continue
             try:
-                ds_norm, _ = normalize_domain(combined.copy(deep=True), method=method, feature_space=cls.FEATURE_SPACE)
+                ds_norm = normalize_domain(combined.copy(deep=True), method=method, feature_space=cls.FEATURE_SPACE)
                 domain_plot(
                     ds=ds_norm,
                     var_groups=cls.VAR_GROUPS[method],

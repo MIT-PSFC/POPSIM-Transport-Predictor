@@ -10,19 +10,18 @@ from jaxtyping import Array, ArrayLike, PyTree
 from popsim import TimeDepModule, discrete_no_save_field
 from popsim.math_utils import safe_log
 from popsim.ml.envs import ModuleTrainingEnv
-from popsim.ml.rtd_mlp import Activation, RtdMLP
+from popsim.ml.rtd_mlp import RtdMLP
 from popsim.simulate import StepperType
 from scipy.constants import eV
 from torax import ToraxConfig
 from torax import experimental as torax_experimental
-from torax._src.geometry import geometry_provider as geometry_provider_lib
 from torax._src.orchestration.step_function import SimulationStepFn
-from torax._src.torax_pydantic import torax_pydantic
 
 from transport_study.modules import plasma_parameters
 from transport_study.modules.normalization import (
     FeatureNormalizer,
     feature_fit_arrays,
+    flat_columns,
     make_feature_normalizer,
 )
 from transport_study.modules.power_balance.module import PowerBalance, PowerBalanceEnv
@@ -37,16 +36,24 @@ from transport_study.modules.profile_predictor.module import (
 )
 from transport_study.modules.profile_predictor.torax_module import (
     TAU_REF_S,
-    TRANSPORT_COEFFICIENT_NAMES,
+    bound_edge_coefficients,
+    bound_source_coefficients,
     bound_transport_coefficients,
-    build_circular_geometry_jax,
-    build_miller_geometry_jax,
+    build_geometry_provider,
+    cell_centers,
+    check_torax_choices,
     clamp_core_profiles,
-    transport_provider_mapping,
-    validate_transport_model_name,
+    interp_core_profiles,
+    make_step_fn_and_grid,
+    make_torax_networks,
+    shared_provider_mapping,
 )
 
 # Positivity floor for the profile outputs, ne [1e20 m^-3] and te [keV]
+# Submodule pseudo-model-types of the sciml prereq cases:
+# sciml -> power_balance + profile, power_balance -> p_oh + p_rad
+SUBMODULE_MODEL_TYPES = ("power_balance", "profile", "p_oh", "p_rad")
+
 MIN_PROFILE = 1e-3
 
 # Floors applied to profiles used to seed a TORAX state.
@@ -102,7 +109,7 @@ SOURCE_SHAPE_COEFFICIENT_NAMES = (
 
 
 @chex.dataclass
-class Inputs:
+class Inputs(profile_predictor_module.DerivedPlasmaParameters):
     """Inputs to the transport predictor module.
 
     Union of the profile predictor and power balance input sets, minus beta_tor_norm:
@@ -126,34 +133,6 @@ class Inputs:
     power_additional_MW: float  # Auxiliary heating power [MW]
     ds_source_idx: float  # Device index selecting per-device normalization statistics
 
-    @property
-    def epsilon(self):
-        return plasma_parameters.inverse_aspect_ratio(self.minor_radius, self.geometric_axis_r)
-
-    @property
-    def q_star(self):
-        return plasma_parameters.q_star(
-            self.ip_MA,
-            self.b_geo,
-            self.geometric_axis_r,
-            self.minor_radius,
-            self.elongation,
-            self.triangularity_upper,
-            self.triangularity_lower,
-        )
-
-    @property
-    def fGW(self):
-        return plasma_parameters.greenwald_fraction(self.n_e_line_average_1e20, self.ip_MA, self.minor_radius)
-
-    @property
-    def aB0(self):
-        return plasma_parameters.a_b0(self.minor_radius, self.b_geo)
-
-    @property
-    def volume_approx(self):
-        return plasma_parameters.volume_approx(self.geometric_axis_r, self.minor_radius, self.elongation)
-
     def beta_tor_norm_from_energy_mhd(self, energy_mhd_MJ: ArrayLike) -> ArrayLike:
         """IMAS beta_tor_norm of a stored energy through the store's own formula, volume_approx as the volume."""
         return plasma_parameters.beta_tor_norm_from_energy_mhd_MJ(
@@ -167,22 +146,16 @@ class Inputs:
     def beta_from_energy_mhd(self, energy_mhd_MJ: ArrayLike) -> ArrayLike:
         """Toroidal beta as a fraction of a stored energy."""
         beta_tor_norm = self.beta_tor_norm_from_energy_mhd(energy_mhd_MJ)
-        return plasma_parameters.beta_tor_from_beta_tor_norm(beta_tor_norm, self.ip_MA, self.minor_radius, self.b0)
+        return self.beta_tor_of(beta_tor_norm)
 
     def te_approx_from_energy_mhd(self, energy_mhd_MJ: ArrayLike) -> ArrayLike:
         """Single-fluid temperature estimate <p> / n_e [keV] of a stored energy."""
         beta_tor = self.beta_from_energy_mhd(energy_mhd_MJ)
-        return plasma_parameters.te_approx_keV(beta_tor, self.b0, self.n_e_line_average_1e20)
+        return self.te_approx_of(beta_tor)
 
     def nu_star_from_energy_mhd(self, energy_mhd_MJ: ArrayLike) -> ArrayLike:
         te_keV = self.te_approx_from_energy_mhd(energy_mhd_MJ)
-        return plasma_parameters.nu_star(
-            te_keV,
-            self.n_e_line_average_1e20,
-            self.q_star,
-            self.geometric_axis_r,
-            self.epsilon,
-        )
+        return self.nu_star_of(te_keV)
 
     def transport_nn_inputs(self, energy_mhd_MJ: ArrayLike) -> Array:
         # The 10 profile predictor feature slots in the same order, with every
@@ -248,33 +221,34 @@ class Inputs:
         )
 
 
-def transport_nn_input_matrix(ds: xr.Dataset) -> np.ndarray:
-    """(N, N_TRANSPORT_NN_INPUTS) matrix of the transport features over a flattened dataset.
+# Inputs fields transport_nn_input_matrix reads from a dataset
+_TRANSPORT_NN_INPUT_MATRIX_VARS = (
+    "ip_MA",
+    "b0",
+    "b_geo",
+    "n_e_line_average_1e20",
+    "geometric_axis_r",
+    "minor_radius",
+    "elongation",
+    "triangularity_upper",
+    "triangularity_lower",
+    "power_additional_MW",
+)
 
-    Every column is broadcast against ip_MA first, so per-shot variables line up
-    with the per-timeslice ones. The beta-derived entries use the MEASURED
-    stored energy (at runtime the modules use the state-implied Wtot instead).
+
+def transport_nn_input_matrix(ds: xr.Dataset) -> np.ndarray:
+    """(N, N_TRANSPORT_NN_INPUTS) matrix of the transport features over a flattened dataset (see flat_columns).
+
+    The beta-derived entries use the MEASURED stored energy
+    (at runtime the modules use the state-implied Wtot instead).
     The profile predictor's counterpart is module.nn_input_matrix.
     """
-    reference = ds["ip_MA"]
-
-    def col(var: str) -> np.ndarray:
-        return np.asarray(ds[var].broadcast_like(reference).values, dtype=float).ravel()
-
-    inputs = Inputs(
-        ip_MA=col("ip_MA"),
-        b0=col("b0"),
-        b_geo=col("b_geo"),
-        n_e_line_average_1e20=col("n_e_line_average_1e20"),
-        geometric_axis_r=col("geometric_axis_r"),
-        minor_radius=col("minor_radius"),
-        elongation=col("elongation"),
-        triangularity_upper=col("triangularity_upper"),
-        triangularity_lower=col("triangularity_lower"),
-        power_additional_MW=col("power_additional_MW"),
-        ds_source_idx=np.zeros(reference.size),  # Unused by transport_nn_inputs
-    )
-    return np.asarray(inputs.transport_nn_inputs(col("energy_mhd_MJ"))).T
+    columns = flat_columns(ds, _TRANSPORT_NN_INPUT_MATRIX_VARS)
+    input_columns = dict(zip(_TRANSPORT_NN_INPUT_MATRIX_VARS, columns.T, strict=True))
+    energy_mhd_MJ = flat_columns(ds, ["energy_mhd_MJ"])[:, 0]
+    # ds_source_idx is unused by transport_nn_inputs
+    inputs = Inputs(**input_columns, ds_source_idx=np.zeros(len(columns)))
+    return np.asarray(inputs.transport_nn_inputs(energy_mhd_MJ)).T
 
 
 def make_transport_nn_input_normalizer(method: str, fit_ds: xr.Dataset | None, n_devices: int, target_idx: int) -> FeatureNormalizer:
@@ -441,8 +415,7 @@ class TransportPredictorTransformer(TransportPredictor):
         prng_seed: int = 42,
     ) -> "TransportPredictorTransformer":
         key_feat, key_prof, key_pos, key_attn, key_head = jax.random.split(jax.random.PRNGKey(prng_seed), 5)
-        # Coerce to tuple: arrays in static fields break pytree metadata equality
-        rhogrid_tuple = tuple(np.asarray(rhogrid).tolist())
+        rhogrid_tuple = profile_predictor_module.static_rhogrid(rhogrid)
         n_rho = len(rhogrid_tuple)
         feature_embed = eqx.nn.Linear(N_TRANSPORT_NN_INPUTS, d_model, key=key_feat)
         profile_embed = eqx.nn.Linear(2 * n_rho, d_model, key=key_prof)
@@ -534,12 +507,11 @@ class TransportPredictorSciML(TransportPredictor):
 class TransportPredictorToraxBase(TransportPredictor):
     """Shared machinery for the TORAX-backed transport predictors.
 
-    Standalone from ProfilePredictorTorax on purpose: that module is a
-    steady-state relaxation estimator which has to infer the auxiliary
-    heating magnitude with a NN, while here P_aux is an input fed
-    straight to the generic_heat source, and the sources network only
-    predicts the deposition shape, the particle fueling, and the
-    density-dependent absorbed fraction of the injected power.
+    Not a ProfilePredictorTorax subclass, the two only share the free functions of torax_module:
+    that module is a steady-state relaxation estimator which has to infer the auxiliary heating magnitude with a NN,
+    while here P_aux is an input fed straight to the generic_heat source,
+    and the sources network only predicts the deposition shape, the particle fueling,
+    and the density-dependent absorbed fraction of the injected power.
     Every beta-derived feature comes from the stored energy implied
     by the profile state, there is no input beta_tor_norm.
 
@@ -552,13 +524,11 @@ class TransportPredictorToraxBase(TransportPredictor):
     """
 
     rhogrid: tuple = eqx.field(static=True)
-    # Which TORAX transport model the transport network parameterizes:
-    # "constant", "gyrobohm", or "qlknn"
+    # TORAX transport model the transport network parameterizes, a TRANSPORT_COEFFICIENT_NAMES key
     transport_model: str = eqx.field(static=True)
-    # Which per-sample geometry builder to use: "circular" or "miller"
+    # Per-sample geometry builder, one of VALID_GEOMETRY_BUILDERS
     geometry_builder: str = eqx.field(static=True)
-    # Radial exponent p in delta(rho_norm) = delta_edge * rho_norm**p,
-    # only used by the miller builder
+    # Radial exponent p in delta(rho_norm) = delta_edge * rho_norm**p, only used by the miller builder
     delta_exponent: float = eqx.field(static=True)
 
     nn_transport: RtdMLP
@@ -569,7 +539,7 @@ class TransportPredictorToraxBase(TransportPredictor):
 
     step_fn: SimulationStepFn = eqx.field(static=True)
 
-    # Static mesh info for JAX-differentiable geometry construction
+    # Static mesh info for the JAX-differentiable geometry construction, see make_step_fn_and_grid
     _face_centers: tuple = eqx.field(static=True)
     _rho_hires_norm: tuple = eqx.field(static=True)
     # Outer simulation time step [s] the torax config window must match
@@ -584,64 +554,22 @@ class TransportPredictorToraxBase(TransportPredictor):
         key: jax.random.PRNGKey,
         normalizer: FeatureNormalizer,
         sim_dt: float,
-        transport_model: str = "gyrobohm",
-        geometry_builder: str = "circular",
-        delta_exponent: float = 2.0,
+        transport_model: str,
+        geometry_builder: str,
+        delta_exponent: float,
     ):
-        if transport_model not in TRANSPORT_COEFFICIENT_NAMES:
-            raise ValueError(f"Unknown transport model '{transport_model}', valid: {sorted(TRANSPORT_COEFFICIENT_NAMES)}")
+        check_torax_choices(transport_model, geometry_builder)
         self.transport_model = transport_model
-        self.normalizer = normalizer
-        if geometry_builder not in ("circular", "miller"):
-            raise ValueError(f"Unknown geometry builder '{geometry_builder}', valid: ('circular', 'miller')")
         self.geometry_builder = geometry_builder
         self.delta_exponent = float(delta_exponent)
-
-        key, subkey_transport, subkey_sources, subkey_edge = jax.random.split(key, 4)
-        self.nn_transport = RtdMLP(
-            in_size=N_TRANSPORT_NN_INPUTS,
-            out_size=len(TRANSPORT_COEFFICIENT_NAMES[transport_model]),
-            width_size=nn_width,
-            depth=nn_depth,
-            activation=Activation.RELU,
-            key=subkey_transport,
+        self.normalizer = normalizer
+        self.nn_transport, self.nn_sources, self.nn_edge = make_torax_networks(
+            N_TRANSPORT_NN_INPUTS, transport_model, len(SOURCE_SHAPE_COEFFICIENT_NAMES), nn_width, nn_depth, key
         )
-        self.nn_sources = RtdMLP(
-            in_size=N_TRANSPORT_NN_INPUTS,
-            # One output per SOURCE_SHAPE_COEFFICIENT_NAMES entry:
-            # S_total, gaussian_location, gaussian_width, electron_heat_fraction, absorption_fraction
-            out_size=len(SOURCE_SHAPE_COEFFICIENT_NAMES),
-            width_size=nn_width,
-            depth=nn_depth,
-            activation=Activation.RELU,
-            key=subkey_sources,
-        )
-        self.nn_edge = RtdMLP(
-            in_size=N_TRANSPORT_NN_INPUTS,
-            out_size=2,  # edge density fraction, edge temperature fraction
-            width_size=nn_width,
-            depth=nn_depth,
-            activation=Activation.RELU,
-            key=subkey_edge,
-        )
-
-        if isinstance(torax_config, dict):
-            torax_config = ToraxConfig.from_dict(torax_config)
-
-        validate_transport_model_name(torax_config, transport_model)
-
-        self.step_fn = torax_experimental.make_step_fn(torax_config)
+        self.step_fn, self._face_centers, self._rho_hires_norm = make_step_fn_and_grid(torax_config, transport_model)
         # Coerce to tuple: arrays in static fields break pytree metadata
         # equality (ambiguous truth value) when two module instances coexist
-        self.rhogrid = tuple(np.asarray(rhogrid).tolist())
-
-        # Static grid structure harvested once from the config-built
-        # placeholder geometry, needed as concrete hashable values for the
-        # per-sample jnp geometry rebuild. See the matching harvest in
-        # ProfilePredictorTorax.__init__ for the full rationale.
-        static_geo = self.step_fn.geometry_provider(0.0)
-        self._face_centers = tuple(static_geo.torax_mesh.face_centers.tolist())
-        self._rho_hires_norm = tuple(np.array(static_geo.rho_hires_norm).tolist())
+        self.rhogrid = profile_predictor_module.static_rhogrid(rhogrid)
 
         # One solver step per __call__ by construction: the config window and
         # the fixed solver dt must both equal the outer simulation dt
@@ -666,9 +594,9 @@ class TransportPredictorToraxBase(TransportPredictor):
         prng_seed: int,
         normalizer: FeatureNormalizer,
         sim_dt: float,
-        transport_model: str = "gyrobohm",
-        geometry_builder: str = "circular",
-        delta_exponent: float = 2.0,
+        transport_model: str,
+        geometry_builder: str,
+        delta_exponent: float,
     ):
         return cls(
             nn_width=nn_width,
@@ -685,58 +613,34 @@ class TransportPredictorToraxBase(TransportPredictor):
 
     @property
     def rho_norm_grid(self) -> np.ndarray:
-        """Cell-center grid the TORAX core profiles live on.
-
-        This is rho_norm, the normalized toroidal flux radius,
-        which is the rho_tor_norm the datasets use.
-        """
-        face_centers = np.array(self._face_centers)
-        return (face_centers[:-1] + face_centers[1:]) / 2.0
+        """Cell-center grid the TORAX core profiles live on, see cell_centers."""
+        return cell_centers(self._face_centers)
 
     def transport_coefficients(self, nn_transport_out: jax.Array) -> dict:
         """Bound the raw transport-network outputs to physical ranges, see bound_transport_coefficients."""
         return bound_transport_coefficients(self.transport_model, nn_transport_out)
 
     def nn_coefficients(self, inputs: Inputs, energy_mhd_MJ: ArrayLike) -> dict:
-        # Transport model free parameters, source shape and edge boundary
-        # conditions from neural networks, bounded to physical ranges so the
-        # TORAX solver stays stable during training. The heating MAGNITUDE is
-        # NOT here: it is the measured power_additional_MW input, wired directly to
-        # generic_heat.P_total in build_provider_and_geo (the NN-predicted
-        # absorption_fraction below scales it into absorbed power).
-        # Source network outputs, per SOURCE_SHAPE_COEFFICIENT_NAMES:
-        #   S_total: 0 - inf, softplus multiple of the device fueling scale
-        #     particle_inventory / TAU_REF_S (x 1e21 in the provider), same
-        #     device-transferable reparameterization as ProfilePredictorTorax
-        #   gaussian_location: 0 - 0.8 (deposition center in rho_norm)
-        #   gaussian_width: 0.02 - 0.4 (deposition width in rho_norm)
-        #   electron_heat_fraction: 0.2 - 0.95 (ceiling raised with the
-        #     profile predictor, ST NBI heating is electron-dominated. The
-        #     sigmoid bias keeps the random init balanced at 0.5)
-        #   absorption_fraction: 1 - exp(-n_e_line_average_1e20 * softplus), the
-        #     absorption grows linearly with line density when optically thin
-        #     and saturates smoothly toward 1, with the NN predicting the opacity per unit density.
-        nn_inputs = self.normalizer(inputs.transport_nn_inputs(energy_mhd_MJ), inputs.ds_source_idx)
-        coeffs = self.transport_coefficients(self.nn_transport(nn_inputs))
-        nn_sources_out = self.nn_sources(nn_inputs)
-        # Particle inventory in 1e21 electrons: n_e_line_average_1e20 * volume * 0.1
-        inventory = 0.1 * inputs.n_e_line_average_1e20 * inputs.volume_approx
-        coeffs["S_total"] = jax.nn.softplus(nn_sources_out[0:1]) * inventory / TAU_REF_S
-        coeffs["gaussian_location"] = 0.8 * jax.nn.sigmoid(nn_sources_out[1:2])
-        coeffs["gaussian_width"] = 0.02 + 0.38 * jax.nn.sigmoid(nn_sources_out[2:3])
-        coeffs["electron_heat_fraction"] = 0.2 + 0.75 * jax.nn.sigmoid(nn_sources_out[3:4] - 0.4)
-        coeffs["absorption_fraction"] = 1.0 - jnp.exp(-inputs.n_e_line_average_1e20 * jax.nn.softplus(nn_sources_out[4:5]))
+        """Transport, source and edge coefficients from the networks, bounded so the TORAX solver stays stable.
 
-        # Edge boundary conditions as NN-predicted fractions, same floors and
-        # negative temperature bias as ProfilePredictorTorax (see the rationale
-        # comments there), with the temperature scale from the state-implied
-        # stored energy instead of a measured beta_tor_norm
-        nn_edge_out = self.nn_edge(nn_inputs)
-        # Same 0.01 floor as the profile predictor, a higher floor railed on most MAST samples
-        coeffs["n_e_right_bc"] = (0.01 + 0.94 * jax.nn.sigmoid(nn_edge_out[0:1])) * inputs.n_e_line_average_1e20  # [1e20 m^-3]
-        te_scale = jnp.clip(inputs.te_approx_from_energy_mhd(energy_mhd_MJ), 0.05, 5.0)
-        coeffs["T_e_right_bc"] = 0.02 + jax.nn.sigmoid(nn_edge_out[1:2] - 5.0) * te_scale  # [keV]
-        return coeffs
+        The shared source coefficients and edge BCs are bound_source_coefficients and bound_edge_coefficients,
+        the edge temperature scale from the state-implied stored energy instead of a measured beta_tor_norm.
+        The heating MAGNITUDE is not here, it is the measured power_additional_MW input (build_provider_and_geo).
+        The network only predicts its absorbed fraction, 1 - exp(-n_e_line_average_1e20 * softplus):
+        linear in line density when optically thin, saturating smoothly toward 1.
+        """
+        nn_inputs = self.normalizer(inputs.transport_nn_inputs(energy_mhd_MJ), inputs.ds_source_idx)
+        nn_sources_out = self.nn_sources(nn_inputs)
+        absorption_idx = SOURCE_SHAPE_COEFFICIENT_NAMES.index("absorption_fraction")
+        absorption_opacity = jax.nn.softplus(nn_sources_out[absorption_idx : absorption_idx + 1])
+        return {
+            **self.transport_coefficients(self.nn_transport(nn_inputs)),
+            **bound_source_coefficients(SOURCE_SHAPE_COEFFICIENT_NAMES, nn_sources_out, inputs.n_e_line_average_1e20, inputs.volume_approx),
+            "absorption_fraction": 1.0 - jnp.exp(-inputs.n_e_line_average_1e20 * absorption_opacity),
+            **bound_edge_coefficients(
+                self.nn_edge(nn_inputs), inputs.n_e_line_average_1e20, inputs.te_approx_from_energy_mhd(energy_mhd_MJ)
+            ),
+        }
 
     def build_provider_and_geo(
         self,
@@ -747,75 +651,52 @@ class TransportPredictorToraxBase(TransportPredictor):
     ):
         """Runtime params provider and per-sample geometry.
 
-        ne_ic / te_ic on rhogrid set the initial profile conditions (only
-        consumed by get_initial_state, so callers that carry the TORAX state
-        omit them).
+        ne_ic / te_ic on rhogrid set the initial profile conditions,
+        only consumed by get_initial_state, so callers that carry the TORAX state omit them.
         """
-        ip_update = torax_experimental.TimeVaryingScalarUpdate(
-            value=jnp.atleast_1d(inputs.ip_MA * 1e6),
-        )
-        S_total_update = torax_experimental.TimeVaryingScalarUpdate(value=coeffs["S_total"] * 1e21)
-        # Measured auxiliary heating; the NN-predicted absorption_fraction
-        # scales it into absorbed power inside TORAX
-        p_aux_update = torax_experimental.TimeVaryingScalarUpdate(value=jnp.atleast_1d(inputs.power_additional_MW * 1e6))
-        absorption_fraction_update = torax_experimental.TimeVaryingScalarUpdate(value=coeffs["absorption_fraction"])
-        gaussian_location_update = torax_experimental.TimeVaryingScalarUpdate(value=coeffs["gaussian_location"])
-        gaussian_width_update = torax_experimental.TimeVaryingScalarUpdate(value=coeffs["gaussian_width"])
-        electron_heat_fraction_update = torax_experimental.TimeVaryingScalarUpdate(value=coeffs["electron_heat_fraction"])
-        ne_right_bc_update = torax_experimental.TimeVaryingScalarUpdate(value=coeffs["n_e_right_bc"] * 1e20)
-        te_right_bc_update = torax_experimental.TimeVaryingScalarUpdate(value=coeffs["T_e_right_bc"])
-
-        mapping = {
-            "profile_conditions.Ip": ip_update,
-            "profile_conditions.n_e_right_bc": ne_right_bc_update,
-            # Assume the ion edge temperature matches the electron edge temperature
-            "profile_conditions.T_e_right_bc": te_right_bc_update,
-            "profile_conditions.T_i_right_bc": te_right_bc_update,
-            "sources.gas_puff.S_total": S_total_update,
-            "sources.generic_heat.P_total": p_aux_update,
-            "sources.generic_heat.absorption_fraction": absorption_fraction_update,
-            "sources.generic_heat.gaussian_location": gaussian_location_update,
-            "sources.generic_heat.gaussian_width": gaussian_width_update,
-            "sources.generic_heat.electron_heat_fraction": electron_heat_fraction_update,
+        mapping = shared_provider_mapping(inputs.ip_MA, self.transport_model, coeffs) | {
+            # Measured auxiliary heating, the NN-predicted absorption_fraction scales it into absorbed power inside TORAX
+            "sources.generic_heat.P_total": torax_experimental.TimeVaryingScalarUpdate(
+                value=jnp.atleast_1d(inputs.power_additional_MW * 1e6)
+            ),
+            "sources.generic_heat.absorption_fraction": torax_experimental.TimeVaryingScalarUpdate(value=coeffs["absorption_fraction"]),
         }
         if ne_ic is not None and te_ic is not None:
             rho_ic = jnp.array(self.rhogrid)
             t_ic_update = torax_experimental.TimeVaryingArrayUpdate(value=te_ic[jnp.newaxis, :], rho_norm=rho_ic)
-            n_ic_update = torax_experimental.TimeVaryingArrayUpdate(value=1e20 * ne_ic[jnp.newaxis, :], rho_norm=rho_ic)
+            # The ion temperature is assumed equal to the electron one
             mapping["profile_conditions.T_e"] = t_ic_update
-            # Assume the ion temperature matches the electron temperature
             mapping["profile_conditions.T_i"] = t_ic_update
-            mapping["profile_conditions.n_e"] = n_ic_update
-        mapping.update(transport_provider_mapping(self.transport_model, coeffs))
+            mapping["profile_conditions.n_e"] = torax_experimental.TimeVaryingArrayUpdate(
+                value=1e20 * ne_ic[jnp.newaxis, :], rho_norm=rho_ic
+            )
         new_provider = self.step_fn.runtime_params_provider.update_provider_from_mapping(mapping)
-
-        # Build JAX-differentiable geometry from per-sample inputs
-        face_centers_np = np.array(self._face_centers)
-        torax_mesh = torax_pydantic.Grid1D(face_centers=face_centers_np)
-        rho_hires_norm_np = np.array(self._rho_hires_norm)
-        if self.geometry_builder == "miller":
-            geo = build_miller_geometry_jax(
-                R_major=inputs.geometric_axis_r,
-                a_minor=inputs.minor_radius,
-                B_0=inputs.b_geo,
-                elongation_LCFS=inputs.elongation,
-                triangularity_upper=inputs.triangularity_upper,
-                triangularity_lower=inputs.triangularity_lower,
-                torax_mesh=torax_mesh,
-                rho_hires_norm_np=rho_hires_norm_np,
-                delta_exponent=self.delta_exponent,
-            )
-        else:
-            geo = build_circular_geometry_jax(
-                R_major=inputs.geometric_axis_r,
-                a_minor=inputs.minor_radius,
-                B_0=inputs.b_geo,
-                elongation_LCFS=inputs.elongation,
-                torax_mesh=torax_mesh,
-                rho_hires_norm_np=rho_hires_norm_np,
-            )
-        geo_provider = geometry_provider_lib.ConstantGeometryProvider(geo=geo)
+        geo_provider = build_geometry_provider(self.geometry_builder, inputs, self._face_centers, self._rho_hires_norm, self.delta_exponent)
         return new_provider, geo_provider
+
+    def seed_initial_state(self, inputs: Inputs, ne: Array, te: Array) -> tuple:
+        """A TORAX initial state seeded from ne / te profiles on rhogrid.
+
+        The profiles are floored first, measured ones can hold exact-zero te points (see TE_SEED_FLOOR_KEV),
+        and their edge points are pinned to the NN Dirichlet BCs, a discontinuity at the LCFS can NaN the solver.
+
+        Returns:
+            (initial_state, initial_post, provider, geo_provider, energy_mhd_MJ),
+            energy_mhd_MJ the stored energy implied by the floored profiles that drove the NN coefficients.
+        """
+        ne_floored = jnp.maximum(ne, NE_SEED_FLOOR_20)
+        te_floored = jnp.maximum(te, TE_SEED_FLOOR_KEV)
+        energy_mhd_MJ = energy_mhd_from_profiles(ne_floored, te_floored, jnp.array(self.rhogrid), inputs.volume_approx)
+        coeffs = self.nn_coefficients(inputs, energy_mhd_MJ)
+        te_ic = te_floored.at[-1].set(jnp.squeeze(coeffs["T_e_right_bc"]))
+        ne_ic = ne_floored.at[-1].set(jnp.squeeze(coeffs["n_e_right_bc"]))
+        provider, geo_provider = self.build_provider_and_geo(inputs, coeffs, ne_ic=ne_ic, te_ic=te_ic)
+        initial_state, initial_post = torax_experimental.get_initial_state_and_post_processed_outputs(
+            step_fn=self.step_fn,
+            runtime_params_overrides=provider,
+            geometry_overrides=geo_provider,
+        )
+        return initial_state, initial_post, provider, geo_provider, energy_mhd_MJ
 
     def _advance_one_step(self, sim_state, post_processed, provider, geo_provider):
         """Advance TORAX by exactly one solver step of sim_dt.
@@ -848,30 +729,12 @@ class TransportPredictorToraxBase(TransportPredictor):
 
         return jax.checkpoint(step, prevent_cse=False)(sim_state, post_processed)
 
-    def _interp_profiles(self, sim_state, coeffs: dict, rho: Array) -> tuple[Array, Array]:
-        """Interpolate TORAX cell-center core profiles onto rho.
-
-        Augment the cell values with both endpoints before interpolating:
-        jnp.interp flat-holds outside the data range, which would ignore the
-        exact Dirichlet edge BC at rho = 1. Duplicating the innermost cell at
-        rho = 0 encodes the zero-gradient axis condition.
-        """
-        # n_e is in m^-3 and T_e is in keV in TORAX
-        ne = sim_state.core_profiles.n_e.value / 1e20
-        te = sim_state.core_profiles.T_e.value
-        rho_cells = jnp.asarray(self.rho_norm_grid)
-        rho_full = jnp.concatenate([jnp.zeros(1), rho_cells, jnp.ones(1)])
-        ne_full = jnp.concatenate([ne[:1], ne, coeffs["n_e_right_bc"]])
-        te_full = jnp.concatenate([te[:1], te, coeffs["T_e_right_bc"]])
-        return jnp.interp(rho, rho_full, ne_full), jnp.interp(rho, rho_full, te_full)
-
 
 class TransportPredictorTorax(TransportPredictorToraxBase):
     """TORAX transport predictor carrying only the ne/te profiles.
 
-    Each __call__ rebuilds a TORAX initial state with the stored profiles as
-    initial condition, runs the simulation over one outer time step, and
-    stores the evolved profiles.
+    Each __call__ seeds a TORAX initial state from the stored profiles,
+    runs the simulation over one outer time step, and stores the evolved profiles.
     """
 
     @chex.dataclass
@@ -881,33 +744,15 @@ class TransportPredictorTorax(TransportPredictorToraxBase):
 
     def __call__(self, state: "TransportPredictorTorax.State", inputs: Inputs) -> tuple:
         rho = jnp.array(self.rhogrid)
-        # Floor the carried profiles before they seed a TORAX state: measured
-        # seeds can contain exact-zero te points (see TE_SEED_FLOOR_KEV)
-        ne_state = jnp.maximum(state.ne, NE_SEED_FLOOR_20)
-        te_state = jnp.maximum(state.te, TE_SEED_FLOOR_KEV)
-        energy_mhd_MJ = energy_mhd_from_profiles(ne_state, te_state, rho, inputs.volume_approx)
-        coeffs = self.nn_coefficients(inputs, energy_mhd_MJ)
-
-        # Initial condition from the stored profiles, edge point pinned to the NN Dirichlet BC
-        # a discontinuity at the LCFS can NaN the solver
-        te_ic = te_state.at[-1].set(jnp.squeeze(coeffs["T_e_right_bc"]))
-        ne_ic = ne_state.at[-1].set(jnp.squeeze(coeffs["n_e_right_bc"]))
-        provider, geo_provider = self.build_provider_and_geo(inputs, coeffs, ne_ic=ne_ic, te_ic=te_ic)
-
-        initial_state, initial_post = torax_experimental.get_initial_state_and_post_processed_outputs(
-            step_fn=self.step_fn,
-            runtime_params_overrides=provider,
-            geometry_overrides=geo_provider,
-        )
+        initial_state, initial_post, provider, geo_provider, energy_mhd_MJ = self.seed_initial_state(inputs, state.ne, state.te)
         final_state, _post = self._advance_one_step(initial_state, initial_post, provider, geo_provider)
 
-        ne_next, te_next = self._interp_profiles(final_state, coeffs, rho)
+        ne_next, te_next = interp_core_profiles(final_state.core_profiles, self._face_centers, rho)
         ne_next, te_next, debug_info = self.positive_profiles(ne_next, te_next)
         debug_info.update(energy_mhd_MJ_state=energy_mhd_MJ)
 
         state_out = TransportPredictorTorax.State(ne=ne_next, te=te_next)
-        # Output the profile estimate at the current time, the evolved
-        # profiles become the next state
+        # Output the profile estimate at the current time, the evolved profiles become the next state
         output = Output(ne=state.ne, te=state.te, rho=rho, debug_info=debug_info)
         return state_out, output
 
@@ -975,8 +820,8 @@ class TransportPredictorToraxSimState(TransportPredictorToraxBase):
         )
         final_state, final_post = self._advance_one_step(sim_state, carried_post, provider, geo_provider)
 
-        # Output the profile estimate at the current time from the carried state
-        ne_now, te_now = self._interp_profiles(carried_state, coeffs, rho)
+        # Output the profile estimate at the current time from the carried state, edge value included
+        ne_now, te_now = interp_core_profiles(carried_state.core_profiles, self._face_centers, rho)
         ne_now, te_now, debug_info = self.positive_profiles(ne_now, te_now)
         debug_info.update(energy_mhd_MJ_state=energy_mhd_MJ)
 
@@ -1027,26 +872,8 @@ class TransportPredictorEnv(ModuleTrainingEnv):
             )
 
         if isinstance(self.module, TransportPredictorToraxSimState):
-            # Build a full TORAX initial state from the measured profiles,
-            # mirroring the per-step initial-condition flow of
-            # TransportPredictorTorax.__call__ (edge points pinned to the NN
-            # Dirichlet BCs so the solver never sees an LCFS discontinuity,
-            # seeds floored against exact-zero te points in the measurements)
-            module = self.module
-            inputs0 = self.create_inputs(observations)
-            rho = jnp.array(module.rhogrid)
-            ne0 = jnp.maximum(ne0, NE_SEED_FLOOR_20)
-            te0 = jnp.maximum(te0, TE_SEED_FLOOR_KEV)
-            energy_mhd_MJ = energy_mhd_from_profiles(ne0, te0, rho, inputs0.volume_approx)
-            coeffs = module.nn_coefficients(inputs0, energy_mhd_MJ)
-            te_ic = te0.at[-1].set(jnp.squeeze(coeffs["T_e_right_bc"]))
-            ne_ic = ne0.at[-1].set(jnp.squeeze(coeffs["n_e_right_bc"]))
-            provider, geo_provider = module.build_provider_and_geo(inputs0, coeffs, ne_ic=ne_ic, te_ic=te_ic)
-            initial_state, initial_post = torax_experimental.get_initial_state_and_post_processed_outputs(
-                step_fn=module.step_fn,
-                runtime_params_overrides=provider,
-                geometry_overrides=geo_provider,
-            )
+            # The full TORAX state seeded from the measured profiles, the same way each rebuild step is seeded
+            initial_state, initial_post, *_ = self.module.seed_initial_state(self.create_inputs(observations), ne0, te0)
             return TransportPredictorToraxSimState.State.wrap(initial_state, initial_post)
 
         raise ValueError(f"Unknown transport predictor module type: {type(self.module)}")

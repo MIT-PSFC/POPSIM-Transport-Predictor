@@ -1,5 +1,6 @@
 import getpass
 import shutil
+import tempfile
 import time
 from datetime import datetime
 from pathlib import Path
@@ -17,9 +18,11 @@ from transport_study.modules.profile_trajectory.train_configs import (
     PROFILE_TRAJECTORY_OPTIMIZER_CONFIG,
 )
 from transport_study.orchestration.slurm_utils import (
+    SINGLE_THREAD_BLAS_ENV,
     count_running_jobs,
-    launch_trajopt_case_parallel,
     resources_available,
+    sbatch_script,
+    submit_sbatch,
 )
 from transport_study.profile_transfer.restore_predictor import (
     checkpoint_to_profile_case,
@@ -801,6 +804,51 @@ class TrajectoryOptimization:
 ###############################################
 # Train the model and optimize the trajectory #
 ###############################################
+
+
+def launch_trajopt_case_parallel(trajopt, case) -> None:
+    """Submit a SLURM job that trains and generates output for a single trajectory optimization case."""
+    log_dir = trajopt.working_dir / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+
+    init_kwargs = {
+        "name": trajopt.name,
+        "working_dir_base": trajopt.working_dir.parent,
+        "profile_module_checkpoint_dir": trajopt.profile_module_checkpoint_dir,
+        "traj_times": trajopt.traj_times,
+        "max_num_traj_times": trajopt.max_num_traj_times,
+    }
+    case_str = str(case)
+
+    py_script = f"""\
+# init_kwargs contains Path objects whose repr is PosixPath('...')
+from pathlib import PosixPath  # noqa: F401
+
+from transport_study.trajectory_optimization.optimize import TrajectoryOptimization
+
+trajopt = TrajectoryOptimization(**{init_kwargs!r})
+case = next(c for c in trajopt.cases if str(c) == {case_str!r})
+
+if not trajopt.checkpoint_dir(case).exists():
+    trajopt.run_case(case)
+
+if not trajopt.output_path(case).exists():
+    trajopt.output_optimized_trajectory(case)
+"""
+
+    job_name = trajopt.train_job_name(case)
+    log_path = log_dir / f"{job_name}.log"
+
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False, prefix=f"{job_name}_", dir=log_dir) as f:
+        f.write(py_script)
+        script_path = f.name
+
+    setup = f"""\
+echo "=== $(date) job $SLURM_JOB_ID ({job_name}) start ==="
+export WANDB_MODE=offline
+{SINGLE_THREAD_BLAS_ENV}"""
+    script = sbatch_script(job_name, config.partition, None, log_path, script_path, setup, gres="gpu:1", requeue=True)
+    submit_sbatch(script, job_name, "trajectory optimization")
 
 
 def run_trajectory_optimization(

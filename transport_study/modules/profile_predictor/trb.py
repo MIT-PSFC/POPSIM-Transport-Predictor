@@ -8,13 +8,11 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import xarray as xr
-from loguru import logger
 from popsim.ml import DataLoader, TrainRunBuilder
-from popsim.ml.checkpointing import create_default_checkpoint_manager, restore_model
 from popsim.ml.dataloading import make_dataloaders
 from popsim.ml.eval import EvalData, EvaluationSuite
 
-from transport_study import EPISODE_DIM, RADIAL_DIM, TIME_COORD, TIME_DIM
+from transport_study import EPISODE_DIM, RADIAL_DIM, TIME_COORD
 from transport_study.config import config
 from transport_study.modules.profile_predictor.module import (
     MODEL_TYPES_WITH_SHAPES,
@@ -30,17 +28,22 @@ from transport_study.modules.profile_predictor.torax_module import ProfilePredic
 from transport_study.modules.trb_utils import (
     CHI_ERROR_VARS,
     PROFILE_SCALE_FLOOR,
+    attach_normalizer_fit_ds,
     chi_gradient,
     chi_value,
+    ds_source_per_shot,
     integrate_error_over_time,
     make_exponential_adamw,
     make_loss_eval_suite,
+    normalizer_fit_dataset,
     peak_scale,
     per_sample_device_values,
     per_sample_sigma_floor,
     resolve_case_datasets,
+    restore_from_checkpoint,
     target_device_idx,
     to_mid,
+    unstack_samples,
 )
 
 
@@ -92,8 +95,8 @@ class ProfilePredictorTRB(TrainRunBuilder):
             episode_coord=EPISODE_DIM,
             input_vars=input_vars,
             target_vars=dataloader_config["target_vars"],
-            extra_vars=dataloader_config.get("extra_vars", None),
-            batch_size=dataloader_config.get("batch_size", None),
+            extra_vars=dataloader_config.get("extra_vars"),
+            batch_size=dataloader_config["batch_size"],
             shuffle=[True, False],
             convert_xr_to_jnp=False,  # Needed to keep the coords for calculating loss
             # Keep every batch the same shape to avoid an extra XLA compilation
@@ -103,40 +106,26 @@ class ProfilePredictorTRB(TrainRunBuilder):
             drop_last=[True, False],
             pad_last=[False, True],
         )
-        # Transfer pretrain fits the normalizer on more data than it trains on
-        # (historic + target shots). model_init reads this attribute off the
-        # train dataloader, every other case fits on train_dl.ds itself
-        # TODO(ZanderKeith): Must be *extremely clear* about why you're doing this
-        if normalizer_fit_ds is not None:
-            train_dl.normalizer_fit_ds = normalizer_fit_ds
+        attach_normalizer_fit_ds(train_dl, normalizer_fit_ds)
         # The validation set doubles as the test set (see resolve_case_datasets)
         return ds_val, train_dl, val_dl, val_dl
 
     @staticmethod
     def model_init(train_dl: DataLoader, model_init_config: dict) -> Any:
+        """The profile predictor of a case, restored from the transfer checkpoint when one is set.
+
+        The data-driven init (normalizer statistics, PCA / k-means shape guess) is skipped when a restore will overwrite it:
+        for a transfer case, and for a skeleton built with skip_data_init on a dataset that cannot support it
+        (the transport sciml submodule, see transport_predictor/trb.py).
         """
-        Instantiate and return your model given a training DataLoader
-        and a model config dict.
-        """
-        # Stat stage (CORAL or z-score) on the dimensionless nn_inputs.
-        # Fitted from the training data only. When a transfer checkpoint will overwrite
-        # the module anyway, skip the fit (a fit on a handful of target shots is
-        # ill-conditioned and the restored stats, fitted on historic + target
-        # shots by the transfer_pretrain prereq case, are the correct ones).
-        # transfer_pretrain dataloaders carry that combined fit dataset as an
-        # attribute (see get_dataloaders).
-        # skip_data_init is the same escape hatch for a caller building this
-        # module as a submodule skeleton on a dataset that cannot support the
-        # data-driven init at all - the transport study's sciml model type builds
-        # one on its own dataloader, which carries neither a measured beta_tor_norm nor
-        # the profile shape variables (see transport_predictor/trb.py)
-        n_devices = len(config.ds_source_to_idx)
         skip_data_init = model_init_config.get("skip_data_init", False)
-        if model_init_config.get("transfer_checkpoint") or skip_data_init:
-            fit_ds = None
-        else:
-            fit_ds = getattr(train_dl, "normalizer_fit_ds", train_dl.ds)
-        normalizer = make_nn_input_normalizer(model_init_config["data_normalization"], fit_ds, n_devices, target_device_idx())
+        # Stat stage (CORAL or z-score) on the dimensionless nn_inputs
+        normalizer = make_nn_input_normalizer(
+            model_init_config["data_normalization"],
+            None if skip_data_init else normalizer_fit_dataset(train_dl, model_init_config),
+            len(config.ds_source_to_idx),
+            target_device_idx(),
+        )
 
         if model_init_config["model_type"] in MODEL_TYPES_WITH_SHAPES:
             te_shape_var = model_init_config["te_shape_var"]
@@ -160,12 +149,9 @@ class ProfilePredictorTRB(TrainRunBuilder):
                 normalizer=normalizer,
             )
 
-            # PCA/K-means initial guess for the shapes.
-            # Skipped when restoring from a transfer checkpoint, which overwrites the
-            # shapes anyway and whose fine-tune dataset may have fewer samples than shapes.
-            # Also skipped for a restore-bound submodule skeleton (skip_data_init),
-            # whose dataloader need not carry the shape variables at all.
-            if not model_init_config.get("transfer_checkpoint", False) and not skip_data_init:
+            # PCA / k-means initial guess for the shapes, unless a restore overwrites them
+            # (a transfer fine-tune dataset can also hold fewer samples than shapes)
+            if not model_init_config.get("transfer_checkpoint") and not skip_data_init:
                 ds = train_dl.ds
                 sample_dim = train_dl.dataset.training_metadata.sample_dim
 
@@ -193,10 +179,10 @@ class ProfilePredictorTRB(TrainRunBuilder):
         elif model_init_config["model_type"] == "reservoir":
             module = ProfilePredictorReservoir(
                 reservoir_size=model_init_config["reservoir_size"],
-                spectral_radius=model_init_config.get("spectral_radius", 0.9),
-                input_scaling=model_init_config.get("input_scaling", 0.5),
-                leak_rate=model_init_config.get("leak_rate", 1.0),
-                n_steps=model_init_config.get("n_steps", 20),
+                spectral_radius=model_init_config["spectral_radius"],
+                input_scaling=model_init_config["input_scaling"],
+                leak_rate=model_init_config["leak_rate"],
+                n_steps=model_init_config["n_steps"],
                 rhogrid=np.asarray(train_dl.ds[RADIAL_DIM]),
                 key=jax.random.PRNGKey(model_init_config["prng_seed"]),
                 normalizer=normalizer,
@@ -224,11 +210,8 @@ class ProfilePredictorTRB(TrainRunBuilder):
         else:
             raise ValueError(f"Invalid model type {model_init_config['model_type']}")
 
-        if model_init_config.get("transfer_checkpoint", False):
-            transfer_manager = create_default_checkpoint_manager(model_init_config["transfer_checkpoint"])
-            module = restore_model(transfer_manager, module)
-            logger.debug(f"Restoring module from transfer learning pretrained checkpoint\n{model_init_config['transfer_checkpoint']}")
-
+        if model_init_config.get("transfer_checkpoint"):
+            module = restore_from_checkpoint(module, model_init_config["transfer_checkpoint"])
         return module
 
     # Softening fraction for the relative-error denominator in study_results.
@@ -315,7 +298,7 @@ class ProfilePredictorTRB(TrainRunBuilder):
         # Standard AdamW plus a global-norm cap
         # the differentiated TORAX solve can spike gradients and NaN a run without it
         return optax.chain(
-            optax.clip_by_global_norm(optimizer_config.get("grad_clip_max_norm", 1.0)),
+            optax.clip_by_global_norm(optimizer_config["grad_clip_max_norm"]),
             make_exponential_adamw(optimizer_config),
         )
 
@@ -369,7 +352,7 @@ class ProfilePredictorTRB(TrainRunBuilder):
         else:
             raise ValueError(f"Invalid model type {model_init_config['model_type']}")
 
-        if model_init_config.get("domain_adaptation") == "transfer":
+        if model_init_config["domain_adaptation"] == "transfer":
             return get_trainable_transfer
         return getter
 
@@ -404,30 +387,6 @@ class ProfilePredictorTRB(TrainRunBuilder):
             Keeps shot and ds_source coordinates for downstream analysis.
             """
 
-            def _unstack_and_rename_time(da: xr.DataArray) -> xr.DataArray:
-                da = da.unstack("sample")
-                # Keep episode/time axes even when they have length 1.
-                # Single-shot eval splits are valid and should retain the shot dimension.
-                protected_dims = {EPISODE_DIM, TIME_DIM, TIME_DIM + "_input"}
-                squeeze_dims = [d for d, n in da.sizes.items() if n == 1 and d not in protected_dims]
-                if squeeze_dims:
-                    da = da.squeeze(dim=squeeze_dims, drop=True)
-                # Time-dependent dataloaders suffix every input-side dim
-                # (the transport study reuses this suite)
-                # rename them back (time_idx_input -> time_idx, rho_tor_norm_input -> rho_tor_norm)
-                # so targets and predictions share one grid
-                # No-op for time-independent evals.
-                renames = {d: d.removesuffix("_input") for d in da.dims if isinstance(d, str) and d.endswith("_input")}
-                if renames:
-                    da = da.rename(renames)
-                return da
-
-            def _get_first_present(ds: xr.Dataset, candidates: list[str]) -> xr.DataArray:
-                for name in candidates:
-                    if name in ds.data_vars:
-                        return ds[name]
-                raise KeyError(f"None of the candidate output vars were found: {candidates}")
-
             def _ensure_rho_dim(pred: xr.DataArray, targ: xr.DataArray) -> xr.DataArray:
                 # Time-dependent stepper outputs are bare arrays whose profile
                 # axis gets a generic auto-generated dim name
@@ -441,30 +400,21 @@ class ProfilePredictorTRB(TrainRunBuilder):
                     raise ValueError(f"Cannot identify the profile axis of the prediction, dims {pred.dims} vs target {targ.dims}")
                 return pred.rename({extra[0]: RADIAL_DIM}).assign_coords({RADIAL_DIM: targ[RADIAL_DIM].values})
 
-            # Targets from input dataset
-            ne_targ = _unstack_and_rename_time(eval_data.input_ds["n_e_1e20"])
-            te_targ = _unstack_and_rename_time(eval_data.input_ds["t_e_keV"])
-            time_2d = _unstack_and_rename_time(eval_data.input_ds[TIME_COORD])
+            ne_targ = unstack_samples(eval_data.input_ds["n_e_1e20"])
+            te_targ = unstack_samples(eval_data.input_ds["t_e_keV"])
+            time_2d = unstack_samples(eval_data.input_ds[TIME_COORD])
 
-            # Predictions from output dataset.
-
-            ne_pred_raw = _get_first_present(
-                eval_data.output_ds,
-                ["ne", "output.ne", "output.profile_predictor_output.ne"],
-            )
-            te_pred_raw = _get_first_present(
-                eval_data.output_ds,
-                ["te", "output.te", "output.profile_predictor_output.te"],
-            )
-            ne_pred = _ensure_rho_dim(_unstack_and_rename_time(ne_pred_raw), ne_targ)
-            te_pred = _ensure_rho_dim(_unstack_and_rename_time(te_pred_raw), te_targ)
+            # The time-dependent modules (the transport study) nest their outputs under output.
+            output_prefix = "" if "ne" in eval_data.output_ds else "output."
+            ne_pred = _ensure_rho_dim(unstack_samples(eval_data.output_ds[f"{output_prefix}ne"]), ne_targ)
+            te_pred = _ensure_rho_dim(unstack_samples(eval_data.output_ds[f"{output_prefix}te"]), te_targ)
 
             # Per-point profile errors
             ne_error_abs_profile = xr.apply_ufunc(np.abs, ne_pred - ne_targ)
             te_error_abs_profile = xr.apply_ufunc(np.abs, te_pred - te_targ)
             if fresh_only:
                 # Stale timeslices score NaN, every error below and the shot integrals then skip them
-                mask_fresh = _unstack_and_rename_time(eval_data.input_ds["fresh_profile"]) == 1
+                mask_fresh = unstack_samples(eval_data.input_ds["fresh_profile"]) == 1
                 ne_error_abs_profile = ne_error_abs_profile.where(mask_fresh)
                 te_error_abs_profile = te_error_abs_profile.where(mask_fresh)
 
@@ -498,27 +448,6 @@ class ProfilePredictorTRB(TrainRunBuilder):
             error_abs_shot = 0.5 * (ne_error_abs_shot + te_error_abs_shot)
             error_rel_shot = 0.5 * (ne_error_rel_shot + te_error_rel_shot)
 
-            # Keep ds_source coord aligned to shot
-            ds_source = eval_data.input_ds["ds_source"]
-            if "sample" in ds_source.dims:
-                ds_source_unstacked = ds_source.unstack("sample")
-                if EPISODE_DIM in ds_source_unstacked.dims and ds_source_unstacked.ndim > 1:
-                    other_dims = [d for d in ds_source_unstacked.dims if d != EPISODE_DIM]
-                    ds_source_stacked = ds_source_unstacked.stack(_other=other_dims).transpose(EPISODE_DIM, "_other")
-                    ds_source_vals = ds_source_stacked.values
-                    ds_source_valid = ds_source_stacked.notnull().values
-                    ds_source_array = np.array(
-                        [
-                            row[np.flatnonzero(valid_mask)[0]] if np.any(valid_mask) else np.nan
-                            for row, valid_mask in zip(ds_source_vals, ds_source_valid, strict=True)
-                        ],
-                        dtype=object,
-                    )
-                else:
-                    ds_source_array = ds_source_unstacked.values
-            else:
-                ds_source_array = np.array([ds_source.values.item() for _ in range(ne_targ.sizes[EPISODE_DIM])])
-
             ds = xr.Dataset(
                 data_vars={
                     "n_e_1e20_targ": ne_targ,
@@ -540,10 +469,8 @@ class ProfilePredictorTRB(TrainRunBuilder):
                 }
             )
 
-            ds = ds.assign_coords(ds_source=(EPISODE_DIM, ds_source_array))
-            ds = ds.drop_vars("quantile", errors="ignore")
-            ds = ds.drop_vars("input_batch", errors="ignore")
-            return ds
+            ds_source = ds_source_per_shot(eval_data.input_ds["ds_source"], ne_targ.sizes[EPISODE_DIM])
+            return ds.assign_coords(ds_source=(EPISODE_DIM, ds_source)).drop_vars(["quantile", "input_batch"], errors="ignore")
 
         if suite_config:
             eval_suite = {

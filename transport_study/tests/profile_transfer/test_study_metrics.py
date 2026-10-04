@@ -15,11 +15,15 @@ import xarray as xr
 from transport_study import RADIAL_DIM
 from transport_study.config import RHO_GRID
 from transport_study.modules.trb_utils import CHI_ERROR_VARS, CHI_GRAD_RHO_MAX
-from transport_study.orchestration.stages import STAGE_AGG_NAMES
-from transport_study.profile_transfer import study_metrics
-from transport_study.profile_transfer.study_metrics import (
+from transport_study.orchestration.case_metrics import (
     case_metrics_path,
     compute_and_save_case_metrics,
+)
+from transport_study.orchestration.case_reports import analysis_case_done
+from transport_study.orchestration.stages import STAGE_AGG_NAMES
+from transport_study.profile_transfer import study_metrics
+from transport_study.profile_transfer.profile_study import ProfileStudy
+from transport_study.profile_transfer.study_metrics import (
     compute_case_timeslice_metrics,
 )
 
@@ -72,7 +76,6 @@ def _make_eval_ds(
     def _scalar_var(arr):
         return (("shot", "time_idx"), np.asarray(arr, dtype=float)[None, :])
 
-    zeros = np.zeros(n_ts)
     return xr.Dataset(
         data_vars={
             "n_e_1e20_error": _profile_var(ne_err),
@@ -82,10 +85,7 @@ def _make_eval_ds(
             "n_e_1e20_gradient_error": _profile_var(ne_grad_err),
             "t_e_keV_gradient_error": _profile_var(te_grad_err),
             "ip_MA": _scalar_var(ip),
-            "power_nbi_MW": _scalar_var(p_nbi),
-            "power_lh_MW": _scalar_var(zeros),
-            "power_ec_MW": _scalar_var(zeros),
-            "power_ic_MW": _scalar_var(zeros),
+            "power_additional_MW": _scalar_var(p_nbi),
         },
         coords={
             "shot": [shot],
@@ -220,6 +220,9 @@ class TestComputeCaseTimesliceMetrics:
 class _StubStudy:
     """Just enough of the Study interface for the per-case metric cache."""
 
+    ANALYSIS_METRICS_MODULE = ProfileStudy.ANALYSIS_METRICS_MODULE
+    ANALYSIS_REPORTS_MODULE = ProfileStudy.ANALYSIS_REPORTS_MODULE
+
     def __init__(self, tmp_path: Path):
         self.result_dir = tmp_path / "results"
         self.figure_dir = tmp_path / "figures"
@@ -275,8 +278,6 @@ class TestCaseMetricsCache:
         xr.testing.assert_allclose(first, second)
 
     def test_analysis_case_done(self, tmp_path, patched_eval):
-        from transport_study.profile_transfer.case_reports import analysis_case_done
-
         study = _StubStudy(tmp_path)
         case = "case.test"
         # No metrics cache yet

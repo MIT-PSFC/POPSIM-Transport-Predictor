@@ -150,6 +150,7 @@ def sciml_module() -> TransportPredictorSciML:
         p_oh_predictor=p_oh,
         p_rad_predictor=p_rad,
         normalizer=RawNormalizer(),
+        prng_seed=42,
     )
     profile_predictor = ProfilePredictorUnstructuredNN(
         nn_width=4,
@@ -173,6 +174,7 @@ def torax_rebuild_module() -> TransportPredictorTorax:
         sim_dt=0.001,
         transport_model="constant",
         geometry_builder="circular",
+        delta_exponent=2.0,
     )
 
 
@@ -188,6 +190,7 @@ def torax_carry_module() -> TransportPredictorToraxSimState:
         sim_dt=0.001,
         transport_model="constant",
         geometry_builder="circular",
+        delta_exponent=2.0,
     )
 
 
@@ -501,6 +504,7 @@ def test_torax_rebuild_step_gradients_finite(transport_model):
         sim_dt=0.001,
         transport_model=transport_model,
         geometry_builder="miller",
+        delta_exponent=2.0,
     )
     obs = make_observations()
     state = TransportPredictorEnv(module=module).create_state(obs, obs)
@@ -575,6 +579,7 @@ def test_torax_absorption_fraction_nn(torax_rebuild_module):
         normalizer=CoralFeatureNormalizer.identity(1, N_NN_INPUTS),
         transport_model="constant",
         geometry_builder="circular",
+        delta_exponent=2.0,
     )
     profile_inputs = inputs.to_profile_predictor_inputs(rho=jnp.asarray(RHO), beta_tor_norm=1.5)
     profile_coeffs = profile_module.nn_coefficients(profile_inputs)

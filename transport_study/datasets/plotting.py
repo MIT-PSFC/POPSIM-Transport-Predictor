@@ -70,189 +70,19 @@ def variable_stats(ds: xr.Dataset) -> dict[str, dict[str, float]]:
     return stats
 
 
-def ds_profile_time_plot(  # noqa: PLR0915
+def ds_profile_time_plot(
     ds: str | xr.Dataset,
     fig_dir: Path | str,
     num_shots: int | None = None,
     title: str = "Profile dataset Time Traces",
 ):
-    """Plot time traces of all signals of interest from the dataset, the first num_shots shots or every one.
-
-    Four axes:
-    1. ip, energy_mhd, and beta_tor_norm
-    2. Line averaged density and b0
-    3. All power sources and sinks
-    4. Shaping parameters
-    """
+    """One PNG per shot, the first num_shots shots or every one, of the time-trace page of ds_summary_report."""
     ds = _working_unit_dataset(ds)
-
     Path(fig_dir).mkdir(parents=True, exist_ok=True)
-
-    # Compute global y-limits across all shots for consistent axes
-    ylim_ip = (0, float(np.nanmax(np.abs(ds["ip_MA"].values))) * 1.1)
-    ylim_wtot = (0, float(np.nanmax(ds["energy_mhd_MJ"].values)) * 1.1)
-    ylim_betan = (0, float(np.nanmax(ds["beta_tor_norm"].values)) * 1.1)
-
-    density_max = min(float(np.nanmax(ds["n_e_line_average_1e20"].values)), DENSITY_YLIM_CAP_1E20)
-    ylim_ne = (0, density_max * 1.1)
-
-    # b0 y-limits for density plot right axis
-    ylim_b0 = (0, float(np.nanmax(ds["b0"].values)) * 1.1)
-
-    power_max = min(max(float(np.nanmax(ds[sig].values)) for sig in POWER_COLORS), POWER_YLIM_CAP_MW)
-    ylim_power = (0, power_max * 1.1)
-
-    shape_min = min(float(np.nanmin(ds[sig].values)) for sig in SHAPE_COLORS)
-    shape_max = max(float(np.nanmax(ds[sig].values)) for sig in SHAPE_COLORS)
-    ylim_shape = (
-        shape_min * 0.9 if shape_min > 0 else shape_min * 1.1,
-        shape_max * 1.1,
-    )
-
-    # geometric_axis_r y-limits for shaping plot right axis
-    ylim_geometric_axis_r = (0, float(np.nanmax(ds["geometric_axis_r"].values)) * 1.1)
-
-    # If any ylim is NaN or infinite, set it to a default range
-    if not np.isfinite(ylim_ip).all():
-        ylim_ip = (0, 1)
-    if not np.isfinite(ylim_wtot).all():
-        ylim_wtot = (0, 1)
-    if not np.isfinite(ylim_betan).all():
-        ylim_betan = (0, 1)
-    if not np.isfinite(ylim_ne).all():
-        ylim_ne = (0, 1)
-    if not np.isfinite(ylim_b0).all():
-        ylim_b0 = (0, 1)
-    if not np.isfinite(ylim_power).all():
-        ylim_power = (0, 1)
-    if not np.isfinite(ylim_shape).all():
-        ylim_shape = (0, 1)
-    if not np.isfinite(ylim_geometric_axis_r).all():
-        ylim_geometric_axis_r = (0, 1)
-
+    all_ylims = _summary_ylims(ds)
     for shot in ds["shot"].data[:num_shots]:
-        shot_ds = ds.sel(shot=shot)
-
-        fig, axes = plt.subplots(4, 1, figsize=(16, 16), sharex=True)
-        fig.patch.set_facecolor(BACKGROUND_COLOR)
-
-        fig.suptitle(f"{title} - {shot}", fontsize=TITLE_FONTSIZE, color=TEXT_COLOR)
-
-        # ip, energy_mhd, and beta_tor_norm
-        ax_ip = axes[0]
-        # Put ip and energy_mhd on the left y axis and beta_tor_norm on the right y axis
-        ax_ip.plot(shot_ds["time"], shot_ds["ip_MA"], label="ip [MA]", color="cyan")
-        ax_ip.plot(shot_ds["time"], shot_ds["energy_mhd_MJ"], label="energy_mhd [MJ]", color="red")
-        ax_ip.set_ylabel("ip [MA] / energy_mhd [MJ]", fontsize=LABEL_FONTSIZE, color="white")
-        ax_ip.set_ylim((0, max(ylim_ip[1], ylim_wtot[1])))
-        ax_ip.legend(
-            fontsize=LEGEND_FONTSIZE,
-            facecolor=BACKGROUND_COLOR,
-            edgecolor=BACKGROUND_COLOR,
-            loc="upper left",
-        )
-        ax_betan = ax_ip.twinx()
-        ax_betan.plot(shot_ds["time"], shot_ds["beta_tor_norm"], label="beta_tor_norm", color="magenta")
-        ax_betan.set_ylabel("Normalized Beta", fontsize=LABEL_FONTSIZE, color="magenta")
-        ax_betan.set_ylim(ylim_betan)
-        ax_betan.tick_params(axis="y", labelsize=TICK_FONTSIZE, colors=TEXT_COLOR)
-
-        # line averaged density
-        ax_ne = axes[1]
-        ax_ne.plot(
-            shot_ds["time"],
-            shot_ds["n_e_line_average_1e20"],
-            label="n_e_line_average",
-            color="white",
-        )
-        ax_ne.set_ylabel("n_e [10^20 m^-3]", fontsize=LABEL_FONTSIZE, color="white")
-        ax_ne.set_ylim(ylim_ne)
-
-        # Dots at 0 for fresh profiles
-        ax_ne.plot(
-            shot_ds["time"],
-            np.where(shot_ds["fresh_profile"] > 0, 0, np.nan),
-            color="green",
-            marker="o",
-            linestyle="None",
-        )
-        ax_ne.legend(
-            fontsize=LEGEND_FONTSIZE,
-            facecolor=BACKGROUND_COLOR,
-            edgecolor=BACKGROUND_COLOR,
-            loc="upper left",
-        )
-
-        # Add b0 on right axis
-        ax_b0 = ax_ne.twinx()
-        ax_b0.plot(
-            shot_ds["time"],
-            shot_ds["b0"],
-            label="b0 [T]",
-            color="magenta",
-            linestyle="-",
-        )
-        ax_b0.set_ylabel("b0 [T]", fontsize=LABEL_FONTSIZE, color="magenta")
-        ax_b0.set_ylim(ylim_b0)
-        ax_b0.tick_params(axis="y", labelsize=TICK_FONTSIZE, colors=TEXT_COLOR)
-
-        # All power sources and sinks
-        ax_power = axes[2]
-        for sig, color in POWER_COLORS.items():
-            ax_power.plot(
-                shot_ds["time"],
-                shot_ds[sig],
-                label=f"{sig.removesuffix('_MW')} [MW]",
-                color=color,
-            )
-        ax_power.set_ylabel("Power [MW]", fontsize=LABEL_FONTSIZE, color="white")
-        ax_power.set_ylim(ylim_power)
-        ax_power.legend(
-            fontsize=LEGEND_FONTSIZE,
-            facecolor=BACKGROUND_COLOR,
-            edgecolor=BACKGROUND_COLOR,
-            loc="upper left",
-        )
-
-        # Shaping
-        ax_shape = axes[3]
-        for sig, color in SHAPE_COLORS.items():
-            ax_shape.plot(shot_ds["time"], shot_ds[sig], label=sig, color=color)
-        ax_shape.set_ylabel("Shaping", fontsize=LABEL_FONTSIZE, color="white")
-        ax_shape.set_ylim(ylim_shape)
-        ax_shape.set_xlabel("Time [s]", fontsize=LABEL_FONTSIZE, color="white")
-        ax_shape.legend(
-            fontsize=LEGEND_FONTSIZE,
-            facecolor=BACKGROUND_COLOR,
-            edgecolor=BACKGROUND_COLOR,
-            loc="upper left",
-        )
-
-        # Add geometric_axis_r on right axis
-        ax_geometric_axis_r = ax_shape.twinx()
-        ax_geometric_axis_r.plot(
-            shot_ds["time"],
-            shot_ds["geometric_axis_r"],
-            label="geometric_axis_r [m]",
-            color="cyan",
-            linestyle="--",
-        )
-        ax_geometric_axis_r.set_ylabel("geometric_axis_r [m]", fontsize=LABEL_FONTSIZE, color="cyan")
-        ax_geometric_axis_r.set_ylim(ylim_geometric_axis_r)
-        ax_geometric_axis_r.tick_params(axis="y", labelsize=TICK_FONTSIZE, colors=TEXT_COLOR)
-
-        for ax in axes:
-            ax.set_facecolor(FACE_COLOR)
-            ax.grid(True, color="gray", linestyle="--", linewidth=0.1)
-            ax.tick_params(axis="both", labelsize=TICK_FONTSIZE, colors=TEXT_COLOR)
-            try:
-                for text in ax.get_legend().get_texts():
-                    text.set_color(TEXT_COLOR)
-            except AttributeError:
-                pass
-
-        fig.tight_layout()
-        fig.savefig(f"{fig_dir}/{shot}_trace.png")
+        fig = _shot_summary_page(ds.sel(shot=shot), shot, title, all_ylims)
+        fig.savefig(Path(fig_dir) / f"{shot}_trace.png")
         plt.close(fig)
 
 
@@ -321,7 +151,6 @@ _SUMMARY_PANEL_DEFS = [
         left_label="ip [MA]",
         left_colors={"ip_MA": "cyan"},
         left_floor_zero=True,
-        left_abs=True,
         right_vars=["b0"],
         right_label="b0 [T]",
         right_colors={"b0": "magenta"},
@@ -360,12 +189,12 @@ _SUMMARY_PANEL_DEFS = [
 ]
 
 
-def _axis_ylim(ds, variables, floor_zero=False, use_abs=False, cap=None):
+def _axis_ylim(ds, variables, floor_zero=False, cap=None):
     """Global (lo, hi) y-limits for a set of variables across the whole dataset"""
     present = [v for v in variables if v in ds]
     if not present:
         return None
-    hi = max(float(np.nanmax(np.abs(ds[v].values) if use_abs else ds[v].values)) for v in present)
+    hi = max(float(np.nanmax(ds[v].values)) for v in present)
     if cap is not None:
         hi = min(hi, cap)
     if floor_zero:
@@ -388,7 +217,6 @@ def _summary_ylims(ds):
                 ds,
                 panel["left_vars"],
                 floor_zero=panel.get("left_floor_zero", False),
-                use_abs=panel.get("left_abs", False),
                 cap=panel.get("left_cap"),
             )
         }
@@ -397,7 +225,6 @@ def _summary_ylims(ds):
                 ds,
                 panel["right_vars"],
                 floor_zero=panel.get("right_floor_zero", False),
-                use_abs=panel.get("right_abs", False),
                 cap=panel.get("right_cap"),
             )
         all_ylims.append(ylims)

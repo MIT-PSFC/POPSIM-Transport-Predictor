@@ -9,16 +9,17 @@ import numpy as np
 import pytest
 import xarray as xr
 
+from transport_study.orchestration.case_metrics import aggregate_case_metrics
+from transport_study.orchestration.stages import STAGE_AGG_NAMES
+from transport_study.orchestration.tables import write_summary_comparison_tables
 from transport_study.power_balance_transfer import study_metrics
-from transport_study.power_balance_transfer.case_reports import best_worst_pdf
+from transport_study.power_balance_transfer.case_reports import shot_pdf
 from transport_study.power_balance_transfer.study_metrics import (
-    STAGE_AGG_NAMES,
-    aggregate_case_metrics,
+    METRIC_NAMES,
     compute_case_timeslice_metrics,
     shot_time_averaged_errors,
 )
-from transport_study.power_balance_transfer.tables import write_comparison_tables
-from transport_study.signals import HEATING_POWERS_MW
+from transport_study.power_balance_transfer.tables import SPEC
 
 N_TS = 100
 SHOTS = [101, 102]
@@ -34,11 +35,8 @@ def device_ds() -> xr.Dataset:
 
     data_vars = {
         "ip_MA": (("shot", "time_idx"), np.stack([ip, ip])),
-        "power_nbi_MW": (("shot", "time_idx"), np.stack([p_nbi, p_nbi])),
+        "power_additional_MW": (("shot", "time_idx"), np.stack([p_nbi, p_nbi])),
     }
-    for sig in HEATING_POWERS_MW:
-        if sig not in data_vars:
-            data_vars[sig] = (("shot", "time_idx"), np.zeros((2, N_TS)))
     return xr.Dataset(
         data_vars=data_vars,
         coords={"shot": SHOTS, "time": (("shot", "time_idx"), np.stack([time, time]))},
@@ -112,7 +110,7 @@ def test_first_real_timeslice_after_leading_padding_is_kept(monkeypatch, device_
 
 
 def test_aggregate_case_metrics(ts_metrics):
-    case_ds = aggregate_case_metrics(ts_metrics)
+    case_ds = aggregate_case_metrics(ts_metrics, METRIC_NAMES)
 
     assert list(case_ds["stage"].values) == list(STAGE_AGG_NAMES)
     counts = case_ds["abs_count"].values
@@ -136,9 +134,9 @@ def test_shot_time_averaged_errors(ts_metrics):
     assert list(n_ts) == [N_TS, 80]
 
 
-def test_best_worst_pdf(tmp_path, result_ds, ts_metrics):
+def test_shot_pdf(tmp_path, result_ds, ts_metrics):
     pdf_path = tmp_path / "case_reports" / "best_worst_shots.pdf"
-    best_worst_pdf(result_ds, ts_metrics, pdf_path)
+    shot_pdf(result_ds, ts_metrics, pdf_path)
     assert pdf_path.exists()
     assert pdf_path.stat().st_size > 0
 
@@ -182,7 +180,7 @@ def collected_datasets() -> tuple[xr.Dataset, xr.Dataset]:
 
 def test_write_comparison_tables(tmp_path, collected_datasets):
     results, metrics = collected_datasets
-    write_comparison_tables(results, metrics, tmp_path)
+    write_summary_comparison_tables(results, metrics, SPEC, tmp_path)
 
     tables_dir = tmp_path / "tables"
     assert (tables_dir / "case_stats.csv").exists()
@@ -211,5 +209,5 @@ def test_write_comparison_tables(tmp_path, collected_datasets):
 
 
 def test_write_comparison_tables_empty(tmp_path):
-    write_comparison_tables(xr.Dataset(), xr.Dataset(), tmp_path)
+    write_summary_comparison_tables(xr.Dataset(), xr.Dataset(), SPEC, tmp_path)
     assert not (tmp_path / "tables").exists()

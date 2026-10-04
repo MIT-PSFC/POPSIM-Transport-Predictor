@@ -1,7 +1,6 @@
 """Per-axis comparison tables for profile transfer study results.
 
-For every case axis (model type, training dataset, domain adaptation, freeze
-shapes, number of target shots) and every combination of the remaining axes,
+For every case axis (CASE_FIELD_ORDER) and every combination of the remaining axes,
 one markdown table comparing the cases that differ only along that axis.
 Columns combine the stage-resolved TIME-AVERAGED loss metrics from
 collected_metrics.nc (per-timeslice means of the value / gradient / combined
@@ -26,10 +25,7 @@ from transport_study.orchestration.tables import (
     merge_stage_metrics,
     write_case_comparison_tables,
 )
-
-# Stage-resolved metric variables in collected_metrics.nc
-# (see profile_transfer.study_metrics.METRIC_NAMES)
-_STAGE_METRICS = ("value", "grad", "combined")
+from transport_study.profile_transfer.study_metrics import METRIC_NAMES
 
 # Per-shot time-integrated errors kept from the long-form collected results,
 # reduced to a per-case median
@@ -70,6 +66,7 @@ SPEC = ComparisonTableSpec(
         ("rel err (integral, med)", "err_rel_shot_med"),
         ("abs err (integral, med)", "err_abs_shot_med"),
     ),
+    stage_metrics=METRIC_NAMES,
 )
 
 
@@ -85,7 +82,7 @@ def case_stats_frame(results_ds: xr.Dataset, metrics_ds: xr.Dataset) -> pd.DataF
     case_fields = grouped[list(CASE_FIELD_ORDER)].first()
     df = pd.concat([case_fields, medians], axis=1).reset_index()
     df = df[[*CASE_FIELD_ORDER, "case_idx", *medians.columns]]
-    return merge_stage_metrics(df, metrics_ds, _STAGE_METRICS)
+    return merge_stage_metrics(df, metrics_ds, SPEC.stage_metrics)
 
 
 def write_comparison_tables(results_ds: xr.Dataset, metrics_ds: xr.Dataset, figure_dir: Path):

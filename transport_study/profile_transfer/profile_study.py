@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from itertools import product
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, ClassVar
 
 if TYPE_CHECKING:
     from popsim.ml import TrainConfig
@@ -12,19 +12,29 @@ import fire
 import netCDF4  # noqa: F401
 import numpy as np
 import xarray as xr
-from loguru import logger
-from pydantic import Field, field_validator
+from pydantic import Field
 
 from transport_study import PACKAGE_ROOT, TIME_DIM
 from transport_study.config import config
+from transport_study.modules.normalization import FEATURE_NORMALIZATIONS
 from transport_study.modules.profile_predictor.module import (
     MODEL_TYPES_WITH_SHAPES,
     NN_INPUT_SOURCE_VARS,
 )
+from transport_study.modules.profile_predictor.torax_module import (
+    TORAX_MODEL_TYPES,
+    VALID_GEOMETRY_BUILDERS,
+)
 from transport_study.modules.profile_predictor.train_configs import (
     PROFILE_PREDICTOR_TORAX_CONFIGS,
 )
-from transport_study.orchestration.case_analysis import run_case_analysis_parallel
+from transport_study.orchestration.case_analysis import (
+    log_section,
+    run_case_analysis_parallel,
+)
+from transport_study.orchestration.case_metrics import collect_metrics
+from transport_study.orchestration.case_reports import generate_case_reports
+from transport_study.orchestration.comparison_figures import comparison_figures
 from transport_study.orchestration.organize_data import PROFILE_TARGET_VARS
 from transport_study.orchestration.study import (
     HYPERPARAM_TARGET_SHOTS,
@@ -32,29 +42,17 @@ from transport_study.orchestration.study import (
     ModelTrainSpec,
     Study,
 )
-from transport_study.profile_transfer.case_reports import (
-    generate_case_reports,
-    torax_relaxation_report,
-)
+from transport_study.profile_transfer.case_reports import torax_relaxation_report
 from transport_study.profile_transfer.data_visualization import DataVisualization
 from transport_study.profile_transfer.plotting import (
-    data_normalization_comparison,
-    domain_adaptation_comparison,
+    COMPARISON_FAMILIES,
+    LAYOUT,
     freeze_shapes_comparison,
-    geometry_builder_comparison,
-    model_comparison,
-    training_dataset_comparison,
 )
-from transport_study.profile_transfer.study_metrics import collect_metrics
 from transport_study.profile_transfer.tables import write_comparison_tables
 
 # Model families without freezable shape bases (the shape-init ones are MODEL_TYPES_WITH_SHAPES)
-MODEL_TYPES_WITHOUT_SHAPES = ("mlp", "reservoir", "torax-constant", "torax-gyrobohm", "torax-qlknn")
-
-# Per-sample geometry builders the torax model types can be benchmarked with
-# (see modules/profile_predictor/torax_module.py). Only meaningful for
-# torax-* model types, every other model type is pinned to "circular".
-VALID_GEOMETRY_BUILDERS = ("circular", "miller")
+MODEL_TYPES_WITHOUT_SHAPES = ("mlp", "reservoir", *TORAX_MODEL_TYPES)
 
 # Input normalization applied to the 10 dimensionless nn_inputs. The physics
 # transform is built into the feature set itself, so unlike power balance
@@ -63,7 +61,6 @@ VALID_GEOMETRY_BUILDERS = ("circular", "miller")
 # - physics-coral: per-device CORAL alignment fitted on them
 # - physics-zscore: per-device z-score fitted on them (mean/std only, no
 #   covariance alignment)
-VALID_DATA_NORMALIZATIONS = ("physics", "physics-coral", "physics-zscore")
 
 # The physical inputs every profile-predictor model consumes
 PROFILE_INPUT_VARS = list(NN_INPUT_SOURCE_VARS)
@@ -99,7 +96,7 @@ class ProfileStudy(Study):
         # by every other model type (see VALID_GEOMETRY_BUILDERS)
         geometry_builders: tuple[str, ...] = Field(default_factory=lambda: ("circular",))
         num_target_shots_options: tuple[int, ...] = Field(default_factory=lambda: (0, 1, 10, -1))
-        # Input normalization case axis over the 10 dimensionless nn_inputs (see VALID_DATA_NORMALIZATIONS)
+        # Input normalization case axis over the 10 dimensionless nn_inputs (see FEATURE_NORMALIZATIONS)
         data_normalization_methods: tuple[str, ...] = Field(default_factory=lambda: ("physics",))
         # Hyperparameter tuning case configuration
         # (hyperparam_domain_adaptation and hyperparam_num_target_shots live on CaseGridConfig)
@@ -113,31 +110,12 @@ class ProfileStudy(Study):
             "hyperparam_num_target_shots",
         )
 
-        @field_validator("model_types")
-        @classmethod
-        def _validate_model_types(cls, v: tuple[str, ...]) -> tuple[str, ...]:
-            valid = {*MODEL_TYPES_WITH_SHAPES, *MODEL_TYPES_WITHOUT_SHAPES}
-            for mt in v:
-                if mt not in valid:
-                    raise ValueError(f"Invalid model type: {mt}. Must be one of {sorted(valid)}.")
-            return v
-
-        @field_validator("geometry_builders")
-        @classmethod
-        def _validate_geometry_builders(cls, v: tuple[str, ...]) -> tuple[str, ...]:
-            for gb in v:
-                if gb not in VALID_GEOMETRY_BUILDERS:
-                    raise ValueError(f"Invalid geometry builder: {gb}. Must be one of {VALID_GEOMETRY_BUILDERS}.")
-            return v
-
-        @field_validator("data_normalization_methods", "hyperparam_data_normalization")
-        @classmethod
-        def _validate_data_normalization(cls, v):
-            methods = (v,) if isinstance(v, str) else v
-            for dn in methods:
-                if dn not in VALID_DATA_NORMALIZATIONS:
-                    raise ValueError(f"Invalid data normalization method: {dn}. Must be one of {VALID_DATA_NORMALIZATIONS}.")
-            return v
+        FIELD_CHOICES: ClassVar[dict[str, tuple]] = {
+            "model_types": (*MODEL_TYPES_WITH_SHAPES, *MODEL_TYPES_WITHOUT_SHAPES),
+            "geometry_builders": VALID_GEOMETRY_BUILDERS,
+            "data_normalization_methods": FEATURE_NORMALIZATIONS,
+            "hyperparam_data_normalization": FEATURE_NORMALIZATIONS,
+        }
 
     @dataclass
     class Case(Study.Case):
@@ -157,7 +135,7 @@ class ProfileStudy(Study):
 
         data_normalization: The stat stage applied to the 10 dimensionless nn_inputs,
         implemented as a frozen POPSIM module fitted from training data only
-        (transport_study/modules/normalization.py, see VALID_DATA_NORMALIZATIONS).
+        (transport_study/modules/normalization.py, see FEATURE_NORMALIZATIONS).
         - physics: the dimensionless parameters as-is
         - physics-coral: per-device CORAL alignment fitted on them
         - physics-zscore: per-device z-score fitted on them
@@ -206,7 +184,7 @@ class ProfileStudy(Study):
 
         def _validate(self):
             super()._validate()
-            if self.data_normalization not in VALID_DATA_NORMALIZATIONS:
+            if self.data_normalization not in FEATURE_NORMALIZATIONS:
                 raise ValueError(f"Unknown data normalization method: {self.data_normalization}")
 
         def __init__(
@@ -281,15 +259,12 @@ class ProfileStudy(Study):
 
     def _base_dataloader_config(self, case: Case) -> dict:
         return {
-            # Profiles plus their gradient / error-bar companions, the
-            # validation loss softens the residual inside the error bars
+            # Profiles plus their gradient and error-bar companions, the chi validation loss divides by the error bars
             "target_vars": [*PROFILE_TARGET_VARS, "ds_source_idx"],
             "training_data": case.training_data,
             "domain_adaptation": case.domain_adaptation,
             "num_target_shots": case.num_target_shots,
             "target_test_set_size": config.target_test_set_size,
-            "prng_seed": 42,
-            "debug": config.debug,
             # Hyperparameters
             # 2048 measured 34.7 GB on the worst torax case
             # (qlknn, nn 64x4, t_final 0.4 with 8 solver steps),
@@ -385,7 +360,6 @@ class ProfileStudy(Study):
                     "model_type": case.model_type,
                     "data_normalization": case.data_normalization,
                     "domain_adaptation": case.domain_adaptation,
-                    "freeze_shapes": case.freeze_shapes,
                     "nn_depth": 2,
                     "nn_width": 16,
                     "in_size": 10,  # Dimensionless nn_inputs derived from the raw input_vars, includes log(nu_star)
@@ -525,38 +499,27 @@ class ProfileStudy(Study):
     ############
 
     def _run_analysis(self, enable_parallelism: bool) -> None:
-        # Per-case analysis (stage metrics + case reports) is CPU-bound matplotlib
-        # and numpy work: with parallelism it fans out as one SLURM job per case on
-        # the analysis partition, and anything unfinished falls back to the serial
-        # paths below (collect_metrics / generate_case_reports skip completed cases)
+        # The per-case stage metrics and reports fan out over SLURM with parallelism,
+        # the serial paths after it skip the completed cases
         if enable_parallelism:
             run_case_analysis_parallel(self)
 
-        # Stage-resolved value / gradient / combined metrics for every finished
-        # case, cached to collected_metrics.nc alongside collected_results.nc
+        # Stage-resolved value / gradient / combined chi metrics of every finished case, cached to collected_metrics.nc
         metrics_ds = collect_metrics(self)
-
-        logger.opt(colors=True).info("<bold><magenta>TRAINING DATASET COMPARISON</magenta></bold>")
-        training_dataset_comparison(metrics_ds, self.figure_dir)
-
-        logger.opt(colors=True).info("<bold><magenta>MODEL COMPARISON</magenta></bold>")
-        model_comparison(metrics_ds, self.figure_dir)
+        for family in COMPARISON_FAMILIES:
+            log_section(family.title)
+            comparison_figures(metrics_ds, LAYOUT, family, self.figure_dir)
+        log_section("Shape freezing comparison")
         freeze_shapes_comparison(metrics_ds, self.figure_dir)
-        # Per-case deep dives: best/worst timeslice PDFs and profile evolution GIFs
+
+        # Best/worst timeslice PDFs and profile evolution GIFs
+        log_section("Case reports")
         generate_case_reports(self, self.figure_dir)
 
-        logger.opt(colors=True).info("<bold><magenta>DOMAIN ADAPTATION COMPARISON</magenta></bold>")
-        domain_adaptation_comparison(metrics_ds, self.figure_dir)
-
-        logger.opt(colors=True).info("<bold><magenta>DATA NORMALIZATION COMPARISON</magenta></bold>")
-        data_normalization_comparison(metrics_ds, self.figure_dir)
-
-        logger.opt(colors=True).info("<bold><magenta>TORAX-SPECIFIC ANALYSIS</magenta></bold>")
-        geometry_builder_comparison(metrics_ds, self.figure_dir)
+        log_section("TORAX relaxation")
         torax_relaxation_report(self, metrics_ds, self.figure_dir)
 
-        # One markdown table per case axis and combination of the other axes
-        logger.opt(colors=True).info("<bold><magenta>COMPARISON TABLES</magenta></bold>")
+        log_section("Comparison tables")
         results_ds = xr.load_dataset(self.collected_results_path())
         write_comparison_tables(results_ds, metrics_ds, self.figure_dir)
 

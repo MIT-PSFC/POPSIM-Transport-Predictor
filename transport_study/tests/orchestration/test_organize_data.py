@@ -342,3 +342,24 @@ class TestGetDsSyntheticStore:
         np.testing.assert_allclose(ds[RADIAL_DIM].values, RHO_GRID)
         assert {"t_e_shape", "n_e_shape"} <= set(ds.data_vars)
         assert all(not ds[name].attrs for name in ds.variables), "attrs are static jit metadata"
+
+
+def test_debug_caps_only_the_source_devices(tmp_path, monkeypatch):
+    """A debug run keeps the most recent DEBUG_MAX_SOURCE_SHOTS source shots and every target shot."""
+    store_path = tmp_path / "synthetic.zarr"
+    write_synthetic_store(store_path, internal=False)
+    load_config(
+        StudyConfig(
+            study_name="test-organize-data-debug",
+            dataset_paths={"source": store_path, "target": store_path},
+            target_device="target",
+            debug=True,
+        )
+    )
+    monkeypatch.setattr("transport_study.orchestration.organize_data.DEBUG_MAX_SOURCE_SHOTS", 2)
+
+    ds_source, _ = get_ds("source", "power_balance_transfer")
+    ds_target, _ = get_ds("target", "power_balance_transfer")
+
+    assert ds_source[EPISODE_DIM].values.tolist() == sorted(SHOT_LENGTHS, reverse=True)[:2]
+    assert ds_target.sizes[EPISODE_DIM] == len(SHOT_LENGTHS)

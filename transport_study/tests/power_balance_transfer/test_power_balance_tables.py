@@ -5,10 +5,11 @@ import pandas as pd
 import xarray as xr
 
 from transport_study.orchestration.stages import STAGE_AGG_NAMES
-from transport_study.power_balance_transfer.tables import (
-    case_stats_frame,
-    write_comparison_tables,
+from transport_study.orchestration.tables import (
+    summary_case_stats_frame,
+    write_summary_comparison_tables,
 )
+from transport_study.power_balance_transfer.tables import SPEC
 
 
 def _results_ds() -> xr.Dataset:
@@ -43,7 +44,7 @@ def _metrics_ds() -> xr.Dataset:
 
 
 def test_case_stats_frame_excludes_submodules_and_merges_metrics():
-    df = case_stats_frame(_results_ds(), _metrics_ds())
+    df = summary_case_stats_frame(_results_ds(), _metrics_ds(), SPEC)
     assert set(df["model_type"]) == {"sciml-taue-nn", "sciml-taue-scalinglaw"}
     # The scalar freeze_submodules coord is broadcast back to a column
     assert (df["freeze_submodules"] == "none").all()
@@ -53,7 +54,7 @@ def test_case_stats_frame_excludes_submodules_and_merges_metrics():
 
 
 def test_write_comparison_tables(tmp_path):
-    write_comparison_tables(_results_ds(), _metrics_ds(), tmp_path)
+    write_summary_comparison_tables(_results_ds(), _metrics_ds(), SPEC, tmp_path)
 
     csv_path = tmp_path / "tables" / "case_stats.csv"
     assert csv_path.exists()
@@ -68,12 +69,12 @@ def test_write_comparison_tables(tmp_path):
 
 
 def test_missing_metrics_render_as_dash(tmp_path):
-    write_comparison_tables(_results_ds(), xr.Dataset(), tmp_path)
+    write_summary_comparison_tables(_results_ds(), xr.Dataset(), SPEC, tmp_path)
     table_path = tmp_path / "tables" / "model_type" / "td_cmod.norm_physics.da_none.freeze_none.targ_0.md"
     content = table_path.read_text()
     assert "| sciml-taue-nn | - |" in content
 
 
 def test_empty_results_skip(tmp_path):
-    write_comparison_tables(xr.Dataset(), xr.Dataset(), tmp_path)
+    write_summary_comparison_tables(xr.Dataset(), xr.Dataset(), SPEC, tmp_path)
     assert not (tmp_path / "tables").exists()

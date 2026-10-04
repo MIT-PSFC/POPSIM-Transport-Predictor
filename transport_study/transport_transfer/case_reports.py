@@ -1,16 +1,9 @@
-"""Per-case deep-dive reports for transport transfer study results.
+"""Per-case reports of transport transfer study results (its ANALYSIS_REPORTS_MODULE, see orchestration.case_reports).
 
-For every finished case: a PDF of the 10 best and 10 worst holdout shots
-ranked by TIME-AVERAGED relative error (the per-shot errors in the result
-files are raw time integrals, which penalize long shots; the time-averaged
-form removes that duration confound). Each page shows the measured vs
-predicted Te and ne profile evolution as (time, rho) maps, plus the
-per-timeslice error traces with the discharge stages shaded and aux-heated
-spans marked.
-
-The ranking, PDF assembly, and completion logic are the power balance study's
-(fully generic, see best_worst_pdf's page_fn hook); only the per-shot page is
-transport-specific.
+The power balance study's shot PDF with a transport-specific page:
+the best and worst holdout shots by TIME-AVERAGED relative error,
+each page the measured vs predicted Te and ne profile evolution as (time, rho) maps,
+plus the per-timeslice error traces with the discharge stages shaded and aux-heated spans marked.
 """
 
 from pathlib import Path
@@ -18,27 +11,25 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 import numpy as np
 import xarray as xr
-from loguru import logger
-from matplotlib.patches import Patch
 
 from transport_study import EPISODE_DIM, RADIAL_DIM, TIME_DIM
-from transport_study.plot_style import BACKGROUND_COLOR, TEXT_COLOR, style_axis
-from transport_study.power_balance_transfer.case_reports import (  # noqa: F401 re-exported for the ANALYSIS_REPORTS_MODULE contract
-    AUX_SHADE_COLOR,
+from transport_study.orchestration.case_reports import TITLE_FONTSIZE, shade_stages
+from transport_study.plot_style import (
+    BACKGROUND_COLOR,
     LABEL_FONTSIZE,
-    STAGE_SHADE_COLORS,
+    LEGEND_STYLE,
+    TEXT_COLOR,
     TICK_FONTSIZE,
-    TITLE_FONTSIZE,
-    analysis_case_done,
-    best_worst_pdf,
-    case_report_dir,
+    style_axis,
+)
+from transport_study.power_balance_transfer.case_reports import (  # noqa: F401 case_report_done is part of the ANALYSIS_REPORTS_MODULE contract
+    REPORT_FILENAME,
     case_report_done,
-    stage_spans,
+    shot_pdf,
+    shot_records,
+    shot_title,
 )
-from transport_study.transport_transfer.study_metrics import (
-    CaseTimesliceMetrics,
-    compute_case_timeslice_metrics,
-)
+from transport_study.power_balance_transfer.study_metrics import CaseTimesliceMetrics
 
 PROFILE_CMAPS = {"t_e_keV": "magma", "n_e_1e20": "viridis"}
 PROFILE_LABELS = {"t_e_keV": "Te [keV]", "n_e_1e20": "ne [1e20 m^-3]"}
@@ -46,7 +37,7 @@ PROFILE_LABELS = {"t_e_keV": "Te [keV]", "n_e_1e20": "ne [1e20 m^-3]"}
 
 def _profile_map(ax, times: np.ndarray, rho: np.ndarray, values: np.ndarray, cmap: str, vmin: float, vmax: float):
     """One (time, rho) profile evolution map on a styled axis."""
-    style_axis(ax, TICK_FONTSIZE)
+    style_axis(ax)
     return ax.pcolormesh(times, rho, values.T, cmap=cmap, vmin=vmin, vmax=vmax, shading="auto")
 
 
@@ -70,10 +61,9 @@ def _shot_page(
     for signal in PROFILE_CMAPS:
         valid &= np.isfinite(shot_res[f"{signal}_targ"].transpose(TIME_DIM, RADIAL_DIM).values).any(axis=-1)
 
-    rec = np.flatnonzero(ts_metrics.shot == shot)
-    rec = rec[np.argsort(ts_metrics.time[rec])]
-    rec_time = ts_metrics.time[rec]
-    device = str(ts_metrics.ds_source[rec[0]]) if len(rec) else str(shot_res["ds_source"].values)
+    records = shot_records(ts_metrics, shot)
+    record_time = ts_metrics.time[records]
+    device = str(ts_metrics.ds_source[records[0]]) if len(records) else str(shot_res["ds_source"].values)
 
     fig, axes = plt.subplots(3, 2, figsize=(11, 10), sharex=True)
     fig.patch.set_facecolor(BACKGROUND_COLOR)
@@ -96,9 +86,9 @@ def _shot_page(
     # Error traces on the left, the right slot repeats them on a log scale
     # (relative errors span orders of magnitude across a discharge)
     for ax_err, log_scale in ((axes[2, 0], False), (axes[2, 1], True)):
-        style_axis(ax_err, TICK_FONTSIZE)
-        ax_err.plot(rec_time, ts_metrics.err_abs[rec], color="#0095ff", linewidth=1.5, label="Abs error (rho integral)")
-        ax_err.plot(rec_time, ts_metrics.err_rel[rec], color="#ff60ec", linewidth=1.5, label="Rel error (rho integral)")
+        style_axis(ax_err)
+        ax_err.plot(record_time, ts_metrics.err_abs[records], color="#0095ff", linewidth=1.5, label="Abs error (rho integral)")
+        ax_err.plot(record_time, ts_metrics.err_rel[records], color="#ff60ec", linewidth=1.5, label="Rel error (rho integral)")
         ax_err.set_xlabel("Time [s]", color=TEXT_COLOR, fontsize=LABEL_FONTSIZE)
         if log_scale:
             ax_err.set_yscale("log")
@@ -106,70 +96,18 @@ def _shot_page(
             ax_err.set_ylabel("Error", color=TEXT_COLOR, fontsize=LABEL_FONTSIZE)
 
     # Stage shading and aux-heated spans on the error panels
-    stage_handles = []
-    for stage, color in STAGE_SHADE_COLORS.items():
-        spans = stage_spans(rec_time, ts_metrics.stage[rec] == stage)
-        for start, end in spans:
-            axes[2, 0].axvspan(start, end, color=color, alpha=0.10, linewidth=0, zorder=0)
-            axes[2, 1].axvspan(start, end, color=color, alpha=0.10, linewidth=0, zorder=0)
-        if spans:
-            stage_handles.append(Patch(facecolor=color, alpha=0.35, label=stage))
-    aux_spans = stage_spans(rec_time, ts_metrics.aux_heated[rec])
-    for start, end in aux_spans:
-        axes[2, 0].axvspan(start, end, ymin=0.0, ymax=0.05, color=AUX_SHADE_COLOR, alpha=0.6, linewidth=0, zorder=0)
-    if aux_spans:
-        stage_handles.append(Patch(facecolor=AUX_SHADE_COLOR, alpha=0.6, label="aux heated"))
-
+    stage_handles = shade_stages((axes[2, 0], axes[2, 1]), axes[2, 0], ts_metrics, records)
     handles, _ = axes[2, 0].get_legend_handles_labels()
-    axes[2, 0].legend(
-        handles=handles + stage_handles,
-        fontsize=TICK_FONTSIZE,
-        labelcolor=TEXT_COLOR,
-        facecolor=BACKGROUND_COLOR,
-        edgecolor=TEXT_COLOR,
-        loc="upper right",
-    )
+    axes[2, 0].legend(handles=handles + stage_handles, fontsize=TICK_FONTSIZE, loc="upper right", **LEGEND_STYLE)
 
-    finite_rel = ts_metrics.err_rel[rec][np.isfinite(ts_metrics.err_rel[rec])]
-    finite_abs = ts_metrics.err_abs[rec][np.isfinite(ts_metrics.err_abs[rec])]
-    avg_rel = float(np.mean(finite_rel)) if len(finite_rel) else np.nan
-    avg_abs = float(np.mean(finite_abs)) if len(finite_abs) else np.nan
-    duration = float(rec_time[-1] - rec_time[0]) if len(rec_time) > 1 else 0.0
-    fig.suptitle(
-        f"{title_prefix}shot {shot} ({device})\n"
-        f"time-avg rel err={avg_rel:.3f}  time-avg abs err={avg_abs:.3f}  "
-        f"{len(rec)} timeslices over {duration:.2f} s",
-        color=TEXT_COLOR,
-        fontsize=TITLE_FONTSIZE,
-    )
+    title = shot_title(ts_metrics, records, shot, device, title_prefix)
+    fig.suptitle(title, color=TEXT_COLOR, fontsize=TITLE_FONTSIZE)
     return fig
 
 
-def generate_case_reports(study, figure_dir: Path):
-    """Best/worst shot PDFs for every finished case. Existing case report
-    directories are left alone; clean_figures wipes the figure dir to force
-    regeneration."""
-    for case in study.cases:
-        generate_case_report(study, case, figure_dir)
-
-
-def generate_case_report(study, case, figure_dir: Path):
-    """Best/worst shot PDF for one case. No-op when the case has no result
-    file or the report already exists."""
-    result_path = study.result_path(case)
-    if not result_path.exists():
-        return
-    case_dir = case_report_dir(figure_dir, case)
-    if case_report_done(case_dir):
-        logger.info(f"Case report already exists for {case}, skipping")
-        return
-
-    result_ds = xr.load_dataset(result_path)
-    ts_metrics = compute_case_timeslice_metrics(result_ds)
-    if len(ts_metrics) == 0:
-        logger.warning(f"No valid test timeslices for case {case}, skipping case report")
-        return
-
+def render_case_report(result_ds: xr.Dataset, ts_metrics: CaseTimesliceMetrics, case_dir: Path):
     # The power_balance / p_oh / p_rad prereq cases write scalar result files, which get the power balance page
-    page_fn = _shot_page if all(f"{signal}_targ" in result_ds for signal in PROFILE_CMAPS) else None
-    best_worst_pdf(result_ds, ts_metrics, case_dir / "best_worst_shots.pdf", page_fn=page_fn)
+    if all(f"{signal}_targ" in result_ds for signal in PROFILE_CMAPS):
+        shot_pdf(result_ds, ts_metrics, case_dir / REPORT_FILENAME, page_fn=_shot_page)
+    else:
+        shot_pdf(result_ds, ts_metrics, case_dir / REPORT_FILENAME)

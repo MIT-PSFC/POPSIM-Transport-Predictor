@@ -5,11 +5,9 @@ import pytest
 import xarray as xr
 
 from transport_study import PACKAGE_ROOT
+from transport_study.orchestration.case_metrics import collected_metrics_path
+from transport_study.orchestration.stages import STAGE_AGG_NAMES
 from transport_study.profile_transfer.profile_study import ProfileStudy, run_study
-from transport_study.profile_transfer.study_metrics import (
-    STAGE_AGG_NAMES,
-    collected_metrics_path,
-)
 from transport_study.tests.sample_data import SAMPLE_DIR, requires_sample_data
 
 
@@ -33,7 +31,6 @@ class TestCmodToCmod:
             },
             target_device="cmod-high",
             debug=True,
-            dry_run=False,
             # Must comfortably exceed target_test_set_size so a train candidate
             # pool remains after the test split (sample datasets have 100 shots)
             max_ds_size=100,

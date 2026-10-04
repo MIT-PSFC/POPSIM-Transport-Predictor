@@ -5,9 +5,9 @@ from types import SimpleNamespace
 import numpy as np
 import xarray as xr
 
+from transport_study.orchestration.case_reports import generate_case_report
 from transport_study.power_balance_transfer import study_metrics
-from transport_study.signals import HEATING_POWERS_MW
-from transport_study.transport_transfer.case_reports import generate_case_report
+from transport_study.transport_transfer.transport_transfer_study import TransportStudy
 
 N_TS = 40
 SHOTS = [101, 102]
@@ -16,7 +16,7 @@ SHOTS = [101, 102]
 def _device_ds() -> xr.Dataset:
     ip = np.concatenate([np.linspace(0.0, 1.0, 10), np.full(20, 1.0), np.linspace(1.0, 0.0, 10)])
     time = np.arange(N_TS) * 1e-3
-    data_vars = {sig: (("shot", "time_idx"), np.zeros((len(SHOTS), N_TS))) for sig in HEATING_POWERS_MW}
+    data_vars = {"power_additional_MW": (("shot", "time_idx"), np.zeros((len(SHOTS), N_TS)))}
     data_vars["ip_MA"] = (("shot", "time_idx"), np.stack([ip, ip]))
     return xr.Dataset(data_vars, coords={"shot": SHOTS, "time": (("shot", "time_idx"), np.stack([time, time]))})
 
@@ -43,7 +43,11 @@ def test_scalar_prereq_case_gets_a_report(tmp_path, monkeypatch):
     monkeypatch.setattr(study_metrics, "load_stage_dataset", lambda device: _device_ds())
     result_path = tmp_path / "result_data.nc"
     _scalar_result_ds().to_netcdf(result_path)
-    study = SimpleNamespace(result_path=lambda case: result_path)
+    study = SimpleNamespace(
+        result_path=lambda case: result_path,
+        ANALYSIS_METRICS_MODULE=TransportStudy.ANALYSIS_METRICS_MODULE,
+        ANALYSIS_REPORTS_MODULE=TransportStudy.ANALYSIS_REPORTS_MODULE,
+    )
 
     generate_case_report(study, "case.p_oh.td_cmod.freeze_True", tmp_path / "figures")
 

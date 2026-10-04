@@ -14,15 +14,23 @@ from popsim.ml import TrainConfig
 
 from transport_study.config import config
 
-# Environment shared by every GPU sbatch script (training and sweep agents).
-# Not an f-string: the shell parameter expansions must land literally
-GPU_JOB_ENV = """\
+# A hung SLURM controller must not freeze the orchestration loop
+SLURM_COMMAND_TIMEOUT_S = 120
+
+# Environment shared by every sbatch script
+SINGLE_THREAD_BLAS_ENV = """\
 # Single-thread host BLAS/OpenMP. Reservoir init runs np.linalg.eigvals whose
 # OpenBLAS threadpool can deadlock nondeterministically under core contention.
 # eigvals is tiny so single-threaded costs nothing.
 export OPENBLAS_NUM_THREADS=1
 export OMP_NUM_THREADS=1
+"""
 
+# Environment shared by every GPU sbatch script (training and sweep agents).
+# Not an f-string: the shell parameter expansions must land literally.
+GPU_JOB_ENV = (
+    SINGLE_THREAD_BLAS_ENV
+    + """
 # Compile XLA GPU programs serially. Parallel compilation threads can deadlock
 # under the 4-cpu cgroup, stalling the job during initial compilation.
 export XLA_FLAGS="${XLA_FLAGS:+$XLA_FLAGS }--xla_gpu_force_compilation_parallelism=1"
@@ -43,6 +51,89 @@ export JAX_PLATFORMS=cuda,cpu
 export XLA_PYTHON_CLIENT_PREALLOCATE=true
 export XLA_PYTHON_CLIENT_MEM_FRACTION=0.80
 """
+)
+
+# Start banner of a GPU job.
+# SLURM_JOB_GPUS is the physical index on the node, the uuid names the exact card for bad-hardware reports.
+# Not an f-string, job_name is filled in with str.format.
+GPU_JOB_BANNER = """\
+echo "=== $(date) job $SLURM_JOB_ID ({job_name}) start ==="
+echo "=== node $SLURMD_NODENAME gpu ${{SLURM_JOB_GPUS:-$CUDA_VISIBLE_DEVICES}} $(nvidia-smi --query-gpu=name,uuid --format=csv,noheader 2>/dev/null || echo nvidia-smi unavailable) ==="
+"""
+
+
+def _run_slurm(cmd: list[str], stdin: str | None = None) -> subprocess.CompletedProcess | None:
+    """The completed SLURM command, None (logged) when it timed out."""
+    try:
+        return subprocess.run(cmd, input=stdin, check=False, capture_output=True, text=True, timeout=SLURM_COMMAND_TIMEOUT_S)
+    except subprocess.TimeoutExpired:
+        logger.critical(f"{cmd[0]} timed out after {SLURM_COMMAND_TIMEOUT_S} s")
+        return None
+
+
+def _slurm_stdout(cmd: list[str], level: str = "CRITICAL") -> str | None:
+    """stdout of a SLURM query, None (logged at level) when it failed or timed out."""
+    result = _run_slurm(cmd)
+    if result is None:
+        return None
+    if result.returncode != 0:
+        logger.log(level, f"{cmd[0]} failed: {result.stderr}")
+        return None
+    return result.stdout
+
+
+def _count_lines(stdout: str) -> int:
+    return len(stdout.strip().split("\n")) if stdout.strip() else 0
+
+
+def sbatch_script(
+    job_name: str,
+    partition: str,
+    time_limit: str | None,
+    log_path: Path | str,
+    script_path: Path | str,
+    setup: str,
+    mem: str = "120G",
+    gres: str | None = None,
+    requeue: bool = False,
+) -> str:
+    """sbatch script that runs script_path with this interpreter after the setup shell lines, then deletes it.
+
+    Resubmitted attempts append to the same log_path.
+    A time_limit of None leaves the partition default.
+    """
+    time_line = f"\n#SBATCH --time={time_limit}" if time_limit else ""
+    gres_line = f"\n#SBATCH --gres={gres}" if gres else ""
+    requeue_line = "\n#SBATCH --requeue" if requeue else ""
+    return f"""\
+#!/bin/bash
+#SBATCH --job-name={job_name}
+#SBATCH --partition={partition}{time_line}{gres_line}
+#SBATCH --mem={mem}
+#SBATCH --cpus-per-task=4
+#SBATCH --export=ALL
+#SBATCH --output={log_path}
+#SBATCH --error={log_path}
+#SBATCH --open-mode=append{requeue_line}
+
+{setup}
+{sys.executable} {script_path}
+exit_code=$?
+rm -f {script_path}
+exit $exit_code
+"""
+
+
+def submit_sbatch(script: str, job_name: str, kind: str) -> bool:
+    """Submit an sbatch script, returns whether SLURM accepted it."""
+    result = _run_slurm(["sbatch"], stdin=script)
+    if result is None:
+        return False
+    if result.returncode != 0:
+        logger.error(f"sbatch failed for {kind} job {job_name}: {result.stderr}")
+        return False
+    logger.info(f"Submitted {kind} job {job_name}: {result.stdout.strip()}")
+    return True
 
 
 def importable_module(cls: type) -> str:
@@ -112,25 +203,10 @@ def count_running_jobs(job_name: str, partition: str | None = None) -> int:
     """
     if partition is None:
         partition = query_partitions()
-    result = subprocess.run(
-        [
-            "squeue",
-            "-p",
-            partition,
-            "-n",
-            job_name,
-            "--state=RUNNING,PENDING",
-            "--noheader",
-        ],
-        check=False,
-        capture_output=True,
-        text=True,
-    )
-    if result.returncode != 0:
-        logger.critical(f"squeue failed: {result.stderr}")
+    stdout = _slurm_stdout(["squeue", "-p", partition, "-n", job_name, "--state=RUNNING,PENDING", "--noheader"])
+    if stdout is None:
         return 999999  # Return a large number to prevent launching more jobs if squeue fails
-    # Count lines (each line is a job)
-    return len(result.stdout.strip().split("\n")) if result.stdout.strip() else 0
+    return _count_lines(stdout)
 
 
 def get_running_job_names(partition: str | None = None) -> set[str] | None:
@@ -144,26 +220,11 @@ def get_running_job_names(partition: str | None = None) -> set[str] | None:
     """
     if partition is None:
         partition = query_partitions()
-    result = subprocess.run(
-        [
-            "squeue",
-            "-p",
-            partition,
-            "-u",
-            getpass.getuser(),
-            "--state=RUNNING,PENDING",
-            "--noheader",
-            # Default %j truncates long names, and case names run long
-            "--format=%512j",
-        ],
-        check=False,
-        capture_output=True,
-        text=True,
-    )
-    if result.returncode != 0:
-        logger.critical(f"squeue failed: {result.stderr}")
+    # Default %j truncates long names, and case names run long
+    stdout = _slurm_stdout(["squeue", "-p", partition, "-u", getpass.getuser(), "--state=RUNNING,PENDING", "--noheader", "--format=%512j"])
+    if stdout is None:
         return None
-    return {line.strip() for line in result.stdout.splitlines() if line.strip()}
+    return {line.strip() for line in stdout.splitlines() if line.strip()}
 
 
 def get_running_job_elapsed_s(partition: str | None = None) -> dict[str, int] | None:
@@ -175,27 +236,12 @@ def get_running_job_elapsed_s(partition: str | None = None) -> dict[str, int] | 
     """
     if partition is None:
         partition = query_partitions()
-    result = subprocess.run(
-        [
-            "squeue",
-            "-p",
-            partition,
-            "-u",
-            getpass.getuser(),
-            "--state=RUNNING",
-            "--noheader",
-            # Default %j truncates long names, and case names run long
-            "--format=%512j %M",
-        ],
-        check=False,
-        capture_output=True,
-        text=True,
-    )
-    if result.returncode != 0:
-        logger.critical(f"squeue failed: {result.stderr}")
+    # Default %j truncates long names, and case names run long
+    stdout = _slurm_stdout(["squeue", "-p", partition, "-u", getpass.getuser(), "--state=RUNNING", "--noheader", "--format=%512j %M"])
+    if stdout is None:
         return None
     elapsed: dict[str, int] = {}
-    for line in result.stdout.splitlines():
+    for line in stdout.splitlines():
         if not line.strip():
             continue
         # %M has no internal whitespace, so the token after the last space is
@@ -220,29 +266,15 @@ def get_pending_job_pending_s(partition: str | None = None) -> dict[str, int] | 
     """
     if partition is None:
         partition = query_partitions()
-    result = subprocess.run(
-        [
-            "squeue",
-            "-p",
-            partition,
-            "-u",
-            getpass.getuser(),
-            "--state=PENDING",
-            "--noheader",
-            # Wide Name field because case names run long and -O truncates at
-            # the given width. PendingTime first so the name is the tail token.
-            "-O",
-            "PendingTime:20,Name:512",
-        ],
-        check=False,
-        capture_output=True,
-        text=True,
+    # Wide Name field because case names run long and -O truncates at the given width.
+    # PendingTime first so the name is the tail token.
+    stdout = _slurm_stdout(
+        ["squeue", "-p", partition, "-u", getpass.getuser(), "--state=PENDING", "--noheader", "-O", "PendingTime:20,Name:512"]
     )
-    if result.returncode != 0:
-        logger.critical(f"squeue failed: {result.stderr}")
+    if stdout is None:
         return None
     pending: dict[str, int] = {}
-    for line in result.stdout.splitlines():
+    for line in stdout.splitlines():
         if not line.strip():
             continue
         # PendingTime has no internal whitespace, so the token before the
@@ -270,23 +302,7 @@ def cancel_job(job_name: str, partition: str | None = None, state: str = "RUNNIN
     # comma-separated list as one literal (nonexistent) name, matching no jobs
     # while still exiting 0, so cancel each partition separately
     for single_partition in partition.split(","):
-        result = subprocess.run(
-            [
-                "scancel",
-                "-p",
-                single_partition,
-                "-u",
-                getpass.getuser(),
-                "-n",
-                job_name,
-                f"--state={state}",
-            ],
-            check=False,
-            capture_output=True,
-            text=True,
-        )
-        if result.returncode != 0:
-            logger.error(f"scancel failed for job {job_name}: {result.stderr}")
+        _slurm_stdout(["scancel", "-p", single_partition, "-u", getpass.getuser(), "-n", job_name, f"--state={state}"], level="ERROR")
 
 
 def count_idle_gpus(partition: str | None = None, buffer_gpus: int | None = None) -> int:
@@ -299,17 +315,11 @@ def count_idle_gpus(partition: str | None = None, buffer_gpus: int | None = None
         partition = config.partition
     if buffer_gpus is None:
         buffer_gpus = config.buffer_gpus
-    sinfo_result = subprocess.run(
-        ["sinfo", "-p", partition, "-N", "--Format=gres", "--noheader"],
-        check=False,
-        capture_output=True,
-        text=True,
-    )
-    if sinfo_result.returncode != 0:
-        logger.critical(f"sinfo failed: {sinfo_result.stderr}")
+    sinfo_stdout = _slurm_stdout(["sinfo", "-p", partition, "-N", "--Format=gres", "--noheader"])
+    if sinfo_stdout is None:
         return 0  # Return 0 to prevent launching more jobs if sinfo fails
     total = 0
-    for line in sinfo_result.stdout.strip().split("\n"):
+    for line in sinfo_stdout.strip().split("\n"):
         counts = re.findall(r"gpu:\w+:(\d+)", line)
         if counts:
             total += int(counts[0])
@@ -320,17 +330,11 @@ def count_idle_gpus(partition: str | None = None, buffer_gpus: int | None = None
     # Instead, sum GPU allocations only from jobs actually RUNNING in this
     # partition (squeue resolves %P to the single assigned partition for
     # running jobs, unlike the requested-partition list shown for pending ones).
-    squeue_result = subprocess.run(
-        ["squeue", "-p", partition, "--states=RUNNING", "-o", "%b", "--noheader"],
-        check=False,
-        capture_output=True,
-        text=True,
-    )
-    if squeue_result.returncode != 0:
-        logger.critical(f"squeue failed: {squeue_result.stderr}")
+    squeue_stdout = _slurm_stdout(["squeue", "-p", partition, "--states=RUNNING", "-o", "%b", "--noheader"])
+    if squeue_stdout is None:
         return 0  # Return 0 to prevent launching more jobs if squeue fails
     used = 0
-    for line in squeue_result.stdout.strip().split("\n"):
+    for line in squeue_stdout.strip().split("\n"):
         for count in re.findall(r"gpu:(?:\w+:)?(\d+)", line):
             used += int(count)
 
@@ -342,24 +346,10 @@ def count_pending_jobs(partition: str | None = None) -> int:
     """Count this user's pending jobs on the partition."""
     if partition is None:
         partition = config.partition
-    result = subprocess.run(
-        [
-            "squeue",
-            "-p",
-            partition,
-            "-u",
-            getpass.getuser(),
-            "--state=PENDING",
-            "--noheader",
-        ],
-        check=False,
-        capture_output=True,
-        text=True,
-    )
-    if result.returncode != 0:
-        logger.critical(f"squeue failed: {result.stderr}")
+    stdout = _slurm_stdout(["squeue", "-p", partition, "-u", getpass.getuser(), "--state=PENDING", "--noheader"])
+    if stdout is None:
         return 999999  # Return a large number to prevent launching more jobs if squeue fails
-    return len(result.stdout.strip().split("\n")) if result.stdout.strip() else 0
+    return _count_lines(stdout)
 
 
 def resources_available(partition: str | None = None, buffer_gpus: int | None = None) -> bool:
@@ -376,22 +366,10 @@ def count_user_jobs() -> int:
     Every job counts toward the association/QOS MaxSubmit ceilings no matter
     which partition it went to, so the spillover budget is based on this total.
     """
-    result = subprocess.run(
-        [
-            "squeue",
-            "-u",
-            getpass.getuser(),
-            "--state=RUNNING,PENDING",
-            "--noheader",
-        ],
-        check=False,
-        capture_output=True,
-        text=True,
-    )
-    if result.returncode != 0:
-        logger.critical(f"squeue failed: {result.stderr}")
+    stdout = _slurm_stdout(["squeue", "-u", getpass.getuser(), "--state=RUNNING,PENDING", "--noheader"])
+    if stdout is None:
         return 999999  # Return a large number to prevent launching more jobs if squeue fails
-    return len(result.stdout.strip().split("\n")) if result.stdout.strip() else 0
+    return _count_lines(stdout)
 
 
 _partition_info_cache: dict[str, dict[str, str]] = {}
@@ -404,16 +382,10 @@ def _partition_info(partition: str) -> dict[str, str]:
     silently disable QOS-capped spillover for the process lifetime."""
     if partition in _partition_info_cache:
         return _partition_info_cache[partition]
-    result = subprocess.run(
-        ["scontrol", "show", "partition", partition],
-        check=False,
-        capture_output=True,
-        text=True,
-    )
-    if result.returncode != 0 or not result.stdout.strip():
-        logger.warning(f"scontrol show partition {partition} failed: {result.stderr}")
+    stdout = _slurm_stdout(["scontrol", "show", "partition", partition], level="WARNING")
+    if not stdout or not stdout.strip():
         return {}
-    info = dict(token.split("=", 1) for token in result.stdout.split() if "=" in token)
+    info = dict(token.split("=", 1) for token in stdout.split() if "=" in token)
     _partition_info_cache[partition] = info
     return info
 
@@ -441,19 +413,13 @@ def partition_user_gpu_cap(partition: str) -> int | None:
     if qos in (None, "N/A"):
         _partition_user_gpu_cap_cache[partition] = None
         return None
-    result = subprocess.run(
-        ["sacctmgr", "-nP", "show", "qos", qos, "format=MaxTRESPU"],
-        check=False,
-        capture_output=True,
-        text=True,
-    )
-    if result.returncode != 0:
-        logger.warning(f"sacctmgr show qos {qos} failed: {result.stderr}")
+    stdout = _slurm_stdout(["sacctmgr", "-nP", "show", "qos", qos, "format=MaxTRESPU"], level="WARNING")
+    if stdout is None:
         return None
-    if not result.stdout.strip():
+    if not stdout.strip():
         logger.warning(f"sacctmgr show qos {qos} returned no output, not caching")
         return None
-    match = re.search(r"gres/gpu=(\d+)", result.stdout)
+    match = re.search(r"gres/gpu=(\d+)", stdout)
     cap = int(match.group(1)) if match else None
     _partition_user_gpu_cap_cache[partition] = cap
     return cap
@@ -487,27 +453,13 @@ def partition_time_limit_s(partition: str) -> int | None:
 
 def count_user_gpus(partition: str) -> int:
     """This user's allocated + requested GPUs among running and pending jobs on a partition."""
-    result = subprocess.run(
-        [
-            "squeue",
-            "-p",
-            partition,
-            "-u",
-            getpass.getuser(),
-            "--state=RUNNING,PENDING",
-            "--noheader",
-            "-O",
-            "tres-alloc:200",
-        ],
-        check=False,
-        capture_output=True,
-        text=True,
+    stdout = _slurm_stdout(
+        ["squeue", "-p", partition, "-u", getpass.getuser(), "--state=RUNNING,PENDING", "--noheader", "-O", "tres-alloc:200"]
     )
-    if result.returncode != 0:
-        logger.critical(f"squeue failed: {result.stderr}")
+    if stdout is None:
         return 999999  # Return a large number to prevent launching more jobs if squeue fails
-    # Generic gres/gpu=N only; the typed gres/gpu:<type>=N entry would double count
-    return sum(int(n) for n in re.findall(r"gres/gpu=(\d+)", result.stdout))
+    # Generic gres/gpu=N only, the typed gres/gpu:<type>=N entry would double count
+    return sum(int(n) for n in re.findall(r"gres/gpu=(\d+)", stdout))
 
 
 def spillover_budget() -> int:
@@ -561,17 +513,11 @@ def gpu_type_exclude_nodes(partition: str, allowed_gpu_types: tuple[str, ...]) -
     static. Returns "" (exclude nothing) if sinfo fails: a job that lands on
     a disallowed card still trains, just slowly.
     """
-    result = subprocess.run(
-        ["sinfo", "-p", partition, "-N", "--noheader", "-o", "%N %G"],
-        check=False,
-        capture_output=True,
-        text=True,
-    )
-    if result.returncode != 0:
-        logger.warning(f"sinfo failed while building the GPU-type exclude list for {partition}: {result.stderr}")
+    stdout = _slurm_stdout(["sinfo", "-p", partition, "-N", "--noheader", "-o", "%N %G"], level="WARNING")
+    if stdout is None:
         return ""
     nodes = set()
-    for line in result.stdout.splitlines():
+    for line in stdout.splitlines():
         node, _, gres = line.strip().partition(" ")
         gpu_types = re.findall(r"gpu:([A-Za-z0-9_]+):", gres)
         if gpu_types and not all(t.lower() in allowed_gpu_types for t in gpu_types):
@@ -606,17 +552,11 @@ def partition_gpu_type_counts(partition: str) -> tuple[tuple[str, int], ...]:
 
     Cached per partition, the hardware inventory is static. Empty if sinfo fails.
     """
-    result = subprocess.run(
-        ["sinfo", "-p", partition, "-N", "--noheader", "-o", "%G"],
-        check=False,
-        capture_output=True,
-        text=True,
-    )
-    if result.returncode != 0:
-        logger.warning(f"sinfo failed while listing GPU types for {partition}: {result.stderr}")
+    stdout = _slurm_stdout(["sinfo", "-p", partition, "-N", "--noheader", "-o", "%G"], level="WARNING")
+    if stdout is None:
         return ()
     counts: dict[str, int] = {}
-    for line in result.stdout.splitlines():
+    for line in stdout.splitlines():
         for gpu_type, count in re.findall(r"gpu:([\w.]+):(\d+)", line):
             counts[gpu_type.lower()] = counts.get(gpu_type.lower(), 0) + int(count)
     return tuple(sorted(counts.items(), key=lambda item: -item[1]))
@@ -651,13 +591,10 @@ def _sbatch_gpu_job(build_script: Callable[[str], str], job_name: str, partition
     """
     result = None
     for gres_fragment in _gres_fragments(partition):
-        result = subprocess.run(
-            ["sbatch"],
-            input=build_script(gres_fragment),
-            check=False,
-            capture_output=True,
-            text=True,
-        )
+        script = build_script(gres_fragment)
+        result = _run_slurm(["sbatch"], stdin=script)
+        if result is None:
+            return
         if result.returncode == 0:
             logger.info(f"Submitted {kind} job {job_name}: {result.stdout.strip()}")
             return
@@ -763,35 +700,11 @@ Path({str(study_config_path)!r}).unlink()
         script_path = f.name
     log_path = log_dir / f"{job_name}.log"
 
+    # Save results to netcdf only, no need to sync wandb runs online from batch jobs
+    setup = GPU_JOB_BANNER.format(job_name=job_name) + "\nexport WANDB_MODE=offline\n\n" + GPU_JOB_ENV
+
     def build_script(gres_fragment: str) -> str:
-        return f"""\
-#!/bin/bash
-#SBATCH --job-name={job_name}
-#SBATCH --partition={partition}
-#SBATCH --time={time_limit}
-#SBATCH --gres={gres_fragment}
-#SBATCH --mem=120G
-#SBATCH --cpus-per-task=4
-#SBATCH --export=ALL
-#SBATCH --output={log_path}
-#SBATCH --error={log_path}
-#SBATCH --open-mode=append
-#SBATCH --requeue
-
-# Resubmitted attempts share this log path, mark where each one starts.
-# SLURM_JOB_GPUS is the physical index on the node, the uuid names the exact card for bad-hardware reports.
-echo "=== $(date) job $SLURM_JOB_ID ({job_name}) start ==="
-echo "=== node $SLURMD_NODENAME gpu ${{SLURM_JOB_GPUS:-$CUDA_VISIBLE_DEVICES}} $(nvidia-smi --query-gpu=name,uuid --format=csv,noheader 2>/dev/null || echo nvidia-smi unavailable) ==="
-
-# Save results to netcdf only; no need to sync wandb runs online from batch jobs
-export WANDB_MODE=offline
-
-{GPU_JOB_ENV}
-{sys.executable} {script_path}
-exit_code=$?
-rm -f {script_path}
-exit $exit_code
-"""
+        return sbatch_script(job_name, partition, time_limit, log_path, script_path, setup, gres=gres_fragment, requeue=True)
 
     _sbatch_gpu_job(build_script, job_name, partition, "training")
 
@@ -855,30 +768,10 @@ Path({str(study_config_path)!r}).unlink()
     with open(script_path, "w") as f:
         f.write(py_script)
 
+    setup = GPU_JOB_BANNER.format(job_name=job_name) + "\n" + GPU_JOB_ENV
+
     def build_script(gres_fragment: str) -> str:
-        return f"""\
-#!/bin/bash
-#SBATCH --job-name={job_name}
-#SBATCH --partition={partition}
-#SBATCH --time={time_limit}
-#SBATCH --gres={gres_fragment}
-#SBATCH --mem=120G
-#SBATCH --cpus-per-task=4
-#SBATCH --export=ALL
-#SBATCH --output={log_path}
-#SBATCH --error={log_path}
-#SBATCH --requeue
-
-# SLURM_JOB_GPUS is the physical index on the node, the uuid names the exact card for bad-hardware reports.
-echo "=== $(date) job $SLURM_JOB_ID ({job_name}) start ==="
-echo "=== node $SLURMD_NODENAME gpu ${{SLURM_JOB_GPUS:-$CUDA_VISIBLE_DEVICES}} $(nvidia-smi --query-gpu=name,uuid --format=csv,noheader 2>/dev/null || echo nvidia-smi unavailable) ==="
-
-{GPU_JOB_ENV}
-{sys.executable} {script_path}
-exit_code=$?
-rm -f {script_path}
-exit $exit_code
-"""
+        return sbatch_script(job_name, partition, time_limit, log_path, script_path, setup, gres=gres_fragment, requeue=True)
 
     _sbatch_gpu_job(build_script, job_name, partition, "agent")
 
@@ -890,10 +783,8 @@ def launch_case_analysis_parallel(study, case) -> None:
     numpy bound with no GPU work, so it goes to config.analysis_partition when
     set (config.partition otherwise) and requests no GPU.
 
-    The job imports the study's analysis modules from its
-    ANALYSIS_METRICS_MODULE / ANALYSIS_REPORTS_MODULE ClassVars: the metrics
-    module must export ``compute_and_save_case_metrics(study, case)`` and the
-    reports module ``generate_case_report(study, case, figure_dir)``.
+    The job runs orchestration.case_metrics and orchestration.case_reports,
+    which pick up the study's own pieces from its ANALYSIS_METRICS_MODULE / ANALYSIS_REPORTS_MODULE ClassVars.
     """
     partition = config.analysis_partition or config.partition
     log_dir = study.working_dir / "logs" / "logs_analysis"
@@ -913,8 +804,8 @@ def launch_case_analysis_parallel(study, case) -> None:
     py_script = f"""\
 from pathlib import Path
 from {importable_module(study_cls)} import {study_cls.__name__}
-from {study_cls.ANALYSIS_REPORTS_MODULE} import generate_case_report
-from {study_cls.ANALYSIS_METRICS_MODULE} import compute_and_save_case_metrics
+from transport_study.orchestration.case_metrics import compute_and_save_case_metrics
+from transport_study.orchestration.case_reports import generate_case_report
 
 study = {study_cls.__name__}(Path({study_config_path!r}))
 case = next(c for c in study.cases if str(c) == {case_str!r})
@@ -930,115 +821,12 @@ Path({study_config_path!r}).unlink()
         script_path = f.name
     log_path = log_dir / f"{job_name}.log"
 
-    sbatch_script = f"""\
-#!/bin/bash
-#SBATCH --job-name={job_name}
-#SBATCH --partition={partition}
-#SBATCH --time={config.analysis_time_limit}
-#SBATCH --mem=32G
-#SBATCH --cpus-per-task=4
-#SBATCH --export=ALL
-#SBATCH --output={log_path}
-#SBATCH --error={log_path}
-#SBATCH --open-mode=append
-
-# Resubmitted attempts share this log path, mark where each one starts
+    # Analysis is cpu-only.
+    # Pinning jax keeps behavior identical regardless of the driver env and skips the cuda plugin init on cpu partitions.
+    setup = f"""\
 echo "=== $(date) job $SLURM_JOB_ID ({job_name}) start on $SLURMD_NODENAME ==="
-
 export MPLBACKEND=Agg
-# Single-thread host BLAS/OpenMP. Reservoir init runs np.linalg.eigvals whose
-# OpenBLAS threadpool can deadlock nondeterministically under core contention.
-# eigvals is tiny so single-threaded costs nothing.
-export OPENBLAS_NUM_THREADS=1
-export OMP_NUM_THREADS=1
-
-# Analysis is cpu-only. Pin jax so behavior is identical regardless of driver env
-# and cuda plugin init is skipped on cpu partitions.
 export JAX_PLATFORMS=cpu
-
-{sys.executable} {script_path}
-exit_code=$?
-rm -f {script_path}
-exit $exit_code
-"""
-
-    result = subprocess.run(["sbatch"], input=sbatch_script, check=False, capture_output=True, text=True)
-    if result.returncode != 0:
-        logger.error(f"sbatch failed for analysis job {job_name}: {result.stderr}")
-    else:
-        logger.info(f"Submitted analysis job {job_name}: {result.stdout.strip()}")
-
-
-def launch_trajopt_case_parallel(
-    trajopt,
-    case,
-) -> None:
-    """Submit a SLURM job that trains and generates output for a single trajectory optimization case."""
-    log_dir = trajopt.working_dir / "logs"
-    log_dir.mkdir(parents=True, exist_ok=True)
-
-    init_kwargs = {
-        "name": trajopt.name,
-        "working_dir_base": trajopt.working_dir.parent,
-        "profile_module_checkpoint_dir": trajopt.profile_module_checkpoint_dir,
-        "traj_times": trajopt.traj_times,
-        "max_num_traj_times": trajopt.max_num_traj_times,
-    }
-    case_str = str(case)
-
-    py_script = f"""\
-# init_kwargs contains Path objects whose repr is PosixPath('...')
-from pathlib import PosixPath  # noqa: F401
-
-from transport_study.trajectory_optimization.optimize import TrajectoryOptimization
-
-trajopt = TrajectoryOptimization(**{init_kwargs!r})
-case = next(c for c in trajopt.cases if str(c) == {case_str!r})
-
-if not trajopt.checkpoint_dir(case).exists():
-    trajopt.run_case(case)
-
-if not trajopt.output_path(case).exists():
-    trajopt.output_optimized_trajectory(case)
-"""
-
-    job_name = trajopt.train_job_name(case)
-    log_path = log_dir / f"{job_name}.log"
-
-    with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False, prefix=f"{job_name}_", dir=log_dir) as f:
-        f.write(py_script)
-        script_path = f.name
-
-    sbatch_script = f"""\
-#!/bin/bash
-#SBATCH --job-name={job_name}
-#SBATCH --partition={config.partition}
-#SBATCH --gres=gpu:1
-#SBATCH --mem=120G
-#SBATCH --cpus-per-task=4
-#SBATCH --export=ALL
-#SBATCH --output={log_path}
-#SBATCH --error={log_path}
-#SBATCH --open-mode=append
-#SBATCH --requeue
-
-# Resubmitted attempts share this log path, mark where each one starts
-echo "=== $(date) job $SLURM_JOB_ID ({job_name}) start ==="
-
-export WANDB_MODE=offline
-# Single-thread host BLAS/OpenMP. Reservoir init runs np.linalg.eigvals whose
-# OpenBLAS threadpool can deadlock nondeterministically under core contention.
-# eigvals is tiny so single-threaded costs nothing.
-export OPENBLAS_NUM_THREADS=1
-export OMP_NUM_THREADS=1
-{sys.executable} {script_path}
-exit_code=$?
-rm -f {script_path}
-exit $exit_code
-"""
-
-    result = subprocess.run(["sbatch"], input=sbatch_script, check=False, capture_output=True, text=True)
-    if result.returncode != 0:
-        logger.error(f"sbatch failed for {job_name}: {result.stderr}")
-    else:
-        logger.info(f"Submitted SLURM job {job_name}: {result.stdout.strip()}")
+{SINGLE_THREAD_BLAS_ENV}"""
+    script = sbatch_script(job_name, partition, config.analysis_time_limit, log_path, script_path, setup, mem="32G")
+    submit_sbatch(script, job_name, "analysis")

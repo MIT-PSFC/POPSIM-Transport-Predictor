@@ -87,9 +87,6 @@ def restore_profile_predictor(
     if isinstance(profile_predictor_config, TrainConfig):
         profile_predictor_config = profile_predictor_config.model_dump()
 
-    # Don't need the full dataloader, only want rho grid
-    profile_predictor_config["dataloader_config"]["debug"] = True
-
     _, profile_predictor_train_dl, _, _ = ProfilePredictorTRB.get_dataloaders(profile_predictor_config["dataloader_config"])
     profile_predictor = ProfilePredictorTRB.model_init(
         profile_predictor_train_dl,

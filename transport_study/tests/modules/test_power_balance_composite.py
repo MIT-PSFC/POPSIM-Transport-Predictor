@@ -181,6 +181,7 @@ def test_structured_outputs_carry_submodule_predictions():
         p_oh_predictor=p_oh,
         p_rad_predictor=p_rad,
         normalizer=make_normalizer("raw", None, 1, target_idx=0),
+        prng_seed=42,
     )
     scalinglaw = PowerBalanceScalingLaw.init(p_oh_predictor=p_oh, p_rad_predictor=p_rad)
     for module in (sciml, scalinglaw):

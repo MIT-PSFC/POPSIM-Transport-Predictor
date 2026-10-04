@@ -11,7 +11,12 @@ from popsim.ml.split_utils import split_dataset_by_fracs
 from transport_validation_datasets.machine.generic import UNIFORM_TIMEBASE_DT
 
 from transport_study import EPISODE_DIM, RADIAL_DIM, TIME_COORD, TIME_DIM
-from transport_study.config import RHO_GRID, TRAIN_VAL_SPLIT, config
+from transport_study.config import (
+    DEBUG_MAX_SOURCE_SHOTS,
+    RHO_GRID,
+    TRAIN_VAL_SPLIT,
+    config,
+)
 from transport_study.modules import plasma_parameters
 from transport_study.modules.normalization import (
     NORM_INPUT_VARS,
@@ -20,6 +25,7 @@ from transport_study.modules.normalization import (
     apply_z_score,
     fit_coral_stats,
     fit_z_score_stats,
+    flat_columns,
     identity_coral_stats,
     physics_feature_vec,
 )
@@ -268,8 +274,6 @@ def _transport_transfer(ds: xr.Dataset) -> xr.Dataset:
     No fresh-profile filter: the time-dependent rollouts need contiguous segments,
     so the forward-filled profile timeslices stay in as targets
     and fresh_profile rides along as data for masking downstream.
-    The shape variables let the sciml profile submodule skeleton run its
-    PCA / k-means initial guess on this dataset (ProfilePredictorTRB.model_init).
     """
     return to_rho_grid(ds)
 
@@ -288,7 +292,8 @@ def get_ds(
     """Open a device store and prepare it for one study.
 
     Reads only the store signals the study needs (the power balance study never loads the profiles),
-    converts to working units, keeps the max_ds_size most recent shots,
+    converts to working units, keeps the max_ds_size most recent shots
+    (and in debug at most DEBUG_MAX_SOURCE_SHOTS of a source device, the target keeps every shot),
     checks every shot is one contiguous 1 kHz segment,
     adds the hazard metric on the full 0D series so every study holds out the same target shots,
     drops the shots without one, then runs the study's prep.
@@ -321,9 +326,12 @@ def get_ds(
 
     ds = ds.sortby(EPISODE_DIM, ascending=False)  # Most recent shots first
     n_shots_stored = ds.sizes[EPISODE_DIM]
-    if config.max_ds_size is not None and n_shots_stored > config.max_ds_size:
-        logger.warning(f"max_ds_size keeps the {config.max_ds_size} most recent of the {n_shots_stored} {source_ds} shots")
-        ds = ds.isel({EPISODE_DIM: slice(0, config.max_ds_size)})
+    max_shots = config.max_ds_size
+    if config.debug and source_ds != config.target_device:
+        max_shots = DEBUG_MAX_SOURCE_SHOTS if max_shots is None else min(max_shots, DEBUG_MAX_SOURCE_SHOTS)
+    if max_shots is not None and n_shots_stored > max_shots:
+        logger.warning(f"Keeping the {max_shots} most recent of the {n_shots_stored} {source_ds} shots")
+        ds = ds.isel({EPISODE_DIM: slice(0, max_shots)})
 
     check_uniform_timebase(ds)
 
@@ -377,56 +385,30 @@ def add_hazard(
     return ds
 
 
-def normalize_domain(
-    ds_source: xr.Dataset,
-    ds_target: xr.Dataset | None = None,
-    method: str = "raw",
-    feature_space: str = "power_balance",
-) -> tuple[xr.Dataset, xr.Dataset | None]:
-    """Apply the specified domain normalization method to the dataset.
+def normalize_domain(ds: xr.Dataset, method: str = "raw", feature_space: str = "power_balance") -> xr.Dataset:
+    """Apply a domain normalization method to a dataset holding every device, for data visualization only.
 
-    Thin wrapper around transport_study.modules.normalization: the per-method
-    math (physics features, per-device z-score, CORAL) is exactly the module
-    implementation the models consume, fitted here from ds_source and applied
-    to both datasets. Used for data visualization only. Datasets are modified
-    in place and returned.
+    Thin wrapper around transport_study.modules.normalization:
+    the per-method math (physics features, per-device z-score, CORAL) is exactly the module implementation the models consume,
+    fitted on ds and applied to it.
+    The dataset is modified in place and returned.
 
-    ds_source is used to inform the normalization parameters (e.g. mean and std for z-score, covariance for coral),
-    but the normalization is applied to both source and target datasets.
-
-    feature_space selects which model family's features the stat stage runs on,
+    feature_space selects which model family's features the physics* methods run on,
     so each study visualizes what its own modules consume:
-        - "power_balance": the 7 physics features of normalization.physics_feature_vec
-          (q_star, epsilon, aB0, f_G, surface_power_density, ...), fitted over the
-          7 physical inputs
+        - "power_balance": the 7 physics features of normalization.physics_feature_vec, fitted over the 7 physical inputs
         - "profile": the 10 dimensionless nn_inputs of the profile predictor
-          (beta, q_star, epsilon, f_G, aB0, beta_tor_norm, elongation,
-          triangularity_upper, triangularity_lower, log_nu_star)
-        - "transport": those 10 slots with the beta-derived ones computed from
-          the measured energy_mhd_MJ, plus the normalized aux power (paux_norm)
-    Only the physics* methods honor it, the raw-variable methods ("zscore",
-    "coral") are power-balance inputs by definition.
+        - "transport": those 10 slots with the beta-derived ones from the measured energy_mhd_MJ, plus paux_norm
+    The raw-variable methods ("zscore", "coral") are power-balance inputs by definition.
 
     Methods:
-        - "raw": No normalization, ip_MA, energy_mhd_MJ, etc. are in their working units
-        - "physics": The module's dimensionless features. In the power-balance space that is
-          (q_star, epsilon, aB0, f_G, surface_power_density) plus beta as a visualization-only extra,
-          in the profile space the nn_inputs themselves (which carry their own beta)
-        - "zscore": Within each device, normalize each variable to zero mean and unit variance. Variable gets a `_z` suffix after normalization. energy_mhd_MJ is a visualization-only extra column (harmless, z-scoring is per-variable)
-        - "coral": CORAL alignment of every device's covariance to the target device's, over exactly the model's 7 input vars.
-          Variable gets a `_coral` suffix after normalization.
-        - "physics-coral": The same CORAL alignment over the physics features of the selected feature space.
-          Variable gets a `_pcoral` suffix (a `_coral` suffix would collide with the raw coral vars).
-        - "physics-zscore": Per-device z-score over the physics features of the selected feature space. Variable gets a `_pz` suffix.
-
-    Args:
-        ds_source: The source dataset (e.g. historic data)
-        ds_target: The target dataset (e.g. DIII-D high-hazard shots)
-        method: The normalization method to apply
-        feature_space: Which model family's feature vector the physics* methods use
-
-    Returns:
-        The normalized source and target datasets.
+        - "raw": no normalization, variables stay in their working units
+        - "physics": the module's dimensionless features.
+          The power-balance space adds beta as a visualization-only extra, the other spaces carry their own beta slot.
+        - "zscore": per-device zero mean and unit variance of each variable, `_z` suffix.
+          energy_mhd_MJ is a visualization-only extra column.
+        - "coral": CORAL alignment of every device's covariance to the target device's over the 7 input vars, `_coral` suffix
+        - "physics-coral": the same CORAL alignment over the physics features of the feature space, `_pcoral` suffix
+        - "physics-zscore": per-device z-score over the physics features of the feature space, `_pz` suffix
     """
     physics_names: tuple[str, ...]
     physics_source_vars: tuple[str, ...]
@@ -451,119 +433,83 @@ def normalize_domain(
         physics_names, physics_source_vars, physics_matrix_fn = PHYSICS_FEATURE_NAMES, NORM_INPUT_VARS, None
     else:
         raise ValueError(f"Unknown feature space: {feature_space}")
-    datasets = [ds_source] if ds_target is None else [ds_source, ds_target]
+    # Broadcast template carrying the full per-sample dims
+    reference = ds[NORM_INPUT_VARS[0]]
 
-    def _reference(ds: xr.Dataset) -> xr.DataArray:
-        # Broadcast template carrying the full per-sample dims
-        return ds[NORM_INPUT_VARS[0]]
-
-    def _feature_matrix_for(ds: xr.Dataset, variables: tuple[str, ...]) -> np.ndarray:
-        reference = _reference(ds)
+    def _feature_matrix_for(variables: tuple[str, ...]) -> np.ndarray:
         missing = [var for var in variables if var not in ds]
         if missing:
             raise ValueError(f"Feature matrix needs {missing}, the dataset lacks them")
-        columns = [np.asarray(ds[var].broadcast_like(reference).values, dtype=float).ravel() for var in variables]
-        return np.column_stack(columns)
+        return flat_columns(ds, variables)
 
-    def _physics_matrix(ds: xr.Dataset) -> np.ndarray:
+    def _physics_matrix() -> np.ndarray:
         if physics_matrix_fn is not None:
             return physics_matrix_fn(ds)
-        raw = jnp.asarray(_feature_matrix_for(ds, NORM_INPUT_VARS))
+        raw = jnp.asarray(_feature_matrix_for(NORM_INPUT_VARS))
         return np.asarray(jax.vmap(physics_feature_vec)(raw))
 
-    # Physics slots that are identity mappings of a raw input var of the same name
-    identity_slots = set(physics_source_vars)
-
-    def _write_features(ds: xr.Dataset, matrix: np.ndarray, names: tuple[str, ...], suffix: str) -> None:
-        reference = _reference(ds)
+    def _write_features(matrix: np.ndarray, names: tuple[str, ...], suffix: str) -> None:
         for j, name in enumerate(names):
             ds[f"{name}{suffix}"] = (reference.dims, np.asarray(matrix[:, j], dtype=float).reshape(reference.shape))
 
-    def _add_physics_vars(ds: xr.Dataset) -> None:
-        phys = _physics_matrix(ds)
-        reference = _reference(ds)
-        for j, name in enumerate(physics_names):
-            # Identity slots (ip_MA / elongation, plus beta_tor_norm / triangularity_* in the profile
-            # feature space) already exist as raw vars
-            if name in identity_slots:
-                continue
-            ds[name] = (reference.dims, np.asarray(phys[:, j], dtype=float).reshape(reference.shape))
-        if feature_space != "power_balance":
-            # The profile and transport feature vectors carry their own beta slot
-            return
-        # beta needs the stored energy, which is the predicted state rather than
-        # a model input, so it is a visualization-only extra.
-        # The same fraction the modules call beta, through the store's betan formula with volume_approx
-        volume_m3 = plasma_parameters.volume_approx(ds["geometric_axis_r"], ds["minor_radius"], ds["elongation"])
-        beta_tor_norm = plasma_parameters.beta_tor_norm_from_energy_mhd_MJ(
-            ds["energy_mhd_MJ"], volume_m3, ds["minor_radius"], ds["b0"], ds["ip_MA"]
-        )
-        ds["beta"] = plasma_parameters.beta_tor_from_beta_tor_norm(beta_tor_norm, ds["ip_MA"], ds["minor_radius"], ds["b0"])
-
     if method == "raw":
-        return ds_source, ds_target
+        return ds
     if method == "physics":
-        for ds in datasets:
-            _add_physics_vars(ds)
-        return ds_source, ds_target
+        physics_matrix = _physics_matrix()
+        # Physics slots that are identity mappings of a raw input var already exist as raw vars
+        identity_slots = set(physics_source_vars)
+        for j, name in enumerate(physics_names):
+            if name not in identity_slots:
+                ds[name] = (reference.dims, np.asarray(physics_matrix[:, j], dtype=float).reshape(reference.shape))
+        if feature_space == "power_balance":
+            # beta needs the stored energy, the predicted state rather than a model input, so it is a visualization-only extra.
+            # The same fraction the modules call beta, through the store's betan formula with volume_approx.
+            volume_m3 = plasma_parameters.volume_approx(ds["geometric_axis_r"], ds["minor_radius"], ds["elongation"])
+            beta_tor_norm = plasma_parameters.beta_tor_norm_from_energy_mhd_MJ(
+                ds["energy_mhd_MJ"], volume_m3, ds["minor_radius"], ds["b0"], ds["ip_MA"]
+            )
+            ds["beta"] = plasma_parameters.beta_tor_from_beta_tor_norm(beta_tor_norm, ds["ip_MA"], ds["minor_radius"], ds["b0"])
+        return ds
 
-    # Stat-bearing methods key per-device statistics on an integer index built
-    # locally from the ds_source coordinate (the modules use the global
-    # config.ds_source_to_idx, but any consistent indexing gives the same stats)
-    registry: dict[str, int] = {}
-    for ds in datasets:
-        for device in np.atleast_1d(ds.coords["ds_source"].values):
-            registry.setdefault(str(device), len(registry))
-
-    def _source_idx_for(ds: xr.Dataset) -> np.ndarray:
-        idx_da = xr.apply_ufunc(np.vectorize(lambda d: registry[str(d)]), ds.coords["ds_source"])
-        return np.asarray(idx_da.broadcast_like(_reference(ds)).values).ravel().astype(int)
+    # Stat-bearing methods key per-device statistics on an integer index built locally from the ds_source coordinate.
+    # The modules use the global config.ds_source_to_idx, any consistent indexing gives the same stats.
+    registry = {str(device): idx for idx, device in enumerate(dict.fromkeys(np.atleast_1d(ds.coords["ds_source"].values)))}
+    source_idx_da = xr.apply_ufunc(np.vectorize(lambda d: registry[str(d)]), ds.coords["ds_source"])
+    source_idx = np.asarray(source_idx_da.broadcast_like(reference).values).ravel().astype(int)
 
     if method == "zscore":
         zscore_vars = (*NORM_INPUT_VARS, "energy_mhd_MJ")
-        means, stds = fit_z_score_stats(_feature_matrix_for(ds_source, zscore_vars), _source_idx_for(ds_source), len(registry))
-        for ds in datasets:
-            matrix = apply_z_score(jnp.asarray(_feature_matrix_for(ds, zscore_vars)), _source_idx_for(ds), means, stds)
-            _write_features(ds, np.asarray(matrix), zscore_vars, "_z")
-        return ds_source, ds_target
-
+        zscore_inputs = _feature_matrix_for(zscore_vars)
+        means, stds = fit_z_score_stats(zscore_inputs, source_idx, len(registry))
+        zscore_matrix = apply_z_score(jnp.asarray(zscore_inputs), source_idx, means, stds)
+        _write_features(np.asarray(zscore_matrix), zscore_vars, "_z")
+        return ds
     if method == "physics-zscore":
-        means, stds = fit_z_score_stats(_physics_matrix(ds_source), _source_idx_for(ds_source), len(registry))
-        for ds in datasets:
-            matrix = apply_z_score(jnp.asarray(_physics_matrix(ds)), _source_idx_for(ds), means, stds)
-            _write_features(ds, np.asarray(matrix), physics_names, "_pz")
-        return ds_source, ds_target
+        physics_matrix = _physics_matrix()
+        means, stds = fit_z_score_stats(physics_matrix, source_idx, len(registry))
+        zscore_matrix = apply_z_score(jnp.asarray(physics_matrix), source_idx, means, stds)
+        _write_features(np.asarray(zscore_matrix), physics_names, "_pz")
+        return ds
+    if method not in ("coral", "physics-coral"):
+        raise ValueError(f"Unknown normalization method: {method}")
 
-    def _shot_idx_for(ds: xr.Dataset) -> np.ndarray:
-        return np.asarray(ds.coords["shot"].broadcast_like(_reference(ds)).values).ravel()
-
-    def _coral_normalization(variables: tuple[str, ...], suffix: str, matrix_fn) -> None:
-        # Every device aligns to the target device's covariance, all keep the identity transform without the target.
-        # Source devices below MIN_CORAL_SHOTS keep the identity transform, so their features pass through raw.
-        # Rows with any NaN feature come out all-NaN (the joint transform needs complete rows).
-        stats = None
-        if config.target_device in registry:
-            stats = fit_coral_stats(
-                matrix_fn(ds_source),
-                _source_idx_for(ds_source),
-                len(registry),
-                _shot_idx_for(ds_source),
-                registry[config.target_device],
-            )
-        means, transforms = identity_coral_stats(len(registry), len(variables)) if stats is None else stats
-        batched_apply = jax.vmap(apply_coral, in_axes=(0, 0, None, None))
-        for ds in datasets:
-            matrix = batched_apply(jnp.asarray(matrix_fn(ds)), jnp.asarray(_source_idx_for(ds)), means, transforms)
-            _write_features(ds, np.asarray(matrix), variables, suffix)
-
+    # Every device aligns to the target device's covariance, all keep the identity transform without the target.
+    # Source devices below MIN_CORAL_SHOTS keep the identity transform, so their features pass through raw.
+    # Rows with any NaN feature come out all-NaN (the joint transform needs complete rows).
+    coral_names: tuple[str, ...]
     if method == "coral":
-        _coral_normalization(NORM_INPUT_VARS, "_coral", lambda ds: _feature_matrix_for(ds, NORM_INPUT_VARS))
-        return ds_source, ds_target
-    if method == "physics-coral":
-        _coral_normalization(physics_names, "_pcoral", _physics_matrix)
-        return ds_source, ds_target
-
-    raise ValueError(f"Unknown normalization method: {method}")
+        coral_names, coral_suffix, coral_inputs = NORM_INPUT_VARS, "_coral", _feature_matrix_for(NORM_INPUT_VARS)
+    else:
+        coral_names, coral_suffix, coral_inputs = physics_names, "_pcoral", _physics_matrix()
+    stats = None
+    if config.target_device in registry:
+        shot_idx = np.asarray(ds.coords["shot"].broadcast_like(reference).values).ravel()
+        stats = fit_coral_stats(coral_inputs, source_idx, len(registry), shot_idx, registry[config.target_device])
+    means, transforms = identity_coral_stats(len(registry), len(coral_names)) if stats is None else stats
+    batched_apply = jax.vmap(apply_coral, in_axes=(0, 0, None, None))
+    coral_matrix = batched_apply(jnp.asarray(coral_inputs), jnp.asarray(source_idx), means, transforms)
+    _write_features(np.asarray(coral_matrix), coral_names, coral_suffix)
+    return ds
 
 
 def get_train_val_datasets(

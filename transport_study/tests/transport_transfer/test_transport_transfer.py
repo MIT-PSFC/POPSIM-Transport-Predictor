@@ -65,7 +65,7 @@ def test_power_balance_submodule_twins_follow_their_own_normalization(
 
 
 def test_power_balance_data_normalization_is_validated():
-    with pytest.raises(ValueError, match="power balance data normalization"):
+    with pytest.raises(ValueError, match="power_balance_data_normalization"):
         _load_transport_config(power_balance_data_normalization="bogus")
 
 

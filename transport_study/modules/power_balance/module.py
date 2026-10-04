@@ -1,3 +1,5 @@
+import abc
+
 import chex
 import equinox as eqx
 import jax
@@ -13,7 +15,12 @@ from transport_study.modules.normalization import InputNormalizer
 from transport_study.modules.power_balance.p_oh.module import OhmicPower
 from transport_study.modules.power_balance.p_rad.module import RadiatedPower
 
-MIN_TAUE = 0.001  # Default minimum reasonable value for tau_e [s]
+# Model types with p_oh / p_rad submodule predictors, each trained as its own prereq case
+MODEL_TYPES_WITH_SUBMODULES = ("sciml-taue-scalinglaw", "sciml-taue-nn")
+# The submodule pseudo-model-types of those prereq cases
+SUBMODULE_MODEL_TYPES = ("p_oh", "p_rad")
+
+MIN_TAUE = 0.001  # Minimum reasonable value for tau_e [s]
 MAX_TAUE = 0.8  # Maximum reasonable value for tau_e [s]
 
 # Floor smoothing width of the scaling-law tau_e clamp [s], kept narrow so
@@ -94,8 +101,6 @@ class ScalingLawPredictor(eqx.Module):
     scaling_hmode: dict[str, Array]
     scaling_lh_transition: dict[str, Array]
 
-    min_taue: float = eqx.field(static=True)
-    max_taue: float = eqx.field(static=True)
     isotope_mass: float = eqx.field(static=True, default=2)  # Assume DD operation, the source devices carry no per-shot isotope signal
 
     @chex.dataclass
@@ -123,24 +128,13 @@ class ScalingLawPredictor(eqx.Module):
         def P_abs_MW(self):
             return self.power_additional_MW + self.power_ohm_MW
 
-    def __init__(
-        self,
-        scaling_lmode: dict[str, ArrayLike] | None = None,
-        scaling_hmode: dict[str, ArrayLike] | None = None,
-        scaling_lh_transition: dict[str, ArrayLike] | None = None,
-        min_taue: float | None = None,
-        max_taue: float | None = None,
-    ):
+    def __init__(self):
+        """ITER89-P L-mode, IPB98(y,2) H-mode and the 1996 L-H threshold as the starting coefficients."""
         # Cast to float arrays so every coefficient is an inexact-array leaf
         # (python float or int values would be dropped by eqx.is_inexact_array)
-        scaling_lmode = scaling_lmode if scaling_lmode is not None else self.create_iter89()
-        scaling_hmode = scaling_hmode if scaling_hmode is not None else self.create_ipb98()
-        scaling_lh_transition = scaling_lh_transition if scaling_lh_transition is not None else self.create_iter1996()
-        self.scaling_lmode = {k: jnp.asarray(v, dtype=float) for k, v in scaling_lmode.items()}
-        self.scaling_hmode = {k: jnp.asarray(v, dtype=float) for k, v in scaling_hmode.items()}
-        self.scaling_lh_transition = {k: jnp.asarray(v, dtype=float) for k, v in scaling_lh_transition.items()}
-        self.min_taue = MIN_TAUE if min_taue is None else min_taue
-        self.max_taue = MAX_TAUE if max_taue is None else max_taue
+        self.scaling_lmode = {k: jnp.asarray(v, dtype=float) for k, v in self.create_iter89().items()}
+        self.scaling_hmode = {k: jnp.asarray(v, dtype=float) for k, v in self.create_ipb98().items()}
+        self.scaling_lh_transition = {k: jnp.asarray(v, dtype=float) for k, v in self.create_iter1996().items()}
 
     def __call__(self, inp: Inputs) -> TauePredictorOutputs:
         # Ensure each of the input values is strictly greater than 0.001 to avoid numerical instability.
@@ -191,8 +185,8 @@ class ScalingLawPredictor(eqx.Module):
         # which a range-fraction min width would distort by tens of percent.
         # (BoundedNNPredictor keeps symmetric widths, its clamp input is a raw
         # NN output with no physical meaning)
-        width_max = BOUND_CLAMP_WIDTH_FRAC * (self.max_taue - self.min_taue)
-        bounded = smooth_clamp(taue, self.min_taue, self.max_taue, TAUE_CLAMP_MIN_WIDTH, width_max)
+        width_max = BOUND_CLAMP_WIDTH_FRAC * (MAX_TAUE - MIN_TAUE)
+        bounded = smooth_clamp(taue, MIN_TAUE, MAX_TAUE, TAUE_CLAMP_MIN_WIDTH, width_max)
         taue_pred = bounded.squeeze()
 
         out = TauePredictorOutputs(
@@ -325,62 +319,33 @@ class PowerBalance(TimeDepModule):
         return jnp.where(wtot_mj <= MIN_WTOT_MJ, jnp.maximum(bounded, 0.0), bounded)
 
 
-class PowerBalanceScalingLaw(PowerBalance):
-    taue_predictor: ScalingLawPredictor
-    p_oh_predictor: OhmicPower
-    p_rad_predictor: RadiatedPower
+class PowerBalanceTaue(PowerBalance):
+    """Base of the tau_e models, dW/dt = P_aux + P_oh - P_rad - Wtot / tau_e with predicted P_oh and P_rad.
 
-    @classmethod
-    def init(
-        cls,
-        p_oh_predictor: OhmicPower,
-        p_rad_predictor: RadiatedPower,
-        scaling_lmode: dict[str, ArrayLike] | None = None,
-        scaling_hmode: dict[str, ArrayLike] | None = None,
-        scaling_lh_transition: dict[str, ArrayLike] | None = None,
-        min_taue: float = MIN_TAUE,
-        max_taue: float = MAX_TAUE,
-    ) -> "PowerBalanceScalingLaw":
-        taue_predictor = ScalingLawPredictor(
-            scaling_lmode=scaling_lmode,
-            scaling_hmode=scaling_hmode,
-            scaling_lh_transition=scaling_lh_transition,
-            min_taue=min_taue,
-            max_taue=max_taue,
-        )
-        return cls(
-            taue_predictor=taue_predictor,
-            p_oh_predictor=p_oh_predictor,
-            p_rad_predictor=p_rad_predictor,
-        )
+    Subclasses declare the submodule fields and implement predict_taue.
+    """
+
+    p_oh_predictor: eqx.AbstractVar[OhmicPower]
+    p_rad_predictor: eqx.AbstractVar[RadiatedPower]
+
+    @abc.abstractmethod
+    def predict_taue(
+        self, inputs: PowerBalance.Inputs, normalizer_inputs: InputNormalizer.Inputs, power_ohm_MW: ArrayLike
+    ) -> TauePredictorOutputs:
+        """tau_e from the physical inputs, their normalizer view and the predicted ohmic power."""
 
     def __call__(self, state: PowerBalance.State, inputs: PowerBalance.Inputs) -> tuple[PowerBalance.State, PowerBalance.Output]:
         # Submodules take physical inputs and normalize internally with their own stats
         normalizer_inputs = inputs.to_normalizer_inputs()
         p_oh_predictor_output = self.p_oh_predictor(normalizer_inputs)
         p_rad_predictor_output = self.p_rad_predictor(normalizer_inputs)
-
-        # The scaling law is dimensional physics, it MUST see physical units.
-        taue_predictor_inputs = ScalingLawPredictor.Inputs(
-            ip_MA=inputs.ip_MA,
-            b_geo=inputs.b_geo,
-            geometric_axis_r=inputs.geometric_axis_r,
-            minor_radius=inputs.minor_radius,
-            elongation=inputs.elongation,
-            n_e_line_average_1e20=inputs.n_e_line_average_1e20,
-            power_additional_MW=inputs.power_additional_MW,
-            power_ohm_MW=p_oh_predictor_output.power_ohm_MW_pred,
-        )
-        taue_predictor_output = self.taue_predictor(taue_predictor_inputs)
-
-        taue_pred = taue_predictor_output.taue_pred
-        energy_mhd_MJ = self.positive_wtot(state.energy_mhd_MJ)
-        P_cond_MW = energy_mhd_MJ / taue_pred
-        power_radiated_MW = p_rad_predictor_output.power_radiated_MW_pred
         power_ohm_MW = p_oh_predictor_output.power_ohm_MW_pred
+        power_radiated_MW = p_rad_predictor_output.power_radiated_MW_pred
 
+        taue_predictor_output = self.predict_taue(inputs, normalizer_inputs, power_ohm_MW)
+        energy_mhd_MJ = self.positive_wtot(state.energy_mhd_MJ)
+        P_cond_MW = energy_mhd_MJ / taue_predictor_output.taue_pred
         P_abs_MW = inputs.power_additional_MW + power_ohm_MW
-
         energy_mhd_MJ_dot = self.bound_wtot_dot(state.energy_mhd_MJ, P_abs_MW - P_cond_MW - power_radiated_MW)
 
         state_dot = PowerBalance.State(energy_mhd_MJ=energy_mhd_MJ_dot)
@@ -394,7 +359,37 @@ class PowerBalanceScalingLaw(PowerBalance):
         return state_dot, output
 
 
-class PowerBalanceSciML(PowerBalance):
+class PowerBalanceScalingLaw(PowerBalanceTaue):
+    taue_predictor: ScalingLawPredictor
+    p_oh_predictor: OhmicPower
+    p_rad_predictor: RadiatedPower
+
+    @classmethod
+    def init(cls, p_oh_predictor: OhmicPower, p_rad_predictor: RadiatedPower) -> "PowerBalanceScalingLaw":
+        return cls(
+            taue_predictor=ScalingLawPredictor(),
+            p_oh_predictor=p_oh_predictor,
+            p_rad_predictor=p_rad_predictor,
+        )
+
+    def predict_taue(
+        self, inputs: PowerBalance.Inputs, normalizer_inputs: InputNormalizer.Inputs, power_ohm_MW: ArrayLike
+    ) -> TauePredictorOutputs:
+        # The scaling law is dimensional physics, it MUST see physical units
+        taue_predictor_inputs = ScalingLawPredictor.Inputs(
+            ip_MA=inputs.ip_MA,
+            b_geo=inputs.b_geo,
+            geometric_axis_r=inputs.geometric_axis_r,
+            minor_radius=inputs.minor_radius,
+            elongation=inputs.elongation,
+            n_e_line_average_1e20=inputs.n_e_line_average_1e20,
+            power_additional_MW=inputs.power_additional_MW,
+            power_ohm_MW=power_ohm_MW,
+        )
+        return self.taue_predictor(taue_predictor_inputs)
+
+
+class PowerBalanceSciML(PowerBalanceTaue):
     taue_predictor: BoundedNNPredictor
     p_oh_predictor: OhmicPower
     p_rad_predictor: RadiatedPower
@@ -410,13 +405,8 @@ class PowerBalanceSciML(PowerBalance):
         p_oh_predictor: OhmicPower,
         p_rad_predictor: RadiatedPower,
         normalizer: InputNormalizer,
-        min_taue: float | None = None,
-        max_taue: float | None = None,
-        prng_seed: int = 42,
+        prng_seed: int,
     ) -> "PowerBalanceSciML":
-        min_taue = MIN_TAUE if min_taue is None else min_taue
-        max_taue = MAX_TAUE if max_taue is None else max_taue
-
         taue_predictor = BoundedNNPredictor(
             nn=eqx.nn.MLP(
                 in_size=in_size,
@@ -425,8 +415,8 @@ class PowerBalanceSciML(PowerBalance):
                 depth=nn_depth,
                 key=jax.random.PRNGKey(prng_seed),
             ),
-            min_val=min_taue,
-            max_val=max_taue,
+            min_val=MIN_TAUE,
+            max_val=MAX_TAUE,
         )
         return cls(
             taue_predictor=taue_predictor,
@@ -435,12 +425,9 @@ class PowerBalanceSciML(PowerBalance):
             normalizer=normalizer,
         )
 
-    def __call__(self, state: PowerBalance.State, inputs: PowerBalance.Inputs) -> tuple[PowerBalance.State, PowerBalance.Output]:
-        # Submodules take physical inputs and normalize internally with their own stats
-        normalizer_inputs = inputs.to_normalizer_inputs()
-        p_oh_predictor_output = self.p_oh_predictor(normalizer_inputs)
-        p_rad_predictor_output = self.p_rad_predictor(normalizer_inputs)
-
+    def predict_taue(
+        self, inputs: PowerBalance.Inputs, normalizer_inputs: InputNormalizer.Inputs, power_ohm_MW: ArrayLike
+    ) -> TauePredictorOutputs:
         # The tau_e NN sees this model's own normalized features
         features = self.normalizer(normalizer_inputs)
         taue_predictor_inputs = BoundedNNPredictor.Inputs(
@@ -452,27 +439,7 @@ class PowerBalanceSciML(PowerBalance):
             n_e_line_average_1e20=features.n_e_line_average_1e20,
             power_additional_MW=features.power_additional_MW,
         )
-        taue_predictor_output = self.taue_predictor(taue_predictor_inputs)
-
-        taue_pred = taue_predictor_output.taue_pred
-        energy_mhd_MJ = self.positive_wtot(state.energy_mhd_MJ)
-        P_cond_MW = energy_mhd_MJ / taue_pred
-        power_radiated_MW = p_rad_predictor_output.power_radiated_MW_pred
-        power_ohm_MW = p_oh_predictor_output.power_ohm_MW_pred
-
-        P_abs_MW = inputs.power_additional_MW + power_ohm_MW
-
-        energy_mhd_MJ_dot = self.bound_wtot_dot(state.energy_mhd_MJ, P_abs_MW - P_cond_MW - power_radiated_MW)
-
-        state_dot = PowerBalance.State(energy_mhd_MJ=energy_mhd_MJ_dot)
-        output = PowerBalance.Output(
-            energy_mhd_MJ_pred=energy_mhd_MJ,
-            P_cond_MW=P_cond_MW,
-            taue_predictor_output=taue_predictor_output,
-            power_ohm_MW_pred=power_ohm_MW,
-            power_radiated_MW_pred=power_radiated_MW,
-        )
-        return state_dot, output
+        return self.taue_predictor(taue_predictor_inputs)
 
 
 class PowerBalanceUnstructuredNN(PowerBalance):
@@ -670,7 +637,7 @@ class PowerBalanceEnv(ModuleTrainingEnv):
                 taue = self.module.taue_predictor
                 for scaling in (taue.scaling_lmode, taue.scaling_hmode, taue.scaling_lh_transition):
                     last_layer_leaves += list(scaling.values())
-            if isinstance(self.module, (PowerBalanceSciML, PowerBalanceScalingLaw)):
+            if isinstance(self.module, PowerBalanceTaue):
                 if "p_oh_predictor" not in self.freeze_submodules:
                     last_layer_leaves += [
                         self.module.p_oh_predictor.nn.layers[-1].weight,
@@ -684,7 +651,7 @@ class PowerBalanceEnv(ModuleTrainingEnv):
             return last_layer_leaves
 
         trainable_leaves = {}
-        if isinstance(self.module, (PowerBalanceScalingLaw, PowerBalanceSciML)):
+        if isinstance(self.module, PowerBalanceTaue):
             if "p_oh_predictor" not in self.freeze_submodules:
                 trainable_leaves["p_oh_predictor"] = eqx.filter(self.module.p_oh_predictor.nn, eqx.is_inexact_array)
             if "p_rad_predictor" not in self.freeze_submodules:

@@ -1,24 +1,36 @@
-"""Generic SLURM fan-out driver for per-case analysis work.
+"""Study analysis drivers.
 
-Both studies dispatch their per-case analysis (stage metrics + case report,
-CPU-bound matplotlib and numpy work) as one SLURM job per case. The driver
-loop here is study-agnostic; each Study subclass declares which modules carry
-its per-case analysis via the ANALYSIS_METRICS_MODULE / ANALYSIS_REPORTS_MODULE
-ClassVars. The metrics module must export
-``compute_and_save_case_metrics(study, case)`` and the reports module
-``generate_case_report(study, case, figure_dir)`` plus
-``analysis_case_done(study, case, figure_dir)``.
+Every study dispatches its per-case analysis (stage metrics + case report,
+CPU-bound matplotlib and numpy work) as one SLURM job per case.
+The driver loop here is study-agnostic,
+the per-study pieces come from the ANALYSIS_METRICS_MODULE / ANALYSIS_REPORTS_MODULE ClassVars
+through orchestration.case_metrics and orchestration.case_reports.
+run_summary_analysis is the whole analysis of the studies whose collect_results is the per-case scalar summary.
 """
 
 import time
-from importlib import import_module
 
+import xarray as xr
 from loguru import logger
 
 from transport_study.config import config
+from transport_study.orchestration.case_metrics import collect_metrics
+from transport_study.orchestration.case_reports import (
+    analysis_case_done,
+    generate_case_reports,
+)
+from transport_study.orchestration.comparison_figures import (
+    ComparisonFamily,
+    ComparisonLayout,
+    comparison_figures,
+)
 from transport_study.orchestration.slurm_utils import (
     get_running_job_names,
     launch_case_analysis_parallel,
+)
+from transport_study.orchestration.tables import (
+    ComparisonTableSpec,
+    write_summary_comparison_tables,
 )
 
 # Resubmission cap per case and how often the driver rechecks for finished cases
@@ -38,7 +50,6 @@ def run_case_analysis_parallel(study) -> None:
     exhaust their attempts fall back to the study's serial analysis path
     afterwards.
     """
-    analysis_case_done = import_module(study.ANALYSIS_REPORTS_MODULE).analysis_case_done
     partition = config.analysis_partition or config.partition
     pending = [case for case in study.cases if study.result_path(case).exists() and not analysis_case_done(study, case, study.figure_dir)]
     if not pending:
@@ -80,3 +91,37 @@ def run_case_analysis_parallel(study) -> None:
 
     if not pending:
         logger.info("Parallel analysis finished for all cases")
+
+
+def log_section(title: str) -> None:
+    logger.opt(colors=True).info(f"<bold><magenta>{title.upper()}</magenta></bold>")
+
+
+def run_summary_analysis(
+    study,
+    enable_parallelism: bool,
+    layout: ComparisonLayout,
+    families: tuple[ComparisonFamily, ...],
+    table_spec: ComparisonTableSpec,
+) -> None:
+    """Analysis of a study whose collect_results is the per-case scalar summary (dims case_idx).
+
+    The per-case stage metrics and reports fan out over SLURM with parallelism,
+    the serial paths after it skip the completed cases.
+    Then the comparison figures over the collected results, the case reports and the per-axis comparison tables.
+    """
+    if enable_parallelism:
+        run_case_analysis_parallel(study)
+
+    # Stage-resolved time-averaged errors of every finished case, cached to collected_metrics.nc
+    metrics_ds = collect_metrics(study)
+    results_ds = xr.load_dataset(study.collected_results_path())
+    for family in families:
+        log_section(family.title)
+        comparison_figures(results_ds, layout, family, study.figure_dir)
+
+    log_section("Case reports")
+    generate_case_reports(study, study.figure_dir)
+
+    log_section("Comparison tables")
+    write_summary_comparison_tables(results_ds, metrics_ds, table_spec, study.figure_dir)

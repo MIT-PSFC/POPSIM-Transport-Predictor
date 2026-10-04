@@ -12,6 +12,7 @@ SPEC = ComparisonTableSpec(
     case_field_order=("a", "b", "num_target_shots"),
     field_tokens={"a": "a_{}", "b": "b_{}", "num_target_shots": "targ_{}"},
     columns=(("metric", "metric"),),
+    stage_metrics=("metric",),
 )
 
 

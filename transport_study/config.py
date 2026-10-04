@@ -8,6 +8,7 @@ import os
 import tomllib
 from pathlib import Path
 from types import MappingProxyType
+from typing import Self
 
 import numpy as np
 import toml
@@ -22,6 +23,13 @@ TRAIN_VAL_SPLIT = (0.8, 0.2)
 # Changing this changes the structure of the modules, cannot restore from checkpoints trained on a different grid
 N_RHO_POINTS = 51
 RHO_GRID = np.linspace(0.0, 1.0, N_RHO_POINTS)
+
+# debug runs a whole study cheaply:
+# the target device keeps every shot, each source device keeps only its DEBUG_MAX_SOURCE_SHOTS most recent ones,
+# training and sweep trials stop by DEBUG_MAX_EPOCHS, and each sweep runs DEBUG_HYPERPARAM_SWEEPS trials
+DEBUG_MAX_SOURCE_SHOTS = 100
+DEBUG_MAX_EPOCHS = 100
+DEBUG_HYPERPARAM_SWEEPS = 1
 
 
 def env_dataset_paths() -> dict[str, Path]:
@@ -62,12 +70,8 @@ class StudyConfig(BaseModel):
     dataset_paths: dict[str, Path] = Field(default_factory=env_dataset_paths)
     target_device: str
 
-    # Debugging and dev stuff
-    debug: bool = True
-    # Unused by the studies, but every existing working dir's config_lock.toml
-    # carries it and the lock is reloaded through this frozen model
-    # TODO(ZanderKeith): Remove this for APS study
-    dry_run: bool = False
+    # Cheap whole-study runs, see DEBUG_MAX_SOURCE_SHOTS
+    debug: bool = False
     # Keep only the most recent shots of each device, every shot when None (get_ds logs a truncation)
     max_ds_size: int | None = None
     hyperparam_sweeps: int = 200
@@ -135,6 +139,15 @@ class StudyConfig(BaseModel):
         object.__setattr__(self, "dataset_paths", MappingProxyType(self.dataset_paths))
         return self
 
+    @model_validator(mode="after")
+    def _apply_debug_limits(self):
+        """Cap the epochs and the sweep size of a debug run (get_ds caps the source shots)."""
+        if self.debug:
+            object.__setattr__(self, "max_epochs", min(self.max_epochs, DEBUG_MAX_EPOCHS))
+            object.__setattr__(self, "hyperparam_max_epochs", min(self.hyperparam_max_epochs, DEBUG_MAX_EPOCHS))
+            object.__setattr__(self, "hyperparam_sweeps", min(self.hyperparam_sweeps, DEBUG_HYPERPARAM_SWEEPS))
+        return self
+
     # dataset_paths is stored as a MappingProxyType for immutability, but the field is typed
     # dict[str, Path], so tell the serializer to emit a plain dict and avoid a Pydantic warning
     @field_serializer("dataset_paths")
@@ -142,18 +155,20 @@ class StudyConfig(BaseModel):
         return dict(v)
 
     @classmethod
-    def from_toml(cls, path: Path | str) -> "StudyConfig":
-        path = Path(path)
+    def toml_kwargs(cls, path: Path | str) -> dict:
+        """Constructor kwargs of a TOML config, its [datasets] table becomes dataset_paths and target_device."""
         with open(path, "rb") as f:
             data = tomllib.load(f)
         datasets = data.pop("datasets", {})
         target = datasets.pop("target", None)
         # Env vars provide defaults, explicit TOML paths win
-        return cls(
-            **data,
-            dataset_paths=env_dataset_paths() | {k: Path(v) for k, v in datasets.items()},
-            target_device=target,
-        )
+        dataset_paths = env_dataset_paths() | {k: Path(v) for k, v in datasets.items()}
+        return data | {"dataset_paths": dataset_paths, "target_device": target}
+
+    @classmethod
+    def from_toml(cls, path: Path | str) -> Self:
+        kwargs = cls.toml_kwargs(path)
+        return cls(**kwargs)
 
     @property
     def ds_source_to_idx(self) -> dict[str, int]:
@@ -164,22 +179,21 @@ class StudyConfig(BaseModel):
         """Check if two configs are compatible for running the same study (e.g. dataset paths and target device must match)."""
         return self.dataset_paths == cfg.dataset_paths and self.target_device == cfg.target_device
 
-    def save(self, path: Path):
-        raw = self.model_dump()
+    def toml_data(self) -> dict:
+        """The TOML table save writes and from_toml reads back, None fields left out."""
         datasets = {k: str(v) for k, v in self.dataset_paths.items()}
         if self.target_device is not None:
             datasets["target"] = self.target_device
         data = {}
-        for k, v in raw.items():
-            if k in ("dataset_paths", "target_device"):
+        for k, v in self.model_dump().items():
+            if k in ("dataset_paths", "target_device") or v is None:
                 continue
-            if v is None:
-                continue
-            if isinstance(v, Path):
-                data[k] = str(v)
-            else:
-                data[k] = v
+            data[k] = str(v) if isinstance(v, Path) else v
         data["datasets"] = datasets
+        return data
+
+    def save(self, path: Path):
+        data = self.toml_data()
         with open(path, "w") as f:
             toml.dump(data, f)
 

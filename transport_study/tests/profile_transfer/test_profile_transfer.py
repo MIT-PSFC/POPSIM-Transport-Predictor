@@ -27,7 +27,6 @@ def _make_config(study_name: str, working_dir_name: str, **overrides) -> Profile
         },
         target_device="cmod-high",
         debug=True,
-        dry_run=False,
         max_ds_size=20,
         hyperparam_sweeps=2,
         max_epochs=2,

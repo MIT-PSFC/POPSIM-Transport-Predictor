@@ -7,7 +7,8 @@ import numpy as np
 import optax
 import xarray as xr
 from loguru import logger
-from popsim.ml import DataLoader
+from popsim.ml import DataLoader, TrainConfig
+from popsim.ml.checkpointing import create_default_checkpoint_manager, restore_model
 from popsim.ml.dataloading import make_dataloaders
 from popsim.ml.eval import EvalData, EvaluationSuite, batched_model_eval_and_loss
 from popsim.ml.preprocess_utils import mask_to_largest_group_mask
@@ -35,6 +36,9 @@ CHI_SIGMA_FLOOR_PERCENTILE = 5.0
 # Dividing by the error bar already discounts where the fit stops resolving the slope,
 # so only the extrapolation right at the edge is dropped
 CHI_GRAD_RHO_MAX = 0.95
+# Floor added to |target| in the relative error of the scalar study results (MJ for Wtot, MW for the powers)
+SCALAR_REL_ERROR_FLOOR = 0.1
+
 # Profile channel -> (value error bar, gradient error bar) chi divides by
 CHI_ERROR_VARS = {
     "n_e_1e20": ("n_e_1e20_error", "n_e_1e20_gradient_error"),
@@ -112,6 +116,96 @@ def chi_sigma_floors(device: str) -> dict[str, float]:
             floors[var] = float(np.percentile(sigma_positive, CHI_SIGMA_FLOOR_PERCENTILE))
     logger.info(f"Chi sigma floors for {device}: " + ", ".join(f"{var}={floor:.5f}" for var, floor in floors.items()))
     return floors
+
+
+def restore_from_checkpoint(module, checkpoint_dir: str):
+    """module with every leaf restored from the best checkpoint in checkpoint_dir, module supplies the pytree structure."""
+    return restore_model(create_default_checkpoint_manager(checkpoint_dir), module)
+
+
+def submodule_config_dict(submodule_config: TrainConfig | dict) -> dict:
+    """A submodule prereq case's train config as a dict.
+
+    make_train_config nests TrainConfig objects, a config reloaded from yaml or wandb holds plain dicts.
+    """
+    return submodule_config.model_dump() if isinstance(submodule_config, TrainConfig) else submodule_config
+
+
+def attach_normalizer_fit_ds(train_dl: DataLoader, normalizer_fit_ds: xr.Dataset | None) -> None:
+    """Carry a transfer_pretrain case's normalizer fit dataset on its train dataloader, see normalizer_fit_dataset."""
+    if normalizer_fit_ds is not None:
+        train_dl.normalizer_fit_ds = normalizer_fit_ds
+
+
+def normalizer_fit_dataset(train_dl: DataLoader, model_init_config: dict) -> xr.Dataset | None:
+    """The dataset a model_init fits its normalizer statistics on, None when a transfer checkpoint will overwrite them.
+
+    A transfer_pretrain case trains on historic data only, but fits its normalizer on historic + target shots,
+    so the transfer case it pretrains for inherits target-aware statistics through the checkpoint restore.
+    model_init only receives the train dataloader, so that fit dataset rides on it as an attribute (attach_normalizer_fit_ds).
+    Every other case fits on its own training data.
+    A transfer case skips the fit: one on its few target shots would be ill-conditioned,
+    and the statistics restored from its transfer_pretrain prereq are the right ones.
+    """
+    if model_init_config.get("transfer_checkpoint"):
+        return None
+    return getattr(train_dl, "normalizer_fit_ds", train_dl.ds)
+
+
+def unstack_samples(da: xr.DataArray) -> xr.DataArray:
+    """An evaluation variable back on its (shot, time_idx[, rho]) dims.
+
+    Unstacks the sample MultiIndex and drops the length-1 batch dims, keeping the shot and time dims even at length 1.
+    Time-dependent dataloaders suffix every input-side dim with _input,
+    the suffix is removed so targets and predictions share one grid.
+    """
+    da = da.unstack("sample")
+    protected_dims = {EPISODE_DIM, TIME_DIM, TIME_DIM + "_input"}
+    squeeze_dims = [dim for dim, size in da.sizes.items() if size == 1 and dim not in protected_dims]
+    if squeeze_dims:
+        da = da.squeeze(dim=squeeze_dims, drop=True)
+    renames = {dim: dim.removesuffix("_input") for dim in da.dims if isinstance(dim, str) and dim.endswith("_input")}
+    return da.rename(renames) if renames else da
+
+
+def ds_source_per_shot(ds_source: xr.DataArray, n_shots: int) -> np.ndarray:
+    """The device of every shot, from the ds_source coordinate of an evaluation input dataset.
+
+    A single-device evaluation set carries ds_source as a scalar coordinate.
+    Otherwise it lives on the sample MultiIndex, and unstacking fills the absent (shot, time) pairs with NaN.
+    """
+    if "sample" not in ds_source.dims:
+        return np.full(n_shots, ds_source.values.item(), dtype=object)
+    unstacked = ds_source.unstack("sample").transpose(EPISODE_DIM, ...)
+    values = unstacked.values.reshape(n_shots, -1)
+    mask_valid = unstacked.notnull().values.reshape(n_shots, -1)
+    return np.array([row[np.flatnonzero(mask_row)[0]] for row, mask_row in zip(values, mask_valid, strict=True)], dtype=object)
+
+
+def scalar_study_results(eval_data: EvalData, signal: str, pred_var: str) -> xr.Dataset:
+    """Final study results of a scalar signal, keeping the shot and ds_source coordinates.
+
+    Target vs predicted signal, absolute and relative error per timeslice,
+    and their per-shot time integrals (NaN-padded entries ignored).
+    """
+    targ = unstack_samples(eval_data.input_ds[signal])
+    pred = unstack_samples(eval_data.output_ds[pred_var])
+    time_2d = unstack_samples(eval_data.input_ds[TIME_COORD])
+
+    error_abs_ts = xr.apply_ufunc(np.abs, pred - targ)
+    error_rel_ts = error_abs_ts / (xr.apply_ufunc(np.abs, targ) + SCALAR_REL_ERROR_FLOOR)
+    ds = xr.Dataset(
+        data_vars={
+            f"{signal}_targ": targ,
+            f"{signal}_pred": pred,
+            "error_abs_ts": error_abs_ts,
+            "error_rel_ts": error_rel_ts,
+            "error_abs_shot": integrate_error_over_time(error_abs_ts, time_2d),
+            "error_rel_shot": integrate_error_over_time(error_rel_ts, time_2d),
+        }
+    )
+    ds_source = ds_source_per_shot(eval_data.input_ds["ds_source"], ds.sizes[EPISODE_DIM])
+    return ds.assign_coords(ds_source=(EPISODE_DIM, ds_source)).drop_vars(["quantile", "input_batch"], errors="ignore")
 
 
 def target_device_idx() -> int:
@@ -294,15 +388,16 @@ def resolve_case_datasets(
         training_data = TrainingData(**training_data)
 
     normalizer_fit_ds = None
-    if dataloader_config.get("domain_adaptation") == "transfer_pretrain":
+    domain_adaptation = dataloader_config["domain_adaptation"]
+    if domain_adaptation == "transfer_pretrain":
         logger.info("Using transfer pretrain dataloader (trains on historic data, normalizer fit on historic + target shots)")
         ds_train, normalizer_fit_ds, ds_val = get_transfer_pretrain_datasets(
             training_data=training_data,
             num_target_shots=dataloader_config["num_target_shots"],
-            target_test_set_size=dataloader_config.get("target_test_set_size", None),
+            target_test_set_size=dataloader_config["target_test_set_size"],
             study_type=study_type,
         )
-    elif dataloader_config.get("domain_adaptation") is None:
+    elif domain_adaptation is None:
         logger.info("Using standard learning dataloader")
         if not training_data.exnihilo:
             ds_train, ds_val = get_train_val_datasets(
@@ -314,7 +409,7 @@ def resolve_case_datasets(
                 training_data=training_data,
                 domain_adaptation=None,
                 num_target_shots=dataloader_config["num_target_shots"],
-                target_test_set_size=dataloader_config.get("target_test_set_size", None),
+                target_test_set_size=dataloader_config["target_test_set_size"],
                 study_type=study_type,
             )
             # Double check there's no source (non-target) data anywhere in here
@@ -324,12 +419,12 @@ def resolve_case_datasets(
                     "Historic data found in training set for exnihilo training_data option. Please check the dataset construction logic."
                 )
     else:
-        logger.info(f"Using transfer learning dataloader with domain adaptation {dataloader_config['domain_adaptation']}")
+        logger.info(f"Using transfer learning dataloader with domain adaptation {domain_adaptation}")
         ds_train, ds_val = get_train_test_datasets(
             training_data=training_data,
-            domain_adaptation=dataloader_config["domain_adaptation"],
+            domain_adaptation=domain_adaptation,
             num_target_shots=dataloader_config["num_target_shots"],
-            target_test_set_size=dataloader_config.get("target_test_set_size", None),
+            target_test_set_size=dataloader_config["target_test_set_size"],
             study_type=study_type,
         )
 
@@ -373,14 +468,8 @@ def get_time_dep_dataloaders(
         )
         ds_val = mask_to_largest_contiguous_segment(ds_val, val_vars)
 
-        segment_length = [
-            dataloader_config.get("segment_length_train", None),
-            dataloader_config.get("segment_length_val", None),
-        ]
-        segment_overlap = [
-            dataloader_config.get("segment_overlap_train", 0) or 0,
-            dataloader_config.get("segment_overlap_val", 0) or 0,
-        ]
+        segment_length = [dataloader_config["segment_length_train"], dataloader_config["segment_length_val"]]
+        segment_overlap = [dataloader_config["segment_overlap_train"], dataloader_config["segment_overlap_val"]]
     else:
         # Segments only apply to time-dependent (state-carrying) dataloaders
         segment_length = None
@@ -392,9 +481,9 @@ def get_time_dep_dataloaders(
         episode_coord=EPISODE_DIM,
         input_vars=input_vars,
         target_vars=dataloader_config["target_vars"],
-        extra_vars=dataloader_config.get("extra_vars", None),
-        state_init_vars=dataloader_config.get("state_vars", None),
-        batch_size=dataloader_config.get("batch_size", None),
+        extra_vars=dataloader_config.get("extra_vars"),
+        state_init_vars=dataloader_config.get("state_vars"),
+        batch_size=dataloader_config["batch_size"],
         segment_length=segment_length,
         segment_overlap=segment_overlap,
         shuffle=[True, False],
@@ -413,10 +502,6 @@ def get_time_dep_dataloaders(
         drop_last=[True, False],
         pad_last=[False, True],
     )
-    # Transfer pretrain fits the normalizer on more data than it trains on
-    # (historic + target shots). model_init reads this attribute off the
-    # train dataloader, every other case fits on train_dl.ds itself
-    if normalizer_fit_ds is not None:
-        train_dl.normalizer_fit_ds = normalizer_fit_ds
+    attach_normalizer_fit_ds(train_dl, normalizer_fit_ds)
     # The validation set doubles as the test set (see resolve_case_datasets)
     return ds_val, train_dl, val_dl, val_dl

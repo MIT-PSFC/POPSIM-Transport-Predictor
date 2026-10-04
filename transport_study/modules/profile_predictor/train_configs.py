@@ -283,36 +283,3 @@ def make_profile_predictor_torax_config(
 PROFILE_PREDICTOR_TORAX_CONFIGS = {
     transport_model: make_profile_predictor_torax_config(transport_model) for transport_model in TORAX_TRANSPORT_BLOCKS
 }
-
-PROFILE_PREDICTOR_DIRECT_POINTS_CONFIG = {
-    "project": "profile_predictor_direct_points",
-    "train_run_builder": ProfilePredictorTRB,
-    "max_epochs": 2,
-    "epochs_per_val": 2,
-    "checkpoint_dir": None,
-    "dataloader_config": {
-        "input_vars": list(NN_INPUT_SOURCE_VARS),
-        "target_vars": [*PROFILE_TARGET_VARS, "ds_source_idx"],
-    },
-    "model_init_config": {
-        "model_type": "direct_points",
-        "shape_type": ShapeType.CONVEX_COMBINATION.value,
-        "n_points": 13,
-        "nn_depth": 3,
-        "nn_width": 20,
-        "prng_seed": 42,
-    },
-    "loss_config": {
-        "huber_delta": 0.5,
-    },
-    "optimizer_config": {
-        "lr0": 3e-3,
-        "transition_steps": 500,
-        "decay_rate": 0.5,
-        "lrf": 5e-4,
-        "weight_decay": 2e-4,
-    },
-    "trainable_getter_config": {
-        "freeze_shapes": True,
-    },
-}

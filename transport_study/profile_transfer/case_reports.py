@@ -1,4 +1,4 @@
-"""Per-case deep-dive reports for profile transfer study results.
+"""Per-case reports of profile transfer study results (its ANALYSIS_REPORTS_MODULE, see orchestration.case_reports).
 
 For every finished case:
 - A PDF of the 10 best and 10 worst test timeslices by the combined metric,
@@ -14,34 +14,37 @@ measured target shape.
 """
 
 import io
+from functools import partial
 from pathlib import Path
 
 import matplotlib.pyplot as plt
 import numpy as np
 import xarray as xr
 from loguru import logger
-from matplotlib.backends.backend_pdf import PdfPages
 from PIL import Image
 
 from transport_study import EPISODE_DIM, RADIAL_DIM, TIME_DIM
 from transport_study.config import config
 from transport_study.modules.trb_utils import CHI_GRAD_RHO_MAX
-from transport_study.plot_style import BACKGROUND_COLOR, TEXT_COLOR, style_axis
+from transport_study.orchestration.case_reports import TITLE_FONTSIZE, best_worst_pdf
+from transport_study.plot_style import (
+    BACKGROUND_COLOR,
+    LABEL_FONTSIZE,
+    LEGEND_STYLE,
+    TEXT_COLOR,
+    TICK_FONTSIZE,
+    style_axis,
+)
 from transport_study.profile_transfer.plot_torax_evolution import plot_relaxation
 from transport_study.profile_transfer.study_metrics import (
     CaseTimesliceMetrics,
-    case_metrics_path,
     compute_case_timeslice_metrics,
     load_eval_dataset,
 )
 from transport_study.signals import convert_to_working_units
 
-N_BEST_WORST = 10
 GIF_FRAME_DURATION_MS = 200
-
-LABEL_FONTSIZE = 11
-TICK_FONTSIZE = 9
-TITLE_FONTSIZE = 12
+REPORT_FILENAME = "best_worst_timeslices.pdf"
 
 VALUE_LABELS = {
     "t_e_keV": r"$T_e$ [keV]",
@@ -115,7 +118,7 @@ def _timeslice_panel(
         grad_pred = np.diff(pred) / d_rho
 
         ax_val = axes[0, col]
-        style_axis(ax_val, TICK_FONTSIZE)
+        style_axis(ax_val)
         ax_val.fill_between(rho, targ - err, targ + err, color="white", alpha=0.25, linewidth=0)
         ax_val.plot(rho, targ, color="white", linewidth=2, linestyle="--", label="Measured")
         ax_val.plot(rho, pred, color="#0095ff", linewidth=2, label="Predicted")
@@ -124,7 +127,7 @@ def _timeslice_panel(
             ax_val.set_ylim(*ylims[f"{var}_value"])
 
         ax_grad = axes[1, col]
-        style_axis(ax_grad, TICK_FONTSIZE)
+        style_axis(ax_grad)
         _shade_ignored_grad_region(ax_grad, rho_mid)
         ax_grad.fill_between(rho_mid, grad_targ_mid - grad_err_mid, grad_targ_mid + grad_err_mid, color="white", alpha=0.25, linewidth=0)
         ax_grad.plot(rho_mid, grad_targ_mid, color="white", linewidth=2, linestyle="--", label="Measured")
@@ -143,13 +146,7 @@ def _timeslice_panel(
                 )
             )
 
-    axes[0, 0].legend(
-        fontsize=TICK_FONTSIZE,
-        labelcolor=TEXT_COLOR,
-        facecolor=BACKGROUND_COLOR,
-        edgecolor=TEXT_COLOR,
-        loc="upper right",
-    )
+    axes[0, 0].legend(fontsize=TICK_FONTSIZE, loc="upper right", **LEGEND_STYLE)
     fig.suptitle(f"{title_prefix}{_record_title(ts_metrics, record_idx)}", color=TEXT_COLOR, fontsize=TITLE_FONTSIZE)
     fig.tight_layout(rect=(0, 0, 1, 0.93))
     return fig
@@ -202,30 +199,6 @@ def _fig_to_image(fig: plt.Figure) -> Image.Image:
     return Image.open(buf).convert("RGB")
 
 
-def best_worst_pdf(result_ds: xr.Dataset, ts_metrics: CaseTimesliceMetrics, pdf_path: Path):
-    """One PDF per case: the N_BEST_WORST best pages then the N_BEST_WORST
-    worst pages, ranked by the per-timeslice combined metric."""
-    finite = np.flatnonzero(np.isfinite(ts_metrics.metric_combined))
-    if len(finite) == 0:
-        logger.warning(f"No finite combined metrics, skipping {pdf_path}")
-        return
-    order = finite[np.argsort(ts_metrics.metric_combined[finite])]
-    best = order[:N_BEST_WORST]
-    worst = order[::-1][:N_BEST_WORST]
-
-    pdf_path.parent.mkdir(parents=True, exist_ok=True)
-    with PdfPages(pdf_path) as pdf:
-        for rank, record_idx in enumerate(best, start=1):
-            fig = _timeslice_panel(result_ds, ts_metrics, record_idx, title_prefix=f"BEST #{rank} - ")
-            pdf.savefig(fig, facecolor=fig.get_facecolor())
-            plt.close(fig)
-        for rank, record_idx in enumerate(worst, start=1):
-            fig = _timeslice_panel(result_ds, ts_metrics, record_idx, title_prefix=f"WORST #{rank} - ")
-            pdf.savefig(fig, facecolor=fig.get_facecolor())
-            plt.close(fig)
-    logger.info(f"Saved best/worst timeslice PDF to {pdf_path}")
-
-
 def _select_gif_shots(ts_metrics: CaseTimesliceMetrics) -> list:
     """Best, median, and worst test shots by shot-mean combined metric."""
     shots = np.unique(ts_metrics.shot)
@@ -272,54 +245,16 @@ def evolution_gifs(result_ds: xr.Dataset, ts_metrics: CaseTimesliceMetrics, case
         logger.info(f"Saved profile evolution GIF to {gif_path}")
 
 
-def generate_case_reports(study, figure_dir: Path):
-    """Best/worst timeslice PDFs and profile evolution GIFs for every finished
-    case. Existing case report directories are left alone (GIF rendering is
-    slow); clean_figures wipes the figure dir to force regeneration."""
-    for case in study.cases:
-        generate_case_report(study, case, figure_dir)
-
-
-def case_report_dir(figure_dir: Path, case) -> Path:
-    return Path(figure_dir) / "case_reports" / str(case)
-
-
 def case_report_done(case_dir: Path) -> bool:
-    return (case_dir / "best_worst_timeslices.pdf").exists() and any(case_dir.glob("shot_*_evolution.gif"))
+    return (case_dir / REPORT_FILENAME).exists() and any(case_dir.glob("shot_*_evolution.gif"))
 
 
-def generate_case_report(study, case, figure_dir: Path):
-    """Best/worst timeslice PDF and profile evolution GIFs for one case.
-    No-op when the case has no result file or the report already exists."""
-    result_path = study.result_path(case)
-    if not result_path.exists():
-        return
-    case_dir = case_report_dir(figure_dir, case)
-    if case_report_done(case_dir):
-        logger.info(f"Case report already exists for {case}, skipping")
-        return
-
-    result_ds = xr.load_dataset(result_path)
-    loss_config = study.make_train_config(case).loss_config
-    ts_metrics = compute_case_timeslice_metrics(result_ds, loss_config)
-    if len(ts_metrics) == 0:
-        logger.warning(f"No valid test timeslices for case {case}, skipping case report")
-        return
-
-    best_worst_pdf(result_ds, ts_metrics, case_dir / "best_worst_timeslices.pdf")
+def render_case_report(result_ds: xr.Dataset, ts_metrics: CaseTimesliceMetrics, case_dir: Path):
+    """The best and worst test timeslices by the combined metric, then the profile evolution GIFs."""
+    timeslice_page = partial(_timeslice_panel, result_ds, ts_metrics)
+    record_idxs = np.arange(len(ts_metrics))
+    best_worst_pdf(record_idxs, ts_metrics.metric_combined, timeslice_page, case_dir / REPORT_FILENAME)
     evolution_gifs(result_ds, ts_metrics, case_dir)
-
-
-def analysis_case_done(study, case, figure_dir: Path) -> bool:
-    """Whether a case needs no more analysis work: its metrics cache exists and
-    either it is the empty 'nothing valid' marker or the case report is on disk."""
-    cache_path = case_metrics_path(study, case)
-    if not cache_path.exists():
-        return False
-    case_metrics = xr.load_dataset(cache_path)
-    if not case_metrics.data_vars:
-        return True
-    return case_report_done(case_report_dir(figure_dir, case))
 
 
 def torax_relaxation_report(study, metrics_ds: xr.Dataset, figure_dir: Path):

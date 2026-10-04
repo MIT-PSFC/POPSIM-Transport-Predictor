@@ -3,25 +3,32 @@ from __future__ import annotations
 from dataclasses import dataclass
 from itertools import product
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, ClassVar
 
 if TYPE_CHECKING:
     from popsim.ml import TrainConfig
 
 import fire
 import netCDF4  # noqa: F401
-import xarray as xr
-from loguru import logger
-from pydantic import Field, field_validator
+from pydantic import Field
 from transport_validation_datasets.machine.generic import UNIFORM_TIMEBASE_DT
 
 from transport_study import PACKAGE_ROOT
 from transport_study.config import config
+from transport_study.modules.normalization import (
+    FEATURE_NORMALIZATIONS,
+    INPUT_NORMALIZATIONS,
+)
 from transport_study.modules.profile_predictor.module import MODEL_TYPES_WITH_SHAPES
+from transport_study.modules.profile_predictor.torax_module import (
+    TORAX_MODEL_TYPES,
+    VALID_GEOMETRY_BUILDERS,
+)
+from transport_study.modules.transport_predictor.module import SUBMODULE_MODEL_TYPES
 from transport_study.modules.transport_predictor.train_configs import (
     make_transport_torax_config,
 )
-from transport_study.orchestration.case_analysis import run_case_analysis_parallel
+from transport_study.orchestration.case_analysis import run_summary_analysis
 from transport_study.orchestration.organize_data import PROFILE_TARGET_VARS
 from transport_study.orchestration.study import (
     HYPERPARAM_TARGET_SHOTS,
@@ -33,22 +40,10 @@ from transport_study.power_balance_transfer.power_balance_study import (
     POWER_BALANCE_INPUT_VARS,
     SCALAR_SUBMODULE_SETTINGS,
 )
-from transport_study.power_balance_transfer.power_balance_study import (
-    VALID_DATA_NORMALIZATIONS as VALID_POWER_BALANCE_DATA_NORMALIZATIONS,
-)
-from transport_study.profile_transfer.profile_study import (
-    PROFILE_INPUT_VARS,
-    VALID_GEOMETRY_BUILDERS,
-)
-from transport_study.transport_transfer.case_reports import generate_case_reports
+from transport_study.profile_transfer.profile_study import PROFILE_INPUT_VARS
 from transport_study.transport_transfer.data_visualization import DataVisualization
-from transport_study.transport_transfer.plotting import (
-    domain_adaptation_comparison,
-    model_comparison,
-    training_dataset_comparison,
-)
-from transport_study.transport_transfer.study_metrics import collect_metrics
-from transport_study.transport_transfer.tables import write_comparison_tables
+from transport_study.transport_transfer.plotting import COMPARISON_FAMILIES, LAYOUT
+from transport_study.transport_transfer.tables import SPEC as TABLE_SPEC
 
 # The physical inputs every transport predictor model consumes (the TRB adds
 # ds_source_idx itself). Normalization happens inside the modules; there is
@@ -88,13 +83,8 @@ TRANSPORT_TARGET_VARS = [
 # needs the t0 inputs, see TransportPredictorEnv.create_state)
 TRANSPORT_STATE_VARS = ["energy_mhd_MJ", *TRANSPORT_PROFILE_TARGETS, *TRANSPORT_INPUT_VARS, "ds_source_idx"]
 
-# The TORAX-backed model types (one per TORAX transport model)
-TORAX_MODEL_TYPES = ("torax-constant", "torax-gyrobohm", "torax-qlknn")
 # Model types that appear on the study's case grid
 TOP_LEVEL_MODEL_TYPES = ("transformer", "sciml", *TORAX_MODEL_TYPES)
-# Submodule pseudo-model-types, they appear as prereq cases of sciml:
-# sciml -> power_balance + profile, power_balance -> p_oh + p_rad
-SUBMODULE_MODEL_TYPES = ("power_balance", "profile", "p_oh", "p_rad")
 # The submodule cases that train with power_balance_data_normalization instead of the study-wide data_normalization
 POWER_BALANCE_SUBMODULE_TYPES = ("power_balance", "p_oh", "p_rad")
 
@@ -114,7 +104,8 @@ class TransportStudy(Study):
     SWEEP_CONFIG_DIR = Path(PACKAGE_ROOT) / "transport_transfer" / "sweep_configs"
     STUDY_TYPE = "transport_transfer"
     DATA_VISUALIZATION = DataVisualization
-    ANALYSIS_METRICS_MODULE = "transport_study.transport_transfer.study_metrics"
+    # The result files carry the power balance error variables, scored by its metrics module
+    ANALYSIS_METRICS_MODULE = "transport_study.power_balance_transfer.study_metrics"
     ANALYSIS_REPORTS_MODULE = "transport_study.transport_transfer.case_reports"
     CASE_AXIS_FIELDS = (
         "model_types",
@@ -127,8 +118,7 @@ class TransportStudy(Study):
     )
     CHI_VALIDATION_LOSS = True
     TUNED_DATALOADER_KEYS = ("segment_length_train", "segment_overlap_train", "batch_size")
-    # huber_delta_grad only matters for the profile submodule cases (their
-    # sweep tunes it); .get-fallback merge keeps it harmless everywhere else
+    # huber_delta_grad only matters for the profile submodule cases, whose sweep tunes it
     TUNED_LOSS_KEYS = ("huber_delta", "huber_delta_grad")
 
     ##################
@@ -177,61 +167,15 @@ class TransportStudy(Study):
             "profile_model_type",
         )
 
-        @field_validator("model_types")
-        @classmethod
-        def _validate_model_types(cls, v: tuple[str, ...]) -> tuple[str, ...]:
-            valid = {*TOP_LEVEL_MODEL_TYPES, *SUBMODULE_MODEL_TYPES}
-            for mt in v:
-                if mt not in valid:
-                    raise ValueError(f"Invalid model type: {mt}. Must be one of {sorted(valid)}.")
-            return v
-
-        @field_validator("geometry_builders")
-        @classmethod
-        def _validate_geometry_builders(cls, v: tuple[str, ...]) -> tuple[str, ...]:
-            for gb in v:
-                if gb not in VALID_GEOMETRY_BUILDERS:
-                    raise ValueError(f"Invalid geometry builder: {gb}. Must be one of {VALID_GEOMETRY_BUILDERS}.")
-            return v
-
-        @field_validator("torax_state_options")
-        @classmethod
-        def _validate_torax_states(cls, v: tuple[str, ...]) -> tuple[str, ...]:
-            for ts in v:
-                if ts not in VALID_TORAX_STATES:
-                    raise ValueError(f"Invalid torax state option: {ts}. Must be one of {VALID_TORAX_STATES}.")
-            return v
-
-        @field_validator("data_normalization")
-        @classmethod
-        def _validate_data_normalization(cls, v: str) -> str:
-            valid = ("physics", "physics-coral", "physics-zscore")
-            if v not in valid:
-                raise ValueError(f"Invalid data normalization method: {v}. Must be one of {valid}.")
-            return v
-
-        @field_validator("power_balance_data_normalization")
-        @classmethod
-        def _validate_power_balance_data_normalization(cls, v: str) -> str:
-            if v not in VALID_POWER_BALANCE_DATA_NORMALIZATIONS:
-                raise ValueError(
-                    f"Invalid power balance data normalization method: {v}. Must be one of {VALID_POWER_BALANCE_DATA_NORMALIZATIONS}."
-                )
-            return v
-
-        @field_validator("power_balance_model_type")
-        @classmethod
-        def _validate_power_balance_model_type(cls, v: str) -> str:
-            if v not in VALID_POWER_BALANCE_MODEL_TYPES:
-                raise ValueError(f"Invalid power balance model type: {v}. Must be one of {VALID_POWER_BALANCE_MODEL_TYPES}.")
-            return v
-
-        @field_validator("profile_model_type")
-        @classmethod
-        def _validate_profile_model_type(cls, v: str) -> str:
-            if v not in VALID_PROFILE_MODEL_TYPES:
-                raise ValueError(f"Invalid profile model type: {v}. Must be one of {VALID_PROFILE_MODEL_TYPES}.")
-            return v
+        FIELD_CHOICES: ClassVar[dict[str, tuple]] = {
+            "model_types": (*TOP_LEVEL_MODEL_TYPES, *SUBMODULE_MODEL_TYPES),
+            "geometry_builders": VALID_GEOMETRY_BUILDERS,
+            "torax_state_options": VALID_TORAX_STATES,
+            "data_normalization": FEATURE_NORMALIZATIONS,
+            "power_balance_data_normalization": INPUT_NORMALIZATIONS,
+            "power_balance_model_type": VALID_POWER_BALANCE_MODEL_TYPES,
+            "profile_model_type": VALID_PROFILE_MODEL_TYPES,
+        }
 
     @dataclass
     class Case(Study.Case):
@@ -414,8 +358,6 @@ class TransportStudy(Study):
             "domain_adaptation": case.domain_adaptation,
             "num_target_shots": case.num_target_shots,
             "target_test_set_size": config.target_test_set_size,
-            "prng_seed": 42,
-            "debug": config.debug,
             # Hyperparameters
             "segment_length_train": 100,
             "segment_overlap_train": 50,
@@ -562,7 +504,6 @@ class TransportStudy(Study):
                         "p_oh_predictor": self._make_submodule_config(case, "p_oh"),
                         "p_rad_predictor": self._make_submodule_config(case, "p_rad"),
                     },
-                    "restore_submodules": True,  # Always restoring pre-trained submodules in this study
                 },
             )
         elif case.model_type == "profile":
@@ -572,8 +513,7 @@ class TransportStudy(Study):
                 train_run_builder="transport_study.modules.profile_predictor.trb.ProfilePredictorTRB",
                 dataloader_config={
                     "input_vars": PROFILE_INPUT_VARS,
-                    # Profiles plus their gradient / error-bar companions, the
-                    # validation loss softens the residual inside the error bars
+                    # Profiles plus their gradient and error-bar companions, the chi validation loss divides by the error bars
                     "target_vars": [*PROFILE_TARGET_VARS, "ds_source_idx"],
                     "extra_vars": ["t_e_shape", "n_e_shape"],
                     **dataloader_config_base,
@@ -622,7 +562,6 @@ class TransportStudy(Study):
                         "power_balance": self._make_submodule_config(case, "power_balance"),
                         "profile_predictor": self._make_submodule_config(case, "profile"),
                     },
-                    "restore_submodules": True,  # Always restoring pre-trained submodules in this study
                 },
             )
         elif case.model_type == "transformer":
@@ -700,34 +639,7 @@ class TransportStudy(Study):
     ############
 
     def _run_analysis(self, enable_parallelism: bool) -> None:
-        # Per-case analysis (stage metrics + best/worst shot PDFs) is CPU-bound
-        # matplotlib and numpy work, so we can fan it out over SLURM to speed things up
-        if enable_parallelism:
-            run_case_analysis_parallel(self)
-
-        # Stage-resolved (rampup / flattop ohmic / flattop aux / rampdown)
-        # time-averaged errors for every finished case, cached to
-        # collected_metrics.nc alongside collected_results.nc
-        metrics_ds = collect_metrics(self)
-
-        results_ds = xr.load_dataset(self.collected_results_path())
-
-        logger.opt(colors=True).info("<bold><magenta>TRAINING DATA COMPARISON</magenta></bold>")
-        training_dataset_comparison(results_ds, self.figure_dir)
-
-        logger.opt(colors=True).info("<bold><magenta>MODEL COMPARISON</magenta></bold>")
-        model_comparison(results_ds, self.figure_dir)
-
-        logger.opt(colors=True).info("<bold><magenta>DOMAIN ADAPTATION COMPARISON</magenta></bold>")
-        domain_adaptation_comparison(results_ds, self.figure_dir)
-
-        # Per-case deep dives: best/worst holdout shot PDFs by time-averaged error
-        logger.opt(colors=True).info("<bold><magenta>CASE REPORTS</magenta></bold>")
-        generate_case_reports(self, self.figure_dir)
-
-        # One markdown table per case axis and combination of the other axes
-        logger.opt(colors=True).info("<bold><magenta>COMPARISON TABLES</magenta></bold>")
-        write_comparison_tables(results_ds, metrics_ds, self.figure_dir)
+        run_summary_analysis(self, enable_parallelism, LAYOUT, COMPARISON_FAMILIES, TABLE_SPEC)
 
 
 run_study = TransportStudy.run_study

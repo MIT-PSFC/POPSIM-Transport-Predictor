@@ -12,7 +12,14 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from types import SimpleNamespace
 
-from transport_study.orchestration.study import CaseGridConfig, Study
+import xarray as xr
+
+from transport_study.orchestration.case_metrics import case_metrics_path
+from transport_study.orchestration.study import (
+    CaseGridConfig,
+    Study,
+    write_netcdf_atomic,
+)
 
 
 class StubConfig(CaseGridConfig):
@@ -59,10 +66,6 @@ class StubStudy(Study):
     Config = StubConfig
     STUDY_TYPE = "stub"
     CASE_AXIS_FIELDS = ()
-    # This module doubles as the per-case analysis reports module (see below),
-    # which is all orchestration.case_analysis resolves off the study class
-    ANALYSIS_REPORTS_MODULE = "transport_study.tests.stubs"
-    ANALYSIS_METRICS_MODULE = "transport_study.tests.stubs"
 
     def __init__(self, cfg: CaseGridConfig, cases: list[StubCase]):
         self.injected_cases = list(cases)
@@ -72,17 +75,6 @@ class StubStudy(Study):
         return self.injected_cases
 
 
-# Marker file standing in for a real study's per-case report artifacts
-ANALYSIS_MARKER_NAME = "analysis_done"
-
-
-def analysis_case_done(study: Study, case, figure_dir) -> bool:
-    """Reports-module hook the parallel analysis driver polls for completion."""
-    return (figure_dir / str(case) / ANALYSIS_MARKER_NAME).exists()
-
-
 def mark_analysis_done(study: Study, case) -> None:
-    """Stand in for a finished analysis job having written its artifacts."""
-    marker = study.figure_dir / str(case) / ANALYSIS_MARKER_NAME
-    marker.parent.mkdir(parents=True, exist_ok=True)
-    marker.touch()
+    """Stand in for a finished analysis job, with the empty 'no valid timeslices' metrics cache."""
+    write_netcdf_atomic(xr.Dataset(), case_metrics_path(study, case))

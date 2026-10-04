@@ -96,7 +96,7 @@ def test_reservoir_state_deterministic_and_input_sensitive(make_module):
 def test_reservoir_trainable_getter_only_readout(make_module):
     """The reservoir tensors must never appear in the trainable selection."""
     module = make_module()
-    trainable = ProfilePredictorTRB.get_trainable_getter({"model_type": "reservoir"})(module)
+    trainable = ProfilePredictorTRB.get_trainable_getter({"model_type": "reservoir", "domain_adaptation": None})(module)
 
     trainable_ids = {id(leaf) for leaf in trainable}
     nn_ids = {id(leaf) for leaf in jax.tree.leaves(module.nn)}

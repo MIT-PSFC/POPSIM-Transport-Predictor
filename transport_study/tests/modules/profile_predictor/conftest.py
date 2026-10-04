@@ -72,6 +72,7 @@ def make_torax_module():
             normalizer=CoralFeatureNormalizer.identity(1, N_NN_INPUTS),
             transport_model=transport_model,
             geometry_builder=geometry_builder,
+            delta_exponent=model_cfg["delta_exponent"],
         )
 
     return _make

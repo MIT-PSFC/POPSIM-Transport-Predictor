@@ -84,7 +84,7 @@ def test_raw_is_identity():
 
 def test_physics_matches_normalize_domain():
     ds = _toy_dataset().assign_coords(ds_source=("shot", np.array(["dev_a"] * 3 + ["dev_b"] * 3)))
-    ds_ref, _ = normalize_domain(ds.copy(deep=True), None, method="physics")
+    ds_ref = normalize_domain(ds.copy(deep=True), method="physics")
 
     norm = PhysicsNormalizer()
     for shot, t in [(0, 5), (2, 10), (4, 0)]:

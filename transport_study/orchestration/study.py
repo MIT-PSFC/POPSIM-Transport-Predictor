@@ -6,12 +6,10 @@ import math
 import os
 import shutil
 import time
-import tomllib
 from dataclasses import dataclass, fields
 from pathlib import Path
 from typing import ClassVar
 
-import toml
 import wandb
 import xarray as xr
 import yaml
@@ -72,6 +70,9 @@ MAX_TRAIN_ATTEMPTS = 3
 # since the tuned config is picked from those runs only (see wandb_utils.is_trained_to_completion)
 # Hyperband with eta 3 lets only a few percent of trials run to completion, so demanding much more than that forces extra trials far past the count target
 MIN_FINISHED_FRACTION = 0.05
+
+# Agents kept running per sweep while it is unfinished, even when fewer trials are outstanding
+MIN_RUNNING_AGENTS = 6
 
 # How long the orchestration loop sleeps between passes over the unfinished cases
 ORCHESTRATION_POLL_INTERVAL_S = 20
@@ -147,9 +148,9 @@ def configure_jax_platforms(enable_parallelism: bool) -> None:
 class CaseGridConfig(StudyConfig):
     """Config base for studies built on a case grid (model_type x training_data x ...).
 
-    Holds the case-grid axes every such study shares. Study-specific axes
-    (model_types, freeze options, hyperparam selections) and is_compatible
-    stay on the study's own Config subclass.
+    Holds the case-grid axes every such study shares and the is_compatible config-lock check.
+    Study-specific axes (model_types, freeze options, hyperparam selections) stay on the study's own Config subclass,
+    which lists its hyperparam fields in COMPAT_HYPERPARAM_FIELDS.
     """
 
     # Organization for datasets and wandb projects
@@ -174,6 +175,9 @@ class CaseGridConfig(StudyConfig):
 
     # Study-specific hyperparam field names checked by is_compatible, set per subclass
     COMPAT_HYPERPARAM_FIELDS: ClassVar[tuple[str, ...]] = ()
+    # Field name -> its valid values, set per subclass.
+    # A tuple field must hold valid values only, a scalar field must be one.
+    FIELD_CHOICES: ClassVar[dict[str, tuple]] = {}
 
     def is_compatible(self, cfg: CaseGridConfig) -> bool:
         """Whether two configs can run the same study (the config-lock check).
@@ -192,6 +196,16 @@ class CaseGridConfig(StudyConfig):
             *self.COMPAT_HYPERPARAM_FIELDS,
         )
         return all(getattr(self, name) == getattr(cfg, name) for name in names)
+
+    @model_validator(mode="after")
+    def _validate_field_choices(self):
+        for field_name, valid in self.FIELD_CHOICES.items():
+            value = getattr(self, field_name)
+            values = value if isinstance(value, tuple) else (value,)
+            invalid = [item for item in values if item not in valid]
+            if invalid:
+                raise ValueError(f"Invalid {field_name}: {invalid}. Must be among {valid}.")
+        return self
 
     @field_validator("domain_adaptation_methods")
     @classmethod
@@ -218,41 +232,27 @@ class CaseGridConfig(StudyConfig):
         return data
 
     @classmethod
-    def from_toml(cls, path: Path) -> CaseGridConfig:
-        with open(path, "rb") as f:
-            data = tomllib.load(f)
-        datasets = data.pop("datasets", {})
-        target = datasets.pop("target", None)
-        study_cases = data.pop("study_cases", {})
-        # PTPS_DATASET_PATHS env var provides defaults, explicit TOML paths win
-        return cls(
-            **data,
-            **study_cases,
-            dataset_paths=env_dataset_paths() | {k: Path(v) for k, v in datasets.items()},
-            target_device=target,
-        )
+    def toml_kwargs(cls, path: Path | str) -> dict:
+        """StudyConfig.toml_kwargs with the case-grid axes of a [study_cases] table flattened in."""
+        kwargs = super().toml_kwargs(path)
+        study_cases = kwargs.pop("study_cases", {})
+        return kwargs | study_cases
 
-    def save(self, path: Path):
-        raw = self.model_dump()
-        datasets = {k: str(v) for k, v in self.dataset_paths.items()}
-        if self.target_device is not None:
-            datasets["target"] = self.target_device
-        skip = {"dataset_paths", "target_device", "training_datasets", "domain_adaptation_methods"}
-        data = {}
-        for k, v in raw.items():
-            if k in skip:
-                continue
-            if v is None:
-                continue
-            if isinstance(v, Path):
-                data[k] = str(v)
-            else:
-                data[k] = v
+    def toml_data(self) -> dict:
+        """StudyConfig.toml_data with the training datasets and domain adaptations in their string forms."""
+        data = super().toml_data()
         data["training_datasets"] = [str(td) for td in self.training_datasets]
         data["domain_adaptation_methods"] = [da if da is not None else "none" for da in self.domain_adaptation_methods]
-        data["datasets"] = datasets
-        with open(path, "w") as f:
-            toml.dump(data, f)
+        return data
+
+
+def data_train_run_builder(train_config: TrainConfig) -> type:
+    """The TRB that builds a train config's dataloaders, as popsim launch resolves it.
+
+    Submodule cases load their data through dataloader_config["data_train_run_builder"], every other case through its own TRB.
+    """
+    builder = train_config.dataloader_config.get("data_train_run_builder") or train_config.train_run_builder
+    return get_train_run_builder_class(builder)
 
 
 @dataclass
@@ -297,9 +297,8 @@ class Study:
     # Whether the validation loss is chi, which needs the per-device error-bar floors in the loss config
     CHI_VALIDATION_LOSS: ClassVar[bool] = False
 
-    # Tuned-config dataloader keys merged by strict indexing (KeyError when a tuned config lacks one)
+    # Tuned-config dataloader and loss keys, merged by strict indexing (KeyError when a tuned config lacks one)
     TUNED_DATALOADER_KEYS: ClassVar[tuple[str, ...]] = ()
-    # Tuned-config loss keys merged with .get fallback to the base value (tuned configs on disk may lack them)
     TUNED_LOSS_KEYS: ClassVar[tuple[str, ...]] = ()
 
     @dataclass
@@ -701,11 +700,10 @@ class Study:
         twins share a config, so they share a cache entry).
         """
         dataloader_config = train_config.dataloader_config
-        builder = dataloader_config.get("data_train_run_builder") or train_config.train_run_builder
-        cache_key = json.dumps([str(builder), dataloader_config], sort_keys=True, default=str)
+        data_trb = data_train_run_builder(train_config)
+        cache_key = json.dumps([str(data_trb), dataloader_config], sort_keys=True, default=str)
         if cache_key not in self._transfer_steps_cache:
-            train_run_builder = get_train_run_builder_class(builder)
-            _, train_dl, _, _ = train_run_builder.get_dataloaders(dataloader_config)
+            _, train_dl, _, _ = data_trb.get_dataloaders(dataloader_config)
             self._transfer_steps_cache[cache_key] = max(1, len(train_dl))
         return self._transfer_steps_cache[cache_key]
 
@@ -820,7 +818,7 @@ class Study:
         logger.info(f"Found tuned hyperparameter config for case {case}, using hyperparameters from that config")
 
         tuned_dataloader = {key: tuned_config.dataloader_config[key] for key in self.TUNED_DATALOADER_KEYS}
-        tuned_loss = {key: tuned_config.loss_config.get(key, train_config_base.loss_config[key]) for key in self.TUNED_LOSS_KEYS}
+        tuned_loss = {key: tuned_config.loss_config[key] for key in self.TUNED_LOSS_KEYS}
         train_config = train_config_base.model_copy(
             update={
                 "dataloader_config": {**train_config_base.dataloader_config, **tuned_dataloader},
@@ -1239,9 +1237,9 @@ class Study:
                 capacity = count_idle_gpus(config.partition, config.buffer_gpus)
             else:
                 capacity = min(spillover_budget(), spillover_slots(partition))
-            # Always have at least a couple agents going (up to capacity) to finish out the sweep
-            # Want to avoid launching only one at a time which may get pruned
-            sweep_jobs = min(capacity, max(outstanding_trials, 6 - running_agents))
+            # Keep MIN_RUNNING_AGENTS going (up to capacity) to finish out the sweep,
+            # one agent at a time may get pruned
+            sweep_jobs = min(capacity, max(outstanding_trials, MIN_RUNNING_AGENTS - running_agents))
             if sweep_jobs <= 0:
                 logger.debug(f"No agent jobs needed for case {case} ({running_agents} agents already running)")
                 return
@@ -1345,44 +1343,23 @@ class Study:
         per-shot integrals need no masking because the padded repeats have
         near-zero dt and contribute nothing to the trapezoid.
         """
-        err_abs_shot = ds["error_abs_shot"]
-        err_rel_shot = ds["error_rel_shot"]
         real = real_timeslice_mask(ds["time"])
-        err_abs_ts = ds["error_abs_ts"].where(real)
-        err_rel_ts = ds["error_rel_ts"].where(real)
-
-        return xr.Dataset(
-            {
-                "err_abs_shot_mean": err_abs_shot.mean(),
-                "err_abs_shot_std": err_abs_shot.std(),
-                "err_abs_shot_med": err_abs_shot.median(),
-                "err_abs_shot_p25": err_abs_shot.quantile(0.25).drop_vars("quantile"),
-                "err_abs_shot_p75": err_abs_shot.quantile(0.75).drop_vars("quantile"),
-                "err_abs_shot_min": err_abs_shot.min(),
-                "err_abs_shot_max": err_abs_shot.max(),
-                "err_rel_shot_mean": err_rel_shot.mean(),
-                "err_rel_shot_std": err_rel_shot.std(),
-                "err_rel_shot_med": err_rel_shot.median(),
-                "err_rel_shot_p25": err_rel_shot.quantile(0.25).drop_vars("quantile"),
-                "err_rel_shot_p75": err_rel_shot.quantile(0.75).drop_vars("quantile"),
-                "err_rel_shot_min": err_rel_shot.min(),
-                "err_rel_shot_max": err_rel_shot.max(),
-                "err_abs_ts_mean": err_abs_ts.mean(),
-                "err_abs_ts_std": err_abs_ts.std(),
-                "err_abs_ts_med": err_abs_ts.median(),
-                "err_abs_ts_p25": err_abs_ts.quantile(0.25).drop_vars("quantile"),
-                "err_abs_ts_p75": err_abs_ts.quantile(0.75).drop_vars("quantile"),
-                "err_abs_ts_min": err_abs_ts.min(),
-                "err_abs_ts_max": err_abs_ts.max(),
-                "err_rel_ts_mean": err_rel_ts.mean(),
-                "err_rel_ts_std": err_rel_ts.std(),
-                "err_rel_ts_med": err_rel_ts.median(),
-                "err_rel_ts_p25": err_rel_ts.quantile(0.25).drop_vars("quantile"),
-                "err_rel_ts_p75": err_rel_ts.quantile(0.75).drop_vars("quantile"),
-                "err_rel_ts_min": err_rel_ts.min(),
-                "err_rel_ts_max": err_rel_ts.max(),
-            }
-        )
+        errors = {
+            "abs_shot": ds["error_abs_shot"],
+            "rel_shot": ds["error_rel_shot"],
+            "abs_ts": ds["error_abs_ts"].where(real),
+            "rel_ts": ds["error_rel_ts"].where(real),
+        }
+        summary = {}
+        for error_name, error in errors.items():
+            summary[f"err_{error_name}_mean"] = error.mean()
+            summary[f"err_{error_name}_std"] = error.std()
+            summary[f"err_{error_name}_med"] = error.median()
+            summary[f"err_{error_name}_p25"] = error.quantile(0.25).drop_vars("quantile")
+            summary[f"err_{error_name}_p75"] = error.quantile(0.75).drop_vars("quantile")
+            summary[f"err_{error_name}_min"] = error.min()
+            summary[f"err_{error_name}_max"] = error.max()
+        return xr.Dataset(summary)
 
     def restore_trainer(self, case: Case, restore_best_checkpoint: bool = True) -> tuple[Trainer, DataLoader]:
         """Restore a given case's trainer and the test dataloader"""
@@ -1392,12 +1369,8 @@ class Study:
             logger.warning(f"Result file for case\n{case}\nnot found at\n{self.result_path(case)}\nTraining may be incomplete!")
         training_config = self.make_train_config(case)
         train_run_builder = get_train_run_builder_class(training_config.train_run_builder)
-        # If this is a submodule, use the dataloader construction logic from the main module. Fallback to using the submodule's own logic otherwise.
-        if training_config.dataloader_config.get("data_train_run_builder"):
-            data_train_run_builder = get_train_run_builder_class(training_config.dataloader_config["data_train_run_builder"])
-            _, train_dl, _val_dl, test_dl = data_train_run_builder.get_dataloaders(training_config.dataloader_config)
-        else:
-            _, train_dl, _val_dl, test_dl = train_run_builder.get_dataloaders(training_config.dataloader_config)
+        data_trb = data_train_run_builder(training_config)
+        _, train_dl, _val_dl, test_dl = data_trb.get_dataloaders(training_config.dataloader_config)
         model = train_run_builder.model_init(train_dl, training_config.model_init_config)
         loss_fn = train_run_builder.get_loss_fn(training_config.loss_config)
         # Tuned configs sweep transition_frac, which launch_train resolves to
@@ -1489,11 +1462,8 @@ class Study:
         """
         Go from datasets to collected results and figures in one command.
 
-        Requires specifying paths to the source datasets in the config TOML or environment variables.
-        Due to data sharing restrictions, the only dataset included in this repository is for C-Mod.
-        If you have access to data from other tokamaks (e.g. DIII-D), create a source dataset using the scripts in `transport_study/datasets/`
-        and provide the path when running this script.
-        If a dataset is not provided for a tokamak, figures which require that data will be skipped.
+        Requires the dataset paths in the config TOML or environment variables.
+        No dataset ships with this repository, build each device's store with `transport_study/datasets/` (see dataset_creation.md).
 
         *"I hardly lifted a finger" - Engi B*
 

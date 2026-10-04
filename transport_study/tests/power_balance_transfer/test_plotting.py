@@ -4,12 +4,8 @@ import numpy as np
 import pytest
 import xarray as xr
 
-from transport_study.power_balance_transfer.plotting import (
-    data_normalization_comparison,
-    domain_adaptation_comparison,
-    model_comparison,
-    training_dataset_comparison,
-)
+from transport_study.orchestration.comparison_figures import comparison_figures
+from transport_study.power_balance_transfer.plotting import COMPARISON_FAMILIES, LAYOUT
 
 
 @pytest.fixture()
@@ -53,20 +49,12 @@ def results_ds() -> xr.Dataset:
 
 
 @pytest.mark.slow
-@pytest.mark.parametrize(
-    ("comparison_fn", "family"),
-    [
-        (model_comparison, "model_comparison"),
-        (training_dataset_comparison, "training_dataset_comparison"),
-        (data_normalization_comparison, "data_normalization_comparison"),
-        (domain_adaptation_comparison, "domain_adaptation_comparison"),
-    ],
-)
-def test_comparison_figures(results_ds, tmp_path, comparison_fn, family):
-    comparison_fn(results_ds, tmp_path)
-    family_dir = tmp_path / "comparison" / family
+@pytest.mark.parametrize("family", COMPARISON_FAMILIES, ids=lambda family: family.name)
+def test_comparison_figures(results_ds, tmp_path, family):
+    comparison_figures(results_ds, LAYOUT, family, tmp_path)
+    family_dir = tmp_path / "comparison" / family.name
     figures = list(family_dir.glob("*.png"))
-    assert figures, f"No {family} figures were generated"
+    assert figures, f"No {family.name} figures were generated"
 
     # Submodule prereq cases predict P_oh/P_rad, not Wtot, and must not
     # appear as figures of their own
@@ -74,9 +62,6 @@ def test_comparison_figures(results_ds, tmp_path, comparison_fn, family):
 
 
 def test_empty_results_skip(tmp_path):
-    empty = xr.Dataset()
-    model_comparison(empty, tmp_path)
-    training_dataset_comparison(empty, tmp_path)
-    data_normalization_comparison(empty, tmp_path)
-    domain_adaptation_comparison(empty, tmp_path)
+    for family in COMPARISON_FAMILIES:
+        comparison_figures(xr.Dataset(), LAYOUT, family, tmp_path)
     assert not (tmp_path / "comparison").exists()

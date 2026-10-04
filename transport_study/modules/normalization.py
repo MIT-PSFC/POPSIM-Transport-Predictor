@@ -39,11 +39,10 @@ from loguru import logger
 
 if TYPE_CHECKING:
     from jaxtyping import ArrayLike
-from popsim.cfspopcon_jax.current_drive import calc_f_shaping, calc_q_star
 from popsim.cfspopcon_jax.geometry import calc_plasma_surface_area
 from popsim.module_base import TimeIndepModule
 
-from transport_study.modules.plasma_parameters import greenwald_fraction
+from transport_study.modules import plasma_parameters
 
 NORM_INPUT_VARS = (
     "ip_MA",
@@ -201,11 +200,11 @@ def physics_feature_vec(vec: jnp.ndarray) -> jnp.ndarray:
     - power_additional_MW    -> P_aux / plasma surface area
     """
     ip_ma, b_geo, r_geo, a_minor, kappa, ne20, p_aux = vec
-    epsilon = a_minor / r_geo
-    f_shaping = calc_f_shaping(epsilon, kappa, jnp.zeros_like(epsilon))
-    q_star = calc_q_star(b_geo, r_geo, epsilon, ip_ma, f_shaping)
-    f_g = greenwald_fraction(ne20, ip_ma, a_minor)
-    a_b0 = a_minor * b_geo
+    epsilon = plasma_parameters.inverse_aspect_ratio(a_minor, r_geo)
+    no_triangularity = jnp.zeros_like(epsilon)
+    q_star = plasma_parameters.q_star(ip_ma, b_geo, r_geo, a_minor, kappa, no_triangularity, no_triangularity)
+    f_g = plasma_parameters.greenwald_fraction(ne20, ip_ma, a_minor)
+    a_b0 = plasma_parameters.a_b0(a_minor, b_geo)
     surface_area = calc_plasma_surface_area(r_geo, epsilon, kappa)
     surface_power_density = p_aux / surface_area
     return jnp.stack([ip_ma, q_star, epsilon, a_b0, kappa, f_g, surface_power_density])
@@ -253,7 +252,7 @@ def apply_z_score(vec: jnp.ndarray, ds_source_idx: ArrayLike, means: jnp.ndarray
 
 
 class ZScoreNormalizer(InputNormalizer):
-    """Per-device zero mean, unit variance.
+    """Per-device zero mean, unit variance of the 7 inputs.
 
     means/stds have shape (n_devices, 7), row order follows the global
     config.ds_source_to_idx. Devices absent from the fitting data keep the
@@ -266,8 +265,13 @@ class ZScoreNormalizer(InputNormalizer):
     means: jnp.ndarray
     stds: jnp.ndarray
 
+    @staticmethod
+    def features(vec: jnp.ndarray) -> jnp.ndarray:
+        """The feature vector the statistics standardize, the 7 inputs themselves."""
+        return vec
+
     def _normalize_vec(self, vec: jnp.ndarray, ds_source_idx: ArrayLike) -> jnp.ndarray:
-        return apply_z_score(vec, ds_source_idx, self.means, self.stds)
+        return apply_z_score(self.features(vec), ds_source_idx, self.means, self.stds)
 
     @classmethod
     def identity(cls, n_devices: int) -> ZScoreNormalizer:
@@ -275,10 +279,20 @@ class ZScoreNormalizer(InputNormalizer):
 
     @classmethod
     def fit(cls, ds: xr.Dataset, n_devices: int) -> ZScoreNormalizer:
-        """Fit per-device mean/std over exactly the 7 input vars."""
-        features, source_idx, _ = _feature_matrix(ds)
-        means, stds = fit_z_score_stats(features, source_idx, n_devices)
+        """Fit per-device mean/std of the features over the training rows."""
+        inputs, source_idx, _ = _feature_matrix(ds)
+        means, stds = fit_z_score_stats(_feature_rows(cls.features, inputs), source_idx, n_devices)
         return cls(means=means, stds=stds)
+
+
+class PhysicsZScoreNormalizer(ZScoreNormalizer):
+    """The physics transform followed by a per-device z-score in physics space.
+
+    The standardization removes the per-device offset and scale of the dimensionless parameters
+    rather than of the raw inputs. Features come out centered, z-scoring does not re-add the device mean the way CORAL does.
+    """
+
+    features = staticmethod(physics_feature_vec)
 
 
 def identity_coral_stats(n_devices: int, n_features: int) -> tuple[jnp.ndarray, jnp.ndarray]:
@@ -370,7 +384,7 @@ def apply_coral(vec: jnp.ndarray, ds_source_idx: ArrayLike, means: jnp.ndarray, 
 
 
 class CoralNormalizer(InputNormalizer):
-    """Per-device CORAL alignment to the target device covariance.
+    """Per-device CORAL alignment of the 7 inputs to the target device covariance.
 
     transforms has shape (n_devices, 7, 7) and means (n_devices, 7), rows
     follow the global config.ds_source_to_idx. Unfitted devices keep the
@@ -380,8 +394,13 @@ class CoralNormalizer(InputNormalizer):
     means: jnp.ndarray
     transforms: jnp.ndarray
 
+    @staticmethod
+    def features(vec: jnp.ndarray) -> jnp.ndarray:
+        """The feature vector the transforms align, the 7 inputs themselves."""
+        return vec
+
     def _normalize_vec(self, vec: jnp.ndarray, ds_source_idx: ArrayLike) -> jnp.ndarray:
-        return apply_coral(vec, ds_source_idx, self.means, self.transforms)
+        return apply_coral(self.features(vec), ds_source_idx, self.means, self.transforms)
 
     @classmethod
     def identity(cls, n_devices: int) -> CoralNormalizer:
@@ -390,76 +409,22 @@ class CoralNormalizer(InputNormalizer):
 
     @classmethod
     def fit(cls, ds: xr.Dataset, n_devices: int, target_idx: int) -> CoralNormalizer:
-        """Fit per-device CORAL transforms over exactly the 7 input vars."""
-        features, source_idx, shot_idx = _feature_matrix(ds)
-        stats = fit_coral_stats(features, source_idx, n_devices, shot_idx, target_idx)
+        """Fit per-device CORAL transforms of the features over the training rows."""
+        inputs, source_idx, shot_idx = _feature_matrix(ds)
+        stats = fit_coral_stats(_feature_rows(cls.features, inputs), source_idx, n_devices, shot_idx, target_idx)
         if stats is None:
             return cls.identity(n_devices)
         means, transforms = stats
         return cls(means=means, transforms=transforms)
 
 
-class PhysicsCoralNormalizer(InputNormalizer):
+class PhysicsCoralNormalizer(CoralNormalizer):
     """The physics transform followed by CORAL alignment in physics space.
 
-    The CORAL statistics are fitted on the physics-transformed training
-    features, so the alignment corrects the per-device distribution of the
-    dimensionless parameters rather than the raw inputs.
-    Buffer shapes match CoralNormalizer.
+    The alignment corrects the per-device distribution of the dimensionless parameters rather than of the raw inputs.
     """
 
-    means: jnp.ndarray
-    transforms: jnp.ndarray
-
-    def _normalize_vec(self, vec: jnp.ndarray, ds_source_idx: ArrayLike) -> jnp.ndarray:
-        phys = physics_feature_vec(vec)
-        return apply_coral(phys, ds_source_idx, self.means, self.transforms)
-
-    @classmethod
-    def identity(cls, n_devices: int) -> PhysicsCoralNormalizer:
-        means, transforms = identity_coral_stats(n_devices, N_FEATURES)
-        return cls(means=means, transforms=transforms)
-
-    @classmethod
-    def fit(cls, ds: xr.Dataset, n_devices: int, target_idx: int) -> PhysicsCoralNormalizer:
-        """Fit per-device CORAL transforms in the physics feature space."""
-        features, source_idx, shot_idx = _feature_matrix(ds)
-        phys_rows = np.asarray(jax.vmap(physics_feature_vec)(jnp.asarray(features)))
-        stats = fit_coral_stats(phys_rows, source_idx, n_devices, shot_idx, target_idx)
-        if stats is None:
-            return cls.identity(n_devices)
-        means, transforms = stats
-        return cls(means=means, transforms=transforms)
-
-
-class PhysicsZScoreNormalizer(InputNormalizer):
-    """The physics transform followed by a per-device z-score in physics space.
-
-    The mean/std statistics are fitted on the physics-transformed training
-    features, so the standardization removes the per-device offset and scale
-    of the dimensionless parameters rather than the raw inputs. Features come
-    out centered (z-scoring does not re-add the device mean the way CORAL
-    does). Buffer shapes match ZScoreNormalizer.
-    """
-
-    means: jnp.ndarray
-    stds: jnp.ndarray
-
-    def _normalize_vec(self, vec: jnp.ndarray, ds_source_idx: ArrayLike) -> jnp.ndarray:
-        phys = physics_feature_vec(vec)
-        return apply_z_score(phys, ds_source_idx, self.means, self.stds)
-
-    @classmethod
-    def identity(cls, n_devices: int) -> PhysicsZScoreNormalizer:
-        return cls(means=jnp.zeros((n_devices, N_FEATURES)), stds=jnp.ones((n_devices, N_FEATURES)))
-
-    @classmethod
-    def fit(cls, ds: xr.Dataset, n_devices: int) -> PhysicsZScoreNormalizer:
-        """Fit per-device mean/std in the physics feature space."""
-        features, source_idx, _ = _feature_matrix(ds)
-        phys_rows = np.asarray(jax.vmap(physics_feature_vec)(jnp.asarray(features)))
-        means, stds = fit_z_score_stats(phys_rows, source_idx, n_devices)
-        return cls(means=means, stds=stds)
+    features = staticmethod(physics_feature_vec)
 
 
 class CoralFeatureNormalizer(TimeIndepModule):
@@ -529,16 +494,22 @@ FeatureNormalizer = CoralFeatureNormalizer | ZScoreFeatureNormalizer
 FEATURE_NORMALIZATIONS = ("physics", "physics-coral", "physics-zscore")
 
 
-def feature_fit_arrays(ds: xr.Dataset, features: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Attach an (N, F) feature matrix to its device and shot indices.
+def flat_columns(ds: xr.Dataset, variables: tuple[str, ...] | list[str]) -> np.ndarray:
+    """(N, len(variables)) float matrix of dataset variables flattened in step.
 
-    The matrix rows are the dataset flattened against ip_MA (see each module's
-    feature-matrix helper). NaN device indices (from NaN-padded concatenation)
-    can't be attributed to a device, so their rows are dropped.
+    Every variable is broadcast against ip_MA first, so per-shot variables line up with the per-timeslice ones.
     """
     reference = ds["ip_MA"]
-    source_idx = np.asarray(ds["ds_source_idx"].broadcast_like(reference).values, dtype=float).ravel()
-    shot_idx = np.asarray(ds["shot"].broadcast_like(reference).values).ravel()
+    return np.column_stack([np.asarray(ds[var].broadcast_like(reference).values, dtype=float).ravel() for var in variables])
+
+
+def feature_fit_arrays(ds: xr.Dataset, features: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Attach an (N, F) feature matrix built with flat_columns to its device and shot indices.
+
+    NaN device indices (from NaN-padded concatenation) can't be attributed to a device, so their rows are dropped.
+    """
+    source_idx = flat_columns(ds, ["ds_source_idx"])[:, 0]
+    shot_idx = np.asarray(ds["shot"].broadcast_like(ds["ip_MA"]).values).ravel()
     attributed = ~np.isnan(source_idx)
     return features[attributed], source_idx[attributed].astype(int), shot_idx[attributed]
 
@@ -580,27 +551,27 @@ def make_feature_normalizer(
 
 
 def _feature_matrix(ds: xr.Dataset) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Flatten the 7 input vars to an (N, 7) matrix plus the matching (N,) device and shot indices."""
-    reference = ds[NORM_INPUT_VARS[0]]
-    columns = [np.asarray(ds[var].broadcast_like(reference).values, dtype=float).ravel() for var in NORM_INPUT_VARS]
-    source_idx = np.asarray(ds["ds_source_idx"].broadcast_like(reference).values, dtype=float).ravel()
-    shot_idx = np.asarray(ds["shot"].broadcast_like(reference).values).ravel()
-    # NaN device indices (from NaN-padded concatenation) can't be attributed to a device
-    features = np.column_stack(columns)
-    attributed = ~np.isnan(source_idx)
-    return features[attributed], source_idx[attributed].astype(int), shot_idx[attributed]
+    """The 7 input vars as an (N, 7) matrix with the matching (N,) device and shot indices, see feature_fit_arrays."""
+    return feature_fit_arrays(ds, flat_columns(ds, NORM_INPUT_VARS))
+
+
+def _feature_rows(features_fn, inputs: np.ndarray) -> np.ndarray:
+    """features_fn applied to every row of an (N, 7) input matrix."""
+    return np.asarray(jax.vmap(features_fn)(jnp.asarray(inputs)))
 
 
 # The InputNormalizer classes per method, grouped by what their fit needs
 _STATELESS_NORMALIZERS: dict[str, type[InputNormalizer]] = {"raw": RawNormalizer, "physics": PhysicsNormalizer}
-_ZSCORE_NORMALIZERS: dict[str, type[ZScoreNormalizer | PhysicsZScoreNormalizer]] = {
+_ZSCORE_NORMALIZERS: dict[str, type[ZScoreNormalizer]] = {
     "zscore": ZScoreNormalizer,
     "physics-zscore": PhysicsZScoreNormalizer,
 }
-_CORAL_NORMALIZERS: dict[str, type[CoralNormalizer | PhysicsCoralNormalizer]] = {
+_CORAL_NORMALIZERS: dict[str, type[CoralNormalizer]] = {
     "coral": CoralNormalizer,
     "physics-coral": PhysicsCoralNormalizer,
 }
+# Every method make_normalizer builds
+INPUT_NORMALIZATIONS = (*_STATELESS_NORMALIZERS, *_ZSCORE_NORMALIZERS, *_CORAL_NORMALIZERS)
 
 
 def make_normalizer(

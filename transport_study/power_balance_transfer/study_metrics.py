@@ -1,22 +1,20 @@
-"""Stage-resolved performance metrics for power balance transfer study results.
+"""Stage-resolved metrics of power balance transfer study results (its ANALYSIS_METRICS_MODULE, see orchestration.case_metrics).
 
-The per-case result files already carry per-timeslice absolute and relative
-Wtot errors (error_abs_ts / error_rel_ts, see PowerBalanceTRB); what they do
-not carry is where in the discharge each timeslice sits. This module joins
-each result timeslice back to its device dataset by (shot, nearest time) to
-pick up ip_MA and the heating powers, labels it with a shot stage
-(rampup / flattop / rampdown, with an aux-heating flag subdividing the
-flattop), and aggregates the errors per stage.
+The result files carry per-timeslice absolute and relative errors (error_abs_ts / error_rel_ts),
+not where in the discharge each timeslice sits.
+Each result timeslice is joined back to its device dataset by (shot, nearest time)
+to pick up ip_MA and the auxiliary power for the shot-stage labels.
+Nothing here reads the predicted signal itself,
+so the transport study, whose result files carry the same error variables, scores its cases with this module too.
 
-Per-shot TIME-AVERAGED errors (mean over the shot's valid timeslices) are also
-computed here: the per-shot errors in the result files are raw time integrals,
-so longer shots score worse at equal instantaneous error. The time-averaged
-form removes that duration confound and is what the case reports rank shots by.
+The per-shot errors in the result files are raw time integrals, so longer shots score worse at equal instantaneous error.
+shot_time_averaged_errors removes that duration confound and is what the case reports rank shots by.
 """
 
 from dataclasses import dataclass
 from functools import cache
 from pathlib import Path
+from typing import ClassVar
 
 import numpy as np
 import xarray as xr
@@ -25,87 +23,41 @@ from transport_validation_datasets.store_schema import HEATING_POWERS
 
 from transport_study import EPISODE_DIM, TIME_COORD
 from transport_study.config import config
-from transport_study.orchestration.stages import STAGE_AGG_NAMES, segment_stages
-from transport_study.orchestration.study import (
-    Study,
-    real_timeslice_mask,
-    write_netcdf_atomic,
+from transport_study.orchestration.case_metrics import (
+    StagedTimesliceMetrics,
+    concat_records,
+    nearest_time_positions,
+    shot_stages,
 )
-from transport_study.signals import HEATING_POWERS_MW, convert_to_working_units
-
-# Joined dataset timeslice must be within this of the result timeslice.
-# Timebases are 1 kHz, so anything beyond half a sample is a bad join
-TIME_JOIN_TOLERANCE_S = 6e-4
+from transport_study.orchestration.study import Study, real_timeslice_mask
+from transport_study.signals import POWER_ADDITIONAL_MW, convert_to_working_units
 
 METRIC_NAMES = ("abs", "rel")
-
-COLLECTED_METRICS_FILENAME = "collected_metrics.nc"
-CASE_METRICS_FILENAME = "case_metrics.nc"
-
-__all__ = [
-    "METRIC_NAMES",
-    "STAGE_AGG_NAMES",
-    "CaseTimesliceMetrics",
-    "case_metrics_path",
-    "collect_metrics",
-    "collected_metrics_path",
-    "compute_and_save_case_metrics",
-    "compute_case_timeslice_metrics",
-    "shot_time_averaged_errors",
-]
 
 
 @cache
 def load_stage_dataset(device: str) -> xr.Dataset:
-    """Device dataset with the signals needed to stage-label result timeslices.
-
-    Only ip_MA, the heating powers, and the time coordinate are kept
-    (the errors themselves already live in the result files).
-    """
+    """Device dataset with only the signals the stage labels need, ip_MA, the auxiliary power and time."""
     ds_path = Path(config.dataset_paths[device])
     ds_store = xr.open_dataset(ds_path)
     ds_store_selected = ds_store[["ip", *HEATING_POWERS, TIME_COORD]]
     ds = convert_to_working_units(ds_store_selected)
-    return ds[["ip_MA", *HEATING_POWERS_MW, TIME_COORD]].load()
+    return ds[["ip_MA", POWER_ADDITIONAL_MW, TIME_COORD]].load()
 
 
 @dataclass
-class CaseTimesliceMetrics:
-    """Long-form per-timeslice metrics for one case, one record per valid test
-    timeslice (finite time and relative error, clock-advancing rather than a
-    padded repeat of the shot's final timeslice, joined to the device dataset)."""
+class CaseTimesliceMetrics(StagedTimesliceMetrics):
+    """Valid test timeslices are clock-advancing (not a padded repeat of the final timeslice)
+    with a finite relative error, joined to the device dataset."""
 
-    shot: np.ndarray
-    ds_source: np.ndarray
-    time: np.ndarray
-    stage: np.ndarray
-    aux_heated: np.ndarray
+    METRIC_PREFIX: ClassVar[str] = "err_"
+
     err_abs: np.ndarray
     err_rel: np.ndarray
 
-    def __len__(self) -> int:
-        return len(self.shot)
-
-    def stage_mask(self, stage: str) -> np.ndarray:
-        if stage == "all":
-            return np.ones(len(self), dtype=bool)
-        if stage == "flattop_ohmic":
-            return (self.stage == "flattop") & ~self.aux_heated
-        if stage == "flattop_aux":
-            return (self.stage == "flattop") & self.aux_heated
-        return self.stage == stage
-
-    def metric(self, name: str) -> np.ndarray:
-        return getattr(self, f"err_{name}")
-
 
 def compute_case_timeslice_metrics(result_ds: xr.Dataset) -> CaseTimesliceMetrics:
-    """Stage-label every valid test timeslice of one case result file.
-
-    Joins each result timeslice to its device dataset by (shot, nearest time)
-    to pick up the Ip and auxiliary power traces the result file does not
-    carry, then labels it with segment_stages.
-    """
+    """Stage-label every valid test timeslice of one case result file."""
     records: dict[str, list] = {name: [] for name in ("shot", "ds_source", "time", "stage", "aux_heated", "err_abs", "err_rel")}
 
     for shot_pos, shot in enumerate(result_ds[EPISODE_DIM].values):
@@ -126,35 +78,13 @@ def compute_case_timeslice_metrics(result_ds: xr.Dataset) -> CaseTimesliceMetric
         if len(result_idxs) == 0:
             continue
 
-        # Nearest-time join into the device dataset
-        stage_time = shot_stage["time"].values
-        finite_stage = np.isfinite(stage_time)
-        stage_positions = np.flatnonzero(finite_stage)
-        if len(stage_positions) == 0:
-            logger.warning(f"Shot {shot} has no finite times in the {device} dataset, skipping")
-            continue
-        stage_times_finite = stage_time[stage_positions]
-        order = np.argsort(stage_times_finite)
-        sorted_times = stage_times_finite[order]
-        sorted_positions = stage_positions[order]
-
-        target_times = res_time[result_idxs]
-        insert = np.searchsorted(sorted_times, target_times)
-        insert = np.clip(insert, 1, len(sorted_times) - 1)
-        left, right = sorted_times[insert - 1], sorted_times[insert]
-        pick_right = np.abs(right - target_times) < np.abs(target_times - left)
-        nearest_sorted = np.where(pick_right, insert, insert - 1)
-        joined = np.abs(sorted_times[nearest_sorted] - target_times) <= TIME_JOIN_TOLERANCE_S
-        if not joined.all():
-            logger.warning(f"Shot {shot}: {np.sum(~joined)} result timeslices had no dataset time within tolerance, dropping them")
-        result_idxs = result_idxs[joined]
-        stage_idxs = sorted_positions[nearest_sorted[joined]]
+        mask_joined, stage_idxs = nearest_time_positions(shot_stage["time"].values, res_time[result_idxs], shot, device)
+        result_idxs = result_idxs[mask_joined]
         if len(result_idxs) == 0:
             continue
 
         # Stage labels over the full shot, then picked at the joined timeslices
-        p_aux = sum(np.nan_to_num(shot_stage[sig].values, nan=0.0) for sig in HEATING_POWERS_MW)
-        stage_full, aux_full = segment_stages(shot_stage["ip_MA"].values, p_aux)
+        stage_full, aux_full = shot_stages(shot_stage)
 
         n = len(result_idxs)
         records["shot"].append(np.full(n, shot))
@@ -165,20 +95,19 @@ def compute_case_timeslice_metrics(result_ds: xr.Dataset) -> CaseTimesliceMetric
         records["err_abs"].append(err_abs[result_idxs])
         records["err_rel"].append(err_rel[result_idxs])
 
-    def _cat(chunks: list, dtype=None) -> np.ndarray:
-        if not chunks:
-            return np.array([], dtype=dtype if dtype is not None else float)
-        return np.concatenate(chunks)
-
     return CaseTimesliceMetrics(
-        shot=_cat(records["shot"]),
-        ds_source=_cat(records["ds_source"], dtype=object).astype(str),
-        time=_cat(records["time"]),
-        stage=_cat(records["stage"], dtype=object).astype(str),
-        aux_heated=_cat(records["aux_heated"], dtype=bool),
-        err_abs=_cat(records["err_abs"]),
-        err_rel=_cat(records["err_rel"]),
+        shot=concat_records(records["shot"]),
+        ds_source=concat_records(records["ds_source"], dtype=object).astype(str),
+        time=concat_records(records["time"]),
+        stage=concat_records(records["stage"], dtype=object).astype(str),
+        aux_heated=concat_records(records["aux_heated"], dtype=bool),
+        err_abs=concat_records(records["err_abs"]),
+        err_rel=concat_records(records["err_rel"]),
     )
+
+
+def case_timeslice_metrics(study: Study, case, result_ds: xr.Dataset) -> CaseTimesliceMetrics:
+    return compute_case_timeslice_metrics(result_ds)
 
 
 def shot_time_averaged_errors(ts_metrics: CaseTimesliceMetrics) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
@@ -204,110 +133,3 @@ def shot_time_averaged_errors(ts_metrics: CaseTimesliceMetrics) -> tuple[np.ndar
             avg_rel[i] = float(np.mean(rel[finite]))
             avg_abs[i] = float(np.nanmean(abs_[finite])) if np.isfinite(abs_[finite]).any() else np.nan
     return shots, avg_abs, avg_rel, n_ts
-
-
-def collected_metrics_path(study: Study) -> Path:
-    return study.result_dir / COLLECTED_METRICS_FILENAME
-
-
-def case_metrics_path(study: Study, case) -> Path:
-    """Per-case stage-aggregate cache, next to the case's result_data.nc.
-    An empty dataset is the marker for 'computed, but no valid timeslices',
-    so parallel analysis jobs can signal completion either way."""
-    return study.result_path(case).parent / CASE_METRICS_FILENAME
-
-
-def aggregate_case_metrics(ts_metrics: CaseTimesliceMetrics) -> xr.Dataset:
-    """Reduce one case's per-timeslice errors to per-stage statistics.
-
-    Dims: stage (STAGE_AGG_NAMES). Data variables <metric>_<stat> for metric in
-    abs/rel and stat in mean/std/med/count. Case-identifying coords are
-    attached later by collect_metrics, which knows the case_idx.
-    """
-    data_vars = {}
-    for metric in METRIC_NAMES:
-        values = ts_metrics.metric(metric)
-        means, stds, meds, counts = [], [], [], []
-        for stage in STAGE_AGG_NAMES:
-            stage_values = values[ts_metrics.stage_mask(stage)]
-            stage_values = stage_values[np.isfinite(stage_values)]
-            counts.append(len(stage_values))
-            if len(stage_values) == 0:
-                means.append(np.nan)
-                stds.append(np.nan)
-                meds.append(np.nan)
-            else:
-                means.append(float(np.mean(stage_values)))
-                stds.append(float(np.std(stage_values)))
-                meds.append(float(np.median(stage_values)))
-        data_vars[f"{metric}_mean"] = ("stage", np.array(means))
-        data_vars[f"{metric}_std"] = ("stage", np.array(stds))
-        data_vars[f"{metric}_med"] = ("stage", np.array(meds))
-        data_vars[f"{metric}_count"] = ("stage", np.array(counts))
-
-    return xr.Dataset(data_vars=data_vars, coords={"stage": list(STAGE_AGG_NAMES)})
-
-
-def compute_and_save_case_metrics(study, case) -> xr.Dataset:
-    """Stage-aggregate metrics for one case, cached to case_metrics_path.
-
-    Returns the cached dataset when present, otherwise computes from the case
-    result file and saves. A case whose result file exists but yields no valid
-    timeslices caches an empty dataset so the work is not retried. A case with
-    no result file returns an empty dataset without caching (results may still
-    appear later).
-    """
-    cache_path = case_metrics_path(study, case)
-    if cache_path.exists():
-        return xr.load_dataset(cache_path)
-
-    result_path = study.result_path(case)
-    if not result_path.exists():
-        return xr.Dataset()
-
-    result_ds = xr.load_dataset(result_path)
-    ts_metrics = compute_case_timeslice_metrics(result_ds)
-    if len(ts_metrics) == 0:
-        logger.warning(f"No valid test timeslices for case {case}, caching empty metrics marker")
-        case_ds = xr.Dataset()
-    else:
-        case_ds = aggregate_case_metrics(ts_metrics)
-        logger.info(f"Computed stage-resolved metrics for case {case} ({len(ts_metrics)} timeslices)")
-
-    write_netcdf_atomic(case_ds, cache_path)
-    return case_ds
-
-
-def collect_metrics(study) -> xr.Dataset:
-    """Aggregate stage-resolved metrics for every finished case.
-
-    Dims: (case_idx, stage) with stage in STAGE_AGG_NAMES. Data variables
-    <metric>_<stat> for metric in abs/rel and stat in mean/std/med/count.
-    Case-identifying coords along case_idx match collect_results.
-
-    Reads the per-case caches written by compute_and_save_case_metrics
-    (parallel analysis jobs fill them ahead of time) and computes any that are
-    still missing in-process. The per-case caches are the real cache; the
-    combined dataset is rebuilt (cheap concat) and written to
-    collected_metrics.nc in the study result dir every call, so a partial file
-    from an interrupted run can never mask newly finished cases.
-    """
-    cache_path = collected_metrics_path(study)
-
-    results = []
-    for case_idx, case in enumerate(study.cases):
-        case_ds = compute_and_save_case_metrics(study, case)
-        if not case_ds.data_vars:
-            continue
-        results.append(case_ds.assign_coords(study.case_coords(case_idx, case)))
-
-    if not results:
-        logger.warning("No finished cases with valid metrics, stage-resolved metrics are empty")
-        return xr.Dataset()
-
-    # coords="different" stacks the per-case scalar coords (model_type, ...).
-    # compat is pinned, the xarray default is changing to "override", which coords="different" rejects
-    metrics_ds = xr.concat(results, dim="case_idx", coords="different", compat="equals")
-    write_netcdf_atomic(metrics_ds, cache_path)
-    logger.info(f"Saved stage-resolved metrics to {cache_path}")
-    return metrics_ds

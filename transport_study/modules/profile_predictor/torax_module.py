@@ -5,7 +5,6 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import xarray as xr
-from jaxtyping import Array
 from popsim import TimeIndepModule
 from popsim.math_utils import smooth_clamp
 from popsim.ml.rtd_mlp import Activation, RtdMLP
@@ -21,8 +20,11 @@ from torax._src.torax_pydantic import torax_pydantic
 from transport_study import RADIAL_DIM
 from transport_study.modules.normalization import FeatureNormalizer
 from transport_study.modules.profile_predictor.module import (
+    N_NN_INPUTS,
     Inputs,
     Outputs,
+    profile_outputs,
+    static_rhogrid,
 )
 
 # For each type of TORAX transport model:
@@ -32,6 +34,9 @@ TRANSPORT_COEFFICIENT_NAMES = {
     "gyrobohm": ("chi_bohm_multiplier", "chi_gyrobohm_multiplier", "D_face_c1", "D_face_c2", "V_face_coeff"),
     "qlknn": ("ITG_flux_ratio_correction", "ETG_correction_factor", "collisionality_multiplier"),
 }
+
+# The torax-backed model type of every implemented transport model, torax-<transport_model>
+TORAX_MODEL_TYPES = tuple(f"torax-{transport_model}" for transport_model in TRANSPORT_COEFFICIENT_NAMES)
 
 # Coefficients predicted by the sources network, in the order of the network outputs
 SOURCE_COEFFICIENT_NAMES = (
@@ -615,26 +620,189 @@ def transport_provider_mapping(transport_model: str, coeffs: dict) -> dict:
     return {prefix + field: value for field, value in updates.items()}
 
 
+# Per-sample geometry builders, see build_geometry_provider
+VALID_GEOMETRY_BUILDERS = ("circular", "miller")
+
+# Bounds on the temperature scale of the edge temperature boundary condition [keV].
+# The beta-derived temperature estimate is off-scale on early low-density samples with a noisy stored energy
+TE_SCALE_BOUNDS_KEV = (0.05, 5.0)
+
+
+def check_torax_choices(transport_model: str, geometry_builder: str) -> None:
+    """Raise for a transport model or a geometry builder the torax modules do not implement."""
+    if transport_model not in TRANSPORT_COEFFICIENT_NAMES:
+        raise ValueError(f"Unknown transport model '{transport_model}', valid: {sorted(TRANSPORT_COEFFICIENT_NAMES)}")
+    if geometry_builder not in VALID_GEOMETRY_BUILDERS:
+        raise ValueError(f"Unknown geometry builder '{geometry_builder}', valid: {VALID_GEOMETRY_BUILDERS}")
+
+
+def make_torax_networks(
+    n_inputs: int, transport_model: str, n_source_outputs: int, nn_width: int, nn_depth: int, key: jax.Array
+) -> tuple[RtdMLP, RtdMLP, RtdMLP]:
+    """The transport, sources and edge networks of a torax module.
+
+    The transport network predicts the TRANSPORT_COEFFICIENT_NAMES of transport_model,
+    the edge network the edge density and temperature fractions (bound_edge_coefficients).
+    """
+    _, key_transport, key_sources, key_edge = jax.random.split(key, 4)
+
+    def mlp(out_size: int, subkey: jax.Array) -> RtdMLP:
+        return RtdMLP(in_size=n_inputs, out_size=out_size, width_size=nn_width, depth=nn_depth, activation=Activation.RELU, key=subkey)
+
+    return mlp(len(TRANSPORT_COEFFICIENT_NAMES[transport_model]), key_transport), mlp(n_source_outputs, key_sources), mlp(2, key_edge)
+
+
+def make_step_fn_and_grid(torax_config: ToraxConfig | dict, transport_model: str) -> tuple[SimulationStepFn, tuple, tuple]:
+    """The TORAX step function of a config, with its static face-center and hires grids.
+
+    Per-sample geometry is rebuilt from traced inputs (build_geometry_provider),
+    but the mesh and hires grids fix array shapes and must be concrete there,
+    so they are harvested once from the config-built placeholder geometry (a cached lookup).
+    They are tuples because static eqx fields must be hashable,
+    and harvesting rather than rederiving from n_rho / hires_factor stays exact for non-uniform face centers.
+    """
+    if isinstance(torax_config, dict):
+        torax_config = ToraxConfig.from_dict(torax_config)
+    validate_transport_model_name(torax_config, transport_model)
+    step_fn = torax_experimental.make_step_fn(torax_config)
+    static_geo = step_fn.geometry_provider(0.0)
+    return step_fn, tuple(static_geo.torax_mesh.face_centers.tolist()), tuple(np.array(static_geo.rho_hires_norm).tolist())
+
+
+def cell_centers(face_centers: tuple) -> np.ndarray:
+    """The cell-center grid of a TORAX mesh, rho_norm, which is the rho_tor_norm the datasets use."""
+    return torax_pydantic.Grid1D(face_centers=np.array(face_centers)).cell_centers
+
+
+def build_geometry_provider(
+    geometry_builder: str, inputs, face_centers: tuple, rho_hires_norm: tuple, delta_exponent: float
+) -> geometry_provider_lib.ConstantGeometryProvider:
+    """The JAX-differentiable per-sample geometry of inputs (any Inputs with the shape fields), circular or miller."""
+    torax_mesh = torax_pydantic.Grid1D(face_centers=np.array(face_centers))
+    rho_hires_norm_np = np.array(rho_hires_norm)
+    if geometry_builder == "miller":
+        geo = build_miller_geometry_jax(
+            R_major=inputs.geometric_axis_r,
+            a_minor=inputs.minor_radius,
+            B_0=inputs.b_geo,
+            elongation_LCFS=inputs.elongation,
+            triangularity_upper=inputs.triangularity_upper,
+            triangularity_lower=inputs.triangularity_lower,
+            torax_mesh=torax_mesh,
+            rho_hires_norm_np=rho_hires_norm_np,
+            delta_exponent=delta_exponent,
+        )
+    else:
+        geo = build_circular_geometry_jax(
+            R_major=inputs.geometric_axis_r,
+            a_minor=inputs.minor_radius,
+            B_0=inputs.b_geo,
+            elongation_LCFS=inputs.elongation,
+            torax_mesh=torax_mesh,
+            rho_hires_norm_np=rho_hires_norm_np,
+        )
+    return geometry_provider_lib.ConstantGeometryProvider(geo=geo)
+
+
+def bound_source_coefficients(
+    source_names: tuple[str, ...], nn_sources_out: jax.Array, n_e_line_average_1e20: jax.Array, volume_m3: jax.Array
+) -> dict:
+    """The fueling and heat deposition coefficients both torax module families share, bounded to physical ranges.
+
+    source_names orders the sources network outputs.
+      S_total: 0 - inf, softplus multiple of the device fueling scale particle_inventory / TAU_REF_S [1e21 / s],
+        so the magnitude transfers between devices
+      gaussian_location: 0 - 0.8 (deposition center in rho_norm)
+      gaussian_width: 0.02 - 0.4 (deposition width in rho_norm)
+      electron_heat_fraction: 0.2 - 0.95, the bias keeps the random init balanced at 0.5
+        (ST NBI heating is electron-dominated, hence the high ceiling)
+    """
+
+    def out(name: str) -> jax.Array:
+        idx = source_names.index(name)
+        return nn_sources_out[idx : idx + 1]
+
+    # Particle inventory in 1e21 electrons
+    inventory = 0.1 * n_e_line_average_1e20 * volume_m3
+    return {
+        "S_total": jax.nn.softplus(out("S_total")) * inventory / TAU_REF_S,
+        "gaussian_location": 0.8 * jax.nn.sigmoid(out("gaussian_location")),
+        "gaussian_width": 0.02 + 0.38 * jax.nn.sigmoid(out("gaussian_width")),
+        "electron_heat_fraction": 0.2 + 0.75 * jax.nn.sigmoid(out("electron_heat_fraction") - 0.4),
+    }
+
+
+def bound_edge_coefficients(nn_edge_out: jax.Array, n_e_line_average_1e20: jax.Array, te_approx_keV: jax.Array) -> dict:
+    """The edge Dirichlet boundary conditions as NN-predicted fractions.
+
+      n_e_right_bc = fraction in (0.01, 0.95) of the line-averaged density [1e20 m^-3]:
+        a fixed edge density above the target profile acts as an infinite particle source, so it scales with the density
+      T_e_right_bc = 20 eV + fraction of the clipped temperature estimate [keV]
+    Both are floored, a near-vacuum edge ill-conditions the density equation.
+    The floors are affine in the sigmoids, so the NN gradient path stays intact.
+    The negative bias makes random-init edge temperatures a few tens of eV:
+    te_approx is an overestimate, and a hot edge flattens the profile,
+    which keeps threshold models like QLKNN subcritical and kills the gradient to the transport network.
+    """
+    te_scale = jnp.clip(te_approx_keV, *TE_SCALE_BOUNDS_KEV)
+    return {
+        "n_e_right_bc": (0.01 + 0.94 * jax.nn.sigmoid(nn_edge_out[0:1])) * n_e_line_average_1e20,
+        "T_e_right_bc": 0.02 + jax.nn.sigmoid(nn_edge_out[1:2] - 5.0) * te_scale,
+    }
+
+
+def shared_provider_mapping(ip_MA: jax.Array, transport_model: str, coeffs: dict) -> dict:
+    """Runtime-params overrides both torax module families share: Ip, the edge BCs, fueling, deposition and transport.
+
+    The ion edge temperature is assumed equal to the electron one.
+    """
+    te_right_bc_update = torax_experimental.TimeVaryingScalarUpdate(value=coeffs["T_e_right_bc"])
+    mapping = {
+        "profile_conditions.Ip": torax_experimental.TimeVaryingScalarUpdate(value=jnp.atleast_1d(ip_MA * 1e6)),
+        "profile_conditions.n_e_right_bc": torax_experimental.TimeVaryingScalarUpdate(value=coeffs["n_e_right_bc"] * 1e20),
+        "profile_conditions.T_e_right_bc": te_right_bc_update,
+        "profile_conditions.T_i_right_bc": te_right_bc_update,
+        "sources.gas_puff.S_total": torax_experimental.TimeVaryingScalarUpdate(value=coeffs["S_total"] * 1e21),
+        "sources.generic_heat.gaussian_location": torax_experimental.TimeVaryingScalarUpdate(value=coeffs["gaussian_location"]),
+        "sources.generic_heat.gaussian_width": torax_experimental.TimeVaryingScalarUpdate(value=coeffs["gaussian_width"]),
+        "sources.generic_heat.electron_heat_fraction": torax_experimental.TimeVaryingScalarUpdate(value=coeffs["electron_heat_fraction"]),
+    }
+    return mapping | transport_provider_mapping(transport_model, coeffs)
+
+
+def interp_core_profiles(core_profiles, face_centers: tuple, rho: jax.Array) -> tuple[jax.Array, jax.Array]:
+    """n_e [1e20 m^-3] and T_e [keV] of TORAX core profiles interpolated onto rho in [0, 1].
+
+    The cell values are augmented with both face values before interpolating (CellVariable.cell_plus_boundaries):
+    jnp.interp flat-holds outside the data range, which would ignore the Dirichlet edge value at rho = 1,
+    and the zero-gradient axis condition makes the rho = 0 face equal the innermost cell.
+    """
+    rho_full = jnp.concatenate([jnp.asarray(face_centers[:1]), jnp.asarray(cell_centers(face_centers)), jnp.asarray(face_centers[-1:])])
+    ne = jnp.interp(rho, rho_full, core_profiles.n_e.cell_plus_boundaries() / 1e20)
+    te = jnp.interp(rho, rho_full, core_profiles.T_e.cell_plus_boundaries())
+    return ne, te
+
+
 class ProfilePredictorTorax(TimeIndepModule):
+    """Steady-state profile estimate from a differentiable TORAX relaxation with NN-predicted coefficients."""
+
     rhogrid: tuple = eqx.field(static=True)
-    # Which TORAX transport model the transport network parameterizes:
-    # "constant", "gyrobohm", or "qlknn"
+    # TORAX transport model the transport network parameterizes, a TRANSPORT_COEFFICIENT_NAMES key
     transport_model: str = eqx.field(static=True)
-    # Which per-sample geometry builder to use: "circular" or "miller"
+    # Per-sample geometry builder, one of VALID_GEOMETRY_BUILDERS
     geometry_builder: str = eqx.field(static=True)
-    # Radial exponent p in delta(rho_norm) = delta_edge * rho_norm**p,
-    # only used by the miller builder
+    # Radial exponent p in delta(rho_norm) = delta_edge * rho_norm**p, only used by the miller builder
     delta_exponent: float = eqx.field(static=True)
 
     nn_transport: RtdMLP
     nn_sources: RtdMLP
     nn_edge: RtdMLP
-    # Per-device CORAL stage over the 10 nn_inputs
+    # Per-device stat stage over the 10 nn_inputs
     normalizer: FeatureNormalizer
 
     step_fn: SimulationStepFn = eqx.field(static=True)
 
-    # Static mesh info for JAX-differentiable geometry construction
+    # Static mesh info for the JAX-differentiable geometry construction, see make_step_fn_and_grid
     _face_centers: tuple = eqx.field(static=True)
     _rho_hires_norm: tuple = eqx.field(static=True)
     # Upper bound on sub-steps in fixed_time_step; enables scan-based (differentiable) loop
@@ -648,70 +816,22 @@ class ProfilePredictorTorax(TimeIndepModule):
         torax_config: ToraxConfig | dict,
         key: jax.random.PRNGKey,
         normalizer: FeatureNormalizer,
-        transport_model: str = "gyrobohm",
-        geometry_builder: str = "circular",
-        delta_exponent: float = 2.0,
+        transport_model: str,
+        geometry_builder: str,
+        delta_exponent: float,
     ):
-        if transport_model not in TRANSPORT_COEFFICIENT_NAMES:
-            raise ValueError(f"Unknown transport model '{transport_model}', valid: {sorted(TRANSPORT_COEFFICIENT_NAMES)}")
+        check_torax_choices(transport_model, geometry_builder)
         self.transport_model = transport_model
-        self.normalizer = normalizer
-        if geometry_builder not in ("circular", "miller"):
-            raise ValueError(f"Unknown geometry builder '{geometry_builder}', valid: ('circular', 'miller')")
         self.geometry_builder = geometry_builder
         self.delta_exponent = float(delta_exponent)
-
-        key, subkey_transport, subkey_sources, subkey_edge = jax.random.split(key, 4)
-        self.nn_transport = RtdMLP(
-            in_size=10,
-            out_size=len(TRANSPORT_COEFFICIENT_NAMES[transport_model]),
-            width_size=nn_width,
-            depth=nn_depth,
-            activation=Activation.RELU,
-            key=subkey_transport,
+        self.normalizer = normalizer
+        self.nn_transport, self.nn_sources, self.nn_edge = make_torax_networks(
+            N_NN_INPUTS, transport_model, len(SOURCE_COEFFICIENT_NAMES), nn_width, nn_depth, key
         )
-        self.nn_sources = RtdMLP(
-            in_size=10,
-            # One output per SOURCE_COEFFICIENT_NAMES entry:
-            # S_total, P_aux_total, gaussian_location, gaussian_width, electron_heat_fraction
-            out_size=len(SOURCE_COEFFICIENT_NAMES),
-            width_size=nn_width,
-            depth=nn_depth,
-            activation=Activation.RELU,
-            key=subkey_sources,
-        )
-        self.nn_edge = RtdMLP(
-            in_size=10,
-            out_size=2,  # edge density fraction, edge temperature fraction
-            width_size=nn_width,
-            depth=nn_depth,
-            activation=Activation.RELU,
-            key=subkey_edge,
-        )
-
-        if isinstance(torax_config, dict):
-            torax_config = ToraxConfig.from_dict(torax_config)
-
-        validate_transport_model_name(torax_config, transport_model)
-
-        self.step_fn = torax_experimental.make_step_fn(torax_config)
+        self.step_fn, self._face_centers, self._rho_hires_norm = make_step_fn_and_grid(torax_config, transport_model)
         # Coerce to tuple: arrays in static fields break pytree metadata
         # equality (ambiguous truth value) when two module instances coexist
-        self.rhogrid = tuple(np.asarray(rhogrid).tolist())
-
-        # Harvest the static grid structure from the config-built placeholder
-        # geometry (a cached lookup, the provider is a ConstantGeometryProvider
-        # built at config validation). Per-sample geometry is rebuilt from
-        # traced inputs inside build_provider_and_geo, but the mesh and hires
-        # grids must be CONCRETE there: Grid1D is a pydantic object constructed
-        # at trace time and the grids fix array shapes, so traced values would
-        # retrace every call. Stored as tuples because static eqx fields must
-        # be hashable (arrays break pytree metadata equality). Harvesting from
-        # the built geometry rather than rederiving from n_rho/hires_factor
-        # keeps us exact under TORAX's non-uniform face_centers support.
-        static_geo = self.step_fn.geometry_provider(0.0)
-        self._face_centers = tuple(static_geo.torax_mesh.face_centers.tolist())
-        self._rho_hires_norm = tuple(np.array(static_geo.rho_hires_norm).tolist())
+        self.rhogrid = static_rhogrid(rhogrid)
 
         # With the fixed time-step calculator the step count to cover the window is deterministic,
         # the ceiling of the window over fixed_dt, plus 1 for the clipped final step that lands exactly on t_final
@@ -721,8 +841,7 @@ class ProfilePredictorTorax(TimeIndepModule):
 
     def _coerce_inputs(self, inputs: Inputs | xr.Dataset) -> Inputs:
         if isinstance(inputs, xr.Dataset):
-            rho = jnp.array(self.rhogrid)
-            inputs = Inputs.from_dataset(inputs, rho)
+            inputs = Inputs.from_dataset(inputs, jnp.array(self.rhogrid))
         return inputs
 
     def transport_coefficients(self, nn_transport_out: jax.Array) -> dict:
@@ -730,185 +849,85 @@ class ProfilePredictorTorax(TimeIndepModule):
         return bound_transport_coefficients(self.transport_model, nn_transport_out)
 
     def nn_coefficients(self, inputs: Inputs, debug: bool = False) -> dict:
-        # Get the transport model free parameters and the particle / heat
-        # sources from neural networks, bounded to physical ranges so the
-        # TORAX solver stays stable during training.
-        # Source network outputs are ordered per SOURCE_COEFFICIENT_NAMES:
-        #   S_total: 0 - inf, softplus multiple of the device fueling scale
-        #     particle_inventory / TAU_REF_S (x 1e21 below)
-        #   P_aux_total: 0 - 4x the w_approx / TAU_REF_S power scale [MW].
-        #     The heating magnitude is NN-inferred (beta_tor_norm encodes the stored
-        #     energy the heating sustains) rather than a measured input, so
-        #     every model has identical inputs.
-        #     The -2 bias makes random-init heating small, starting the solver near
-        #     the ohmic-only behavior (same trick as the edge-Te bias below).
-        #   gaussian_location: 0 - 0.8 (deposition center in rho_norm)
-        #   gaussian_width: 0.02 - 0.4 (deposition width in rho_norm)
-        #   electron_heat_fraction: 0.2 - 0.95 (amount of aux heating going to electrons)
+        """Transport, source and edge coefficients from the networks, bounded so the TORAX solver stays stable.
+
+        The shared source coefficients and edge BCs are bound_source_coefficients and bound_edge_coefficients.
+        The auxiliary heating magnitude P_aux_total is NN-inferred here (beta_tor_norm encodes the stored energy it sustains),
+        so every profile model family has identical inputs:
+        0 - 4x the w_approx / TAU_REF_S power scale [MW],
+        the -2 bias starts the random-init solver near ohmic-only behavior.
+        """
         nn_inputs = self.normalizer(inputs.nn_inputs, inputs.ds_source_idx)
-        coeffs = self.transport_coefficients(self.nn_transport(nn_inputs))
         nn_sources_out = self.nn_sources(nn_inputs)
-        # Particle inventory in 1e21 electrons: n_e_line_average_1e20 * volume * 0.1
-        inventory = 0.1 * inputs.n_e_line_average_1e20 * inputs.volume_approx
-        S_total = jax.nn.softplus(nn_sources_out[0:1]) * inventory / TAU_REF_S
-        p_aux_total = 4.0 * jax.nn.sigmoid(nn_sources_out[1:2] - 2.0) * inputs.w_approx / TAU_REF_S
-        gaussian_location = 0.8 * jax.nn.sigmoid(nn_sources_out[2:3])
-        gaussian_width = 0.02 + 0.38 * jax.nn.sigmoid(nn_sources_out[3:4])
-        electron_heat_fraction = 0.2 + 0.75 * jax.nn.sigmoid(nn_sources_out[4:5] - 0.4)
-
-        # Edge boundary conditions as NN-predicted fractions:
-        #   n_e_right_bc = fraction in (0.01, 0.95) * line-averaged density
-        #   T_e_right_bc = 20 eV + fraction * clipped te_approx (beta-derived
-        #                  temperature guess, same scaling trick as the shape-init predictors)
-        # A fixed edge density BC above the target profile acts as an infinite
-        # particle source, so the BC must scale with the requested density.
-        # Both BCs are floored: a near-vacuum edge ill-conditions the density
-        # equation, and te_approx (beta / ne_la) is off-scale on early-shot
-        # low-density samples where beta_tor_norm is noisy, which can NaN training.
-        # Floors are affine in the sigmoid so the NN gradient path stays intact,
-        # te_approx carries no NN params so a hard clip on it costs nothing.
-        # The negative bias on the temperature fraction makes random-init edge
-        # temperatures small (a few tens of eV): te_approx is a beta-derived
-        # overestimate, and a hot edge BC flattens the profile relative to
-        # itself, which keeps a threshold model like QLKNN subcritical
-        # (chi = chi_min) and kills the gradient to the transport network.
-        nn_edge_out = self.nn_edge(nn_inputs)
-        ne_right_bc = (0.01 + 0.94 * jax.nn.sigmoid(nn_edge_out[0:1])) * inputs.n_e_line_average_1e20
-        te_scale = jnp.clip(inputs.te_approx, 0.05, 5.0)
-        te_right_bc = 0.02 + jax.nn.sigmoid(nn_edge_out[1:2] - 5.0) * te_scale
-
-        coeffs["S_total"] = S_total
-        coeffs["P_aux_total"] = p_aux_total  # [MW]
-        coeffs["gaussian_location"] = gaussian_location
-        coeffs["gaussian_width"] = gaussian_width
-        coeffs["electron_heat_fraction"] = electron_heat_fraction
-        coeffs["n_e_right_bc"] = ne_right_bc  # [1e20 m^-3]
-        coeffs["T_e_right_bc"] = te_right_bc  # [keV]
+        p_aux_idx = SOURCE_COEFFICIENT_NAMES.index("P_aux_total")
+        coeffs = {
+            **self.transport_coefficients(self.nn_transport(nn_inputs)),
+            **bound_source_coefficients(SOURCE_COEFFICIENT_NAMES, nn_sources_out, inputs.n_e_line_average_1e20, inputs.volume_approx),
+            "P_aux_total": 4.0 * jax.nn.sigmoid(nn_sources_out[p_aux_idx : p_aux_idx + 1] - 2.0) * inputs.w_approx / TAU_REF_S,
+            **bound_edge_coefficients(self.nn_edge(nn_inputs), inputs.n_e_line_average_1e20, inputs.te_approx),
+        }
         if debug:
             fmt = " ".join(f"{name}={{{name}}}" for name in coeffs)
             jax.debug.print("[nn] " + fmt + " nn_in={nn_in}", nn_in=nn_inputs, **coeffs)
         return coeffs
 
     def build_provider_and_geo(self, inputs: Inputs, coeffs: dict):
-        S_total = coeffs["S_total"]
+        """Runtime params provider and per-sample geometry of one relaxation.
+
+        The initial profiles are parabolic (1 - rho^2) from a core anchor down to the NN edge BC,
+        sampled on the static cell-center grid plus both endpoints (static shapes, so no retracing).
+        Core = edge + positive keeps them strictly decreasing and continuous with the BC for any NN output,
+        a discontinuity at the LCFS or an exactly flat profile can NaN the solver.
+        """
         ne_right_bc = coeffs["n_e_right_bc"]
         te_right_bc = coeffs["T_e_right_bc"]
-
-        # Build runtime params override
-        ip_update = torax_experimental.TimeVaryingScalarUpdate(
-            value=jnp.atleast_1d(inputs.ip_MA * 1e6),
-        )
-        S_total_update = torax_experimental.TimeVaryingScalarUpdate(value=S_total * 1e21)
-        p_aux_update = torax_experimental.TimeVaryingScalarUpdate(value=coeffs["P_aux_total"] * 1e6)
-        gaussian_location_update = torax_experimental.TimeVaryingScalarUpdate(value=coeffs["gaussian_location"])
-        gaussian_width_update = torax_experimental.TimeVaryingScalarUpdate(value=coeffs["gaussian_width"])
-        electron_heat_fraction_update = torax_experimental.TimeVaryingScalarUpdate(value=coeffs["electron_heat_fraction"])
-        ne_right_bc_update = torax_experimental.TimeVaryingScalarUpdate(value=ne_right_bc * 1e20)
-        te_right_bc_update = torax_experimental.TimeVaryingScalarUpdate(value=te_right_bc)
-
-        # Initial profiles are parabolic (1 - rho^2) from a core anchor down to the NN edge BC,
-        # sampled on the static cell-center grid plus both endpoints
-        # Static shapes, so no retracing.
-        face_centers_np = np.array(self._face_centers)
-        cell_centers_np = (face_centers_np[:-1] + face_centers_np[1:]) / 2.0
-        rho_ic = jnp.array(np.concatenate([[0.0], cell_centers_np, [1.0]]))
+        rho_ic = jnp.array(np.concatenate([[0.0], cell_centers(self._face_centers), [1.0]]))
         ic_shape = 1.0 - rho_ic**2
 
-        # Temperature core anchor: edge BC + ~2x te_approx.
-        # Scaling the init with te_approx starts the relaxation near the expected equilibrium
-        # (a flat 0.3 keV start is several keV short on high-temperature C-Mod samples,
-        # so most of the few fixed steps get burned on the transient).
-        # The clip keeps a 0.3 keV floor where te_approx is small or unreliable.
-        # Core = edge + positive keeps the initial state strictly decreasing and continuous with the BC for any NN output
-        # A discontinuity at the LCFS or an exactly-flat profile can NaN the solver
+        # Temperature core anchor: edge BC + ~2x te_approx, so the relaxation starts near the expected equilibrium
+        # (a flat 0.3 keV start is several keV short on hot C-Mod samples and burns the few fixed steps on the transient).
+        # The clip keeps a 0.3 keV floor where te_approx is small or unreliable
         te_core_init = te_right_bc + jnp.clip(2.0 * inputs.te_approx, 0.3, 10.0)
-        t_init_value = (te_right_bc + (te_core_init - te_right_bc) * ic_shape)[jnp.newaxis, :]
         t_init_update = torax_experimental.TimeVaryingArrayUpdate(
-            value=t_init_value,
+            value=(te_right_bc + (te_core_init - te_right_bc) * ic_shape)[jnp.newaxis, :],
             rho_norm=rho_ic,
         )
-
-        # Density core anchor set so the midplane chord average of the parabola matches the measured line average
-        # mean of (1 - rho^2) over the chord is 2/3, so core = bc + 1.5*(line_avg - bc).
-        # ne_right_bc is a fraction in (0.01, 0.95) of n_e_line_average_1e20, so
-        # core > bc always holds and the init is continuous with the BC.
+        # Density core anchor so the midplane chord average of the parabola matches the measured line average:
+        # the chord mean of (1 - rho^2) is 2/3, so core = bc + 1.5 (line_avg - bc), above the BC since the BC is a fraction below 1
         ne_core_init = ne_right_bc + 1.5 * (inputs.n_e_line_average_1e20 - ne_right_bc)
-        n_init_value = 1e20 * (ne_right_bc + (ne_core_init - ne_right_bc) * ic_shape)[jnp.newaxis, :]
         n_init_update = torax_experimental.TimeVaryingArrayUpdate(
-            value=n_init_value,
+            value=1e20 * (ne_right_bc + (ne_core_init - ne_right_bc) * ic_shape)[jnp.newaxis, :],
             rho_norm=rho_ic,
         )
 
-        mapping = {
-            "profile_conditions.Ip": ip_update,
+        mapping = shared_provider_mapping(inputs.ip_MA, self.transport_model, coeffs) | {
             "profile_conditions.n_e": n_init_update,
-            "profile_conditions.n_e_right_bc": ne_right_bc_update,
-            # Assume the ion edge temperature matches the electron edge temperature
-            "profile_conditions.T_e_right_bc": te_right_bc_update,
-            "profile_conditions.T_i_right_bc": te_right_bc_update,
             "profile_conditions.T_e": t_init_update,
             "profile_conditions.T_i": t_init_update,
-            "sources.gas_puff.S_total": S_total_update,
-            # NN-inferred auxiliary heating, absorption_fraction stays at its
-            # config value (fixed, degenerate with P_total)
-            "sources.generic_heat.P_total": p_aux_update,
-            "sources.generic_heat.gaussian_location": gaussian_location_update,
-            "sources.generic_heat.gaussian_width": gaussian_width_update,
-            "sources.generic_heat.electron_heat_fraction": electron_heat_fraction_update,
+            # NN-inferred auxiliary heating, absorption_fraction stays at its config value (degenerate with P_total)
+            "sources.generic_heat.P_total": torax_experimental.TimeVaryingScalarUpdate(value=coeffs["P_aux_total"] * 1e6),
         }
-        mapping.update(transport_provider_mapping(self.transport_model, coeffs))
         new_provider = self.step_fn.runtime_params_provider.update_provider_from_mapping(mapping)
-
-        # Build JAX-differentiable geometry from per-sample inputs
-        torax_mesh = torax_pydantic.Grid1D(face_centers=face_centers_np)
-        rho_hires_norm_np = np.array(self._rho_hires_norm)
-        if self.geometry_builder == "miller":
-            geo = build_miller_geometry_jax(
-                R_major=inputs.geometric_axis_r,
-                a_minor=inputs.minor_radius,
-                B_0=inputs.b_geo,
-                elongation_LCFS=inputs.elongation,
-                triangularity_upper=inputs.triangularity_upper,
-                triangularity_lower=inputs.triangularity_lower,
-                torax_mesh=torax_mesh,
-                rho_hires_norm_np=rho_hires_norm_np,
-                delta_exponent=self.delta_exponent,
-            )
-        else:
-            geo = build_circular_geometry_jax(
-                R_major=inputs.geometric_axis_r,
-                a_minor=inputs.minor_radius,
-                B_0=inputs.b_geo,
-                elongation_LCFS=inputs.elongation,
-                torax_mesh=torax_mesh,
-                rho_hires_norm_np=rho_hires_norm_np,
-            )
-        geo_provider = geometry_provider_lib.ConstantGeometryProvider(geo=geo)
+        geo_provider = build_geometry_provider(self.geometry_builder, inputs, self._face_centers, self._rho_hires_norm, self.delta_exponent)
         return new_provider, geo_provider
 
     @property
     def rho_norm_grid(self) -> np.ndarray:
-        """Cell-center grid the TORAX core profiles live on.
-
-        This is rho_norm, the normalized toroidal flux radius,
-        which is the rho_tor_norm the datasets use.
-        """
-        face_centers = np.array(self._face_centers)
-        return (face_centers[:-1] + face_centers[1:]) / 2.0
+        """Cell-center grid the TORAX core profiles live on, see cell_centers."""
+        return cell_centers(self._face_centers)
 
     def __call__(self, inputs: Inputs | xr.Dataset, debug: bool = False) -> Outputs:
         inputs = self._coerce_inputs(inputs)
         coeffs = self.nn_coefficients(inputs, debug=debug)
         new_provider, geo_provider = self.build_provider_and_geo(inputs, coeffs)
 
-        # Get initial state and run simulation
         initial_state, initial_post = torax_experimental.get_initial_state_and_post_processed_outputs(
             step_fn=self.step_fn,
             runtime_params_overrides=new_provider,
             geometry_overrides=geo_provider,
         )
-        cp0 = initial_state.core_profiles
         if debug:
+            cp0 = initial_state.core_profiles
             jax.debug.print(
                 "[init] Te[min,max]=[{te_lo},{te_hi}] ne[min,max]=[{ne_lo},{ne_hi}]",
                 te_lo=cp0.T_e.value.min(),
@@ -927,36 +946,9 @@ class ProfilePredictorTorax(TimeIndepModule):
             debug=debug,
         )
 
-        # n_e is in m^-3 and T_e is keV in TORAX
-        ne = state.core_profiles.n_e.value / 1e20
-        te = state.core_profiles.T_e.value
-
-        # Interpolate onto rhogrid.
-        # TORAX evolves profiles on rho_norm, its normalized toroidal flux coordinate,
-        # which is the data's rho_tor_norm, so no coordinate mapping is needed.
-        # The cell values are augmented with both endpoints before interpolating.
-        # jnp.interp flat-holds outside the data range, which would ignore the exact Dirichlet edge BC at rho = 1
-        # (the flat-held edge overpredicts exactly where measured profiles fall steeply).
-        # Duplicating the innermost cell at rho = 0 encodes the zero-gradient axis condition.
-        rho_cells = jnp.asarray(self.rho_norm_grid)
-        rho_full = jnp.concatenate([jnp.zeros(1), rho_cells, jnp.ones(1)])
-        ne_full = jnp.concatenate([ne[:1], ne, coeffs["n_e_right_bc"]])
-        te_full = jnp.concatenate([te[:1], te, coeffs["T_e_right_bc"]])
-        ne_interp = jnp.interp(inputs.rho, rho_full, ne_full)
-        te_interp = jnp.interp(inputs.rho, rho_full, te_full)
-
-        return Outputs(
-            ne=xr.DataArray(
-                data=ne_interp,
-                dims=(RADIAL_DIM,),
-                coords={RADIAL_DIM: list(self.rhogrid)},
-            ),
-            te=xr.DataArray(
-                data=te_interp,
-                dims=(RADIAL_DIM,),
-                coords={RADIAL_DIM: list(self.rhogrid)},
-            ),
-        )
+        # TORAX evolves the profiles on rho_norm, which is the data's rho_tor_norm, so no coordinate mapping is needed
+        ne, te = interp_core_profiles(state.core_profiles, self._face_centers, inputs.rho)
+        return profile_outputs(self.rhogrid, ne, te)
 
     def evolve(
         self,
@@ -1035,29 +1027,3 @@ class ProfilePredictorTorax(TimeIndepModule):
 
         coeffs_out = {name: float(np.asarray(value).squeeze()) for name, value in coeffs.items()}
         return steps, coeffs_out
-
-    @classmethod
-    def init(
-        cls,
-        rhogrid: Array,
-        torax_config: ToraxConfig,
-        nn_width: int,
-        nn_depth: int,
-        prng_seed: int,
-        normalizer: FeatureNormalizer,
-        transport_model: str = "gyrobohm",
-        geometry_builder: str = "circular",
-        delta_exponent: float = 2.0,
-    ):
-        rhogrid_tuple = tuple(rhogrid.tolist())
-        return cls(
-            nn_width=nn_width,
-            nn_depth=nn_depth,
-            rhogrid=rhogrid_tuple,
-            torax_config=torax_config,
-            key=jax.random.PRNGKey(prng_seed),
-            normalizer=normalizer,
-            transport_model=transport_model,
-            geometry_builder=geometry_builder,
-            delta_exponent=delta_exponent,
-        )

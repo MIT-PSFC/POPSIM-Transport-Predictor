@@ -3,51 +3,41 @@ from __future__ import annotations
 from dataclasses import dataclass
 from itertools import product
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, ClassVar
 
 if TYPE_CHECKING:
     from popsim.ml import TrainConfig
 
 import fire
 import netCDF4  # noqa: F401
-import xarray as xr
-from loguru import logger
-from pydantic import Field, field_validator
+from pydantic import Field
 
 from transport_study import PACKAGE_ROOT
 from transport_study.config import config
-from transport_study.modules.normalization import NORM_INPUT_VARS
-from transport_study.orchestration.case_analysis import run_case_analysis_parallel
+from transport_study.modules.normalization import INPUT_NORMALIZATIONS, NORM_INPUT_VARS
+from transport_study.modules.power_balance.module import (
+    MODEL_TYPES_WITH_SUBMODULES,
+    SUBMODULE_MODEL_TYPES,
+)
+from transport_study.orchestration.case_analysis import run_summary_analysis
 from transport_study.orchestration.study import (
     HYPERPARAM_TARGET_SHOTS,
     CaseGridConfig,
     ModelTrainSpec,
     Study,
 )
-from transport_study.power_balance_transfer.case_reports import generate_case_reports
 from transport_study.power_balance_transfer.data_visualization import DataVisualization
-from transport_study.power_balance_transfer.plotting import (
-    data_normalization_comparison,
-    domain_adaptation_comparison,
-    model_comparison,
-    training_dataset_comparison,
-)
-from transport_study.power_balance_transfer.study_metrics import collect_metrics
-from transport_study.power_balance_transfer.tables import write_comparison_tables
+from transport_study.power_balance_transfer.plotting import COMPARISON_FAMILIES, LAYOUT
+from transport_study.power_balance_transfer.tables import SPEC as TABLE_SPEC
 
 # The 7 physical inputs every power-balance model consumes. Normalization is
 # done inside the modules (transport_study.modules.normalization), so the
 # dataloader always pulls exactly these (the TRB adds ds_source_idx itself)
 POWER_BALANCE_INPUT_VARS = list(NORM_INPUT_VARS)
 
-# Model types with p_oh/p_rad submodules (the SciML-style structured models)
-MODEL_TYPES_WITH_SUBMODULES = ("sciml-taue-scalinglaw", "sciml-taue-nn")
 # Purely data-driven model types, no submodules so nothing to freeze
 MODEL_TYPES_WITHOUT_SUBMODULES = ("mlp", "transformer")
-# Submodule pseudo-model-types, they appear as prereq cases of the structured models
-SUBMODULE_MODEL_TYPES = ("p_oh", "p_rad")
 
-VALID_DATA_NORMALIZATIONS = ("raw", "physics", "zscore", "coral", "physics-coral", "physics-zscore")
 
 # Per-submodule train settings shared with the transport study, which trains
 # the same p_oh/p_rad prereq cases for its power balance submodule
@@ -86,7 +76,7 @@ class PowerBalanceStudy(Study):
     class Config(CaseGridConfig):
         # The different cases being compared in this study
         model_types: tuple[str, ...] = Field(default_factory=lambda: ("sciml-taue-scalinglaw", "sciml-taue-nn", "mlp", "transformer"))
-        data_normalization_methods: tuple[str, ...] = Field(default_factory=lambda: VALID_DATA_NORMALIZATIONS)
+        data_normalization_methods: tuple[str, ...] = Field(default_factory=lambda: INPUT_NORMALIZATIONS)
         freeze_submodules_options: tuple[bool, ...] = Field(default_factory=lambda: (True,))
         num_target_shots_options: tuple[int, ...] = Field(default_factory=lambda: (0, 1, 3, 10, 32, -1))
         # Hyperparameter tuning case configuration
@@ -101,23 +91,11 @@ class PowerBalanceStudy(Study):
             "hyperparam_num_target_shots",
         )
 
-        @field_validator("model_types")
-        @classmethod
-        def _validate_model_types(cls, v: tuple[str, ...]) -> tuple[str, ...]:
-            valid = {*MODEL_TYPES_WITH_SUBMODULES, *MODEL_TYPES_WITHOUT_SUBMODULES, *SUBMODULE_MODEL_TYPES}
-            for mt in v:
-                if mt not in valid:
-                    raise ValueError(f"Invalid model type: {mt}. Must be one of {sorted(valid)}.")
-            return v
-
-        @field_validator("data_normalization_methods", "hyperparam_data_normalization")
-        @classmethod
-        def _validate_data_normalization(cls, v):
-            methods = (v,) if isinstance(v, str) else v
-            for dn in methods:
-                if dn not in VALID_DATA_NORMALIZATIONS:
-                    raise ValueError(f"Invalid data normalization method: {dn}. Must be one of {sorted(VALID_DATA_NORMALIZATIONS)}.")
-            return v
+        FIELD_CHOICES: ClassVar[dict[str, tuple]] = {
+            "model_types": (*MODEL_TYPES_WITH_SUBMODULES, *MODEL_TYPES_WITHOUT_SUBMODULES, *SUBMODULE_MODEL_TYPES),
+            "data_normalization_methods": INPUT_NORMALIZATIONS,
+            "hyperparam_data_normalization": INPUT_NORMALIZATIONS,
+        }
 
     @dataclass
     class Case(Study.Case):
@@ -126,7 +104,7 @@ class PowerBalanceStudy(Study):
         - sciml-taue-scalinglaw: H89, H98, and P_LH scaling laws to predict tau_e
         - sciml-taue-nn: neural network predicts tau_e, and we do the power balance calculation
         - mlp: a simple MLP directly predicts stored energy evolution
-        - transformer: recurrent causal attention over past inputs directly predicts stored energy evolution
+        - transformer: the current inputs attend over a buffer of past predicted stored energies to predict its evolution
         - p_oh / p_rad: submodule predictors, appear only as prereq cases of sciml-taue-scalinglaw and sciml-taue-nn
 
         training_data: The dataset(s) used for training
@@ -185,7 +163,7 @@ class PowerBalanceStudy(Study):
 
         def _validate(self):
             super()._validate()
-            if self.data_normalization not in VALID_DATA_NORMALIZATIONS:
+            if self.data_normalization not in INPUT_NORMALIZATIONS:
                 raise ValueError(f"Unknown data normalization method: {self.data_normalization}")
             if self.model_type in SUBMODULE_MODEL_TYPES and self.freeze_submodules != config.hyperparam_freeze_submodules:
                 raise ValueError(
@@ -251,8 +229,6 @@ class PowerBalanceStudy(Study):
             "domain_adaptation": case.domain_adaptation,
             "num_target_shots": case.num_target_shots,
             "target_test_set_size": config.target_test_set_size,
-            "prng_seed": 42,
-            "debug": config.debug,
             # Hyperparameters
             "segment_length_train": 100,
             "segment_overlap_train": 50,
@@ -343,7 +319,6 @@ class PowerBalanceStudy(Study):
                         "p_oh_predictor": self._make_submodule_config(case, "p_oh"),
                         "p_rad_predictor": self._make_submodule_config(case, "p_rad"),
                     },
-                    "restore_submodules": True,  # Always restoring pre-trained submodules in this study
                 },
             )
         elif case.model_type == "mlp":
@@ -424,37 +399,7 @@ class PowerBalanceStudy(Study):
     ############
 
     def _run_analysis(self, enable_parallelism: bool) -> None:
-        # Per-case analysis (stage metrics + best/worst shot PDFs) is CPU-bound
-        # matplotlib and numpy work, so we can fan it out over SLURM to speed things up
-        if enable_parallelism:
-            run_case_analysis_parallel(self)
-
-        # Stage-resolved (rampup / flattop ohmic / flattop aux / rampdown)
-        # time-averaged errors for every finished case, cached to
-        # collected_metrics.nc alongside collected_results.nc
-        metrics_ds = collect_metrics(self)
-
-        results_ds = xr.load_dataset(self.collected_results_path())
-
-        logger.opt(colors=True).info("<bold><magenta>TRAINING DATA COMPARISON</magenta></bold>")
-        training_dataset_comparison(results_ds, self.figure_dir)
-
-        logger.opt(colors=True).info("<bold><magenta>MODEL COMPARISON</magenta></bold>")
-        model_comparison(results_ds, self.figure_dir)
-
-        logger.opt(colors=True).info("<bold><magenta>DATA NORMALIZATION COMPARISON</magenta></bold>")
-        data_normalization_comparison(results_ds, self.figure_dir)
-
-        logger.opt(colors=True).info("<bold><magenta>DOMAIN ADAPTATION COMPARISON</magenta></bold>")
-        domain_adaptation_comparison(results_ds, self.figure_dir)
-
-        # Per-case deep dives: best/worst holdout shot PDFs by time-averaged error
-        logger.opt(colors=True).info("<bold><magenta>CASE REPORTS</magenta></bold>")
-        generate_case_reports(self, self.figure_dir)
-
-        # One markdown table per case axis and combination of the other axes
-        logger.opt(colors=True).info("<bold><magenta>COMPARISON TABLES</magenta></bold>")
-        write_comparison_tables(results_ds, metrics_ds, self.figure_dir)
+        run_summary_analysis(self, enable_parallelism, LAYOUT, COMPARISON_FAMILIES, TABLE_SPEC)
 
 
 run_study = PowerBalanceStudy.run_study
