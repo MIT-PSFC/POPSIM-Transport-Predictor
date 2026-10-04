@@ -12,14 +12,106 @@ from popsim.ml.dataloading import make_dataloaders
 from popsim.ml.eval import EvalData, EvaluationSuite, batched_model_eval_and_loss
 from popsim.ml.preprocess_utils import mask_to_largest_group_mask
 
-from transport_study import EPISODE_DIM, TIME_COORD, TIME_DIM
+from transport_study import EPISODE_DIM, RADIAL_DIM, TIME_COORD, TIME_DIM
 from transport_study.config import config
 from transport_study.orchestration.organize_data import (
     TrainingData,
+    get_ds,
     get_train_test_datasets,
     get_train_val_datasets,
     get_transfer_pretrain_datasets,
 )
+
+# Floor on the per-timeslice profile peak used for peak normalization.
+# In channel units (1e20 m^-3 for ne, keV for Te) any real profile peaks far above it,
+# it only guards degenerate targets from blowing up the 1/scale division
+PROFILE_SCALE_FLOOR = 1e-2
+
+# Chi is the profile residual in units of the GP-fit error bar.
+# Each error bar is floored at this percentile of its own peak-normalized distribution per device,
+# so a single overconfident fit point cannot carry unbounded weight
+CHI_SIGMA_FLOOR_PERCENTILE = 5.0
+# Chi gradients count below this rho.
+# Dividing by the error bar already discounts where the fit stops resolving the slope,
+# so only the extrapolation right at the edge is dropped
+CHI_GRAD_RHO_MAX = 0.95
+# Profile channel -> (value error bar, gradient error bar) chi divides by
+CHI_ERROR_VARS = {
+    "n_e_1e20": ("n_e_1e20_error", "n_e_1e20_gradient_error"),
+    "t_e_keV": ("t_e_keV_error", "t_e_keV_gradient_error"),
+}
+
+
+def peak_scale(targ: jnp.ndarray) -> jnp.ndarray:
+    """Per-timeslice peak of a target profile (..., rho), floored, the scale every profile loss normalizes by."""
+    return jnp.maximum(jnp.max(jnp.abs(targ), axis=-1, keepdims=True), PROFILE_SCALE_FLOOR)
+
+
+def to_mid(arr: jnp.ndarray) -> jnp.ndarray:
+    """Grid-point signal (..., rho) averaged to the rho midpoints, where finite-difference gradients live."""
+    return 0.5 * (arr[..., :-1] + arr[..., 1:])
+
+
+def per_sample_device_values(ds_source_idx: jnp.ndarray, values_by_device: dict[str, float], fill: float) -> jnp.ndarray:
+    """values_by_device[device] at every sample of that device and fill elsewhere, shaped like ds_source_idx."""
+    values = jnp.full(jnp.shape(ds_source_idx), fill)
+    for device, value in values_by_device.items():
+        values = jnp.where(ds_source_idx == config.ds_source_to_idx[device], value, values)
+    return values
+
+
+def per_sample_sigma_floor(ds_source_idx: jnp.ndarray, sigma_floors: dict[str, dict[str, float]], error_var: str) -> jnp.ndarray:
+    """The chi_sigma_floors entry of error_var for each sample's device, shaped (..., 1) to broadcast over rho.
+
+    NaN for a device without floors, so a missing entry fails loudly.
+    """
+    floors = {device: device_floors[error_var] for device, device_floors in sigma_floors.items()}
+    return per_sample_device_values(ds_source_idx, floors, jnp.nan)[..., None]
+
+
+def chi_value(pred: jnp.ndarray, targ: jnp.ndarray, sigma: jnp.ndarray, floor: jnp.ndarray, rho: jnp.ndarray) -> jnp.ndarray:
+    """int_0^1 |pred - targ| / max(sigma, floor) drho on peak-normalized profiles.
+
+    Profiles and sigma are (..., rho), floor is the peak-normalized sigma floor broadcast to (..., 1).
+    """
+    scale = peak_scale(targ)
+    chi = jnp.abs(pred - targ) / scale / jnp.maximum(sigma / scale, floor)
+    return jnp.trapezoid(chi, x=rho, axis=-1)
+
+
+def chi_gradient(
+    pred: jnp.ndarray, targ: jnp.ndarray, grad_targ: jnp.ndarray, grad_sigma: jnp.ndarray, floor: jnp.ndarray, rho: jnp.ndarray
+) -> jnp.ndarray:
+    """int_0^CHI_GRAD_RHO_MAX |pred' - targ'| / max(sigma', floor) drho on peak-normalized profiles.
+
+    pred' is the finite difference of the prediction at the rho midpoints,
+    targ' and sigma' are the GP-fit gradient and its error bar averaged to the same midpoints.
+    """
+    scale = peak_scale(targ)
+    rho_mid = to_mid(rho)
+    grad_pred = jnp.diff(pred / scale, axis=-1) / jnp.diff(rho, axis=-1)
+    chi = jnp.abs(grad_pred - to_mid(grad_targ) / scale) / jnp.maximum(to_mid(grad_sigma) / scale, floor)
+    return jnp.trapezoid((rho_mid < CHI_GRAD_RHO_MAX) * chi, x=rho_mid, axis=-1)
+
+
+def chi_sigma_floors(device: str) -> dict[str, float]:
+    """The peak-normalized error-bar floor of every CHI_ERROR_VARS variable for one device.
+
+    The CHI_SIGMA_FLOOR_PERCENTILE-th percentile of the positive normalized error bars over the device's fresh profiles,
+    a property of the fits rather than of any case.
+    """
+    ds, _ = get_ds(device, "profile_transfer")
+    floors = {}
+    for channel, error_vars in CHI_ERROR_VARS.items():
+        scale = np.asarray(peak_scale(ds[channel].transpose(..., RADIAL_DIM).values))
+        for var in error_vars:
+            sigma = (ds[var].transpose(..., RADIAL_DIM).values / scale).ravel()
+            sigma_positive = sigma[np.isfinite(sigma) & (sigma > 0)]
+            if not sigma_positive.size:
+                raise ValueError(f"{device} has no positive {var} to floor the chi error bars with")
+            floors[var] = float(np.percentile(sigma_positive, CHI_SIGMA_FLOOR_PERCENTILE))
+    logger.info(f"Chi sigma floors for {device}: " + ", ".join(f"{var}={floor:.5f}" for var, floor in floors.items()))
+    return floors
 
 
 def target_device_idx() -> int:

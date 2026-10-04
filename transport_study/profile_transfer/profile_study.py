@@ -84,6 +84,7 @@ class ProfileStudy(Study):
         "geometry_builders",
         "num_target_shots_options",
     )
+    CHI_VALIDATION_LOSS = True
     TUNED_DATALOADER_KEYS = ("batch_size",)
     TUNED_LOSS_KEYS = ("huber_delta", "huber_delta_grad")
 
@@ -298,23 +299,16 @@ class ProfileStudy(Study):
 
     def _base_loss_config(self) -> dict:
         return {
-            # The loss runs on peak-normalized profiles (target scaled to max 1),
-            # so both deltas read as fractional errors. Both are swept
-            # hyperparameters (see sweep_configs/*.yaml), these values are the
-            # fallback for cases run without a tuned config. Validation loss is
-            # delta-free (get_val_loss_fn), so the sweep metric cannot be gamed
-            # by shrinking the deltas
+            # The training loss runs on peak-normalized profiles (target scaled to max 1),
+            # so both deltas read as fractional errors.
+            # Both are swept (see sweep_configs/*.yaml), these values are the fallback without a tuned config.
+            # The chi validation loss reads no delta, so the sweep metric cannot be gamed by shrinking them
             "huber_delta": 0.1,
-            # Penalize profile gradient mismatch too, since stability predictions
-            # depend on dTe/drho and dne/drho. Normalized gradients are ~10x the
-            # normalized value scale over rho in [0, 1], so they get their own delta.
+            # Profile gradient mismatch counts too, stability predictions depend on dTe/drho and dne/drho.
+            # Weighs the gradient term in training and in the chi validation loss alike
             "gradient_weight": 0.1,
+            # Normalized gradients are ~10x the normalized value scale, so they get their own delta
             "huber_delta_grad": 1.0,
-            # Residual inside the GP-fit error bar is down-weighted by this
-            # factor in the VALIDATION loss only (the training loss uses the
-            # raw residual): checkpoint selection is still pulled toward the
-            # fit mean, but landing within the error bars costs much less
-            "within_error_weight": 0.1,
         }
 
     def _base_optimizer_config(self) -> dict:

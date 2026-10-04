@@ -25,7 +25,7 @@ from PIL import Image
 
 from transport_study import EPISODE_DIM, RADIAL_DIM, TIME_DIM
 from transport_study.config import config
-from transport_study.modules.profile_predictor.trb import ProfilePredictorTRB
+from transport_study.modules.trb_utils import CHI_GRAD_RHO_MAX
 from transport_study.plot_style import BACKGROUND_COLOR, TEXT_COLOR, style_axis
 from transport_study.profile_transfer.plot_torax_evolution import plot_relaxation
 from transport_study.profile_transfer.study_metrics import (
@@ -63,10 +63,8 @@ def _axis_lims(*arrays: np.ndarray) -> tuple[float, float]:
 
 
 def _shade_ignored_grad_region(ax, rho_mid: np.ndarray):
-    """Transparent red span over the rho region excluded from the gradient
-    loss (rho >= GRAD_LOSS_RHO_MAX), where the measured gradients are
-    unreliable and not fit against."""
-    ax.axvspan(ProfilePredictorTRB.GRAD_LOSS_RHO_MAX, rho_mid[-1], color="red", alpha=0.12, linewidth=0, zorder=0)
+    """Transparent red span over the rho region the gradient chi metric excludes (rho >= CHI_GRAD_RHO_MAX)."""
+    ax.axvspan(CHI_GRAD_RHO_MAX, rho_mid[-1], color="red", alpha=0.12, linewidth=0, zorder=0)
 
 
 def _record_title(ts_metrics: CaseTimesliceMetrics, record_idx: int) -> str:
@@ -136,7 +134,7 @@ def _timeslice_panel(
         if ylims and f"{var}_gradient" in ylims:
             ax_grad.set_ylim(*ylims[f"{var}_gradient"])
         else:
-            grad_rho_mask = rho_mid < ProfilePredictorTRB.GRAD_LOSS_RHO_MAX
+            grad_rho_mask = rho_mid < CHI_GRAD_RHO_MAX
             ax_grad.set_ylim(
                 *_axis_lims(
                     (grad_targ_mid - grad_err_mid)[grad_rho_mask],
@@ -160,15 +158,14 @@ def _timeslice_panel(
 def _shot_ylims(result_ds: xr.Dataset, ts_metrics: CaseTimesliceMetrics, record_idxs: np.ndarray) -> dict:
     """Fixed axis limits over one shot's frames so the GIF does not jump around.
 
-    Gradient y-lims are computed only over rho < GRAD_LOSS_RHO_MAX, the region
-    actually counted in the gradient loss, so a noisy/unreliable edge gradient
-    outside that region does not blow out the axis scale.
+    Gradient y-lims are computed only over rho < CHI_GRAD_RHO_MAX, the region the gradient metric counts,
+    so a noisy edge gradient outside it does not blow out the axis scale.
     """
     ylims = {}
     rho = result_ds[RADIAL_DIM].values
     d_rho = np.diff(rho)
     rho_mid = 0.5 * (rho[:-1] + rho[1:])
-    grad_rho_mask = rho_mid < ProfilePredictorTRB.GRAD_LOSS_RHO_MAX
+    grad_rho_mask = rho_mid < CHI_GRAD_RHO_MAX
     shot = ts_metrics.shot[record_idxs[0]]
     device = ts_metrics.ds_source[record_idxs[0]]
     shot_res = result_ds.sel({EPISODE_DIM: shot})

@@ -2,6 +2,7 @@
 
 Everything runs on hand-built profiles so the expected loss values are exact,
 plus one end-to-end check against real GP-fit signals from a sample dataset.
+The training loss is huber on the peak-normalized residual, the validation loss is chi.
 """
 
 import jax.numpy as jnp
@@ -14,6 +15,11 @@ from transport_study import EPISODE_DIM, RADIAL_DIM, TIME_COORD
 from transport_study.config import RHO_GRID, config, load_config
 from transport_study.modules.profile_predictor.module import Outputs
 from transport_study.modules.profile_predictor.trb import ProfilePredictorTRB
+from transport_study.modules.trb_utils import (
+    CHI_ERROR_VARS,
+    CHI_GRAD_RHO_MAX,
+    chi_sigma_floors,
+)
 from transport_study.orchestration.organize_data import (
     PROFILE_TARGET_VARS,
     get_ds,
@@ -23,6 +29,11 @@ from transport_study.profile_transfer.profile_study import ProfileStudy
 from transport_study.tests.sample_data import SAMPLE_DIR, requires_sample_data
 
 RHO = RHO_GRID
+RHO_MID = 0.5 * (RHO[:-1] + RHO[1:])
+TRAIN_CONFIG = {"huber_delta": 0.5, "gradient_weight": 0.1, "huber_delta_grad": 5.0}
+# Fractional (peak-normalized) error bar of the hand-built targets, far above SIGMA_FLOOR
+SIGMA_FRAC = 0.05
+SIGMA_FLOOR = 1e-3
 
 
 @pytest.fixture
@@ -51,35 +62,44 @@ def loaded_config(request):
         request.getfixturevalue("study_config")
 
 
+def _val_config(gradient_weight: float = 0.1, floor: float = SIGMA_FLOOR, **overrides) -> dict:
+    """Chi validation loss config with the same sigma floor for every device and error bar."""
+    floors = {var: floor for error_vars in CHI_ERROR_VARS.values() for var in error_vars}
+    return {"gradient_weight": gradient_weight, "chi_sigma_floors": dict.fromkeys(config.dataset_paths, floors), **overrides}
+
+
 def _profile_da(values):
     return xr.DataArray(data=jnp.asarray(values), dims=(RADIAL_DIM,), coords={RADIAL_DIM: RHO})
 
 
-def _pred_and_targ(ne_pred, te_pred, ne_targ, te_targ, **extra_targ_vars):
+def _pred_and_targ(ne_pred, te_pred, ne_targ, te_targ, **targ_overrides):
     """Build a prediction/target pair for the loss.
 
-    extra_targ_vars adds optional target vars by name, e.g. the error-bar and
-    gradient signals n_e_1e20_error / t_e_keV_gradient / etc. Tests that omit
-    them exercise the defaults: zero-width error bars and finite-difference
-    gradient targets.
+    The targets carry every companion the losses read:
+    gradients exact for the quadratic test profiles (second-order differences)
+    and flat error bars of SIGMA_FRAC times each profile's peak.
+    targ_overrides replaces any of them by name.
     """
     pred = Outputs(ne=_profile_da(ne_pred), te=_profile_da(te_pred))
-    targ = {
-        "n_e_1e20": _profile_da(ne_targ),
-        "t_e_keV": _profile_da(te_targ),
-        "ds_source_idx": xr.DataArray(data=jnp.asarray(0.0)),
-    }
-    for name, values in extra_targ_vars.items():
-        targ[name] = _profile_da(values)
+    targ_values = {"n_e_1e20": np.asarray(ne_targ), "t_e_keV": np.asarray(te_targ)}
+    for channel in ("n_e_1e20", "t_e_keV"):
+        profile = targ_values[channel]
+        targ_values[f"{channel}_gradient"] = np.gradient(profile, RHO, edge_order=2)
+        sigma = np.full_like(RHO, SIGMA_FRAC * np.max(np.abs(profile)))
+        targ_values[f"{channel}_error"] = sigma
+        targ_values[f"{channel}_gradient_error"] = sigma
+    targ_values.update(targ_overrides)
+    targ = {name: _profile_da(values) for name, values in targ_values.items()}
+    targ["ds_source_idx"] = xr.DataArray(data=jnp.asarray(0.0))
     return pred, targ
 
 
-def test_loss_zero_for_perfect_prediction():
-    loss_fn = ProfilePredictorTRB.get_loss_fn({"huber_delta": 0.5, "gradient_weight": 0.1})
+def test_losses_zero_for_perfect_prediction():
     ne = 1.5 * (1 - RHO**2)
     te = 3.0 * (1 - RHO**2)
     pred, targ = _pred_and_targ(ne, te, ne, te)
-    assert float(loss_fn(pred, targ)) == pytest.approx(0.0)
+    assert float(ProfilePredictorTRB.get_loss_fn(TRAIN_CONFIG)(pred, targ)) == pytest.approx(0.0)
+    assert float(ProfilePredictorTRB.get_val_loss_fn(_val_config())(pred, targ)) == pytest.approx(0.0)
 
 
 def test_gradient_term_penalizes_slope_mismatch():
@@ -87,7 +107,7 @@ def test_gradient_term_penalizes_slope_mismatch():
 
     A constant offset keeps the target's slope, an alternating offset of the same
     magnitude corrupts it. The value-only loss cannot tell them apart, the
-    gradient term must.
+    gradient term must, in training and in validation alike.
     """
     ne = 1.5 * (1 - RHO**2)
     te = 3.0 * (1 - RHO**2)
@@ -98,56 +118,48 @@ def test_gradient_term_penalizes_slope_mismatch():
     pred_const, targ = _pred_and_targ(ne + offset_const, te + offset_const, ne, te)
     pred_alt, _ = _pred_and_targ(ne + offset_alt, te + offset_alt, ne, te)
 
-    value_only = ProfilePredictorTRB.get_loss_fn({"huber_delta": 0.5, "gradient_weight": 0.0})
-    with_grad = ProfilePredictorTRB.get_loss_fn({"huber_delta": 0.5, "gradient_weight": 0.1, "huber_delta_grad": 5.0})
-
-    assert float(value_only(pred_const, targ)) == pytest.approx(float(value_only(pred_alt, targ)), rel=1e-5)
-    assert float(with_grad(pred_alt, targ)) > float(with_grad(pred_const, targ))
-    # Constant offset leaves gradients untouched, so the gradient term adds nothing
-    assert float(with_grad(pred_const, targ)) == pytest.approx(float(value_only(pred_const, targ)), rel=1e-5)
-
-
-def test_gradient_weight_defaults_off():
-    """A loss config without gradient keys weights the gradient term at zero."""
-    ne = 1.5 * (1 - RHO**2)
-    te = 3.0 * (1 - RHO**2)
-    pred, targ = _pred_and_targ(ne + 0.3 * RHO, te - 0.3 * RHO, ne, te)
-    implicit_off = ProfilePredictorTRB.get_loss_fn({"huber_delta": 0.5})
-    explicit_off = ProfilePredictorTRB.get_loss_fn({"huber_delta": 0.5, "gradient_weight": 0.0})
-    assert float(implicit_off(pred, targ)) == pytest.approx(float(explicit_off(pred, targ)), rel=1e-6)
+    for value_only, with_grad in (
+        (ProfilePredictorTRB.get_loss_fn({**TRAIN_CONFIG, "gradient_weight": 0.0}), ProfilePredictorTRB.get_loss_fn(TRAIN_CONFIG)),
+        (ProfilePredictorTRB.get_val_loss_fn(_val_config(gradient_weight=0.0)), ProfilePredictorTRB.get_val_loss_fn(_val_config())),
+    ):
+        assert float(value_only(pred_const, targ)) == pytest.approx(float(value_only(pred_alt, targ)), rel=1e-5)
+        assert float(with_grad(pred_alt, targ)) > float(with_grad(pred_const, targ))
+        # Constant offset leaves gradients untouched, so the gradient term adds nothing
+        assert float(with_grad(pred_const, targ)) == pytest.approx(float(value_only(pred_const, targ)), rel=1e-5)
 
 
 def test_device_weights_scale_loss():
     """device_weights multiplies the loss for samples from the matching device only.
 
     Samples in _pred_and_targ carry ds_source_idx 0, which maps to the
-    alphabetically-first device. Weighting that device by 3 must triple the
-    loss (value and gradient terms alike), weighting any other device must
-    leave it unchanged.
+    alphabetically-first device. Weighting that device by 3 must triple both losses,
+    weighting any other device must leave them unchanged.
     """
     ne = 1.5 * (1 - RHO**2)
     te = 3.0 * (1 - RHO**2)
     pred, targ = _pred_and_targ(ne + 0.3 * RHO, te - 0.2 * RHO, ne, te)
 
     devices = sorted(config.dataset_paths)
-    loss_base = {"huber_delta": 0.5, "gradient_weight": 0.1, "huber_delta_grad": 5.0}
-    unweighted = ProfilePredictorTRB.get_loss_fn(loss_base)
-
     weights_sample_device = dict.fromkeys(devices, 1.0)
     weights_sample_device[devices[0]] = 3.0
-    weighted = ProfilePredictorTRB.get_loss_fn({**loss_base, "device_weights": weights_sample_device})
-    assert float(weighted(pred, targ)) == pytest.approx(3.0 * float(unweighted(pred, targ)), rel=1e-5)
-
     weights_other_device = dict.fromkeys(devices, 1.0)
     weights_other_device[devices[-1]] = 3.0
-    other_weighted = ProfilePredictorTRB.get_loss_fn({**loss_base, "device_weights": weights_other_device})
-    assert float(other_weighted(pred, targ)) == pytest.approx(float(unweighted(pred, targ)), rel=1e-6)
+
+    for make_loss_fn, loss_config in (
+        (ProfilePredictorTRB.get_loss_fn, TRAIN_CONFIG),
+        (ProfilePredictorTRB.get_val_loss_fn, _val_config()),
+    ):
+        unweighted = float(make_loss_fn(loss_config)(pred, targ))
+        weighted = float(make_loss_fn({**loss_config, "device_weights": weights_sample_device})(pred, targ))
+        other_weighted = float(make_loss_fn({**loss_config, "device_weights": weights_other_device})(pred, targ))
+        assert weighted == pytest.approx(3.0 * unweighted, rel=1e-5)
+        assert other_weighted == pytest.approx(unweighted, rel=1e-6)
 
 
 def test_channels_balanced_by_peak_normalization():
     """Equal fractional error must cost the same in ne and Te.
 
-    The loss runs on peak-normalized profiles, so a 10% error on a tiny ne
+    Both losses run on peak-normalized profiles, so a 10% error on a tiny ne
     profile (0.05e20 m^-3 peak) and a 10% error on a large Te profile (8 keV
     peak) must contribute identically - without normalization the Te channel
     would dominate by orders of magnitude.
@@ -160,7 +172,7 @@ def test_channels_balanced_by_peak_normalization():
 
     for loss_fn in (
         ProfilePredictorTRB.get_loss_fn({"huber_delta": 0.1, "gradient_weight": 0.1, "huber_delta_grad": 1.0}),
-        ProfilePredictorTRB.get_val_loss_fn({"gradient_weight": 0.1, "within_error_weight": 0.5}),
+        ProfilePredictorTRB.get_val_loss_fn(_val_config()),
     ):
         ne_off_loss = float(loss_fn(pred_ne_off, targ))
         te_off_loss = float(loss_fn(pred_te_off, targ))
@@ -180,11 +192,11 @@ def test_val_loss_independent_of_huber_delta():
     te = 3.0 * (1 - RHO**2)
     pred, targ = _pred_and_targ(ne + 0.3, te - 0.4, ne, te)
 
-    small = {"huber_delta": 0.01, "huber_delta_grad": 0.1, "gradient_weight": 0.1, "within_error_weight": 0.5}
-    large = {"huber_delta": 1.0, "huber_delta_grad": 10.0, "gradient_weight": 0.1, "within_error_weight": 0.5}
+    small = {"huber_delta": 0.01, "huber_delta_grad": 0.1, "gradient_weight": 0.1}
+    large = {"huber_delta": 1.0, "huber_delta_grad": 10.0, "gradient_weight": 0.1}
 
-    val_small = float(ProfilePredictorTRB.get_val_loss_fn(small)(pred, targ))
-    val_large = float(ProfilePredictorTRB.get_val_loss_fn(large)(pred, targ))
+    val_small = float(ProfilePredictorTRB.get_val_loss_fn(_val_config(**small))(pred, targ))
+    val_large = float(ProfilePredictorTRB.get_val_loss_fn(_val_config(**large))(pred, targ))
     assert val_small == pytest.approx(val_large, rel=1e-6)
     assert val_small > 0.0
 
@@ -194,20 +206,17 @@ def test_val_loss_independent_of_huber_delta():
 
 
 def test_normalized_loss_magnitude_is_numerically_safe():
-    """Peak normalization shrinks loss values - check they stay well above
-    float32 resolution.
+    """Peak normalization shrinks the training loss - check it stays well above float32 resolution.
 
-    A typical 5% profile error gives a training huber loss of order 1e-3 and a
-    validation abs-error loss of order 1e-2. float32 has ~1e-38 normal range
-    and ~1e-7 relative precision, so these are far from underflow, and the
-    swept learning rate absorbs the overall loss-scale change.
+    A typical 5% profile error gives a training huber loss of order 1e-3,
+    and a chi of order one when the error bars are 5% too.
     """
     ne = 1.5 * (1 - RHO**2)
     te = 3.0 * (1 - RHO**2)
     pred, targ = _pred_and_targ(1.05 * ne, 1.05 * te, ne, te)
 
     train_loss = float(ProfilePredictorTRB.get_loss_fn({"huber_delta": 0.1, "gradient_weight": 0.1, "huber_delta_grad": 1.0})(pred, targ))
-    val_loss = float(ProfilePredictorTRB.get_val_loss_fn({"gradient_weight": 0.1, "within_error_weight": 0.5})(pred, targ))
+    val_loss = float(ProfilePredictorTRB.get_val_loss_fn(_val_config())(pred, targ))
 
     for loss in (train_loss, val_loss):
         assert np.isfinite(loss)
@@ -272,157 +281,122 @@ def test_weighted_zero_target_shots_disables_patience(study_config):
     assert study.make_train_config(baseline_case).patience == config.patience
 
 
-def test_error_bars_soften_loss_within_them():
-    """Residuals inside the measurement error bars are down-weighted, not free.
+def test_chi_counts_the_residual_in_error_bars():
+    """A prediction offset by k error bars at every point scores chi k per channel, in units of the GP-fit error bar.
 
-    The part of the residual inside the error bar is scaled by
-    within_error_weight, the part beyond it is penalized at full weight. A
-    prediction offset by half the error bar must therefore cost something (it
-    is still pulled toward the GP fit mean) but exactly within_error_weight
-    times what it would cost without error bars. Outside the bar only the
-    within-bar part is discounted.
-    """
-    w = 0.25
-    ne = 1.5 * (1 - RHO**2)
-    te = 3.0 * (1 - RHO**2)
-    ne_sigma = np.full_like(RHO, 0.2)
-    te_sigma = np.full_like(RHO, 0.3)
-    errors = {"n_e_1e20_error": ne_sigma, "t_e_keV_error": te_sigma}
-
-    train_loss = ProfilePredictorTRB.get_loss_fn({"huber_delta": 0.1, "within_error_weight": w})
-    val_loss = ProfilePredictorTRB.get_val_loss_fn({"within_error_weight": w})
-
-    # Half-sigma offset: entirely inside the bar, so the delta-free validation
-    # loss is exactly w times the unbanded loss on the same offset
-    pred_inside, targ = _pred_and_targ(ne + 0.5 * ne_sigma, te - 0.5 * te_sigma, ne, te, **errors)
-    _, targ_no_err = _pred_and_targ(ne, te, ne, te)
-    inside_loss = float(val_loss(pred_inside, targ))
-    assert inside_loss > 0.0
-    assert inside_loss == pytest.approx(w * float(val_loss(pred_inside, targ_no_err)), rel=1e-5)
-    assert float(train_loss(pred_inside, targ)) > 0.0
-
-    # Three-sigma offset: sigma of it discounted by w, two sigma at full
-    # weight, so it equals the unbanded loss on a (2 + w) sigma offset
-    pred_outside, _ = _pred_and_targ(ne + 3.0 * ne_sigma, te - 3.0 * te_sigma, ne, te, **errors)
-    pred_equiv, _ = _pred_and_targ(ne + (2.0 + w) * ne_sigma, te - (2.0 + w) * te_sigma, ne, te)
-    assert float(val_loss(pred_outside, targ)) == pytest.approx(float(val_loss(pred_equiv, targ_no_err)), rel=1e-5)
-
-    # Missing the error bar costs much more than landing inside it
-    assert float(val_loss(pred_outside, targ)) > float(val_loss(pred_inside, targ))
-    assert float(train_loss(pred_outside, targ)) > float(train_loss(pred_inside, targ))
-
-
-def test_zero_error_sentinel_matches_missing_error_signals():
-    """Error bars of 0 (the no-error-quantification sentinel) must score exactly
-    the same as omitting the error signals entirely, gradient term included.
-
-    The profiles are quadratic, so the analytic gradient signal averaged to
-    the rho midpoints equals the finite differences of the values exactly and
-    the comparison isolates the sentinel handling.
+    The offset is constant, so the gradients are untouched and only the value chi counts.
+    The training loss never reads the error bars.
     """
     ne = 1.5 * (1 - RHO**2)
     te = 3.0 * (1 - RHO**2)
-    zeros = np.zeros_like(RHO)
-    sentinel_extras = {
-        "n_e_1e20_error": zeros,
-        "t_e_keV_error": zeros,
-        "n_e_1e20_gradient": -3.0 * RHO,
-        "t_e_keV_gradient": -6.0 * RHO,
-        "n_e_1e20_gradient_error": zeros,
-        "t_e_keV_gradient_error": zeros,
-    }
-    loss_base = {"huber_delta": 0.5, "gradient_weight": 0.1, "huber_delta_grad": 5.0, "within_error_weight": 0.5}
+    val_loss = ProfilePredictorTRB.get_val_loss_fn(_val_config())
+    train_loss = ProfilePredictorTRB.get_loss_fn(TRAIN_CONFIG)
+    ne_sigma = SIGMA_FRAC * 1.5
+    te_sigma = SIGMA_FRAC * 3.0
 
-    pred, targ_sentinel = _pred_and_targ(ne + 0.3, te - 0.4, ne, te, **sentinel_extras)
-    _, targ_no_signals = _pred_and_targ(ne + 0.3, te - 0.4, ne, te)
+    for k in (0.5, 3.0):
+        pred, targ = _pred_and_targ(ne + k * ne_sigma, te - k * te_sigma, ne, te)
+        # Value chi is k at every point, integrated over rho in [0, 1], for each of the two channels
+        assert float(val_loss(pred, targ)) == pytest.approx(2.0 * k, rel=1e-6)
 
-    for loss_fn in (ProfilePredictorTRB.get_loss_fn(loss_base), ProfilePredictorTRB.get_val_loss_fn(loss_base)):
-        assert float(loss_fn(pred, targ_sentinel)) == pytest.approx(float(loss_fn(pred, targ_no_signals)), rel=1e-5)
-        assert float(loss_fn(pred, targ_sentinel)) > 0.0
+    pred, targ = _pred_and_targ(ne + ne_sigma, te - te_sigma, ne, te)
+    _, targ_wide_bars = _pred_and_targ(
+        ne, te, ne, te, n_e_1e20_error=np.full_like(RHO, 10 * ne_sigma), t_e_keV_error=np.full_like(RHO, 10 * te_sigma)
+    )
+    assert float(train_loss(pred, targ)) == pytest.approx(float(train_loss(pred, targ_wide_bars)), rel=1e-9)
+
+
+def test_chi_floor_caps_tight_error_bars():
+    """Error bars below the device floor count as the floor, so one overconfident fit point has bounded weight."""
+    ne = 1.5 * (1 - RHO**2)
+    te = 3.0 * (1 - RHO**2)
+    floor = 0.02
+    offset = 0.01  # Normalized by the 1.5 / 3.0 peaks, 0.0067 and 0.0033 fractional
+    tight = {var: np.full_like(RHO, 1e-6) for var in ("n_e_1e20_error", "t_e_keV_error")}
+    pred, targ = _pred_and_targ(ne + offset, te + offset, ne, te, **tight)
+
+    val_loss = ProfilePredictorTRB.get_val_loss_fn(_val_config(floor=floor))
+
+    assert float(val_loss(pred, targ)) == pytest.approx((offset / 1.5 + offset / 3.0) / floor, rel=1e-6)
 
 
 def test_measured_gradient_signal_is_the_gradient_target():
-    """When gradient signals are present they define the gradient target.
+    """The GP-fit gradient signals define the gradient target, in both losses.
 
-    The prediction matches the target values exactly, so any gradient loss can
-    only come from the measured gradient signal disagreeing with the
-    prediction's slope. A gradient error bar covering that disagreement must
-    down-weight it to within_error_weight times the unbanded gradient loss.
+    The prediction matches the target values exactly, so any loss can only come
+    from the measured gradient signal disagreeing with the prediction's slope.
+    In chi that disagreement counts in units of the gradient error bar, out to CHI_GRAD_RHO_MAX.
     """
-    w = 0.25
     ne = 1.5 * (1 - RHO**2)
     te = 3.0 * (1 - RHO**2)
     grad_offset = 1.0
-    extras = {
-        "n_e_1e20_gradient": -3.0 * RHO + grad_offset,
-        "t_e_keV_gradient": -6.0 * RHO + grad_offset,
-    }
-    loss_base = {"gradient_weight": 0.1, "within_error_weight": w}
-    with_grad = ProfilePredictorTRB.get_val_loss_fn(loss_base)
-    value_only = ProfilePredictorTRB.get_val_loss_fn({**loss_base, "gradient_weight": 0.0})
+    grad_sigma = 2.0 * grad_offset
+    pred, targ = _pred_and_targ(
+        ne,
+        te,
+        ne,
+        te,
+        n_e_1e20_gradient=-3.0 * RHO + grad_offset,
+        t_e_keV_gradient=-6.0 * RHO + grad_offset,
+        n_e_1e20_gradient_error=np.full_like(RHO, grad_sigma),
+        t_e_keV_gradient_error=np.full_like(RHO, grad_sigma),
+    )
 
-    pred, targ = _pred_and_targ(ne, te, ne, te, **extras)
-    assert float(value_only(pred, targ)) == pytest.approx(0.0, abs=1e-9)
-    unbanded = float(with_grad(pred, targ))
-    assert unbanded > 0.0
+    assert float(ProfilePredictorTRB.get_loss_fn({**TRAIN_CONFIG, "gradient_weight": 0.0})(pred, targ)) == pytest.approx(0.0, abs=1e-9)
+    assert float(ProfilePredictorTRB.get_loss_fn(TRAIN_CONFIG)(pred, targ)) > 0.0
 
-    # Gradient error bars at least as large as the disagreement discount the
-    # whole gradient residual by w. The offset is in channel units and the
-    # error bar comparison runs on normalized quantities, so any error bar
-    # >= the offset works for both channels
-    big_sigma = np.full_like(RHO, 2.0 * grad_offset)
-    _, targ_banded = _pred_and_targ(ne, te, ne, te, **extras, n_e_1e20_gradient_error=big_sigma, t_e_keV_gradient_error=big_sigma)
-    assert float(with_grad(pred, targ_banded)) == pytest.approx(w * unbanded, rel=1e-5)
+    # Peak normalization divides offset and error bar alike, so each midpoint scores offset / sigma
+    chi_grad_channel = np.trapezoid((RHO_MID < CHI_GRAD_RHO_MAX) * grad_offset / grad_sigma, x=RHO_MID)
+    expected = 0.1 * 2.0 * chi_grad_channel
+    assert float(ProfilePredictorTRB.get_val_loss_fn(_val_config())(pred, targ)) == pytest.approx(expected, rel=1e-6)
 
 
-def test_gradient_loss_only_below_rho_09():
-    """Gradient mismatch at rho >= 0.9 must not contribute to the loss.
+@pytest.mark.parametrize(
+    ("make_loss_fn", "loss_config", "rho_cut"),
+    [
+        (ProfilePredictorTRB.get_loss_fn, TRAIN_CONFIG, ProfilePredictorTRB.GRAD_LOSS_RHO_MAX),
+        (ProfilePredictorTRB.get_val_loss_fn, None, CHI_GRAD_RHO_MAX),
+    ],
+    ids=["train", "chi"],
+)
+def test_gradient_terms_count_only_inside_their_rho_cut(make_loss_fn, loss_config, rho_cut):
+    """Gradient mismatch beyond the cut (0.9 in training, 0.95 in chi) must not contribute, the same mismatch in the core must.
 
-    The measured gradients in the pedestal / edge are unreliable, so the
-    gradient term is masked to rho < GRAD_LOSS_RHO_MAX. A large gradient-signal
-    disagreement confined to rho >= 0.92 (whose midpoint contributions all sit
-    at rho >= 0.9) must leave the loss at zero, while the same disagreement in
-    the core must not.
+    The measured gradients at the edge are unreliable.
+    The offset sits on the grid points at and beyond the next point past the cut,
+    so every midpoint it reaches lies beyond the cut.
     """
     ne = 1.5 * (1 - RHO**2)
     te = 3.0 * (1 - RHO**2)
-    ne_grad_true = -3.0 * RHO
-    te_grad_true = -6.0 * RHO
-    loss_fn = ProfilePredictorTRB.get_loss_fn({"huber_delta": 0.5, "gradient_weight": 0.1, "huber_delta_grad": 5.0})
+    loss_fn = make_loss_fn(_val_config() if loss_config is None else loss_config)
+    first_offset_point = RHO[np.flatnonzero(RHO > rho_cut)[0] + 1]
 
-    edge_offset = np.where(RHO >= 0.92, 50.0, 0.0)
-    pred, targ_edge = _pred_and_targ(
-        ne, te, ne, te, n_e_1e20_gradient=ne_grad_true + edge_offset, t_e_keV_gradient=te_grad_true + edge_offset
-    )
+    edge_offset = np.where(RHO >= first_offset_point, 50.0, 0.0)
+    pred, targ_edge = _pred_and_targ(ne, te, ne, te, n_e_1e20_gradient=-3.0 * RHO + edge_offset, t_e_keV_gradient=-6.0 * RHO + edge_offset)
     assert float(loss_fn(pred, targ_edge)) == pytest.approx(0.0, abs=1e-9)
 
     core_offset = np.where(RHO <= 0.5, 50.0, 0.0)
-    _, targ_core = _pred_and_targ(ne, te, ne, te, n_e_1e20_gradient=ne_grad_true + core_offset, t_e_keV_gradient=te_grad_true + core_offset)
+    _, targ_core = _pred_and_targ(ne, te, ne, te, n_e_1e20_gradient=-3.0 * RHO + core_offset, t_e_keV_gradient=-6.0 * RHO + core_offset)
     assert float(loss_fn(pred, targ_core)) > 0.0
 
 
 @pytest.mark.slow
 @requires_sample_data
 def test_loss_on_prepared_sample_dataset():
-    """Full-pipeline check: signals prepared by get_ds feed the loss directly.
+    """Full-pipeline check: signals prepared by get_ds feed the losses directly.
 
     Pulls one fully-finite timeslice of the prepared cmod-high sample dataset
     (real GP-fit profiles, gradients and error bars on the uniform 51-point
-    rho grid) and checks the error-bar semantics on real error bars: perfect
-    predictions cost nothing, within-error-bar predictions cost exactly
-    within_error_weight times their unbanded loss, predictions outside cost
-    more, and the gradient term stays finite on real gradient signals.
+    rho grid) with the device's real chi_sigma_floors:
+    perfect predictions cost nothing, a two-sigma miss costs more than a half-sigma miss,
+    and both losses stay finite on real signals.
     """
-    w = 0.25
     ds, _ = get_ds("cmod-high", "profile_transfer")
 
     finite = np.ones((ds.sizes[EPISODE_DIM], ds.sizes["time_idx"]), dtype=bool)
     for var in PROFILE_TARGET_VARS:
         finite &= np.isfinite(ds[var].values).all(axis=-1)
-    # The deadband assertions need real (nonzero) error bars on every point
-    finite &= (ds["n_e_1e20_error"].values > 0).all(axis=-1)
-    finite &= (ds["t_e_keV_error"].values > 0).all(axis=-1)
-    assert finite.any(), "sample dataset has no fully-finite timeslice with error bars"
+    assert finite.any(), "sample dataset has no fully-finite timeslice"
     i_shot, i_time = np.argwhere(finite)[0]
     ts = ds.isel({EPISODE_DIM: i_shot, "time_idx": i_time})
 
@@ -432,27 +406,20 @@ def test_loss_on_prepared_sample_dataset():
     te_sigma = ts["t_e_keV_error"].values
     extras = {var: ts[var].values for var in PROFILE_TARGET_VARS if var not in ("n_e_1e20", "t_e_keV")}
 
-    val_loss = ProfilePredictorTRB.get_val_loss_fn({"within_error_weight": w})
-    train_loss = ProfilePredictorTRB.get_loss_fn(
-        {"huber_delta": 0.1, "gradient_weight": 0.1, "huber_delta_grad": 1.0, "within_error_weight": w}
-    )
+    floors = {device: chi_sigma_floors(device) for device in config.dataset_paths}
+    val_loss = ProfilePredictorTRB.get_val_loss_fn({"gradient_weight": 0.1, "chi_sigma_floors": floors})
+    train_loss = ProfilePredictorTRB.get_loss_fn({"huber_delta": 0.1, "gradient_weight": 0.1, "huber_delta_grad": 1.0})
 
     pred_perfect, targ = _pred_and_targ(ne, te, ne, te, **extras)
     assert float(val_loss(pred_perfect, targ)) == pytest.approx(0.0, abs=1e-9)
 
-    # Half-sigma offset: fully inside the real error bars, so the loss is
-    # exactly w times the same offset's loss without error bars
     pred_inside, _ = _pred_and_targ(ne + 0.5 * ne_sigma, te - 0.5 * te_sigma, ne, te, **extras)
-    _, targ_no_err = _pred_and_targ(ne, te, ne, te)
-    inside_loss = float(val_loss(pred_inside, targ))
-    assert inside_loss > 0.0
-    assert inside_loss == pytest.approx(w * float(val_loss(pred_inside, targ_no_err)), rel=1e-5)
-
     pred_outside, _ = _pred_and_targ(ne + 2.0 * ne_sigma, te - 2.0 * te_sigma, ne, te, **extras)
-    assert float(val_loss(pred_outside, targ)) > inside_loss
+    assert float(val_loss(pred_outside, targ)) > float(val_loss(pred_inside, targ)) > 0.0
 
     for pred in (pred_perfect, pred_inside, pred_outside):
         assert np.isfinite(float(train_loss(pred, targ)))
+        assert np.isfinite(float(val_loss(pred, targ)))
 
 
 def test_nan_target_samples_never_reach_loss():

@@ -1,20 +1,14 @@
 """Stage-resolved performance metrics for profile transfer study results.
 
-Recomputes the delta-free validation loss components (see
-ProfilePredictorTRB._make_profile_loss_fn with use_huber=False) in numpy from
-the per-case result files, joined back to the device datasets for measurement
-error bars, GP-fit gradients, ip_MA, and the heating powers. Each test
-timeslice gets three metrics:
+Scores every test timeslice with the chi validation loss (ProfilePredictorTRB.get_val_loss_fn, trb_utils.chi_value / chi_gradient),
+joined back to the device datasets for the measurement error bars, GP-fit gradients, ip_MA and the heating powers.
+Each test timeslice gets three metrics:
 
-- metric_value: peak-normalized, error-bar-softened profile residual integrated
-  over rho, summed over the ne and Te channels
-- metric_grad: same for the profile gradients at the rho midpoints, masked to
-  rho below GRAD_LOSS_RHO_MAX
-- metric_combined: metric_value + gradient_weight * metric_grad, the same
-  weighting the training loss uses
+- metric_value: value chi integrated over rho, summed over the ne and Te channels
+- metric_grad: gradient chi at the rho midpoints, masked to rho below CHI_GRAD_RHO_MAX, summed over the channels
+- metric_combined: metric_value + gradient_weight * metric_grad, the validation loss itself
 
-and a shot-stage label (rampup / flattop / rampdown, with an aux-heating flag
-subdividing the flattop).
+and a shot-stage label (rampup / flattop / rampdown, with an aux-heating flag subdividing the flattop).
 """
 
 from dataclasses import dataclass
@@ -27,7 +21,7 @@ from loguru import logger
 
 from transport_study import EPISODE_DIM, RADIAL_DIM, TIME_COORD, TIME_DIM
 from transport_study.config import config
-from transport_study.modules.profile_predictor.trb import ProfilePredictorTRB
+from transport_study.modules.trb_utils import CHI_ERROR_VARS, chi_gradient, chi_value
 from transport_study.orchestration.organize_data import (
     PROFILE_TARGET_VARS,
     to_rho_grid,
@@ -67,47 +61,6 @@ def load_eval_dataset(device: str) -> xr.Dataset:
     return ds_rho.load()
 
 
-def _to_mid(arr: np.ndarray) -> np.ndarray:
-    """Grid-point signal averaged to the rho midpoints."""
-    return 0.5 * (arr[..., :-1] + arr[..., 1:])
-
-
-def _channel_value_metric(pred: np.ndarray, targ: np.ndarray, err: np.ndarray, rho: np.ndarray, within_error_weight: float) -> np.ndarray:
-    """Peak-normalized softened value residual integrated over rho. Shapes (..., rho)."""
-    floor = ProfilePredictorTRB.PROFILE_SCALE_FLOOR
-    scale = np.maximum(np.max(np.abs(targ), axis=-1, keepdims=True), floor)
-    abs_residual = np.abs(pred / scale - targ / scale)
-    sigma = np.maximum(err / scale, 0.0)
-    outside = np.maximum(abs_residual - sigma, 0.0)
-    inside = np.minimum(abs_residual, sigma)
-    softened = outside + within_error_weight * inside
-    return np.trapezoid(softened, x=rho, axis=-1)
-
-
-def _channel_grad_metric(
-    pred: np.ndarray, targ: np.ndarray, grad_targ: np.ndarray, grad_err: np.ndarray, rho: np.ndarray, within_error_weight: float
-) -> np.ndarray:
-    """Softened gradient residual at the rho midpoints, masked to
-    rho < GRAD_LOSS_RHO_MAX, integrated over rho. Shapes (..., rho)."""
-    floor = ProfilePredictorTRB.PROFILE_SCALE_FLOOR
-    scale = np.maximum(np.max(np.abs(targ), axis=-1, keepdims=True), floor)
-
-    d_rho = np.diff(rho)
-    rho_mid = 0.5 * (rho[:-1] + rho[1:])
-
-    grad_pred = np.diff(pred / scale, axis=-1) / d_rho
-    grad_targ_mid = _to_mid(grad_targ) / scale
-    sigma = np.maximum(_to_mid(grad_err) / scale, 0.0)
-
-    abs_residual = np.abs(grad_pred - grad_targ_mid)
-    outside = np.maximum(abs_residual - sigma, 0.0)
-    inside = np.minimum(abs_residual, sigma)
-    softened = outside + within_error_weight * inside
-
-    grad_rho_mask = rho_mid < ProfilePredictorTRB.GRAD_LOSS_RHO_MAX
-    return np.trapezoid(grad_rho_mask * softened, x=rho_mid, axis=-1)
-
-
 @dataclass
 class CaseTimesliceMetrics:
     """Long-form per-timeslice metrics for one case, one record per valid test
@@ -143,14 +96,15 @@ class CaseTimesliceMetrics:
 
 
 def compute_case_timeslice_metrics(result_ds: xr.Dataset, loss_config: dict) -> CaseTimesliceMetrics:
-    """Score every valid test timeslice of one case result file.
+    """Score every valid test timeslice of one case result file with the chi validation loss.
 
     Joins each result timeslice to its device dataset by (shot, nearest time)
     to pick up the measurement error bars, GP gradients, Ip, and aux power the
     result file does not carry.
+    loss_config is the case's own, for gradient_weight and the per-device chi_sigma_floors.
     """
-    gradient_weight = loss_config.get("gradient_weight", 0.0)
-    within_error_weight = loss_config["within_error_weight"]
+    gradient_weight = loss_config["gradient_weight"]
+    sigma_floors = loss_config["chi_sigma_floors"]
 
     rho = result_ds[RADIAL_DIM].values
 
@@ -208,24 +162,22 @@ def compute_case_timeslice_metrics(result_ds: xr.Dataset, loss_config: dict) -> 
         p_aux = sum(np.nan_to_num(shot_eval[sig].values, nan=0.0) for sig in HEATING_POWERS_MW)
         stage_full, aux_full = segment_stages(shot_eval["ip_MA"].values, p_aux)
 
-        ne_pred = ne_pred_all[result_idxs]
-        te_pred = te_pred_all[result_idxs]
-        ne_targ = shot_res["n_e_1e20_targ"].transpose(TIME_DIM, RADIAL_DIM).values[result_idxs]
-        te_targ = shot_res["t_e_keV_targ"].transpose(TIME_DIM, RADIAL_DIM).values[result_idxs]
-
-        ne_err = shot_eval["n_e_1e20_error"].transpose(TIME_DIM, RADIAL_DIM).values[eval_idxs]
-        te_err = shot_eval["t_e_keV_error"].transpose(TIME_DIM, RADIAL_DIM).values[eval_idxs]
-        ne_grad = shot_eval["n_e_1e20_gradient"].transpose(TIME_DIM, RADIAL_DIM).values[eval_idxs]
-        te_grad = shot_eval["t_e_keV_gradient"].transpose(TIME_DIM, RADIAL_DIM).values[eval_idxs]
-        ne_grad_err = shot_eval["n_e_1e20_gradient_error"].transpose(TIME_DIM, RADIAL_DIM).values[eval_idxs]
-        te_grad_err = shot_eval["t_e_keV_gradient_error"].transpose(TIME_DIM, RADIAL_DIM).values[eval_idxs]
-
-        metric_value = _channel_value_metric(ne_pred, ne_targ, ne_err, rho, within_error_weight) + _channel_value_metric(
-            te_pred, te_targ, te_err, rho, within_error_weight
-        )
-        metric_grad = _channel_grad_metric(ne_pred, ne_targ, ne_grad, ne_grad_err, rho, within_error_weight) + _channel_grad_metric(
-            te_pred, te_targ, te_grad, te_grad_err, rho, within_error_weight
-        )
+        preds = {"n_e_1e20": ne_pred_all[result_idxs], "t_e_keV": te_pred_all[result_idxs]}
+        device_floors = sigma_floors[device]
+        metric_value = np.zeros(len(result_idxs))
+        metric_grad = np.zeros(len(result_idxs))
+        for channel, (value_error_var, grad_error_var) in CHI_ERROR_VARS.items():
+            targ, sigma, grad_targ, grad_sigma = (
+                profiles.transpose(TIME_DIM, RADIAL_DIM).values[idxs]
+                for profiles, idxs in (
+                    (shot_res[f"{channel}_targ"], result_idxs),
+                    (shot_eval[value_error_var], eval_idxs),
+                    (shot_eval[f"{channel}_gradient"], eval_idxs),
+                    (shot_eval[grad_error_var], eval_idxs),
+                )
+            )
+            metric_value += np.asarray(chi_value(preds[channel], targ, sigma, device_floors[value_error_var], rho))
+            metric_grad += np.asarray(chi_gradient(preds[channel], targ, grad_targ, grad_sigma, device_floors[grad_error_var], rho))
         metric_combined = metric_value + gradient_weight * metric_grad
 
         n = len(result_idxs)

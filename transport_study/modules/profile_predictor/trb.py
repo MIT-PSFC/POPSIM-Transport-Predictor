@@ -28,11 +28,19 @@ from transport_study.modules.profile_predictor.module import (
 )
 from transport_study.modules.profile_predictor.torax_module import ProfilePredictorTorax
 from transport_study.modules.trb_utils import (
+    CHI_ERROR_VARS,
+    PROFILE_SCALE_FLOOR,
+    chi_gradient,
+    chi_value,
     integrate_error_over_time,
     make_exponential_adamw,
     make_loss_eval_suite,
+    peak_scale,
+    per_sample_device_values,
+    per_sample_sigma_floor,
     resolve_case_datasets,
     target_device_idx,
+    to_mid,
 )
 
 
@@ -223,229 +231,84 @@ class ProfilePredictorTRB(TrainRunBuilder):
 
         return module
 
-    # Floor on the per-sample target peak used for profile normalization.
-    # In channel units (1e20 m^-3 for ne, keV for Te) any real fresh profile
-    # peaks far above this, so the floor only guards degenerate targets from
-    # blowing up the 1/scale division
-    PROFILE_SCALE_FLOOR = 1e-2
-
-    # Softening fraction for the relative-error denominator in study_results
-    # The floor added to abs(targ) is this fraction of the profile's own peak
-    # (per timeslice, floored by PROFILE_SCALE_FLOOR), so it reads as the same
-    # relative amount for ne (1e20 m^-3) and Te (keV) on every device instead
-    # of a fixed absolute offset in mismatched units
+    # Softening fraction for the relative-error denominator in study_results.
+    # The floor added to abs(targ) is this fraction of the profile's own peak (per timeslice, floored by PROFILE_SCALE_FLOOR),
+    # so it reads as the same relative amount for ne and Te on every device
     REL_ERROR_FLOOR_FRAC = 0.1
 
-    # Gradient loss only applies for rho below this. Beyond it the GP fits
-    # are extrapolating into the pedestal / scrape-off layer where the
-    # measured gradients are unreliable, so they should not steer training
+    # The training gradient loss only applies below this rho.
+    # Beyond it the GP fits extrapolate into the pedestal and scrape-off layer, where the measured gradients are unreliable
     GRAD_LOSS_RHO_MAX = 0.9
 
     @staticmethod
-    def _make_profile_loss_fn(loss_config: dict, use_huber: bool) -> Callable[[Any, Any], jnp.ndarray]:
-        """Shared builder for the training and validation losses.
+    def get_loss_fn(loss_config: dict) -> Callable[[Any, Any], jnp.ndarray]:
+        """Training loss: huber on the peak-normalized residual of the values and of the gradients.
 
-        Both losses operate on peak-normalized profiles: each target profile is
-        scaled so its largest value is 1, and the prediction is divided by the
-        same per-sample scale. This keeps the two channels comparable (ne is
-        ~0.5-4 in 1e20 m^-3, Te up to ~8 keV on C-Mod but ~1 on TCV) so neither
-        channel nor device dominates, and an error of 0.1 always means 10% of
-        the profile peak.
-
-        Measurement error bars (<v>_error / <v>_gradient_error target vars, from
-        the GP profile fits) soften the VALIDATION residual only: the part of
-        the residual inside the error bar is down-weighted by
-        within_error_weight, the part beyond it is penalized at full weight, so
-        the validation metric still pulls toward the GP fit mean everywhere but
-        landing inside the error bars costs significantly less than missing
-        them. The training loss uses the raw residual, its robustness to fit
-        noise comes from the huber deltas alone. An error of 0 is the sentinel
-        for "no rigorous error quantification" and gives a zero-width bar,
-        which reduces to the plain residual loss. When the error / gradient
-        target vars are absent entirely the validation loss falls back to
-        zero-width error bars, and both losses fall back to finite-difference
-        gradient targets.
-
-        use_huber=True builds the training loss with the swept huber_delta /
-        huber_delta_grad (deltas read as fractional errors on the normalized
-        profiles). use_huber=False builds the validation loss as plain absolute
-        error with no deltas at all: huber loss shrinks monotonically as
-        delta -> 0, so a delta-dependent sweep metric would reward small deltas
-        instead of good predictions.
+        Each target profile is scaled so its peak is 1 and the prediction by the same per-sample scale,
+        so the channels and devices are commensurate and huber_delta / huber_delta_grad read as fractional errors.
+        The gradient targets are the GP-fit gradients, masked to rho below GRAD_LOSS_RHO_MAX.
+        The swept deltas make this loss unfit for the sweep metric, validation uses get_val_loss_fn.
         """
-        if "device_weights" not in loss_config:
-            device_weights = dict.fromkeys(config.dataset_paths, 1.0)
-        else:
-            device_weights = loss_config["device_weights"]
-
-        # Weight of the profile-gradient term relative to the value term.
-        # Gradient agreement matters for downstream stability predictions, which
-        # depend on dTe/drho and dne/drho rather than the values themselves.
-        gradient_weight = loss_config.get("gradient_weight", 0.0)
-
-        if use_huber:
-            # Normalized gradients are still larger than normalized values
-            # (a peak-normalized pedestal can have d/drho of order 10), so the
-            # huber transition needs its own delta
-            huber_delta = loss_config["huber_delta"]
-            huber_delta_grad = loss_config.get("huber_delta_grad", 1.0)
-
-            def value_err(excess):
-                return optax.huber_loss(excess, delta=huber_delta)
-
-            def grad_err(excess):
-                return optax.huber_loss(excess, delta=huber_delta_grad)
-
-            def _residual(pred, targ, sigma):
-                # Training residual: plain distance to the GP fit mean,
-                # the error bars do not soften it
-                return jnp.abs(pred - targ)
-        else:
-
-            def value_err(excess):
-                return excess
-
-            grad_err = value_err
-
-            # Down-weighting of the residual inside the measurement error bar, read strictly
-            # a silent default here would change checkpoint selection without changing the case
-            # TODO(ZanderKeith): This was a poor design choice on my part. Should be doing chi metrics.
-            # I'm reporting on chi metrics in the presentation, must update this to match
-            within_error_weight = loss_config["within_error_weight"]
-
-            def _residual(pred, targ, sigma):
-                # Piecewise-linear shrink of the residual: full weight on the
-                # part beyond the error bar, within_error_weight on the part
-                # inside it. Continuous and monotone in |residual|, so the pull
-                # toward the GP fit mean never vanishes, it just weakens inside
-                # the bar. sigma is clamped at 0 so a degenerate negative error
-                # bar cannot inflate the residual
-                abs_residual = jnp.abs(pred - targ)
-                sigma = jnp.maximum(sigma, 0.0)
-                outside = jnp.maximum(abs_residual - sigma, 0.0)
-                inside = jnp.minimum(abs_residual, sigma)
-                return outside + within_error_weight * inside
-
-        def _sigma_from_targ(targ, var, scale):
-            # Error-bar target var, normalized like the profiles. An absent
-            # var behaves like the 0 sentinel (zero-width error bar)
-            if var in targ:
-                return targ[var].data / scale
-            return 0.0
+        device_weights = loss_config.get("device_weights", {})
+        gradient_weight = loss_config["gradient_weight"]
+        huber_delta = loss_config["huber_delta"]
+        # Normalized gradients are larger than normalized values (a pedestal can reach d/drho of order 10),
+        # so the gradient huber transition has its own delta
+        huber_delta_grad = loss_config["huber_delta_grad"]
 
         def loss_fn(pred, targ):
-            ne_targ = targ["n_e_1e20"].data
-            te_targ = targ["t_e_keV"].data
-
-            # Peak-normalize per sample: scale comes from the target only and is
-            # applied to prediction and target alike, so a perfect prediction
-            # still gives zero loss
-            floor = ProfilePredictorTRB.PROFILE_SCALE_FLOOR
-            ne_scale = jnp.maximum(jnp.max(jnp.abs(ne_targ), axis=-1, keepdims=True), floor)
-            te_scale = jnp.maximum(jnp.max(jnp.abs(te_targ), axis=-1, keepdims=True), floor)
-
-            ne_sigma = _sigma_from_targ(targ, "n_e_1e20_error", ne_scale)
-            te_sigma = _sigma_from_targ(targ, "t_e_keV_error", te_scale)
-
-            ne_err = value_err(_residual(pred.ne.data / ne_scale, ne_targ / ne_scale, ne_sigma))
-            te_err = value_err(_residual(pred.te.data / te_scale, te_targ / te_scale, te_sigma))
-
-            # Build per-sample device weight
-            ds_source_idx = targ["ds_source_idx"].data
-            sample_weights = jnp.ones(ds_source_idx.shape, dtype=ne_err.dtype)
-            for device, weight in device_weights.items():
-                sample_weights = jnp.where(
-                    ds_source_idx == config.ds_source_to_idx[device],
-                    weight,
-                    sample_weights,
-                )
-
-            # Broadcast sample weights across profile/time axes
-            while sample_weights.ndim < ne_err.ndim:
-                sample_weights = sample_weights[..., None]
-
             rho = pred.ne[RADIAL_DIM].data
-            ne_rho_loss = jnp.trapezoid(sample_weights * ne_err, x=rho)
-            te_rho_loss = jnp.trapezoid(sample_weights * te_err, x=rho)
-
-            loss = ne_rho_loss + te_rho_loss
-
-            if gradient_weight > 0.0:
-                # Finite-difference gradients of the normalized predictions at
-                # the rho midpoints (robust to non-uniform grids, no
-                # jnp.gradient spacing support needed)
-                d_rho = jnp.diff(rho)
-                rho_mid = 0.5 * (rho[:-1] + rho[1:])
-
-                ne_grad_pred = jnp.diff(pred.ne.data / ne_scale, axis=-1) / d_rho
-                te_grad_pred = jnp.diff(pred.te.data / te_scale, axis=-1) / d_rho
-
-                def _to_mid(arr):
-                    # Grid-point signal averaged to the rho midpoints, matching
-                    # the finite-difference prediction gradients
-                    return 0.5 * (arr[..., :-1] + arr[..., 1:])
-
-                # Gradient targets come from the GP-fit gradient signals when present
-                # (measured slope, smoother than differencing the values),
-                # otherwise fall back to finite differences of the value targets
-                if "n_e_1e20_gradient" in targ:
-                    ne_grad_targ = _to_mid(targ["n_e_1e20_gradient"].data) / ne_scale
-                else:
-                    ne_grad_targ = jnp.diff(ne_targ / ne_scale, axis=-1) / d_rho
-                if "t_e_keV_gradient" in targ:
-                    te_grad_targ = _to_mid(targ["t_e_keV_gradient"].data) / te_scale
-                else:
-                    te_grad_targ = jnp.diff(te_targ / te_scale, axis=-1) / d_rho
-
-                ne_grad_sigma = _sigma_from_targ(targ, "n_e_1e20_gradient_error", ne_scale)
-                te_grad_sigma = _sigma_from_targ(targ, "t_e_keV_gradient_error", te_scale)
-                if not isinstance(ne_grad_sigma, float):
-                    ne_grad_sigma = _to_mid(ne_grad_sigma)
-                if not isinstance(te_grad_sigma, float):
-                    te_grad_sigma = _to_mid(te_grad_sigma)
-
-                ne_grad_err = sample_weights * grad_err(_residual(ne_grad_pred, ne_grad_targ, ne_grad_sigma))
-                te_grad_err = sample_weights * grad_err(_residual(te_grad_pred, te_grad_targ, te_grad_sigma))
-
-                # Gradient loss only counts for rho below GRAD_LOSS_RHO_MAX,
-                # the measured gradients beyond it are unreliable
-                grad_rho_mask = rho_mid < ProfilePredictorTRB.GRAD_LOSS_RHO_MAX
-
-                ne_grad_loss = jnp.trapezoid(grad_rho_mask * ne_grad_err, x=rho_mid)
-                te_grad_loss = jnp.trapezoid(grad_rho_mask * te_grad_err, x=rho_mid)
-
-                loss = loss + gradient_weight * (ne_grad_loss + te_grad_loss)
-
-            return loss
+            rho_mid = to_mid(rho)
+            mask_grad_rho = rho_mid < ProfilePredictorTRB.GRAD_LOSS_RHO_MAX
+            sample_weights = per_sample_device_values(targ["ds_source_idx"].data, device_weights, 1.0)
+            loss = 0.0
+            for channel, pred_channel in (("n_e_1e20", pred.ne.data), ("t_e_keV", pred.te.data)):
+                targ_channel = targ[channel].data
+                scale = peak_scale(targ_channel)
+                value_err = optax.huber_loss(pred_channel / scale - targ_channel / scale, delta=huber_delta)
+                grad_pred = jnp.diff(pred_channel / scale, axis=-1) / jnp.diff(rho)
+                grad_targ = to_mid(targ[f"{channel}_gradient"].data) / scale
+                grad_err = optax.huber_loss(grad_pred - grad_targ, delta=huber_delta_grad)
+                loss = loss + jnp.trapezoid(value_err, x=rho, axis=-1)
+                loss = loss + gradient_weight * jnp.trapezoid(mask_grad_rho * grad_err, x=rho_mid, axis=-1)
+            return sample_weights * loss
 
         return loss_fn
 
     @staticmethod
-    def get_loss_fn(loss_config: dict) -> Callable[[Any, Any], jnp.ndarray]:
-        """Training loss: huber on the raw peak-normalized residual.
-
-        No error-bar softening, so robustness to GP-fit noise comes from the huber deltas alone.
-        huber_delta and huber_delta_grad are swept hyperparameters,
-        so this loss must only be used for training.
-        Validation uses get_val_loss_fn, which is delta-free,
-        so the sweep metric stays comparable across delta values.
-        """
-        return ProfilePredictorTRB._make_profile_loss_fn(loss_config, use_huber=True)
-
-    @staticmethod
     def get_val_loss_fn(loss_config: dict) -> Callable[[Any, Any], jnp.ndarray]:
-        """Validation loss: error-bar-softened absolute error on peak-normalized profiles.
+        """Validation loss: chi, the residual in units of the GP-fit error bar (trb_utils.chi_value / chi_gradient).
 
-        Shares device_weights and gradient_weight with the training loss so
-        validation weights samples consistently, but reads no huber deltas:
-        the sweep metric val/loss.mean must not depend on the swept deltas or
-        the sweep would drive them to their minimum to shrink the reported
-        number instead of improving predictions. Unlike the training loss it
-        down-weights the residual inside the GP-fit error bars
-        (within_error_weight), so checkpoint selection does not chase fit
-        noise the measurement cannot distinguish.
+        Summed over ne and Te, value chi plus gradient_weight times gradient chi, device-weighted.
+        The error bars are floored per device at chi_sigma_floors from the loss config.
+        Chi reads no huber delta, so the sweep metric val/loss.mean cannot be gamed by shrinking one.
         """
-        return ProfilePredictorTRB._make_profile_loss_fn(loss_config, use_huber=False)
+        device_weights = loss_config.get("device_weights", {})
+        gradient_weight = loss_config["gradient_weight"]
+        sigma_floors = loss_config["chi_sigma_floors"]
+
+        def loss_fn(pred, targ):
+            rho = pred.ne[RADIAL_DIM].data
+            ds_source_idx = targ["ds_source_idx"].data
+            sample_weights = per_sample_device_values(ds_source_idx, device_weights, 1.0)
+            loss = 0.0
+            for channel, pred_channel in (("n_e_1e20", pred.ne.data), ("t_e_keV", pred.te.data)):
+                targ_channel = targ[channel].data
+                value_error_var, grad_error_var = CHI_ERROR_VARS[channel]
+                value_floor = per_sample_sigma_floor(ds_source_idx, sigma_floors, value_error_var)
+                grad_floor = per_sample_sigma_floor(ds_source_idx, sigma_floors, grad_error_var)
+                loss = loss + chi_value(pred_channel, targ_channel, targ[value_error_var].data, value_floor, rho)
+                loss = loss + gradient_weight * chi_gradient(
+                    pred_channel,
+                    targ_channel,
+                    targ[f"{channel}_gradient"].data,
+                    targ[grad_error_var].data,
+                    grad_floor,
+                    rho,
+                )
+            return sample_weights * loss
+
+        return loss_fn
 
     @staticmethod
     def get_optimizer(optimizer_config: dict) -> optax.GradientTransformation:
@@ -517,8 +380,7 @@ class ProfilePredictorTRB(TrainRunBuilder):
             return None
 
         # Shares device_weights / gradient_weight with the training loss_config,
-        # but builds the delta-free validation loss: huber_delta is a swept
-        # hyperparameter and must not leak into the sweep metric
+        # but scores chi, which no swept delta can shrink
         return make_loss_eval_suite(ProfilePredictorTRB.get_val_loss_fn(suite_config["loss_config"]))
 
     @staticmethod
@@ -610,7 +472,7 @@ class ProfilePredictorTRB(TrainRunBuilder):
             # instead of a fixed absolute value, so it means the same relative
             # amount for ne and Te on every device (see REL_ERROR_FLOOR_FRAC)
             floor_frac = ProfilePredictorTRB.REL_ERROR_FLOOR_FRAC
-            scale_floor = ProfilePredictorTRB.PROFILE_SCALE_FLOOR
+            scale_floor = PROFILE_SCALE_FLOOR
             ne_peak = np.maximum(xr.apply_ufunc(np.abs, ne_targ).max(dim=RADIAL_DIM), scale_floor)
             te_peak = np.maximum(xr.apply_ufunc(np.abs, te_targ).max(dim=RADIAL_DIM), scale_floor)
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import functools
 import json
 import math
 import os
@@ -28,6 +29,7 @@ from pydantic import Field, field_validator, model_validator
 from transport_study import PACKAGE_ROOT, TIME_DIM
 from transport_study.config import StudyConfig, config, env_dataset_paths, load_config
 from transport_study.modules.normalization import STAT_NORMALIZATIONS
+from transport_study.modules.trb_utils import chi_sigma_floors
 from transport_study.orchestration.organize_data import (
     TrainingData,
     get_loaded_shot_count,
@@ -291,6 +293,9 @@ class Study:
     # The reports module a generate_case_report and an analysis_case_done function
     ANALYSIS_METRICS_MODULE: ClassVar[str]
     ANALYSIS_REPORTS_MODULE: ClassVar[str]
+
+    # Whether the validation loss is chi, which needs the per-device error-bar floors in the loss config
+    CHI_VALIDATION_LOSS: ClassVar[bool] = False
 
     # Tuned-config dataloader keys merged by strict indexing (KeyError when a tuned config lacks one)
     TUNED_DATALOADER_KEYS: ClassVar[tuple[str, ...]] = ()
@@ -669,6 +674,11 @@ class Study:
 
         return dataset_weights
 
+    @functools.cached_property
+    def chi_sigma_floors_by_device(self) -> dict[str, dict[str, float]]:
+        """trb_utils.chi_sigma_floors of every configured device, computed once per study since it loads each device's profiles."""
+        return {device: chi_sigma_floors(device) for device in config.dataset_paths}
+
     def _set_transfer_checkpoint(self, train_config: TrainConfig, transfer_case: Case) -> TrainConfig:
         """Point model_init at the pretrained checkpoint the transfer case fine-tunes from."""
         return train_config.model_copy(
@@ -757,6 +767,9 @@ class Study:
             # "addition" adds the same target shots but as normal samples,
             # so it deliberately gets no device_weights entry
             loss_config["device_weights"] = self.make_weighted_device_weights(case)
+        if self.CHI_VALIDATION_LOSS:
+            # Read by the chi validation loss, which val_eval_suite_config shares
+            loss_config["chi_sigma_floors"] = self.chi_sigma_floors_by_device
 
         # Weighted / addition with no target shots runs to max_epochs, early stopping disabled
         patience = None if case.domain_adaptation in ("weighted", "addition") and case.num_target_shots == 0 else config.patience

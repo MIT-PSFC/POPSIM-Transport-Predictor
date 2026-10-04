@@ -1,5 +1,5 @@
-"""Unit tests for the validation-loss-style per-case metrics in
-profile_transfer.study_metrics, on synthetic data with no training involved.
+"""Unit tests for the chi per-case metrics in profile_transfer.study_metrics,
+on synthetic data with no training involved.
 
 The stage segmentation these join against is shared machinery covered by
 tests/orchestration/test_stages.py.
@@ -14,6 +14,7 @@ import xarray as xr
 
 from transport_study import RADIAL_DIM
 from transport_study.config import RHO_GRID
+from transport_study.modules.trb_utils import CHI_ERROR_VARS, CHI_GRAD_RHO_MAX
 from transport_study.orchestration.stages import STAGE_AGG_NAMES
 from transport_study.profile_transfer import study_metrics
 from transport_study.profile_transfer.study_metrics import (
@@ -22,7 +23,8 @@ from transport_study.profile_transfer.study_metrics import (
     compute_case_timeslice_metrics,
 )
 
-WITHIN_ERROR_WEIGHT = 0.25
+# Peak-normalized error-bar floor, it applies wherever the synthetic error bars are zero
+SIGMA_FLOOR = 0.01
 
 
 def _make_result_ds(times: np.ndarray, ne_pred, ne_targ, te_pred, te_targ, shot: int = 1) -> xr.Dataset:
@@ -105,7 +107,10 @@ EVAL_TIMES = np.array([0.0, 0.1, 0.2, 0.3, 0.4, 0.5])
 EVAL_IP = np.array([0.2, 0.5, 1.0, 1.0, 1.0, 0.3])
 EVAL_P_NBI = np.array([0.0, 0.0, 0.05, 0.5, 0.0, 0.0])
 
-LOSS_CONFIG = {"gradient_weight": 0.1, "within_error_weight": WITHIN_ERROR_WEIGHT}
+LOSS_CONFIG = {
+    "gradient_weight": 0.1,
+    "chi_sigma_floors": {"devA": {var: SIGMA_FLOOR for error_vars in CHI_ERROR_VARS.values() for var in error_vars}},
+}
 
 
 @pytest.fixture()
@@ -143,41 +148,38 @@ class TestComputeCaseTimesliceMetrics:
         np.testing.assert_array_equal(ts.stage_mask("flattop_aux"), [False, False, True, False])
         np.testing.assert_array_equal(ts.stage_mask("all"), [True, True, True, True])
 
-    def test_residual_outside_error_bar_full_weight(self, patched_eval):
-        # Constant offsets with zero-width error bars: the normalized residual
-        # integrates to delta / peak per channel
+    def test_value_chi_counts_offset_in_error_bars(self, patched_eval):
+        # Constant offsets of half the ne error bar and a quarter of the Te one,
+        # chi integrates to that fraction over rho in [0, 1]
+        result_ds = _make_result_ds(RESULT_TIMES, NE_TARG + 0.1, NE_TARG, TE_TARG + 0.1, TE_TARG)
+        eval_ds = _make_eval_ds(EVAL_TIMES, EVAL_IP, EVAL_P_NBI, ne_err=0.2, te_err=0.4, ne_grad=-1.0, te_grad=-2.0)
+        patched_eval(eval_ds)
+
+        ts = compute_case_timeslice_metrics(result_ds, LOSS_CONFIG)
+        np.testing.assert_allclose(ts.metric_value, 0.5 + 0.25, rtol=1e-10)
+        # A constant offset leaves the gradients untouched
+        np.testing.assert_allclose(ts.metric_grad, 0.0, atol=1e-9)
+        np.testing.assert_allclose(ts.metric_combined, ts.metric_value + LOSS_CONFIG["gradient_weight"] * ts.metric_grad, rtol=1e-12)
+
+    def test_zero_error_bars_count_as_the_floor(self, patched_eval):
+        # Zero-width error bars fall back to the device floor on the peak-normalized residual
         result_ds = _make_result_ds(RESULT_TIMES, NE_TARG + 0.1, NE_TARG, TE_TARG + 0.1, TE_TARG)
         eval_ds = _make_eval_ds(EVAL_TIMES, EVAL_IP, EVAL_P_NBI, ne_grad=-1.0, te_grad=-2.0)
         patched_eval(eval_ds)
 
         ts = compute_case_timeslice_metrics(result_ds, LOSS_CONFIG)
-        expected = 0.1 / 2.0 + 0.1 / 4.0
-        np.testing.assert_allclose(ts.metric_value, expected, rtol=1e-10)
-        # A constant offset leaves the gradients untouched
-        np.testing.assert_allclose(ts.metric_grad, 0.0, atol=1e-9)
-        np.testing.assert_allclose(ts.metric_combined, ts.metric_value + LOSS_CONFIG["gradient_weight"] * ts.metric_grad, rtol=1e-12)
-
-    def test_residual_inside_error_bar_is_down_weighted(self, patched_eval):
-        # Error bars wider than the offset: the whole residual sits inside the
-        # bar and is scaled by within_error_weight
-        result_ds = _make_result_ds(RESULT_TIMES, NE_TARG + 0.1, NE_TARG, TE_TARG + 0.1, TE_TARG)
-        eval_ds = _make_eval_ds(EVAL_TIMES, EVAL_IP, EVAL_P_NBI, ne_err=0.2, te_err=0.3, ne_grad=-1.0, te_grad=-2.0)
-        patched_eval(eval_ds)
-
-        ts = compute_case_timeslice_metrics(result_ds, LOSS_CONFIG)
-        expected = WITHIN_ERROR_WEIGHT * (0.1 / 2.0 + 0.1 / 4.0)
-        np.testing.assert_allclose(ts.metric_value, expected, rtol=1e-10)
+        np.testing.assert_allclose(ts.metric_value, (0.1 / 2.0 + 0.1 / 4.0) / SIGMA_FLOOR, rtol=1e-10)
 
     def test_gradient_error_beyond_rho_max_is_masked(self, patched_eval):
         # GP gradient targets disagree with the (perfect-value) prediction only
-        # beyond GRAD_LOSS_RHO_MAX, where the mask must zero the contribution
+        # beyond CHI_GRAD_RHO_MAX, where the mask must zero the contribution
         rho_mid = 0.5 * (RHO_GRID[:-1] + RHO_GRID[1:])
         ne_grad = np.full(len(RHO_GRID), -1.0)
         te_grad = np.full(len(RHO_GRID), -2.0)
         # Corrupt the gradient targets only where every midpoint average of
         # adjacent points is beyond the mask
-        edge = RHO_GRID > 0.95
-        assert rho_mid[np.flatnonzero(edge)[0] - 1] >= 0.9
+        edge = RHO_GRID > 0.97
+        assert rho_mid[np.flatnonzero(edge)[0] - 1] >= CHI_GRAD_RHO_MAX
         ne_grad[edge] = 50.0
         te_grad[edge] = 50.0
 
@@ -251,7 +253,7 @@ class TestCaseMetricsCache:
         case_ds = compute_and_save_case_metrics(study, "case.test")
         assert case_metrics_path(study, "case.test").exists()
         assert list(case_ds["stage"].values) == list(STAGE_AGG_NAMES)
-        expected_value = 0.1 / 2.0 + 0.1 / 4.0
+        expected_value = (0.1 / 2.0 + 0.1 / 4.0) / SIGMA_FLOOR
         np.testing.assert_allclose(case_ds["value_mean"].sel(stage="all").item(), expected_value, rtol=1e-10)
         assert case_ds["value_count"].sel(stage="all").item() == 4
         # From EVAL_IP / EVAL_P_NBI: rampup at 0.1s, flattop at 0.2-0.4s with one aux slice

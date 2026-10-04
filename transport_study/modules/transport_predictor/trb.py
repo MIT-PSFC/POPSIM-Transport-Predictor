@@ -24,9 +24,13 @@ from transport_study.modules.transport_predictor.module import (
     make_transport_nn_input_normalizer,
 )
 from transport_study.modules.trb_utils import (
+    chi_value,
     get_time_dep_dataloaders,
     make_grouped_exponential_adamw,
     make_loss_eval_suite,
+    peak_scale,
+    per_sample_device_values,
+    per_sample_sigma_floor,
     target_device_idx,
 )
 
@@ -186,148 +190,79 @@ class TransportPredictorTRB(TrainRunBuilder):
         return env
 
     @staticmethod
-    def _make_profile_loss_fn(loss_config: dict, use_huber: bool, include_anchors: bool = False) -> IntegralLoss:
+    def _make_profile_loss_fn(loss_config: dict, use_chi: bool) -> IntegralLoss:
         """Device-weighted loss on the predicted ne/te profiles, wrapped for time integration.
 
-        Profiles are peak-normalized per timeslice (scale from the target
-        only, floored) so the two channels and all devices are commensurate
-        and the huber delta reads as a fractional error, same convention as
-        the profile study loss.
+        Training (use_chi False): huber on the peak-normalized residual with the swept huber_delta,
+        the same convention as the profile study training loss, plus the sciml anchor terms.
+        Validation (use_chi True): value chi, the residual in units of the GP-fit error bar
+        floored per device at chi_sigma_floors (trb_utils.chi_value), so no swept delta can shrink the sweep metric.
 
-        Both losses count only timeslices with a fresh profile measurement:
-        the profile residual is masked by the fresh_profile target var, so
-        forward-filled (stale) profile slices steer neither training nor
-        checkpoint selection. The anchor terms are exempt, their measured
-        signals exist at every timeslice.
+        Both count only timeslices with a fresh profile measurement:
+        the profile terms are multiplied by the fresh_profile target var,
+        so forward-filled (stale) slices steer neither training nor checkpoint selection.
 
-        use_huber selects the training loss (huber on the raw residual, with
-        the swept huber_delta) or the validation loss (delta-free absolute
-        error, softened inside the GP-fit error bars). Same split as the
-        profile study: the sweep metric val/loss.mean cannot be gamed by
-        shrinking delta, and checkpoint selection does not chase fit noise
-        the measurement cannot distinguish (within_error_weight down-weights
-        the part of the residual inside the <v>_error bars, a 0 error is the
-        sentinel for a zero-width bar and an absent error var behaves the
-        same). The training loss never reads the error bars, its robustness
-        to fit noise comes from the huber delta alone.
-
-        include_anchors adds the ANCHOR_SIGNALS terms pulling the sciml
-        submodule predictions (the power balance's Wtot plus its own p_oh and
-        p_rad submodules) toward the measured signals, weighted by the
-        anchor_weight_* loss_config keys. Training loss only: validation stays
-        pure profile error so the sweep metric is comparable across model
-        types. The terms drop out at trace time for model types whose
-        target_vars do not carry the measured signals (transformer, torax-*).
-
-        Anchor errors are plain absolute error, not huber.
-        huber_delta is swept on the peak-normalized profile residuals and is
-        meaningless for the MJ / MW scale anchor signals,
-        and the anchors are not worth a second delta hyperparameter
+        The anchor terms pull the sciml submodule predictions (the power balance Wtot and its own p_oh / p_rad)
+        toward the measured signals, weighted by the anchor_weight_* loss_config keys.
+        They are training only, measured at every timeslice so exempt from the freshness mask,
+        plain absolute error (huber_delta is sized for the profile residuals, not MJ / MW signals),
+        and drop out at trace time for model types whose target_vars lack the signals (transformer, torax-*).
         """
-        if "device_weights" not in loss_config:
-            device_weights = dict.fromkeys(config.dataset_paths, 1.0)
+        device_weights = loss_config.get("device_weights", {})
+        if use_chi:
+            sigma_floors = loss_config["chi_sigma_floors"]
+            divergence_penalty = loss_config["divergence_penalty_val"]
+            anchor_weights = {}
         else:
-            device_weights = loss_config["device_weights"]
-
-        anchor_weights = {}
-        if include_anchors:
-            for signal, (_, weight_key) in ANCHOR_SIGNALS.items():
-                anchor_weights[signal] = loss_config.get(weight_key, 0.0)
-
-        if use_huber:
             huber_delta = loss_config["huber_delta"]
-
-            def value_err(residual):
-                return optax.huber_loss(residual, delta=huber_delta)
-
-            def _residual(pred, targ, sigma):
-                # Training residual: plain distance to the GP fit mean, the
-                # error bars do not soften it
-                return jnp.abs(pred - targ)
-        else:
-
-            def value_err(residual):
-                return residual
-
-            # Down-weighting of the residual inside the measurement error bar,
-            # read strictly (see ProfilePredictorTRB)
-            within_error_weight = loss_config["within_error_weight"]
-
-            def _residual(pred, targ, sigma):
-                # Piecewise-linear shrink of the residual, same as the profile
-                # study validation loss: full weight on the part beyond the
-                # error bar, within_error_weight on the part inside it. sigma
-                # is clamped at 0 so a degenerate negative error bar cannot
-                # inflate the residual
-                abs_residual = jnp.abs(pred - targ)
-                sigma = jnp.maximum(sigma, 0.0)
-                outside = jnp.maximum(abs_residual - sigma, 0.0)
-                inside = jnp.minimum(abs_residual, sigma)
-                return outside + within_error_weight * inside
-
-        def _sigma_from_targ(targ, var, scale):
-            # Error-bar target var, normalized like the profiles. An absent
-            # var behaves like the 0 sentinel (zero-width error bar)
-            if var in targ:
-                return targ[var].data / scale
-            return 0.0
+            divergence_penalty = loss_config["divergence_penalty"]
+            anchor_weights = {signal: loss_config[weight_key] for signal, (_, weight_key) in ANCHOR_SIGNALS.items()}
 
         def loss_fn(pred, targ):
             ne_targ = targ["n_e_1e20"].data
             te_targ = targ["t_e_keV"].data
+            ds_source_idx = targ["ds_source_idx"].data
+            sample_weights = per_sample_device_values(ds_source_idx, device_weights, 1.0)
 
-            floor = ProfilePredictorTRB.PROFILE_SCALE_FLOOR
-            ne_scale = jnp.maximum(jnp.max(jnp.abs(ne_targ), axis=-1, keepdims=True), floor)
-            te_scale = jnp.maximum(jnp.max(jnp.abs(te_targ), axis=-1, keepdims=True), floor)
-
-            ne_sigma = _sigma_from_targ(targ, "n_e_1e20_error", ne_scale)
-            te_sigma = _sigma_from_targ(targ, "t_e_keV_error", te_scale)
-
-            # A diverged rollout is a failure of the model, not a missing
-            # measurement, so it is charged instead of being allowed through as
-            # NaN. Sanitize BEFORE the arithmetic: a single jnp.where after the
-            # fact still drags NaN through the backward pass, because reverse
-            # mode differentiates the discarded branch too. Replacing the bad
-            # values with the target makes the residual exactly 0 there, so the
-            # only thing those timeslices contribute is the explicit penalty
-            # term below.
+            # A diverged rollout is a failure of the model, not a missing measurement,
+            # so it is charged by the divergence penalty below instead of passing through as NaN.
+            # The non-finite values are replaced by the target BEFORE the arithmetic,
+            # because reverse mode also differentiates the discarded branch of a later jnp.where
             ne_finite = jnp.isfinite(pred.ne)
             te_finite = jnp.isfinite(pred.te)
             ne_pred = jnp.where(ne_finite, pred.ne, ne_targ)
             te_pred = jnp.where(te_finite, pred.te, te_targ)
-            # Per-timeslice divergence flag (any bad point on either channel)
             diverged = ~(jnp.all(ne_finite, axis=-1) & jnp.all(te_finite, axis=-1))
 
-            ne_err = value_err(_residual(ne_pred / ne_scale, ne_targ / ne_scale, ne_sigma))
-            te_err = value_err(_residual(te_pred / te_scale, te_targ / te_scale, te_sigma))
-
-            # Build per-sample weights from device labels
-            ds_source_idx = targ["ds_source_idx"].data
-            sample_weights = jnp.ones(ds_source_idx.shape, dtype=ne_err.dtype)
-            for device, weight in device_weights.items():
-                sample_weights = jnp.where(
-                    ds_source_idx == config.ds_source_to_idx[device],
-                    weight,
-                    sample_weights,
-                )
-
-            # Freshness mask: only timeslices with a fresh profile measurement
-            # contribute to the profile terms, forward-filled slices are zeroed
+            # Only timeslices with a fresh profile measurement count for the profile terms
             profile_weights = sample_weights * targ["fresh_profile"].data
-            # Broadcast across the rho axis
-            while profile_weights.ndim < ne_err.ndim:
-                profile_weights = profile_weights[..., None]
+            if use_chi:
+                chi_ne = chi_value(
+                    ne_pred,
+                    ne_targ,
+                    targ["n_e_1e20_error"].data,
+                    per_sample_sigma_floor(ds_source_idx, sigma_floors, "n_e_1e20_error"),
+                    pred.rho,
+                )
+                chi_te = chi_value(
+                    te_pred,
+                    te_targ,
+                    targ["t_e_keV_error"].data,
+                    per_sample_sigma_floor(ds_source_idx, sigma_floors, "t_e_keV_error"),
+                    pred.rho,
+                )
+                loss = jnp.mean(profile_weights * (chi_ne + chi_te))
+            else:
+                ne_scale = peak_scale(ne_targ)
+                te_scale = peak_scale(te_targ)
+                ne_err = optax.huber_loss(ne_pred / ne_scale - ne_targ / ne_scale, delta=huber_delta)
+                te_err = optax.huber_loss(te_pred / te_scale - te_targ / te_scale, delta=huber_delta)
+                loss = 0.5 * (jnp.mean(profile_weights[..., None] * ne_err) + jnp.mean(profile_weights[..., None] * te_err))
 
-            loss = 0.5 * (jnp.mean(profile_weights * ne_err) + jnp.mean(profile_weights * te_err))
-
-            # Anchor terms are scalar signals measured at every timeslice, so
-            # they take the unbroadcast per-sample weights without the
-            # freshness mask (freshness only applies to the profiles)
             for signal, anchor_weight in anchor_weights.items():
                 if anchor_weight <= 0.0 or signal not in targ:
                     continue
-                pred_attr = ANCHOR_SIGNALS[signal][0]
-                anchor_pred = getattr(pred, pred_attr)
+                anchor_pred = getattr(pred, ANCHOR_SIGNALS[signal][0])
                 anchor_finite = jnp.isfinite(anchor_pred)
                 anchor_targ = targ[signal].data
                 # Same sanitize-then-charge treatment as the profiles
@@ -335,37 +270,24 @@ class TransportPredictorTRB(TrainRunBuilder):
                 loss = loss + anchor_weight * jnp.mean(sample_weights * anchor_errors)
                 diverged = diverged | ~anchor_finite
 
-            # Divergence penalty, deliberately OUTSIDE the freshness mask:
-            # a rollout that went non-finite is broken whether or not those
-            # timeslices happened to carry a fresh profile measurement, and
-            # masking it would let a fully diverged run score as though the
-            # stale slices simply did not count.
-            #
-            # Applied to BOTH the training and validation loss (one builder),
-            # which is the point: previously a diverged trial paid nothing.
-            # popsim's own guard only counts SKIPPED steps, so steps recovered
-            # by NaN-masking left train/nan_skip_fraction at 0, and the sweep
-            # metric val/loss.mean never saw the divergence at all - so the
-            # bayes sweep was free to walk into the divergent high-lr corner
-            # TODO(ZanderKeith): This deserves a revisit
-            divergence_penalty = loss_config["divergence_penalty"]
-            loss = loss + divergence_penalty * jnp.mean(sample_weights * diverged.astype(loss.dtype))
-
-            return loss
+            # The divergence penalty is deliberately outside the freshness mask:
+            # a rollout that went non-finite is broken whether or not those slices carry a fresh measurement.
+            # It applies to validation too, so a diverged trial cannot win the sweep
+            return loss + divergence_penalty * jnp.mean(sample_weights * diverged.astype(loss.dtype))
 
         return IntegralLoss(loss_fn)
 
     @staticmethod
     def get_loss_fn(loss_config: dict) -> Callable[[Any, Any], jnp.ndarray]:
-        return TransportPredictorTRB._make_profile_loss_fn(loss_config, use_huber=True, include_anchors=True)
+        return TransportPredictorTRB._make_profile_loss_fn(loss_config, use_chi=False)
 
     @staticmethod
     def get_val_loss_fn(loss_config: dict) -> Callable[[Any, Any], jnp.ndarray]:
-        return TransportPredictorTRB._make_profile_loss_fn(loss_config, use_huber=False)
+        return TransportPredictorTRB._make_profile_loss_fn(loss_config, use_chi=True)
 
     @staticmethod
     def get_val_eval_suite(suite_config) -> EvaluationSuite | None:
-        """Validation suite computing the delta-free loss (sweep metric val/loss.mean)."""
+        """Validation suite computing the chi loss (sweep metric val/loss.mean)."""
         if suite_config is None:
             return None
         return make_loss_eval_suite(TransportPredictorTRB.get_val_loss_fn(suite_config["loss_config"]))

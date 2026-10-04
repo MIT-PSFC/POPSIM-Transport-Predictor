@@ -69,10 +69,10 @@ TRANSPORT_INPUT_VARS = [
 # Predicted profile channels (the loss and test eval compare against these)
 TRANSPORT_PROFILE_TARGETS = ["n_e_1e20", "t_e_keV"]
 
-# Everything the transport loss reads from the target side: the profiles,
-# their error-bar companions (softening the validation loss residual), the
-# freshness flag masking both losses to timeslices with a fresh profile
-# measurement, and the device label for per-device weighting
+# Everything the transport loss reads from the target side:
+# the profiles, their error bars (the chi validation loss divides by them),
+# the freshness flag masking both losses to timeslices with a fresh profile measurement,
+# and the device label for per-device weighting
 TRANSPORT_TARGET_VARS = [
     *TRANSPORT_PROFILE_TARGETS,
     "n_e_1e20_error",
@@ -125,6 +125,7 @@ class TransportStudy(Study):
         "torax_state_options",
         "num_target_shots_options",
     )
+    CHI_VALIDATION_LOSS = True
     TUNED_DATALOADER_KEYS = ("segment_length_train", "segment_overlap_train", "batch_size")
     # huber_delta_grad only matters for the profile submodule cases (their
     # sweep tunes it); .get-fallback merge keeps it harmless everywhere else
@@ -439,28 +440,21 @@ class TransportStudy(Study):
 
     def _base_loss_config(self) -> dict:
         return {
-            # The loss runs on peak-normalized profiles (target scaled to max
-            # 1), so the delta reads as a fractional error. Fallback for cases
-            # run without a tuned config; validation loss is delta-free
+            # The training loss runs on peak-normalized profiles (target scaled to max 1),
+            # so the delta reads as a fractional error. Fallback for cases run without a tuned config.
+            # The chi validation loss reads no delta
             "huber_delta": 0.1,
             # Only read by the profile submodule cases (ProfilePredictorTRB),
-            # matching the profile study's loss configuration; the transport
-            # and power balance losses ignore these keys
+            # matching the profile study's loss configuration
             "gradient_weight": 0.1,
             "huber_delta_grad": 1.0,
-            # Down-weighting of the residual inside the GP-fit error bars,
-            # validation loss only. Read by both the transport loss and the
-            # profile submodule cases
-            "within_error_weight": 0.01,
-            # Charged per diverged (non-finite) timeslice, in BOTH the training
-            # and validation loss. Typical converged losses here are ~5e-3, so
-            # at 10.0 even one diverged timeslice in a thousand adds ~1e-2 and
-            # dominates the metric - a diverged trial can no longer win the
-            # sweep, which it previously could (see TransportPredictorTRB).
-            # Sized to be unambiguous rather than finely tuned; lower it only
-            # with a reason, since the whole point is that it swamps ordinary
-            # loss differences
+            # Charged per diverged (non-finite) timeslice, sized to swamp ordinary loss differences
+            # so a diverged trial cannot win the sweep.
+            # One per loss scale: converged peak-normalized training losses are ~5e-3,
+            # while chi averaged over the mostly stale timeslices is ~0.1-1.
+            # At these values one diverged timeslice in a thousand adds ~1e-2 to training and ~10 to validation
             "divergence_penalty": 10.0,
+            "divergence_penalty_val": 1e4,
             # Anchor terms keeping the sciml submodule predictions close to
             # the measured signals while the whole module trains on the
             # profiles: the power balance's Wtot plus its own p_oh/p_rad
