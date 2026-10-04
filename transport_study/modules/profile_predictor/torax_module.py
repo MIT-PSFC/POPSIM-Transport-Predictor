@@ -752,19 +752,8 @@ class ProfilePredictorTorax(TimeIndepModule):
 
     def _coerce_inputs(self, inputs: Inputs | xr.Dataset) -> Inputs:
         if isinstance(inputs, xr.Dataset):
-            inputs = Inputs(
-                ip_MA=inputs["ip_MA"].data,
-                b_geo=inputs["b_geo"].data,
-                beta_tor_norm=inputs["beta_tor_norm"].data,
-                n_e_line_average_1e20=inputs["n_e_line_average_1e20"].data,
-                geometric_axis_r=inputs["geometric_axis_r"].data,
-                minor_radius=inputs["minor_radius"].data,
-                elongation=inputs["elongation"].data,
-                triangularity_upper=inputs["triangularity_upper"].data,
-                triangularity_lower=inputs["triangularity_lower"].data,
-                ds_source_idx=inputs["ds_source_idx"].data,
-                rho=jnp.array(self.rhogrid),
-            )
+            rho = jnp.array(self.rhogrid)
+            inputs = Inputs.from_dataset(inputs, rho)
         return inputs
 
     def transport_coefficients(self, nn_transport_out: jax.Array) -> dict:

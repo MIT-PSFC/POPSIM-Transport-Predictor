@@ -88,6 +88,8 @@ REQUIRED_SIGNALS_POWER_BALANCE = [
     "minor_radius",  # For inverse aspect ratio
     "n_e_line_average_1e20",
     "power_additional_MW",
+    # Extra
+    "b0",  # Visualization-only beta_tor of normalize_domain, normalized with b0 at r0 as IMAS does
 ]
 
 
@@ -111,6 +113,7 @@ REQUIRED_SIGNALS_PROFILE_TRANSFER = [
     "fresh_profile",  # Needed so we only train on time points where the profile data is fresh, avoiding forward-filled.
     # Inputs
     "ip_MA",
+    "b0",
     "b_geo",
     "beta_tor_norm",
     "n_e_line_average_1e20",
@@ -135,6 +138,7 @@ REQUIRED_SIGNALS_TRANSPORT_TRANSFER = [
     "fresh_profile",  # Kept as data (not a filter) so downstream losses or metrics can mask stale forward-filled profiles
     # Inputs
     "ip_MA",
+    "b0",
     "b_geo",
     "n_e_line_average_1e20",
     "geometric_axis_r",
@@ -569,7 +573,7 @@ def normalize_domain(
         # a model input, so it is a visualization-only extra
         epsilon = ds["minor_radius"] / ds["geometric_axis_r"]
         avg_pressure = (2.0 / 3.0) * (ds["energy_mhd_MJ"] * 1e6) / calc_plasma_volume(ds["geometric_axis_r"], epsilon, ds["elongation"])
-        ds["beta"] = 100 * avg_pressure / ((ds["b_geo"] ** 2) / (2 * mu_0))
+        ds["beta"] = 100 * avg_pressure / ((ds["b0"] ** 2) / (2 * mu_0))
 
     if method == "raw":
         return ds_source, ds_target

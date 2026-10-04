@@ -69,6 +69,7 @@ def _batch_inputs() -> Inputs:
     n_batch = 2
     return Inputs(
         ip_MA=jnp.array([1.0, 0.8]),
+        b0=jnp.full(n_batch, 5.56),
         b_geo=jnp.full(n_batch, 5.4),
         beta_tor_norm=jnp.array([1.2, 0.9]),
         n_e_line_average_1e20=jnp.array([1.5, 1.2]),

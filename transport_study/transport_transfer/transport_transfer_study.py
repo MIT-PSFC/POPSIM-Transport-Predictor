@@ -51,6 +51,7 @@ from transport_study.transport_transfer.tables import write_comparison_tables
 # deliberately no beta_tor_norm: beta quantities come from the evolving state Wtot
 TRANSPORT_INPUT_VARS = [
     "ip_MA",
+    "b0",
     "b_geo",
     "n_e_line_average_1e20",
     "geometric_axis_r",

@@ -47,8 +47,9 @@ def convert_to_working_units(ds: xr.Dataset) -> xr.Dataset:
     Converts whichever WORKING_UNIT_CONVERSIONS signals are present,
     so a store whose radial dim was dropped converts too.
     Adds b_geo when b0 is there, the vacuum toroidal field at the geometric axis,
-    where TORAX, q_star, beta_N (as every store holds it) and the confinement scalings quote it.
+    where TORAX, q_star, aB0 and the confinement scalings quote it.
     The vacuum field falls off as 1/R, so b_geo = b0 r0 / geometric_axis_r.
+    beta_tor_norm keeps the IMAS normalization with b0 at r0, so the betan inversions use b0.
     Adds power_additional_MW when the heating powers are there, which needs all four of them.
 
     Raises:

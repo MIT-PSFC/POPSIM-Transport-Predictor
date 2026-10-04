@@ -71,6 +71,7 @@ TRANSPORT_NN_INPUT_NAMES = (*NN_INPUT_NAMES, "paux_norm")
 # beta-derived slots come from the stored energy)
 TRANSPORT_NN_INPUT_SOURCE_VARS = (
     "ip_MA",
+    "b0",
     "b_geo",
     "n_e_line_average_1e20",
     "geometric_axis_r",
@@ -107,6 +108,7 @@ class Inputs:
     """
 
     ip_MA: float  # Plasma current [MA]
+    b0: float  # Vacuum toroidal field at r0, the one IMAS normalizes beta_tor_norm with [T]
     b_geo: float  # Vacuum toroidal field at the geometric axis [T]
     n_e_line_average_1e20: float  # Line-averaged electron density [10^20 m^-3]
     geometric_axis_r: float  # Geometric major radius [m]
@@ -150,13 +152,13 @@ class Inputs:
         )
 
     def beta_from_energy_mhd(self, energy_mhd_MJ: ArrayLike) -> ArrayLike:
-        # Inverse of W = (3/2) * beta * B_geo^2 / (2 mu_0) * V / 1e6
+        # Inverse of W = (3/2) * beta_tor * b0^2 / (2 mu_0) * V / 1e6, beta_tor as IMAS defines it with b0 at r0
         pressure_Pa = energy_mhd_MJ * 1e6 / (1.5 * self.volume_approx)
-        return 2.0 * mu_0 * pressure_Pa / self.b_geo**2
+        return 2.0 * mu_0 * pressure_Pa / self.b0**2
 
     def beta_tor_norm_from_energy_mhd(self, energy_mhd_MJ: ArrayLike) -> ArrayLike:
-        # beta_tor_norm follows the percent Troyon convention (beta[%] * a*B_geo/Ip)
-        return self.beta_from_energy_mhd(energy_mhd_MJ) * 100.0 * self.minor_radius * self.b_geo / self.ip_MA
+        # beta_tor_norm follows the IMAS percent convention (beta[%] * a*b0/Ip) with b0 at r0
+        return self.beta_from_energy_mhd(energy_mhd_MJ) * 100.0 * self.minor_radius * self.b0 / self.ip_MA
 
     def te_approx_from_energy_mhd(self, energy_mhd_MJ: ArrayLike) -> ArrayLike:
         # Single-fluid pressure p = ne * Te, so Te = p / ne
@@ -232,6 +234,7 @@ class Inputs:
         measured input here, callers derive it from the state Wtot."""
         return profile_predictor_module.Inputs(
             ip_MA=self.ip_MA,
+            b0=self.b0,
             b_geo=self.b_geo,
             beta_tor_norm=beta_tor_norm,
             n_e_line_average_1e20=self.n_e_line_average_1e20,
@@ -260,6 +263,7 @@ def transport_nn_input_matrix(ds: xr.Dataset) -> np.ndarray:
 
     inputs = Inputs(
         ip_MA=col("ip_MA"),
+        b0=col("b0"),
         b_geo=col("b_geo"),
         n_e_line_average_1e20=col("n_e_line_average_1e20"),
         geometric_axis_r=col("geometric_axis_r"),
@@ -1052,6 +1056,7 @@ class TransportPredictorEnv(ModuleTrainingEnv):
             inputs = {var: inputs[var].data for var in inputs.data_vars}
         return Inputs(
             ip_MA=inputs["ip_MA"],
+            b0=inputs["b0"],
             b_geo=inputs["b_geo"],
             n_e_line_average_1e20=inputs["n_e_line_average_1e20"],
             geometric_axis_r=inputs["geometric_axis_r"],

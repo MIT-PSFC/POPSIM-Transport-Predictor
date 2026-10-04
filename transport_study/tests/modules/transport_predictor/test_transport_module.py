@@ -81,6 +81,7 @@ TE0[-3:] = 0.0
 
 INPUT_SCALARS = {
     "ip_MA": 1.0,
+    "b0": 5.56,
     "b_geo": 5.4,
     "n_e_line_average_1e20": 1.5,
     "geometric_axis_r": 0.68,
@@ -639,6 +640,7 @@ def test_normalizer_fit_features():
 
     source_vars = (
         "ip_MA",
+        "b0",
         "b_geo",
         "n_e_line_average_1e20",
         "geometric_axis_r",
