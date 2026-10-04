@@ -233,11 +233,9 @@ class TransportStudy(Study):
             ("geom_", "geometry_builder", "circular"),
             ("tstate_", "torax_state", "rebuild"),
         )
-        # geometry_builder and torax_state are deliberately NOT hyperparam
-        # fields (like model_type): they stay untouched by
-        # _hyperparam_field_values, so miller / carry cases get their own
-        # hyperparameter sweep and tuned config instead of inheriting the
-        # circular / rebuild tuned hyperparameters
+        # geometry_builder and torax_state are deliberately NOT hyperparam fields (like model_type):
+        # miller and carry cases get their own hyperparameter sweep and tuned config
+        # instead of inheriting the circular and rebuild ones.
         HYPERPARAM_FIELDS = ("domain_adaptation", "freeze_submodules", "num_target_shots")
 
         # The dataclass decorator would null an inherited __hash__
@@ -256,16 +254,16 @@ class TransportStudy(Study):
             self.freeze_submodules = freeze_submodules
             self.geometry_builder = geometry_builder
             self.torax_state = torax_state
-            self._init_common(model_type, training_data, domain_adaptation, num_target_shots)
+            self.init_common(model_type, training_data, domain_adaptation, num_target_shots)
 
-        def _normalization_method(self) -> str | None:
+        def normalization_method(self) -> str | None:
             # Study-wide settings, not case axes
             if self.model_type in POWER_BALANCE_SUBMODULE_TYPES:
                 return config.power_balance_data_normalization
             return config.data_normalization
 
-        def _validate(self):
-            super()._validate()
+        def validate(self):
+            super().validate()
             if self.geometry_builder not in VALID_GEOMETRY_BUILDERS:
                 raise ValueError(f"Unknown geometry builder: {self.geometry_builder}")
             if self.torax_state not in VALID_TORAX_STATES:
@@ -280,7 +278,7 @@ class TransportStudy(Study):
                     f"freeze_submodules should be a dummy value ({config.hyperparam_freeze_submodules}) for submodule {self.model_type}"
                 )
 
-        def _model_type_prereqs(self) -> list[Study.Case]:
+        def model_type_prereqs(self) -> list[Study.Case]:
             # sciml restores a pre-trained power balance and profile predictor;
             # the power balance itself restores pre-trained p_oh/p_rad
             if self.model_type == "sciml":
@@ -325,7 +323,7 @@ class TransportStudy(Study):
             case_geometry, case_torax_state = geometry_builder, torax_state
             if not model_type.startswith("torax-"):
                 # geometry_builder and torax_state only apply to torax model
-                # types, and Case._validate pins non-torax cases to the
+                # types, and Case.validate pins non-torax cases to the
                 # "circular" / "rebuild" values. Emit each non-torax case once,
                 # on the first value of each axis, rather than on the pinned
                 # value: a study running only torax-carry (or only miller)
@@ -352,7 +350,7 @@ class TransportStudy(Study):
     # EXECUTION #
     #############
 
-    def _base_dataloader_config(self, case: Case) -> dict:
+    def base_dataloader_config(self, case: Case) -> dict:
         return {
             "training_data": case.training_data,
             "domain_adaptation": case.domain_adaptation,
@@ -363,7 +361,7 @@ class TransportStudy(Study):
             "segment_overlap_train": 50,
             # Below the power balance study's 4096: every torax sample runs a
             # 100-step differentiated TORAX rollout under vmap (with
-            # jax.checkpoint remat, see _advance_one_step). Memory and time
+            # jax.checkpoint remat, see TransportPredictorToraxBase). Memory and time
             # scale linearly with batch and segment_length_train, so measure
             # before changing this.
             # Measured 2026-07-26 (A100-80GB, gyrobohm, real cmod dataloader):
@@ -380,7 +378,7 @@ class TransportStudy(Study):
             "segment_overlap_val": 0,
         }
 
-    def _base_loss_config(self) -> dict:
+    def base_loss_config(self) -> dict:
         return {
             # The training loss runs on peak-normalized profiles (target scaled to max 1),
             # so the delta reads as a fractional error. Fallback for cases run without a tuned config.
@@ -409,9 +407,9 @@ class TransportStudy(Study):
             "anchor_weight_power_radiated": 0.1,
         }
 
-    def _base_optimizer_config(self) -> dict:
+    def base_optimizer_config(self) -> dict:
         return {
-            **super()._base_optimizer_config(),
+            **super().base_optimizer_config(),
             # Cap on global L2 gradient norm per update, guards against rare
             # gradient spikes from the differentiated TORAX solve NaN-ing a run
             "grad_clip_max_norm": 1.0,
@@ -446,7 +444,7 @@ class TransportStudy(Study):
             **dataloader_config_base,
         }
 
-    def _model_train_spec(self, case: Case, dataloader_config_base: dict) -> ModelTrainSpec:
+    def model_train_spec(self, case: Case, dataloader_config_base: dict) -> ModelTrainSpec:
         trb = "transport_study.modules.transport_predictor.trb.TransportPredictorTRB"
         pb_trb = "transport_study.modules.power_balance.trb.PowerBalanceTRB"
         if case.model_type in ("p_oh", "p_rad"):
@@ -603,7 +601,7 @@ class TransportStudy(Study):
         else:
             raise ValueError(f"Unknown model type: {case.model_type}")
 
-    def _tuned_model_init_updates(self, case: Case, tuned_config: TrainConfig) -> dict:
+    def tuned_model_init_updates(self, case: Case, tuned_config: TrainConfig) -> dict:
         # sciml has no NN of its own (its submodules carry their own tuned configs)
         updates = {}
         if case.model_type != "sciml":
@@ -623,7 +621,7 @@ class TransportStudy(Study):
     ##############
 
     # Coords describing which case a record belongs to
-    _CASE_COORD_NAMES = (
+    CASE_COORD_NAMES = (
         "case_idx",
         "model_type",
         "training_data",
@@ -638,7 +636,7 @@ class TransportStudy(Study):
     # ANALYSIS #
     ############
 
-    def _run_analysis(self, enable_parallelism: bool) -> None:
+    def run_analysis(self, enable_parallelism: bool) -> None:
         run_summary_analysis(self, enable_parallelism, LAYOUT, COMPARISON_FAMILIES, TABLE_SPEC)
 
 

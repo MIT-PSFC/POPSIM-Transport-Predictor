@@ -169,21 +169,20 @@ class ProfileStudy(Study):
             ("geom_", "geometry_builder"),
         )
         # geometry_builder is deliberately NOT a hyperparam field (like model_type):
-        # it stays untouched by _hyperparam_field_values, so miller cases get their
-        # own hyperparameter sweep and tuned config (keyed by their own geom_miller
-        # case string) instead of inheriting circular's tuned hyperparameters.
-        # data_normalization IS one (like power balance): every method inherits
-        # the tuned config from the hyperparam_data_normalization sweep
+        # miller cases get their own hyperparameter sweep and tuned config,
+        # keyed by their own geom_miller case string, instead of inheriting circular's.
+        # data_normalization IS one (like power balance):
+        # every method inherits the tuned config from the hyperparam_data_normalization sweep.
         HYPERPARAM_FIELDS = ("data_normalization", "domain_adaptation", "freeze_shapes", "num_target_shots")
 
         # The dataclass decorator would null an inherited __hash__
         __hash__ = Study.Case.__hash__
 
-        def _normalization_method(self) -> str | None:
+        def normalization_method(self) -> str | None:
             return self.data_normalization
 
-        def _validate(self):
-            super()._validate()
+        def validate(self):
+            super().validate()
             if self.data_normalization not in FEATURE_NORMALIZATIONS:
                 raise ValueError(f"Unknown data normalization method: {self.data_normalization}")
 
@@ -200,7 +199,7 @@ class ProfileStudy(Study):
             self.data_normalization = data_normalization
             self.freeze_shapes = freeze_shapes
             self.geometry_builder = geometry_builder
-            self._init_common(model_type, training_data, domain_adaptation, num_target_shots)
+            self.init_common(model_type, training_data, domain_adaptation, num_target_shots)
 
     def make_cases(self):
         cases = []
@@ -257,7 +256,7 @@ class ProfileStudy(Study):
     # EXECUTION #
     #############
 
-    def _base_dataloader_config(self, case: Case) -> dict:
+    def base_dataloader_config(self, case: Case) -> dict:
         return {
             # Profiles plus their gradient and error-bar companions, the chi validation loss divides by the error bars
             "target_vars": [*PROFILE_TARGET_VARS, "ds_source_idx"],
@@ -272,7 +271,7 @@ class ProfileStudy(Study):
             "batch_size": 2048,
         }
 
-    def _base_loss_config(self) -> dict:
+    def base_loss_config(self) -> dict:
         return {
             # The training loss runs on peak-normalized profiles (target scaled to max 1),
             # so both deltas read as fractional errors.
@@ -286,15 +285,15 @@ class ProfileStudy(Study):
             "huber_delta_grad": 1.0,
         }
 
-    def _base_optimizer_config(self) -> dict:
+    def base_optimizer_config(self) -> dict:
         return {
-            **super()._base_optimizer_config(),
+            **super().base_optimizer_config(),
             # Cap on global L2 gradient norm per update, guards against rare
             # gradient spikes from the differentiated TORAX solve NaN-ing a run
             "grad_clip_max_norm": 1.0,
         }
 
-    def _model_train_spec(self, case: Case, dataloader_config_base: dict) -> ModelTrainSpec:
+    def model_train_spec(self, case: Case, dataloader_config_base: dict) -> ModelTrainSpec:
         trb = "transport_study.modules.profile_predictor.trb.ProfilePredictorTRB"
         if case.model_type in MODEL_TYPES_WITH_SHAPES:
             return ModelTrainSpec(
@@ -375,7 +374,7 @@ class ProfileStudy(Study):
         else:
             raise ValueError(f"Unknown model type: {case.model_type}")
 
-    def _tuned_model_init_updates(self, case: Case, tuned_config: TrainConfig) -> dict:
+    def tuned_model_init_updates(self, case: Case, tuned_config: TrainConfig) -> dict:
         # The reservoir has no MLP depth/width, everything else sweeps them
         updates = {}
         if case.model_type != "reservoir":
@@ -401,7 +400,7 @@ class ProfileStudy(Study):
     ##############
 
     # Coords describing which case a record belongs to (broadcast over every shot of that case).
-    _CASE_COORD_NAMES = (
+    CASE_COORD_NAMES = (
         "case_idx",
         "model_type",
         "training_data",
@@ -489,7 +488,7 @@ class ProfileStudy(Study):
         if not records:
             return xr.Dataset()
 
-        coord_names = [*self._CASE_COORD_NAMES, "shot", "ds_source"]
+        coord_names = [*self.CASE_COORD_NAMES, "shot", "ds_source"]
         data_vars = {name: ("record", np.array([r[name] for r in records])) for name in data_var_names}
         coords = {name: ("record", np.array([r[name] for r in records])) for name in coord_names}
         return xr.Dataset(data_vars=data_vars, coords=coords)
@@ -498,7 +497,7 @@ class ProfileStudy(Study):
     # ANALYSIS #
     ############
 
-    def _run_analysis(self, enable_parallelism: bool) -> None:
+    def run_analysis(self, enable_parallelism: bool) -> None:
         # The per-case stage metrics and reports fan out over SLURM with parallelism,
         # the serial paths after it skip the completed cases
         if enable_parallelism:

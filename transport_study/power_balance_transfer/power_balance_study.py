@@ -156,13 +156,13 @@ class PowerBalanceStudy(Study):
         ):
             self.data_normalization = data_normalization
             self.freeze_submodules = freeze_submodules
-            self._init_common(model_type, training_data, domain_adaptation, num_target_shots)
+            self.init_common(model_type, training_data, domain_adaptation, num_target_shots)
 
-        def _normalization_method(self) -> str | None:
+        def normalization_method(self) -> str | None:
             return self.data_normalization
 
-        def _validate(self):
-            super()._validate()
+        def validate(self):
+            super().validate()
             if self.data_normalization not in INPUT_NORMALIZATIONS:
                 raise ValueError(f"Unknown data normalization method: {self.data_normalization}")
             if self.model_type in SUBMODULE_MODEL_TYPES and self.freeze_submodules != config.hyperparam_freeze_submodules:
@@ -170,7 +170,7 @@ class PowerBalanceStudy(Study):
                     f"freeze_submodules should be a dummy value ({config.hyperparam_freeze_submodules}) for submodule {self.model_type}"
                 )
 
-        def _model_type_prereqs(self) -> list[Study.Case]:
+        def model_type_prereqs(self) -> list[Study.Case]:
             # The structured models restore pre-trained p_oh/p_rad submodules
             if self.model_type not in MODEL_TYPES_WITH_SUBMODULES:
                 return []
@@ -223,7 +223,7 @@ class PowerBalanceStudy(Study):
     # EXECUTION #
     #############
 
-    def _base_dataloader_config(self, case: Case) -> dict:
+    def base_dataloader_config(self, case: Case) -> dict:
         return {
             "training_data": case.training_data,
             "domain_adaptation": case.domain_adaptation,
@@ -241,9 +241,9 @@ class PowerBalanceStudy(Study):
             "segment_overlap_val": 0,
         }
 
-    def _base_optimizer_config(self) -> dict:
+    def base_optimizer_config(self) -> dict:
         return {
-            **super()._base_optimizer_config(),
+            **super().base_optimizer_config(),
             # The p_oh/p_rad submodules train at a reduced rate relative to
             # the taue network so joint training does not pull them far from
             # their pretrained behavior. In transfer finetunes this stacks
@@ -255,7 +255,7 @@ class PowerBalanceStudy(Study):
             "submodule_lr_factors": {"p_oh_predictor": 0.1, "p_rad_predictor": 0.1},
         }
 
-    def _base_loss_config(self) -> dict:
+    def base_loss_config(self) -> dict:
         return {
             "huber_delta": 0.5,
             # Anchor terms keeping the p_oh/p_rad submodule predictions close
@@ -271,7 +271,7 @@ class PowerBalanceStudy(Study):
         so submodule cases get their own tuned merge and transfer wiring."""
         return self.make_train_config(case.replace(model_type=submodule_type, freeze_submodules=config.hyperparam_freeze_submodules))
 
-    def _model_train_spec(self, case: Case, dataloader_config_base: dict) -> ModelTrainSpec:
+    def model_train_spec(self, case: Case, dataloader_config_base: dict) -> ModelTrainSpec:
         trb = "transport_study.modules.power_balance.trb.PowerBalanceTRB"
         if case.model_type in SUBMODULE_MODEL_TYPES:
             submodule_settings = SCALAR_SUBMODULE_SETTINGS[case.model_type]
@@ -367,7 +367,7 @@ class PowerBalanceStudy(Study):
         else:
             raise ValueError(f"Unknown model type: {case.model_type}")
 
-    def _tuned_model_init_updates(self, case: Case, tuned_config: TrainConfig) -> dict:
+    def tuned_model_init_updates(self, case: Case, tuned_config: TrainConfig) -> dict:
         # sciml-taue-scalinglaw has no NN of its own (its submodules carry their own tuned configs)
         updates = {}
         if case.model_type in [*SUBMODULE_MODEL_TYPES, "mlp", "sciml-taue-nn", "transformer"]:
@@ -384,7 +384,7 @@ class PowerBalanceStudy(Study):
     ##############
 
     # Coords describing which case a record belongs to
-    _CASE_COORD_NAMES = (
+    CASE_COORD_NAMES = (
         "case_idx",
         "model_type",
         "training_data",
@@ -398,7 +398,7 @@ class PowerBalanceStudy(Study):
     # ANALYSIS #
     ############
 
-    def _run_analysis(self, enable_parallelism: bool) -> None:
+    def run_analysis(self, enable_parallelism: bool) -> None:
         run_summary_analysis(self, enable_parallelism, LAYOUT, COMPARISON_FAMILIES, TABLE_SPEC)
 
 

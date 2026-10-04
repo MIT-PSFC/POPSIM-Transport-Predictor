@@ -258,7 +258,7 @@ def data_train_run_builder(train_config: TrainConfig) -> type[TrainRunBuilder]:
 
 @dataclass
 class ModelTrainSpec:
-    """The per-model-type pieces of a TrainConfig, returned by Study._model_train_spec."""
+    """The per-model-type pieces of a TrainConfig, returned by Study.model_train_spec."""
 
     train_run_builder: str
     dataloader_config: dict
@@ -274,8 +274,8 @@ class Study:
 
     Subclasses define a nested Config (CaseGridConfig subclass) and Case
     (Study.Case subclass), make_cases, the make_train_config hooks
-    (_base_dataloader_config / _base_loss_config / _model_train_spec /
-    _tuned_model_init_updates), collect_results, and _run_analysis.
+    (base_dataloader_config / base_loss_config / model_train_spec /
+    tuned_model_init_updates), collect_results, and run_analysis.
     """
 
     # Stuff set by subclasses:
@@ -310,7 +310,7 @@ class Study:
         compare it to other cases. Subclasses declare their extra fields plus
         the VALID_MODEL_TYPES / STR_TOKEN_FIELDS / HYPERPARAM_FIELDS ClassVars,
         keep a thin __init__ in the class body that sets the extra fields and
-        then calls _init_common, and alias __hash__ = Study.Case.__hash__
+        then calls init_common, and alias __hash__ = Study.Case.__hash__
         (a dataclass body without its own __init__ or __hash__ would have them
         regenerated or nulled by the dataclass decorator).
         """
@@ -325,7 +325,7 @@ class Study:
         # Cases this one depends on, run first (None when independent)
         prereqs: list[Study.Case] | None
 
-        # Model types accepted by _validate
+        # Model types accepted by validate
         VALID_MODEL_TYPES: ClassVar[tuple[str, ...]] = ()
         # (prefix, field name) or (prefix, field name, suppress_value) tokens
         # between the td_ and targ_ tokens of str(case). The 3-tuple form
@@ -336,7 +336,7 @@ class Study:
         # Per-case fields with a config.hyperparam_<name> counterpart
         HYPERPARAM_FIELDS: ClassVar[tuple[str, ...]] = ()
 
-        def _init_common(self, model_type, training_data, domain_adaptation, num_target_shots):
+        def init_common(self, model_type, training_data, domain_adaptation, num_target_shots):
             """Shared between every subclass __init__: parse, validate, build prereqs."""
             if isinstance(training_data, str):
                 training_data = parse_training_data(training_data, dict(config.dataset_paths), config.target_device)
@@ -344,11 +344,11 @@ class Study:
             self.training_data = training_data
             self.domain_adaptation = domain_adaptation
             self.num_target_shots = num_target_shots
-            self._validate()
+            self.validate()
             prereqs = self._build_prereqs()
             self.prereqs = prereqs if prereqs else None
 
-        def _validate(self):
+        def validate(self):
             if self.model_type not in self.VALID_MODEL_TYPES:
                 raise ValueError(f"Unknown model type: {self.model_type}")
             if self.domain_adaptation is None:
@@ -362,16 +362,16 @@ class Study:
             prereqs = []
             if not self.is_hyperparam_case():
                 prereqs.append(self.replace(**self._hyperparam_field_values()))
-            prereqs.extend(self._model_type_prereqs())
+            prereqs.extend(self.model_type_prereqs())
             if self.domain_adaptation == "transfer":
                 prereqs.append(self.transfer_pretrain_case())
             return list(dict.fromkeys(prereqs))
 
-        def _model_type_prereqs(self) -> list[Study.Case]:
+        def model_type_prereqs(self) -> list[Study.Case]:
             """Extra prereq cases implied by the model type (e.g. submodule predictors)."""
             return []
 
-        def _normalization_method(self) -> str | None:
+        def normalization_method(self) -> str | None:
             """The input normalization method this case trains with, None when the study has none."""
             return None
 
@@ -390,7 +390,7 @@ class Study:
             normalizations (raw, physics) have nothing to fit, so all their
             transfer cases share one twin at HYPERPARAM_TARGET_SHOTS.
             """
-            if self._normalization_method() in STAT_NORMALIZATIONS:
+            if self.normalization_method() in STAT_NORMALIZATIONS:
                 return self.replace(domain_adaptation="transfer_pretrain")
             return self.replace(domain_adaptation="transfer_pretrain", num_target_shots=HYPERPARAM_TARGET_SHOTS)
 
@@ -427,7 +427,7 @@ class Study:
             if (
                 self.domain_adaptation == "transfer_pretrain"
                 and self.num_target_shots == 0
-                and self._normalization_method() in STAT_NORMALIZATIONS
+                and self.normalization_method() in STAT_NORMALIZATIONS
             ):
                 return True
 
@@ -754,11 +754,11 @@ class Study:
         Builds the shared scaffold (dataloader/loss/optimizer bases, weighted
         device weights, transfer checkpoint wiring, tuned-config merge,
         transfer LR scaling) around the per-model-type pieces supplied by
-        the _model_train_spec hook.
+        the model_train_spec hook.
         """
-        dataloader_config_base = self._base_dataloader_config(case)
-        loss_config = self._base_loss_config()
-        optimizer_config = self._base_optimizer_config()
+        dataloader_config_base = self.base_dataloader_config(case)
+        loss_config = self.base_loss_config()
+        optimizer_config = self.base_optimizer_config()
         if case.domain_adaptation == "weighted":
             # Loss function reads these from loss_config as "device_weights".
             # val_eval_suite_config references the same dict, so validation
@@ -773,7 +773,7 @@ class Study:
         # Weighted / addition with no target shots runs to max_epochs, early stopping disabled
         patience = None if case.domain_adaptation in ("weighted", "addition") and case.num_target_shots == 0 else config.patience
 
-        spec = self._model_train_spec(case, dataloader_config_base)
+        spec = self.model_train_spec(case, dataloader_config_base)
         train_config_base = TrainConfig(
             project=self.wandb_project_name(case),
             train_run_builder=spec.train_run_builder,
@@ -831,12 +831,12 @@ class Study:
             update={
                 "model_init_config": {
                     **train_config.model_init_config,
-                    **self._tuned_model_init_updates(case, tuned_config),
+                    **self.tuned_model_init_updates(case, tuned_config),
                 }
             }
         )
 
-    def _base_optimizer_config(self) -> dict:
+    def base_optimizer_config(self) -> dict:
         """Fallback optimizer hyperparameters for cases run without a tuned config."""
         return {
             "lr0": 5e-4,
@@ -846,19 +846,19 @@ class Study:
             "weight_decay": 2e-4,
         }
 
-    def _base_dataloader_config(self, case: Case) -> dict:
+    def base_dataloader_config(self, case: Case) -> dict:
         """Dataloader settings shared by every model type of this study."""
         raise NotImplementedError
 
-    def _base_loss_config(self) -> dict:
+    def base_loss_config(self) -> dict:
         """Fallback loss hyperparameters for cases run without a tuned config."""
         raise NotImplementedError
 
-    def _model_train_spec(self, case: Case, dataloader_config_base: dict) -> ModelTrainSpec:
+    def model_train_spec(self, case: Case, dataloader_config_base: dict) -> ModelTrainSpec:
         """Per-model-type train_run_builder, dataloader_config, and model_init_config."""
         raise NotImplementedError
 
-    def _tuned_model_init_updates(self, case: Case, tuned_config: TrainConfig) -> dict:
+    def tuned_model_init_updates(self, case: Case, tuned_config: TrainConfig) -> dict:
         """model_init_config entries swept only for certain model types."""
         raise NotImplementedError
 
@@ -1401,12 +1401,12 @@ class Study:
         return trainer, test_dl
 
     # Coords describing which case a record belongs to, set per subclass
-    _CASE_COORD_NAMES: ClassVar[tuple[str, ...]] = ()
+    CASE_COORD_NAMES: ClassVar[tuple[str, ...]] = ()
 
     def case_coords(self, case_idx: int, case: Case) -> dict:
         """Build the per-case coordinate values for collect_results."""
         coords = {}
-        for name in self._CASE_COORD_NAMES:
+        for name in self.CASE_COORD_NAMES:
             if name == "case_idx":
                 coords[name] = case_idx
             elif name == "training_data":
@@ -1425,7 +1425,7 @@ class Study:
         transport); the profile study overrides with a per-shot long form.
 
         Dims: case_idx
-        Coords (along case_idx): the _CASE_COORD_NAMES fields of each case
+        Coords (along case_idx): the CASE_COORD_NAMES fields of each case
         Data variables (along case_idx): err_E_D_S where E is 'abs' or 'rel', D is
         'shot' (time-integrated per shot) or 'ts' (per timeslice), and S is one of
         mean, std, med, p25, p75, min, max. E.g. err_abs_shot_mean, err_rel_ts_p75.
@@ -1450,7 +1450,7 @@ class Study:
         # "override" which is incompatible with coords="different"
         return xr.concat(results, dim="case_idx", coords="different", compat="equals")
 
-    def _run_analysis(self, enable_parallelism: bool) -> None:
+    def run_analysis(self, enable_parallelism: bool) -> None:
         """Post-orchestration analysis and plotting (study-specific)."""
         raise NotImplementedError
 
@@ -1534,7 +1534,7 @@ class Study:
             ds_final = study.collect_results()
             write_netcdf_atomic(ds_final, study.collected_results_path())
 
-        study._run_analysis(enable_parallelism=bool(enable_parallelism))
+        study.run_analysis(enable_parallelism=bool(enable_parallelism))
 
     def __init__(self, cfg: str | Path | CaseGridConfig):
         """
