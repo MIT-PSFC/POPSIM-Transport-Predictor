@@ -1,5 +1,5 @@
-"""Tests for the power balance composite training loss (submodule anchor terms)
-and the grouped optimizer (reduced submodule learning rate).
+"""Tests for the power balance TRB and modules: the training loss (submodule anchor terms), the module outputs,
+and the grouped optimizer (reduced submodule learning rate, no weight decay on the scaling law).
 """
 
 from pathlib import Path
@@ -12,13 +12,14 @@ import xarray as xr
 from popsim.ml.partition import make_partition_by_members
 
 from transport_study.config import StudyConfig, load_config
-from transport_study.modules.normalization import make_normalizer
+from transport_study.modules.normalization import InputNormalizer, make_normalizer
 from transport_study.modules.power_balance.module import (
+    SCALING_LAW_FIELDS,
     PowerBalance,
+    PowerBalanceMLP,
     PowerBalanceScalingLaw,
     PowerBalanceSciML,
     PowerBalanceTransformer,
-    PowerBalanceUnstructuredNN,
     TauePredictorOutputs,
 )
 from transport_study.modules.power_balance.p_oh.module import OhmicPower
@@ -120,7 +121,7 @@ def test_anchor_weight_zero_disables_term():
 def test_anchor_terms_respect_device_weights():
     load_config(
         StudyConfig(
-            study_name="composite_loss_test",
+            study_name="pb_trb_loss_test",
             dataset_paths={"cmod": Path("unused_a.nc"), "mast": Path("unused_b.nc")},
             target_device="mast",
         )
@@ -142,7 +143,7 @@ def test_anchor_terms_respect_device_weights():
 ##################
 
 
-def _scalar_inputs() -> PowerBalance.Inputs:
+def _scalar_inputs() -> InputNormalizer.Inputs:
     return PowerBalance.Inputs(
         ip_MA=jnp.asarray(1.0),
         b_geo=jnp.asarray(5.0),
@@ -170,8 +171,8 @@ def test_structured_outputs_carry_submodule_predictions():
     inputs = _scalar_inputs()
     state = PowerBalance.State(energy_mhd_MJ=jnp.asarray(0.1))
 
-    expected_p_oh = p_oh(inputs.to_normalizer_inputs()).power_ohm_MW_pred
-    expected_p_rad = p_rad(inputs.to_normalizer_inputs()).power_radiated_MW_pred
+    expected_p_oh = p_oh(inputs).power_ohm_MW_pred
+    expected_p_rad = p_rad(inputs).power_radiated_MW_pred
 
     sciml = PowerBalanceSciML.init(
         in_size=7,
@@ -189,20 +190,29 @@ def test_structured_outputs_carry_submodule_predictions():
         assert np.isclose(float(output.power_ohm_MW_pred), float(expected_p_oh))
         assert np.isclose(float(output.power_radiated_MW_pred), float(expected_p_rad))
 
-    mlp = PowerBalanceUnstructuredNN.init(
-        in_size=7, out_size=1, nn_width=4, nn_depth=1, normalizer=make_normalizer("raw", None, 1, target_idx=0)
-    )
+    # The models fed their own Wtot take a normalizer built with_energy
+    energy_normalizer = make_normalizer("zscore", None, 1, target_idx=0, with_energy=True)
+    mlp = PowerBalanceMLP.init(nn_width=4, nn_depth=1, normalizer=energy_normalizer)
     _, output = mlp(state, inputs)
     assert np.isnan(float(output.power_ohm_MW_pred))
     assert np.isnan(float(output.power_radiated_MW_pred))
 
-    transformer = PowerBalanceTransformer.init(
-        d_model=8, num_heads=2, history_len=4, nn_width=4, nn_depth=1, normalizer=make_normalizer("raw", None, 1, target_idx=0)
-    )
+    transformer = PowerBalanceTransformer.init(d_model=8, num_heads=2, history_len=4, nn_width=4, nn_depth=1, normalizer=energy_normalizer)
     transformer_state = PowerBalanceTransformer.State(energy_mhd_MJ=jnp.asarray(0.1), history=jnp.full((4,), 0.1))
     _, output = transformer(transformer_state, inputs)
     assert np.isnan(float(output.power_ohm_MW_pred))
     assert np.isnan(float(output.power_radiated_MW_pred))
+
+
+def test_mlp_feeds_back_its_predicted_wtot():
+    """The mlp's dW/dt depends on its own state, without that feedback a rollout is an open-loop integrator."""
+    mlp = PowerBalanceMLP.init(nn_width=4, nn_depth=1, normalizer=make_normalizer("raw", None, 1, target_idx=0))
+    inputs = _scalar_inputs()
+
+    state_dot_low, _ = mlp(PowerBalance.State(energy_mhd_MJ=jnp.asarray(0.05)), inputs)
+    state_dot_high, _ = mlp(PowerBalance.State(energy_mhd_MJ=jnp.asarray(0.5)), inputs)
+
+    assert float(state_dot_low.energy_mhd_MJ) != float(state_dot_high.energy_mhd_MJ)
 
 
 #####################
@@ -222,7 +232,7 @@ class FakeModule(eqx.Module):
 
 OPTIMIZER_CONFIG = {
     "lr0": 1e-3,
-    "lrf": 1e-5,
+    "lrf_frac": 0.01,
     "transition_steps": 100,
     "decay_rate": 0.9,
     "weight_decay": 0.0,
@@ -292,10 +302,27 @@ def test_grouped_adamw_labels_transfer_partition():
     assert np.isclose(float(u_p_oh / u_taue), 0.1, atol=1e-3)
 
 
+def test_scaling_law_coefficients_skip_weight_decay():
+    """With zero gradients the AdamW step is pure weight decay, which the submodule NNs take and the scaling law does not."""
+    p_oh, p_rad = _make_submodules()
+    model = PowerBalanceScalingLaw.init(p_oh_predictor=p_oh, p_rad_predictor=p_rad)
+    trainable, _ = make_partition_by_members(lambda m: m)(model)
+    optimizer = PowerBalanceTRB.get_optimizer({**OPTIMIZER_CONFIG, "weight_decay": 0.1})
+    opt_state = optimizer.init(trainable)
+    zero_grads = jax.tree.map(jnp.zeros_like, trainable)
+
+    updates, _ = optimizer.update(zero_grads, opt_state, trainable)
+
+    for name in SCALING_LAW_FIELDS:
+        scaling_updates = getattr(updates.taue_predictor, name)
+        assert all(float(update) == 0.0 for update in scaling_updates.values())
+    assert float(jnp.abs(updates.p_oh_predictor.nn.layers[0].weight).max()) > 0.0
+
+
 def test_base_optimizer_config_carries_lr_factors(tmp_path):
     study = PowerBalanceStudy(
         PowerBalanceStudy.Config(
-            study_name="composite_optimizer_test",
+            study_name="pb_trb_optimizer_test",
             working_dir_base=tmp_path,
             dataset_paths={
                 "cmod-low1": SAMPLE_DIR / "cmod-low1.nc",
@@ -327,7 +354,7 @@ def test_transfer_config_stacks_submodule_lr_factors(tmp_path):
     # transfer cases exactly as for da=None cases
     study = PowerBalanceStudy(
         PowerBalanceStudy.Config(
-            study_name="composite_transfer_lr_test",
+            study_name="pb_trb_transfer_lr_test",
             working_dir_base=tmp_path,
             dataset_paths={
                 "cmod-low1": SAMPLE_DIR / "cmod-low1.nc",

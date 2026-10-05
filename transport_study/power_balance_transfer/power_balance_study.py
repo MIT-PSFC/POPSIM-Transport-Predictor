@@ -328,6 +328,8 @@ class PowerBalanceStudy(Study):
                     "input_vars": POWER_BALANCE_INPUT_VARS,
                     "target_vars": ["energy_mhd_MJ", "ds_source_idx"],
                     "state_vars": ["energy_mhd_MJ"],
+                    # Unused by the model, but the dataloader drops the NaN slices of every loaded variable,
+                    # so the measured powers keep the training segments identical to the structured models'
                     "extra_vars": ["power_ohm_MW", "power_radiated_MW"],
                     **dataloader_config_base,
                 },
@@ -337,8 +339,6 @@ class PowerBalanceStudy(Study):
                     "domain_adaptation": case.domain_adaptation,
                     "nn_depth": 2,
                     "nn_width": 16,
-                    "in_size": 7,  # The NORM_INPUT_VARS
-                    "out_size": 1,
                     "prng_seed": 42,
                 },
             )
@@ -349,6 +349,7 @@ class PowerBalanceStudy(Study):
                     "input_vars": POWER_BALANCE_INPUT_VARS,
                     "target_vars": ["energy_mhd_MJ", "ds_source_idx"],
                     "state_vars": ["energy_mhd_MJ"],
+                    # Same training segments as the structured models, see mlp
                     "extra_vars": ["power_ohm_MW", "power_radiated_MW"],
                     **dataloader_config_base,
                 },

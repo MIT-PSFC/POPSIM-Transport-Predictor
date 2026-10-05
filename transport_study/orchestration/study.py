@@ -724,7 +724,7 @@ class Study:
         The scale keeps lr x total_steps near lr0 x max_epochs,
         scale = max_epochs / total_steps from the measured train dataloader, clipped to [TRANSFER_LR_FLOOR, 1].
 
-        The schedule is also flattened (lrf = lr0, a constant under optax exponential_decay),
+        The schedule is also flattened (lrf_frac = 1, a constant under optax exponential_decay),
         so the whole step budget is spent at working LR.
         Best-checkpoint selection and early stopping guard against overshoot.
         A live finetune could not stop on the test set, but every compared case does the same.
@@ -744,7 +744,7 @@ class Study:
                 "optimizer_config": {
                     **train_config.optimizer_config,
                     "lr0": lr0_finetune,
-                    "lrf": lr0_finetune,
+                    "lrf_frac": 1.0,
                 }
             }
         )
@@ -841,9 +841,9 @@ class Study:
         """Fallback optimizer hyperparameters for cases run without a tuned config."""
         return {
             "lr0": 5e-4,
-            "transition_steps": 500,
-            "decay_rate": 0.5,
-            "lrf": 1e-4,
+            "transition_steps": 1661,
+            "decay_rate": 0.1,
+            "lrf_frac": 0.2,
             "weight_decay": 2e-4,
         }
 

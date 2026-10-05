@@ -139,9 +139,9 @@ def test_reservoir_training_smoke():
         },
         optimizer_config={
             "lr0": 3e-3,
-            "transition_steps": 500,
-            "decay_rate": 0.5,
-            "lrf": 5e-4,
+            "transition_steps": 1661,
+            "decay_rate": 0.1,
+            "lrf_frac": 0.17,
             "weight_decay": 2e-4,
         },
     )

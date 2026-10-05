@@ -38,9 +38,9 @@ PROFILE_PREDICTOR_SHAPE_INIT_CONFIG = {
     },
     "optimizer_config": {
         "lr0": 3e-3,
-        "transition_steps": 500,
-        "decay_rate": 0.5,
-        "lrf": 5e-4,
+        "transition_steps": 1661,
+        "decay_rate": 0.1,
+        "lrf_frac": 0.17,
         "weight_decay": 2e-4,
     },
     "trainable_getter_config": {
@@ -251,9 +251,9 @@ _PROFILE_PREDICTOR_TORAX_CONFIG_BASE: dict[str, Any] = {
     },
     "optimizer_config": {
         "lr0": 1e-3,
-        "transition_steps": 200,
-        "decay_rate": 0.5,
-        "lrf": 1e-4,
+        "transition_steps": 664,
+        "decay_rate": 0.1,
+        "lrf_frac": 0.1,
         "weight_decay": 1e-4,
     },
 }

@@ -11,12 +11,14 @@ from popsim.ml.eval import EvaluationSuite
 from transport_study.config import config
 from transport_study.modules.normalization import make_normalizer
 from transport_study.modules.power_balance.module import (
+    MODEL_TYPES_WITH_ENERGY_INPUT,
     MODEL_TYPES_WITH_SUBMODULES,
+    SCALING_LAW_FIELDS,
     PowerBalanceEnv,
+    PowerBalanceMLP,
     PowerBalanceScalingLaw,
     PowerBalanceSciML,
     PowerBalanceTransformer,
-    PowerBalanceUnstructuredNN,
 )
 from transport_study.modules.power_balance.p_oh.trb import OhmicPowerTRB
 from transport_study.modules.power_balance.p_rad.trb import RadiatedPowerTRB
@@ -36,7 +38,7 @@ STUDY_TYPE = "power_balance_transfer"
 
 # Anchor terms in the training loss of the models with p_oh / p_rad submodules, keyed by measured target signal:
 # (Output attribute holding the submodule's prediction, loss_config key of its weight).
-# They keep the submodule predictions close to what the submodules predict.
+# They keep the submodule predictions close to the measured signals.
 # Not cheating, a real application has these signals for training alongside the target Wtot
 ANCHOR_SIGNALS = {
     "power_ohm_MW": ("power_ohm_MW_pred", "anchor_weight_power_ohm"),
@@ -68,16 +70,18 @@ class PowerBalanceTRB(TrainRunBuilder):
     def _build_module(train_dl: DataLoader, model_init_config: dict) -> Any:
         """The power balance module of model_init_config["model_type"], normalizer fitted on the training data."""
         model_type = model_init_config["model_type"]
+        if model_type == "sciml-taue-scalinglaw":
+            # The scaling law consumes physical units and holds no normalizer,
+            # data_normalization reaches only its p_oh / p_rad prereq cases
+            p_oh_predictor, p_rad_predictor = _restored_submodules(train_dl, model_init_config)
+            return PowerBalanceScalingLaw.init(p_oh_predictor=p_oh_predictor, p_rad_predictor=p_rad_predictor)
         normalizer = make_normalizer(
             model_init_config["data_normalization"],
             normalizer_fit_dataset(train_dl, model_init_config),
             len(config.ds_source_to_idx),
             target_device_idx(),
+            with_energy=model_type in MODEL_TYPES_WITH_ENERGY_INPUT,
         )
-        if model_type == "sciml-taue-scalinglaw":
-            p_oh_predictor, p_rad_predictor = _restored_submodules(train_dl, model_init_config)
-            # The scaling law consumes physical units, the normalizer only reaches the submodules
-            return PowerBalanceScalingLaw.init(p_oh_predictor=p_oh_predictor, p_rad_predictor=p_rad_predictor)
         if model_type == "sciml-taue-nn":
             p_oh_predictor, p_rad_predictor = _restored_submodules(train_dl, model_init_config)
             return PowerBalanceSciML.init(
@@ -91,9 +95,7 @@ class PowerBalanceTRB(TrainRunBuilder):
                 prng_seed=model_init_config["prng_seed"],
             )
         if model_type == "mlp":
-            return PowerBalanceUnstructuredNN.init(
-                in_size=model_init_config["in_size"],
-                out_size=model_init_config["out_size"],
+            return PowerBalanceMLP.init(
                 nn_width=model_init_config["nn_width"],
                 nn_depth=model_init_config["nn_depth"],
                 normalizer=normalizer,
@@ -158,8 +160,6 @@ class PowerBalanceTRB(TrainRunBuilder):
             residual = pred.energy_mhd_MJ_pred - targ["energy_mhd_MJ"].data
             errors = optax.huber_loss(residual, delta=loss_config["huber_delta"]) if use_huber else jnp.abs(residual)
             sample_weights = per_sample_device_values(targ["ds_source_idx"].data, device_weights, 1.0)
-            while sample_weights.ndim < errors.ndim:
-                sample_weights = sample_weights[..., None]
             loss = jnp.mean(sample_weights * errors)
 
             for signal, anchor_weight in anchor_weights.items():
@@ -188,7 +188,7 @@ class PowerBalanceTRB(TrainRunBuilder):
 
     @staticmethod
     def get_optimizer(optimizer_config: dict) -> optax.GradientTransformation:
-        return make_grouped_exponential_adamw(optimizer_config)
+        return make_grouped_exponential_adamw(optimizer_config, no_decay_names=SCALING_LAW_FIELDS)
 
     @staticmethod
     def get_test_eval_suite(suite_config) -> EvaluationSuite | None:

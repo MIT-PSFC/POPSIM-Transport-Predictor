@@ -21,6 +21,10 @@ Methods:
 - physics-zscore: the physics transform followed by a per-device z-score
   fitted in the dimensionless physics feature space
 
+The power balance mlp also normalizes its own state, the stored energy, as an 8th slot
+(normalize_with_energy, a normalizer built with_energy),
+and energy_rate_scale maps its network output back to dW/dt.
+
 organize_data.normalize_domain (data visualization) is a thin wrapper around
 the fit/apply helpers in this file, so the visualized feature spaces are the
 ones the models actually consume.
@@ -54,6 +58,11 @@ NORM_INPUT_VARS = (
     "power_additional_MW",
 )
 N_FEATURES = len(NORM_INPUT_VARS)
+# The stored energy, the 8th slot of a normalizer built with_energy
+ENERGY_VAR = "energy_mhd_MJ"
+# Time unit [s] of the dW/dt output of the methods that normalize the stored energy,
+# ~tau_E on C-Mod and MAST so the network output sits near 1
+TAU_REF_S = 0.03
 
 # A feature whose within-device spread is below this fraction of the target spread
 # is treated as constant for that device.
@@ -122,6 +131,21 @@ class InputNormalizer(TimeIndepModule):
                 ]
             )
 
+    @staticmethod
+    def input_vec(inputs: InputNormalizer.Inputs) -> jnp.ndarray:
+        """The 7 physical inputs stacked in NORM_INPUT_VARS order."""
+        return jnp.stack(
+            [
+                inputs.ip_MA,
+                inputs.b_geo,
+                inputs.geometric_axis_r,
+                inputs.minor_radius,
+                inputs.elongation,
+                inputs.n_e_line_average_1e20,
+                inputs.power_additional_MW,
+            ]
+        )
+
     @classmethod
     def inputs_from_dict(cls, data: dict[str, ArrayLike] | xr.Dataset) -> InputNormalizer.Inputs:
         """Build Inputs from dataset variables keyed by their NORM_INPUT_VARS names."""
@@ -141,18 +165,22 @@ class InputNormalizer(TimeIndepModule):
     def _normalize_vec(self, vec: jnp.ndarray, ds_source_idx: ArrayLike) -> jnp.ndarray:
         raise NotImplementedError
 
+    def normalize_with_energy(self, inputs: Inputs, energy_mhd_MJ: ArrayLike) -> jnp.ndarray:
+        """The 7 normalized inputs followed by the normalized stored energy, from a normalizer built with_energy."""
+        input_vec = self.input_vec(inputs)
+        vec = jnp.append(input_vec, energy_mhd_MJ)
+        return self._normalize_vec(vec, inputs.ds_source_idx)
+
+    def energy_rate_scale(self, inputs: Inputs) -> ArrayLike:
+        """dW/dt [MW] per unit of a network output predicting it.
+
+        Methods that keep the stored energy in MJ (raw, coral) take the output in MW.
+        The others take it in their normalized energy units per TAU_REF_S.
+        """
+        return 1.0
+
     def __call__(self, inputs: Inputs) -> Output:
-        vec = jnp.stack(
-            [
-                inputs.ip_MA,
-                inputs.b_geo,
-                inputs.geometric_axis_r,
-                inputs.minor_radius,
-                inputs.elongation,
-                inputs.n_e_line_average_1e20,
-                inputs.power_additional_MW,
-            ]
-        )
+        vec = self.input_vec(inputs)
         out = self._normalize_vec(vec, inputs.ds_source_idx)
         return self.Output(
             ip_MA=out[0],
@@ -184,8 +212,28 @@ PHYSICS_FEATURE_NAMES = (
 )
 
 
+def energy_at_unit_beta_n_MJ(ip_MA, b_geo, geometric_axis_r, minor_radius, elongation):
+    """Stored energy [MJ] at beta_N = 1, the energy unit of the physics methods.
+
+    b_geo stands in for b0, the power balance inputs carry no b0.
+    """
+    volume_m3 = plasma_parameters.volume_approx(geometric_axis_r, minor_radius, elongation)
+    return plasma_parameters.energy_mhd_MJ_from_beta_tor_norm(1.0, volume_m3, minor_radius, b_geo, ip_MA)
+
+
+def physics_energy_unit_MJ(inputs: InputNormalizer.Inputs) -> ArrayLike:
+    """energy_at_unit_beta_n_MJ at the physical inputs."""
+    return energy_at_unit_beta_n_MJ(inputs.ip_MA, inputs.b_geo, inputs.geometric_axis_r, inputs.minor_radius, inputs.elongation)
+
+
+def physics_energy_rate_scale(inputs: InputNormalizer.Inputs) -> ArrayLike:
+    """dW/dt [MW] per unit rate of the beta_N slot, one beta_N of stored energy per TAU_REF_S."""
+    energy_unit_MJ = physics_energy_unit_MJ(inputs)
+    return energy_unit_MJ / TAU_REF_S
+
+
 def physics_feature_vec(vec: jnp.ndarray) -> jnp.ndarray:
-    """The dimensionless physics features for a stacked 7-input vector.
+    """The dimensionless physics features for a stacked 7-input vector, or 8 with the stored energy.
 
     Slot mapping (slot name -> feature):
     - ip_MA                  -> ip_MA (kept raw, sufficiently device-invariant)
@@ -198,8 +246,9 @@ def physics_feature_vec(vec: jnp.ndarray) -> jnp.ndarray:
     - elongation             -> elongation
     - n_e_line_average_1e20  -> Greenwald fraction f_G
     - power_additional_MW    -> P_aux / plasma surface area
+    - energy_mhd_MJ (8th)    -> beta_N, the stored energy over energy_at_unit_beta_n_MJ
     """
-    ip_ma, b_geo, r_geo, a_minor, kappa, ne20, p_aux = vec
+    ip_ma, b_geo, r_geo, a_minor, kappa, ne20, p_aux = vec[:N_FEATURES]
     epsilon = plasma_parameters.inverse_aspect_ratio(a_minor, r_geo)
     no_triangularity = jnp.zeros_like(epsilon)
     q_star = plasma_parameters.q_star(ip_ma, b_geo, r_geo, a_minor, kappa, no_triangularity, no_triangularity)
@@ -207,7 +256,11 @@ def physics_feature_vec(vec: jnp.ndarray) -> jnp.ndarray:
     a_b0 = plasma_parameters.a_b0(a_minor, b_geo)
     surface_area = calc_plasma_surface_area(r_geo, epsilon, kappa)
     surface_power_density = p_aux / surface_area
-    return jnp.stack([ip_ma, q_star, epsilon, a_b0, kappa, f_g, surface_power_density])
+    features = [ip_ma, q_star, epsilon, a_b0, kappa, f_g, surface_power_density]
+    if vec.shape[0] > N_FEATURES:
+        energy_unit_MJ = energy_at_unit_beta_n_MJ(ip_ma, b_geo, r_geo, a_minor, kappa)
+        features.append(vec[N_FEATURES] / energy_unit_MJ)
+    return jnp.stack(features)
 
 
 class PhysicsNormalizer(InputNormalizer):
@@ -219,6 +272,9 @@ class PhysicsNormalizer(InputNormalizer):
 
     def _normalize_vec(self, vec: jnp.ndarray, ds_source_idx: ArrayLike) -> jnp.ndarray:
         return physics_feature_vec(vec)
+
+    def energy_rate_scale(self, inputs: InputNormalizer.Inputs) -> ArrayLike:
+        return physics_energy_rate_scale(inputs)
 
 
 def fit_z_score_stats(features: np.ndarray, source_idx: np.ndarray, n_devices: int) -> tuple[jnp.ndarray, jnp.ndarray]:
@@ -267,20 +323,34 @@ class ZScoreNormalizer(InputNormalizer):
 
     @staticmethod
     def features(vec: jnp.ndarray) -> jnp.ndarray:
-        """The feature vector the statistics standardize, the 7 inputs themselves."""
+        """The feature vector the statistics standardize, the inputs themselves."""
         return vec
+
+    @staticmethod
+    def energy_unit_MJ(inputs: InputNormalizer.Inputs) -> ArrayLike:
+        """MJ per unit of the energy slot before standardization."""
+        return 1.0
 
     def _normalize_vec(self, vec: jnp.ndarray, ds_source_idx: ArrayLike) -> jnp.ndarray:
         return apply_z_score(self.features(vec), ds_source_idx, self.means, self.stds)
 
-    @classmethod
-    def identity(cls, n_devices: int) -> ZScoreNormalizer:
-        return cls(means=jnp.zeros((n_devices, N_FEATURES)), stds=jnp.ones((n_devices, N_FEATURES)))
+    def energy_rate_scale(self, inputs: InputNormalizer.Inputs) -> ArrayLike:
+        """One device std of the energy slot per TAU_REF_S."""
+        if self.stds.shape[1] != N_FEATURES + 1:
+            raise ValueError("energy_rate_scale needs a normalizer built with_energy")
+        idx = jnp.asarray(inputs.ds_source_idx).astype(jnp.int32)
+        energy_std = jnp.take(self.stds[:, N_FEATURES], idx)
+        energy_unit_MJ = self.energy_unit_MJ(inputs)
+        return energy_std * energy_unit_MJ / TAU_REF_S
 
     @classmethod
-    def fit(cls, ds: xr.Dataset, n_devices: int) -> ZScoreNormalizer:
-        """Fit per-device mean/std of the features over the training rows."""
-        inputs, source_idx, _ = _feature_matrix(ds)
+    def identity(cls, n_devices: int, n_features: int = N_FEATURES) -> ZScoreNormalizer:
+        return cls(means=jnp.zeros((n_devices, n_features)), stds=jnp.ones((n_devices, n_features)))
+
+    @classmethod
+    def fit(cls, ds: xr.Dataset, n_devices: int, variables: tuple[str, ...] = NORM_INPUT_VARS) -> ZScoreNormalizer:
+        """Fit per-device mean/std of the features of variables over the training rows."""
+        inputs, source_idx, _ = _feature_matrix(ds, variables)
         means, stds = fit_z_score_stats(_feature_rows(cls.features, inputs), source_idx, n_devices)
         return cls(means=means, stds=stds)
 
@@ -293,6 +363,7 @@ class PhysicsZScoreNormalizer(ZScoreNormalizer):
     """
 
     features = staticmethod(physics_feature_vec)
+    energy_unit_MJ = staticmethod(physics_energy_unit_MJ)
 
 
 def identity_coral_stats(n_devices: int, n_features: int) -> tuple[jnp.ndarray, jnp.ndarray]:
@@ -403,17 +474,17 @@ class CoralNormalizer(InputNormalizer):
         return apply_coral(self.features(vec), ds_source_idx, self.means, self.transforms)
 
     @classmethod
-    def identity(cls, n_devices: int) -> CoralNormalizer:
-        means, transforms = identity_coral_stats(n_devices, N_FEATURES)
+    def identity(cls, n_devices: int, n_features: int = N_FEATURES) -> CoralNormalizer:
+        means, transforms = identity_coral_stats(n_devices, n_features)
         return cls(means=means, transforms=transforms)
 
     @classmethod
-    def fit(cls, ds: xr.Dataset, n_devices: int, target_idx: int) -> CoralNormalizer:
-        """Fit per-device CORAL transforms of the features over the training rows."""
-        inputs, source_idx, shot_idx = _feature_matrix(ds)
+    def fit(cls, ds: xr.Dataset, n_devices: int, target_idx: int, variables: tuple[str, ...] = NORM_INPUT_VARS) -> CoralNormalizer:
+        """Fit per-device CORAL transforms of the features of variables over the training rows."""
+        inputs, source_idx, shot_idx = _feature_matrix(ds, variables)
         stats = fit_coral_stats(_feature_rows(cls.features, inputs), source_idx, n_devices, shot_idx, target_idx)
         if stats is None:
-            return cls.identity(n_devices)
+            return cls.identity(n_devices, len(variables))
         means, transforms = stats
         return cls(means=means, transforms=transforms)
 
@@ -425,6 +496,9 @@ class PhysicsCoralNormalizer(CoralNormalizer):
     """
 
     features = staticmethod(physics_feature_vec)
+
+    def energy_rate_scale(self, inputs: InputNormalizer.Inputs) -> ArrayLike:
+        return physics_energy_rate_scale(inputs)
 
 
 class CoralFeatureNormalizer(TimeIndepModule):
@@ -550,13 +624,13 @@ def make_feature_normalizer(
     raise ValueError(f"Unknown feature normalization method: {method}. Must be one of {FEATURE_NORMALIZATIONS}.")
 
 
-def _feature_matrix(ds: xr.Dataset) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """The 7 input vars as an (N, 7) matrix with the matching (N,) device and shot indices, see feature_fit_arrays."""
-    return feature_fit_arrays(ds, flat_columns(ds, NORM_INPUT_VARS))
+def _feature_matrix(ds: xr.Dataset, variables: tuple[str, ...]) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """variables as an (N, len(variables)) matrix with the matching (N,) device and shot indices, see feature_fit_arrays."""
+    return feature_fit_arrays(ds, flat_columns(ds, variables))
 
 
 def _feature_rows(features_fn, inputs: np.ndarray) -> np.ndarray:
-    """features_fn applied to every row of an (N, 7) input matrix."""
+    """features_fn applied to every row of an input matrix."""
     return np.asarray(jax.vmap(features_fn)(jnp.asarray(inputs)))
 
 
@@ -579,6 +653,7 @@ def make_normalizer(
     train_ds: xr.Dataset | None,
     n_devices: int,
     target_idx: int,
+    with_energy: bool = False,
 ) -> InputNormalizer:
     """Build the normalizer for a case.
 
@@ -586,13 +661,19 @@ def make_normalizer(
     about to overwrite the module from a checkpoint (transfer restore), then
     passing None yields identity stats with the correct pytree structure.
     target_idx is the device the CORAL methods align every other device to.
+    with_energy adds the stored energy as an 8th slot (see normalize_with_energy).
     """
+    variables = (*NORM_INPUT_VARS, ENERGY_VAR) if with_energy else NORM_INPUT_VARS
     if method in _STATELESS_NORMALIZERS:
         return _STATELESS_NORMALIZERS[method]()
     if method in _ZSCORE_NORMALIZERS:
         zscore_cls = _ZSCORE_NORMALIZERS[method]
-        return zscore_cls.identity(n_devices) if train_ds is None else zscore_cls.fit(train_ds, n_devices)
+        if train_ds is None:
+            return zscore_cls.identity(n_devices, len(variables))
+        return zscore_cls.fit(train_ds, n_devices, variables)
     if method in _CORAL_NORMALIZERS:
         coral_cls = _CORAL_NORMALIZERS[method]
-        return coral_cls.identity(n_devices) if train_ds is None else coral_cls.fit(train_ds, n_devices, target_idx)
+        if train_ds is None:
+            return coral_cls.identity(n_devices, len(variables))
+        return coral_cls.fit(train_ds, n_devices, target_idx, variables)
     raise ValueError(f"Unknown normalization method: {method}")

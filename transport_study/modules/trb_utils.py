@@ -36,8 +36,14 @@ CHI_SIGMA_FLOOR_PERCENTILE = 5.0
 # Dividing by the error bar already discounts where the fit stops resolving the slope,
 # so only the extrapolation right at the edge is dropped
 CHI_GRAD_RHO_MAX = 0.95
-# Floor added to |target| in the relative error of the scalar study results (MJ for Wtot, MW for the powers)
-SCALAR_REL_ERROR_FLOOR = 0.1
+# Floor added to |target| in the relative error of the scalar study results, in the signal's units.
+# Each sits below the signal's typical size so the error stays relative,
+# Wtot medians are 0.03-0.05 MJ on C-Mod and MAST
+SCALAR_REL_ERROR_FLOORS = {
+    "energy_mhd_MJ": 0.01,
+    "power_ohm_MW": 0.1,
+    "power_radiated_MW": 0.1,
+}
 
 # Profile channel -> (value error bar, gradient error bar) chi divides by
 CHI_ERROR_VARS = {
@@ -193,7 +199,7 @@ def scalar_study_results(eval_data: EvalData, signal: str, pred_var: str) -> xr.
     time_2d = unstack_samples(eval_data.input_ds[TIME_COORD])
 
     error_abs_ts = xr.apply_ufunc(np.abs, pred - targ)
-    error_rel_ts = error_abs_ts / (xr.apply_ufunc(np.abs, targ) + SCALAR_REL_ERROR_FLOOR)
+    error_rel_ts = error_abs_ts / (xr.apply_ufunc(np.abs, targ) + SCALAR_REL_ERROR_FLOORS[signal])
     ds = xr.Dataset(
         data_vars={
             f"{signal}_targ": targ,
@@ -234,51 +240,67 @@ def integrate_error_over_time(error_ts: xr.DataArray, time_2d: xr.DataArray) -> 
     )
 
 
-def make_exponential_adamw(optimizer_config: dict) -> optax.GradientTransformation:
-    """AdamW on an exponentially decaying learning rate schedule."""
+def path_names(path: tuple) -> set:
+    """The attribute names and dict keys along a pytree path."""
+    # GetAttrKey carries .name, DictKey carries .key
+    return {getattr(key, "name", None) for key in path} | {getattr(key, "key", None) for key in path}
+
+
+def make_exponential_adamw(optimizer_config: dict, no_decay_names: tuple[str, ...] = ()) -> optax.GradientTransformation:
+    """AdamW on an exponentially decaying learning rate schedule.
+
+    The rate falls from lr0 by decay_rate every transition_steps and holds at lr0 * lrf_frac.
+    lrf_frac <= 1 keeps the final rate at or below lr0
+    (optax treats end_value as a floor, an end_value above lr0 would run the whole schedule there).
+    Leaves whose pytree path holds one of no_decay_names skip the weight decay.
+    """
+    lr0 = optimizer_config["lr0"]
+    lrf = lr0 * optimizer_config["lrf_frac"]
     schedule = optax.exponential_decay(
-        init_value=optimizer_config["lr0"],
+        init_value=lr0,
         transition_steps=optimizer_config["transition_steps"],
         decay_rate=optimizer_config["decay_rate"],
-        end_value=optimizer_config["lrf"],
+        end_value=lrf,
     )
-    return optax.adamw(learning_rate=schedule, weight_decay=optimizer_config["weight_decay"])
+
+    def decay_mask(params):
+        return jax.tree_util.tree_map_with_path(lambda path, _leaf: not (path_names(path) & set(no_decay_names)), params)
+
+    return optax.adamw(
+        learning_rate=schedule,
+        weight_decay=optimizer_config["weight_decay"],
+        mask=decay_mask if no_decay_names else None,
+    )
 
 
-def make_grouped_exponential_adamw(optimizer_config: dict) -> optax.GradientTransformation:
+def make_grouped_exponential_adamw(optimizer_config: dict, no_decay_names: tuple[str, ...] = ()) -> optax.GradientTransformation:
     """AdamW where selected submodules run a scaled copy of the exponential schedule.
 
     optimizer_config["submodule_lr_factors"] maps a module attribute name
-    (e.g. "p_oh_predictor") to a multiplier on lr0/lrf. Any trainable leaf
+    (e.g. "p_oh_predictor") to a multiplier on the whole schedule. Any trainable leaf
     whose pytree path contains that attribute follows the scaled schedule,
     everything else the base one. Labeling is by pytree path, so it works both
     for the full-module partition and for the transfer-mode last-layer
     partition (frozen leaves are None in the trainable pytree and are never
     labeled). Without the key (or with all factors 1.0) this is exactly
     make_exponential_adamw.
+    no_decay_names passes through to every group.
     """
     factors = optimizer_config.get("submodule_lr_factors") or {}
     factors = {name: factor for name, factor in factors.items() if factor != 1.0}
     if not factors:
-        return make_exponential_adamw(optimizer_config)
+        return make_exponential_adamw(optimizer_config, no_decay_names)
 
-    def scaled_config(factor: float) -> dict:
-        cfg = dict(optimizer_config)
-        cfg["lr0"] = cfg["lr0"] * factor
-        cfg["lrf"] = cfg["lrf"] * factor
-        return cfg
-
-    transforms = {"base": make_exponential_adamw(optimizer_config)}
+    transforms = {"base": make_exponential_adamw(optimizer_config, no_decay_names)}
     for name, factor in factors.items():
-        transforms[name] = make_exponential_adamw(scaled_config(factor))
+        # lrf is a fraction of lr0, so scaling lr0 scales the whole schedule
+        scaled_config = {**optimizer_config, "lr0": optimizer_config["lr0"] * factor}
+        transforms[name] = make_exponential_adamw(scaled_config, no_decay_names)
 
     def label_params(params):
         def label(path, _leaf):
-            for name in factors:
-                # GetAttrKey carries .name, DictKey carries .key
-                if any(name in (getattr(key, "name", None), getattr(key, "key", None)) for key in path):
-                    return name
-            return "base"
+            names_on_path = path_names(path)
+            return next((name for name in factors if name in names_on_path), "base")
 
         return jax.tree_util.tree_map_with_path(label, params)
 

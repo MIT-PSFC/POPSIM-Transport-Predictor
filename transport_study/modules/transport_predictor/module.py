@@ -20,6 +20,7 @@ from torax._src.orchestration.step_function import SimulationStepFn
 from transport_study.modules import plasma_parameters
 from transport_study.modules.normalization import (
     FeatureNormalizer,
+    InputNormalizer,
     feature_fit_arrays,
     flat_columns,
     make_feature_normalizer,
@@ -190,7 +191,7 @@ class Inputs(profile_predictor_module.DerivedPlasmaParameters):
         )
         return inp_array
 
-    def to_power_balance_inputs(self) -> PowerBalance.Inputs:
+    def to_power_balance_inputs(self) -> InputNormalizer.Inputs:
         return PowerBalance.Inputs(
             ip_MA=self.ip_MA,
             b_geo=self.b_geo,

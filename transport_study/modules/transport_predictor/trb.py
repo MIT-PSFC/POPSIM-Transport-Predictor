@@ -11,6 +11,7 @@ from popsim.ml.eval import EvaluationSuite
 
 from transport_study import RADIAL_DIM
 from transport_study.config import config
+from transport_study.modules.power_balance.module import SCALING_LAW_FIELDS
 from transport_study.modules.power_balance.trb import PowerBalanceTRB
 from transport_study.modules.profile_predictor.trb import ProfilePredictorTRB
 from transport_study.modules.transport_predictor.module import (
@@ -253,11 +254,12 @@ class TransportPredictorTRB(TrainRunBuilder):
         # Then the global-norm cap as in the profile study, the differentiated TORAX solve can spike gradients.
         # Last the power balance study's grouped schedule:
         # submodule_lr_factors runs the sciml power_balance subtree at a reduced learning rate,
-        # a no-op for model types without a matching pytree path.
+        # and its scaling-law coefficients skip the weight decay,
+        # both no-ops for model types without a matching pytree path.
         return optax.chain(
             optax.zero_nans(),
             optax.clip_by_global_norm(optimizer_config["grad_clip_max_norm"]),
-            make_grouped_exponential_adamw(optimizer_config),
+            make_grouped_exponential_adamw(optimizer_config, no_decay_names=SCALING_LAW_FIELDS),
         )
 
     @staticmethod

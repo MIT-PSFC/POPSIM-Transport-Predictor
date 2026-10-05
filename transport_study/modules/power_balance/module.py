@@ -1,17 +1,17 @@
 import abc
+from collections.abc import Mapping
 
 import chex
 import equinox as eqx
 import jax
 import jax.numpy as jnp
-import xarray as xr
 from jaxtyping import Array, ArrayLike
 from popsim import TimeDepModule, discrete_no_save_field
 from popsim.math_utils import smooth_clamp
 from popsim.ml.envs import ModuleTrainingEnv
 from popsim.simulate import StepperType
 
-from transport_study.modules.normalization import InputNormalizer
+from transport_study.modules.normalization import N_FEATURES, InputNormalizer
 from transport_study.modules.power_balance.p_oh.module import OhmicPower
 from transport_study.modules.power_balance.p_rad.module import RadiatedPower
 
@@ -19,6 +19,8 @@ from transport_study.modules.power_balance.p_rad.module import RadiatedPower
 MODEL_TYPES_WITH_SUBMODULES = ("sciml-taue-scalinglaw", "sciml-taue-nn")
 # The submodule pseudo-model-types of those prereq cases
 SUBMODULE_MODEL_TYPES = ("p_oh", "p_rad")
+# Model types fed their own predicted Wtot, their normalizer is built with_energy
+MODEL_TYPES_WITH_ENERGY_INPUT = ("mlp", "transformer")
 
 MIN_TAUE = 0.001  # Minimum reasonable value for tau_e [s]
 MAX_TAUE = 0.8  # Maximum reasonable value for tau_e [s]
@@ -31,14 +33,70 @@ TAUE_CLAMP_MIN_WIDTH = 0.001
 # a hard jnp.where switch would zero the gradient of the P_LH threshold coefficients
 LH_BLEND_SHARPNESS = 8.0
 
-MIN_POWER = -32  # Minimum reasonable value for conducted power (dW/dt) [MW]
-MAX_POWER = 32  # Maximum reasonable value for conducted power (dW/dt) [MW]
+MIN_POWER = -40  # Lower bound on the predicted dW/dt [MW]
+MAX_POWER = 40  # Upper bound on the predicted dW/dt [MW]
 MIN_WTOT_MJ = 0.001  # Floor for predicted stored energy [MJ], keeps Wtot strictly positive
 
 # Smoothing width of every smooth_clamp bound, as a fraction of the bound range.
 # smooth_clamp is identity inside (min+width, max-width) and its gradient tail
 # decays as exp(-overshoot/width), staying alive ~10x further out than tanh soft_clip
 BOUND_CLAMP_WIDTH_FRAC = 0.1
+
+# Starting coefficients of the scaling-law tau_e model, a prefactor and the exponent of each factor.
+# ITER89-P L-mode [s], its a^0.3 folded into R^1.5 epsilon^0.3,
+# density in 1e19 m^-3 (the published 0.048 is for 1e20 m^-3, times 10^-0.1)
+ITER89P_LMODE = {
+    "coeff": 0.038,
+    "alpha_I": 0.85,
+    "alpha_B": 0.2,
+    "alpha_N": 0.1,
+    "alpha_P": -0.5,
+    "alpha_R": 1.5,
+    "alpha_kappa": 0.5,
+    "alpha_epsilon": 0.3,
+    "alpha_mass": 0.5,
+}
+# IPB98(y,2) H-mode [s], density in 1e19 m^-3
+IPB98Y2_HMODE = {
+    "coeff": 0.0562,
+    "alpha_I": 0.93,
+    "alpha_B": 0.15,
+    "alpha_N": 0.41,
+    "alpha_P": -0.69,
+    "alpha_R": 1.97,
+    "alpha_kappa": 0.78,
+    "alpha_epsilon": 0.58,
+    "alpha_mass": 0.19,
+}
+# ITER 1996 L-H power threshold [MW], density in 1e20 m^-3
+# (https://ukaea.github.io/PROCESS/physics-models/plasma_h_mode/)
+ITER1996_LH_THRESHOLD = {
+    "coeff": 0.45,
+    "alpha_N": 0.75,
+    "alpha_B": 1.0,
+    "alpha_R": 2.0,
+}
+# The ScalingLawPredictor fields holding those coefficients.
+# They train but take no weight decay, a pull toward zero is no prior for a physics exponent
+SCALING_LAW_FIELDS = ("scaling_lmode", "scaling_hmode", "scaling_lh_transition")
+
+
+def trainable_scaling(scaling: dict[str, float]) -> dict[str, Array]:
+    """The trainable leaves of a scaling, its prefactor stored as log_coeff.
+
+    A log prefactor stays positive and trains in relative steps like the exponents.
+    A linear one sits at ~0.05, where an Adam step of ~lr could flip its sign.
+    """
+    leaves = {name: jnp.asarray(value, dtype=float) for name, value in scaling.items() if name != "coeff"}
+    coeff = jnp.asarray(scaling["coeff"], dtype=float)
+    leaves["log_coeff"] = jnp.log(coeff)
+    return leaves
+
+
+def power_law(scaling: Mapping[str, ArrayLike], factors: Mapping[str, ArrayLike]) -> Array:
+    """exp(log_coeff) * prod(factor^alpha) over the exponents of a scaling, factors keyed by exponent name."""
+    log_terms = [alpha * jnp.log(factors[name]) for name, alpha in scaling.items() if name != "log_coeff"]
+    return jnp.exp(scaling["log_coeff"] + sum(log_terms))
 
 
 @chex.dataclass
@@ -48,37 +106,14 @@ class TauePredictorOutputs:
 
 
 class BoundedNNPredictor(eqx.Module):
-    """Predict tau_e with a bounded NN"""
+    """tau_e from an NN over the normalized input features, smooth-clamped to [min_val, max_val]."""
 
     nn: eqx.Module
     min_val: float = eqx.field(static=True)
     max_val: float = eqx.field(static=True)
 
-    @chex.dataclass
-    class Inputs:
-        """Inputs for NN predictor"""
-
-        ip_MA: float
-        b_geo: float
-        geometric_axis_r: float
-        minor_radius: float
-        elongation: float
-        n_e_line_average_1e20: float
-        power_additional_MW: float
-
-    def __call__(self, inp: "Inputs") -> TauePredictorOutputs:
-        arr = jnp.array(
-            [
-                inp.ip_MA,
-                inp.b_geo,
-                inp.geometric_axis_r,
-                inp.minor_radius,
-                inp.elongation,
-                inp.n_e_line_average_1e20,
-                inp.power_additional_MW,
-            ]
-        )
-        nn_out = self.nn(arr)
+    def __call__(self, feature_vec: Array) -> TauePredictorOutputs:
+        nn_out = self.nn(feature_vec)
         width = BOUND_CLAMP_WIDTH_FRAC * (self.max_val - self.min_val)
         bounded_out = smooth_clamp(nn_out, self.min_val, self.max_val, width, width).squeeze()
 
@@ -130,14 +165,12 @@ class ScalingLawPredictor(eqx.Module):
 
     def __init__(self):
         """ITER89-P L-mode, IPB98(y,2) H-mode and the 1996 L-H threshold as the starting coefficients."""
-        # Cast to float arrays so every coefficient is an inexact-array leaf
-        # (python float or int values would be dropped by eqx.is_inexact_array)
-        self.scaling_lmode = {k: jnp.asarray(v, dtype=float) for k, v in self.create_iter89().items()}
-        self.scaling_hmode = {k: jnp.asarray(v, dtype=float) for k, v in self.create_ipb98().items()}
-        self.scaling_lh_transition = {k: jnp.asarray(v, dtype=float) for k, v in self.create_iter1996().items()}
+        self.scaling_lmode = trainable_scaling(ITER89P_LMODE)
+        self.scaling_hmode = trainable_scaling(IPB98Y2_HMODE)
+        self.scaling_lh_transition = trainable_scaling(ITER1996_LH_THRESHOLD)
 
     def __call__(self, inp: Inputs) -> TauePredictorOutputs:
-        # Ensure each of the input values is strictly greater than 0.001 to avoid numerical instability.
+        # Every factor floored at 0.001 so its log stays finite
         ip_MA = jnp.clip(inp.ip_MA, 0.001, None)
         b_geo = jnp.clip(inp.b_geo, 0.001, None)
         ne19 = jnp.clip(inp.n_e_line_average_1e20 * 10, 0.001, None)
@@ -147,33 +180,20 @@ class ScalingLawPredictor(eqx.Module):
         epsilon = jnp.clip(inp.epsilon, 0.001, None)
         geometric_axis_r = jnp.clip(inp.geometric_axis_r, 0.001, None)
 
-        p_thresh = self.scaling_lh_transition["coeff"] * (
-            (ne20 ** self.scaling_lh_transition["alpha_N"])
-            * (b_geo ** self.scaling_lh_transition["alpha_B"])
-            * (geometric_axis_r ** self.scaling_lh_transition["alpha_R"])
-        )
-
-        taue_lmode = self.scaling_lmode["coeff"] * (
-            (ip_MA ** self.scaling_lmode["alpha_I"])
-            * (b_geo ** self.scaling_lmode["alpha_B"])
-            * (ne19 ** self.scaling_lmode["alpha_N"])
-            * (P_abs_MW ** self.scaling_lmode["alpha_P"])
-            * (geometric_axis_r ** self.scaling_lmode["alpha_R"])
-            * (elongation ** self.scaling_lmode["alpha_kappa"])
-            * (epsilon ** self.scaling_lmode["alpha_epsilon"])
-            * (self.isotope_mass ** self.scaling_lmode["alpha_mass"])
-        )
-
-        taue_hmode = self.scaling_hmode["coeff"] * (
-            (ip_MA ** self.scaling_hmode["alpha_I"])
-            * (b_geo ** self.scaling_hmode["alpha_B"])
-            * (ne19 ** self.scaling_hmode["alpha_N"])
-            * (P_abs_MW ** self.scaling_hmode["alpha_P"])
-            * (geometric_axis_r ** self.scaling_hmode["alpha_R"])
-            * (elongation ** self.scaling_hmode["alpha_kappa"])
-            * (epsilon ** self.scaling_hmode["alpha_epsilon"])
-            * (self.isotope_mass ** self.scaling_hmode["alpha_mass"])
-        )
+        confinement_factors: dict[str, ArrayLike] = {
+            "alpha_I": ip_MA,
+            "alpha_B": b_geo,
+            "alpha_N": ne19,
+            "alpha_P": P_abs_MW,
+            "alpha_R": geometric_axis_r,
+            "alpha_kappa": elongation,
+            "alpha_epsilon": epsilon,
+            "alpha_mass": self.isotope_mass,
+        }
+        taue_lmode = power_law(self.scaling_lmode, confinement_factors)
+        taue_hmode = power_law(self.scaling_hmode, confinement_factors)
+        threshold_factors: dict[str, ArrayLike] = {"alpha_N": ne20, "alpha_B": b_geo, "alpha_R": geometric_axis_r}
+        p_thresh = power_law(self.scaling_lh_transition, threshold_factors)
 
         # Smooth blend so gradient reaches the scaling_lh_transition coefficients
         lh_weight = jax.nn.sigmoid(LH_BLEND_SHARPNESS * (P_abs_MW / p_thresh - 1.0))
@@ -199,48 +219,6 @@ class ScalingLawPredictor(eqx.Module):
 
         return out
 
-    @classmethod
-    def create_ipb98(cls) -> dict[str, ArrayLike]:
-        scaling = {
-            "coeff": jnp.array(56.2 * 10**-3),
-            "alpha_I": jnp.array(0.93),
-            "alpha_B": jnp.array(0.15),
-            "alpha_N": jnp.array(0.41),
-            "alpha_P": jnp.array(-0.69),
-            "alpha_R": jnp.array(1.97),
-            "alpha_kappa": jnp.array(0.78),
-            "alpha_epsilon": jnp.array(0.58),
-            "alpha_mass": jnp.array(0.19),
-        }
-        return scaling
-
-    @classmethod
-    def create_iter89(cls):
-        scaling = {
-            "coeff": jnp.array(38 * 10**-3),
-            "alpha_I": jnp.array(0.85),
-            "alpha_B": jnp.array(0.2),
-            "alpha_N": jnp.array(0.1),
-            "alpha_P": jnp.array(-0.5),
-            "alpha_R": jnp.array(1.5),
-            "alpha_kappa": jnp.array(0.5),
-            "alpha_epsilon": jnp.array(0.3),
-            "alpha_mass": jnp.array(0.5),
-        }
-        return scaling
-
-    @classmethod
-    def create_iter1996(cls):
-        # https://ukaea.github.io/PROCESS/physics-models/plasma_h_mode/
-        # NOTE: This scaling law uses ne20 instead of ne19
-        scaling = {
-            "coeff": 0.45,
-            "alpha_N": 0.75,
-            "alpha_B": 1,
-            "alpha_R": 2,
-        }
-        return scaling
-
 
 class PowerBalance(TimeDepModule):
     """Base for the time-dependent stored-energy models.
@@ -255,30 +233,8 @@ class PowerBalance(TimeDepModule):
     class State:
         energy_mhd_MJ: float
 
-    @chex.dataclass
-    class Inputs:
-        # Real-valued inputs in physical units
-        ip_MA: float
-        b_geo: float
-        geometric_axis_r: float
-        minor_radius: float
-        elongation: float
-        n_e_line_average_1e20: float
-        power_additional_MW: float
-        # Device index selecting per-device normalization statistics
-        ds_source_idx: float
-
-        def to_normalizer_inputs(self) -> InputNormalizer.Inputs:
-            return InputNormalizer.Inputs(
-                ip_MA=self.ip_MA,
-                b_geo=self.b_geo,
-                geometric_axis_r=self.geometric_axis_r,
-                minor_radius=self.minor_radius,
-                elongation=self.elongation,
-                n_e_line_average_1e20=self.n_e_line_average_1e20,
-                power_additional_MW=self.power_additional_MW,
-                ds_source_idx=self.ds_source_idx,
-            )
+    # The 7 physical inputs plus the device index selecting per-device normalization statistics
+    Inputs = InputNormalizer.Inputs
 
     @chex.dataclass
     class Output:
@@ -321,26 +277,28 @@ class PowerBalanceTaue(PowerBalance):
     """Base of the tau_e models, dW/dt = P_aux + P_oh - P_rad - Wtot / tau_e with predicted P_oh and P_rad.
 
     Subclasses declare the submodule fields and implement predict_taue.
+    Note that while we are including most of the same terms,
+    this tau_E is not quite the same as in H89 and H98 scaling laws.
+    Here we say the tau_E is based on total energy for only the conducted power, while
+    ITER89-P and IPB98(y,2) define tau_E with the loss power P_heat - dW/dt,
+    radiation not subtracted, and for only the thermal energy.
     """
 
     p_oh_predictor: eqx.AbstractVar[OhmicPower]
     p_rad_predictor: eqx.AbstractVar[RadiatedPower]
 
     @abc.abstractmethod
-    def predict_taue(
-        self, inputs: PowerBalance.Inputs, normalizer_inputs: InputNormalizer.Inputs, power_ohm_MW: ArrayLike
-    ) -> TauePredictorOutputs:
-        """tau_e from the physical inputs, their normalizer view and the predicted ohmic power."""
+    def predict_taue(self, inputs: InputNormalizer.Inputs, power_ohm_MW: ArrayLike) -> TauePredictorOutputs:
+        """tau_e from the physical inputs and the predicted ohmic power."""
 
-    def __call__(self, state: PowerBalance.State, inputs: PowerBalance.Inputs) -> tuple[PowerBalance.State, PowerBalance.Output]:
+    def __call__(self, state: PowerBalance.State, inputs: InputNormalizer.Inputs) -> tuple[PowerBalance.State, PowerBalance.Output]:
         # Submodules take physical inputs and normalize internally with their own stats
-        normalizer_inputs = inputs.to_normalizer_inputs()
-        p_oh_predictor_output = self.p_oh_predictor(normalizer_inputs)
-        p_rad_predictor_output = self.p_rad_predictor(normalizer_inputs)
+        p_oh_predictor_output = self.p_oh_predictor(inputs)
+        p_rad_predictor_output = self.p_rad_predictor(inputs)
         power_ohm_MW = p_oh_predictor_output.power_ohm_MW_pred
         power_radiated_MW = p_rad_predictor_output.power_radiated_MW_pred
 
-        taue_predictor_output = self.predict_taue(inputs, normalizer_inputs, power_ohm_MW)
+        taue_predictor_output = self.predict_taue(inputs, power_ohm_MW)
         energy_mhd_MJ = self.positive_wtot(state.energy_mhd_MJ)
         P_cond_MW = energy_mhd_MJ / taue_predictor_output.taue_pred
         P_abs_MW = inputs.power_additional_MW + power_ohm_MW
@@ -370,9 +328,7 @@ class PowerBalanceScalingLaw(PowerBalanceTaue):
             p_rad_predictor=p_rad_predictor,
         )
 
-    def predict_taue(
-        self, inputs: PowerBalance.Inputs, normalizer_inputs: InputNormalizer.Inputs, power_ohm_MW: ArrayLike
-    ) -> TauePredictorOutputs:
+    def predict_taue(self, inputs: InputNormalizer.Inputs, power_ohm_MW: ArrayLike) -> TauePredictorOutputs:
         # The scaling law is dimensional physics, it MUST see physical units
         taue_predictor_inputs = ScalingLawPredictor.Inputs(
             ip_MA=inputs.ip_MA,
@@ -423,35 +379,38 @@ class PowerBalanceSciML(PowerBalanceTaue):
             normalizer=normalizer,
         )
 
-    def predict_taue(
-        self, inputs: PowerBalance.Inputs, normalizer_inputs: InputNormalizer.Inputs, power_ohm_MW: ArrayLike
-    ) -> TauePredictorOutputs:
+    def predict_taue(self, inputs: InputNormalizer.Inputs, power_ohm_MW: ArrayLike) -> TauePredictorOutputs:
         # The tau_e NN sees this model's own normalized features
-        features = self.normalizer(normalizer_inputs)
-        taue_predictor_inputs = BoundedNNPredictor.Inputs(
-            ip_MA=features.ip_MA,
-            b_geo=features.b_geo,
-            geometric_axis_r=features.geometric_axis_r,
-            minor_radius=features.minor_radius,
-            elongation=features.elongation,
-            n_e_line_average_1e20=features.n_e_line_average_1e20,
-            power_additional_MW=features.power_additional_MW,
-        )
-        return self.taue_predictor(taue_predictor_inputs)
+        features = self.normalizer(inputs)
+        feature_vec = features.to_vec()
+        return self.taue_predictor(feature_vec)
 
 
-class PowerBalanceUnstructuredNN(PowerBalance):
+class PowerBalanceMLP(PowerBalance):
+    """dW/dt from an MLP over the normalized inputs and the current predicted Wtot.
+
+    The predicted Wtot is the rollout's only feedback, the model's own state as in the tau_e models' Wtot / tau_e.
+    Without it dW/dt is a function of the inputs alone,
+    an open-loop integrator that accumulates every error over the shot.
+    The normalizer (built with_energy) scales Wtot into the NN input
+    and maps the NN output back to dW/dt (normalize_with_energy, energy_rate_scale),
+    so both sides sit near 1 whatever the device's energy scale.
+    """
+
     nn: eqx.Module
     normalizer: InputNormalizer
 
-    def __call__(self, state: PowerBalance.State, inputs: PowerBalance.Inputs) -> tuple[PowerBalance.State, PowerBalance.Output]:
-        features = self.normalizer(inputs.to_normalizer_inputs())
-        nn_out = self.nn(features.to_vec())
-        energy_mhd_MJ_dot = self.bound_wtot_dot(state.energy_mhd_MJ, nn_out.squeeze())
+    def __call__(self, state: PowerBalance.State, inputs: InputNormalizer.Inputs) -> tuple[PowerBalance.State, PowerBalance.Output]:
+        energy_mhd_MJ = self.positive_wtot(state.energy_mhd_MJ)
+        nn_input = self.normalizer.normalize_with_energy(inputs, energy_mhd_MJ)
+        nn_out = self.nn(nn_input)
+        energy_rate_scale = self.normalizer.energy_rate_scale(inputs)
+        energy_mhd_MJ_dot_unbounded = energy_rate_scale * nn_out.squeeze()
+        energy_mhd_MJ_dot = self.bound_wtot_dot(state.energy_mhd_MJ, energy_mhd_MJ_dot_unbounded)
 
         state_dot = PowerBalance.State(energy_mhd_MJ=energy_mhd_MJ_dot)
         output = PowerBalance.Output(
-            energy_mhd_MJ_pred=self.positive_wtot(state.energy_mhd_MJ),
+            energy_mhd_MJ_pred=energy_mhd_MJ,
             P_cond_MW=jnp.nan,  # Not predicted in this model
             taue_predictor_output=TauePredictorOutputs(taue_pred=jnp.nan, debug_info={"nn_out": nn_out.squeeze()}),
         )
@@ -461,16 +420,14 @@ class PowerBalanceUnstructuredNN(PowerBalance):
     @classmethod
     def init(
         cls,
-        in_size: int,
-        out_size: int,
         nn_width: int,
         nn_depth: int,
         normalizer: InputNormalizer,
         prng_seed: int = 42,
-    ) -> "PowerBalanceUnstructuredNN":
+    ) -> "PowerBalanceMLP":
         nn = eqx.nn.MLP(
-            in_size=in_size,
-            out_size=out_size,
+            in_size=N_FEATURES + 1,
+            out_size=1,
             width_size=nn_width,
             depth=nn_depth,
             key=jax.random.PRNGKey(prng_seed),
@@ -490,13 +447,15 @@ class PowerBalanceTransformer(PowerBalance):
     no_save keeps the (history_len,) buffer out of the recorded simulation output.
 
     Each step: shift the current (floored) Wtot state into the buffer,
-    embed the normalized 7-vector to a query token,
+    embed the normalized 7 inputs to a query token,
     embed each buffered Wtot value plus a learned per-slot position embedding to key/value tokens,
     attend (causal by construction, the buffer only ever contains current and past predictions),
     then a residual connection and an MLP head produce a bounded energy_mhd_MJ_dot.
     Scalar Wtot tokens are indistinguishable beyond their value,
     so without the position embedding attention would be
-    permutation-invariant over the history and unable to read trends
+    permutation-invariant over the history and unable to read trends.
+    As in the mlp, the normalizer (built with_energy) scales every buffered Wtot at the current inputs
+    and maps the head output back to dW/dt (normalize_with_energy, energy_rate_scale).
     """
 
     normalizer: InputNormalizer
@@ -514,20 +473,23 @@ class PowerBalanceTransformer(PowerBalance):
         # (history_len,) past predicted energy_mhd_MJ values, most recent last
         history: Array = discrete_no_save_field(default=None)
 
-    def __call__(self, state: "PowerBalanceTransformer.State", inputs: PowerBalance.Inputs) -> tuple:
-        features = self.normalizer(inputs.to_normalizer_inputs())
-        query = self.feature_embed(features.to_vec())
-
+    def __call__(self, state: "PowerBalanceTransformer.State", inputs: InputNormalizer.Inputs) -> tuple:
         # Shift the buffer by one and insert the current predicted Wtot at the end
         wtot_now = self.positive_wtot(state.energy_mhd_MJ)
         new_history = jnp.concatenate([state.history[1:], wtot_now[None]])
 
-        tokens = jax.vmap(self.wtot_embed)(new_history[:, None]) + self.pos_embed
+        # Every buffered Wtot normalized at the current inputs, the last row holds the current state
+        normalized_vecs = jax.vmap(lambda energy_mhd_MJ: self.normalizer.normalize_with_energy(inputs, energy_mhd_MJ))(new_history)
+        query = self.feature_embed(normalized_vecs[-1, :N_FEATURES])
+        normalized_history = normalized_vecs[:, N_FEATURES]
+
+        tokens = jax.vmap(self.wtot_embed)(normalized_history[:, None]) + self.pos_embed
         attn_out = self.attention(query[None, :], tokens, tokens)[0]
         latent = query + attn_out
         nn_out = self.head(latent)
-        energy_mhd_MJ_dot = self.bound_wtot_dot(state.energy_mhd_MJ, nn_out.squeeze())
-
+        energy_rate_scale = self.normalizer.energy_rate_scale(inputs)
+        energy_mhd_MJ_dot_unbounded = energy_rate_scale * nn_out.squeeze()
+        energy_mhd_MJ_dot = self.bound_wtot_dot(state.energy_mhd_MJ, energy_mhd_MJ_dot_unbounded)
         state_out = PowerBalanceTransformer.State(energy_mhd_MJ=energy_mhd_MJ_dot, history=new_history)
         output = PowerBalance.Output(
             energy_mhd_MJ_pred=wtot_now,
@@ -593,18 +555,7 @@ class PowerBalanceEnv(ModuleTrainingEnv):
     def create_inputs(inputs: dict[str, ArrayLike]):
         # Top-level module inputs are always in physical units,
         # normalization happens inside the modules
-        if isinstance(inputs, xr.Dataset):
-            inputs = {var: inputs[var].data for var in inputs.data_vars}
-        return PowerBalance.Inputs(
-            ip_MA=inputs["ip_MA"],
-            b_geo=inputs["b_geo"],
-            geometric_axis_r=inputs["geometric_axis_r"],
-            minor_radius=inputs["minor_radius"],
-            elongation=inputs["elongation"],
-            n_e_line_average_1e20=inputs["n_e_line_average_1e20"],
-            power_additional_MW=inputs["power_additional_MW"],
-            ds_source_idx=inputs["ds_source_idx"],
-        )
+        return InputNormalizer.inputs_from_dict(inputs)
 
     def get_trainable(self):
         """Trainable leaves for the optimizer partition.
@@ -615,7 +566,7 @@ class PowerBalanceEnv(ModuleTrainingEnv):
         """
         if self.domain_adaptation == "transfer":
             last_layer_leaves = []
-            if isinstance(self.module, PowerBalanceUnstructuredNN):
+            if isinstance(self.module, PowerBalanceMLP):
                 last_layer_leaves += [
                     self.module.nn.layers[-1].weight,
                     self.module.nn.layers[-1].bias,
@@ -632,8 +583,8 @@ class PowerBalanceEnv(ModuleTrainingEnv):
                 ]
             if isinstance(self.module, PowerBalanceScalingLaw):
                 # No last-layer analog, fine-tune all three coefficient dicts
-                taue = self.module.taue_predictor
-                for scaling in (taue.scaling_lmode, taue.scaling_hmode, taue.scaling_lh_transition):
+                for name in SCALING_LAW_FIELDS:
+                    scaling = getattr(self.module.taue_predictor, name)
                     last_layer_leaves += list(scaling.values())
             if isinstance(self.module, PowerBalanceTaue):
                 if "p_oh_predictor" not in self.freeze_submodules:
@@ -659,7 +610,7 @@ class PowerBalanceEnv(ModuleTrainingEnv):
             trainable_leaves["taue_predictor"] = eqx.filter(self.module.taue_predictor.nn, eqx.is_inexact_array)
         elif isinstance(self.module, PowerBalanceScalingLaw):
             trainable_leaves["taue_predictor"] = eqx.filter(self.module.taue_predictor, eqx.is_inexact_array)
-        elif isinstance(self.module, PowerBalanceUnstructuredNN):
+        elif isinstance(self.module, PowerBalanceMLP):
             trainable_leaves["nn"] = eqx.filter(self.module.nn, eqx.is_inexact_array)
         elif isinstance(self.module, PowerBalanceTransformer):
             trainable_leaves["feature_embed"] = eqx.filter(self.module.feature_embed, eqx.is_inexact_array)

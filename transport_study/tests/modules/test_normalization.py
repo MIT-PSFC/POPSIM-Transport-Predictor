@@ -5,6 +5,7 @@ import numpy as np
 import pytest
 import xarray as xr
 
+from transport_study.modules import plasma_parameters
 from transport_study.modules.normalization import (
     CORAL_DEGENERATE_STD_FRAC,
     FEATURE_NORMALIZATIONS,
@@ -12,6 +13,7 @@ from transport_study.modules.normalization import (
     MIN_CORAL_SHOTS,
     N_FEATURES,
     NORM_INPUT_VARS,
+    TAU_REF_S,
     CoralNormalizer,
     InputNormalizer,
     PhysicsNormalizer,
@@ -292,6 +294,38 @@ def test_feature_normalizer_without_data_matches_fitted_layout(method):
     fitted = make_feature_normalizer(method, fit_data, N_DEVICES, N_FEATURES, TARGET_IDX)
 
     _assert_same_layout(identity, fitted)
+
+
+@pytest.mark.parametrize("method", ["raw", "physics", "zscore", "physics-zscore"])
+def test_energy_rate_scale_inverts_the_energy_slot(method):
+    """One unit of the mlp's NN output is one unit of its normalized stored energy per time unit.
+
+    The time unit is TAU_REF_S where the method normalizes the energy, 1 s where it stays in MJ (raw, MW out).
+    """
+    ds = _toy_dataset()
+    normalizer = make_normalizer(method, train_ds=ds, n_devices=N_DEVICES, target_idx=TARGET_IDX, with_energy=True)
+    time_unit_s = 1.0 if method == "raw" else TAU_REF_S
+    for shot, device in [(0, 0), (4, 1)]:
+        inputs = _sample_inputs(ds, shot, 3, device)
+        energy_mhd_MJ = float(ds["energy_mhd_MJ"][shot, 3])
+
+        slot_per_MJ = jax.grad(lambda energy, inputs=inputs: normalizer.normalize_with_energy(inputs, energy)[N_FEATURES])(energy_mhd_MJ)
+        energy_rate_scale = normalizer.energy_rate_scale(inputs)
+
+        assert float(slot_per_MJ * energy_rate_scale * time_unit_s) == pytest.approx(1.0, rel=1e-6)
+
+
+def test_physics_energy_slot_is_beta_n():
+    """The physics methods see the stored energy as beta_N, b_geo standing in for b0."""
+    ds = _toy_dataset()
+    inputs = _sample_inputs(ds, 1, 3, 0)
+    energy_mhd_MJ = float(ds["energy_mhd_MJ"][1, 3])
+    volume_m3 = plasma_parameters.volume_approx(inputs.geometric_axis_r, inputs.minor_radius, inputs.elongation)
+    beta_n = plasma_parameters.beta_tor_norm_from_energy_mhd_MJ(energy_mhd_MJ, volume_m3, inputs.minor_radius, inputs.b_geo, inputs.ip_MA)
+
+    energy_slot = PhysicsNormalizer().normalize_with_energy(inputs, energy_mhd_MJ)[N_FEATURES]
+
+    assert float(energy_slot) == pytest.approx(float(beta_n), rel=1e-6)
 
 
 def test_make_normalizer_rejects_unknown():

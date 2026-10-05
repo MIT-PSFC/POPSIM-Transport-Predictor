@@ -80,9 +80,9 @@ class StudyConfig(BaseModel):
     patience: int = 6  # epochs_per_val * patience = max epochs without improvement before stopping
     # Epoch cap for hyperparameter sweep trials and agent jobs
     # Trials are wall-clock limited to train_wall_budget_s and stop early via patience
-    # Capped below max_epochs so sweep trials stay cheap. The swept LR decay params
-    # (transition_steps, decay_rate) carry into production training unchanged, so
-    # tuned schedules are only validated over this shorter horizon
+    # Capped below max_epochs so sweep trials stay cheap.
+    # The swept transition_frac is a fraction of each run's own step budget,
+    # so a tuned schedule stretches to the production horizon, validated only over this shorter one
     hyperparam_max_epochs: int = 240
 
     # Environment-specific orchestration settings
