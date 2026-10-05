@@ -176,15 +176,13 @@ class ScalingLawPredictor(eqx.Module):
         )
 
         # Smooth blend so gradient reaches the scaling_lh_transition coefficients
-        # (jnp.where is piecewise constant in p_thresh, threshold could never train)
         lh_weight = jax.nn.sigmoid(LH_BLEND_SHARPNESS * (P_abs_MW / p_thresh - 1.0))
         taue = (1.0 - lh_weight) * taue_lmode + lh_weight * taue_hmode
 
         # The clamp input here is the PHYSICAL scaling-law tau_e, so the floor
         # smoothing must stay narrow: device tau_e commonly sits at 20-50 ms,
         # which a range-fraction min width would distort by tens of percent.
-        # (BoundedNNPredictor keeps symmetric widths, its clamp input is a raw
-        # NN output with no physical meaning)
+        # (BoundedNNPredictor keeps symmetric widths, its clamp input is a raw NN output with no physical meaning)
         width_max = BOUND_CLAMP_WIDTH_FRAC * (MAX_TAUE - MIN_TAUE)
         bounded = smooth_clamp(taue, MIN_TAUE, MAX_TAUE, TAUE_CLAMP_MIN_WIDTH, width_max)
         taue_pred = bounded.squeeze()
