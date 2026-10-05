@@ -34,6 +34,7 @@ from transport_study.modules.profile_predictor.module import (
     N_NN_INPUTS,
     NN_INPUT_NAMES,
     ProfilePredictor,
+    scaled_profile_points,
 )
 from transport_study.modules.profile_predictor.torax_module import (
     TAU_REF_S,
@@ -313,6 +314,19 @@ class TransportPredictor(TimeDepModule):
         return ne_pos, te_pos, debug_info
 
 
+def _peak_normalized_rows(profiles: Array, n_rho: int) -> Array:
+    """(rows, 2 * n_rho + 2) history tokens [ne / ne_peak | te / te_peak | ne_peak, te_peak] of raw [ne | te] rows.
+
+    The profile part is in [0, 1] and the peaks carry the scale history.
+    The MIN_PROFILE floor keeps a zero seed row from dividing by 0.
+    """
+    ne_rows = profiles[:, :n_rho]
+    te_rows = profiles[:, n_rho:]
+    ne_peaks = jnp.maximum(jnp.max(ne_rows, axis=1, keepdims=True), MIN_PROFILE)
+    te_peaks = jnp.maximum(jnp.max(te_rows, axis=1, keepdims=True), MIN_PROFILE)
+    return jnp.concatenate([ne_rows / ne_peaks, te_rows / te_peaks, ne_peaks, te_peaks], axis=1)
+
+
 class TransportPredictorTransformer(TransportPredictor):
     """Transport predictor using a fully data-driven transformer architecture.
 
@@ -328,10 +342,12 @@ class TransportPredictorTransformer(TransportPredictor):
     1: derive the stored energy implied by the current buffered profile (there is no measured beta_tor_norm)
     2: embed the normalized transport features of the CURRENT timestep to a query token
     (only predicted profiles are kept as history, never past input features)
-    3: embed each buffered profile plus a learned per-slot position embedding to key/value tokens
+    3: embed each buffered profile, peak-normalized plus its two peaks, and add a learned per-slot position embedding to key/value tokens
     4: attend (causal by construction, the buffer only ever contains current and past profiles)
-    5: then a residual connection and an MLP head produce the next profile
-    6: which is rolled into the buffer
+    5: then a residual connection and an MLP head produce the next profile points and their te and ne correction factors
+    6: the corrected profile is rolled into the buffer
+    Only the normalized features and the normalized history enter the network,
+    no n_e_line_average or te_approx scale.
     Without the position embedding attention is permutation-invariant over the history,
     so the model could not tell the most recent profile from the least recent
     (and the t0-seeded buffer holds identical rows, where values alone carry no ordering at all)
@@ -361,31 +377,20 @@ class TransportPredictorTransformer(TransportPredictor):
         ne_now = state.profiles[-1, :n_rho]
         te_now = state.profiles[-1, n_rho:]
 
-        # Stored energy implied by the current profile state drives every
-        # beta-derived feature and scale
+        # Stored energy implied by the current profile state drives every beta-derived feature
         energy_mhd_MJ = energy_mhd_from_profiles(ne_now, te_now, rho, inputs.volume_approx)
         features = self.normalizer(inputs.transport_nn_inputs(energy_mhd_MJ), inputs.ds_source_idx)
         query = self.feature_embed(features)
 
-        # Buffer rows are raw physical profiles: scale to order one with the
-        # same data-derived scales the profile predictors use, floored where
-        # the state or inputs are unreliable
-        ne_scale = jnp.maximum(inputs.n_e_line_average_1e20, 1e-2)
-        te_scale = jnp.clip(inputs.te_approx_from_energy_mhd(energy_mhd_MJ), 0.05, 5.0)
-        row_scale = jnp.concatenate(
-            [
-                jnp.broadcast_to(ne_scale, (n_rho,)),
-                jnp.broadcast_to(te_scale, (n_rho,)),
-            ]
-        )
-        tokens = jax.vmap(self.profile_embed)(state.profiles / row_scale) + self.pos_embed
+        # Buffer rows are raw physical profiles, the tokens see their shapes and peaks
+        history_rows = _peak_normalized_rows(state.profiles, n_rho)
+        tokens = jax.vmap(self.profile_embed)(history_rows) + self.pos_embed
 
         attn_out = self.attention(query[jnp.newaxis, :], tokens, tokens)[0]
         latent = query + attn_out
         nn_out = self.head(latent)
 
-        ne_next = nn_out[:n_rho] * ne_scale
-        te_next = nn_out[n_rho:] * te_scale
+        ne_next, te_next = scaled_profile_points(nn_out, n_rho)
         # Clipped values enter the buffer so the carried state stays physical
         ne_next, te_next, debug_info = self.positive_profiles(ne_next, te_next)
         debug_info.update(energy_mhd_MJ_state=energy_mhd_MJ)
@@ -419,14 +424,15 @@ class TransportPredictorTransformer(TransportPredictor):
         rhogrid_tuple = profile_predictor_module.static_rhogrid(rhogrid)
         n_rho = len(rhogrid_tuple)
         feature_embed = eqx.nn.Linear(N_TRANSPORT_NN_INPUTS, d_model, key=key_feat)
-        profile_embed = eqx.nn.Linear(2 * n_rho, d_model, key=key_prof)
+        # Peak-normalized [ne | te] rows plus their two peaks
+        profile_embed = eqx.nn.Linear(2 * n_rho + 2, d_model, key=key_prof)
         # Small random init breaks slot symmetry when the buffer holds a
         # constant history (the seeded state at t0)
         pos_embed = 0.02 * jax.random.normal(key_pos, (history_len, d_model))
         attention = eqx.nn.MultiheadAttention(num_heads=num_heads, query_size=d_model, key=key_attn)
         head = eqx.nn.MLP(
             in_size=d_model,
-            out_size=2 * n_rho,
+            out_size=2 * n_rho + 2,  # +2 for the te and ne correction factors
             width_size=nn_width,
             depth=nn_depth,
             key=key_head,

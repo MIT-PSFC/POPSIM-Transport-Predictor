@@ -314,7 +314,6 @@ class ProfileStudy(Study):
                     "nn_depth": 2,
                     "nn_width": 16,
                     "in_size": 10,  # Dimensionless nn_inputs derived from the raw input_vars, includes log(nu_star)
-                    "softmax_temp": 1,
                     "prng_seed": 42,
                 },
             )
@@ -382,7 +381,6 @@ class ProfileStudy(Study):
             updates["nn_width"] = tuned_config.model_init_config["nn_width"]
         if case.model_type in MODEL_TYPES_WITH_SHAPES:
             updates["n_shapes"] = tuned_config.model_init_config["n_shapes"]
-            updates["softmax_temp"] = tuned_config.model_init_config["softmax_temp"]
         elif case.model_type == "reservoir":
             updates["reservoir_size"] = tuned_config.model_init_config["reservoir_size"]
             updates["spectral_radius"] = tuned_config.model_init_config["spectral_radius"]

@@ -144,7 +144,6 @@ class ProfilePredictorTRB(TrainRunBuilder):
                 nn_depth=model_init_config["nn_depth"],
                 in_size=model_init_config["in_size"],
                 shape_type=shape_type,
-                softmax_temp=model_init_config["softmax_temp"],
                 prng_seed=model_init_config["prng_seed"],
                 normalizer=normalizer,
             )

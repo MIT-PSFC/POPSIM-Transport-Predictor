@@ -66,8 +66,8 @@ class ProfileShape(TimeIndepModule):
         self,
         n_normalize: int = 100,
     ) -> float:
-        """Calculate the integral of the profile shape."""
-        rho_norm = jnp.linspace(0, 1.2, n_normalize)
+        """Integral of the profile shape over the rho grid domain [0, 1], where the data shapes have unit integral."""
+        rho_norm = jnp.linspace(0, 1, n_normalize)
         vals_rho_norm = self.basis(self.coeffs, rho_norm)
         integral = jnp.trapezoid(vals_rho_norm, rho_norm)
         return integral
@@ -327,6 +327,20 @@ def profile_outputs(rhogrid: tuple, ne: Array, te: Array, debug_info: dict | Non
     return Outputs(ne=ne_da, te=te_da, debug_info=debug_info)
 
 
+def scaled_profile_points(output_vector: Array, n_rho: int) -> tuple[Array, Array]:
+    """ne and te from an output vector of ne points, te points, then the te and ne scale corrections.
+
+    The one decode of every data-driven profile model (mlp, reservoir, shape-init, transport transformer).
+    """
+    ne_points = output_vector[:n_rho]
+    te_points = output_vector[n_rho : 2 * n_rho]
+    te_correction = jnp.abs(output_vector[-2])
+    ne_correction = jnp.abs(output_vector[-1])
+    ne = ne_points * ne_correction
+    te = te_points * te_correction
+    return ne, te
+
+
 class ShapeType(IntEnum):
     PCA_LIKE = 0
     CONVEX_COMBINATION = 1
@@ -381,7 +395,9 @@ def pca_initial_guess(n_shapes: int, te_data: xr.DataArray, ne_data: xr.DataArra
             f"Only {te_data.sizes[sample_dim]} samples available for {n_shapes} PCA shapes, fitting {n_modes} modes and repeating them"
         )
 
-    te_eof = EOF(n_modes=n_modes)
+    # Uncentered, so the leading mode follows the average profile.
+    # A centered basis spans only the variations about the mean and cannot represent the profiles themselves.
+    te_eof = EOF(n_modes=n_modes, center=False)
     te_eof.fit(te_data, dim=sample_dim)
     te_components = te_eof.components()
     te_shapes = [
@@ -392,7 +408,7 @@ def pca_initial_guess(n_shapes: int, te_data: xr.DataArray, ne_data: xr.DataArra
         )
         for i in range(n_shapes)
     ]
-    ne_eof = EOF(n_modes=n_modes)
+    ne_eof = EOF(n_modes=n_modes, center=False)
     ne_eof.fit(ne_data, dim=sample_dim)
     ne_components = ne_eof.components()
     ne_shapes = [
@@ -416,14 +432,8 @@ class ProfilePredictor(TimeIndepModule):
     normalizer: FeatureNormalizer
 
     def assemble_profile_outputs(self, output_vector: Array, debug_info: dict | None = None) -> Outputs:
-        """Profiles from an output vector of ne points, te points, then the te and ne scale corrections."""
-        n_pred_points = len(self.rhogrid)
-        ne_points = output_vector[:n_pred_points]
-        te_points = output_vector[n_pred_points : 2 * n_pred_points]
-        ne_correction = jnp.abs(output_vector[-1])
-        te_correction = jnp.abs(output_vector[-2])
-        ne = ne_points * ne_correction
-        te = te_points * te_correction
+        """Outputs from an output vector laid out as scaled_profile_points reads it."""
+        ne, te = scaled_profile_points(output_vector, len(self.rhogrid))
         return profile_outputs(self.rhogrid, ne, te, debug_info)
 
 
@@ -432,7 +442,6 @@ class ProfilePredictorShapeInit(ProfilePredictor):
     ne_shapes: list[ProfileShape]
 
     shape_type: ShapeType = eqx.field(static=True)
-    softmax_temp: float = eqx.field(static=True, default=1.0)
 
     def __init__(
         self,
@@ -441,7 +450,6 @@ class ProfilePredictorShapeInit(ProfilePredictor):
         nn_width: int,
         nn_depth: int,
         in_size: int,
-        softmax_temp: float,
         shape_type: ShapeType,
         rhogrid: tuple,
         key: jax.random.PRNGKey,
@@ -461,7 +469,6 @@ class ProfilePredictorShapeInit(ProfilePredictor):
             final_activation=Activation.IDENTITY,
             key=subkey,
         )
-        self.softmax_temp = softmax_temp
         self.shape_type = shape_type
         self.rhogrid = rhogrid
 
@@ -479,8 +486,8 @@ class ProfilePredictorShapeInit(ProfilePredictor):
         corrections = coeffs_and_corrections[-2:]
 
         if self.shape_type == ShapeType.CONVEX_COMBINATION:
-            te_coeffs = jax.nn.softmax(te_coeffs / self.softmax_temp)
-            ne_coeffs = jax.nn.softmax(ne_coeffs / self.softmax_temp)
+            te_coeffs = jax.nn.softmax(te_coeffs)
+            ne_coeffs = jax.nn.softmax(ne_coeffs)
         elif self.shape_type == ShapeType.PCA_LIKE:
             # NN outputs are already ready to be used as coefficients.
             pass
@@ -497,8 +504,8 @@ class ProfilePredictorShapeInit(ProfilePredictor):
             axis=0,
         )
 
-        ne_points = jnp.sum(ne_shapes, axis=0)
-        te_points = jnp.sum(te_shapes, axis=0)
+        ne_points = jnp.sum(ne_shapes, axis=0) * inputs.n_e_line_average_1e20
+        te_points = jnp.sum(te_shapes, axis=0) * inputs.te_approx
 
         if debug:
             debug_info = {
@@ -509,7 +516,7 @@ class ProfilePredictorShapeInit(ProfilePredictor):
             debug_info = None
 
         output_vector = jnp.concatenate([ne_points, te_points, corrections])
-        return self.assemble_profile_outputs(output_vector, inputs, debug_info)
+        return self.assemble_profile_outputs(output_vector, debug_info)
 
     @classmethod
     def init(
@@ -520,7 +527,6 @@ class ProfilePredictorShapeInit(ProfilePredictor):
         nn_depth: int,
         in_size: int,
         shape_type: ShapeType,
-        softmax_temp: float,
         prng_seed: int,
         normalizer: FeatureNormalizer,
     ) -> "ProfilePredictor":
@@ -538,7 +544,6 @@ class ProfilePredictorShapeInit(ProfilePredictor):
             nn_width=nn_width,
             nn_depth=nn_depth,
             in_size=in_size,
-            softmax_temp=softmax_temp,
             shape_type=shape_type,
             rhogrid=rhogrid_tuple,
             key=jax.random.PRNGKey(prng_seed),
@@ -620,7 +625,7 @@ class ProfilePredictorReservoir(ProfilePredictor):
         state = self.reservoir_state(nn_inputs)
         # Profile values directly on the rhogrid
         nn_outputs = self.nn(state)
-        return self.assemble_profile_outputs(nn_outputs, inputs)
+        return self.assemble_profile_outputs(nn_outputs)
 
 
 class ProfilePredictorUnstructuredNN(ProfilePredictor):
@@ -654,4 +659,4 @@ class ProfilePredictorUnstructuredNN(ProfilePredictor):
         nn_inputs = self.normalizer(inputs.nn_inputs, inputs.ds_source_idx)
         # Profile values directly on the rhogrid
         nn_outputs = self.nn(nn_inputs)
-        return self.assemble_profile_outputs(nn_outputs, inputs)
+        return self.assemble_profile_outputs(nn_outputs)

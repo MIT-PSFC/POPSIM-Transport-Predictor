@@ -30,7 +30,6 @@ PROFILE_PREDICTOR_SHAPE_INIT_CONFIG = {
         "nn_depth": 2,
         "nn_width": 16,
         "in_size": 10,  # Dimensionless nn_inputs derived from the raw input_vars, includes log(nu_star)
-        "softmax_temp": 1,
         "prng_seed": 42,
     },
     "loss_config": {
