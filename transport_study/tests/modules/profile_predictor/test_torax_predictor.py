@@ -16,6 +16,7 @@ from transport_study.modules.profile_predictor.module import Inputs
 from transport_study.modules.profile_predictor.torax_module import (
     TRANSPORT_COEFFICIENT_NAMES,
     bound_transport_coefficients,
+    clamp_core_profiles,
     transport_provider_mapping,
     validate_transport_model_name,
 )
@@ -297,6 +298,25 @@ def test_resolve_relaxation_overrides():
         resolve_relaxation_overrides({"t_final": 0.2, "fixed_dt": 0.02, "n_solver_steps": 5})
     with pytest.raises(ValueError, match="requires t_final"):
         resolve_relaxation_overrides({"n_solver_steps": 5})
+
+
+def test_clamp_core_profiles_is_identity_in_range(make_torax_module):
+    """Repeated clamping leaves in-range profiles bitwise unchanged.
+
+    The clamp runs after every solver step, so an in-range shift accumulates per step
+    (a 4 keV softplus width removed 2-27 eV per call).
+    """
+    module = make_torax_module("gyrobohm")
+    inputs = jax.tree_util.tree_map(lambda x: x[0], _batch_inputs())
+    provider, geo = module.build_provider_and_geo(inputs, module.nn_coefficients(inputs))
+    state, _ = torax_experimental.get_initial_state_and_post_processed_outputs(
+        step_fn=module.step_fn, runtime_params_overrides=provider, geometry_overrides=geo
+    )
+    clamped = state
+    for _ in range(100):
+        clamped = clamp_core_profiles(clamped)
+    for name in ("T_e", "T_i", "n_e"):
+        np.testing.assert_array_equal(getattr(clamped.core_profiles, name).value, getattr(state.core_profiles, name).value)
 
 
 def test_torax_max_steps_from_n_solver_steps(make_torax_module):

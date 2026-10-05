@@ -143,12 +143,15 @@ TORAX_CONFIG_BASE: dict[str, Any] = {
         # Same as the legacy fallback for circular geometry, but explicit to
         # silence the TORAX deprecation warning.
         "initial_psi_mode": "j",
+        # No non-inductive current source and bootstrap off, so the formula current is the total current.
+        # This skips TORAX's psi and source iteration, which the transport rebuild runs every step
+        "initial_j_is_total_current": True,
     },
     "numerics": {
         "t_initial": 0.0,
-        "t_final": 0.1,  # Give it ~100 ms to relax, on order of energy confinement time
-        # Linear theta solver is implicit / unconditionally stable, so we
-        # can take large fixed steps to reach steady state cheaply
+        "t_final": 0.1,
+        # With the Pereverzev linear step below, every step makes the same progress at any dt,
+        # so the relaxation is a fixed number of damped steps from the initial profiles, not a steady state
         "fixed_dt": 2e-2,
         "min_dt": 1e-3,
         # dt never changes with the fixed time-step calculator, so the
@@ -176,10 +179,11 @@ TORAX_CONFIG_BASE: dict[str, Any] = {
         "n_rho": 50,
     },
     # "transport" block filled per transport model from TORAX_TRANSPORT_BLOCKS
+    # No cyclotron radiation, it is negligible at these fields and temperatures (measured no output change).
+    # No generic_current either, TORAX's default drives 20 percent of Ip at rho 0.4 and reverses the shear
     "sources": {
         "ei_exchange": {},
         "bremsstrahlung": {},
-        "cyclotron_radiation": {},
         "ohmic": {},
         "gas_puff": {"S_total": 9999},  # Predicted by NN
         # NN-inferred auxiliary heating. All entries except
@@ -195,21 +199,21 @@ TORAX_CONFIG_BASE: dict[str, Any] = {
             "electron_heat_fraction": 0.6,  # Predicted by NN
             "absorption_fraction": 0.9,
         },
-        "generic_current": {},
     },
+    # The profile relaxation solver, the transport predictor replaces it per transport model.
     "solver": {
-        # Active for the linear theta solver this config selects,
-        # TORAX warns when a nonlinear transport model like qlknn runs on a linear solver without it
+        # Pereverzev at the TORAX defaults (chi 30, D 15 m^2/s) damps every shape change by ~dt chi / a^2 per step.
+        # That keeps the lagged linear step from oscillating, but it pins the progress per step
         "use_pereverzev": True,
-        # One linearized solve per step, no fixed-point corrector iterations.
-        # Benchmarked at the 20 ms dt above, 1/2/4/8 corrector steps all reach the same val loss within the seed spread.
+        # One linearized solve per step: transport coefficients, sources and the transient n_e are taken at the old state
         "use_predictor_corrector": False,
-        # Backward (implicit) Euler, unconditionally stable at the 20 ms dt.
+        # Backward (implicit) Euler.
         # Forward Euler (0.0) violates the diffusion CFL bound dt <= dx^2 / (2 chi) by orders of magnitude here.
         "theta_implicit": 1.0,
     },
     "time_step_calculator": {"calculator_type": "fixed"},
-    "neoclassical": {},
+    # Kim poloidal velocity only feeds the ExB shear of rotation-enabled QuaLiKiz-family models, and rotation is off
+    "neoclassical": {"poloidal_velocity": {"model_name": "zeros"}},
     "pedestal": {},
 }
 

@@ -6,7 +6,6 @@ import jax.numpy as jnp
 import numpy as np
 import xarray as xr
 from popsim import TimeIndepModule
-from popsim.math_utils import smooth_clamp
 from popsim.ml.rtd_mlp import Activation, RtdMLP
 from torax import ToraxConfig
 from torax import experimental as torax_experimental
@@ -403,28 +402,32 @@ def build_miller_geometry_jax(
     )
 
 
-# Soft clamp bounds (lo, hi, lo_width, hi_width) for the evolving core profiles,
+# Clamp bounds (lo, hi) for the evolving core profiles,
 # in TORAX internal units: temperatures in keV, density in m^-3.
-# Bounds sit far outside the physical range of C-Mod/MAST/TCV/DIII-D
-# widths set how far past a bound the saturation still has usable gradient.
-_TE_CLAMP_KEV = (0.005, 30.0, 0.005, 4.0)
-_NE_CLAMP_M3 = (1e17, 1e21, 1e17, 5e19)
+# Bounds sit far outside the physical range of C-Mod/MAST/TCV/DIII-D.
+_TE_CLAMP_KEV = (0.005, 30.0)
+_NE_CLAMP_M3 = (1e17, 1e21)
 
 
 def clamp_core_profiles(state):
-    """Return state with T_e, T_i, n_e cell values soft-clamped to physical range.
+    """Return state with T_e, T_i, n_e cell values clipped to the clamp bounds.
 
     Applied to the state carried between solver steps, before the next step_fn call,
     so the clamp acts before the operations that manufacture inf/NaN from an extreme state
-    (resistivity ~ T^-1.5, divisions by n_e)
-    Clamping after the loop would be too late: NaN propagates, and softplus(NaN) stays NaN.
+    (resistivity ~ T^-1.5, divisions by n_e).
+    Clamping after the loop would be too late, NaN propagates.
+    It runs after every step, so it must be the exact identity in range:
+    any in-range shift accumulates per step, not per unit time.
+    A softplus clamp with a 4 keV width removed 2-27 eV per call,
+    an artificial heat sink of 9-27 percent of the loss power at 1 ms steps.
+    The gradient is zero only past a bound.
     """
     cp = state.core_profiles
     cp = dataclasses.replace(
         cp,
-        T_e=dataclasses.replace(cp.T_e, value=smooth_clamp(cp.T_e.value, *_TE_CLAMP_KEV)),
-        T_i=dataclasses.replace(cp.T_i, value=smooth_clamp(cp.T_i.value, *_TE_CLAMP_KEV)),
-        n_e=dataclasses.replace(cp.n_e, value=smooth_clamp(cp.n_e.value, *_NE_CLAMP_M3)),
+        T_e=dataclasses.replace(cp.T_e, value=jnp.clip(cp.T_e.value, *_TE_CLAMP_KEV)),
+        T_i=dataclasses.replace(cp.T_i, value=jnp.clip(cp.T_i.value, *_TE_CLAMP_KEV)),
+        n_e=dataclasses.replace(cp.n_e, value=jnp.clip(cp.n_e.value, *_NE_CLAMP_M3)),
     )
     return dataclasses.replace(state, core_profiles=cp)
 
@@ -519,12 +522,13 @@ def bound_transport_coefficients(transport_model: str, nn_transport_out: jax.Arr
         #   D_face_c1: 0.01 - 5  (diffusivity weighting at the axis, TORAX default 1.0)
         #   D_face_c2: 0.01 - 5  (diffusivity weighting at the edge, TORAX default 0.3)
         #   V_face_coeff: -4 - 2 (convectivity / diffusivity ratio, TORAX default -0.1).
-        #     The sigmoid bias puts a random init at the TORAX default
+        # The sigmoid biases put a zero output at the TORAX defaults of D_face_c1, D_face_c2 and V_face_coeff.
+        # Unbiased, D_face_c1 and D_face_c2 would start at 2.5, which empties a TCV plasma in ~5 ms
         return {
             "chi_bohm_multiplier": jnp.exp(3.0 * jnp.tanh(nn_transport_out[0:1])),
             "chi_gyrobohm_multiplier": jnp.exp(3.0 * jnp.tanh(nn_transport_out[1:2])),
-            "D_face_c1": 0.01 + 4.99 * jax.nn.sigmoid(nn_transport_out[2:3]),
-            "D_face_c2": 0.01 + 4.99 * jax.nn.sigmoid(nn_transport_out[3:4]),
+            "D_face_c1": 0.01 + 4.99 * jax.nn.sigmoid(nn_transport_out[2:3] - 1.40),
+            "D_face_c2": 0.01 + 4.99 * jax.nn.sigmoid(nn_transport_out[3:4] - 2.79),
             "V_face_coeff": 2.0 - 6.0 * jax.nn.sigmoid(nn_transport_out[4:5] - 0.62),
         }
     else:  # qlknn

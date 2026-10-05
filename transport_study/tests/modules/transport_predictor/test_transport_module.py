@@ -39,6 +39,7 @@ from transport_study.modules.profile_predictor.module import (
 from transport_study.modules.profile_predictor.torax_module import (
     TAU_REF_S,
     ProfilePredictorTorax,
+    clamp_core_profiles,
 )
 from transport_study.modules.profile_predictor.train_configs import (
     TORAX_CONFIG_BASE,
@@ -524,6 +525,55 @@ def test_torax_rebuild_step_gradients_finite(transport_model):
         leaves = jax.tree_util.tree_leaves(eqx.filter(getattr(grads, name), eqx.is_inexact_array))
         assert all(bool(jnp.all(jnp.isfinite(leaf))) for leaf in leaves), name
         assert any(bool(jnp.any(leaf != 0.0)) for leaf in leaves), name
+
+
+@pytest.mark.slow
+def test_torax_one_ms_step_matches_fine_substeps():
+    """Twenty carried 1 ms gyrobohm steps match two hundred converged 0.1 ms substeps.
+
+    Pins the transport solver of make_transport_torax_config.
+    The reference runs 4 corrector iterations without Pereverzev whatever the config says:
+    the missing -T dn/dt of a corrector-free step does not shrink with dt, so a self-convergence check would miss it.
+    Without the corrector Te is off by 0.08 here,
+    and the old linear step with the default Pereverzev is off by 0.21.
+    """
+    converged_solver = {"use_pereverzev": False, "use_predictor_corrector": True, "n_corrector_steps": 4}
+
+    def carried_cell_profiles(sim_dt: float, n_steps: int, solver_overrides: dict) -> tuple[np.ndarray, np.ndarray]:
+        torax_config = make_transport_torax_config("gyrobohm")
+        torax_config["numerics"].update({"t_final": sim_dt, "fixed_dt": sim_dt, "min_dt": sim_dt / 10})
+        torax_config["solver"].update(solver_overrides)
+        module = TransportPredictorTorax.init(
+            rhogrid=jnp.asarray(RHO),
+            torax_config=torax_config,
+            nn_width=8,
+            nn_depth=2,
+            prng_seed=0,
+            normalizer=make_transport_nn_input_normalizer("physics", None, 2, target_idx=0),
+            sim_dt=sim_dt,
+            transport_model="gyrobohm",
+            geometry_builder="circular",
+            delta_exponent=2.0,
+        )
+        state, post, provider, geo, _ = module.seed_initial_state(make_inputs(), jnp.asarray(NE0), jnp.asarray(TE0))
+
+        @jax.jit
+        def advance(state, post):
+            # Rewind t before each step, as the carried-state module does
+            state = dataclasses.replace(state, t=jnp.zeros_like(state.t))
+            state, post = module.step_fn(state, post, runtime_params_overrides=provider, geo_overrides=geo)
+            return clamp_core_profiles(state), post
+
+        for _ in range(n_steps):
+            state, post = advance(state, post)
+        return np.asarray(state.core_profiles.T_e.value), np.asarray(state.core_profiles.n_e.value)
+
+    te_coarse, ne_coarse = carried_cell_profiles(1e-3, 20, {})
+    te_fine, ne_fine = carried_cell_profiles(1e-4, 200, converged_solver)
+    te_error = np.sqrt(np.mean((te_coarse - te_fine) ** 2)) / np.abs(te_fine).max()
+    ne_error = np.sqrt(np.mean((ne_coarse - ne_fine) ** 2)) / np.abs(ne_fine).max()
+    assert te_error < 0.02
+    assert ne_error < 0.02
 
 
 def test_torax_absorption_fraction_nn(torax_rebuild_module):
