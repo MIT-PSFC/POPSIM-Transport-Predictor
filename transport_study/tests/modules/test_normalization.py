@@ -1,4 +1,5 @@
 import equinox as eqx
+import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
@@ -6,17 +7,22 @@ import xarray as xr
 
 from transport_study.modules.normalization import (
     CORAL_DEGENERATE_STD_FRAC,
+    FEATURE_NORMALIZATIONS,
+    INPUT_NORMALIZATIONS,
     MIN_CORAL_SHOTS,
     N_FEATURES,
     NORM_INPUT_VARS,
     CoralNormalizer,
     InputNormalizer,
-    PhysicsCoralNormalizer,
     PhysicsNormalizer,
     PhysicsZScoreNormalizer,
     RawNormalizer,
+    ZScoreFeatureNormalizer,
     ZScoreNormalizer,
+    feature_fit_arrays,
     fit_coral_stats,
+    flat_columns,
+    make_feature_normalizer,
     make_normalizer,
 )
 from transport_study.orchestration.organize_data import normalize_domain
@@ -98,30 +104,36 @@ def test_physics_matches_normalize_domain():
         assert np.isclose(float(out.power_additional_MW), float(ds_ref["surface_power_density"][shot, t]), rtol=1e-5)
 
 
-def test_z_score_standardizes_per_device():
+def _device_outputs(norm: InputNormalizer, ds: xr.Dataset, device: int) -> np.ndarray:
+    """(N, N_FEATURES) normalized outputs of every timeslice of one device's shots."""
+    rows = []
+    for shot in np.flatnonzero(ds["ds_source_idx"].values == device):
+        for t in range(ds.sizes["time_idx"]):
+            out = norm(_sample_inputs(ds, int(shot), t, device))
+            rows.append(out.to_vec())
+    return np.array(rows)
+
+
+@pytest.mark.parametrize("norm_cls", [ZScoreNormalizer, PhysicsZScoreNormalizer])
+def test_z_score_standardizes_per_device(norm_cls):
+    """Each fitted device comes out at zero mean and unit std, in the raw or the physics feature space."""
     ds = _toy_dataset()
-    norm = ZScoreNormalizer.fit(ds, n_devices=N_DEVICES)
+    norm = norm_cls.fit(ds, n_devices=N_DEVICES)
 
     for device in (0, 1):
-        rows = []
-        for shot in np.where(ds["ds_source_idx"].values == device)[0]:
-            for t in range(ds.sizes["time_idx"]):
-                out = norm(_sample_inputs(ds, int(shot), t, device))
-                rows.append(out.to_vec())
-        arr = np.array(rows)
-        mean = np.nanmean(arr, axis=0)
-        std = np.nanstd(arr, axis=0)
-        np.testing.assert_allclose(mean, np.zeros(N_FEATURES), atol=0.05)
-        np.testing.assert_allclose(std, np.ones(N_FEATURES), atol=0.05)
+        outputs = _device_outputs(norm, ds, device)
+        np.testing.assert_allclose(np.nanmean(outputs, axis=0), np.zeros(N_FEATURES), atol=0.05)
+        np.testing.assert_allclose(np.nanstd(outputs, axis=0), np.ones(N_FEATURES), atol=0.05)
 
 
-def test_z_score_unfitted_device_passthrough():
+@pytest.mark.parametrize(("norm_cls", "unfitted_cls"), [(ZScoreNormalizer, RawNormalizer), (PhysicsZScoreNormalizer, PhysicsNormalizer)])
+def test_z_score_unfitted_device_passthrough(norm_cls, unfitted_cls):
+    """A device absent from the fit keeps the identity stats, so it gets the plain features of its space."""
     ds = _toy_dataset()
-    norm = ZScoreNormalizer.fit(ds, n_devices=N_DEVICES)
-    inp = _sample_inputs(ds, 0, 1, device=2)  # device 2 never fitted
-    out = norm(inp)
-    for var in NORM_INPUT_VARS:
-        assert np.isclose(float(getattr(out, var)), float(getattr(inp, var)))
+    norm = norm_cls.fit(ds, n_devices=N_DEVICES)
+    inp = _sample_inputs(ds, 0, 1, device=2)
+
+    np.testing.assert_allclose(norm(inp).to_vec(), unfitted_cls()(inp).to_vec(), rtol=1e-6)
 
 
 def test_coral_aligns_source_covariance_to_target():
@@ -251,30 +263,35 @@ def test_coral_shot_gates():
     )
 
 
-def test_physics_zscore_standardizes_in_physics_space():
-    """PhysicsZScoreNormalizer.fit on the toy dataset:
-    - transformed outputs of each fitted device have ~zero mean and ~unit std
-      per physics feature (compare against physics_feature_vec applied to the
-      same rows)
-    - device 2 (never fitted) keeps identity stats, so its output equals the
-      plain physics features
-    - identity() and fit() instances share pytree structure (transfer restore
-      overwrites identity buffers from a fitted checkpoint)
-    """
+def _assert_same_layout(identity, fitted):
+    """Same class, pytree structure, and array shapes and dtypes, so fitted buffers restore into the identity instance."""
+    assert type(identity) is type(fitted)
+    assert jax.tree.structure(identity) == jax.tree.structure(fitted)
+    identity_leaves = jax.tree.leaves(eqx.filter(identity, eqx.is_array))
+    fitted_leaves = jax.tree.leaves(eqx.filter(fitted, eqx.is_array))
+    assert [(leaf.shape, leaf.dtype) for leaf in identity_leaves] == [(leaf.shape, leaf.dtype) for leaf in fitted_leaves]
 
 
-def test_make_normalizer_identity_without_data():
-    for method, cls in [
-        ("zscore", ZScoreNormalizer),
-        ("coral", CoralNormalizer),
-        ("physics-coral", PhysicsCoralNormalizer),
-        ("physics-zscore", PhysicsZScoreNormalizer),
-    ]:
-        norm = make_normalizer(method, train_ds=None, n_devices=N_DEVICES, target_idx=TARGET_IDX)
-        assert isinstance(norm, cls)
-        fitted = make_normalizer(method, train_ds=_toy_dataset(), n_devices=N_DEVICES, target_idx=TARGET_IDX)
-        # Identity and fitted instances share pytree structure (checkpoint restore relies on it)
-        assert jnp.asarray(norm.means).shape == jnp.asarray(fitted.means).shape
+@pytest.mark.parametrize("method", INPUT_NORMALIZATIONS)
+def test_normalizer_without_data_matches_fitted_layout(method):
+    """A transfer case builds its normalizer without data and restores the pretrain statistics into it."""
+    ds = _toy_dataset(n_shots=2 * MIN_CORAL_SHOTS)
+
+    identity = make_normalizer(method, train_ds=None, n_devices=N_DEVICES, target_idx=TARGET_IDX)
+    fitted = make_normalizer(method, train_ds=ds, n_devices=N_DEVICES, target_idx=TARGET_IDX)
+
+    _assert_same_layout(identity, fitted)
+
+
+@pytest.mark.parametrize("method", FEATURE_NORMALIZATIONS)
+def test_feature_normalizer_without_data_matches_fitted_layout(method):
+    ds = _toy_dataset(n_shots=2 * MIN_CORAL_SHOTS)
+    fit_data = feature_fit_arrays(ds, flat_columns(ds, NORM_INPUT_VARS))
+
+    identity = make_feature_normalizer(method, None, N_DEVICES, N_FEATURES, TARGET_IDX)
+    fitted = make_feature_normalizer(method, fit_data, N_DEVICES, N_FEATURES, TARGET_IDX)
+
+    _assert_same_layout(identity, fitted)
 
 
 def test_make_normalizer_rejects_unknown():
@@ -298,93 +315,29 @@ def test_stats_are_arrays_not_trainable_by_selectors():
 
 
 def test_zscore_feature_normalizer_standardizes_per_device():
-    """ZScoreFeatureNormalizer.fit_from_features on a toy (N, F) matrix with two
-    devices: transformed rows of each fitted device have ~zero mean and ~unit
-    std per feature, and the transform matches (x - mean_d) / std_d exactly.
-    """
+    """Each fitted device comes out at zero mean and unit std per feature, an unfitted device passes through."""
+    rng = np.random.default_rng(3)
+    features = np.concatenate([rng.normal([1.0, -2.0], [0.5, 3.0], (200, 2)), rng.normal([4.0, 0.0], [2.0, 0.1], (100, 2))])
+    source_idx = np.repeat([0, 1], [200, 100])
+    norm = ZScoreFeatureNormalizer.fit_from_features(features, source_idx, n_devices=N_DEVICES)
+
+    normalized = np.asarray(jax.vmap(norm)(jnp.asarray(features), jnp.asarray(source_idx)))
+    for device in (0, 1):
+        device_rows = normalized[source_idx == device]
+        np.testing.assert_allclose(device_rows.mean(axis=0), 0.0, atol=1e-5)
+        np.testing.assert_allclose(device_rows.std(axis=0), 1.0, atol=1e-5)
+    np.testing.assert_allclose(norm(jnp.asarray(features[0]), 2), features[0], rtol=1e-6)
 
 
-def test_zscore_feature_normalizer_unfitted_device_passthrough():
-    """A device index absent from the fitting data keeps the identity row
-    (mean 0, std 1), so its feature vectors pass through unchanged. Mirrors
-    test_z_score_unfitted_device_passthrough for the feature-vector variant.
-    """
+def test_feature_fit_arrays_drops_unattributed_rows():
+    """Rows without a device index (NaN padding of a concatenation) are dropped, the rest stay aligned with their device and shot."""
+    ds = _toy_dataset(n_shots=4, n_time=3)
+    ds["ds_source_idx"][1] = np.nan
+    features = flat_columns(ds, ["ip_MA", "b_geo"])
 
+    kept_features, source_idx, shot_idx = feature_fit_arrays(ds, features)
 
-def test_zscore_feature_normalizer_identity_matches_fitted_structure():
-    """ZScoreFeatureNormalizer.identity and .fit_from_features instances share
-    pytree structure (same field names, array shapes, dtypes). Transfer
-    restore builds the identity instance and overwrites its buffers from a
-    checkpoint written by a fitted instance, so any structure drift breaks
-    physics-zscore transfer cases.
-    """
-
-
-def test_profile_model_init_physics_zscore_dispatch():
-    """ProfilePredictorTRB.model_init with data_normalization='physics-zscore':
-    - without transfer_checkpoint the module normalizer is a
-      ZScoreFeatureNormalizer fitted on the 10 nn_inputs (non-identity stats
-      for devices present in the training data)
-    - with transfer_checkpoint set the normalizer is
-      ZScoreFeatureNormalizer.identity (buffers to be overwritten by restore)
-    - 'physics' still yields identity CoralFeatureNormalizer and unknown
-      methods still raise ValueError
-    """
-
-
-def test_physics_zscore_is_stat_normalization_pretrain_case():
-    """A profile transfer case with data_normalization='physics-zscore' (or
-    'physics-coral') gets a transfer_pretrain_case() with
-    domain_adaptation='transfer_pretrain' keeping this case's
-    num_target_shots (the stat-fit-on-historic+target twin-case design),
-    while 'physics' falls back to the plain da=None baseline prereq.
-    """
-
-
-def test_profile_case_norm_token_naming():
-    """str(case) naming with the data_normalization axis:
-    - every method (physics, physics-coral, physics-zscore) produces its own
-      norm_{method} token between td_ and freeze_, data_normalization is not
-      suppressed from the case name (unlike geometry_builder's "circular")
-    - restore_predictor.checkpoint_to_profile_case round-trips all three
-      (with and without geom_ / targ_ / da_ tokens present)
-    """
-
-
-def test_model_init_requires_data_normalization():
-    """ProfilePredictorTRB.model_init and TransportPredictorTRB.model_init raise
-    KeyError when model_init_config has no data_normalization key, instead of
-    silently falling back to a fitted stat stage. Matches the power balance
-    TRBs, which index the key strictly - a config that lost the key must fail
-    loudly, not train a different model than its case name claims.
-    """
-
-
-def test_make_feature_normalizer_matches_make_normalizer_contract():
-    """make_feature_normalizer is the feature-vector twin of make_normalizer,
-    and both module wrappers (profile make_nn_input_normalizer, transport
-    make_transport_nn_input_normalizer) inherit its contract:
-    - fit_data None yields identity buffers whose pytree structure matches the
-      fitted instance of the same method (so a transfer restore lands cleanly)
-    - 'physics' yields identity CoralFeatureNormalizer buffers with either
-      fit_data, 'physics-coral' / 'physics-zscore' yield their fitted class
-    - a power-balance-only method ('raw', 'zscore', 'coral') raises ValueError
-    - feature_fit_arrays drops rows whose ds_source_idx is NaN and keeps the
-      features, device indices, and shot indices aligned
-    """
-
-
-def test_normalize_domain_feature_spaces_match_modules():
-    """normalize_domain(..., feature_space=...) visualizes exactly the features
-    each study's modules consume:
-    - 'profile' writes module.nn_input_matrix column by column (identity slots
-      beta_tor_norm / kappa / triangularity_upper / triangularity_lower stay the raw dataset vars)
-    - 'transport' writes transport_nn_input_matrix the same way (identity slots
-      kappa / triangularity_upper / triangularity_lower, and beta_tor_norm IS written since the transport
-      datasets carry no measured beta_tor_norm)
-    - physics-coral / physics-zscore stats fitted here match the stats the
-      matching make_*_normalizer fits on the same dataset
-    - 'power_balance' is unchanged (still the 7 physics features plus the
-      Wtot-derived beta extra)
-    - an unknown feature space raises ValueError
-    """
+    mask_attributed = np.repeat(ds["shot"].values != 1, ds.sizes["time_idx"])
+    np.testing.assert_array_equal(kept_features, features[mask_attributed])
+    np.testing.assert_array_equal(shot_idx, np.repeat([0, 2, 3], ds.sizes["time_idx"]))
+    np.testing.assert_array_equal(source_idx, np.repeat(ds["ds_source_idx"].values[[0, 2, 3]], ds.sizes["time_idx"]).astype(int))

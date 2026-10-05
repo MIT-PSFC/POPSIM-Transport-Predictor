@@ -46,9 +46,11 @@ class StubCase:
     prereqs: list[StubCase] | None = None
     training_data: SimpleNamespace = field(default_factory=lambda: SimpleNamespace(sources=[], exnihilo=False))
     domain_adaptation: str | None = None
+    # A hyperparam case also owns sweep agent jobs
+    hyperparam: bool = False
 
     def is_hyperparam_case(self) -> bool:
-        return False
+        return self.hyperparam
 
     def is_impossible(self) -> bool:
         return False

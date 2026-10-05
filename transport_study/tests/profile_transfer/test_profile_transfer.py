@@ -132,14 +132,3 @@ def test_study_cmod_to_mast():
     _run_every_case(study, skip_tuning=True)
 
     study.collect_results().to_netcdf(study.collected_results_path())
-
-
-def test_transfer_trainable_getter_is_last_layer_only():
-    """ProfilePredictorTRB.get_trainable_getter with domain_adaptation='transfer'
-    returns only the last-layer leaves of every network in the module
-    (module.nn for shape-init / mlp / reservoir, nn_transport + nn_sources +
-    nn_edge for torax-*), matching PowerBalanceEnv.get_trainable. Shapes,
-    reservoir weights, and the normalizer statistics restored from the pretrain
-    checkpoint stay frozen regardless of freeze_shapes. Every other
-    domain_adaptation keeps the per-family getter.
-    """

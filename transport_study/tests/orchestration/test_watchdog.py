@@ -8,12 +8,11 @@ Both exist so a case can never be stranded by a job that will not finish:
 - The pending watchdog (Study._kill_long_pending_jobs) cancels a job stuck
   PENDING on a spillover partition, handing the case back to the launch path
   so pick_partition can re-decide placement. The primary partition is exempt.
-
-The pending-watchdog bodies are blocked out as docstring stubs.
 """
 
 import os
 import time
+from types import SimpleNamespace
 
 import jax.numpy as jnp
 import pytest
@@ -23,9 +22,11 @@ from popsim.ml.checkpointing import (
     save_train_state,
 )
 
+from transport_study.orchestration import slurm_utils
 from transport_study.orchestration import study as study_module
 from transport_study.orchestration.study import (
     WATCHDOG_MIN_AGE_S,
+    WATCHDOG_PENDING_S,
     WATCHDOG_STALL_S,
     Study,
 )
@@ -134,91 +135,136 @@ def test_latest_checkpoint_epoch_reads_real_checkpoint_layout(study, case):
 
 
 # ----------------------------------------------------------------------
-# Pending watchdog (Study._kill_long_pending_jobs)
+# Pending watchdog (Study._kill_long_pending_jobs, driven through run_unfinished_cases)
 # ----------------------------------------------------------------------
-def test_pending_job_past_threshold_is_cancelled():
-    """A train job pending WATCHDOG_PENDING_S or longer on a spillover partition gets cancelled.
+SPILLOVER_PARTITIONS = ("spill_a", "spill_b")
 
-    Mock get_pending_job_pending_s to return the case's train job name at
-    WATCHDOG_PENDING_S seconds and assert cancel_job is called once with
-    state="PENDING" and the spillover partition string for that job name.
+
+@pytest.fixture
+def spillover_study(make_stub_study) -> Study:
+    """The primary partition also listed among the spillover ones, which the watchdog must filter out."""
+    return make_stub_study(
+        [StubCase(name="case.a", hyperparam=True)],
+        study_name="pending_watchdog_test",
+        partition="primary",
+        spillover_partitions=("primary", *SPILLOVER_PARTITIONS),
+    )
+
+
+def run_one_pass(monkeypatch, study: Study, pending: dict[str, int] | None) -> SimpleNamespace:
+    """One run_unfinished_cases pass with the given squeue pending map, the case finishing in it.
+
+    Returns the partitions the pending squeue was asked about and every cancel_job call.
     """
+    calls = SimpleNamespace(pending_queries=[], cancels=[])
+
+    def pending_job_pending_s(partition=None):
+        calls.pending_queries.append(partition)
+        return pending
+
+    def cancel_job(job_name, partition=None, state="RUNNING"):
+        calls.cancels.append((job_name, partition, state))
+
+    def finish_case(case, skip_tuning, enable_parallelism):
+        result_path = study.result_path(case)
+        result_path.parent.mkdir(parents=True, exist_ok=True)
+        result_path.touch()
+
+    monkeypatch.setattr(study_module, "get_pending_job_pending_s", pending_job_pending_s)
+    monkeypatch.setattr(study_module, "cancel_job", cancel_job)
+    monkeypatch.setattr(study_module, "get_running_job_names", lambda partition=None: set())
+    monkeypatch.setattr(study_module, "get_running_job_elapsed_s", lambda partition=None: {})
+    monkeypatch.setattr(study_module, "pick_partition", lambda *args, **kwargs: "primary")
+    monkeypatch.setattr(study_module.time, "sleep", lambda s: None)
+    monkeypatch.setattr(study, "run_case", finish_case)
+    study.run_unfinished_cases(skip_tuning=True, enable_parallelism=True)
+    return calls
 
 
-def test_primary_partition_pending_jobs_are_exempt():
-    """The watchdog only queries and cancels on spillover partitions.
+@pytest.mark.parametrize(("pending_s", "cancelled"), [(WATCHDOG_PENDING_S, True), (WATCHDOG_PENDING_S - 1, False)])
+def test_spillover_train_job_cancelled_past_threshold(spillover_study, monkeypatch, pending_s, cancelled):
+    """Only the spillover partitions are queried and cancelled on, so a primary-partition job keeps its queue position."""
+    train_job_name = spillover_study.train_job_name(spillover_study.cases[0])
 
-    Both get_pending_job_pending_s and cancel_job must receive the
-    comma-joined config.spillover_partitions (with config.partition filtered
-    out if it appears there), never config.partition, so a job pending on the
-    primary partition keeps its queue position no matter how long it pends.
+    calls = run_one_pass(monkeypatch, spillover_study, {train_job_name: pending_s})
+
+    spillover = ",".join(SPILLOVER_PARTITIONS)
+    assert calls.pending_queries == [spillover]
+    assert calls.cancels == ([(train_job_name, spillover, "PENDING")] if cancelled else [])
+
+
+def test_no_spillover_partitions_disables_watchdog(make_stub_study, monkeypatch):
+    study = make_stub_study([StubCase(name="case.a")], partition="primary", spillover_partitions=())
+    train_job_name = study.train_job_name(study.cases[0])
+
+    calls = run_one_pass(monkeypatch, study, {train_job_name: 10 * WATCHDOG_PENDING_S})
+
+    assert calls.pending_queries == []
+    assert calls.cancels == []
+
+
+@pytest.mark.parametrize(("attempts_before", "attempts_after"), [(2, 1), (None, 0)])
+def test_pending_cancel_refunds_train_attempt(spillover_study, monkeypatch, attempts_before, attempts_after):
+    """A job cancelled while pending never ran, so its launch attempt is refunded, never below 0.
+
+    None is an orchestrator restart, an empty counter facing a job the previous process submitted.
     """
+    case = spillover_study.cases[0]
+    if attempts_before is not None:
+        spillover_study.train_attempts[str(case)] = attempts_before
+
+    run_one_pass(monkeypatch, spillover_study, {spillover_study.train_job_name(case): WATCHDOG_PENDING_S})
+
+    assert spillover_study.train_attempts[str(case)] == attempts_after
 
 
-def test_no_spillover_partitions_disables_watchdog():
-    """With config.spillover_partitions empty the watchdog is a no-op.
+def test_agent_pending_cancel_skips_refund(spillover_study, monkeypatch):
+    """launch_sweep tops agents back up on its own, so cancelling a pending agent refunds nothing."""
+    case = spillover_study.cases[0]
+    spillover_study.train_attempts[str(case)] = 2
+    agent_job_name = spillover_study.agent_job_name(case)
 
-    Neither squeue (get_pending_job_pending_s) nor scancel (cancel_job) is
-    called, every job can only be pending on the primary partition.
-    """
+    calls = run_one_pass(monkeypatch, spillover_study, {agent_job_name: WATCHDOG_PENDING_S})
 
-
-def test_pending_job_under_threshold_is_left_alone():
-    """A train job pending less than WATCHDOG_PENDING_S is not cancelled.
-
-    Mock the pending map just under the threshold and assert cancel_job is
-    never called.
-    """
+    assert calls.cancels == [(agent_job_name, ",".join(SPILLOVER_PARTITIONS), "PENDING")]
+    assert spillover_study.train_attempts[str(case)] == 2
 
 
-def test_pending_cancel_refunds_train_attempt():
-    """Cancelling a pending train job decrements train_attempts for the case.
+def test_squeue_failure_skips_pending_watchdog(spillover_study, monkeypatch):
+    """An unreachable scheduler must not read as "no pending jobs" and trigger cancels."""
+    calls = run_one_pass(monkeypatch, spillover_study, None)
 
-    Seed study.train_attempts[str(case)] = 2, trigger the watchdog, and assert
-    the counter drops to 1. Repeated pending-cancel cycles must never reach
-    MAX_TRAIN_ATTEMPTS, since the job never ran.
-    """
+    assert calls.cancels == []
 
 
-def test_pending_refund_does_not_go_negative():
-    """A cancel with no recorded launch attempt leaves the counter at 0.
+@pytest.fixture
+def slurm_commands(monkeypatch) -> SimpleNamespace:
+    """Record every SLURM command and answer it with the configured stdout."""
+    record = SimpleNamespace(commands=[], stdout="")
 
-    Covers the orchestrator-restart path where train_attempts is empty but a
-    pending job from the previous orchestrator process is still in the queue.
-    """
+    def run(cmd, **kwargs):
+        record.commands.append(cmd)
+        return SimpleNamespace(returncode=0, stdout=record.stdout, stderr="")
 
-
-def test_agent_pending_cancel_skips_refund():
-    """Cancelling a pending agent job leaves train_attempts untouched.
-
-    Hyperparam case with a pending agent job past the threshold: cancel_job is
-    called for the agent job name but the train attempt counter is unchanged,
-    launch_sweep handles agent top-up on its own.
-    """
+    monkeypatch.setattr(slurm_utils.subprocess, "run", run)
+    return record
 
 
-def test_squeue_failure_skips_pending_watchdog():
-    """When get_pending_job_pending_s returns None nothing is cancelled.
+def test_get_pending_job_pending_s_parses_output(slurm_commands):
+    """PendingTime:20,Name:512 columns parse into {name: seconds}, a repeated name keeping its longest wait."""
+    slurm_commands.stdout = "1234                case.a     \n\n50                  agent.b    \n900                 agent.b    \n"
 
-    Scheduler-unreachable must not look like "no pending jobs" and must not
-    trigger any scancel calls.
-    """
+    pending = slurm_utils.get_pending_job_pending_s(partition="spill_a")
 
-
-# ----------------------------------------------------------------------
-# The slurm_utils helpers both watchdogs drive
-# ----------------------------------------------------------------------
-def test_get_pending_job_pending_s_parses_output():
-    """squeue -O 'PendingTime:20,Name:512' lines parse into {name: seconds}.
-
-    Mock subprocess.run stdout with padded columns, a blank line, and two
-    entries sharing a name where the larger pending time must win.
-    """
+    assert pending == {"case.a": 1234, "agent.b": 900}
 
 
-def test_cancel_job_state_parameter_reaches_scancel():
-    """cancel_job(job, state="PENDING") passes --state=PENDING to scancel.
+def test_cancel_job_runs_one_scancel_per_partition_in_the_given_state(slurm_commands):
+    """scancel -p takes one partition, a comma list would match nothing while still exiting 0."""
+    slurm_utils.cancel_job("job.a", partition="spill_a,spill_b", state="PENDING")
+    slurm_utils.cancel_job("job.a", partition="spill_a")
 
-    Default call keeps --state=RUNNING so the stall watchdog behavior is
-    unchanged, and one scancel runs per configured partition.
-    """
+    partitions = [cmd[cmd.index("-p") + 1] for cmd in slurm_commands.commands]
+    states = [next(arg for arg in cmd if arg.startswith("--state=")) for cmd in slurm_commands.commands]
+    assert partitions == ["spill_a", "spill_b", "spill_a"]
+    assert states == ["--state=PENDING", "--state=PENDING", "--state=RUNNING"]

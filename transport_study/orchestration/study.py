@@ -119,6 +119,12 @@ def real_timeslice_mask(time_2d: xr.DataArray, time_dim: str = TIME_DIM) -> xr.D
     return time_2d.notnull() & (prev.isnull() | ((time_2d - prev) > PAD_TIME_STEP_S))
 
 
+def transfer_lr_scale(steps_per_epoch: int, max_epochs: int) -> float:
+    """lr0 scale of a finetune, max_epochs / total_steps clipped to [TRANSFER_LR_FLOOR, 1] (see Study._scale_transfer_lr)."""
+    total_steps = steps_per_epoch * max_epochs
+    return min(1.0, max(TRANSFER_LR_FLOOR, max_epochs / total_steps))
+
+
 def write_netcdf_atomic(ds: xr.Dataset, path: Path | str) -> None:
     """Write ds to path through a temporary file, so a partial file is never visible at path.
 
@@ -727,7 +733,7 @@ class Study:
         """
         steps_per_epoch = self._transfer_steps_per_epoch(train_config)
         total_steps = steps_per_epoch * train_config.max_epochs
-        scale = min(1.0, max(TRANSFER_LR_FLOOR, train_config.max_epochs / total_steps))
+        scale = transfer_lr_scale(steps_per_epoch, train_config.max_epochs)
         logger.info(
             f"Transfer LR scale {scale:.3g} from step budget "
             f"({steps_per_epoch} steps/epoch x {train_config.max_epochs} epochs = {total_steps} steps)"
@@ -1551,11 +1557,11 @@ class Study:
         self.cases = self.make_cases()
         # Launch counter per case (str(case) -> count) backing MAX_TRAIN_ATTEMPTS
         self.train_attempts: dict[str, int] = {}
-        # Latest-checkpoint epoch per case as of its last launch. A relaunch whose
-        # checkpoint advanced past this is a resume making progress, not a failure
+        # Latest-checkpoint epoch per case as of its last launch.
+        # A relaunch whose checkpoint advanced past this is a resume making progress, not a failure
         self.train_attempt_epochs: dict[str, int | None] = {}
-        # Measured steps-per-epoch per transfer dataloader config, so repeated
-        # make_train_config calls do not rebuild dataloaders (see _transfer_steps_per_epoch)
+        # Measured steps-per-epoch per transfer dataloader config,
+        # so repeated make_train_config calls do not rebuild dataloaders (see _transfer_steps_per_epoch)
         self._transfer_steps_cache: dict[str, int] = {}
 
         self.working_dir = Path(config.working_dir_base) / self.name

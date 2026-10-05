@@ -56,13 +56,8 @@ def test_domain_adaptation_case_name(loaded_config):
 
 
 def test_weighted_case_name(loaded_config):
-    """Pin the case-name string for the 'weighted' domain adaptation method.
-
-    Should test that a case with domain_adaptation='weighted' names as
-    case.{model_type}.td_{td}.norm_{n}.freeze_{f}.geom_{g}.targ_{n}.da_weighted, and that
-    checkpoint_to_profile_case round-trips it (see
-    test_checkpoint_parser_round_trip).
-    """
+    case = _case(data_normalization="physics-coral", domain_adaptation="weighted", num_target_shots=3)
+    assert str(case) == "case.shape-init-pca.td_cmod-low1.norm_physics-coral.freeze_True.geom_circular.targ_3.da_weighted"
 
 
 @pytest.mark.parametrize(
@@ -71,6 +66,8 @@ def test_weighted_case_name(loaded_config):
         {},
         {"model_type": "mlp", "training_data": "exnihilo", "num_target_shots": 7},
         {"model_type": "torax-gyrobohm", "domain_adaptation": "transfer", "num_target_shots": 3},
+        {"data_normalization": "physics-coral", "domain_adaptation": "weighted", "num_target_shots": 3},
+        {"model_type": "torax-qlknn", "geometry_builder": "miller", "domain_adaptation": "addition", "num_target_shots": 1},
     ],
 )
 def test_checkpoint_parser_round_trip(loaded_config, overrides):

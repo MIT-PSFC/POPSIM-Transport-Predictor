@@ -8,6 +8,7 @@ wiring lives in tests/transport_transfer/.
 
 import copy
 import dataclasses
+from pathlib import Path
 
 import equinox as eqx
 import jax
@@ -15,6 +16,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 import xarray as xr
+from popsim.ml.partition import make_partition_by_members
 
 from transport_study import RADIAL_DIM
 from transport_study.config import RHO_GRID
@@ -63,8 +65,10 @@ from transport_study.modules.transport_predictor.module import (
 from transport_study.modules.transport_predictor.train_configs import (
     make_transport_torax_config,
 )
+from transport_study.modules.transport_predictor.trb import TransportPredictorTRB
 from transport_study.signals import convert_to_working_units
 from transport_study.tests.sample_data import SAMPLE_DIR, requires_sample_data
+from transport_study.transport_transfer.transport_transfer_study import TransportStudy
 
 RHO = np.asarray(RHO_GRID)
 N_RHO = len(RHO)
@@ -710,3 +714,35 @@ def test_normalizer_fit_features():
             np.tile(eye, (n_devices, 1, 1)),
         )
     assert isinstance(make_transport_nn_input_normalizer("physics-zscore", None, n_devices, target_idx=1), ZScoreFeatureNormalizer)
+
+
+def test_sciml_power_balance_subtree_runs_at_the_submodule_lr(sciml_module, tmp_path):
+    """The study's submodule_lr_factors keys must name the sciml pytree paths, or the subtree silently trains at the full rate.
+
+    Adam normalizes the first-step update to the learning rate, so the update ratio between the groups is the factor.
+    """
+    study = TransportStudy(
+        TransportStudy.Config(
+            study_name="test-sciml-lr-groups",
+            working_dir_base=tmp_path,
+            dataset_paths={"cmod": Path("path/to/cmod.zarr"), "mast": Path("path/to/mast.zarr")},
+            target_device="mast",
+            target_test_set_size=1,
+            training_datasets=("cmod",),
+        )
+    )
+    optimizer_config = study.base_optimizer_config()
+    optimizer = TransportPredictorTRB.get_optimizer(optimizer_config)
+    trainable, _ = make_partition_by_members(lambda module: module)(sciml_module)
+
+    grads = jax.tree.map(jnp.ones_like, trainable)
+    updates, _ = optimizer.update(grads, optimizer.init(trainable), trainable)
+
+    update_sizes = {"power_balance": [], "profile_predictor": []}
+    for path, leaf in jax.tree_util.tree_leaves_with_path(updates):
+        path_str = jax.tree_util.keystr(path)
+        for group, sizes in update_sizes.items():
+            if f".{group}" in path_str:
+                sizes.append(float(jnp.abs(leaf).mean()))
+    update_ratio = np.mean(update_sizes["power_balance"]) / np.mean(update_sizes["profile_predictor"])
+    assert update_ratio == pytest.approx(optimizer_config["submodule_lr_factors"]["power_balance"], rel=1e-2)
