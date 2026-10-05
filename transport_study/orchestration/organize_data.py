@@ -44,13 +44,18 @@ if TYPE_CHECKING:
 class TrainingData:
     """The source devices a case trains on.
 
-    sources_unsorted: device keys, read sorted through sources
+    sources: device keys, stored sorted for stable concatenation and indexing,
+             so equal device sets compare and hash equal
     exnihilo: train from scratch on the target device only,
               every source device is loaded and then stripped from the training set again
     """
 
-    sources_unsorted: list[str]
+    # A list rather than a tuple, train configs are YAML-dumped and safe_load rejects python tuples
+    sources: list[str]
     exnihilo: bool = False
+
+    def __post_init__(self):
+        object.__setattr__(self, "sources", sorted(self.sources))
 
     def __hash__(self):
         return hash((tuple(self.sources), self.exnihilo))
@@ -58,12 +63,7 @@ class TrainingData:
     def __str__(self) -> str:
         if self.exnihilo:
             return "exnihilo"
-        return "_".join(sorted(self.sources))
-
-    @property
-    def sources(self) -> list[str]:
-        """Sources in deterministic order for stable concatenation and indexing."""
-        return sorted(self.sources_unsorted)
+        return "_".join(self.sources)
 
     @property
     def source_idxs(self) -> list:
@@ -75,13 +75,13 @@ def parse_training_data(s: str, dataset_paths: dict, target_device: str | None) 
     """Convert a string like 'cmod_tcv' or 'exnihilo' to a TrainingData object."""
     if s == "exnihilo":
         non_target = set(dataset_paths.keys()) - ({target_device} if target_device else set())
-        return TrainingData(sources_unsorted=sorted(non_target), exnihilo=True)
+        return TrainingData(sources=sorted(non_target), exnihilo=True)
     sources = s.split("_")
     if target_device in sources:
         raise ValueError(
             f"training_data {s!r} names the target device {target_device!r}, whose held-out test shots would land in the training set"
         )
-    return TrainingData(sources_unsorted=sources)
+    return TrainingData(sources=sources)
 
 
 REQUIRED_SIGNALS_POWER_BALANCE = [
@@ -288,7 +288,7 @@ STUDY_PREPS = {
 def get_ds(
     source_ds: str,
     study_type: str,
-) -> tuple[xr.Dataset, str]:
+) -> xr.Dataset:
     """Open a device store and prepare it for one study.
 
     Reads only the store signals the study needs (the power balance study never loads the profiles),
@@ -303,7 +303,7 @@ def get_ds(
         study_type (str): Type of study for which to prepare the dataset.
 
     Returns:
-        tuple[xr.Dataset, str]: The processed dataset and the dimension along which to group the data
+        xr.Dataset: The prepared dataset on (shot, time_idx[, rho_tor_norm])
     """
     if source_ds not in config.dataset_paths:
         raise ValueError(f"Unknown source dataset: {source_ds!r}. Available: {set(config.dataset_paths)}")
@@ -335,7 +335,7 @@ def get_ds(
 
     check_uniform_timebase(ds)
 
-    ds = add_hazard(ds, EPISODE_DIM)
+    ds = add_hazard(ds)
     mask_hazard_valid = ds["hazard"].notnull().values
     if not mask_hazard_valid.all():
         shots_without_hazard = ds[EPISODE_DIM].values[~mask_hazard_valid]
@@ -348,13 +348,10 @@ def get_ds(
     if TIME_COORD not in ds.coords:
         ds = ds.set_coords(TIME_COORD)
 
-    return ds, EPISODE_DIM
+    return ds
 
 
-def add_hazard(
-    ds: xr.Dataset,
-    episode_coord: str,
-) -> xr.Dataset:
+def add_hazard(ds: xr.Dataset) -> xr.Dataset:
     """Add the per-shot hazard metric, the p95 along the shot of (energy_mhd_MJ^2 + ip_MA^2)^0.5,
     each normalized by its dataset maximum, so shots with more stored energy and plasma current rank higher.
     NaNs are ignored.
@@ -525,26 +522,25 @@ def get_train_val_datasets(
     That means all historic source data can be used for training and validation.
     """
     ds_sources: dict[str, tuple] = {}
-    episode_coord = None
 
     for source in training_data.sources:
-        ds, episode_coord = get_ds(source, study_type)
+        ds = get_ds(source, study_type)
         # popsim requires a seed, the hazard sort makes the split deterministic and leaves it unused
         train_src, val_src = split_dataset_by_fracs(
             ds,
             fracs=TRAIN_VAL_SPLIT,
-            dim=episode_coord,
+            dim=EPISODE_DIM,
             seed=0,
             sortby="hazard",
         )
         src_idx = config.ds_source_to_idx[source]
         train_src["ds_source_idx"] = (
-            episode_coord,
-            np.full(train_src.sizes[episode_coord], src_idx),
+            EPISODE_DIM,
+            np.full(train_src.sizes[EPISODE_DIM], src_idx),
         )
         val_src["ds_source_idx"] = (
-            episode_coord,
-            np.full(val_src.sizes[episode_coord], src_idx),
+            EPISODE_DIM,
+            np.full(val_src.sizes[EPISODE_DIM], src_idx),
         )
         train_src = train_src.assign_coords(ds_source=source)
         val_src = val_src.assign_coords(ds_source=source)
@@ -557,11 +553,11 @@ def get_train_val_datasets(
         source = next(iter(ds_sources))
         train_ds, val_ds = ds_sources[source]
     else:
-        train_ds = concat_with_nan_padding([pair[0] for pair in ds_sources.values()], concat_dim=episode_coord)
-        val_ds = concat_with_nan_padding([pair[1] for pair in ds_sources.values()], concat_dim=episode_coord)
+        train_ds = concat_with_nan_padding([pair[0] for pair in ds_sources.values()], concat_dim=EPISODE_DIM)
+        val_ds = concat_with_nan_padding([pair[1] for pair in ds_sources.values()], concat_dim=EPISODE_DIM)
 
-    logger.debug("Historic Training dataset size: {}", train_ds.sizes[episode_coord])
-    logger.debug("Historic Validation dataset size: {}", val_ds.sizes[episode_coord])
+    logger.debug("Historic Training dataset size: {}", train_ds.sizes[EPISODE_DIM])
+    logger.debug("Historic Validation dataset size: {}", val_ds.sizes[EPISODE_DIM])
 
     return train_ds, val_ds
 
@@ -575,8 +571,8 @@ def get_loaded_shot_count(source_ds: str, study_type: str = "profile_transfer") 
     from disk, so it is not free, but it is only needed once per device when
     building a train config.
     """
-    ds, episode_coord = get_ds(source_ds, study_type)
-    return int(ds.sizes[episode_coord])
+    ds = get_ds(source_ds, study_type)
+    return int(ds.sizes[EPISODE_DIM])
 
 
 def _split_target_shots(
@@ -589,26 +585,26 @@ def _split_target_shots(
     A deterministic hazard sort: the test set is the target_test_set_size highest-hazard shots,
     the training shots are the first num_target_shots of the remaining pool
     (or every shot for -1, the cheating upper-bound reference).
-    Returns (train_ds_target, test_ds, episode_coord).
+    Returns (train_ds_target, test_ds).
     """
     target = config.target_device
     if target is None:
         raise ValueError("config.target_device must be set before transfer learning")
 
-    ds_target, episode_coord = get_ds(target, study_type=study_type)
+    ds_target = get_ds(target, study_type=study_type)
     ds_target["ds_source_idx"] = (
-        episode_coord,
-        np.full(ds_target.sizes[episode_coord], config.ds_source_to_idx[target]),
+        EPISODE_DIM,
+        np.full(ds_target.sizes[EPISODE_DIM], config.ds_source_to_idx[target]),
     )
     ds_target = ds_target.assign_coords(ds_source=target)
     sorted_shots = np.argsort(ds_target["hazard"].values)
 
     test_shot_pool = sorted_shots[-target_test_set_size:] if target_test_set_size else sorted_shots[:0]
-    test_ds = ds_target.isel({episode_coord: test_shot_pool})
+    test_ds = ds_target.isel({EPISODE_DIM: test_shot_pool})
 
     if num_target_shots == -1:
         # All available target shots in training and testing (upper-bound reference, CHEATING!)
-        train_ds_target = ds_target.isel({episode_coord: sorted_shots})
+        train_ds_target = ds_target.isel({EPISODE_DIM: sorted_shots})
     else:
         # Exclude the held-out test shots before selecting training shots so the two pools
         # never overlap (otherwise a large num_target_shots would leak high-hazard test
@@ -623,9 +619,9 @@ def _split_target_shots(
             )
         train_shot_pool = train_candidate_pool[:num_target_shots]
         assert not (set(train_shot_pool.tolist()) & set(test_shot_pool.tolist())), "Target train and test shot pools overlap - data leakage"
-        train_ds_target = ds_target.isel({episode_coord: train_shot_pool})
+        train_ds_target = ds_target.isel({EPISODE_DIM: train_shot_pool})
 
-    return train_ds_target, test_ds, episode_coord
+    return train_ds_target, test_ds
 
 
 def get_train_test_datasets(
@@ -651,14 +647,14 @@ def get_train_test_datasets(
     We treat the test set as a validation set for checkpoint selection, which is slightly optimistic
     but consistent across all models so comparisons are fair.
     """
-    train_ds_target, test_ds, episode_coord = _split_target_shots(num_target_shots, target_test_set_size, study_type)
+    train_ds_target, test_ds = _split_target_shots(num_target_shots, target_test_set_size, study_type)
 
     # Load historic source data for training (for exnihilo it is stripped again below)
     # exnihilo.sources contains all non-target devices, so we can pass training_data directly
     train_ds_hist, val_ds_hist = get_train_val_datasets(training_data, study_type=study_type)
     train_ds = concat_with_nan_padding(
         [train_ds_hist, val_ds_hist, train_ds_target],
-        concat_dim=episode_coord,
+        concat_dim=EPISODE_DIM,
     )
 
     # For 'transfer' and exnihilo: strip historic data, train only on target device shots
@@ -668,8 +664,8 @@ def get_train_test_datasets(
             drop=True,
         )
 
-    logger.debug("HP Training dataset size: {}", train_ds.sizes[episode_coord])
-    logger.debug("HP Test dataset size: {}", test_ds.sizes[episode_coord])
+    logger.debug("HP Training dataset size: {}", train_ds.sizes[EPISODE_DIM])
+    logger.debug("HP Test dataset size: {}", test_ds.sizes[EPISODE_DIM])
 
     return train_ds, test_ds
 
@@ -691,14 +687,14 @@ def get_transfer_pretrain_datasets(
 
     Returns (train_ds_hist, train_ds_combined, test_ds).
     """
-    train_ds_target, test_ds, episode_coord = _split_target_shots(num_target_shots, target_test_set_size, study_type)
+    train_ds_target, test_ds = _split_target_shots(num_target_shots, target_test_set_size, study_type)
 
     train_ds_hist, val_ds_hist = get_train_val_datasets(training_data, study_type=study_type)
-    train_ds_hist = concat_with_nan_padding([train_ds_hist, val_ds_hist], concat_dim=episode_coord)
-    train_ds_combined = concat_with_nan_padding([train_ds_hist, train_ds_target], concat_dim=episode_coord)
+    train_ds_hist = concat_with_nan_padding([train_ds_hist, val_ds_hist], concat_dim=EPISODE_DIM)
+    train_ds_combined = concat_with_nan_padding([train_ds_hist, train_ds_target], concat_dim=EPISODE_DIM)
 
-    logger.debug("Transfer pretrain historic dataset size: {}", train_ds_hist.sizes[episode_coord])
-    logger.debug("Transfer pretrain normalizer-fit dataset size: {}", train_ds_combined.sizes[episode_coord])
-    logger.debug("Transfer pretrain test dataset size: {}", test_ds.sizes[episode_coord])
+    logger.debug("Transfer pretrain historic dataset size: {}", train_ds_hist.sizes[EPISODE_DIM])
+    logger.debug("Transfer pretrain normalizer-fit dataset size: {}", train_ds_combined.sizes[EPISODE_DIM])
+    logger.debug("Transfer pretrain test dataset size: {}", test_ds.sizes[EPISODE_DIM])
 
     return train_ds_hist, train_ds_combined, test_ds

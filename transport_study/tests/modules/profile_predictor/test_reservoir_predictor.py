@@ -118,7 +118,7 @@ def test_reservoir_training_smoke():
         dataloader_config={
             "input_vars": PROFILE_INPUT_VARS,
             "target_vars": [*PROFILE_TARGET_VARS, "ds_source_idx"],
-            "training_data": {"sources_unsorted": ["cmod-low"], "exnihilo": False},
+            "training_data": {"sources": ["cmod-low"], "exnihilo": False},
             "batch_size": None,
         },
         model_init_config={

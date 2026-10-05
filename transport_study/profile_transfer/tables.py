@@ -9,9 +9,9 @@ time-integrated per-shot errors) with the time-integrated per-shot error
 medians from the long-form collected_results.nc.
 
 A flat case_stats.csv with one row per case and every column is written next
-to the tables for ad hoc analysis. The table and csv writing itself is the
-shared orchestration.tables machinery; this module only declares the spec and
-builds the per-case stats frame.
+to the tables for ad hoc analysis.
+The table and csv writing itself is the shared orchestration.tables machinery,
+this module only declares the spec and builds the per-case stats frame.
 """
 
 from pathlib import Path

@@ -9,6 +9,7 @@ from loguru import logger
 from matplotlib import patches
 from scipy.spatial import ConvexHull
 
+from transport_study import EPISODE_DIM
 from transport_study.config import config
 from transport_study.orchestration.organize_data import (
     TrainingData,
@@ -63,7 +64,7 @@ def _device_colors() -> dict[str, str]:
 
 def _td(devices: list[str]) -> TrainingData:
     """Build a TrainingData from an explicit device list (no underscore splitting)."""
-    return TrainingData(sources_unsorted=list(devices))
+    return TrainingData(sources=list(devices))
 
 
 def hazard_extrapolation_plot(
@@ -317,13 +318,12 @@ def domain_plot(
     plt.close()
 
 
-def _combined_raw_dataset(study_type: str) -> tuple[xr.Dataset, str]:
+def _combined_raw_dataset(study_type: str) -> xr.Dataset:
     """Concatenate every device (sources + target) into one dataset with a per-shot
     ds_source coordinate, the hazard/p95 metrics come with get_ds."""
     datasets = []
-    episode_coord = None
     for device in _all_devices():
-        ds, episode_coord = get_ds(device, study_type=study_type)
+        ds = get_ds(device, study_type=study_type)
         ds = ds.assign_coords(ds_source=device)
         datasets.append(ds)
 
@@ -331,8 +331,8 @@ def _combined_raw_dataset(study_type: str) -> tuple[xr.Dataset, str]:
         raise ValueError("No dataset paths provided in config, cannot build domain-overlap dataset.")
 
     if len(datasets) == 1:
-        return datasets[0], episode_coord
-    return concat_with_nan_padding(datasets, concat_dim=episode_coord), episode_coord
+        return datasets[0]
+    return concat_with_nan_padding(datasets, concat_dim=EPISODE_DIM)
 
 
 class DataVisualizationBase:
@@ -429,7 +429,7 @@ class DataVisualizationBase:
         if all((save_dir / f"domain_overlap_{method}.png").exists() for method in methods):
             return
 
-        combined, _ = _combined_raw_dataset(cls.STUDY_TYPE)
+        combined = _combined_raw_dataset(cls.STUDY_TYPE)
 
         for method in methods:
             fig_path = save_dir / f"domain_overlap_{method}.png"

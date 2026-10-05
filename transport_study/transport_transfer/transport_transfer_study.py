@@ -45,9 +45,9 @@ from transport_study.transport_transfer.data_visualization import DataVisualizat
 from transport_study.transport_transfer.plotting import COMPARISON_FAMILIES, LAYOUT
 from transport_study.transport_transfer.tables import SPEC as TABLE_SPEC
 
-# The physical inputs every transport predictor model consumes (the TRB adds
-# ds_source_idx itself). Normalization happens inside the modules; there is
-# deliberately no beta_tor_norm: beta quantities come from the evolving state Wtot
+# The physical inputs every transport predictor model consumes (the TRB adds ds_source_idx itself).
+# Normalization happens inside the modules.
+# There is deliberately no beta_tor_norm, beta quantities come from the evolving state Wtot.
 TRANSPORT_INPUT_VARS = [
     "ip_MA",
     "b0",
@@ -146,9 +146,9 @@ class TransportStudy(Study):
         # Hyperparameter tuning case configuration
         # (hyperparam_domain_adaptation and hyperparam_num_target_shots live on CaseGridConfig)
         hyperparam_freeze_submodules: bool = True
-        # Which variants back the sciml prereq submodules. Study-wide settings
-        # rather than case axes; they change model semantics under unchanged
-        # case names, so they are part of the config lock below
+        # Which variants back the sciml prereq submodules.
+        # Study-wide settings rather than case axes.
+        # They change model semantics under unchanged case names, so they are part of the config lock below.
         power_balance_model_type: str = "sciml-taue-nn"
         power_balance_data_normalization: str = "physics"
         # Whether the power balance prereq case freezes ITS p_oh/p_rad
@@ -279,8 +279,8 @@ class TransportStudy(Study):
                 )
 
         def model_type_prereqs(self) -> list[Study.Case]:
-            # sciml restores a pre-trained power balance and profile predictor;
-            # the power balance itself restores pre-trained p_oh/p_rad
+            # sciml restores a pre-trained power balance and profile predictor.
+            # The power balance itself restores pre-trained p_oh/p_rad.
             if self.model_type == "sciml":
                 submodule_types = ("power_balance", "profile")
             elif self.model_type == "power_balance":
@@ -359,19 +359,10 @@ class TransportStudy(Study):
             # Hyperparameters
             "segment_length_train": 100,
             "segment_overlap_train": 50,
-            # Below the power balance study's 4096: every torax sample runs a
-            # 100-step differentiated TORAX rollout under vmap (with
-            # jax.checkpoint remat, see TransportPredictorToraxBase). Memory and time
-            # scale linearly with batch and segment_length_train, so measure
-            # before changing this.
-            # Measured 2026-07-26 (A100-80GB, gyrobohm, real cmod dataloader):
-            # VRAM is NOT the limit at any usable size - a linear ~5 MB/sample
-            # puts batch 8192 at 38 GB of the 68 GB pool. Wall-clock per epoch
-            # is 5.50 min at 64, 2.19 at 256, 1.46 at 512, then flat (1.00 at
-            # 8192) because s/step doubles with batch past that point. So 512
-            # takes nearly all the available speedup while still running 34
-            # optimizer steps per epoch on the full cmod set; going higher
-            # would only spend gradient updates for no wall-clock gain
+            # Below the power balance study's 4096:
+            # every torax sample runs a 100-step differentiated TORAX rollout (jax.checkpoint remat, see TransportPredictorToraxBase).
+            # Measured on an A100-80GB with gyrobohm, VRAM is not the limit (~5 MB/sample, 8192 fits in 38 GB).
+            # Epoch time stops falling past 512, so a larger batch only gives up optimizer steps.
             "batch_size": 512,
             # Part of validation, should be left alone during hyperparameter tuning
             "segment_length_val": None,
@@ -522,8 +513,8 @@ class TransportStudy(Study):
                     "model_type": config.profile_model_type,
                     "data_normalization": config.data_normalization,
                     "domain_adaptation": case.domain_adaptation,
-                    # Profile study hyperparam default; the shapes are an
-                    # initial-guess basis, not physics to fine-tune here
+                    # Profile study hyperparam default.
+                    # The shapes are an initial-guess basis, not physics to fine-tune here.
                     "freeze_shapes": True,
                     "te_shape_var": "t_e_shape",
                     "ne_shape_var": "n_e_shape",

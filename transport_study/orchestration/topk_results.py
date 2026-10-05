@@ -30,8 +30,8 @@ def aggregate_topk_results(per_step: dict[int, xr.Dataset], best_step: int) -> x
     trajectories would be smoother than any actual model and mislead the
     case report plots, whose error-based shot rankings still use the means.
 
-    Means and stds skip NaNs, so a timeslice one checkpoint diverges on
-    still averages over the others; all-NaN padding stays NaN.
+    Means and stds skip NaNs, so a timeslice one checkpoint diverges on still averages over the others.
+    All-NaN padding stays NaN.
 
     The retained checkpoint epochs and the best epoch land in the dataset
     attrs (result_checkpoint_epochs / result_checkpoint_best_epoch).

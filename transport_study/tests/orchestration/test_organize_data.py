@@ -51,9 +51,8 @@ class TestGetDs:
     @pytest.mark.parametrize("source_ds", ["cmod-low1", "mast-high"])
     @pytest.mark.parametrize("study_type", ["profile_transfer", "power_balance_transfer"])
     def test_get_ds_returns_dataset_and_dims(self, sample_dataset_config, source_ds, study_type):
-        ds, episode_dim = get_ds(source_ds, study_type)
+        ds = get_ds(source_ds, study_type)
         assert ds is not None
-        assert episode_dim == EPISODE_DIM
         assert TIME_COORD in ds.coords
         assert TIME_DIM in ds.dims
 
@@ -69,18 +68,18 @@ class TestGetDs:
 
     @requires_sample_data
     def test_get_ds_profile_transfer_has_shape_vars(self, sample_dataset_config):
-        ds, _ = get_ds("cmod-low1", "profile_transfer")
+        ds = get_ds("cmod-low1", "profile_transfer")
         assert "t_e_shape" in ds
         assert "n_e_shape" in ds
 
     @requires_sample_data
     def test_get_ds_power_balance_has_aux_power(self, sample_dataset_config):
-        ds, _ = get_ds("cmod-low1", "power_balance_transfer")
+        ds = get_ds("cmod-low1", "power_balance_transfer")
         assert "power_additional_MW" in ds
 
     @requires_sample_data
     def test_get_ds_max_ds_size_limits_shots(self, sample_dataset_config):
-        ds, _ = get_ds("cmod-low1", "power_balance_transfer")
+        ds = get_ds("cmod-low1", "power_balance_transfer")
         assert ds.sizes[EPISODE_DIM] <= MAX_DS_SIZE
 
 
@@ -88,37 +87,37 @@ class TestGetDs:
 class TestAddHazard:
     @pytest.mark.parametrize("study_type", ["profile_transfer", "power_balance_transfer"])
     def test_add_hazard_adds_variables(self, sample_dataset_config, study_type):
-        ds, episode_coord = get_ds("cmod-low1", study_type)
-        result = add_hazard(ds, episode_coord)
+        ds = get_ds("cmod-low1", study_type)
+        result = add_hazard(ds)
         assert "hazard" in result
         assert "ip_MA_p95" in result
         assert "energy_mhd_MJ_p95" in result
-        assert result["hazard"].dims == (episode_coord,)
+        assert result["hazard"].dims == (EPISODE_DIM,)
 
     def test_add_hazard_nonnegative(self, sample_dataset_config):
-        ds, episode_coord = get_ds("cmod-high", "power_balance_transfer")
-        result = add_hazard(ds, episode_coord)
+        ds = get_ds("cmod-high", "power_balance_transfer")
+        result = add_hazard(ds)
         valid = result["hazard"].values
         assert all(v >= 0 for v in valid if not np.isnan(v))
 
 
 class TestTrainingData:
     def test_training_data_str_sorted(self):
-        td = TrainingData(sources_unsorted=["mast-high", "cmod-high"])
+        td = TrainingData(sources=["mast-high", "cmod-high"])
         assert str(td) == "cmod-high_mast-high"
 
     def test_training_data_exnihilo_str(self):
-        td = TrainingData(sources_unsorted=["cmod-low1"], exnihilo=True)
+        td = TrainingData(sources=["cmod-low1"], exnihilo=True)
         assert str(td) == "exnihilo"
 
     def test_training_data_source_order_deterministic(self):
-        td_1 = TrainingData(sources_unsorted=["cmod-low1", "cmod-high"])
-        td_2 = TrainingData(sources_unsorted=["cmod-high", "cmod-low1"])
+        td_1 = TrainingData(sources=["cmod-low1", "cmod-high"])
+        td_2 = TrainingData(sources=["cmod-high", "cmod-low1"])
         assert td_1.sources == td_2.sources
         assert hash(td_1) == hash(td_2)
 
     def test_training_data_source_idxs_use_config(self, sample_dataset_config):
-        td = TrainingData(sources_unsorted=["cmod-low1", "cmod-high"])
+        td = TrainingData(sources=["cmod-low1", "cmod-high"])
         assert td.source_idxs == [sample_dataset_config.ds_source_to_idx[s] for s in td.sources]
 
     def test_parse_training_data_splits_on_underscore(self, sample_dataset_config):
@@ -141,7 +140,7 @@ class TestTrainingData:
 class TestGetTrainValDatasets:
     @requires_sample_data
     def test_get_train_val_datasets_returns_split(self, sample_dataset_config):
-        td = TrainingData(sources_unsorted=["cmod-low1", "cmod-low2"])
+        td = TrainingData(sources=["cmod-low1", "cmod-low2"])
         train_ds, val_ds = get_train_val_datasets(td, study_type="power_balance_transfer")
         assert train_ds.sizes[EPISODE_DIM] > 0
         assert val_ds.sizes[EPISODE_DIM] > 0
@@ -156,7 +155,7 @@ class TestGetTrainValDatasets:
             assert val_subset["hazard"].values.min() >= train_subset["hazard"].values.max()
 
     def test_get_train_val_datasets_empty_sources_raises(self, sample_dataset_config):
-        td = TrainingData(sources_unsorted=[])
+        td = TrainingData(sources=[])
         with pytest.raises(ValueError, match="sources is empty"):
             get_train_val_datasets(td, study_type="power_balance_transfer")
 
@@ -164,7 +163,7 @@ class TestGetTrainValDatasets:
 @requires_sample_data
 class TestGetTrainTestDatasets:
     def test_get_train_test_datasets_returns_split(self, sample_dataset_config):
-        td = TrainingData(sources_unsorted=["cmod-low1", "cmod-low2"])
+        td = TrainingData(sources=["cmod-low1", "cmod-low2"])
         train_ds, test_ds = get_train_test_datasets(
             td,
             domain_adaptation="addition",
@@ -189,7 +188,7 @@ class TestGetTrainTestDatasets:
         assert test_ds["hazard"].values.min() >= train_target["hazard"].values.max()
 
     def test_get_train_test_datasets_zero_test_size_keeps_test_empty(self, sample_dataset_config):
-        td = TrainingData(sources_unsorted=["cmod-low1"])
+        td = TrainingData(sources=["cmod-low1"])
         _, test_ds = get_train_test_datasets(
             td,
             domain_adaptation="addition",
@@ -238,7 +237,7 @@ class TestAddHazardSynthetic:
         nan = np.nan
         times = [[0.1, 0.101, 0.102, 0.103, 0.104], [0.1, 0.101, 0.102, nan, nan]]
         energy = [[1.0, 2.0, 3.0, 4.0, 5.0], [1.0, 1.5, 2.0, nan, nan]]
-        ds = add_hazard(_time_series_ds(times, energy), EPISODE_DIM)
+        ds = add_hazard(_time_series_ds(times, energy))
 
         # ip_MA = 2 W everywhere, so the normalized radius is W / W_max sqrt(1 + 1) with W_max = 5
         hazard_expected = np.array([np.percentile([1, 2, 3, 4, 5], 95), np.percentile([1, 1.5, 2], 95)]) / 5.0 * np.sqrt(2.0)
@@ -252,7 +251,7 @@ class TestAddHazardSynthetic:
         nan = np.nan
         times = [[0.1, 0.101], [0.1, 0.101]]
         energy = [[1.0, 2.0], [nan, nan]]
-        ds = add_hazard(_time_series_ds(times, energy), EPISODE_DIM)
+        ds = add_hazard(_time_series_ds(times, energy))
 
         assert np.isnan(ds["hazard"].values[1])
         assert np.isnan(ds["ip_MA_p95"].values[1])
@@ -293,9 +292,8 @@ def synthetic_store_config(tmp_path) -> StudyConfig:
 class TestGetDsSyntheticStore:
     @pytest.mark.parametrize("study_type", list(REQUIRED_SIGNALS))
     def test_study_signals_hazard_and_time_coordinate(self, synthetic_store_config, study_type):
-        ds, episode_dim = get_ds("synthetic", study_type)
+        ds = get_ds("synthetic", study_type)
 
-        assert episode_dim == EPISODE_DIM
         assert TIME_COORD in ds.coords
         for name in REQUIRED_SIGNALS[study_type]:
             assert name in ds.variables, name
@@ -309,14 +307,14 @@ class TestGetDsSyntheticStore:
     @pytest.mark.parametrize("study_type", list(REQUIRED_SIGNALS))
     def test_hazard_is_the_same_for_every_study(self, synthetic_store_config, study_type):
         """The hazard comes from the full 0D series before any study prep, so every study holds out the same shots."""
-        ds, _ = get_ds("synthetic", study_type)
+        ds = get_ds("synthetic", study_type)
 
         # The synthetic store grows ip and W with the shot index, so the hazard orders the shots as listed
         hazard_by_shot = ds["hazard"].sel({EPISODE_DIM: list(SHOT_LENGTHS)}).values
         assert np.all(np.diff(hazard_by_shot) > 0)
 
     def test_magnitudes_and_working_units(self, synthetic_store_config):
-        ds, _ = get_ds("synthetic", "power_balance_transfer")
+        ds = get_ds("synthetic", "power_balance_transfer")
 
         assert (ds["ip_MA"].fillna(1.0) > 0).all(), "the signed shot is a magnitude now"
         np.testing.assert_allclose(ds["energy_mhd_MJ"].isel({EPISODE_DIM: 0}).dropna(TIME_DIM).values[0], 0.06 * 1.4, rtol=1e-5)
@@ -326,7 +324,7 @@ class TestGetDsSyntheticStore:
     @pytest.mark.parametrize("study_type", list(REQUIRED_SIGNALS))
     def test_train_val_split_holds_out_the_highest_hazard_shots(self, synthetic_store_config, study_type):
         """The 80/20 split runs end to end on a real store and the val shots are the top-hazard fifth."""
-        train_ds, val_ds = get_train_val_datasets(TrainingData(sources_unsorted=["synthetic"]), study_type=study_type)
+        train_ds, val_ds = get_train_val_datasets(TrainingData(sources=["synthetic"]), study_type=study_type)
 
         shots_train = set(train_ds[EPISODE_DIM].values.tolist())
         shots_val = set(val_ds[EPISODE_DIM].values.tolist())
@@ -337,7 +335,7 @@ class TestGetDsSyntheticStore:
 
     @pytest.mark.parametrize("study_type", ["profile_transfer", "transport_transfer"])
     def test_profiles_on_rho_grid_with_shapes(self, synthetic_store_config, study_type):
-        ds, _ = get_ds("synthetic", study_type)
+        ds = get_ds("synthetic", study_type)
 
         np.testing.assert_allclose(ds[RADIAL_DIM].values, RHO_GRID)
         assert {"t_e_shape", "n_e_shape"} <= set(ds.data_vars)
@@ -358,8 +356,8 @@ def test_debug_caps_only_the_source_devices(tmp_path, monkeypatch):
     )
     monkeypatch.setattr("transport_study.orchestration.organize_data.DEBUG_MAX_SOURCE_SHOTS", 2)
 
-    ds_source, _ = get_ds("source", "power_balance_transfer")
-    ds_target, _ = get_ds("target", "power_balance_transfer")
+    ds_source = get_ds("source", "power_balance_transfer")
+    ds_target = get_ds("target", "power_balance_transfer")
 
     assert ds_source[EPISODE_DIM].values.tolist() == sorted(SHOT_LENGTHS, reverse=True)[:2]
     assert ds_target.sizes[EPISODE_DIM] == len(SHOT_LENGTHS)

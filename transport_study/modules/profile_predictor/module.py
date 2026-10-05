@@ -4,7 +4,6 @@ import chex
 import equinox as eqx
 import jax
 import jax.numpy as jnp
-import matplotlib.pyplot as plt
 import numpy as np
 import xarray as xr
 from jaxtyping import Array, ArrayLike
@@ -72,29 +71,6 @@ class ProfileShape(TimeIndepModule):
         vals_rho_norm = self.basis(self.coeffs, rho_norm)
         integral = jnp.trapezoid(vals_rho_norm, rho_norm)
         return integral
-
-    def visualize(self, rho: Array = None, ax=None):
-        """Visualize the profile shape and the components"""
-        if rho is None:
-            rho = jnp.linspace(0, 1.2, 100)
-        # Calculate the profile shape and its components
-        profile_shape = self(rho)
-
-        # Create a new figure and axis if none are provided
-        if ax is None:
-            _fig, ax = plt.subplots()
-
-        # Plot the overall profile shape
-        ax.plot(rho, profile_shape, label="Profile Shape", color="black", linewidth=2)
-
-        # Add labels and legend
-        ax.set_xlabel(r"$\rho_{tor,N}$")
-        ax.set_ylabel("Profile value")
-        ax.legend()
-
-        # Display the plot if a new figure was created
-        if ax is None:
-            plt.show()
 
     @classmethod
     def make_bspline(cls, coeffs: Array, normalize: bool = True) -> "ProfileShape":
@@ -609,10 +585,10 @@ class ProfilePredictorReservoir(ProfilePredictor):
         key_in, key_res, key_bias, key_out = jax.random.split(key, 4)
         self.w_in = input_scaling * jax.random.uniform(key_in, (reservoir_size, N_NN_INPUTS), minval=-1.0, maxval=1.0)
         w_res = jax.random.normal(key_res, (reservoir_size, reservoir_size))
-        # Rescale recurrent weights to the requested spectral radius so the state
-        # update is contracting (echo state property)
-        # Done with numpy at init time since general eigvals is host-side anyway.
-        # TODO(ZanderKeith): double check this
+        # Rescale the recurrent weights to the requested spectral radius (max |eigenvalue|).
+        # A radius below 1 is the standard echo state heuristic for fading memory of the initial state,
+        # though only a largest singular value below 1 guarantees a contracting update.
+        # numpy at init time, general eigvals is host-side anyway.
         eig_max = float(np.max(np.abs(np.linalg.eigvals(np.asarray(w_res)))))
         self.w_res = w_res * (spectral_radius / eig_max)
         self.res_bias = input_scaling * jax.random.uniform(key_bias, (reservoir_size,), minval=-1.0, maxval=1.0)

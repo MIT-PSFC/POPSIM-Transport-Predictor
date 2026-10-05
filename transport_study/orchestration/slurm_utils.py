@@ -20,35 +20,30 @@ SLURM_COMMAND_TIMEOUT_S = 120
 
 # Environment shared by every sbatch script
 SINGLE_THREAD_BLAS_ENV = """\
-# Single-thread host BLAS/OpenMP. Reservoir init runs np.linalg.eigvals whose
-# OpenBLAS threadpool can deadlock nondeterministically under core contention.
-# eigvals is tiny so single-threaded costs nothing.
+# Single-thread host BLAS and OpenMP.
+# Reservoir init runs np.linalg.eigvals, whose OpenBLAS threadpool can deadlock under core contention.
+# eigvals is tiny, so a single thread costs nothing.
 export OPENBLAS_NUM_THREADS=1
 export OMP_NUM_THREADS=1
 """
 
 # Environment shared by every GPU sbatch script (training and sweep agents).
-# Not an f-string: the shell parameter expansions must land literally.
+# Not an f-string, the shell parameter expansions must land literally.
 GPU_JOB_ENV = (
     SINGLE_THREAD_BLAS_ENV
     + """
-# Compile XLA GPU programs serially. Parallel compilation threads can deadlock
-# under the 4-cpu cgroup, stalling the job during initial compilation.
+# Compile XLA GPU programs serially, parallel compile threads can deadlock under the 4-cpu cgroup.
 export XLA_FLAGS="${XLA_FLAGS:+$XLA_FLAGS }--xla_gpu_force_compilation_parallelism=1"
 
-# The driver may run with JAX_PLATFORMS=cpu, which leaks in via --export=ALL.
-# Pin this GPU job to cuda. Listing platforms explicitly makes jax raise if cuda
-# fails to init, so a broken GPU env fails loudly instead of training on cpu.
-# cpu stays second in the list only so host-side helpers like jax.devices("cpu")
-# keep working. All compute defaults to cuda.
+# The driver may run with JAX_PLATFORMS=cpu, which leaks in through --export=ALL.
+# Listing cuda first makes jax raise if cuda fails to init, instead of training on cpu.
+# cpu stays listed so host-side helpers like jax.devices("cpu") keep working.
 export JAX_PLATFORMS=cuda,cpu
 
-# One preallocated XLA pool at 80% of VRAM
-# Keep preallocation on: growth-mode allocation fragments the pool,
-# and a batch-2048 TORAX transport grad step needs a single ~36 GB contiguous temp buffer,
-# which fragmentation OOMs even on an idle 80 GB card.
-# 80% still leaves the CUDA context and library kernel images (~0.7 GB measured)
-# room outside the pool.
+# One preallocated XLA pool at 80% of VRAM.
+# Growth-mode allocation fragments the pool,
+# and a batch-2048 TORAX transport grad step needs one ~36 GB contiguous buffer.
+# The other 20% holds the CUDA context and kernel images (~0.7 GB measured).
 export XLA_PYTHON_CLIENT_PREALLOCATE=true
 export XLA_PYTHON_CLIENT_MEM_FRACTION=0.80
 """
@@ -827,7 +822,7 @@ from transport_study.orchestration.case_metrics import compute_and_save_case_met
 from transport_study.orchestration.case_reports import generate_case_report
 
 study = {study_cls.__name__}(Path({study_config_path!r}))
-case = next(c for c in study.cases if str(c) == {case_str!r})
+case = study.case_by_name({case_str!r})
 
 case_metrics = compute_and_save_case_metrics(study, case)
 if case_metrics.data_vars:

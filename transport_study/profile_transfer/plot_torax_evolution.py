@@ -1,41 +1,33 @@
-"""Visualize how the TORAX profile predictor relaxes ne/Te towards the target shape.
+"""Visualize how a trained TORAX profile predictor relaxes ne/Te towards the target shape.
 
-Runs the ProfilePredictorTorax module on a single (shot, timestep) slice of a dataset,
-recording the core profiles after every internal TORAX step, and plots the density and
-temperature evolution against the measured target profiles.
+Rebuilds one torax case of a profile study through its make_train_config,
+runs it on a single (shot, timestep) slice of a device store,
+records the core profiles after every internal TORAX step,
+and plots the density and temperature evolution against the measured target profiles.
 
 Example:
     python -m transport_study.profile_transfer.plot_torax_evolution \
-        --dataset transport_study/datasets/sample/cmod-low.nc \
+        --study_config studies/icddps2/profile_predictor.toml \
+        --case case.torax-gyrobohm.td_cmod.norm_physics.freeze_True.geom_circular.targ_10.da_transfer \
         --shot 1160920013 --timestep 264 \
-        --transport_model gyrobohm \
-        --checkpoint /path/to/trained/torax/checkpoint \
         --prescribed '{"chi_bohm_multiplier": 2.0, "S_total": 1.0}'
 """
 
 from pathlib import Path
 
 import fire
-import jax
 import matplotlib.pyplot as plt
 import numpy as np
 import xarray as xr
 from loguru import logger
 from matplotlib import cm
-from popsim.ml.checkpointing import create_default_checkpoint_manager, restore_model
 
-from transport_study import RADIAL_DIM
-from transport_study.modules.profile_predictor.module import (
-    NN_INPUT_SOURCE_VARS,
-    make_nn_input_normalizer,
-)
+from transport_study import EPISODE_DIM, RADIAL_DIM, TIME_DIM
+from transport_study.config import config
+from transport_study.modules.profile_predictor.module import NN_INPUT_SOURCE_VARS
 from transport_study.modules.profile_predictor.torax_module import (
     SOURCE_COEFFICIENT_NAMES,
     TRANSPORT_COEFFICIENT_NAMES,
-    ProfilePredictorTorax,
-)
-from transport_study.modules.profile_predictor.train_configs import (
-    PROFILE_PREDICTOR_TORAX_CONFIGS,
 )
 from transport_study.plot_style import BACKGROUND_COLOR, TEXT_COLOR, style_axis
 from transport_study.signals import convert_to_working_units
@@ -48,7 +40,7 @@ LEGEND_FONTSIZE = 13
 
 def valid_timesteps(shot_ds: xr.Dataset) -> np.ndarray:
     """Timesteps where all inputs are finite and the target profiles are freshly measured."""
-    valid = np.ones(shot_ds.sizes["time_idx"], dtype=bool)
+    valid = np.ones(shot_ds.sizes[TIME_DIM], dtype=bool)
     for var in NN_INPUT_SOURCE_VARS:
         valid &= ~np.isnan(shot_ds[var].values)
     valid &= shot_ds["fresh_profile"].values.astype(bool)
@@ -57,14 +49,13 @@ def valid_timesteps(shot_ds: xr.Dataset) -> np.ndarray:
     return np.flatnonzero(valid)
 
 
-def _load_timeslice(dataset: str | Path, shot: int, timestep: int, ds_source_idx: int = 0) -> xr.Dataset:
-    ds_path = Path(dataset)
-    if not ds_path.exists():
-        raise FileNotFoundError(f"Dataset not found: {ds_path}")
-    ds_store = xr.open_dataset(ds_path)
-    ds = convert_to_working_units(ds_store)
-    shot_ds = ds.sel(shot=shot)
+def load_timeslice(device: str, shot: int, timestep: int) -> xr.Dataset:
+    """One timeslice of a device store in working units, the inputs a profile predictor takes.
 
+    Raises when the timeslice has NaN inputs or stale or all-NaN target profiles.
+    """
+    ds_store = xr.open_dataset(config.dataset_paths[device])
+    shot_ds = convert_to_working_units(ds_store.sel({EPISODE_DIM: shot}))
     valid = valid_timesteps(shot_ds)
     if timestep not in valid:
         if len(valid) == 0:
@@ -74,44 +65,11 @@ def _load_timeslice(dataset: str | Path, shot: int, timestep: int, ds_source_idx
             f"Timestep {timestep} of shot {shot} has NaN inputs, stale profiles, or all-NaN target profiles. "
             f"Nearest valid timestep: {nearest} (valid range {valid.min()}-{valid.max()}, {len(valid)} total)"
         )
-    timeslice = shot_ds.isel(time_idx=timestep)
-    # Raw device files lack the device index organize_data assigns, the
-    # module's normalizer needs it to pick the right per-device statistics
-    timeslice["ds_source_idx"] = float(ds_source_idx)
+    timeslice = shot_ds.isel({TIME_DIM: timestep})
+    # Raw device stores lack the device index organize_data assigns,
+    # the module's normalizer needs it to pick the per-device statistics
+    timeslice["ds_source_idx"] = float(config.ds_source_to_idx[device])
     return timeslice
-
-
-def _build_module(
-    timeslice: xr.Dataset,
-    checkpoint: str | Path | None,
-    transport_model: str,
-    n_devices: int = 1,
-    data_normalization: str = "physics",
-) -> ProfilePredictorTorax:
-    model_cfg = PROFILE_PREDICTOR_TORAX_CONFIGS[transport_model]["model_init_config"]
-    module = ProfilePredictorTorax(
-        nn_width=model_cfg["nn_width"],
-        nn_depth=model_cfg["nn_depth"],
-        rhogrid=tuple(timeslice[RADIAL_DIM].values.tolist()),
-        torax_config=model_cfg["torax_config"],
-        key=jax.random.PRNGKey(model_cfg["prng_seed"]),
-        # Identity buffers, restore_model overwrites them with the trained
-        # statistics when a checkpoint is given. Both n_devices and
-        # data_normalization must match the checkpoint: the stat method picks
-        # the normalizer class, and the classes have different pytrees.
-        # Identity buffers have no alignment reference, so target_idx is unused
-        normalizer=make_nn_input_normalizer(data_normalization, None, n_devices, target_idx=0),
-        transport_model=transport_model,
-        geometry_builder=model_cfg.get("geometry_builder", "circular"),
-        delta_exponent=model_cfg.get("delta_exponent", 2.0),
-    )
-    if checkpoint is not None:
-        manager = create_default_checkpoint_manager(checkpoint)
-        module = restore_model(manager, module)
-        logger.info(f"Restored profile predictor from checkpoint {checkpoint}")
-    else:
-        logger.warning("No checkpoint given, using randomly initialized network weights")
-    return module
 
 
 def plot_relaxation(
@@ -140,7 +98,8 @@ def plot_relaxation(
     ne_targ = timeslice["n_e_1e20"].values
     te_targ = timeslice["t_e_keV"].values
 
-    fig, (ax_ne, ax_te) = plt.subplots(2, 1, figsize=(12, 10), sharex=True)
+    # Constrained layout keeps the multi-line suptitle clear of the top panel
+    fig, (ax_ne, ax_te) = plt.subplots(2, 1, figsize=(12, 10), sharex=True, layout="constrained")
     fig.patch.set_facecolor(BACKGROUND_COLOR)
 
     def _coeff_label(name: str) -> str:
@@ -192,74 +151,69 @@ def plot_relaxation(
 
 
 def plot_torax_evolution(
-    dataset: str,
+    study_config: str,
+    case: str,
     shot: int,
     timestep: int,
-    transport_model: str = "gyrobohm",
-    checkpoint: str | None = None,
-    n_devices: int = 1,
-    data_normalization: str = "physics",
-    ds_source_idx: int = 0,
+    device: str | None = None,
     prescribed: dict | None = None,
     output_dir: str | None = None,
-):
-    """Plot ne/Te profile evolution across the internal TORAX relaxation steps.
+) -> Path:
+    """Plot ne/Te profile evolution across the internal TORAX relaxation steps of one trained torax case.
+
+    The module is built through the study's make_train_config,
+    so its tuned network size, geometry builder and solver settings match the checkpoint.
 
     Args:
-        dataset: Path to a device store (on-disk IMAS schema) with dims (shot, time_idx, rho_tor_norm).
+        study_config: TOML of the profile study the case belongs to.
+        case: Case string, the name of the case's checkpoint directory.
         shot: Shot number to select.
         timestep: time_idx index of the timeslice to predict.
-        transport_model: TORAX transport model: "constant", "gyrobohm", or "qlknn".
-        checkpoint: Optional checkpoint directory of a trained torax profile predictor
-            (must have been trained with the same transport_model).
-        n_devices: Number of devices the checkpoint was trained with (sizes the
-            normalizer buffers so the checkpoint restores).
-        data_normalization: Normalization method the checkpoint was trained with
-            (the norm_ token of its case name: "physics", "physics-coral", or
-            "physics-zscore"). Picks the normalizer class, which the restore
-            needs to match.
-        ds_source_idx: Device index of the plotted dataset in the training
-            source ordering (selects the normalizer's per-device statistics).
+        device: Device key of the shot, the study's target device by default.
         prescribed: Optional dict of coefficients bypassing the NN outputs.
-            Valid keys are the transport coefficients of the chosen model
-            (constant: chi_i, chi_e, D_e [m^2/s], V_e [m/s];
-            gyrobohm: chi_bohm_multiplier, chi_gyrobohm_multiplier, D_face_c1,
-            D_face_c2, V_face_coeff,
-            qlknn: ITG_flux_ratio_correction, ETG_correction_factor, collisionality_multiplier)
-            plus the source coefficients (S_total [1e21 /s], P_aux_total [MW],
-            gaussian_location, gaussian_width, electron_heat_fraction) and
-            n_e_right_bc [1e20 m^-3], T_e_right_bc [keV].
-            From the CLI pass as a dict literal, e.g. --prescribed '{"S_total": 1.0}'.
+            Valid keys are the transport coefficients of the case's TORAX model
+            (constant: chi_i, chi_e, D_e [m^2/s], V_e [m/s],
+            gyrobohm: chi_bohm_multiplier, chi_gyrobohm_multiplier, D_face_c1, D_face_c2, V_face_coeff,
+            qlknn: ITG_flux_ratio_correction, ETG_correction_factor, collisionality_multiplier),
+            the source coefficients (S_total [1e21 /s], P_aux_total [MW],
+            gaussian_location, gaussian_width, electron_heat_fraction)
+            and n_e_right_bc [1e20 m^-3], T_e_right_bc [keV].
+            From the CLI pass a dict literal, e.g. --prescribed '{"S_total": 1.0}'.
         output_dir: Directory to save the figure in (default: current directory).
     """
+    # Function-level imports: profile_study imports this module through case_reports, a top-level import would cycle
+    from transport_study.profile_transfer.profile_study import ProfileStudy
+    from transport_study.profile_transfer.restore_predictor import (
+        restore_profile_predictor,
+    )
+
+    study = ProfileStudy(study_config)
+    profile_case = study.case_by_name(case)
+    transport_model = profile_case.model_type.removeprefix("torax-")
     if transport_model not in TRANSPORT_COEFFICIENT_NAMES:
-        raise ValueError(f"Unknown transport model '{transport_model}', valid: {sorted(TRANSPORT_COEFFICIENT_NAMES)}")
-    timeslice = _load_timeslice(dataset, shot, timestep, ds_source_idx=ds_source_idx)
+        raise ValueError(f"Case {case} is not a torax case")
+    timeslice = load_timeslice(device or config.target_device, shot, timestep)
     time_s = float(timeslice["time"].values)
-    module = _build_module(timeslice, checkpoint, transport_model, n_devices=n_devices, data_normalization=data_normalization)
+    train_config = study.make_train_config(profile_case)
+    module = restore_profile_predictor(train_config)
 
     prescribed = prescribed or {}
     prescribed_names = {name for name, value in prescribed.items() if value is not None}
-
     steps, coeffs = module.evolve(timeslice, prescribed=prescribed)
     logger.info(f"TORAX relaxation recorded {len(steps)} states (initial + {len(steps) - 1} steps)")
 
     out_dir = Path(output_dir) if output_dir is not None else Path.cwd()
-    plot_path = out_dir / f"torax_evolution_{transport_model}_{Path(dataset).stem}_{shot}_ts{timestep}.png"
+    plot_path = out_dir / f"torax_evolution_{case}_shot{shot}_ts{timestep}.png"
     return plot_relaxation(
         steps,
         coeffs,
         timeslice,
         transport_model,
-        title_context=f"shot {shot} @ t={time_s:.3f}s (time_idx {timestep})",
+        title_context=f"{case}\nshot {shot} @ t={time_s:.3f}s (time_idx {timestep})",
         plot_path=plot_path,
         prescribed_names=prescribed_names,
     )
 
 
 if __name__ == "__main__":
-    fire.Fire(
-        {
-            "plot_torax_evolution": plot_torax_evolution,
-        }
-    )
+    fire.Fire(plot_torax_evolution)

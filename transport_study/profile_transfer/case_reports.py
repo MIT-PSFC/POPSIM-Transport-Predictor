@@ -24,7 +24,6 @@ from loguru import logger
 from PIL import Image
 
 from transport_study import EPISODE_DIM, RADIAL_DIM, TIME_DIM
-from transport_study.config import config
 from transport_study.modules.trb_utils import CHI_GRAD_RHO_MAX
 from transport_study.orchestration.case_reports import TITLE_FONTSIZE, best_worst_pdf
 from transport_study.plot_style import (
@@ -35,13 +34,15 @@ from transport_study.plot_style import (
     TICK_FONTSIZE,
     style_axis,
 )
-from transport_study.profile_transfer.plot_torax_evolution import plot_relaxation
+from transport_study.profile_transfer.plot_torax_evolution import (
+    load_timeslice,
+    plot_relaxation,
+)
 from transport_study.profile_transfer.study_metrics import (
     CaseTimesliceMetrics,
     compute_case_timeslice_metrics,
     load_eval_dataset,
 )
-from transport_study.signals import convert_to_working_units
 
 GIF_FRAME_DURATION_MS = 200
 REPORT_FILENAME = "best_worst_timeslices.pdf"
@@ -308,16 +309,6 @@ def torax_relaxation_report(study, metrics_ds: xr.Dataset, figure_dir: Path):
         logger.info(f"TORAX relaxation figure already exists at {plot_path}, skipping")
         return
 
-    # The device store carries the scalar input vars the module needs, in SI under IMAS names.
-    # load_eval_dataset keeps the same time_idx indexing (rows are never dropped)
-    ds_store = xr.open_dataset(config.dataset_paths[device])
-    timeslice_store = ds_store.sel({EPISODE_DIM: shot}).isel({TIME_DIM: eval_time_idx})
-    # The module takes the working units (ip_MA, b_geo, ...), as in training
-    timeslice = convert_to_working_units(timeslice_store)
-    # Raw device files lack the device index organize_data assigns, the
-    # module's normalizer needs it to pick the right per-device statistics
-    timeslice["ds_source_idx"] = float(config.ds_source_to_idx[device])
-
     # Function-level import: restore_predictor imports profile_study, which
     # imports this module at run_study time, so a top-level import would cycle
     from transport_study.profile_transfer.restore_predictor import (
@@ -325,10 +316,12 @@ def torax_relaxation_report(study, metrics_ds: xr.Dataset, figure_dir: Path):
     )
 
     try:
+        # The result files keep the store's time_idx indexing (rows are never dropped)
+        timeslice = load_timeslice(device, shot, eval_time_idx)
         module = restore_profile_predictor(train_config)
         steps, coeffs = module.evolve(timeslice)
     except Exception:
-        logger.exception(f"Failed to restore or evolve torax module for case {case}, skipping relaxation report")
+        logger.exception(f"Failed to load, restore or evolve torax module for case {case}, skipping relaxation report")
         return
     logger.info(f"TORAX relaxation recorded {len(steps)} states (initial + {len(steps) - 1} steps)")
 

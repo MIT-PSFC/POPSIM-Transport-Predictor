@@ -57,7 +57,7 @@ def study_config(tmp_path) -> ProfileStudy.Config:
 
 @pytest.fixture(autouse=True)
 def loaded_config(request):
-    """Every test needs a loaded config; study tests get theirs from study_config."""
+    """Every test needs a loaded config, study tests get theirs from study_config."""
     if "study_config" not in request.fixturenames:
         request.getfixturevalue("study_config")
 
@@ -391,7 +391,7 @@ def test_loss_on_prepared_sample_dataset():
     perfect predictions cost nothing, a two-sigma miss costs more than a half-sigma miss,
     and both losses stay finite on real signals.
     """
-    ds, _ = get_ds("cmod-high", "profile_transfer")
+    ds = get_ds("cmod-high", "profile_transfer")
 
     finite = np.ones((ds.sizes[EPISODE_DIM], ds.sizes["time_idx"]), dtype=bool)
     for var in PROFILE_TARGET_VARS:

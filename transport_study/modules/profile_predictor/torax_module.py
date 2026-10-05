@@ -805,7 +805,7 @@ class ProfilePredictorTorax(TimeIndepModule):
     # Static mesh info for the JAX-differentiable geometry construction, see make_step_fn_and_grid
     _face_centers: tuple = eqx.field(static=True)
     _rho_hires_norm: tuple = eqx.field(static=True)
-    # Upper bound on sub-steps in fixed_time_step; enables scan-based (differentiable) loop
+    # Upper bound on sub-steps in fixed_time_step, it makes the loop a differentiable scan
     max_steps: int = eqx.field(static=True)
 
     def __init__(

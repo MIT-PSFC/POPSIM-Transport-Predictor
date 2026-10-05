@@ -256,12 +256,12 @@ def test_env_create_state_per_model_type(transformer_module, sciml_module, torax
 
 
 def test_env_get_trainable_selections(transformer_module, sciml_module, torax_rebuild_module):
-    """get_trainable never includes normalizer statistics; for transfer it
-    returns only last-layer leaves (transformer head, the three torax MLPs,
-    sciml taue/profile last layers); for sciml with freeze_submodules both
-    submodules drop out of the selection entirely; for the transformer at
-    da=none the selection is exactly feature_embed, profile_embed, pos_embed,
-    attention and head."""
+    """get_trainable never includes normalizer statistics.
+
+    For transfer it returns only last-layer leaves (transformer head, the three torax MLPs, sciml taue/profile last layers).
+    For sciml with freeze_submodules both submodules drop out of the selection entirely.
+    For the transformer at da=none the selection is exactly feature_embed, profile_embed, pos_embed, attention and head.
+    """
     # Transformer, da=none: exactly the five architecture components
     sel_tf = TransportPredictorEnv(module=transformer_module, domain_adaptation="none").get_trainable()
     assert sorted(sel_tf.keys()) == ["attention", "feature_embed", "head", "pos_embed", "profile_embed"]
@@ -403,14 +403,14 @@ def test_transformer_history_holds_profiles_only(transformer_module):
 
 
 def test_torax_p_aux_feed_through(torax_rebuild_module):
-    """The measured power_additional_MW input is wired directly to the TORAX
-    generic_heat.P_total runtime update (MW to W) for the rebuild variant,
-    the carry variant, and the env's initial TORAX state construction (all
-    three route through TransportPredictorToraxBase.build_provider_and_geo);
-    the sources network predicts only the deposition shape
-    (gaussian_location, gaussian_width, electron_heat_fraction), the
-    gas-puff fueling, and the absorption_fraction, so no NN output can
-    override the measured injected heating magnitude."""
+    """The measured power_additional_MW input is wired directly to the TORAX generic_heat.P_total runtime update (MW to W).
+
+    That holds for the rebuild variant, the carry variant and the env's initial TORAX state construction,
+    all three route through TransportPredictorToraxBase.build_provider_and_geo.
+    The sources network predicts only the deposition shape (gaussian_location, gaussian_width, electron_heat_fraction),
+    the gas-puff fueling and the absorption_fraction,
+    so no NN output can override the measured injected heating magnitude.
+    """
     module = torax_rebuild_module
 
     # The sources network has no heating-magnitude output slot

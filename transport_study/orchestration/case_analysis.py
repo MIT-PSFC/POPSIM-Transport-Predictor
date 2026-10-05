@@ -43,12 +43,11 @@ def run_case_analysis_parallel(study) -> None:
 
     Submits CPU jobs for finished cases that still need analysis (via
     launch_case_analysis_parallel, which targets config.analysis_partition)
-    and polls until every case is done or has exhausted its attempts. At most
-    config.max_analysis_jobs analysis jobs are in the queue (running or
-    pending) at once, so a study with hundreds of cases does not flood the
-    scheduler; more jobs are submitted as earlier ones finish. Cases that
-    exhaust their attempts fall back to the study's serial analysis path
-    afterwards.
+    and polls until every case is done or has exhausted its attempts.
+    At most config.max_analysis_jobs analysis jobs are queued (running or pending) at once,
+    so a study with hundreds of cases does not flood the scheduler.
+    More jobs are submitted as earlier ones finish.
+    Cases that exhaust their attempts fall back to the study's serial analysis path afterwards.
     """
     partition = config.analysis_partition or config.partition
     pending = [case for case in study.cases if study.result_path(case).exists() and not analysis_case_done(study, case, study.figure_dir)]

@@ -104,7 +104,7 @@ def chi_sigma_floors(device: str) -> dict[str, float]:
     The CHI_SIGMA_FLOOR_PERCENTILE-th percentile of the positive normalized error bars over the device's fresh profiles,
     a property of the fits rather than of any case.
     """
-    ds, _ = get_ds(device, "profile_transfer")
+    ds = get_ds(device, "profile_transfer")
     floors = {}
     for channel, error_vars in CHI_ERROR_VARS.items():
         scale = np.asarray(peak_scale(ds[channel].transpose(..., RADIAL_DIM).values))

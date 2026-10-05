@@ -580,7 +580,7 @@ class Study:
         """All configured non-target source devices, the canonical hyperparam case."""
         target = config.target_device
         sources = sorted(set(config.dataset_paths.keys()) - ({target} if target else set()))
-        return TrainingData(sources_unsorted=sources)
+        return TrainingData(sources=sources)
 
     def make_cases(self) -> list[Case]:
         """Build every case of the study's case grid from the global config (study-specific)."""
@@ -711,24 +711,19 @@ class Study:
     def _scale_transfer_lr(self, train_config: TrainConfig) -> TrainConfig:
         """Step-budget the learning-rate schedule for fine-tuning from a pretrained checkpoint.
 
-        Tuned learning rates were swept for from-scratch training. A fixed
-        cooling factor starves a step-poor finetune: with batch_size larger
-        than the finetune dataset there is 1 optimizer step per epoch and
-        max_epochs steps total, so a 0.1 factor leaves the pretrained model
-        essentially unmoved. Budget rule: keep lr x total_steps at roughly
-        lr0 x max_epochs, i.e. scale = max_epochs / total_steps with
-        total_steps measured from the actual train dataloader, clipped to
-        [TRANSFER_LR_FLOOR, 1.0].
+        Tuned learning rates were swept for from-scratch training.
+        A fixed cooling factor starves a step-poor finetune:
+        with batch_size above the finetune dataset size there is 1 optimizer step per epoch,
+        so a 0.1 factor leaves the pretrained model essentially unmoved.
+        The scale keeps lr x total_steps near lr0 x max_epochs,
+        scale = max_epochs / total_steps from the measured train dataloader, clipped to [TRANSFER_LR_FLOOR, 1].
 
-        The schedule is also flattened (lrf = lr0, which optax
-        exponential_decay clamps to a constant) so the whole step budget is
-        spent at working LR - best-checkpoint selection and early stopping
-        already guard against overshoot. Yes I know this is cheating since
-        in a live case you wouldn't know when to stop, but it's a fair
-        comparison to the other cases which also use early stopping.
+        The schedule is also flattened (lrf = lr0, a constant under optax exponential_decay),
+        so the whole step budget is spent at working LR.
+        Best-checkpoint selection and early stopping guard against overshoot.
+        A live finetune could not stop on the test set, but every compared case does the same.
 
-        Applied after the tuned-config merge so the swept optimizer_config
-        cannot overwrite it.
+        Applied after the tuned-config merge so the swept optimizer_config cannot overwrite it.
         """
         steps_per_epoch = self._transfer_steps_per_epoch(train_config)
         total_steps = steps_per_epoch * train_config.max_epochs
@@ -865,11 +860,8 @@ class Study:
     def check_data_requirements(self, case: Case) -> bool:
         """Given a case, check if the required data for that case is available."""
         required = set(case.training_data.sources)
-        if case.training_data.exnihilo or case.domain_adaptation in (
-            "weighted",
-            "addition",
-            "transfer",
-        ):
+        # Every domain adaptation method reads target shots, transfer_pretrain to fit its normalizer
+        if case.training_data.exnihilo or case.domain_adaptation is not None:
             required.add(config.target_device)
 
         missing = [ds for ds in required if ds not in config.dataset_paths]
@@ -878,6 +870,13 @@ class Study:
             return False
 
         return True
+
+    def case_by_name(self, case_name: str) -> Case:
+        """The study case whose str(case) is case_name."""
+        for case in self.cases:
+            if str(case) == case_name:
+                return case
+        raise ValueError(f"Study {self.name} has no case {case_name}")
 
     def get_unfinished_cases(self) -> list[Case]:
         unfinished = []
@@ -903,11 +902,10 @@ class Study:
 
         A job counts as deadlocked once it has run at least WATCHDOG_MIN_AGE_S
         with no checkpoint written in the last WATCHDOG_STALL_S (including one
-        that never wrote a first checkpoint at all). Killing it frees the case
-        to be relaunched as a fresh process by the normal orchestration loop;
-        launch_train's attempt counter only resets on checkpoint progress, so a
-        job that keeps deadlocking still hits MAX_TRAIN_ATTEMPTS and aborts the
-        study rather than looping forever.
+        that never wrote a first checkpoint at all).
+        Killing it frees the case to be relaunched as a fresh process by the normal orchestration loop.
+        launch_train's attempt counter only resets on checkpoint progress,
+        so a job that keeps deadlocking still hits MAX_TRAIN_ATTEMPTS and aborts the study rather than looping forever.
         """
         elapsed = get_running_job_elapsed_s()
         if not elapsed:
@@ -1007,8 +1005,8 @@ class Study:
         and no job for the case already in flight. Blocked and in-flight cases
         are counted in a single per-pass summary line instead of being visited
         (and logged about) individually. Prereqs are themselves cases in
-        self.cases, so a blocked case becomes runnable once its prereq case
-        finishes; nothing needs to recurse into prereq chains here.
+        self.cases, so a blocked case becomes runnable once its prereq case finishes.
+        Nothing needs to recurse into prereq chains here.
 
         A case whose job just left the queue is held for RELAUNCH_GRACE_S
         before it can be relaunched: its result file may already be written but
@@ -1421,8 +1419,8 @@ class Study:
     def collect_results(self) -> xr.Dataset:
         """Collect scalar summary statistics per case (one row per case).
 
-        Default implementation for the scalar-summary studies (power balance,
-        transport); the profile study overrides with a per-shot long form.
+        Default implementation for the scalar-summary studies (power balance, transport).
+        The profile study overrides it with a per-shot long form.
 
         Dims: case_idx
         Coords (along case_idx): the CASE_COORD_NAMES fields of each case

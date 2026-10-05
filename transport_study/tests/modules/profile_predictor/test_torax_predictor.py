@@ -159,7 +159,7 @@ def test_torax_predictor(transport_model):
 
     train_config = TrainConfig(**PROFILE_PREDICTOR_TORAX_CONFIGS[transport_model])
     training_data = {
-        "sources_unsorted": ["cmod-low"],
+        "sources": ["cmod-low"],
         "exnihilo": False,
     }
     train_config = train_config.model_copy(
@@ -203,7 +203,7 @@ def test_torax_predictor_mast_miller(transport_model):
 
     train_config = TrainConfig(**PROFILE_PREDICTOR_TORAX_CONFIGS[transport_model])
     training_data = {
-        "sources_unsorted": ["mast-low"],
+        "sources": ["mast-low"],
         "exnihilo": False,
     }
     train_config = train_config.model_copy(

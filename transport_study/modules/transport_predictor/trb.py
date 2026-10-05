@@ -246,22 +246,14 @@ class TransportPredictorTRB(TrainRunBuilder):
 
     @staticmethod
     def get_optimizer(optimizer_config: dict) -> optax.GradientTransformation:
-        # zero_nans FIRST, because the global-norm cap cannot help against a
-        # non-finite gradient: clip_by_global_norm(NaN) is still NaN, so one
-        # bad backward pass poisons every parameter and the run is dead even
-        # though the forward losses were all finite (the transformer rollout
-        # does this - the loss sanitizes non-finite PREDICTIONS, but a finite
-        # loss can still have a NaN derivative). Zeroing turns that step into
-        # a no-op for the affected leaves instead of ending the run, and the
-        # divergence_penalty term still charges the sample in the loss so the
-        # sweep metric keeps seeing it.
-        #
-        # Then the global-norm cap as in the profile study (the differentiated
-        # TORAX solve can spike gradients and NaN a run without it), on top of
-        # the power balance study's grouped schedule: submodule_lr_factors runs
-        # the sciml power_balance subtree at a reduced learning rate while
-        # the profile predictor keeps the full one (pytree-path labeling, a
-        # no-op for model types without a matching path)
+        # zero_nans first, the global-norm cap cannot fix a non-finite gradient (clip_by_global_norm(NaN) is NaN).
+        # A finite loss can still have a NaN derivative (the transformer rollout does this),
+        # so zeroing makes that step a no-op for the affected leaves instead of ending the run.
+        # The divergence_penalty term still charges the sample, so the sweep metric sees it.
+        # Then the global-norm cap as in the profile study, the differentiated TORAX solve can spike gradients.
+        # Last the power balance study's grouped schedule:
+        # submodule_lr_factors runs the sciml power_balance subtree at a reduced learning rate,
+        # a no-op for model types without a matching pytree path.
         return optax.chain(
             optax.zero_nans(),
             optax.clip_by_global_norm(optimizer_config["grad_clip_max_norm"]),

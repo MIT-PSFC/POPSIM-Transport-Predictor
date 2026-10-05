@@ -102,29 +102,24 @@ class StudyConfig(BaseModel):
     # resumes from that checkpoint. 27000 s = 7.5 h
     train_wall_budget_s: int = Field(default_factory=lambda: int(os.environ.get("PTPS_TRAIN_WALL_BUDGET_S", "27000")))
     buffer_gpus: int | None = Field(default_factory=lambda: int(os.environ.get("PTPS_BUFFER_GPUS", "12")))
-    # SLURM gres GPU type names training and agent jobs may land on
-    # The default keeps float64 TORAX training off cards with slow fp64
-    # pipelines (l40s, a40, l4, rtx_pro_6000). Empty disables the exclusion
+    # SLURM gres GPU type names training and agent jobs may land on.
+    # The default keeps float64 TORAX training off cards with slow fp64 pipelines (l40s, a40, l4, rtx_pro_6000).
+    # Empty disables the exclusion.
     gpu_types: tuple[str, ...] = Field(default_factory=_env_gpu_types)
-    # SLURM node names GPU jobs must never land on, e.g. a node with a GPU
-    # that faults every job at startup. Unlike the gpu_types exclusion this
-    # applies to every gres request, typed fallbacks included. Note sbatch has
-    # no SBATCH_EXCLUDE environment variable, so an in-script #SBATCH
-    # --exclude line is the only way to pass this through. Empty disables it
+    # SLURM node names GPU jobs must never land on, e.g. a node whose GPU faults every job at startup.
+    # Unlike the gpu_types exclusion it applies to every gres request, typed fallbacks included.
+    # sbatch has no SBATCH_EXCLUDE environment variable, so it reaches the job as an #SBATCH --exclude line.
+    # Empty disables it.
     exclude_nodes: tuple[str, ...] = Field(default_factory=_env_exclude_nodes)
-    # Overflow partitions for GPU jobs once `partition` has no idle GPUs beyond
-    # buffer_gpus, tried in order. Jobs submitted there can be preempted
-    # (requeued) at any time, so training relies on resume-from-checkpoint.
-    # Submissions per partition are capped at its per-user GPU allowance
-    # (QOS MaxTRESPU gres/gpu) so jobs don't pile up pending behind a QOS cap.
-    # Empty disables spillover
+    # Overflow partitions for GPU jobs once `partition` has no idle GPUs beyond buffer_gpus, tried in order.
+    # Jobs there can be preempted at any time, so training relies on resume-from-checkpoint.
+    # Submissions per partition are capped at its per-user GPU allowance (QOS MaxTRESPU gres/gpu).
+    # Empty disables spillover.
     spillover_partitions: tuple[str, ...] = Field(default_factory=_env_spillover_partitions)
-    # Ceiling on this user's total running + pending jobs across all partitions.
-    # Default matches the mit_preemptable QOS MaxSubmitPU (448), the tightest of
-    # the limits that apply (association MaxSubmit is 500)
+    # Ceiling on this user's running + pending jobs across all partitions.
+    # The default is the mit_preemptable QOS MaxSubmitPU (448), the tightest limit that applies.
     max_user_jobs: int = Field(default_factory=lambda: int(os.environ.get("PTPS_MAX_USER_JOBS", "448")))
-    # Spillover submissions stop once total jobs reach max_user_jobs - this headroom,
-    # leaving slack for analysis jobs and interactive work
+    # Spillover submissions stop at max_user_jobs minus this headroom, leaving slack for analysis and interactive jobs
     spillover_job_headroom: int = Field(default_factory=lambda: int(os.environ.get("PTPS_SPILLOVER_JOB_HEADROOM", "10")))
     wandb_entity: str | None = Field(default_factory=lambda: os.environ.get("PTPS_WANDB_ENTITY"))
     # Scratch directory for trajectory-optimization intermediate results
