@@ -67,15 +67,13 @@ def test_study_cmod_to_cmod_no_tuning(model_type):
         "cmod_to_cmod_no_tuning",
         model_types=[model_type],
     )
+    ProfileStudy.clean_working_dir(cfg, clean_models=True, clean_results=True, clean_figures=True)
     study = ProfileStudy(cfg)
     study.setup_directories(
         enable_parallelism=False,
         skip_tuning=True,
         skip_visualization=True,
         clean_sweeps=True,
-        clean_models=True,
-        clean_results=True,
-        clean_figures=True,
     )
 
     _run_every_case(study, skip_tuning=True)
@@ -90,15 +88,13 @@ def test_study_cmod_to_cmod_with_tuning():
         model_types=["mlp"],
         num_target_shots_options=[0, -1],
     )
+    ProfileStudy.clean_working_dir(cfg, clean_models=True, clean_results=True, clean_figures=True)
     study = ProfileStudy(cfg)
     study.setup_directories(
         enable_parallelism=False,
         skip_tuning=False,
         skip_visualization=True,
         clean_sweeps=True,
-        clean_models=True,
-        clean_results=True,
-        clean_figures=True,
     )
 
     _run_every_case(study, skip_tuning=False)
@@ -118,15 +114,13 @@ def test_study_cmod_to_mast():
         model_types=["mlp"],
         training_datasets=["exnihilo", "cmod-low_cmod-high"],
     )
+    ProfileStudy.clean_working_dir(cfg, clean_models=True, clean_results=True, clean_figures=True)
     study = ProfileStudy(cfg)
     study.setup_directories(
         enable_parallelism=False,
         skip_tuning=True,
         skip_visualization=True,
         clean_sweeps=True,
-        clean_models=True,
-        clean_results=True,
-        clean_figures=True,
     )
 
     _run_every_case(study, skip_tuning=True)

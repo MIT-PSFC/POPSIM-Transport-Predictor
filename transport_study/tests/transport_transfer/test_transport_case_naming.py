@@ -67,13 +67,16 @@ def test_torax_axis_tokens(loaded_config, geometry_builder, torax_state, suffix)
 
 
 def test_submodule_prereq_case_names(loaded_config):
-    """sciml needs a power_balance and a profile case, and the power_balance case needs p_oh and p_rad."""
+    """sciml needs a power_balance and a profile case, and the power_balance case needs p_oh and p_rad.
+
+    Submodule cases sit at the unfrozen hyperparam default, so their names carry no freeze token.
+    """
     prereq_names = {str(prereq) for prereq in _case().prereqs}
-    assert {"case.power_balance.td_cmod-low1.freeze_True", "case.profile.td_cmod-low1.freeze_True"} <= prereq_names
+    assert {"case.power_balance.td_cmod-low1", "case.profile.td_cmod-low1"} <= prereq_names
 
     power_balance_case = next(prereq for prereq in _case().prereqs if prereq.model_type == "power_balance")
     power_balance_prereq_names = {str(prereq) for prereq in power_balance_case.prereqs}
-    assert {"case.p_oh.td_cmod-low1.freeze_True", "case.p_rad.td_cmod-low1.freeze_True"} <= power_balance_prereq_names
+    assert {"case.p_oh.td_cmod-low1", "case.p_rad.td_cmod-low1"} <= power_balance_prereq_names
 
 
 @pytest.mark.parametrize("torax_axis", [{"geometry_builder": "miller"}, {"torax_state": "carry"}])

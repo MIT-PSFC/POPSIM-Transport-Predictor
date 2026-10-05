@@ -43,8 +43,9 @@ def test_source_trained_case_name(loaded_config):
 
 
 def test_exnihilo_case_name(loaded_config):
-    case = _case(model_type="mlp", training_data="exnihilo", data_normalization="raw", num_target_shots=5)
-    assert str(case) == "case.mlp.td_exnihilo.norm_raw.freeze_True.targ_5"
+    # Unfrozen is the default, so it leaves no freeze token
+    case = _case(model_type="mlp", training_data="exnihilo", data_normalization="raw", freeze_submodules=False, num_target_shots=5)
+    assert str(case) == "case.mlp.td_exnihilo.norm_raw.targ_5"
 
 
 def test_domain_adaptation_case_name(loaded_config):

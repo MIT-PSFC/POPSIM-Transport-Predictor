@@ -7,26 +7,24 @@ from transport_study.modules.profile_predictor.module import ProfilePredictor
 from transport_study.modules.profile_predictor.trb import (
     ProfilePredictorTRB,
 )
-from transport_study.profile_transfer.profile_study import (
-    HYPERPARAM_TARGET_SHOTS,
-    ProfileStudy,
-)
+from transport_study.orchestration.study import HYPERPARAM_TARGET_SHOTS
+from transport_study.profile_transfer.profile_study import ProfileStudy
 
 
 def checkpoint_to_profile_case(checkpoint_dir: Path | str) -> ProfileStudy.Case:
     """Parse a case directory name back into a ProfileStudy.Case.
 
     Mirrors ProfileStudy.Case.__str__:
-    case.{model_type}.td_{td}.norm_{n}.freeze_{f}.geom_{g}                   source-trained, no adaptation
-    case.{model_type}.td_{td}.norm_{n}.freeze_{f}.geom_{g}.targ_{n}          exnihilo
-    case.{model_type}.td_{td}.norm_{n}.freeze_{f}.geom_{g}.targ_{n}.da_{da}  domain adaptation
+    case.{model_type}.td_{td}.norm_{n}[.freeze_True].geom_{g}                   source-trained, no adaptation
+    case.{model_type}.td_{td}.norm_{n}[.freeze_True].geom_{g}.targ_{n}          exnihilo
+    case.{model_type}.td_{td}.norm_{n}[.freeze_True].geom_{g}.targ_{n}.da_{da}  domain adaptation
 
-    No case-name token is suppressed (see Study.Case.STR_TOKEN_FIELDS), so
-    norm_/freeze_/geom_ are all mandatory and fixed in position.
+    The freeze_ token is suppressed for unfrozen shapes (see Study.Case.STR_TOKEN_FIELDS),
+    norm_ and geom_ are mandatory and fixed in position.
     """
     case_name = Path(checkpoint_dir).name
     pieces = case_name.split(".")
-    if len(pieces) < 6 or pieces[0] != "case" or not pieces[2].startswith("td_"):
+    if len(pieces) < 5 or pieces[0] != "case" or not pieces[2].startswith("td_"):
         raise ValueError(f"Unexpected case name format: {case_name}")
 
     idx = 3
@@ -35,12 +33,13 @@ def checkpoint_to_profile_case(checkpoint_dir: Path | str) -> ProfileStudy.Case:
     data_normalization = pieces[idx].removeprefix("norm_")
     idx += 1
 
-    if not pieces[idx].startswith("freeze_"):
-        raise ValueError(f"Unexpected case name format: {case_name}")
-    freeze_shapes = pieces[idx].removeprefix("freeze_") == "True"
-    idx += 1
+    freeze_shapes = pieces[idx].startswith("freeze_")
+    if freeze_shapes:
+        if pieces[idx] != "freeze_True":
+            raise ValueError(f"Unexpected case name format: {case_name}")
+        idx += 1
 
-    if not pieces[idx].startswith("geom_"):
+    if idx == len(pieces) or not pieces[idx].startswith("geom_"):
         raise ValueError(f"Unexpected case name format: {case_name}")
     geometry_builder = pieces[idx].removeprefix("geom_")
     idx += 1

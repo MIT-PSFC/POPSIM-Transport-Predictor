@@ -1,14 +1,31 @@
 """
 Load and parse configuration files for the project.
-This is where we set global variables from env vars or config files
+This is where we set global variables from env vars or config files.
+
+Every config field has exactly one role, declared with its type,
+because the role decides whether changing the field can mix results from two setups:
+- Identity (Identity[T]): names the study, whose working dir is working_dir_base / study_name.
+- Locked (no marker): changes what a case produces without changing the case's name.
+  The config lock refuses a run that changes one.
+  Unmarked fields are locked on purpose, so a new setting can never silently mix results.
+- Case axis (Annotated[T, CaseAxis(<Case field>)]): the values one Case field takes across the case grid.
+  It selects which cases exist, never what one case produces, so it may change between runs.
+- Orchestration (Orchestration[T]): where and how jobs run.
+  It never changes what a job computes, so it is neither locked nor written to the lock.
+
+A study TOML mirrors the roles:
+identity and locked fields at the top level, the axes under [cases], the orchestration settings under [orchestration],
+and the device dataset paths plus the target device under [datasets].
 """
 
 import json
 import os
 import tomllib
+from dataclasses import dataclass
+from enum import StrEnum
 from pathlib import Path
 from types import MappingProxyType
-from typing import Self
+from typing import Annotated, Self, TypeVar
 
 import numpy as np
 import toml
@@ -30,6 +47,34 @@ RHO_GRID = np.linspace(0.0, 1.0, N_RHO_POINTS)
 DEBUG_MAX_SOURCE_SHOTS = 100
 DEBUG_MAX_EPOCHS = 100
 DEBUG_HYPERPARAM_SWEEPS = 1
+
+
+class FieldRole(StrEnum):
+    """What a config field controls, see the module docstring."""
+
+    IDENTITY = "identity"
+    LOCKED = "locked"
+    CASE_AXIS = "case_axis"
+    ORCHESTRATION = "orchestration"
+
+
+@dataclass(frozen=True)
+class CaseAxis:
+    """Marks a config field as a case-grid axis, the values the Case field case_field takes across the grid."""
+
+    case_field: str
+
+
+T = TypeVar("T")
+Identity = Annotated[T, FieldRole.IDENTITY]
+Orchestration = Annotated[T, FieldRole.ORCHESTRATION]
+
+# TOML table of each role kept out of the top level, where the identity and locked fields sit
+ROLE_TABLES = {FieldRole.CASE_AXIS: "cases", FieldRole.ORCHESTRATION: "orchestration"}
+
+
+def _toml_location(table: str | None) -> str:
+    return f"in [{table}]" if table else "at the top level"
 
 
 def env_dataset_paths() -> dict[str, Path]:
@@ -66,7 +111,7 @@ def _env_exclude_nodes() -> tuple[str, ...]:
 # Main config for environment variables
 class StudyConfig(BaseModel):
     # Shared between all studies
-    study_name: str
+    study_name: Identity[str]
     dataset_paths: dict[str, Path] = Field(default_factory=env_dataset_paths)
     target_device: str
 
@@ -86,44 +131,44 @@ class StudyConfig(BaseModel):
     hyperparam_max_epochs: int = 240
 
     # Environment-specific orchestration settings
-    partition: str | None = Field(default_factory=lambda: os.environ.get("PTPS_PARTITION"))
+    partition: Orchestration[str | None] = Field(default_factory=lambda: os.environ.get("PTPS_PARTITION"))
     # Partition for CPU-only analysis jobs (per-case metrics and case reports).
     # These need no GPU, so point this at a CPU partition. Falls back to `partition`
-    analysis_partition: str | None = Field(default_factory=lambda: os.environ.get("PTPS_ANALYSIS_PARTITION"))
+    analysis_partition: Orchestration[str | None] = Field(default_factory=lambda: os.environ.get("PTPS_ANALYSIS_PARTITION"))
     # SLURM walltime request for analysis jobs, sbatch --time format
-    analysis_time_limit: str = Field(default_factory=lambda: os.environ.get("PTPS_ANALYSIS_TIME_LIMIT", "07:59:59"))
+    analysis_time_limit: Orchestration[str] = Field(default_factory=lambda: os.environ.get("PTPS_ANALYSIS_TIME_LIMIT", "07:59:59"))
     # Cap on this study's concurrent (running + pending) analysis jobs, so a study
     # with hundreds of cases doesn't flood the queue with pending jobs at once
-    max_analysis_jobs: int = Field(default_factory=lambda: int(os.environ.get("PTPS_MAX_ANALYSIS_JOBS", "20")))
+    max_analysis_jobs: Orchestration[int] = Field(default_factory=lambda: int(os.environ.get("PTPS_MAX_ANALYSIS_JOBS", "20")))
     # SLURM walltime request for training and agent jobs, sbatch --time format
-    train_time_limit: str = Field(default_factory=lambda: os.environ.get("PTPS_TRAIN_TIME_LIMIT", "07:59:59"))
+    train_time_limit: Orchestration[str] = Field(default_factory=lambda: os.environ.get("PTPS_TRAIN_TIME_LIMIT", "07:59:59"))
     # In-job wall-clock training budget in seconds. Set below the SLURM limit so the
     # trainer can save the latest checkpoint and exit cleanly, then a resubmitted job
     # resumes from that checkpoint. 27000 s = 7.5 h
-    train_wall_budget_s: int = Field(default_factory=lambda: int(os.environ.get("PTPS_TRAIN_WALL_BUDGET_S", "27000")))
-    buffer_gpus: int | None = Field(default_factory=lambda: int(os.environ.get("PTPS_BUFFER_GPUS", "12")))
+    train_wall_budget_s: Orchestration[int] = Field(default_factory=lambda: int(os.environ.get("PTPS_TRAIN_WALL_BUDGET_S", "27000")))
+    buffer_gpus: Orchestration[int | None] = Field(default_factory=lambda: int(os.environ.get("PTPS_BUFFER_GPUS", "12")))
     # SLURM gres GPU type names training and agent jobs may land on.
     # The default keeps float64 TORAX training off cards with slow fp64 pipelines (l40s, a40, l4, rtx_pro_6000).
     # Empty disables the exclusion.
-    gpu_types: tuple[str, ...] = Field(default_factory=_env_gpu_types)
+    gpu_types: Orchestration[tuple[str, ...]] = Field(default_factory=_env_gpu_types)
     # SLURM node names GPU jobs must never land on, e.g. a node whose GPU faults every job at startup.
     # Unlike the gpu_types exclusion it applies to every gres request, typed fallbacks included.
     # sbatch has no SBATCH_EXCLUDE environment variable, so it reaches the job as an #SBATCH --exclude line.
     # Empty disables it.
-    exclude_nodes: tuple[str, ...] = Field(default_factory=_env_exclude_nodes)
+    exclude_nodes: Orchestration[tuple[str, ...]] = Field(default_factory=_env_exclude_nodes)
     # Overflow partitions for GPU jobs once `partition` has no idle GPUs beyond buffer_gpus, tried in order.
     # Jobs there can be preempted at any time, so training relies on resume-from-checkpoint.
     # Submissions per partition are capped at its per-user GPU allowance (QOS MaxTRESPU gres/gpu).
     # Empty disables spillover.
-    spillover_partitions: tuple[str, ...] = Field(default_factory=_env_spillover_partitions)
+    spillover_partitions: Orchestration[tuple[str, ...]] = Field(default_factory=_env_spillover_partitions)
     # Ceiling on this user's running + pending jobs across all partitions.
     # The default is the mit_preemptable QOS MaxSubmitPU (448), the tightest limit that applies.
-    max_user_jobs: int = Field(default_factory=lambda: int(os.environ.get("PTPS_MAX_USER_JOBS", "448")))
+    max_user_jobs: Orchestration[int] = Field(default_factory=lambda: int(os.environ.get("PTPS_MAX_USER_JOBS", "448")))
     # Spillover submissions stop at max_user_jobs minus this headroom, leaving slack for analysis and interactive jobs
-    spillover_job_headroom: int = Field(default_factory=lambda: int(os.environ.get("PTPS_SPILLOVER_JOB_HEADROOM", "10")))
-    wandb_entity: str | None = Field(default_factory=lambda: os.environ.get("PTPS_WANDB_ENTITY"))
+    spillover_job_headroom: Orchestration[int] = Field(default_factory=lambda: int(os.environ.get("PTPS_SPILLOVER_JOB_HEADROOM", "10")))
+    wandb_entity: Orchestration[str | None] = Field(default_factory=lambda: os.environ.get("PTPS_WANDB_ENTITY"))
     # Scratch directory for trajectory-optimization intermediate results
-    scratch_dir: Path | None = None
+    scratch_dir: Orchestration[Path | None] = None
 
     # make everything in the config completely immutable, including the nested dataset_paths dict
     # extra="forbid" so a mistyped field name raises instead of being silently ignored and replaced by the default
@@ -150,15 +195,58 @@ class StudyConfig(BaseModel):
         return dict(v)
 
     @classmethod
+    def field_role(cls, name: str) -> FieldRole:
+        """The role a field declares with its type, LOCKED when it declares none."""
+        for marker in cls.model_fields[name].metadata:
+            if isinstance(marker, CaseAxis):
+                return FieldRole.CASE_AXIS
+            if isinstance(marker, FieldRole):
+                return marker
+        return FieldRole.LOCKED
+
+    @classmethod
+    def fields_with_role(cls, *roles: FieldRole) -> tuple[str, ...]:
+        return tuple(name for name in cls.model_fields if cls.field_role(name) in roles)
+
+    @classmethod
+    def case_axes(cls) -> dict[str, str]:
+        """Case field name -> the config field holding its values, one entry per case-grid axis."""
+        axes = {}
+        for name, info in cls.model_fields.items():
+            for marker in info.metadata:
+                if isinstance(marker, CaseAxis):
+                    axes[marker.case_field] = name
+        return axes
+
+    def differing_fields(self, other: "StudyConfig", *roles: FieldRole) -> list[str]:
+        """Names of the fields with one of roles whose values differ between the two configs."""
+        return [name for name in self.fields_with_role(*roles) if getattr(self, name) != getattr(other, name)]
+
+    @classmethod
     def toml_kwargs(cls, path: Path | str) -> dict:
-        """Constructor kwargs of a TOML config, its [datasets] table becomes dataset_paths and target_device."""
+        """Constructor kwargs of a study TOML laid out by role (see the module docstring).
+
+        A field outside the table of its role raises, naming the right table.
+        PTPS_DATASET_PATHS provides default device paths, explicit [datasets] paths win.
+        """
         with open(path, "rb") as f:
             data = tomllib.load(f)
         datasets = data.pop("datasets", {})
         target = datasets.pop("target", None)
-        # Env vars provide defaults, explicit TOML paths win
+        tables = {table: data.pop(table, {}) for table in ROLE_TABLES.values()}
+        kwargs = {}
+        for table, entries in [(None, data), *tables.items()]:
+            for name, value in entries.items():
+                if name not in cls.model_fields:
+                    raise ValueError(f"Unknown config field {name} {_toml_location(table)} of {path}")
+                expected_table = ROLE_TABLES.get(cls.field_role(name))
+                if expected_table != table:
+                    raise ValueError(
+                        f"Config field {name} is {_toml_location(table)} of {path}, but it belongs {_toml_location(expected_table)}"
+                    )
+                kwargs[name] = value
         dataset_paths = env_dataset_paths() | {k: Path(v) for k, v in datasets.items()}
-        return data | {"dataset_paths": dataset_paths, "target_device": target}
+        return kwargs | {"dataset_paths": dataset_paths, "target_device": target}
 
     @classmethod
     def from_toml(cls, path: Path | str) -> Self:
@@ -170,22 +258,24 @@ class StudyConfig(BaseModel):
         """Stable integer index per device, sorted alphabetically for reproducibility."""
         return {k: i for i, k in enumerate(sorted(self.dataset_paths.keys()))}
 
-    def is_compatible(self, cfg: "StudyConfig") -> bool:
-        """Check if two configs are compatible for running the same study (e.g. dataset paths and target device must match)."""
-        return self.dataset_paths == cfg.dataset_paths and self.target_device == cfg.target_device
+    def toml_data(self, roles: tuple[FieldRole, ...] = tuple(FieldRole)) -> dict:
+        """The TOML tables save writes and from_toml reads back, laid out by role.
 
-    def toml_data(self) -> dict:
-        """The TOML table save writes and from_toml reads back, None fields left out."""
+        Only fields with one of roles are written, None fields are left out.
+        """
         datasets = {k: str(v) for k, v in self.dataset_paths.items()}
         if self.target_device is not None:
             datasets["target"] = self.target_device
-        data = {}
-        for k, v in self.model_dump().items():
-            if k in ("dataset_paths", "target_device") or v is None:
+        data: dict = {}
+        tables: dict = {table: {} for role, table in ROLE_TABLES.items() if role in roles}
+        for name, value in self.model_dump().items():
+            role = self.field_role(name)
+            if name in ("dataset_paths", "target_device") or value is None or role not in roles:
                 continue
-            data[k] = str(v) if isinstance(v, Path) else v
-        data["datasets"] = datasets
-        return data
+            table = ROLE_TABLES.get(role)
+            entries = tables[table] if table else data
+            entries[name] = str(value) if isinstance(value, Path) else value
+        return data | tables | {"datasets": datasets}
 
     def save(self, path: Path):
         data = self.toml_data()
@@ -223,6 +313,12 @@ class _ConfigProxy:
         if _ConfigProxy._cfg is None:
             raise RuntimeError("Config not loaded. Call load_config() first.")
         return type(_ConfigProxy._cfg)
+
+    def get_instance(self) -> StudyConfig:
+        """The loaded config object itself, for code that stores or compares it (e.g. the config lock)."""
+        if _ConfigProxy._cfg is None:
+            raise RuntimeError("Config not loaded. Call load_config() first.")
+        return _ConfigProxy._cfg
 
 
 config = _ConfigProxy()

@@ -26,10 +26,8 @@ from transport_study.modules.power_balance.p_oh.module import OhmicPower
 from transport_study.modules.power_balance.p_rad.module import RadiatedPower
 from transport_study.modules.power_balance.trb import PowerBalanceTRB
 from transport_study.modules.trb_utils import make_grouped_exponential_adamw
-from transport_study.power_balance_transfer.power_balance_study import (
-    HYPERPARAM_TARGET_SHOTS,
-    PowerBalanceStudy,
-)
+from transport_study.orchestration.study import HYPERPARAM_TARGET_SHOTS
+from transport_study.power_balance_transfer.power_balance_study import PowerBalanceStudy
 from transport_study.tests.sample_data import SAMPLE_DIR, requires_sample_data
 
 ##################

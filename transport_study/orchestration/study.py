@@ -7,8 +7,9 @@ import os
 import shutil
 import time
 from dataclasses import dataclass, fields
+from itertools import product
 from pathlib import Path
-from typing import ClassVar
+from typing import Annotated, ClassVar
 
 import wandb
 import xarray as xr
@@ -22,12 +23,27 @@ from popsim.ml.launch import (
     resolve_transition_frac,
 )
 from popsim.ml.train_config import load_dict
-from pydantic import Field, field_validator, model_validator
+from pydantic import Field, field_serializer, field_validator, model_validator
 
 from transport_study import PACKAGE_ROOT, TIME_DIM
-from transport_study.config import StudyConfig, config, env_dataset_paths, load_config
+from transport_study.config import (
+    CaseAxis,
+    FieldRole,
+    Orchestration,
+    StudyConfig,
+    config,
+    env_dataset_paths,
+    load_config,
+)
 from transport_study.modules.normalization import STAT_NORMALIZATIONS
 from transport_study.modules.trb_utils import chi_sigma_floors
+from transport_study.orchestration.config_lock import (
+    CONFIG_LOCK_FILENAME,
+    ConfigLock,
+    new_stamp,
+    read_config_lock,
+    write_config_lock,
+)
 from transport_study.orchestration.organize_data import (
     TrainingData,
     get_loaded_shot_count,
@@ -56,8 +72,6 @@ from transport_study.orchestration.wandb_utils import (
     is_trained_to_completion,
     run_clean_sweeps,
 )
-
-CONFIG_LOCK_FILENAME = "config_lock.toml"
 
 # Target-shot count for hyperparameter tuning cases. When domain adaptation is
 # None no target data is used during training, and during domain adaptation no
@@ -155,18 +169,20 @@ def configure_jax_platforms(enable_parallelism: bool) -> None:
 class CaseGridConfig(StudyConfig):
     """Config base for studies built on a case grid (model_type x training_data x ...).
 
-    Holds the case-grid axes every such study shares and the is_compatible config-lock check.
-    Study-specific axes (model_types, freeze options, hyperparam selections) stay on the study's own Config subclass,
-    which lists its hyperparam fields in COMPAT_HYPERPARAM_FIELDS.
+    Holds the case-grid axes every such study shares.
+    Study-specific axes (model_types, freeze options, ...) and hyperparam selections stay on the study's own Config subclass.
+    Field roles (identity, locked, case axis, orchestration) are explained in transport_study/config.py.
     """
 
     # Organization for datasets and wandb projects
-    working_dir_base: Path = Field(
+    working_dir_base: Orchestration[Path] = Field(
         default_factory=lambda: Path(os.environ.get("PTPS_WORKING_DIR_BASE", str(PACKAGE_ROOT / "popsim_studies" / "working_dir")))
     )
     # Case-grid axes shared by every study of this shape
-    training_datasets: tuple[TrainingData, ...]
-    domain_adaptation_methods: tuple[str | None, ...] = Field(default_factory=lambda: (None, "weighted", "addition", "transfer"))
+    training_datasets: Annotated[tuple[TrainingData, ...], CaseAxis("training_data")]
+    domain_adaptation_methods: Annotated[tuple[str | None, ...], CaseAxis("domain_adaptation")] = Field(
+        default_factory=lambda: (None, "weighted", "addition", "transfer")
+    )
     target_test_set_size: int
     # Hyperparameter tuning case axes shared by every study of this shape
     hyperparam_domain_adaptation: str | None = None
@@ -180,29 +196,9 @@ class CaseGridConfig(StudyConfig):
     # Sweeps always keep 1. Must be >= 1 (1 only computes best-checkpoint test metrics)
     num_result_checkpoints: int = Field(default=10, ge=1)
 
-    # Study-specific hyperparam field names checked by is_compatible, set per subclass
-    COMPAT_HYPERPARAM_FIELDS: ClassVar[tuple[str, ...]] = ()
     # Field name -> its valid values, set per subclass.
     # A tuple field must hold valid values only, a scalar field must be one.
     FIELD_CHOICES: ClassVar[dict[str, tuple]] = {}
-
-    def is_compatible(self, cfg: CaseGridConfig) -> bool:
-        """Whether two configs can run the same study (the config-lock check).
-
-        Compares study identity (name, datasets, target, test set size,
-        dataset fractions) and the hyperparameter tuning configuration.
-        Case-grid axes like model_types may differ between runs.
-        """
-        names = (
-            "study_name",
-            "dataset_paths",
-            "target_device",
-            "target_test_set_size",
-            "dataset_fractions",
-            "num_result_checkpoints",
-            *self.COMPAT_HYPERPARAM_FIELDS,
-        )
-        return all(getattr(self, name) == getattr(cfg, name) for name in names)
 
     @model_validator(mode="after")
     def _validate_field_choices(self):
@@ -238,19 +234,14 @@ class CaseGridConfig(StudyConfig):
         )
         return data
 
-    @classmethod
-    def toml_kwargs(cls, path: Path | str) -> dict:
-        """StudyConfig.toml_kwargs with the case-grid axes of a [study_cases] table flattened in."""
-        kwargs = super().toml_kwargs(path)
-        study_cases = kwargs.pop("study_cases", {})
-        return kwargs | study_cases
+    # The TOML forms of the axes, which the validators above parse back
+    @field_serializer("training_datasets")
+    def _serialize_training_datasets(self, v):
+        return [str(td) for td in v]
 
-    def toml_data(self) -> dict:
-        """StudyConfig.toml_data with the training datasets and domain adaptations in their string forms."""
-        data = super().toml_data()
-        data["training_datasets"] = [str(td) for td in self.training_datasets]
-        data["domain_adaptation_methods"] = [da if da is not None else "none" for da in self.domain_adaptation_methods]
-        return data
+    @field_serializer("domain_adaptation_methods")
+    def _serialize_domain_adaptation_methods(self, v):
+        return ["none" if da is None else da for da in v]
 
 
 def data_train_run_builder(train_config: TrainConfig) -> type[TrainRunBuilder]:
@@ -279,9 +270,10 @@ class Study:
     - Results
 
     Subclasses define a nested Config (CaseGridConfig subclass) and Case
-    (Study.Case subclass), make_cases, the make_train_config hooks
+    (Study.Case subclass), the make_train_config hooks
     (base_dataloader_config / base_loss_config / model_train_spec /
     tuned_model_init_updates), collect_results, and run_analysis.
+    The case grid comes from the Config's case axes (make_cases).
     """
 
     # Stuff set by subclasses:
@@ -293,8 +285,6 @@ class Study:
     STUDY_TYPE: ClassVar[str]
     # the study's DataVisualization class
     DATA_VISUALIZATION: ClassVar[type]
-    # config attribute names of the case-grid axes (logged at init)
-    CASE_AXIS_FIELDS: ClassVar[tuple[str, ...]] = ()
     # dotted paths of the per-case analysis modules dispatched over SLURM (see orchestration.case_analysis)
     # The metrics module must export a compute_and_save_case_metrics function
     # The reports module a generate_case_report and an analysis_case_done function
@@ -421,6 +411,14 @@ class Study:
                 return self
             return self.replace(**self._hyperparam_field_values())
 
+        @classmethod
+        def pin_inapplicable_axes(cls, fields: dict) -> dict:
+            """A case-grid point's Case fields with every axis its model type ignores pinned to the one value that type always takes.
+
+            The pinned duplicates of a grid point collapse into one case in finalize_cases.
+            """
+            return fields
+
         def is_impossible(self) -> bool:
             """Some cases don't make sense to run. Mark those cases as impossible and raise an error if we try to run them."""
             # Can't do transfer learning or training from nothing with 0 target shots.
@@ -535,28 +533,55 @@ class Study:
                 return False
         return True
 
+    @classmethod
+    def clean_working_dir(
+        cls,
+        cfg: CaseGridConfig,
+        enable_parallelism: bool = False,
+        clean_models: bool = False,
+        clean_results: bool = False,
+        clean_figures: bool = False,
+    ):
+        """Delete the chosen parts of a study's working dir, before the Study is built.
+
+        It runs before Study.__init__ checks the config lock,
+        so a study whose lock refuses the current config can still be reset.
+        Cleaning models or results also deletes the lock, since the results it vouched for are gone,
+        and the next init writes a fresh one with a new stamp.
+        """
+        logger.info(f"Clean models: {clean_models}")
+        logger.info(f"Clean results: {clean_results}")
+        logger.info(f"Clean figures: {clean_figures}")
+        if (clean_models or clean_results or clean_figures) and enable_parallelism:
+            raise ValueError(
+                "Cannot clean models, results, or figures when parallelism is enabled, as this would interfere with jobs currently running or queued."
+            )
+        working_dir = Path(cfg.working_dir_base) / cfg.study_name
+        if clean_models:
+            shutil.rmtree(working_dir / "models", ignore_errors=True)
+        if clean_results:
+            shutil.rmtree(working_dir / "results", ignore_errors=True)
+        if clean_figures:
+            shutil.rmtree(working_dir / "figures", ignore_errors=True)
+        if clean_models or clean_results:
+            (working_dir / CONFIG_LOCK_FILENAME).unlink(missing_ok=True)
+
     def setup_directories(
         self,
         enable_parallelism: bool = False,
         skip_tuning: bool = True,
         skip_visualization: bool = False,
         clean_sweeps: bool = False,
-        clean_models: bool = False,
-        clean_results: bool = False,
-        clean_figures: bool = False,
     ):
         logger.info("SETTING UP DIRECTORIES")
         logger.info(f"Enable parallelism: {enable_parallelism}")
         logger.info(f"Skip hyperparameter tuning: {skip_tuning}")
         logger.info(f"Skip visualization: {skip_visualization}")
         logger.info(f"Clean sweeps: {clean_sweeps}")
-        logger.info(f"Clean models: {clean_models}")
-        logger.info(f"Clean results: {clean_results}")
-        logger.info(f"Clean figures: {clean_figures}")
 
-        if (clean_sweeps or clean_models or clean_results or clean_figures) and enable_parallelism:
+        if clean_sweeps and enable_parallelism:
             raise ValueError(
-                "Cannot clean models, results, or figures when parallelism is enabled, as this would interfere with jobs currently running or queued."
+                "Cannot clean sweeps when parallelism is enabled, as this would interfere with agents currently running or queued."
             )
 
         if (not skip_tuning) and (not enable_parallelism):
@@ -567,13 +592,6 @@ class Study:
         if clean_sweeps:
             project_names = {self.wandb_project_name(case) for case in self.cases if case.is_hyperparam_case()}
             run_clean_sweeps(project_names)
-        if clean_models:
-            shutil.rmtree(self.model_dir, ignore_errors=True)
-            shutil.rmtree(self.working_dir / "wandb", ignore_errors=True)
-        if clean_results:
-            shutil.rmtree(self.result_dir, ignore_errors=True)
-        if clean_figures:
-            shutil.rmtree(self.figure_dir, ignore_errors=True)
 
         for directory in [self.model_dir, self.result_dir, self.figure_dir]:
             directory.mkdir(parents=True, exist_ok=True)
@@ -588,9 +606,24 @@ class Study:
         sources = sorted(set(config.dataset_paths.keys()) - ({target} if target else set()))
         return TrainingData(sources=sources)
 
-    def make_cases(self) -> list[Case]:
-        """Build every case of the study's case grid from the global config (study-specific)."""
-        raise NotImplementedError
+    def make_cases(self, cfg: StudyConfig) -> list[Case]:
+        """Every case of the grid spanned by cfg's case axes, plus their prereqs.
+
+        cfg is an argument rather than the global config so another config's grid can be rebuilt.
+        The Case construction still reads the global config, which only matters through locked fields.
+        """
+        case_axes = cfg.case_axes()
+        cases = []
+        for axis_values in product(*(getattr(cfg, name) for name in case_axes.values())):
+            fields = dict(zip(case_axes, axis_values, strict=True))
+            if fields["domain_adaptation"] is None:
+                if fields["training_data"].exnihilo:
+                    if fields["num_target_shots"] == 0:
+                        continue  # Can't train from nothing with 0 target shots
+                elif fields["num_target_shots"] != HYPERPARAM_TARGET_SHOTS:
+                    continue  # Without adaptation a source-trained case sees no target shots
+            cases.append(self.Case(**self.Case.pin_inapplicable_axes(fields)))
+        return self.finalize_cases(cases)
 
     def finalize_cases(self, cases: list[Case]) -> list[Case]:
         """Unwrap prereq chains into the flat case list, dedupe, sort, drop impossible cases."""
@@ -1404,13 +1437,15 @@ class Study:
 
         return trainer, test_dl
 
-    # Coords describing which case a record belongs to, set per subclass
-    CASE_COORD_NAMES: ClassVar[tuple[str, ...]] = ()
+    @classmethod
+    def case_coord_names(cls) -> tuple[str, ...]:
+        """Coords describing which case a record belongs to: case_idx and every case-grid axis."""
+        return ("case_idx", *cls.Config.case_axes())
 
     def case_coords(self, case_idx: int, case: Case) -> dict:
         """Build the per-case coordinate values for collect_results."""
         coords = {}
-        for name in self.CASE_COORD_NAMES:
+        for name in self.case_coord_names():
             if name == "case_idx":
                 coords[name] = case_idx
             elif name == "training_data":
@@ -1429,7 +1464,7 @@ class Study:
         The profile study overrides it with a per-shot long form.
 
         Dims: case_idx
-        Coords (along case_idx): the CASE_COORD_NAMES fields of each case
+        Coords (along case_idx): the case_coord_names fields of each case
         Data variables (along case_idx): err_E_D_S where E is 'abs' or 'rel', D is
         'shot' (time-integrated per shot) or 'ts' (per timeslice), and S is one of
         mean, std, med, p25, p75, min, max. E.g. err_abs_shot_mean, err_rel_ts_p75.
@@ -1498,8 +1533,10 @@ class Study:
             If True, delete any existing wandb sweeps for this project before running.
         clean_models : bool | None
             If True, delete any existing trained models in the working directory before running.
+            Also deletes the config lock, so the study starts over under the current config.
         clean_results : bool | None
             If True, delete any existing intermediate results in the working directory before running.
+            Also deletes the config lock, so the study starts over under the current config.
         clean_figures : bool | None
             If True, delete any existing figures in the figure directory before running.
         """
@@ -1510,15 +1547,20 @@ class Study:
         # real config object (it shadows the module-level proxy)
         if isinstance(config, (str, Path)):
             config = cls.Config.from_toml(Path(config))
+        cls.clean_working_dir(
+            config,
+            enable_parallelism=bool(enable_parallelism),
+            clean_models=bool(clean_models),
+            clean_results=bool(clean_results),
+            clean_figures=bool(clean_figures),
+        )
         study = cls(config)
+        study.record_case_grid()
         study.setup_directories(
-            enable_parallelism=enable_parallelism,
-            skip_tuning=skip_tuning,
-            skip_visualization=skip_visualization,
-            clean_sweeps=clean_sweeps,
-            clean_models=clean_models,
-            clean_results=clean_results,
-            clean_figures=clean_figures,
+            enable_parallelism=bool(enable_parallelism),
+            skip_tuning=bool(skip_tuning),
+            skip_visualization=bool(skip_visualization),
+            clean_sweeps=bool(clean_sweeps),
         )
 
         if enable_parallelism and not config.partition:
@@ -1534,7 +1576,7 @@ class Study:
             )
         else:
             logger.opt(colors=True).info("<bold><magenta>ORCHESTRATION</magenta></bold>")
-            study.run_unfinished_cases(skip_tuning=skip_tuning, enable_parallelism=enable_parallelism)
+            study.run_unfinished_cases(skip_tuning=bool(skip_tuning), enable_parallelism=bool(enable_parallelism))
             ds_final = study.collect_results()
             write_netcdf_atomic(ds_final, study.collected_results_path())
 
@@ -1554,7 +1596,6 @@ class Study:
             load_config(cfg)
 
         self.name = config.study_name
-        self.cases = self.make_cases()
         # Launch counter per case (str(case) -> count) backing MAX_TRAIN_ATTEMPTS
         self.train_attempts: dict[str, int] = {}
         # Latest-checkpoint epoch per case as of its last launch.
@@ -1571,22 +1612,8 @@ class Study:
         self.log_dir = self.working_dir / "logs"
 
         self.working_dir.mkdir(parents=True, exist_ok=True)
-
-        # Save config on first run, and on subsequent runs check for changes.
-        # This locks in the state so on subsequent runs if the dataset paths or
-        # target device changes, we'll get an error instead of silently wrong results
-        config_path = self.working_dir / CONFIG_LOCK_FILENAME
-        if config_path.exists():
-            saved = config.from_toml(config_path)
-            if not config.is_compatible(saved):
-                raise RuntimeError(
-                    f"Dataset config changed since study was created.\n"
-                    f"Saved:   {saved}\n"
-                    f"Current: {config}\n"
-                    f"Delete {config_path} to reset (will invalidate existing results)."
-                )
-        else:
-            config.save(config_path)
+        self.lock = self._open_config_lock()
+        self.cases = self.make_cases(config.get_instance())
 
         self.log_dir.mkdir(parents=True, exist_ok=True)
         log_path = self.log_dir / f"{os.getpid()}_run_study.log"
@@ -1599,5 +1626,47 @@ class Study:
         logger.info(f"Target test set size: {config.target_test_set_size}")
         logger.info(f"Dataset paths: {config.dataset_paths}")
         logger.info(f"Target device: {config.target_device}")
-        for axis_field in self.CASE_AXIS_FIELDS:
+        for axis_field in config.fields_with_role(FieldRole.CASE_AXIS):
             logger.info(f"{axis_field}: {getattr(config, axis_field)}")
+
+    def _open_config_lock(self) -> ConfigLock:
+        """Check the current config against the study's config lock, or write the lock on the study's first run.
+
+        The lock pins the identity and locked fields (see transport_study/config.py),
+        so a run under a different setup raises instead of mixing its results with the existing ones.
+        A lock is only ever created over an empty study, so deleting one by hand can never vouch for stale results.
+        """
+        lock_path = self.working_dir / CONFIG_LOCK_FILENAME
+        if not lock_path.exists():
+            stale_dirs = [directory for directory in (self.model_dir, self.result_dir) if directory.exists() and any(directory.iterdir())]
+            if stale_dirs:
+                raise RuntimeError(
+                    f"Study {self.name} has no config lock, but {[str(d) for d in stale_dirs]} hold artifacts of an unknown setup.\n"
+                    "Clean the study (clean_models and clean_results) to start it over."
+                )
+            lock = ConfigLock(config=config.get_instance(), study_type=self.STUDY_TYPE, stamp=new_stamp())
+            write_config_lock(lock_path, lock)
+            return lock
+
+        lock = read_config_lock(lock_path, self.Config)
+        if lock.study_type != self.STUDY_TYPE:
+            raise RuntimeError(f"Working dir {self.working_dir} holds a {lock.study_type} study, not a {self.STUDY_TYPE} study.")
+        changed = config.differing_fields(lock.config, FieldRole.IDENTITY, FieldRole.LOCKED)
+        if changed:
+            details = "\n".join(f"  {name}: locked {getattr(lock.config, name)!r}, now {getattr(config, name)!r}" for name in changed)
+            raise RuntimeError(
+                f"Study {self.name} was locked under a different config, these fields changed:\n{details}\n"
+                "Revert them, or clean the study (clean_models and clean_results) to start over under the new config."
+            )
+        return lock
+
+    def record_case_grid(self) -> None:
+        """Rewrite the config lock when the case-grid axes changed, so it records the grid of the latest orchestrator run.
+
+        Only run_study calls this, analysis jobs and plotting entry points never change the record.
+        """
+        current = config.get_instance()
+        if not current.differing_fields(self.lock.config, FieldRole.CASE_AXIS):
+            return
+        self.lock = ConfigLock(config=current, study_type=self.lock.study_type, stamp=self.lock.stamp)
+        write_config_lock(self.working_dir / CONFIG_LOCK_FILENAME, self.lock)

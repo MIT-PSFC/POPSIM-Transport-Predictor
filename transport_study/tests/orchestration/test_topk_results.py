@@ -27,7 +27,7 @@ from transport_study.orchestration.topk_results import (
     compute_topk_study_results,
     topk_checkpoint_steps,
 )
-from transport_study.tests.stubs import StubCase, StubConfig
+from transport_study.tests.stubs import StubCase
 
 CKPT_STD_012 = float(np.std([0.0, 1.0, 2.0]))
 
@@ -185,23 +185,6 @@ def test_launch_train_wires_num_result_checkpoints(make_stub_study, monkeypatch)
     monkeypatch.setattr(study_module, "launch_agent", fake_launch_agent)
     study.launch_sweep(case, enable_parallelism=False)
     assert captured["sweep"].checkpoint_max_to_keep == 1
-
-
-def test_config_lock_includes_num_result_checkpoints(tmp_path: Path):
-    """is_compatible must reject two otherwise identical study configs that
-    differ in num_result_checkpoints: their result files mix top-K means
-    with single-checkpoint draws and must not share a study directory."""
-    cfg = StubConfig(
-        study_name="lock_study",
-        working_dir_base=tmp_path,
-        dataset_paths={},
-        target_device="cmod",
-        num_result_checkpoints=10,
-    )
-    assert cfg.is_compatible(cfg.model_copy())
-    other = cfg.model_copy(update={"num_result_checkpoints": 5})
-    assert not cfg.is_compatible(other)
-    assert not other.is_compatible(cfg)
 
 
 class _TinyModel(eqx.Module):

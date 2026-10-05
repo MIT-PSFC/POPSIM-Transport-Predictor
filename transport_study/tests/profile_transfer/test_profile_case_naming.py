@@ -68,6 +68,9 @@ def test_weighted_case_name(loaded_config):
         {"model_type": "torax-gyrobohm", "domain_adaptation": "transfer", "num_target_shots": 3},
         {"data_normalization": "physics-coral", "domain_adaptation": "weighted", "num_target_shots": 3},
         {"model_type": "torax-qlknn", "geometry_builder": "miller", "domain_adaptation": "addition", "num_target_shots": 1},
+        # Unfrozen shapes leave no freeze token
+        {"freeze_shapes": False},
+        {"freeze_shapes": False, "domain_adaptation": "transfer", "num_target_shots": 3},
     ],
 )
 def test_checkpoint_parser_round_trip(loaded_config, overrides):

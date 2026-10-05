@@ -11,10 +11,8 @@ from transport_study import PACKAGE_ROOT
 from transport_study.config import config
 from transport_study.modules.normalization import STAT_NORMALIZATIONS
 from transport_study.orchestration.organize_data import get_train_test_datasets
-from transport_study.power_balance_transfer.power_balance_study import (
-    HYPERPARAM_TARGET_SHOTS,
-    PowerBalanceStudy,
-)
+from transport_study.orchestration.study import HYPERPARAM_TARGET_SHOTS
+from transport_study.power_balance_transfer.power_balance_study import PowerBalanceStudy
 from transport_study.tests.sample_data import SAMPLE_DIR, requires_sample_data
 
 

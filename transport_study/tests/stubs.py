@@ -11,9 +11,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from types import SimpleNamespace
+from typing import Annotated
 
 import xarray as xr
 
+from transport_study.config import CaseAxis, StudyConfig
 from transport_study.orchestration.case_metrics import case_metrics_path
 from transport_study.orchestration.study import (
     CaseGridConfig,
@@ -29,7 +31,7 @@ class StubConfig(CaseGridConfig):
     """
 
     target_test_set_size: int = 0
-    training_datasets: tuple[str, ...] = ()
+    training_datasets: Annotated[tuple[str, ...], CaseAxis("training_data")] = ()
 
 
 @dataclass
@@ -67,13 +69,12 @@ class StubStudy(Study):
 
     Config = StubConfig
     STUDY_TYPE = "stub"
-    CASE_AXIS_FIELDS = ()
 
     def __init__(self, cfg: CaseGridConfig, cases: list[StubCase]):
         self.injected_cases = list(cases)
         super().__init__(cfg)
 
-    def make_cases(self) -> list[StubCase]:
+    def make_cases(self, cfg: StudyConfig) -> list[StubCase]:
         return self.injected_cases
 
 

@@ -50,7 +50,7 @@ def test_power_balance_submodule_twins_follow_their_own_normalization(
         model_type=model_type,
         training_data="cmod-low1",
         domain_adaptation="transfer",
-        freeze_submodules=True,
+        freeze_submodules=False,
         num_target_shots=3,
     )
 

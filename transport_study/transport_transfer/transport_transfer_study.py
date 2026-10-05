@@ -1,9 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from itertools import product
 from pathlib import Path
-from typing import TYPE_CHECKING, ClassVar
+from typing import TYPE_CHECKING, Annotated, ClassVar
 
 if TYPE_CHECKING:
     from popsim.ml import TrainConfig
@@ -14,7 +13,7 @@ from pydantic import Field
 from transport_validation_datasets.machine.generic import UNIFORM_TIMEBASE_DT
 
 from transport_study import PACKAGE_ROOT
-from transport_study.config import config
+from transport_study.config import CaseAxis, config
 from transport_study.modules.normalization import (
     FEATURE_NORMALIZATIONS,
     INPUT_NORMALIZATIONS,
@@ -32,7 +31,6 @@ from transport_study.modules.transport_predictor.train_configs import (
 from transport_study.orchestration.case_analysis import run_summary_analysis
 from transport_study.orchestration.organize_data import PROFILE_TARGET_VARS
 from transport_study.orchestration.study import (
-    HYPERPARAM_TARGET_SHOTS,
     CaseGridConfig,
     ModelTrainSpec,
     Study,
@@ -103,15 +101,6 @@ class TransportStudy(Study):
     # The result files carry the power balance error variables, scored by its metrics module
     ANALYSIS_METRICS_MODULE = "transport_study.power_balance_transfer.study_metrics"
     ANALYSIS_REPORTS_MODULE = "transport_study.transport_transfer.case_reports"
-    CASE_AXIS_FIELDS = (
-        "model_types",
-        "training_datasets",
-        "domain_adaptation_methods",
-        "freeze_submodules_options",
-        "geometry_builders",
-        "torax_state_options",
-        "num_target_shots_options",
-    )
     CHI_VALIDATION_LOSS = True
     TUNED_DATALOADER_KEYS = ("segment_length_train", "segment_overlap_train", "batch_size")
     # huber_delta_grad only matters for the profile submodule cases, whose sweep tunes it
@@ -122,15 +111,17 @@ class TransportStudy(Study):
     ##################
     class Config(CaseGridConfig):
         # The different cases being compared in this study
-        model_types: tuple[str, ...] = Field(default_factory=lambda: TOP_LEVEL_MODEL_TYPES)
-        freeze_submodules_options: tuple[bool, ...] = Field(default_factory=lambda: (True,))
+        model_types: Annotated[tuple[str, ...], CaseAxis("model_type")] = Field(default_factory=lambda: TOP_LEVEL_MODEL_TYPES)
+        freeze_submodules_options: Annotated[tuple[bool, ...], CaseAxis("freeze_submodules")] = Field(default_factory=lambda: (False,))
         # Per-sample geometry builders to compare for torax-* model types,
         # ignored by every other model type (see VALID_GEOMETRY_BUILDERS)
-        geometry_builders: tuple[str, ...] = Field(default_factory=lambda: ("circular",))
+        geometry_builders: Annotated[tuple[str, ...], CaseAxis("geometry_builder")] = Field(default_factory=lambda: ("circular",))
         # TORAX state carry variants to compare for torax-* model types,
         # ignored by every other model type (see VALID_TORAX_STATES)
-        torax_state_options: tuple[str, ...] = Field(default_factory=lambda: ("rebuild",))
-        num_target_shots_options: tuple[int, ...] = Field(default_factory=lambda: (0, 1, 3, 10, 32, -1))
+        torax_state_options: Annotated[tuple[str, ...], CaseAxis("torax_state")] = Field(default_factory=lambda: ("rebuild",))
+        num_target_shots_options: Annotated[tuple[int, ...], CaseAxis("num_target_shots")] = Field(
+            default_factory=lambda: (0, 1, 3, 10, 32, -1)
+        )
         # Input normalization applied to the 11 dimensionless transport
         # features, one setting for the whole study run (not a case axis, so
         # it never appears in case names):
@@ -141,27 +132,16 @@ class TransportStudy(Study):
         data_normalization: str = "physics-coral"
         # Hyperparameter tuning case configuration
         # (hyperparam_domain_adaptation and hyperparam_num_target_shots live on CaseGridConfig)
-        hyperparam_freeze_submodules: bool = True
+        hyperparam_freeze_submodules: bool = False
         # Which variants back the sciml prereq submodules.
         # Study-wide settings rather than case axes.
-        # They change model semantics under unchanged case names, so they are part of the config lock below.
+        # They change model semantics under unchanged case names, so they are locked.
         power_balance_model_type: str = "sciml-taue-nn"
         power_balance_data_normalization: str = "physics"
         # Whether the power balance prereq case freezes ITS p_oh/p_rad
         # submodules during training (the power balance study default)
-        power_balance_freeze_submodules: bool = True
+        power_balance_freeze_submodules: bool = False
         profile_model_type: str = "shape-init-pca"
-
-        COMPAT_HYPERPARAM_FIELDS = (
-            "data_normalization",
-            "hyperparam_domain_adaptation",
-            "hyperparam_freeze_submodules",
-            "hyperparam_num_target_shots",
-            "power_balance_data_normalization",
-            "power_balance_freeze_submodules",
-            "power_balance_model_type",
-            "profile_model_type",
-        )
 
         FIELD_CHOICES: ClassVar[dict[str, tuple]] = {
             "model_types": (*TOP_LEVEL_MODEL_TYPES, *SUBMODULE_MODEL_TYPES),
@@ -221,11 +201,10 @@ class TransportStudy(Study):
         torax_state: str
 
         VALID_MODEL_TYPES = (*TOP_LEVEL_MODEL_TYPES, *SUBMODULE_MODEL_TYPES)
-        # geometry_builder and torax_state defaults are suppressed from the
-        # case name, so the default grid keeps clean case names and new axes
-        # never rename pre-existing cases
+        # Unfrozen submodules and the geometry_builder and torax_state defaults are suppressed from the case name,
+        # so the default grid keeps clean case names and new axes never rename pre-existing cases
         STR_TOKEN_FIELDS = (
-            ("freeze_", "freeze_submodules"),
+            ("freeze_", "freeze_submodules", False),
             ("geom_", "geometry_builder", "circular"),
             ("tstate_", "torax_state", "rebuild"),
         )
@@ -274,6 +253,18 @@ class TransportStudy(Study):
                     f"freeze_submodules should be a dummy value ({config.hyperparam_freeze_submodules}) for submodule {self.model_type}"
                 )
 
+        @classmethod
+        def pin_inapplicable_axes(cls, fields: dict) -> dict:
+            pinned = dict(fields)
+            # Only sciml has submodules to freeze
+            if fields["model_type"] != "sciml":
+                pinned["freeze_submodules"] = config.hyperparam_freeze_submodules
+            # The geometry and the carried TORAX state only enter the TORAX families
+            if fields["model_type"] not in TORAX_MODEL_TYPES:
+                pinned["geometry_builder"] = "circular"
+                pinned["torax_state"] = "rebuild"
+            return pinned
+
         def model_type_prereqs(self) -> list[Study.Case]:
             # sciml restores a pre-trained power balance and profile predictor.
             # The power balance itself restores pre-trained p_oh/p_rad.
@@ -287,60 +278,6 @@ class TransportStudy(Study):
                 self.replace(model_type=submodule_type, freeze_submodules=config.hyperparam_freeze_submodules)
                 for submodule_type in submodule_types
             ]
-
-    def make_cases(self):
-        cases = []
-        # Make every case we're interested in for this study
-        for (
-            model_type,
-            training_dataset,
-            domain_adaptation,
-            freeze_submodules,
-            geometry_builder,
-            torax_state,
-            num_target_shots,
-        ) in product(
-            config.model_types,
-            config.training_datasets,
-            config.domain_adaptation_methods,
-            config.freeze_submodules_options,
-            config.geometry_builders,
-            config.torax_state_options,
-            config.num_target_shots_options,
-        ):
-            if domain_adaptation is None:
-                if training_dataset.exnihilo:
-                    if num_target_shots == 0:
-                        continue  # Can't train from nothing with 0 target shots
-                elif num_target_shots != HYPERPARAM_TARGET_SHOTS:
-                    continue  # Invalid case, skip
-            if model_type != "sciml" and freeze_submodules != config.hyperparam_freeze_submodules:
-                continue  # No submodules to freeze, just do one of the two
-            case_geometry, case_torax_state = geometry_builder, torax_state
-            if not model_type.startswith("torax-"):
-                # geometry_builder and torax_state only apply to torax model
-                # types, and Case.validate pins non-torax cases to the
-                # "circular" / "rebuild" values. Emit each non-torax case once,
-                # on the first value of each axis, rather than on the pinned
-                # value: a study running only torax-carry (or only miller)
-                # would otherwise drop every non-torax case from the grid
-                if (geometry_builder, torax_state) != (config.geometry_builders[0], config.torax_state_options[0]):
-                    continue
-                case_geometry, case_torax_state = "circular", "rebuild"
-
-            case = self.Case(
-                model_type=model_type,
-                training_data=training_dataset,
-                domain_adaptation=domain_adaptation,
-                freeze_submodules=freeze_submodules,
-                num_target_shots=num_target_shots,
-                geometry_builder=case_geometry,
-                torax_state=case_torax_state,
-            )
-
-            cases.append(case)
-
-        return self.finalize_cases(cases)
 
     #############
     # EXECUTION #
@@ -597,22 +534,6 @@ class TransportStudy(Study):
         if case.model_type == "profile" and config.profile_model_type in MODEL_TYPES_WITH_SHAPES:
             updates["n_shapes"] = tuned_config.model_init_config["n_shapes"]
         return updates
-
-    ##############
-    # COLLECTION #
-    ##############
-
-    # Coords describing which case a record belongs to
-    CASE_COORD_NAMES = (
-        "case_idx",
-        "model_type",
-        "training_data",
-        "domain_adaptation",
-        "freeze_submodules",
-        "geometry_builder",
-        "torax_state",
-        "num_target_shots",
-    )
 
     ############
     # ANALYSIS #

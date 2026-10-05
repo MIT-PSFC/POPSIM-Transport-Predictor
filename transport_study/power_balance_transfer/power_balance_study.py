@@ -1,9 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from itertools import product
 from pathlib import Path
-from typing import TYPE_CHECKING, ClassVar
+from typing import TYPE_CHECKING, Annotated, ClassVar
 
 if TYPE_CHECKING:
     from popsim.ml import TrainConfig
@@ -13,7 +12,7 @@ import netCDF4  # noqa: F401
 from pydantic import Field
 
 from transport_study import PACKAGE_ROOT
-from transport_study.config import config
+from transport_study.config import CaseAxis, config
 from transport_study.modules.normalization import INPUT_NORMALIZATIONS, NORM_INPUT_VARS
 from transport_study.modules.power_balance.module import (
     MODEL_TYPES_WITH_SUBMODULES,
@@ -21,7 +20,6 @@ from transport_study.modules.power_balance.module import (
 )
 from transport_study.orchestration.case_analysis import run_summary_analysis
 from transport_study.orchestration.study import (
-    HYPERPARAM_TARGET_SHOTS,
     CaseGridConfig,
     ModelTrainSpec,
     Study,
@@ -59,14 +57,6 @@ class PowerBalanceStudy(Study):
     DATA_VISUALIZATION = DataVisualization
     ANALYSIS_METRICS_MODULE = "transport_study.power_balance_transfer.study_metrics"
     ANALYSIS_REPORTS_MODULE = "transport_study.power_balance_transfer.case_reports"
-    CASE_AXIS_FIELDS = (
-        "model_types",
-        "training_datasets",
-        "data_normalization_methods",
-        "domain_adaptation_methods",
-        "freeze_submodules_options",
-        "num_target_shots_options",
-    )
     TUNED_DATALOADER_KEYS = ("segment_length_train", "segment_overlap_train", "batch_size")
     TUNED_LOSS_KEYS = ("huber_delta",)
 
@@ -75,21 +65,20 @@ class PowerBalanceStudy(Study):
     ##################
     class Config(CaseGridConfig):
         # The different cases being compared in this study
-        model_types: tuple[str, ...] = Field(default_factory=lambda: ("sciml-taue-scalinglaw", "sciml-taue-nn", "mlp", "transformer"))
-        data_normalization_methods: tuple[str, ...] = Field(default_factory=lambda: INPUT_NORMALIZATIONS)
-        freeze_submodules_options: tuple[bool, ...] = Field(default_factory=lambda: (True,))
-        num_target_shots_options: tuple[int, ...] = Field(default_factory=lambda: (0, 1, 3, 10, 32, -1))
+        model_types: Annotated[tuple[str, ...], CaseAxis("model_type")] = Field(
+            default_factory=lambda: ("sciml-taue-scalinglaw", "sciml-taue-nn", "mlp", "transformer")
+        )
+        data_normalization_methods: Annotated[tuple[str, ...], CaseAxis("data_normalization")] = Field(
+            default_factory=lambda: INPUT_NORMALIZATIONS
+        )
+        freeze_submodules_options: Annotated[tuple[bool, ...], CaseAxis("freeze_submodules")] = Field(default_factory=lambda: (False,))
+        num_target_shots_options: Annotated[tuple[int, ...], CaseAxis("num_target_shots")] = Field(
+            default_factory=lambda: (0, 1, 3, 10, 32, -1)
+        )
         # Hyperparameter tuning case configuration
         # (hyperparam_domain_adaptation and hyperparam_num_target_shots live on CaseGridConfig)
         hyperparam_data_normalization: str = "physics"
-        hyperparam_freeze_submodules: bool = True
-
-        COMPAT_HYPERPARAM_FIELDS = (
-            "hyperparam_data_normalization",
-            "hyperparam_domain_adaptation",
-            "hyperparam_freeze_submodules",
-            "hyperparam_num_target_shots",
-        )
+        hyperparam_freeze_submodules: bool = False
 
         FIELD_CHOICES: ClassVar[dict[str, tuple]] = {
             "model_types": (*MODEL_TYPES_WITH_SUBMODULES, *MODEL_TYPES_WITHOUT_SUBMODULES, *SUBMODULE_MODEL_TYPES),
@@ -138,7 +127,8 @@ class PowerBalanceStudy(Study):
         freeze_submodules: bool
 
         VALID_MODEL_TYPES = (*MODEL_TYPES_WITH_SUBMODULES, *MODEL_TYPES_WITHOUT_SUBMODULES, *SUBMODULE_MODEL_TYPES)
-        STR_TOKEN_FIELDS = (("norm_", "data_normalization"), ("freeze_", "freeze_submodules"))
+        # Unfrozen submodules are the default, so only frozen ones show in the name
+        STR_TOKEN_FIELDS = (("norm_", "data_normalization"), ("freeze_", "freeze_submodules", False))
         HYPERPARAM_FIELDS = ("data_normalization", "domain_adaptation", "freeze_submodules", "num_target_shots")
 
         # The dataclass decorator would null an inherited __hash__
@@ -169,6 +159,13 @@ class PowerBalanceStudy(Study):
                     f"freeze_submodules should be a dummy value ({config.hyperparam_freeze_submodules}) for submodule {self.model_type}"
                 )
 
+        @classmethod
+        def pin_inapplicable_axes(cls, fields: dict) -> dict:
+            # Only the structured models have submodules to freeze
+            if fields["model_type"] not in MODEL_TYPES_WITH_SUBMODULES:
+                return fields | {"freeze_submodules": config.hyperparam_freeze_submodules}
+            return fields
+
         def model_type_prereqs(self) -> list[Study.Case]:
             # The structured models restore pre-trained p_oh/p_rad submodules
             if self.model_type not in MODEL_TYPES_WITH_SUBMODULES:
@@ -177,46 +174,6 @@ class PowerBalanceStudy(Study):
                 self.replace(model_type=submodule_type, freeze_submodules=config.hyperparam_freeze_submodules)
                 for submodule_type in SUBMODULE_MODEL_TYPES
             ]
-
-    def make_cases(self):
-        cases = []
-        # Make every case we're interested in for this study
-        for (
-            model_type,
-            training_dataset,
-            data_normalization,
-            domain_adaptation,
-            freeze_submodules,
-            num_target_shots,
-        ) in product(
-            config.model_types,
-            config.training_datasets,
-            config.data_normalization_methods,
-            config.domain_adaptation_methods,
-            config.freeze_submodules_options,
-            config.num_target_shots_options,
-        ):
-            if domain_adaptation is None:
-                if training_dataset.exnihilo:
-                    if num_target_shots == 0:
-                        continue  # Can't train from nothing with 0 target shots
-                elif num_target_shots != HYPERPARAM_TARGET_SHOTS:
-                    continue  # Invalid case, skip
-            if model_type in MODEL_TYPES_WITHOUT_SUBMODULES and freeze_submodules != config.hyperparam_freeze_submodules:
-                continue  # No submodules to freeze, just do one of the two
-
-            case = self.Case(
-                model_type=model_type,
-                training_data=training_dataset,
-                data_normalization=data_normalization,
-                domain_adaptation=domain_adaptation,
-                freeze_submodules=freeze_submodules,
-                num_target_shots=num_target_shots,
-            )
-
-            cases.append(case)
-
-        return self.finalize_cases(cases)
 
     #############
     # EXECUTION #
@@ -377,21 +334,6 @@ class PowerBalanceStudy(Study):
             updates["num_heads"] = tuned_config.model_init_config["num_heads"]
             updates["history_len"] = tuned_config.model_init_config["history_len"]
         return updates
-
-    ##############
-    # COLLECTION #
-    ##############
-
-    # Coords describing which case a record belongs to
-    CASE_COORD_NAMES = (
-        "case_idx",
-        "model_type",
-        "training_data",
-        "data_normalization",
-        "domain_adaptation",
-        "freeze_submodules",
-        "num_target_shots",
-    )
 
     ############
     # ANALYSIS #

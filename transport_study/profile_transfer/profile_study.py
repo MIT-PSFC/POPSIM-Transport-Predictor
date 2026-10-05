@@ -1,9 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from itertools import product
 from pathlib import Path
-from typing import TYPE_CHECKING, ClassVar
+from typing import TYPE_CHECKING, Annotated, ClassVar
 
 if TYPE_CHECKING:
     from popsim.ml import TrainConfig
@@ -15,7 +14,7 @@ import xarray as xr
 from pydantic import Field
 
 from transport_study import PACKAGE_ROOT, TIME_DIM
-from transport_study.config import config
+from transport_study.config import CaseAxis, config
 from transport_study.modules.normalization import FEATURE_NORMALIZATIONS
 from transport_study.modules.profile_predictor.module import (
     MODEL_TYPES_WITH_SHAPES,
@@ -37,7 +36,6 @@ from transport_study.orchestration.case_reports import generate_case_reports
 from transport_study.orchestration.comparison_figures import comparison_figures
 from transport_study.orchestration.organize_data import PROFILE_TARGET_VARS
 from transport_study.orchestration.study import (
-    HYPERPARAM_TARGET_SHOTS,
     CaseGridConfig,
     ModelTrainSpec,
     Study,
@@ -72,15 +70,6 @@ class ProfileStudy(Study):
     DATA_VISUALIZATION = DataVisualization
     ANALYSIS_METRICS_MODULE = "transport_study.profile_transfer.study_metrics"
     ANALYSIS_REPORTS_MODULE = "transport_study.profile_transfer.case_reports"
-    CASE_AXIS_FIELDS = (
-        "model_types",
-        "training_datasets",
-        "data_normalization_methods",
-        "domain_adaptation_methods",
-        "freeze_shapes_options",
-        "geometry_builders",
-        "num_target_shots_options",
-    )
     CHI_VALIDATION_LOSS = True
     TUNED_DATALOADER_KEYS = ("batch_size",)
     TUNED_LOSS_KEYS = ("huber_delta", "huber_delta_grad")
@@ -90,25 +79,20 @@ class ProfileStudy(Study):
     ##################
     class Config(CaseGridConfig):
         # The different cases being compared in this study
-        model_types: tuple[str, ...] = Field(default_factory=lambda: ("shape-init-pca", "shape-init-kmeans", "mlp"))
-        freeze_shapes_options: tuple[bool, ...] = Field(default_factory=lambda: (True,))
+        model_types: Annotated[tuple[str, ...], CaseAxis("model_type")] = Field(
+            default_factory=lambda: ("shape-init-pca", "shape-init-kmeans", "mlp")
+        )
+        freeze_shapes_options: Annotated[tuple[bool, ...], CaseAxis("freeze_shapes")] = Field(default_factory=lambda: (True,))
         # Per-sample geometry builders to compare for torax-* model types, ignored
         # by every other model type (see VALID_GEOMETRY_BUILDERS)
-        geometry_builders: tuple[str, ...] = Field(default_factory=lambda: ("circular",))
-        num_target_shots_options: tuple[int, ...] = Field(default_factory=lambda: (0, 1, 10, -1))
+        geometry_builders: Annotated[tuple[str, ...], CaseAxis("geometry_builder")] = Field(default_factory=lambda: ("circular",))
+        num_target_shots_options: Annotated[tuple[int, ...], CaseAxis("num_target_shots")] = Field(default_factory=lambda: (0, 1, 10, -1))
         # Input normalization case axis over the 10 dimensionless nn_inputs (see FEATURE_NORMALIZATIONS)
-        data_normalization_methods: tuple[str, ...] = Field(default_factory=lambda: ("physics",))
+        data_normalization_methods: Annotated[tuple[str, ...], CaseAxis("data_normalization")] = Field(default_factory=lambda: ("physics",))
         # Hyperparameter tuning case configuration
         # (hyperparam_domain_adaptation and hyperparam_num_target_shots live on CaseGridConfig)
         hyperparam_data_normalization: str = "physics"
         hyperparam_freeze_shapes: bool = True
-
-        COMPAT_HYPERPARAM_FIELDS = (
-            "hyperparam_data_normalization",
-            "hyperparam_domain_adaptation",
-            "hyperparam_freeze_shapes",
-            "hyperparam_num_target_shots",
-        )
 
         FIELD_CHOICES: ClassVar[dict[str, tuple]] = {
             "model_types": (*MODEL_TYPES_WITH_SHAPES, *MODEL_TYPES_WITHOUT_SHAPES),
@@ -163,9 +147,10 @@ class ProfileStudy(Study):
         geometry_builder: str
 
         VALID_MODEL_TYPES = (*MODEL_TYPES_WITH_SHAPES, *MODEL_TYPES_WITHOUT_SHAPES)
+        # Only frozen shapes show in the name, unfrozen is the default
         STR_TOKEN_FIELDS = (
             ("norm_", "data_normalization"),
-            ("freeze_", "freeze_shapes"),
+            ("freeze_", "freeze_shapes", False),
             ("geom_", "geometry_builder"),
         )
         # geometry_builder is deliberately NOT a hyperparam field (like model_type):
@@ -180,6 +165,17 @@ class ProfileStudy(Study):
 
         def normalization_method(self) -> str | None:
             return self.data_normalization
+
+        @classmethod
+        def pin_inapplicable_axes(cls, fields: dict) -> dict:
+            pinned = dict(fields)
+            # Only the shape-init families have shapes to freeze
+            if fields["model_type"] in MODEL_TYPES_WITHOUT_SHAPES:
+                pinned["freeze_shapes"] = config.hyperparam_freeze_shapes
+            # The geometry only enters the TORAX families
+            if fields["model_type"] not in TORAX_MODEL_TYPES:
+                pinned["geometry_builder"] = "circular"
+            return pinned
 
         def validate(self):
             super().validate()
@@ -200,57 +196,6 @@ class ProfileStudy(Study):
             self.freeze_shapes = freeze_shapes
             self.geometry_builder = geometry_builder
             self.init_common(model_type, training_data, domain_adaptation, num_target_shots)
-
-    def make_cases(self):
-        cases = []
-        # Make every case we're interested in for this study
-        for (
-            model_type,
-            training_dataset,
-            data_normalization,
-            domain_adaptation,
-            freeze_shapes,
-            geometry_builder,
-            num_target_shots,
-        ) in product(
-            config.model_types,
-            config.training_datasets,
-            config.data_normalization_methods,
-            config.domain_adaptation_methods,
-            config.freeze_shapes_options,
-            config.geometry_builders,
-            config.num_target_shots_options,
-        ):
-            if domain_adaptation is None:
-                if training_dataset.exnihilo:
-                    if num_target_shots == 0:
-                        continue  # Can't train from nothing with 0 target shots
-                elif num_target_shots != HYPERPARAM_TARGET_SHOTS:
-                    continue  # Invalid case, skip
-            if model_type in MODEL_TYPES_WITHOUT_SHAPES and not freeze_shapes:
-                continue  # No shapes to freeze, just do one of the two
-            case_geometry = geometry_builder
-            if not model_type.startswith("torax-"):
-                # geometry_builder only applies to torax model types, the rest are pinned to circular.
-                # Emit each non-torax case once, on the first configured geometry,
-                # so a study without "circular" still keeps its non-torax cases
-                if geometry_builder != config.geometry_builders[0]:
-                    continue
-                case_geometry = "circular"
-
-            case = self.Case(
-                model_type=model_type,
-                training_data=training_dataset,
-                data_normalization=data_normalization,
-                domain_adaptation=domain_adaptation,
-                freeze_shapes=freeze_shapes,
-                num_target_shots=num_target_shots,
-                geometry_builder=case_geometry,
-            )
-
-            cases.append(case)
-
-        return self.finalize_cases(cases)
 
     #############
     # EXECUTION #
@@ -394,17 +339,6 @@ class ProfileStudy(Study):
     ##############
 
     # Coords describing which case a record belongs to (broadcast over every shot of that case).
-    CASE_COORD_NAMES = (
-        "case_idx",
-        "model_type",
-        "training_data",
-        "data_normalization",
-        "domain_adaptation",
-        "freeze_shapes",
-        "geometry_builder",
-        "num_target_shots",
-    )
-
     def collect_results(self):
         """Collect per-shot test errors from all finished cases into one tidy (long-form) dataset.
 
@@ -482,7 +416,7 @@ class ProfileStudy(Study):
         if not records:
             return xr.Dataset()
 
-        coord_names = [*self.CASE_COORD_NAMES, "shot", "ds_source"]
+        coord_names = [*self.case_coord_names(), "shot", "ds_source"]
         data_vars = {name: ("record", np.array([r[name] for r in records])) for name in data_var_names}
         coords = {name: ("record", np.array([r[name] for r in records])) for name in coord_names}
         return xr.Dataset(data_vars=data_vars, coords=coords)
