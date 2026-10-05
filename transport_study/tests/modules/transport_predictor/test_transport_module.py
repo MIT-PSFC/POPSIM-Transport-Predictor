@@ -47,6 +47,7 @@ from transport_study.modules.profile_predictor.train_configs import (
     TORAX_TRANSPORT_BLOCKS,
 )
 from transport_study.modules.transport_predictor.module import (
+    ABSORPTION_DEPTH_BIAS,
     MIN_W_MJ,
     N_TRANSPORT_NN_INPUTS,
     NE_SEED_FLOOR_20,
@@ -445,13 +446,16 @@ def test_torax_p_aux_feed_through(torax_rebuild_module):
         assert 0.2 <= scalar(coeffs["electron_heat_fraction"]) <= 0.95
         assert scalar(coeffs["S_total"]) >= 0.0
 
-    # Transport coefficient bounds saturate for any raw network output
+    # Transport coefficient bounds saturate for any raw network output,
+    # dimensionless against the device diffusivity scale chi_ref that a zero output gives
+    minor_radius = make_inputs().minor_radius
+    chi_ref = scalar(module.transport_coefficients(jnp.zeros(4), minor_radius)["chi_i"])
     for raw in (50.0, -50.0):
-        bounded = module.transport_coefficients(jnp.full((4,), raw))
-        assert 0.1 <= scalar(bounded["chi_i"]) <= 5.0
-        assert 0.1 <= scalar(bounded["chi_e"]) <= 10.0
-        assert 0.1 <= scalar(bounded["D_e"]) <= 2.0
-        assert -5.0 <= scalar(bounded["V_e"]) <= 5.0
+        bounded = module.transport_coefficients(jnp.full((4,), raw), minor_radius)
+        for name in ("chi_i", "chi_e", "D_e"):
+            assert 0.1 <= scalar(bounded[name]) / chi_ref <= 10.0, name
+        peaking_rate = scalar(bounded["V_e"]) * minor_radius / scalar(bounded["D_e"])
+        assert -6.0 - 1e-5 <= peaking_rate <= 2.0 + 1e-5
 
     # Perturbing the sources network changes its predictions but can never
     # touch the measured heating magnitude
@@ -525,8 +529,10 @@ def test_torax_one_ms_step_matches_fine_substeps():
     Pins the transport solver of make_transport_torax_config.
     The reference runs 4 corrector iterations without Pereverzev whatever the config says:
     the missing -T dn/dt of a corrector-free step does not shrink with dt, so a self-convergence check would miss it.
-    Without the corrector Te is off by 0.08 here,
-    and the old linear step with the default Pereverzev is off by 0.21.
+    The transport network outputs zero, the TORAX default BGB coefficients with no pinch.
+    A random init can land on an outward pinch, which no corrector count fixes at 1 ms (ne off by 0.03).
+    Without the corrector Te is off by 0.06 here,
+    and the old linear step with the default Pereverzev is off by 0.20.
     """
     converged_solver = {"use_pereverzev": False, "use_predictor_corrector": True, "n_corrector_steps": 4}
 
@@ -545,6 +551,11 @@ def test_torax_one_ms_step_matches_fine_substeps():
             transport_model="gyrobohm",
             geometry_builder="circular",
             delta_exponent=2.0,
+        )
+        module = eqx.tree_at(
+            lambda m: (m.nn_transport.layers[-1].weight, m.nn_transport.layers[-1].bias),
+            module,
+            replace_fn=jnp.zeros_like,
         )
         state, post, provider, geo, _ = module.seed_initial_state(make_inputs(), jnp.asarray(NE0), jnp.asarray(TE0))
 
@@ -569,8 +580,9 @@ def test_torax_one_ms_step_matches_fine_substeps():
 
 def test_torax_absorption_fraction_nn(torax_rebuild_module):
     """The transport sources network's last output sets absorption_fraction
-    via the saturating Beer-Lambert form 1 - exp(-n_e_line_average_1e20 * softplus(nn
-    output)): always in (0, 1), linear in line density when optically thin,
+    via the saturating Beer-Lambert form 1 - exp(-softplus(nn output) * n_e_line_average_1e20 * a),
+    a dimensionless optical depth per unit line-integrated density:
+    always in (0, 1), linear in line density when optically thin,
     smoothly saturating toward 1 with no gradient-dead cap. The value reaches
     the generic_heat.absorption_fraction runtime update in
     build_provider_and_geo, and the profile predictor's TORAX modules keep
@@ -583,15 +595,15 @@ def test_torax_absorption_fraction_nn(torax_rebuild_module):
         inputs = make_inputs(n_e_line_average_1e20=ne)
         coeffs = module.nn_coefficients(inputs, wtot)
         nn_inputs = module.normalizer(inputs.transport_nn_inputs(wtot), inputs.ds_source_idx)
-        opacity = jax.nn.softplus(module.nn_sources(nn_inputs)[4:5])
-        expected = 1.0 - jnp.exp(-ne * opacity)
+        opacity = jax.nn.softplus(module.nn_sources(nn_inputs)[4:5] + ABSORPTION_DEPTH_BIAS)
+        expected = 1.0 - jnp.exp(-opacity * ne * inputs.minor_radius)
         np.testing.assert_allclose(np.asarray(coeffs["absorption_fraction"]), np.asarray(expected), rtol=1e-6)
         assert 0.0 < scalar(coeffs["absorption_fraction"]) < 1.0
 
     # Fix the opacity and probe the functional form in line density
     inputs = make_inputs()
     nn_inputs = module.normalizer(inputs.transport_nn_inputs(wtot), inputs.ds_source_idx)
-    opacity = float(jax.nn.softplus(module.nn_sources(nn_inputs)[4]))
+    opacity = float(jax.nn.softplus(module.nn_sources(nn_inputs)[4] + ABSORPTION_DEPTH_BIAS))
     assert opacity > 0.0
 
     def beer_lambert(ne_line):

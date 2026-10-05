@@ -266,7 +266,7 @@ class ProfileStudy(Study):
             "target_test_set_size": config.target_test_set_size,
             # Hyperparameters
             # 2048 measured 34.7 GB on the worst torax case
-            # (qlknn, nn 64x4, t_final 0.4 with 8 solver steps),
+            # (qlknn, nn 64x4, 8 solver steps),
             # Throughput saturates here, 4096 gains nothing (1.8 ms/sample at both).
             "batch_size": 2048,
         }
@@ -364,8 +364,6 @@ class ProfileStudy(Study):
                     "torax_config": torax_defaults["torax_config"],
                     "geometry_builder": case.geometry_builder,
                     "delta_exponent": torax_defaults["delta_exponent"],
-                    "t_final": torax_defaults["t_final"],
-                    "fixed_dt": torax_defaults["fixed_dt"],
                     "n_solver_steps": torax_defaults["n_solver_steps"],
                     "prng_seed": 42,
                 },
@@ -388,8 +386,6 @@ class ProfileStudy(Study):
             updates["leak_rate"] = tuned_config.model_init_config["leak_rate"]
             updates["n_steps"] = tuned_config.model_init_config["n_steps"]
         elif case.model_type.startswith("torax"):
-            updates["t_final"] = tuned_config.model_init_config["t_final"]
-            updates["fixed_dt"] = tuned_config.model_init_config["fixed_dt"]
             updates["n_solver_steps"] = tuned_config.model_init_config["n_solver_steps"]
         return updates
 

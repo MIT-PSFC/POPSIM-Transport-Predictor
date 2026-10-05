@@ -25,7 +25,7 @@ from transport_study.modules.profile_predictor.train_configs import (
     TORAX_CONFIG_BASE,
     TORAX_TRANSPORT_BLOCKS,
 )
-from transport_study.modules.profile_predictor.trb import resolve_relaxation_overrides
+from transport_study.modules.profile_predictor.trb import relaxation_numerics
 from transport_study.orchestration.organize_data import PROFILE_TARGET_VARS
 from transport_study.tests.sample_data import SAMPLE_DIR, requires_sample_data
 
@@ -91,7 +91,7 @@ def test_transport_provider_mapping_reaches_runtime_params(transport_model):
 
     n_coefficients = len(TRANSPORT_COEFFICIENT_NAMES[transport_model])
     raw_outputs = 0.5 + 0.37 * jnp.arange(n_coefficients)
-    coeffs = bound_transport_coefficients(transport_model, raw_outputs)
+    coeffs = bound_transport_coefficients(transport_model, raw_outputs, minor_radius=0.22)
     mapping = transport_provider_mapping(transport_model, coeffs)
     updated_provider = provider.update_provider_from_mapping(mapping)
 
@@ -274,32 +274,6 @@ def test_torax_output_hits_edge_bc_and_smooth_init(make_torax_module, sample_tim
         assert np.all(np.abs(d2 - d2.mean()) < 1e-3 * scale), key
 
 
-def test_resolve_relaxation_overrides():
-    # Nothing set: no overrides, torax_config numerics stay authoritative
-    assert resolve_relaxation_overrides({}) == {}
-    assert resolve_relaxation_overrides({"t_final": None, "fixed_dt": None, "n_solver_steps": None}) == {}
-
-    # Explicit t_final / fixed_dt pass through unchanged
-    assert resolve_relaxation_overrides({"t_final": 0.2}) == {"t_final": 0.2}
-    assert resolve_relaxation_overrides({"t_final": 0.2, "fixed_dt": 0.02}) == {"t_final": 0.2, "fixed_dt": 0.02}
-
-    # n_solver_steps derives fixed_dt = t_final / n_solver_steps, so the
-    # swept horizon does not multiply per-sample solver cost
-    assert resolve_relaxation_overrides({"t_final": 0.4, "n_solver_steps": 10}) == {
-        "t_final": 0.4,
-        "fixed_dt": pytest.approx(0.04),
-    }
-    assert resolve_relaxation_overrides({"t_final": 0.1, "n_solver_steps": 5, "fixed_dt": None}) == {
-        "t_final": 0.1,
-        "fixed_dt": pytest.approx(0.02),
-    }
-
-    with pytest.raises(ValueError, match="mutually exclusive"):
-        resolve_relaxation_overrides({"t_final": 0.2, "fixed_dt": 0.02, "n_solver_steps": 5})
-    with pytest.raises(ValueError, match="requires t_final"):
-        resolve_relaxation_overrides({"n_solver_steps": 5})
-
-
 def test_clamp_core_profiles_is_identity_in_range(make_torax_module):
     """Repeated clamping leaves in-range profiles bitwise unchanged.
 
@@ -320,9 +294,9 @@ def test_clamp_core_profiles_is_identity_in_range(make_torax_module):
 
 
 def test_torax_max_steps_from_n_solver_steps(make_torax_module):
-    # The module derives max_steps = ceil(t_final / fixed_dt) + 1, so an
-    # n_solver_steps override must bound the scan length to n_solver_steps + 1
-    module = make_torax_module("gyrobohm", numerics_overrides=resolve_relaxation_overrides({"t_final": 0.4, "n_solver_steps": 10}))
+    # The module derives max_steps = ceil(t_final / fixed_dt) + 1,
+    # so an n_solver_steps window must bound the scan length to n_solver_steps + 1
+    module = make_torax_module("gyrobohm", numerics_overrides=relaxation_numerics(10))
     assert module.max_steps == 11
 
 

@@ -110,6 +110,10 @@ SOURCE_SHAPE_COEFFICIENT_NAMES = (
     "absorption_fraction",
 )
 
+# Bias on the absorption network output, softplus(2.95) = 3:
+# a zero output starts the optical depth at 3 per 1e20 m^-2 of line-integrated density
+ABSORPTION_DEPTH_BIAS = 2.95
+
 
 @chex.dataclass
 class Inputs(profile_predictor_module.DerivedPlasmaParameters):
@@ -624,9 +628,9 @@ class TransportPredictorToraxBase(TransportPredictor):
         """Cell-center grid the TORAX core profiles live on, see cell_centers."""
         return cell_centers(self._face_centers)
 
-    def transport_coefficients(self, nn_transport_out: jax.Array) -> dict:
+    def transport_coefficients(self, nn_transport_out: jax.Array, minor_radius: ArrayLike) -> dict:
         """Bound the raw transport-network outputs to physical ranges, see bound_transport_coefficients."""
-        return bound_transport_coefficients(self.transport_model, nn_transport_out)
+        return bound_transport_coefficients(self.transport_model, nn_transport_out, minor_radius)
 
     def nn_coefficients(self, inputs: Inputs, energy_mhd_MJ: ArrayLike) -> dict:
         """Transport, source and edge coefficients from the networks, bounded so the TORAX solver stays stable.
@@ -634,17 +638,21 @@ class TransportPredictorToraxBase(TransportPredictor):
         The shared source coefficients and edge BCs are bound_source_coefficients and bound_edge_coefficients,
         the edge temperature scale from the state-implied stored energy instead of a measured beta_tor_norm.
         The heating MAGNITUDE is not here, it is the measured power_additional_MW input (build_provider_and_geo).
-        The network only predicts its absorbed fraction, 1 - exp(-n_e_line_average_1e20 * softplus):
-        linear in line density when optically thin, saturating smoothly toward 1.
+        The network only predicts its absorbed fraction, 1 - exp(-softplus x n_e_line_average_1e20 x a):
+        a dimensionless optical depth per 1e20 m^-2 of line-integrated density n_e a,
+        linear in it when optically thin and saturating smoothly toward 1.
+        ABSORPTION_DEPTH_BIAS starts the depth at 3 per 1e20 m^-2.
         """
         nn_inputs = self.normalizer(inputs.transport_nn_inputs(energy_mhd_MJ), inputs.ds_source_idx)
+        nn_transport_out = self.nn_transport(nn_inputs)
         nn_sources_out = self.nn_sources(nn_inputs)
         absorption_idx = SOURCE_SHAPE_COEFFICIENT_NAMES.index("absorption_fraction")
-        absorption_opacity = jax.nn.softplus(nn_sources_out[absorption_idx : absorption_idx + 1])
+        absorption_opacity = jax.nn.softplus(nn_sources_out[absorption_idx : absorption_idx + 1] + ABSORPTION_DEPTH_BIAS)
+        line_density_1e20_m2 = inputs.n_e_line_average_1e20 * inputs.minor_radius
         return {
-            **self.transport_coefficients(self.nn_transport(nn_inputs)),
+            **self.transport_coefficients(nn_transport_out, inputs.minor_radius),
             **bound_source_coefficients(SOURCE_SHAPE_COEFFICIENT_NAMES, nn_sources_out, inputs.n_e_line_average_1e20, inputs.volume_approx),
-            "absorption_fraction": 1.0 - jnp.exp(-inputs.n_e_line_average_1e20 * absorption_opacity),
+            "absorption_fraction": 1.0 - jnp.exp(-absorption_opacity * line_density_1e20_m2),
             **bound_edge_coefficients(
                 self.nn_edge(nn_inputs), inputs.n_e_line_average_1e20, inputs.te_approx_from_energy_mhd(energy_mhd_MJ)
             ),

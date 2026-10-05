@@ -5,6 +5,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import xarray as xr
+from jaxtyping import ArrayLike
 from popsim import TimeIndepModule
 from popsim.ml.rtd_mlp import Activation, RtdMLP
 from torax import ToraxConfig
@@ -50,6 +51,9 @@ SOURCE_COEFFICIENT_NAMES = (
 # P_aux_total is a bounded fraction of w_approx / TAU_REF
 # S_total a softplus multiple of particle_inventory / TAU_REF
 TAU_REF_S = 0.05
+
+# j_01^2, the lowest cylindrical diffusion eigenvalue (decay time a^2 / (j_01^2 chi))
+_J01_SQUARED = 5.783
 
 # TORAX model_name of the single core transport model each transport model's config holds,
 # at torax_config.transport.core_transport_models[transport_model]
@@ -490,26 +494,38 @@ def _run_loop_jit_with_geo(
     return output_state, post_processed
 
 
-def bound_transport_coefficients(transport_model: str, nn_transport_out: jax.Array) -> dict:
+def density_peaking_rate(nn_out: jax.Array) -> jax.Array:
+    """Dimensionless density peaking rate c = V a / D in (-6, 2) from a raw network output.
+
+    With no core particle source the steady-state density obeys d ln n / d rho_norm = c,
+    so one range means the same peaking on every device, whatever its minor radius.
+    The ln 3 bias puts a zero output at c = 0, no pinch.
+    """
+    return 2.0 - 8.0 * jax.nn.sigmoid(nn_out - jnp.log(3.0))
+
+
+def bound_transport_coefficients(transport_model: str, nn_transport_out: jax.Array, minor_radius: ArrayLike) -> dict:
     """Bound the raw transport-network outputs to physical ranges for the configured model.
 
+    The network predicts dimensionless values, the minor radius [m] turns them into TORAX units.
     The bounds keep the TORAX solver stable during training for any network output.
     Keys and order match TRANSPORT_COEFFICIENT_NAMES[transport_model].
     Shared by the profile and transport predictor TORAX modules.
     """
     if transport_model == "constant":
-        # Approximate ranges taken from DIII-D study and TFTR
-        # https://iopscience-iop-org.libproxy.mit.edu/article/10.1088/0029-5515/38/4/301/pdf
-        # https://iopscience-iop-org.libproxy.mit.edu/article/10.1088/0029-5515/39/1/309/pdf
-        #   chi_i: 0.1 - 5 m^2/s
-        #   chi_e: 0.1 - 10 m^2/s
-        #   D_e:   0.1 - 2 m^2/s   (nonzero floor prevents advection-only blowup)
-        #   V_e:   -5 - 5 m/s      (signed pinch)
+        # Multiples of the device's own diffusivity scale chi_ref = a^2 / (j_01^2 TAU_REF_S),
+        # whose lowest cylindrical decay time a^2 / (j_01^2 chi) is TAU_REF_S.
+        # Measured tau_E puts the effective chi at medians of 0.4 - 2 chi_ref on every device.
+        #   chi_i, chi_e, D_e: 0.1 - 10 chi_ref, log-uniform around chi_ref (D ~ chi as in the TORAX defaults)
+        #   V_e: density_peaking_rate x D_e / a (signed pinch)
+        chi_ref = minor_radius**2 / (_J01_SQUARED * TAU_REF_S)
+        D_e = chi_ref * jnp.exp(2.3 * jnp.tanh(nn_transport_out[2:3]))
+        peaking_rate = density_peaking_rate(nn_transport_out[3:4])
         return {
-            "chi_i": 0.1 + 4.9 * jax.nn.sigmoid(nn_transport_out[0:1]),
-            "chi_e": 0.1 + 9.9 * jax.nn.sigmoid(nn_transport_out[1:2]),
-            "D_e": 0.1 + 1.9 * jax.nn.sigmoid(nn_transport_out[2:3]),
-            "V_e": 5.0 * jnp.tanh(nn_transport_out[3:4]),
+            "chi_i": chi_ref * jnp.exp(2.3 * jnp.tanh(nn_transport_out[0:1])),
+            "chi_e": chi_ref * jnp.exp(2.3 * jnp.tanh(nn_transport_out[1:2])),
+            "D_e": D_e,
+            "V_e": peaking_rate * D_e / minor_radius,
         }
     elif transport_model == "gyrobohm":
         # Free parameters of the Bohm-GyroBohm model. The Bohm and GyroBohm
@@ -521,15 +537,16 @@ def bound_transport_coefficients(transport_model: str, nn_transport_out: jax.Arr
         #     exp(-3) - exp(3), ~0.05 - 20, log-uniform around 1
         #   D_face_c1: 0.01 - 5  (diffusivity weighting at the axis, TORAX default 1.0)
         #   D_face_c2: 0.01 - 5  (diffusivity weighting at the edge, TORAX default 0.3)
-        #   V_face_coeff: -4 - 2 (convectivity / diffusivity ratio, TORAX default -0.1).
-        # The sigmoid biases put a zero output at the TORAX defaults of D_face_c1, D_face_c2 and V_face_coeff.
+        #   V_face_coeff: density_peaking_rate / a [1/m] (BGB sets V = V_face_coeff x D)
+        # The sigmoid biases put a zero output at the TORAX defaults of D_face_c1 and D_face_c2.
         # Unbiased, D_face_c1 and D_face_c2 would start at 2.5, which empties a TCV plasma in ~5 ms
+        peaking_rate = density_peaking_rate(nn_transport_out[4:5])
         return {
             "chi_bohm_multiplier": jnp.exp(3.0 * jnp.tanh(nn_transport_out[0:1])),
             "chi_gyrobohm_multiplier": jnp.exp(3.0 * jnp.tanh(nn_transport_out[1:2])),
             "D_face_c1": 0.01 + 4.99 * jax.nn.sigmoid(nn_transport_out[2:3] - 1.40),
             "D_face_c2": 0.01 + 4.99 * jax.nn.sigmoid(nn_transport_out[3:4] - 2.79),
-            "V_face_coeff": 2.0 - 6.0 * jax.nn.sigmoid(nn_transport_out[4:5] - 0.62),
+            "V_face_coeff": peaking_rate / minor_radius,
         }
     else:  # qlknn
         # Free parameters of the QLKNN surrogate. TORAX computes ITG/TEM/ETG
@@ -854,9 +871,9 @@ class ProfilePredictorTorax(TimeIndepModule):
             inputs = Inputs.from_dataset(inputs, jnp.array(self.rhogrid))
         return inputs
 
-    def transport_coefficients(self, nn_transport_out: jax.Array) -> dict:
+    def transport_coefficients(self, nn_transport_out: jax.Array, minor_radius: ArrayLike) -> dict:
         """Bound the raw transport-network outputs to physical ranges, see bound_transport_coefficients."""
-        return bound_transport_coefficients(self.transport_model, nn_transport_out)
+        return bound_transport_coefficients(self.transport_model, nn_transport_out, minor_radius)
 
     def nn_coefficients(self, inputs: Inputs, debug: bool = False) -> dict:
         """Transport, source and edge coefficients from the networks, bounded so the TORAX solver stays stable.
@@ -869,9 +886,10 @@ class ProfilePredictorTorax(TimeIndepModule):
         """
         nn_inputs = self.normalizer(inputs.nn_inputs, inputs.ds_source_idx)
         nn_sources_out = self.nn_sources(nn_inputs)
+        nn_transport_out = self.nn_transport(nn_inputs)
         p_aux_idx = SOURCE_COEFFICIENT_NAMES.index("P_aux_total")
         coeffs = {
-            **self.transport_coefficients(self.nn_transport(nn_inputs)),
+            **self.transport_coefficients(nn_transport_out, inputs.minor_radius),
             **bound_source_coefficients(SOURCE_COEFFICIENT_NAMES, nn_sources_out, inputs.n_e_line_average_1e20, inputs.volume_approx),
             "P_aux_total": 4.0 * jax.nn.sigmoid(nn_sources_out[p_aux_idx : p_aux_idx + 1] - 2.0) * inputs.w_approx / TAU_REF_S,
             **bound_edge_coefficients(self.nn_edge(nn_inputs), inputs.n_e_line_average_1e20, inputs.te_approx),

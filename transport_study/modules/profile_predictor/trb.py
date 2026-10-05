@@ -46,30 +46,17 @@ from transport_study.modules.trb_utils import (
     unstack_samples,
 )
 
+# Profile relaxation solver step [s].
+# The Pereverzev linear step makes the same progress per step at any dt,
+# so the step count alone sets how far the relaxation gets:
+# the output is n_solver_steps damped steps from the parabolic initial profiles, never a steady state.
+# 25 ms is the step the production relaxation was benchmarked at (8 steps, 0.2 s).
+RELAXATION_DT_S = 0.025
 
-def resolve_relaxation_overrides(model_init_config: dict) -> dict:
-    """Numerics overrides for the sweepable torax relaxation window.
 
-    n_solver_steps fixes the solver step count and derives fixed_dt = t_final / n_solver_steps,
-    which decouples the swept relaxation horizon from per-sample solver cost
-    (compute scales with step count, not physical time).
-    Returns the dict of numerics keys to override, empty when nothing is set.
-    """
-    t_final = model_init_config.get("t_final")
-    fixed_dt = model_init_config.get("fixed_dt")
-    n_solver_steps = model_init_config.get("n_solver_steps")
-    overrides: dict[str, float] = {}
-    if t_final is not None:
-        overrides["t_final"] = float(t_final)
-    if n_solver_steps is not None:
-        if fixed_dt is not None:
-            raise ValueError("n_solver_steps and fixed_dt are mutually exclusive, sweep one or the other")
-        if t_final is None:
-            raise ValueError("n_solver_steps requires t_final to derive fixed_dt")
-        overrides["fixed_dt"] = float(t_final) / int(n_solver_steps)
-    elif fixed_dt is not None:
-        overrides["fixed_dt"] = float(fixed_dt)
-    return overrides
+def relaxation_numerics(n_solver_steps: int) -> dict:
+    """TORAX numerics window of an n_solver_steps relaxation at the fixed RELAXATION_DT_S step."""
+    return {"t_final": n_solver_steps * RELAXATION_DT_S, "fixed_dt": RELAXATION_DT_S}
 
 
 class ProfilePredictorTRB(TrainRunBuilder):
@@ -188,13 +175,8 @@ class ProfilePredictorTRB(TrainRunBuilder):
             )
         elif model_init_config["model_type"].startswith("torax-"):
             # model_type is "torax-<transport_model>", e.g. "torax-gyrobohm"
-            torax_config = model_init_config["torax_config"]
-            numerics_overrides = resolve_relaxation_overrides(model_init_config)
-            if numerics_overrides:
-                if not isinstance(torax_config, dict):
-                    raise ValueError("t_final / fixed_dt / n_solver_steps overrides require torax_config as a dict")
-                torax_config = copy.deepcopy(torax_config)
-                torax_config["numerics"].update(numerics_overrides)
+            torax_config = copy.deepcopy(model_init_config["torax_config"])
+            torax_config["numerics"].update(relaxation_numerics(model_init_config["n_solver_steps"]))
             module = ProfilePredictorTorax(
                 nn_width=model_init_config["nn_width"],
                 nn_depth=model_init_config["nn_depth"],

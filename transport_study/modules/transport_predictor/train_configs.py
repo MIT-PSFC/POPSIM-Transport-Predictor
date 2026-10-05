@@ -37,6 +37,7 @@ def make_transport_torax_config(transport_model: str, torax_state: str = "rebuil
     timebase: TransportPredictorToraxBase advances exactly one step per
     __call__ and enforces t_final - t_initial == fixed_dt == sim_dt.
     The solver comes from TRANSPORT_SOLVER_BLOCKS, never from the shared base.
+    Angioni-Sauter neoclassical transport runs on top of the core transport model, unlike the profile relaxation.
     torax_state picks the module the config is for, one of VALID_TORAX_STATES.
     """
     if transport_model not in TORAX_TRANSPORT_BLOCKS:
@@ -46,6 +47,9 @@ def make_transport_torax_config(transport_model: str, torax_state: str = "rebuil
     torax_config = copy.deepcopy(TORAX_CONFIG_BASE)
     torax_config["transport"] = copy.deepcopy(TORAX_TRANSPORT_BLOCKS[transport_model])
     torax_config["solver"].update(TRANSPORT_SOLVER_BLOCKS[transport_model])
+    # Neoclassical chi, D and V including the Ware pinch, at 1.05 - 1.10x the cost of a rollout step.
+    # On top of BGB it cut the DIII-D zero-shot seed spread 2.5x, and the network moved heat transport from gyroBohm to it
+    torax_config["neoclassical"]["transport"] = {"model_name": "angioni_sauter"}
     torax_config["numerics"].update(
         {
             "t_initial": 0.0,

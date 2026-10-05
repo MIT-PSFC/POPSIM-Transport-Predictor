@@ -14,8 +14,7 @@ parameters:
         values: [8, 16, 32, 64]
       nn_depth:
         values: [1, 2, 3, 4]
-      t_final:
-        values: [0.1, 0.2, 0.4]
+      # Relaxation length in fixed 25 ms steps (trb.RELAXATION_DT_S), the window has no other knob
       n_solver_steps:
         values: [4, 6, 8]
   optimizer_config:

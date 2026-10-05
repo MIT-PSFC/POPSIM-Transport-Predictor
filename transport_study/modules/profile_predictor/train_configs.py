@@ -7,8 +7,12 @@ from transport_study.modules.profile_predictor.module import (
 )
 from transport_study.modules.profile_predictor.trb import (
     ProfilePredictorTRB,
+    relaxation_numerics,
 )
 from transport_study.orchestration.organize_data import PROFILE_TARGET_VARS
+
+# Solver steps of the profile relaxation without a tuned config
+DEFAULT_N_SOLVER_STEPS = 8
 
 PROFILE_PREDICTOR_SHAPE_INIT_CONFIG = {
     "project": "profile_predictor_shape_init",
@@ -76,8 +80,8 @@ TORAX_TRANSPORT_BLOCKS = {
             },
         },
         # No stability clipping here:
-        # the NN bounds already floor chi and D (bound_transport_coefficients),
-        # so the TORAX defaults (chi_min 0.05, chi_max 100, D_e_min 0.05) never bind.
+        # the NN bounds chi and D at 0.1 - 10 chi_ref of the device (bound_transport_coefficients),
+        # the TORAX defaults (chi_min 0.05, chi_max 100, D_e_min 0.05) bind only at the bottom of that range on C-Mod and TCV.
     },
     "gyrobohm": {
         "core_transport_models": {
@@ -149,10 +153,10 @@ TORAX_CONFIG_BASE: dict[str, Any] = {
     },
     "numerics": {
         "t_initial": 0.0,
-        "t_final": 0.1,
         # With the Pereverzev linear step below, every step makes the same progress at any dt,
-        # so the relaxation is a fixed number of damped steps from the initial profiles, not a steady state
-        "fixed_dt": 2e-2,
+        # so the relaxation is a fixed number of damped steps from the initial profiles, not a steady state.
+        # The TRB sets the window from n_solver_steps at the fixed RELAXATION_DT_S (trb.relaxation_numerics)
+        **relaxation_numerics(DEFAULT_N_SOLVER_STEPS),
         "min_dt": 1e-3,
         # dt never changes with the fixed time-step calculator, so the
         # adaptive retry loop is pure overhead (1.4x, bit-identical results)
@@ -203,7 +207,8 @@ TORAX_CONFIG_BASE: dict[str, Any] = {
     # The profile relaxation solver, the transport predictor replaces it per transport model.
     "solver": {
         # Pereverzev at the TORAX defaults (chi 30, D 15 m^2/s) damps every shape change by ~dt chi / a^2 per step.
-        # That keeps the lagged linear step from oscillating, but it pins the progress per step
+        # That keeps the lagged linear step from oscillating, but it pins the progress per step,
+        # so the relaxation output is n_solver_steps damped steps from the parabolic initial profiles
         "use_pereverzev": True,
         # One linearized solve per step: transport coefficients, sources and the transient n_e are taken at the old state
         "use_predictor_corrector": False,
@@ -240,14 +245,9 @@ _PROFILE_PREDICTOR_TORAX_CONFIG_BASE: dict[str, Any] = {
         # uses triangularity_upper/triangularity_lower with delta ~ rho_norm**delta_exponent)
         "geometry_builder": "circular",
         "delta_exponent": 2.0,
-        # Relaxation window overrides, None keeps the torax_config numerics values.
-        # Top-level keys so wandb sweeps can search them like nn_width.
-        # n_solver_steps derives fixed_dt = t_final / n_solver_steps so sweeps
-        # can widen the horizon without multiplying per-sample solver cost.
-        # Mutually exclusive with an explicit fixed_dt
-        "t_final": None,
-        "fixed_dt": None,
-        "n_solver_steps": None,
+        # Relaxation length in solver steps of RELAXATION_DT_S, the only window knob.
+        # Top-level so wandb sweeps can search it like nn_width
+        "n_solver_steps": DEFAULT_N_SOLVER_STEPS,
     },
     "loss_config": {
         "huber_delta": 0.5,

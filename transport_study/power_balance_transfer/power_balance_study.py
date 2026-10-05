@@ -262,7 +262,7 @@ class PowerBalanceStudy(Study):
             # to the measured signals while the whole module trains on Wtot.
             # Training loss only, and a no-op for model types without
             # submodules (their target_vars carry no power_ohm_MW / power_radiated_MW).
-            # Sized to the Wtot term in the trained state (2026-10-05 probe on cmod),
+            # Sized to the Wtot term in the trained state,
             # at 0.1 the anchors outweighed it ~100x and unfrozen submodules barely moved toward Wtot
             "anchor_weight_power_ohm": 2e-3,
             "anchor_weight_power_radiated": 2e-3,
