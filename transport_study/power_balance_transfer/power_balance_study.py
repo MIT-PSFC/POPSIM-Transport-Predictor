@@ -103,14 +103,13 @@ class PowerBalanceStudy(Study):
         model_type: The type of power_balance model to use.
         - sciml-taue-scalinglaw: H89, H98, and P_LH scaling laws to predict tau_e
         - sciml-taue-nn: neural network predicts tau_e, and we do the power balance calculation
-        - mlp: a simple MLP directly predicts stored energy evolution
+        - mlp: an MLP predicts the stored-energy evolution from the inputs and its own predicted stored energy
         - transformer: the current inputs attend over a buffer of past predicted stored energies to predict its evolution
         - p_oh / p_rad: submodule predictors, appear only as prereq cases of sciml-taue-scalinglaw and sciml-taue-nn
 
-        training_data: The dataset(s) used for training
-        - cmod: C-Mod only
-        - tcv: TCV only
-        - cmod_tcv: C-Mod + TCV
+        training_data: The historic dataset(s) used for training
+        - a device name from config.dataset_paths, e.g. cmod
+        - device names joined by _ for a combination, e.g. cmod_tcv
         - exnihilo: No historic training data
 
         data_normalization: The method for normalizing the model's NN inputs, implemented
@@ -257,13 +256,16 @@ class PowerBalanceStudy(Study):
 
     def base_loss_config(self) -> dict:
         return {
-            "huber_delta": 0.5,
+            # [MJ] on the scale of a Wtot error, C-Mod and MAST medians are 0.03-0.05 MJ
+            "huber_delta": 0.05,
             # Anchor terms keeping the p_oh/p_rad submodule predictions close
             # to the measured signals while the whole module trains on Wtot.
             # Training loss only, and a no-op for model types without
-            # submodules (their target_vars carry no power_ohm_MW / power_radiated_MW)
-            "anchor_weight_power_ohm": 0.1,
-            "anchor_weight_power_radiated": 0.1,
+            # submodules (their target_vars carry no power_ohm_MW / power_radiated_MW).
+            # Sized to the Wtot term in the trained state (2026-10-05 probe on cmod),
+            # at 0.1 the anchors outweighed it ~100x and unfrozen submodules barely moved toward Wtot
+            "anchor_weight_power_ohm": 2e-3,
+            "anchor_weight_power_radiated": 2e-3,
         }
 
     def _make_submodule_config(self, case: Case, submodule_type: str) -> TrainConfig:
@@ -287,8 +289,6 @@ class PowerBalanceStudy(Study):
                     "nn_depth": 2,
                     "nn_width": 16,
                     "prng_seed": 42,
-                    "in_size": 7,
-                    "out_size": 1,
                     "data_normalization": case.data_normalization,
                     "domain_adaptation": case.domain_adaptation,
                 },
@@ -312,8 +312,6 @@ class PowerBalanceStudy(Study):
                     "freeze_submodules": case.freeze_submodules,
                     "nn_depth": 2,
                     "nn_width": 16,
-                    "in_size": 7,  # The NORM_INPUT_VARS
-                    "out_size": 1,
                     "prng_seed": 42,
                     "submodules": {
                         "p_oh_predictor": self._make_submodule_config(case, "p_oh"),

@@ -9,8 +9,8 @@ class DataVisualization(DataVisualizationBase):
     # Input-variable pairs to plot per normalization method.
     # Power-balance datasets always carry power_additional_MW (signals.convert_to_working_units sums the heating powers),
     # so the aux-power derived variables are safe to plot.
-    # Coral and physics-coral pairs use only the module's joint feature set
-    # (adding energy_mhd_MJ or beta to the fit would change every var's transform).
+    # Coral and physics-coral pairs use the 7-input joint feature set of the tau_e models and submodules.
+    # The mlp and transformer fit theirs with energy_mhd_MJ as an 8th feature, which changes every var's transform.
     VAR_GROUPS: ClassVar[dict[str, list[list[str]]]] = {
         "raw": [
             ["ip_MA", "energy_mhd_MJ"],

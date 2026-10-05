@@ -145,11 +145,9 @@ def transformer_module() -> TransportPredictorTransformer:
 
 @pytest.fixture(scope="module")
 def sciml_module() -> TransportPredictorSciML:
-    p_oh = OhmicPower.init(in_size=7, out_size=1, nn_width=4, nn_depth=1, prng_seed=0, normalizer=RawNormalizer())
-    p_rad = RadiatedPower.init(in_size=7, out_size=1, nn_width=4, nn_depth=1, prng_seed=1, normalizer=RawNormalizer())
+    p_oh = OhmicPower.init(nn_width=4, nn_depth=1, prng_seed=0, normalizer=RawNormalizer())
+    p_rad = RadiatedPower.init(nn_width=4, nn_depth=1, prng_seed=1, normalizer=RawNormalizer())
     power_balance = PowerBalanceSciML.init(
-        in_size=7,
-        out_size=1,
         nn_width=4,
         nn_depth=1,
         p_oh_predictor=p_oh,

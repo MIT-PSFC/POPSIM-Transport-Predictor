@@ -4,7 +4,7 @@ import jax
 import jax.numpy as jnp
 from popsim.module_base import TimeIndepModule
 
-from transport_study.modules.normalization import InputNormalizer
+from transport_study.modules.normalization import N_FEATURES, InputNormalizer
 
 
 class RadiatedPower(TimeIndepModule):
@@ -50,16 +50,14 @@ class RadiatedPower(TimeIndepModule):
     @classmethod
     def init(
         cls,
-        in_size: int,
-        out_size: int,
         nn_width: int,
         nn_depth: int,
         prng_seed: int,
         normalizer: InputNormalizer,
     ) -> "RadiatedPower":
         nn = eqx.nn.MLP(
-            in_size=in_size,
-            out_size=out_size,
+            in_size=N_FEATURES,
+            out_size=1,
             width_size=nn_width,
             depth=nn_depth,
             key=jax.random.PRNGKey(prng_seed),

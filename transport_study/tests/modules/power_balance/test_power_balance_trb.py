@@ -157,12 +157,8 @@ def _scalar_inputs() -> InputNormalizer.Inputs:
 
 
 def _make_submodules() -> tuple[OhmicPower, RadiatedPower]:
-    p_oh = OhmicPower.init(
-        in_size=7, out_size=1, nn_width=4, nn_depth=1, prng_seed=1, normalizer=make_normalizer("raw", None, 1, target_idx=0)
-    )
-    p_rad = RadiatedPower.init(
-        in_size=7, out_size=1, nn_width=4, nn_depth=1, prng_seed=2, normalizer=make_normalizer("raw", None, 1, target_idx=0)
-    )
+    p_oh = OhmicPower.init(nn_width=4, nn_depth=1, prng_seed=1, normalizer=make_normalizer("raw", None, 1, target_idx=0))
+    p_rad = RadiatedPower.init(nn_width=4, nn_depth=1, prng_seed=2, normalizer=make_normalizer("raw", None, 1, target_idx=0))
     return p_oh, p_rad
 
 
@@ -175,8 +171,6 @@ def test_structured_outputs_carry_submodule_predictions():
     expected_p_rad = p_rad(inputs).power_radiated_MW_pred
 
     sciml = PowerBalanceSciML.init(
-        in_size=7,
-        out_size=1,
         nn_width=4,
         nn_depth=1,
         p_oh_predictor=p_oh,

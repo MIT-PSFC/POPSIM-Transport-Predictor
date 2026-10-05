@@ -352,8 +352,6 @@ class PowerBalanceSciML(PowerBalanceTaue):
     @classmethod
     def init(
         cls,
-        in_size: int,
-        out_size: int,
         nn_width: int,
         nn_depth: int,
         p_oh_predictor: OhmicPower,
@@ -363,8 +361,8 @@ class PowerBalanceSciML(PowerBalanceTaue):
     ) -> "PowerBalanceSciML":
         taue_predictor = BoundedNNPredictor(
             nn=eqx.nn.MLP(
-                in_size=in_size,
-                out_size=out_size,
+                in_size=N_FEATURES,
+                out_size=1,
                 width_size=nn_width,
                 depth=nn_depth,
                 key=jax.random.PRNGKey(prng_seed),
@@ -510,7 +508,7 @@ class PowerBalanceTransformer(PowerBalance):
         prng_seed: int = 42,
     ) -> "PowerBalanceTransformer":
         key_embed, key_wtot, key_pos, key_attn, key_head = jax.random.split(jax.random.PRNGKey(prng_seed), 5)
-        feature_embed = eqx.nn.Linear(7, d_model, key=key_embed)
+        feature_embed = eqx.nn.Linear(N_FEATURES, d_model, key=key_embed)
         wtot_embed = eqx.nn.Linear(1, d_model, key=key_wtot)
         # Small random init breaks slot symmetry when the buffer holds a constant history
         # (the seeded state at t0)

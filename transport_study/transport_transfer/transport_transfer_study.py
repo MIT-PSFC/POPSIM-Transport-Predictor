@@ -392,10 +392,11 @@ class TransportStudy(Study):
             # submodules. Training loss only, and a no-op for model types
             # whose target_vars lack the measured signals (only the sciml
             # case carries them). The power balance submodule prereq case
-            # also reads anchor_weight_power_ohm/_power_radiated through PowerBalanceTRB
+            # also reads anchor_weight_power_ohm/_power_radiated through PowerBalanceTRB,
+            # sized like the power balance study's to its Wtot term
             "anchor_weight_energy_mhd": 0.1,
-            "anchor_weight_power_ohm": 0.1,
-            "anchor_weight_power_radiated": 0.1,
+            "anchor_weight_power_ohm": 2e-3,
+            "anchor_weight_power_radiated": 2e-3,
         }
 
     def base_optimizer_config(self) -> dict:
@@ -456,8 +457,6 @@ class TransportStudy(Study):
                     "nn_depth": 2,
                     "nn_width": 16,
                     "prng_seed": 42,
-                    "in_size": 7,
-                    "out_size": 1,
                     "data_normalization": config.power_balance_data_normalization,
                     "domain_adaptation": case.domain_adaptation,
                 },
@@ -486,8 +485,6 @@ class TransportStudy(Study):
                     "freeze_submodules": config.power_balance_freeze_submodules,
                     "nn_depth": 2,
                     "nn_width": 16,
-                    "in_size": 7,  # The NORM_INPUT_VARS
-                    "out_size": 1,
                     "prng_seed": 42,
                     "submodules": {
                         "p_oh_predictor": self._make_submodule_config(case, "p_oh"),

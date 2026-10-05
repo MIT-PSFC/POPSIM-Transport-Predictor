@@ -46,8 +46,6 @@ class ScalarPowerTRB(TrainRunBuilder):
             target_device_idx(),
         )
         module = cls.MODULE_CLS.init(
-            in_size=model_init_config["in_size"],
-            out_size=model_init_config["out_size"],
             nn_width=model_init_config["nn_width"],
             nn_depth=model_init_config["nn_depth"],
             prng_seed=model_init_config["prng_seed"],
