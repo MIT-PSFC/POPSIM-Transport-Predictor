@@ -26,6 +26,7 @@ from transport_study.modules.profile_predictor.torax_module import (
 )
 from transport_study.modules.transport_predictor.module import SUBMODULE_MODEL_TYPES
 from transport_study.modules.transport_predictor.train_configs import (
+    VALID_TORAX_STATES,
     make_transport_torax_config,
 )
 from transport_study.orchestration.case_analysis import run_summary_analysis
@@ -87,11 +88,6 @@ TRANSPORT_STATE_VARS = ["energy_mhd_MJ", *TRANSPORT_PROFILE_TARGETS, *TRANSPORT_
 TOP_LEVEL_MODEL_TYPES = ("transformer", "sciml", *TORAX_MODEL_TYPES)
 # The submodule cases that train with power_balance_data_normalization instead of the study-wide data_normalization
 POWER_BALANCE_SUBMODULE_TYPES = ("power_balance", "p_oh", "p_rad")
-
-# How the TORAX-backed models carry state between steps (see
-# modules/transport_predictor/module.py): "rebuild" re-seeds a TORAX initial
-# state from the stored ne/te each step, "carry" keeps the full ToraxSimState
-VALID_TORAX_STATES = ("rebuild", "carry")
 
 # Power balance variants allowed as the sciml stored-energy submodule (the
 # structured ones, so profile-loss gradients flow into physical parameters)
@@ -214,8 +210,8 @@ class TransportStudy(Study):
 
         torax_state: How the torax-* model types carry state between steps,
         only meaningful for torax-* (every other model type is pinned to "rebuild").
-        - rebuild: carry only ne/te and rebuild a TORAX initial state each step
-        - carry: carry the full ToraxSimState pytree between steps
+        - rebuild: carry only ne/te and rebuild a TORAX initial state each step (T_i := T_e, psi from Ip)
+        - carry: also carry T_i and psi, so the ion channel and the current evolve over the rollout
 
         num_target_shots: The number of shots included in the training data from the target dataset, or -1 to include all shots (including all shots in training is cheating, but again answers the question of what is the best possible performance).
         """
@@ -576,7 +572,7 @@ class TransportStudy(Study):
                     "domain_adaptation": case.domain_adaptation,
                     "nn_depth": 2,
                     "nn_width": 16,
-                    "torax_config": make_transport_torax_config(transport_model),
+                    "torax_config": make_transport_torax_config(transport_model, case.torax_state),
                     "torax_state": case.torax_state,
                     "geometry_builder": case.geometry_builder,
                     "delta_exponent": 2.0,

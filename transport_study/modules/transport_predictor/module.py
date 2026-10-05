@@ -1,4 +1,4 @@
-import dataclasses
+import copy
 
 import chex
 import equinox as eqx
@@ -6,7 +6,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import xarray as xr
-from jaxtyping import Array, ArrayLike, PyTree
+from jaxtyping import Array, ArrayLike
 from popsim import TimeDepModule, discrete_no_save_field
 from popsim.math_utils import safe_log
 from popsim.ml.envs import ModuleTrainingEnv
@@ -45,6 +45,7 @@ from transport_study.modules.profile_predictor.torax_module import (
     cell_centers,
     check_torax_choices,
     clamp_core_profiles,
+    interp_cell_plus_boundaries,
     interp_core_profiles,
     make_step_fn_and_grid,
     make_torax_networks,
@@ -655,11 +656,12 @@ class TransportPredictorToraxBase(TransportPredictor):
         coeffs: dict,
         ne_ic: Array | None = None,
         te_ic: Array | None = None,
+        step_fn: SimulationStepFn | None = None,
     ):
         """Runtime params provider and per-sample geometry.
 
-        ne_ic / te_ic on rhogrid set the initial profile conditions,
-        only consumed by get_initial_state, so callers that carry the TORAX state omit them.
+        ne_ic / te_ic on rhogrid set the initial profile conditions, T_i equal to T_e.
+        step_fn is the step function whose provider is updated, self.step_fn when None.
         """
         mapping = shared_provider_mapping(inputs.ip_MA, self.transport_model, coeffs) | {
             # Measured auxiliary heating, the NN-predicted absorption_fraction scales it into absorbed power inside TORAX
@@ -677,15 +679,17 @@ class TransportPredictorToraxBase(TransportPredictor):
             mapping["profile_conditions.n_e"] = torax_experimental.TimeVaryingArrayUpdate(
                 value=1e20 * ne_ic[jnp.newaxis, :], rho_norm=rho_ic
             )
-        new_provider = self.step_fn.runtime_params_provider.update_provider_from_mapping(mapping)
+        provider_step_fn = self.step_fn if step_fn is None else step_fn
+        new_provider = provider_step_fn.runtime_params_provider.update_provider_from_mapping(mapping)
         geo_provider = build_geometry_provider(self.geometry_builder, inputs, self._face_centers, self._rho_hires_norm, self.delta_exponent)
         return new_provider, geo_provider
 
-    def seed_initial_state(self, inputs: Inputs, ne: Array, te: Array) -> tuple:
+    def seed_initial_state(self, inputs: Inputs, ne: Array, te: Array, step_fn: SimulationStepFn | None = None) -> tuple:
         """A TORAX initial state seeded from ne / te profiles on rhogrid.
 
         The profiles are floored first, measured ones can hold exact-zero te points (see TE_SEED_FLOOR_KEV),
         and their edge points are pinned to the NN Dirichlet BCs, a discontinuity at the LCFS can NaN the solver.
+        step_fn builds the state, self.step_fn when None.
 
         Returns:
             (initial_state, initial_post, provider, geo_provider, energy_mhd_MJ),
@@ -697,9 +701,10 @@ class TransportPredictorToraxBase(TransportPredictor):
         coeffs = self.nn_coefficients(inputs, energy_mhd_MJ)
         te_ic = te_floored.at[-1].set(jnp.squeeze(coeffs["T_e_right_bc"]))
         ne_ic = ne_floored.at[-1].set(jnp.squeeze(coeffs["n_e_right_bc"]))
-        provider, geo_provider = self.build_provider_and_geo(inputs, coeffs, ne_ic=ne_ic, te_ic=te_ic)
+        seed_step_fn = self.step_fn if step_fn is None else step_fn
+        provider, geo_provider = self.build_provider_and_geo(inputs, coeffs, ne_ic=ne_ic, te_ic=te_ic, step_fn=seed_step_fn)
         initial_state, initial_post = torax_experimental.get_initial_state_and_post_processed_outputs(
-            step_fn=self.step_fn,
+            step_fn=seed_step_fn,
             runtime_params_overrides=provider,
             geometry_overrides=geo_provider,
         )
@@ -764,77 +769,118 @@ class TransportPredictorTorax(TransportPredictorToraxBase):
         return state_out, output
 
 
-class TransportPredictorToraxSimState(TransportPredictorToraxBase):
-    """TORAX transport predictor carrying the full TORAX state.
+def _carried_state(core_profiles) -> "TransportPredictorToraxCarry.State":
+    """The TransportPredictorToraxCarry state holding these TORAX core profiles."""
+    return TransportPredictorToraxCarry.State(
+        ne=core_profiles.n_e.cell_plus_boundaries() / 1e20,
+        te=core_profiles.T_e.cell_plus_boundaries(),
+        ti=core_profiles.T_i.cell_plus_boundaries(),
+        psi=core_profiles.psi.value,
+    )
 
-    Alternative to TransportPredictorTorax: instead of rebuilding a TORAX
-    initial state from stored ne/te each step, the whole TORAX SimState pytree
-    (profiles, psi, currents) is carried as DISCRETE state, so nothing is
-    lost to per-step reinitialization. The cost is TORAX internals inside the
-    module state: seeding requires get_initial_state_and_post_processed_outputs
-    and the state layout is tied to the torax config.
+
+class TransportPredictorToraxCarry(TransportPredictorToraxBase):
+    """TORAX transport predictor carrying ne, te, ti and psi between steps.
+
+    Alternative to TransportPredictorTora (that one resets T_i to T_e and rebuilds psi from Ip every step)
+    Here the ion temperature and the poloidal flux persist, so the ion channel and the current evolve over the rollout.
+    The carried values are plain arrays on the TORAX cell grid, the profiles with both face values,
+    so no TORAX pytree enters the module State (popsim's state partitions rebuild CellVariable halves, which TORAX rejects).
+    Each __call__ re-enters them as the initial conditions of one TORAX step,
+    psi through initial_psi_mode "profile_conditions" with the edge gradient set by the current Ip.
+    That needs the make_transport_torax_config(..., torax_state="carry") config, which also evolves the current.
+    The segment start has no psi to carry, so seed_step_fn takes it from TORAX's current-profile formula.
     """
+
+    # Step function of the same config with psi from the current-profile formula, used only to seed a segment
+    seed_step_fn: SimulationStepFn = eqx.field(static=True)
 
     @chex.dataclass
     class State:
-        # Both TORAX pytrees are held inside 1-tuples, see wrap / unwrap below.
-        # popsim's create_filter_spec (field_labels.py) builds its boolean
-        # filter spec by recursing into every nested DATACLASS field and
-        # rebuilding it with dataclasses.replace. TORAX's CellVariable rejects
-        # that: its __post_init__ requires exactly one face constraint set, and
-        # a spec sets both to booleans. A tuple is not a dataclass, so the walk
-        # stops at the wrapper and the whole subtree inherits this field's
-        # discrete / no-save label through eqx.partition's prefix semantics.
-        # Known broken on upstream TORAX: eqx.partition still rebuilds the complementary
-        # half with None leaves, which CellVariable.__post_init__ rejects (see CLAUDE.md)
-        sim_state: PyTree = discrete_no_save_field(default=None)  # (SimState,)
-        post_processed: PyTree = discrete_no_save_field(default=None)  # (PostProcessedOutputs,)
+        # Profiles as cell values with both face values (CellVariable.cell_plus_boundaries)
+        ne: Array = discrete_no_save_field(default=None)  # (n_cells + 2,) [1e20 m^-3]
+        te: Array = discrete_no_save_field(default=None)  # (n_cells + 2,) [keV]
+        ti: Array = discrete_no_save_field(default=None)  # (n_cells + 2,) [keV]
+        psi: Array = discrete_no_save_field(default=None)  # (n_cells,) poloidal flux [Wb]
 
-        @staticmethod
-        def wrap(sim_state, post_processed) -> "TransportPredictorToraxSimState.State":
-            """Build a State from the bare TORAX pytrees."""
-            return TransportPredictorToraxSimState.State(sim_state=(sim_state,), post_processed=(post_processed,))
-
-        def unwrap(self) -> tuple:
-            """The bare (SimState, PostProcessedOutputs) this state carries."""
-            return self.sim_state[0], self.post_processed[0]
-
-    def __call__(self, state: "TransportPredictorToraxSimState.State", inputs: Inputs) -> tuple:
-        rho = jnp.array(self.rhogrid)
-        carried_state, carried_post = state.unwrap()
-
-        # Stored energy implied by the carried TORAX core profiles drives the
-        # NN features, cell values suffice for the integral
-        core_profiles = carried_state.core_profiles
-        rho_cells = jnp.asarray(self.rho_norm_grid)
-        energy_mhd_MJ = energy_mhd_from_profiles(
-            core_profiles.n_e.value / 1e20,
-            core_profiles.T_e.value,
-            rho_cells,
-            inputs.volume_approx,
+    def __init__(
+        self,
+        nn_width: int,
+        nn_depth: int,
+        rhogrid: tuple,
+        torax_config: ToraxConfig | dict,
+        key: jax.Array,
+        normalizer: FeatureNormalizer,
+        sim_dt: float,
+        transport_model: str,
+        geometry_builder: str,
+        delta_exponent: float,
+    ):
+        if not isinstance(torax_config, dict):
+            raise TypeError("TransportPredictorToraxCarry derives its seed config from the torax config dict")
+        if torax_config["profile_conditions"].get("initial_psi_mode") != "profile_conditions":
+            raise ValueError("TransportPredictorToraxCarry needs the make_transport_torax_config(..., torax_state='carry') config")
+        super().__init__(
+            nn_width=nn_width,
+            nn_depth=nn_depth,
+            rhogrid=rhogrid,
+            torax_config=torax_config,
+            key=key,
+            normalizer=normalizer,
+            sim_dt=sim_dt,
+            transport_model=transport_model,
+            geometry_builder=geometry_builder,
+            delta_exponent=delta_exponent,
         )
+        seed_config = copy.deepcopy(torax_config)
+        seed_config["profile_conditions"]["initial_psi_mode"] = "j"
+        seed_config["profile_conditions"].pop("psi")
+        self.seed_step_fn, _, _ = make_step_fn_and_grid(seed_config, transport_model)
+
+    def seed_state(self, inputs: Inputs, ne: Array, te: Array) -> "TransportPredictorToraxCarry.State":
+        """The carried state at a segment start, from ne / te on rhogrid.
+
+        Seeded like a rebuild step (seed_initial_state: floors, edge points pinned to the NN BCs),
+        with T_i equal to T_e and psi from the current-profile formula.
+        """
+        initial_state, *_ = self.seed_initial_state(inputs, ne, te, step_fn=self.seed_step_fn)
+        return _carried_state(initial_state.core_profiles)
+
+    def __call__(self, state: "TransportPredictorToraxCarry.State", inputs: Inputs) -> tuple:
+        rho = jnp.array(self.rhogrid)
+        # Profiles at the current time on rhogrid, edge values included
+        ne_now = interp_cell_plus_boundaries(state.ne, self._face_centers, rho)
+        te_now = interp_cell_plus_boundaries(state.te, self._face_centers, rho)
+        energy_mhd_MJ = energy_mhd_from_profiles(ne_now, te_now, rho, inputs.volume_approx)
         coeffs = self.nn_coefficients(inputs, energy_mhd_MJ)
-        # No initial profile conditions: the state is carried, not rebuilt
         provider, geo_provider = self.build_provider_and_geo(inputs, coeffs)
 
-        # step_fn evaluates time-varying params at the state time and clips
-        # dt against the config t_final, and the carried state has already
-        # advanced to t_final, so rewind t to t_initial before each step
-        numerics = self.step_fn.runtime_params_provider.numerics
-        sim_state = dataclasses.replace(
-            carried_state,
-            t=jnp.full_like(carried_state.t, float(numerics.t_initial)),
-        )
-        final_state, final_post = self._advance_one_step(sim_state, carried_post, provider, geo_provider)
+        # The carried cell values become the initial conditions, the face values come from the new boundary conditions
+        rho_cells = jnp.asarray(self.rho_norm_grid)
 
-        # Output the profile estimate at the current time from the carried state, edge value included
-        ne_now, te_now = interp_core_profiles(carried_state.core_profiles, self._face_centers, rho)
+        def cell_update(values: Array) -> torax_experimental.TimeVaryingArrayUpdate:
+            return torax_experimental.TimeVaryingArrayUpdate(value=values[jnp.newaxis, :], rho_norm=rho_cells)
+
+        ne_cells_m3 = 1e20 * state.ne[1:-1]
+        provider = provider.update_provider_from_mapping(
+            {
+                "profile_conditions.n_e": cell_update(ne_cells_m3),
+                "profile_conditions.T_e": cell_update(state.te[1:-1]),
+                "profile_conditions.T_i": cell_update(state.ti[1:-1]),
+                "profile_conditions.psi": cell_update(state.psi),
+            }
+        )
+        initial_state, initial_post = torax_experimental.get_initial_state_and_post_processed_outputs(
+            step_fn=self.step_fn,
+            runtime_params_overrides=provider,
+            geometry_overrides=geo_provider,
+        )
+        final_state, _post = self._advance_one_step(initial_state, initial_post, provider, geo_provider)
+
         ne_now, te_now, debug_info = self.positive_profiles(ne_now, te_now)
         debug_info.update(energy_mhd_MJ_state=energy_mhd_MJ)
-
-        state_out = TransportPredictorToraxSimState.State.wrap(final_state, final_post)
         output = Output(ne=ne_now, te=te_now, rho=rho, debug_info=debug_info)
-        return state_out, output
+        return _carried_state(final_state.core_profiles), output
 
 
 class TransportPredictorEnv(ModuleTrainingEnv):
@@ -842,7 +888,7 @@ class TransportPredictorEnv(ModuleTrainingEnv):
 
     State seeding uses the measured signals at the segment start: the
     dataloader's state_init_vars carry the t0 slice of the profiles, the
-    stored energy, and (for the TORAX sim-state variant) every scalar input,
+    stored energy, and (for the TORAX carry variant) every scalar input,
     so create_state never has to slice the time axis itself.
     """
 
@@ -878,10 +924,8 @@ class TransportPredictorEnv(ModuleTrainingEnv):
                 te=jnp.maximum(te0, TE_SEED_FLOOR_KEV),
             )
 
-        if isinstance(self.module, TransportPredictorToraxSimState):
-            # The full TORAX state seeded from the measured profiles, the same way each rebuild step is seeded
-            initial_state, initial_post, *_ = self.module.seed_initial_state(self.create_inputs(observations), ne0, te0)
-            return TransportPredictorToraxSimState.State.wrap(initial_state, initial_post)
+        if isinstance(self.module, TransportPredictorToraxCarry):
+            return self.module.seed_state(self.create_inputs(observations), ne0, te0)
 
         raise ValueError(f"Unknown transport predictor module type: {type(self.module)}")
 

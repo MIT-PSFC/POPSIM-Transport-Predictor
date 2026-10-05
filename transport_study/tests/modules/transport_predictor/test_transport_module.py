@@ -16,6 +16,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 import xarray as xr
+from popsim.field_labels import partition_discrete_cont, partition_save_no_save
 from popsim.ml.partition import make_partition_by_members
 
 from transport_study import RADIAL_DIM
@@ -57,7 +58,7 @@ from transport_study.modules.transport_predictor.module import (
     TransportPredictorSciML,
     TransportPredictorTorax,
     TransportPredictorToraxBase,
-    TransportPredictorToraxSimState,
+    TransportPredictorToraxCarry,
     TransportPredictorTransformer,
     energy_mhd_from_profiles,
     make_transport_nn_input_normalizer,
@@ -182,10 +183,10 @@ def torax_rebuild_module() -> TransportPredictorTorax:
 
 
 @pytest.fixture(scope="module")
-def torax_carry_module() -> TransportPredictorToraxSimState:
-    return TransportPredictorToraxSimState.init(
+def torax_carry_module() -> TransportPredictorToraxCarry:
+    return TransportPredictorToraxCarry.init(
         rhogrid=RHO,
-        torax_config=make_transport_torax_config("constant"),
+        torax_config=make_transport_torax_config("constant", "carry"),
         nn_width=8,
         nn_depth=2,
         prng_seed=0,
@@ -202,8 +203,8 @@ def test_env_create_state_per_model_type(transformer_module, sciml_module, torax
     transformer gets a (history_len, 2 n_rho) buffer tiled from the measured
     t0 profiles, sciml gets PowerBalance.State with the measured energy_mhd_MJ,
     torax rebuild gets ne/te from the measured profiles, and torax carry gets
-    a full ToraxSimState built from the measured profiles with the edge points
-    pinned to the NN boundary conditions."""
+    cell-grid ne/te/ti with the edge faces pinned to the NN boundary conditions,
+    T_i equal to T_e, and psi from the current-profile formula."""
     obs = make_observations()
 
     # Transformer: whole buffer tiled from the raw measured t0 profiles
@@ -228,34 +229,26 @@ def test_env_create_state_per_model_type(transformer_module, sciml_module, torax
     np.testing.assert_allclose(np.asarray(state_rb.te[-3:]), TE_SEED_FLOOR_KEV)
     np.testing.assert_allclose(np.asarray(state_rb.ne[-1]), NE_SEED_FLOOR_20)
 
-    # Torax carry: full ToraxSimState at t_initial, edge points pinned to the
-    # NN Dirichlet boundary conditions computed from the floored seeds
+    # Torax carry: cell values plus both faces, the edge faces pinned to the NN Dirichlet
+    # boundary conditions computed from the floored seeds
     state_carry = TransportPredictorEnv(module=torax_carry_module).create_state(obs, obs)
-    assert isinstance(state_carry, TransportPredictorToraxSimState.State)
-    sim_state, post_processed = state_carry.unwrap()
-    assert sim_state is not None
-    assert post_processed is not None
-    assert float(sim_state.t) == pytest.approx(0.0)
+    assert isinstance(state_carry, TransportPredictorToraxCarry.State)
+    n_cells = len(torax_carry_module.rho_norm_grid)
+    for name in ("ne", "te", "ti"):
+        assert getattr(state_carry, name).shape == (n_cells + 2,)
+    assert state_carry.psi.shape == (n_cells,)
 
     inputs0 = TransportPredictorEnv.create_inputs(obs)
     ne_seed = jnp.maximum(jnp.asarray(NE0), NE_SEED_FLOOR_20)
     te_seed = jnp.maximum(jnp.asarray(TE0), TE_SEED_FLOOR_KEV)
     wtot0 = energy_mhd_from_profiles(ne_seed, te_seed, jnp.asarray(RHO), inputs0.volume_approx)
     coeffs = torax_carry_module.nn_coefficients(inputs0, wtot0)
-    core_profiles = sim_state.core_profiles
-    np.testing.assert_allclose(
-        np.asarray(core_profiles.T_e.right_face_constraint),
-        np.squeeze(np.asarray(coeffs["T_e_right_bc"])),
-        rtol=1e-6,
-    )
-    np.testing.assert_allclose(
-        np.asarray(core_profiles.n_e.right_face_constraint),
-        1e20 * np.squeeze(np.asarray(coeffs["n_e_right_bc"])),
-        rtol=1e-6,
-    )
-    assert np.all(np.isfinite(np.asarray(core_profiles.T_e.value)))
-    assert np.all(np.asarray(core_profiles.T_e.value) > 0.0)
-    assert np.all(np.asarray(core_profiles.n_e.value) > 0.0)
+    np.testing.assert_allclose(float(state_carry.te[-1]), scalar(coeffs["T_e_right_bc"]), rtol=1e-6)
+    np.testing.assert_allclose(float(state_carry.ne[-1]), scalar(coeffs["n_e_right_bc"]), rtol=1e-6)
+    np.testing.assert_array_equal(np.asarray(state_carry.ti), np.asarray(state_carry.te))
+    assert np.all(np.isfinite(np.asarray(state_carry.psi)))
+    assert np.all(np.asarray(state_carry.te) > 0.0)
+    assert np.all(np.asarray(state_carry.ne) > 0.0)
 
 
 def test_env_get_trainable_selections(transformer_module, sciml_module, torax_rebuild_module):
@@ -430,7 +423,7 @@ def test_torax_p_aux_feed_through(torax_rebuild_module):
     # Rebuild, carry, and the env's initial-state construction all share the
     # base implementation, so the provider-level checks below cover them all
     assert TransportPredictorTorax.build_provider_and_geo is TransportPredictorToraxBase.build_provider_and_geo
-    assert TransportPredictorToraxSimState.build_provider_and_geo is TransportPredictorToraxBase.build_provider_and_geo
+    assert TransportPredictorToraxCarry.build_provider_and_geo is TransportPredictorToraxBase.build_provider_and_geo
 
     for p_aux in (0.0, 2.0, 6.0):
         inputs = make_inputs(power_additional_MW=p_aux)
@@ -640,30 +633,48 @@ def test_torax_absorption_fraction_nn(torax_rebuild_module):
 
 
 @pytest.mark.slow
-def test_torax_absorbed_power_matches_absorption_fraction(torax_carry_module):
+def test_torax_absorbed_power_matches_absorption_fraction(torax_rebuild_module):
     """The absorbed power inside TORAX equals P_total * absorption_fraction:
     after one solver step the post-processed generic_heat total is the
     measured P_aux scaled by the NN-predicted absorption fraction."""
     obs = make_observations()
     inputs = TransportPredictorEnv.create_inputs(obs)
-    state = TransportPredictorEnv(module=torax_carry_module).create_state(obs, obs)
+    state, post, provider, geo, energy_mhd_MJ = torax_rebuild_module.seed_initial_state(inputs, jnp.asarray(NE0), jnp.asarray(TE0))
+    coeffs = torax_rebuild_module.nn_coefficients(inputs, energy_mhd_MJ)
 
-    # Recompute the coefficients exactly as __call__ does, from the stored
-    # energy implied by the carried TORAX core profiles
-    core_profiles = state.unwrap()[0].core_profiles
-    rho_cells = jnp.asarray(torax_carry_module.rho_norm_grid)
-    wtot = energy_mhd_from_profiles(
-        core_profiles.n_e.value / 1e20,
-        core_profiles.T_e.value,
-        rho_cells,
-        inputs.volume_approx,
-    )
-    coeffs = torax_carry_module.nn_coefficients(inputs, wtot)
-
-    next_state, _output = torax_carry_module(state, inputs)
-    absorbed = float(np.squeeze(np.asarray(next_state.unwrap()[1].P_aux_generic_total)))
-    expected = float(inputs.power_additional_MW) * 1e6 * float(np.squeeze(np.asarray(coeffs["absorption_fraction"])))
+    _next_state, next_post = torax_rebuild_module.step_fn(state, post, runtime_params_overrides=provider, geo_overrides=geo)
+    absorbed = float(np.squeeze(np.asarray(next_post.P_aux_generic_total)))
+    expected = float(inputs.power_additional_MW) * 1e6 * scalar(coeffs["absorption_fraction"])
     assert absorbed == pytest.approx(expected, rel=1e-3)
+
+
+@pytest.mark.slow
+def test_torax_carry_state_runs_under_popsim_and_evolves_ions_and_current(torax_carry_module):
+    """The carried state survives popsim's state partitions and a jitted rollout step,
+    and keeps the ion temperature and psi that the rebuild variant resets every step.
+
+    A carried TORAX SimState crashed every popsim partition (CellVariable rejects the None-filled halves).
+    """
+    obs = make_observations()
+    inputs = make_inputs()
+    state0 = TransportPredictorEnv(module=torax_carry_module).create_state(obs, obs)
+    partition_discrete_cont(state0)
+    partition_save_no_save(state0)
+
+    step = eqx.filter_jit(lambda module, state: _rollout_step(module, state, inputs))
+    state1 = step(torax_carry_module, state0)
+    state2 = step(torax_carry_module, state1)
+    for name in ("ne", "te", "ti", "psi"):
+        assert np.all(np.isfinite(np.asarray(getattr(state2, name)))), name
+    # T_i starts equal to T_e and then evolves on its own, psi evolves with the current
+    assert not np.allclose(np.asarray(state2.ti), np.asarray(state2.te))
+    assert not np.allclose(np.asarray(state2.psi), np.asarray(state0.psi))
+
+
+def _rollout_step(module: TransportPredictorToraxCarry, state, inputs: Inputs):
+    """One popsim simple-Euler step of a discrete-state module, whose next state is the module output."""
+    discrete_next, _continuous = partition_discrete_cont(module(state, inputs)[0])
+    return discrete_next
 
 
 @requires_sample_data

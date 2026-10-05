@@ -18,7 +18,7 @@ from transport_study.modules.transport_predictor.module import (
     TransportPredictorEnv,
     TransportPredictorSciML,
     TransportPredictorTorax,
-    TransportPredictorToraxSimState,
+    TransportPredictorToraxCarry,
     TransportPredictorTransformer,
     make_transport_nn_input_normalizer,
 )
@@ -103,7 +103,7 @@ class TransportPredictorTRB(TrainRunBuilder):
                 prng_seed=model_init_config["prng_seed"],
             )
         if model_type.startswith("torax-"):
-            torax_cls = {"rebuild": TransportPredictorTorax, "carry": TransportPredictorToraxSimState}[model_init_config["torax_state"]]
+            torax_cls = {"rebuild": TransportPredictorTorax, "carry": TransportPredictorToraxCarry}[model_init_config["torax_state"]]
             return torax_cls.init(
                 rhogrid=rhogrid,
                 torax_config=model_init_config["torax_config"],

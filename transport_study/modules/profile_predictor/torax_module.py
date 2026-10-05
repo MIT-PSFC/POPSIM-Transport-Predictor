@@ -774,16 +774,22 @@ def shared_provider_mapping(ip_MA: jax.Array, transport_model: str, coeffs: dict
     return mapping | transport_provider_mapping(transport_model, coeffs)
 
 
-def interp_core_profiles(core_profiles, face_centers: tuple, rho: jax.Array) -> tuple[jax.Array, jax.Array]:
-    """n_e [1e20 m^-3] and T_e [keV] of TORAX core profiles interpolated onto rho in [0, 1].
+def interp_cell_plus_boundaries(values: jax.Array, face_centers: tuple, rho: jax.Array) -> jax.Array:
+    """Cell values with both face values (CellVariable.cell_plus_boundaries) interpolated onto rho in [0, 1].
 
-    The cell values are augmented with both face values before interpolating (CellVariable.cell_plus_boundaries):
-    jnp.interp flat-holds outside the data range, which would ignore the Dirichlet edge value at rho = 1,
+    The face values matter: jnp.interp flat-holds outside the data range, which would ignore the Dirichlet edge value at rho = 1,
     and the zero-gradient axis condition makes the rho = 0 face equal the innermost cell.
     """
     rho_full = jnp.concatenate([jnp.asarray(face_centers[:1]), jnp.asarray(cell_centers(face_centers)), jnp.asarray(face_centers[-1:])])
-    ne = jnp.interp(rho, rho_full, core_profiles.n_e.cell_plus_boundaries() / 1e20)
-    te = jnp.interp(rho, rho_full, core_profiles.T_e.cell_plus_boundaries())
+    return jnp.interp(rho, rho_full, values)
+
+
+def interp_core_profiles(core_profiles, face_centers: tuple, rho: jax.Array) -> tuple[jax.Array, jax.Array]:
+    """n_e [1e20 m^-3] and T_e [keV] of TORAX core profiles interpolated onto rho in [0, 1], see interp_cell_plus_boundaries."""
+    ne_with_faces = core_profiles.n_e.cell_plus_boundaries() / 1e20
+    te_with_faces = core_profiles.T_e.cell_plus_boundaries()
+    ne = interp_cell_plus_boundaries(ne_with_faces, face_centers, rho)
+    te = interp_cell_plus_boundaries(te_with_faces, face_centers, rho)
     return ne, te
 
 
