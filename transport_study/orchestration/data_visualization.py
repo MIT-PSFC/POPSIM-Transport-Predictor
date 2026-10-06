@@ -430,6 +430,7 @@ class DataVisualizationBase:
         Each target shot is drawn in the hazard plane (top)
         and in the heating plane (bottom), P_aux against stored energy, which splits ohmic from heated shots,
         marked as test, pool or picked.
+        The named target_test_shots that set the test cutoff are gold triangles on top.
         """
         target = config.target_device
         shot_counts = sorted(n for n in config.num_target_shots_options if n > 0)
@@ -449,8 +450,9 @@ class DataVisualizationBase:
             (ds_power_balance["ip_MA_p95"].values, energy_mhd_MJ_p95, "ip_MA (hazard p95)"),
             (power_additional_MW_p95, energy_mhd_MJ_p95, "power_additional_MW (p95)"),
         )
-        color_by_role = {"pool": "#808080", "test": "#ff4d4d", "picked": "#1ad1ff"}
-        marker_by_role = {"pool": ("o", 8), "test": ("*", 30), "picked": ("s", 30)}
+        color_by_role = {"pool": "#808080", "test": "#ff4d4d", "picked": "#1ad1ff", "named test": "#ffd700"}
+        marker_by_role = {"pool": ("o", 8), "test": ("*", 30), "picked": ("s", 30), "named test": ("^", 70)}
+        mask_named_test = np.isin(shots, config.target_test_shots)
 
         for order, fig_path in fig_paths.items():
             if fig_path.exists():
@@ -460,15 +462,30 @@ class DataVisualizationBase:
             for col, num_target_shots in enumerate(shot_counts):
                 target_split = configured_target_split(num_target_shots, order)
                 train_shots, test_shots = target_shot_split(ds_power_balance, target_split)
-                mask_by_role = {"test": np.isin(shots, test_shots), "picked": np.isin(shots, train_shots)}
+                mask_by_role = {
+                    "test": np.isin(shots, test_shots),
+                    "picked": np.isin(shots, train_shots),
+                    "named test": mask_named_test,
+                }
                 mask_by_role["pool"] = ~mask_by_role["test"] & ~mask_by_role["picked"]
                 for row, (x_values, y_values, x_label) in enumerate(planes):
                     ax = axes[row, col]
                     style_axis(ax)
-                    for role in ("pool", "test", "picked"):
-                        marker, size = marker_by_role[role]
+                    # Drawn in this order, so the named test shots sit on top of the other test shots
+                    for role in ("pool", "test", "picked", "named test"):
                         mask = mask_by_role[role]
-                        ax.scatter(x_values[mask], y_values[mask], c=color_by_role[role], marker=marker, s=size, label=role)
+                        if not mask.any():
+                            continue
+                        marker, size = marker_by_role[role]
+                        ax.scatter(
+                            x_values[mask],
+                            y_values[mask],
+                            c=color_by_role[role],
+                            marker=marker,
+                            s=size,
+                            edgecolors="black" if role == "named test" else "none",
+                            label=role,
+                        )
                     ax.set_xlabel(x_label, color=TEXT_COLOR)
                     if col == 0:
                         ax.set_ylabel("energy_mhd_MJ (hazard p95)", color=TEXT_COLOR)
