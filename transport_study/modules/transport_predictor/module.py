@@ -38,6 +38,7 @@ from transport_study.modules.profile_predictor.module import (
 )
 from transport_study.modules.profile_predictor.torax_module import (
     TAU_REF_S,
+    TORAX_MODEL_TYPES,
     bound_edge_coefficients,
     bound_source_coefficients,
     bound_transport_coefficients,
@@ -57,6 +58,9 @@ from transport_study.modules.profile_predictor.torax_module import (
 # Submodule pseudo-model-types of the sciml prereq cases:
 # sciml -> power_balance + profile, power_balance -> p_oh + p_rad
 SUBMODULE_MODEL_TYPES = ("power_balance", "profile", "p_oh", "p_rad")
+# Model types the multiobjective case axis applies to, each also outputs the stored energy and the ohmic power:
+# the transformer from two more head outputs, TORAX from its own post-processing of the state
+MULTIOBJECTIVE_MODEL_TYPES = ("transformer", *TORAX_MODEL_TYPES)
 
 MIN_PROFILE = 1e-3
 
@@ -288,8 +292,9 @@ class Output:
     ne: Array  # Electron density profile on rho [1e20 m^-3]
     te: Array  # Electron temperature profile on rho [keV]
     rho: Array  # The rho grid the profiles are evaluated on
-    # Submodule predictions surfaced for the sciml anchor terms in the
-    # training loss (see TransportPredictorTRB), NaN for the other model types
+    # Predictions the training loss can anchor to the measured signals (see TransportPredictorTRB):
+    # the sciml submodules', a multiobjective transformer's heads, TORAX's own stored energy and ohmic power.
+    # NaN where a model type predicts none
     energy_mhd_MJ_pred: float = float("nan")
     power_ohm_MW_pred: float = float("nan")
     power_radiated_MW_pred: float = float("nan")
@@ -354,6 +359,9 @@ class TransportPredictorTransformer(TransportPredictor):
     6: the corrected profile is rolled into the buffer
     Only the normalized features and the normalized history enter the network,
     no n_e_line_average or te_approx scale.
+    With multiobjective the head has two more outputs after those,
+    the stored energy as a correction to the profile-implied one and the ohmic power on its W / TAU_REF_S scale.
+    They never enter the profile update, they only give the training loss extra targets to anchor.
     Without the position embedding attention is permutation-invariant over the history,
     so the model could not tell the most recent profile from the least recent
     (and the t0-seeded buffer holds identical rows, where values alone carry no ordering at all)
@@ -371,6 +379,7 @@ class TransportPredictorTransformer(TransportPredictor):
     rhogrid: tuple = eqx.field(static=True)
     history_len: int = eqx.field(static=True)
     d_model: int = eqx.field(static=True)
+    multiobjective: bool = eqx.field(static=True)
 
     @chex.dataclass
     class State:
@@ -396,7 +405,9 @@ class TransportPredictorTransformer(TransportPredictor):
         latent = query + attn_out
         nn_out = self.head(latent)
 
-        ne_next, te_next = scaled_profile_points(nn_out, n_rho)
+        # scaled_profile_points reads the correction factors at the end of its vector, so the aux outputs are cut off first
+        nn_out_profiles = nn_out[: 2 * n_rho + 2]
+        ne_next, te_next = scaled_profile_points(nn_out_profiles, n_rho)
         # Clipped values enter the buffer so the carried state stays physical
         ne_next, te_next, debug_info = self.positive_profiles(ne_next, te_next)
         debug_info.update(energy_mhd_MJ_state=energy_mhd_MJ)
@@ -406,11 +417,18 @@ class TransportPredictorTransformer(TransportPredictor):
         new_profiles = jnp.concatenate([state.profiles[1:], new_row[jnp.newaxis, :]], axis=0)
 
         state_out = TransportPredictorTransformer.State(profiles=new_profiles)
+        aux_outputs = {}
+        if self.multiobjective:
+            aux_outputs = {
+                "energy_mhd_MJ_pred": energy_mhd_MJ * (1.0 + nn_out[2 * n_rho + 2]),
+                "power_ohm_MW_pred": energy_mhd_MJ / TAU_REF_S * nn_out[2 * n_rho + 3],
+            }
         output = Output(
             ne=ne_now,
             te=te_now,
             rho=rho,
             debug_info=debug_info,
+            **aux_outputs,
         )
         return state_out, output
 
@@ -424,6 +442,7 @@ class TransportPredictorTransformer(TransportPredictor):
         nn_depth: int,
         rhogrid: Array,
         normalizer: FeatureNormalizer,
+        multiobjective: bool,
         prng_seed: int = 42,
     ) -> "TransportPredictorTransformer":
         key_feat, key_prof, key_pos, key_attn, key_head = jax.random.split(jax.random.PRNGKey(prng_seed), 5)
@@ -438,7 +457,8 @@ class TransportPredictorTransformer(TransportPredictor):
         attention = eqx.nn.MultiheadAttention(num_heads=num_heads, query_size=d_model, key=key_attn)
         head = eqx.nn.MLP(
             in_size=d_model,
-            out_size=2 * n_rho + 2,  # +2 for the te and ne correction factors
+            # +2 for the te and ne correction factors, +2 more for the multiobjective stored energy and ohmic power
+            out_size=2 * n_rho + 2 + (2 if multiobjective else 0),
             width_size=nn_width,
             depth=nn_depth,
             key=key_head,
@@ -453,6 +473,7 @@ class TransportPredictorTransformer(TransportPredictor):
             rhogrid=rhogrid_tuple,
             history_len=history_len,
             d_model=d_model,
+            multiobjective=multiobjective,
         )
 
 
@@ -722,6 +743,18 @@ class TransportPredictorToraxBase(TransportPredictor):
         )
         return initial_state, initial_post, provider, geo_provider, energy_mhd_MJ
 
+    @staticmethod
+    def inferred_outputs(post_processed) -> dict:
+        """The stored energy and the ohmic power TORAX infers from a state, Output fields in MJ and MW.
+
+        The thermal stored energy counts ions and impurities at T_i (T_e in the rebuild), no fast ions.
+        The ohmic power is j_ohm E over the TORAX resistivity at the state's T_e and Z_eff.
+        """
+        return {
+            "energy_mhd_MJ_pred": post_processed.W_thermal_total / 1e6,
+            "power_ohm_MW_pred": post_processed.P_ohmic_e / 1e6,
+        }
+
     def _advance_one_step(self, sim_state, post_processed, provider, geo_provider):
         """Advance TORAX by exactly one solver step of sim_dt.
 
@@ -776,8 +809,9 @@ class TransportPredictorTorax(TransportPredictorToraxBase):
         debug_info.update(energy_mhd_MJ_state=energy_mhd_MJ)
 
         state_out = TransportPredictorTorax.State(ne=ne_next, te=te_next)
-        # Output the profile estimate at the current time, the evolved profiles become the next state
-        output = Output(ne=state.ne, te=state.te, rho=rho, debug_info=debug_info)
+        # Output the profile estimate at the current time, the evolved profiles become the next state.
+        # initial_post is the state at the current time too
+        output = Output(ne=state.ne, te=state.te, rho=rho, debug_info=debug_info, **self.inferred_outputs(initial_post))
         return state_out, output
 
 
@@ -891,7 +925,7 @@ class TransportPredictorToraxCarry(TransportPredictorToraxBase):
 
         ne_now, te_now, debug_info = self.positive_profiles(ne_now, te_now)
         debug_info.update(energy_mhd_MJ_state=energy_mhd_MJ)
-        output = Output(ne=ne_now, te=te_now, rho=rho, debug_info=debug_info)
+        output = Output(ne=ne_now, te=te_now, rho=rho, debug_info=debug_info, **self.inferred_outputs(initial_post))
         return _carried_state(final_state.core_profiles), output
 
 

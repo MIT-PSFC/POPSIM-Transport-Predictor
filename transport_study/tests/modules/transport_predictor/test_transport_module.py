@@ -141,6 +141,7 @@ def transformer_module() -> TransportPredictorTransformer:
         nn_depth=1,
         rhogrid=RHO,
         normalizer=make_transport_nn_input_normalizer("physics", None, 2, target_idx=0),
+        multiobjective=False,
         prng_seed=0,
     )
 
@@ -397,6 +398,90 @@ def test_transformer_history_holds_profiles_only(transformer_module):
     _, output = transformer_module(next_a, make_inputs())
     np.testing.assert_array_equal(np.asarray(output.ne), np.asarray(next_a.profiles[-1, :N_RHO]))
     np.testing.assert_array_equal(np.asarray(output.te), np.asarray(next_a.profiles[-1, N_RHO:]))
+
+
+def test_transformer_multiobjective_heads_leave_the_profiles_alone(transformer_module):
+    """The two multiobjective head rows come after the profile decode, which reads its corrections at the end.
+
+    A multiobjective twin sharing every plain weight, its extra head rows zeroed,
+    steps to the same next profile, reports the profile-implied stored energy and zero ohmic power.
+    The plain transformer reports neither.
+    """
+    multiobjective_module = TransportPredictorTransformer.init(
+        d_model=D_MODEL,
+        num_heads=2,
+        history_len=HISTORY_LEN,
+        nn_width=8,
+        nn_depth=1,
+        rhogrid=RHO,
+        normalizer=make_transport_nn_input_normalizer("physics", None, 2, target_idx=0),
+        multiobjective=True,
+        prng_seed=0,
+    )
+    plain_arrays, _ = eqx.partition(transformer_module, eqx.is_array)
+    multiobjective_arrays, multiobjective_static = eqx.partition(multiobjective_module, eqx.is_array)
+    plain_leaves = jax.tree_util.tree_leaves(plain_arrays)
+    multiobjective_leaves, multiobjective_treedef = jax.tree_util.tree_flatten(multiobjective_arrays)
+    twin_leaves = []
+    for plain_leaf, multiobjective_leaf in zip(plain_leaves, multiobjective_leaves, strict=True):
+        n_extra_rows = multiobjective_leaf.shape[0] - plain_leaf.shape[0]
+        extra_rows = jnp.zeros((n_extra_rows, *plain_leaf.shape[1:]), dtype=plain_leaf.dtype)
+        twin_leaves.append(jnp.concatenate([plain_leaf, extra_rows]))
+    twin_arrays = jax.tree_util.tree_unflatten(multiobjective_treedef, twin_leaves)
+    twin = eqx.combine(twin_arrays, multiobjective_static)
+
+    obs = make_observations()
+    inputs = make_inputs()
+    state = TransportPredictorEnv(module=transformer_module).create_state(obs, obs)
+    next_plain, output_plain = transformer_module(state, inputs)
+    next_twin, output_twin = twin(state, inputs)
+
+    np.testing.assert_array_equal(np.asarray(next_twin.profiles), np.asarray(next_plain.profiles))
+    energy_mhd_MJ_profiles = energy_mhd_from_profiles(state.profiles[-1, :N_RHO], state.profiles[-1, N_RHO:], RHO, inputs.volume_approx)
+    assert float(output_twin.energy_mhd_MJ_pred) == pytest.approx(float(energy_mhd_MJ_profiles))
+    assert float(output_twin.power_ohm_MW_pred) == 0.0
+    assert np.isnan(float(output_plain.energy_mhd_MJ_pred))
+    assert np.isnan(float(output_plain.power_ohm_MW_pred))
+
+    # Freshly initialized, the multiobjective heads give finite values that differ from the zeroed twin's
+    _, output_multiobjective = multiobjective_module(state, inputs)
+    assert np.isfinite(float(output_multiobjective.energy_mhd_MJ_pred))
+    assert np.isfinite(float(output_multiobjective.power_ohm_MW_pred))
+    assert float(output_multiobjective.power_ohm_MW_pred) != 0.0
+
+
+@pytest.mark.slow
+def test_torax_inferred_outputs_track_the_state_and_reach_the_transport_network(torax_rebuild_module):
+    """TORAX's stored energy and ohmic power at the current time come from the seeded state's post-processing.
+
+    They are finite and positive, the thermal energy sits near the profile-implied one,
+    and after one step the ohmic power depends on the transport network through the evolved profiles,
+    so a multiobjective anchor trains it.
+    """
+    obs = make_observations()
+    inputs = TransportPredictorEnv.create_inputs(obs)
+    state = TransportPredictorEnv(module=torax_rebuild_module).create_state(obs, obs)
+    _seeded, initial_post, *_rest, energy_mhd_MJ_profiles = torax_rebuild_module.seed_initial_state(inputs, state.ne, state.te)
+    _next_state, output = torax_rebuild_module(state, inputs)
+
+    energy_mhd_MJ_pred = float(output.energy_mhd_MJ_pred)
+    power_ohm_MW_pred = float(output.power_ohm_MW_pred)
+    assert energy_mhd_MJ_pred == pytest.approx(float(initial_post.W_thermal_total) / 1e6)
+    assert power_ohm_MW_pred == pytest.approx(float(initial_post.P_ohmic_e) / 1e6)
+    assert energy_mhd_MJ_pred > 0.0
+    assert power_ohm_MW_pred > 0.0
+    assert 0.5 < energy_mhd_MJ_pred / float(energy_mhd_MJ_profiles) < 2.0
+    assert np.isnan(float(output.power_radiated_MW_pred))
+
+    def ohmic_power_after_one_step(module):
+        stepped_state, _ = module(state, inputs)
+        _, stepped_output = module(stepped_state, inputs)
+        return stepped_output.power_ohm_MW_pred
+
+    grads = eqx.filter_jit(eqx.filter_grad(ohmic_power_after_one_step))(torax_rebuild_module)
+    transport_leaves = jax.tree_util.tree_leaves(eqx.filter(grads.nn_transport, eqx.is_inexact_array))
+    assert all(bool(jnp.all(jnp.isfinite(leaf))) for leaf in transport_leaves)
+    assert any(bool(jnp.any(leaf != 0.0)) for leaf in transport_leaves)
 
 
 def test_torax_p_aux_feed_through(torax_rebuild_module):

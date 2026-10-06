@@ -19,11 +19,10 @@ from transport_study.modules.power_balance.p_rad.module import RadiatedPower
 MODEL_TYPES_WITH_SUBMODULES = ("sciml-taue-scalinglaw", "sciml-taue-nn")
 # The submodule pseudo-model-types of those prereq cases
 SUBMODULE_MODEL_TYPES = ("p_oh", "p_rad")
-# The transformer and its multiobjective copy, whose head also predicts P_oh and P_rad for the loss to anchor
-TRANSFORMER_MODEL_TYPES = ("transformer", "transformer-multiobjective")
-MULTIOBJECTIVE_MODEL_TYPES = ("transformer-multiobjective",)
+# Model types the multiobjective case axis applies to: the transformer's head also predicts P_oh and P_rad for the loss to anchor
+MULTIOBJECTIVE_MODEL_TYPES = ("transformer",)
 # Model types fed their own predicted Wtot, their normalizer is built with_energy
-MODEL_TYPES_WITH_ENERGY_INPUT = ("mlp", *TRANSFORMER_MODEL_TYPES)
+MODEL_TYPES_WITH_ENERGY_INPUT = ("mlp", "transformer")
 
 MIN_TAUE = 0.001  # Minimum reasonable value for tau_e [s]
 MAX_TAUE = 0.8  # Maximum reasonable value for tau_e [s]
@@ -458,7 +457,7 @@ class PowerBalanceTransformer(PowerBalance):
     As in the mlp, the normalizer (built with_energy) scales every buffered Wtot at the current inputs
     and maps the head output back to dW/dt (normalize_with_energy, energy_rate_scale).
 
-    With predicts_powers (the transformer-multiobjective model type) the head has two more outputs,
+    With predicts_powers (a multiobjective case) the head has two more outputs,
     P_oh and P_rad on the same normalized power scale as dW/dt.
     They do not enter the Wtot update, they only give the training loss extra targets to anchor.
     """

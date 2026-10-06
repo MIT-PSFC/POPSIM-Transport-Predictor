@@ -101,3 +101,17 @@ def test_non_torax_rejects_torax_axes(loaded_config, torax_axis):
 def test_cases_are_hashable_and_set_stable(loaded_config):
     assert _case() in {_case()}
     assert hash(_case()) == hash(_case())
+
+
+@pytest.mark.parametrize("model_type", ["transformer", "torax-gyrobohm"])
+def test_multiobjective_case_name_and_shared_sweep(loaded_config, model_type):
+    """A multiobjective case carries mo_True and tunes on the plain case's sweep."""
+    case = _case(model_type=model_type, freeze_submodules=False, domain_adaptation="weighted", num_target_shots=3, multiobjective=True)
+    assert str(case) == f"case.{model_type}.td_cmod-low1.mo_True.targ_3.da_weighted"
+    assert str(case.prereqs[0]) == f"case.{model_type}.td_cmod-low1"
+
+
+def test_sciml_rejects_multiobjective(loaded_config):
+    # sciml always anchors its submodules, the axis does not apply to it
+    with pytest.raises(ValueError, match="multiobjective should be a dummy value"):
+        _case(multiobjective=True)

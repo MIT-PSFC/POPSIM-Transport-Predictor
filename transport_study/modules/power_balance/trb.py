@@ -13,9 +13,7 @@ from transport_study.modules.normalization import make_normalizer
 from transport_study.modules.power_balance.module import (
     MODEL_TYPES_WITH_ENERGY_INPUT,
     MODEL_TYPES_WITH_SUBMODULES,
-    MULTIOBJECTIVE_MODEL_TYPES,
     SCALING_LAW_FIELDS,
-    TRANSFORMER_MODEL_TYPES,
     PowerBalanceEnv,
     PowerBalanceMLP,
     PowerBalanceScalingLaw,
@@ -101,7 +99,7 @@ class PowerBalanceTRB(TrainRunBuilder):
                 normalizer=normalizer,
                 prng_seed=model_init_config["prng_seed"],
             )
-        if model_type in TRANSFORMER_MODEL_TYPES:
+        if model_type == "transformer":
             return PowerBalanceTransformer.init(
                 d_model=model_init_config["d_model"],
                 num_heads=model_init_config["num_heads"],
@@ -109,7 +107,7 @@ class PowerBalanceTRB(TrainRunBuilder):
                 nn_width=model_init_config["nn_width"],
                 nn_depth=model_init_config["nn_depth"],
                 normalizer=normalizer,
-                predicts_powers=model_type in MULTIOBJECTIVE_MODEL_TYPES,
+                predicts_powers=model_init_config["multiobjective"],
                 prng_seed=model_init_config["prng_seed"],
             )
         raise ValueError(f"Invalid model type: {model_type}")
@@ -149,8 +147,8 @@ class PowerBalanceTRB(TrainRunBuilder):
         The training loss adds the ANCHOR_SIGNALS terms pulling the submodule
         predictions toward the measured signals, weighted by the anchor_weight_* loss_config keys.
         Validation stays pure Wtot so the sweep metric is comparable across model types.
-        The terms drop out at trace time for model types whose target_vars do not
-        carry the measured signals (mlp, transformer).
+        The terms drop out at trace time for cases whose target_vars do not
+        carry the measured signals (mlp, the plain transformer).
         Anchor errors are plain absolute error: huber_delta is swept on the MJ-scale Wtot residuals,
         meaningless for the MW-scale powers, and the anchors are not worth a second delta
         """

@@ -160,8 +160,8 @@ def collected_datasets() -> tuple[xr.Dataset, xr.Dataset]:
         strict=True,
     ):
         results = results.assign_coords({coord_name: ("case_idx", [row[idx] for row in rows])})
-    # A single configured order is a scalar coord in real collected files
-    results = results.assign_coords(target_shot_order="ascending")
+    # A single configured value is a scalar coord in real collected files
+    results = results.assign_coords(target_shot_order="ascending", multiobjective=False)
     for err in ("err_abs", "err_rel"):
         for domain in ("shot", "ts"):
             for stat in ("mean", "std", "med", "p25", "p75", "min", "max"):

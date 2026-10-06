@@ -38,7 +38,7 @@ from transport_study.modules.trb_utils import (
 
 STUDY_TYPE = "transport_transfer"
 
-# Anchor terms in the sciml training loss, keyed by measured target signal:
+# Anchor terms in the training loss (sciml and multiobjective cases), keyed by measured target signal:
 # (Output attribute holding the model's own prediction, loss_config key for the weight)
 ANCHOR_SIGNALS = {
     "energy_mhd_MJ": ("energy_mhd_MJ_pred", "anchor_weight_energy_mhd"),
@@ -100,6 +100,7 @@ class TransportPredictorTRB(TrainRunBuilder):
                 nn_depth=model_init_config["nn_depth"],
                 rhogrid=rhogrid,
                 normalizer=normalizer,
+                multiobjective=model_init_config["multiobjective"],
                 prng_seed=model_init_config["prng_seed"],
             )
         if model_type.startswith("torax-"):
@@ -147,7 +148,7 @@ class TransportPredictorTRB(TrainRunBuilder):
         """Device-weighted loss on the predicted ne/te profiles, wrapped for time integration.
 
         Training (use_chi False): huber on the peak-normalized residual with the swept huber_delta,
-        the same convention as the profile study training loss, plus the sciml anchor terms.
+        the same convention as the profile study training loss, plus the anchor terms.
         Validation (use_chi True): value chi, the residual in units of the GP-fit error bar
         floored per device at chi_sigma_floors (trb_utils.chi_value), so no swept delta can shrink the sweep metric.
 
@@ -156,10 +157,11 @@ class TransportPredictorTRB(TrainRunBuilder):
         so forward-filled (stale) slices steer neither training nor checkpoint selection.
 
         The anchor terms pull the sciml submodule predictions (the power balance Wtot and its own p_oh / p_rad)
-        toward the measured signals, weighted by the anchor_weight_* loss_config keys.
+        and a multiobjective case's stored energy and ohmic power toward the measured signals,
+        weighted by the anchor_weight_* loss_config keys.
         They are training only, measured at every timeslice so exempt from the freshness mask,
         plain absolute error (huber_delta is sized for the profile residuals, not MJ / MW signals),
-        and drop out at trace time for model types whose target_vars lack the signals (transformer, torax-*).
+        and drop out at trace time for cases whose target_vars lack the signals (the plain transformer and torax-*).
         """
         device_weights = loss_config.get("device_weights", {})
         if use_chi:

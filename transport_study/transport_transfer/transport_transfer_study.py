@@ -23,7 +23,10 @@ from transport_study.modules.profile_predictor.torax_module import (
     TORAX_MODEL_TYPES,
     VALID_GEOMETRY_BUILDERS,
 )
-from transport_study.modules.transport_predictor.module import SUBMODULE_MODEL_TYPES
+from transport_study.modules.transport_predictor.module import (
+    MULTIOBJECTIVE_MODEL_TYPES,
+    SUBMODULE_MODEL_TYPES,
+)
 from transport_study.modules.transport_predictor.train_configs import (
     VALID_TORAX_STATES,
     make_transport_torax_config,
@@ -76,6 +79,12 @@ TRANSPORT_TARGET_VARS = [
     "ds_source_idx",
 ]
 
+# The measured powers every top-level case loads (the stored energy is a state var of every case),
+# so the training segments are the same whatever a case anchors (a NaN in any loaded variable drops a segment)
+MEASURED_POWER_VARS = ["power_ohm_MW", "power_radiated_MW"]
+# The signals a multiobjective case anchors, the ones TORAX infers from its state (no P_rad, see TransportPredictorToraxBase)
+MULTIOBJECTIVE_TARGET_VARS = ["energy_mhd_MJ", "power_ohm_MW"]
+
 # Everything the env may need to seed a state at the segment start: the
 # measured profiles (transformer buffer / torax initial condition), the stored
 # energy (sciml power balance state), and every scalar input plus the device
@@ -120,6 +129,8 @@ class TransportStudy(Study):
         # TORAX state carry variants to compare for torax-* model types,
         # ignored by every other model type (see VALID_TORAX_STATES)
         torax_state_options: Annotated[tuple[str, ...], CaseAxis("torax_state")] = Field(default_factory=lambda: ("rebuild",))
+        # Whether the MULTIOBJECTIVE_MODEL_TYPES also anchor their stored energy and ohmic power, ignored by every other model type
+        multiobjective_options: Annotated[tuple[bool, ...], CaseAxis("multiobjective")] = Field(default_factory=lambda: (False,))
         num_target_shots_options: Annotated[tuple[int, ...], CaseAxis("num_target_shots")] = Field(
             default_factory=lambda: (0, 1, 3, 10, 32)
         )
@@ -134,6 +145,7 @@ class TransportStudy(Study):
         # Hyperparameter tuning case configuration
         # (hyperparam_domain_adaptation and hyperparam_num_target_shots live on CaseGridConfig)
         hyperparam_freeze_submodules: bool = False
+        hyperparam_multiobjective: bool = False
         # Which variants back the sciml prereq submodules.
         # Study-wide settings rather than case axes.
         # They change model semantics under unchanged case names, so they are locked.
@@ -167,10 +179,9 @@ class TransportStudy(Study):
         - power_balance / profile / p_oh / p_rad: submodule predictors, appear
           only as prereq cases of sciml (power_balance itself chains p_oh and p_rad)
 
-        training_data: The dataset(s) used for training
-        - cmod: C-Mod only
-        - tcv: TCV only
-        - cmod_tcv: C-Mod + TCV
+        training_data: The historic dataset(s) used for training
+        - a device name from config.dataset_paths, e.g. cmod
+        - device names joined by _ for a combination, e.g. cmod_tcv
         - exnihilo: No historic training data
 
         domain_adaptation: The method for domain adaptation between source and target devices.
@@ -194,6 +205,12 @@ class TransportStudy(Study):
         - rebuild: carry only ne/te and rebuild a TORAX initial state each step (T_i := T_e, psi from Ip)
         - carry: also carry T_i and psi, so the ion channel and the current evolve over the rollout
 
+        multiobjective: Whether the training loss also anchors the stored energy and the ohmic power to the measured signals,
+        only meaningful for MULTIOBJECTIVE_MODEL_TYPES (every other model type is pinned to the hyperparam default,
+        sciml always anchors its submodules).
+        The transformer predicts them with two more head outputs, TORAX infers them from its own state.
+        Shares the plain case's sweep, only multiobjective cases show it in the name
+
         num_target_shots: The number of shots included in the training data from the target dataset, never any of the held-out test shots.
 
         target_shot_order: The order the target training shots are added in as num_target_shots grows, see orchestration/target_shots.py
@@ -205,6 +222,7 @@ class TransportStudy(Study):
         freeze_submodules: bool
         geometry_builder: str
         torax_state: str
+        multiobjective: bool
 
         VALID_MODEL_TYPES = (*TOP_LEVEL_MODEL_TYPES, *SUBMODULE_MODEL_TYPES)
         # Unfrozen submodules and the geometry_builder and torax_state defaults are suppressed from the case name,
@@ -213,11 +231,13 @@ class TransportStudy(Study):
             ("freeze_", "freeze_submodules", False),
             ("geom_", "geometry_builder", "circular"),
             ("tstate_", "torax_state", "rebuild"),
+            ("mo_", "multiobjective", False),
         )
         # geometry_builder and torax_state are deliberately NOT hyperparam fields (like model_type):
         # miller and carry cases get their own hyperparameter sweep and tuned config
         # instead of inheriting the circular and rebuild ones.
-        HYPERPARAM_FIELDS = ("domain_adaptation", "freeze_submodules", "num_target_shots")
+        # multiobjective is one, a multiobjective case takes the plain case's tuned config
+        HYPERPARAM_FIELDS = ("domain_adaptation", "freeze_submodules", "multiobjective", "num_target_shots")
 
         # The dataclass decorator would null an inherited __hash__
         __hash__ = Study.Case.__hash__
@@ -232,10 +252,12 @@ class TransportStudy(Study):
             geometry_builder: str = "circular",
             torax_state: str = "rebuild",
             target_shot_order: str = BASE_TARGET_SHOT_ORDER,
+            multiobjective: bool = False,
         ):
             self.freeze_submodules = freeze_submodules
             self.geometry_builder = geometry_builder
             self.torax_state = torax_state
+            self.multiobjective = multiobjective
             self.init_common(model_type, training_data, domain_adaptation, num_target_shots, target_shot_order)
 
         def normalization_method(self) -> str | None:
@@ -259,6 +281,11 @@ class TransportStudy(Study):
                 raise ValueError(
                     f"freeze_submodules should be a dummy value ({config.hyperparam_freeze_submodules}) for submodule {self.model_type}"
                 )
+            if self.model_type not in MULTIOBJECTIVE_MODEL_TYPES and self.multiobjective != config.hyperparam_multiobjective:
+                raise ValueError(
+                    f"multiobjective should be a dummy value ({config.hyperparam_multiobjective}) for {self.model_type}, "
+                    f"only {MULTIOBJECTIVE_MODEL_TYPES} take it"
+                )
 
         @classmethod
         def pin_inapplicable_axes(cls, fields: dict) -> dict:
@@ -270,6 +297,8 @@ class TransportStudy(Study):
             if fields["model_type"] not in TORAX_MODEL_TYPES:
                 pinned["geometry_builder"] = "circular"
                 pinned["torax_state"] = "rebuild"
+            if fields["model_type"] not in MULTIOBJECTIVE_MODEL_TYPES:
+                pinned["multiobjective"] = config.hyperparam_multiobjective
             return pinned
 
         def model_type_prereqs(self) -> list[Study.Case]:
@@ -326,9 +355,9 @@ class TransportStudy(Study):
             # Anchor terms keeping the sciml submodule predictions close to
             # the measured signals while the whole module trains on the
             # profiles: the power balance's Wtot plus its own p_oh/p_rad
-            # submodules. Training loss only, and a no-op for model types
-            # whose target_vars lack the measured signals (only the sciml
-            # case carries them). The power balance submodule prereq case
+            # submodules. A multiobjective case anchors its own Wtot and P_oh with the same weights.
+            # Training loss only, and a no-op for cases
+            # whose target_vars lack the measured signals. The power balance submodule prereq case
             # also reads anchor_weight_power_ohm/_power_radiated through PowerBalanceTRB,
             # sized like the power balance study's to its Wtot term
             "anchor_weight_energy_mhd": 0.1,
@@ -364,12 +393,18 @@ class TransportStudy(Study):
         so submodule cases get their own tuned merge and transfer wiring."""
         return self.make_train_config(case.replace(model_type=submodule_type, freeze_submodules=config.hyperparam_freeze_submodules))
 
-    def _transport_dataloader_config(self, dataloader_config_base: dict) -> dict:
-        """Dataloader config shared by every top-level transport model type."""
+    def _transport_dataloader_config(self, case: Case, dataloader_config_base: dict) -> dict:
+        """Dataloader config shared by every top-level transport model type.
+
+        A multiobjective case's anchored signals are targets, so the training loss anchors them.
+        The other measured powers ride along as extra_vars only to keep the segments of every case identical.
+        """
+        target_vars = [*TRANSPORT_TARGET_VARS, *(MULTIOBJECTIVE_TARGET_VARS if case.multiobjective else [])]
         return {
             "input_vars": TRANSPORT_INPUT_VARS,
-            "target_vars": TRANSPORT_TARGET_VARS,
+            "target_vars": target_vars,
             "state_vars": TRANSPORT_STATE_VARS,
+            "extra_vars": [name for name in MEASURED_POWER_VARS if name not in target_vars],
             **dataloader_config_base,
         }
 
@@ -463,16 +498,12 @@ class TransportStudy(Study):
             return ModelTrainSpec(
                 train_run_builder=trb,
                 dataloader_config={
-                    **self._transport_dataloader_config(dataloader_config_base),
+                    **self._transport_dataloader_config(case, dataloader_config_base),
                     # The measured stored energy and powers are extra targets
                     # so the training loss can anchor the submodule
                     # predictions to them (anchor_weight_* in the loss config)
-                    "target_vars": [
-                        *TRANSPORT_TARGET_VARS,
-                        "energy_mhd_MJ",
-                        "power_ohm_MW",
-                        "power_radiated_MW",
-                    ],
+                    "target_vars": [*TRANSPORT_TARGET_VARS, "energy_mhd_MJ", *MEASURED_POWER_VARS],
+                    "extra_vars": [],
                 },
                 model_init_config={
                     "model_type": case.model_type,
@@ -489,7 +520,7 @@ class TransportStudy(Study):
         elif case.model_type == "transformer":
             return ModelTrainSpec(
                 train_run_builder=trb,
-                dataloader_config=self._transport_dataloader_config(dataloader_config_base),
+                dataloader_config=self._transport_dataloader_config(case, dataloader_config_base),
                 model_init_config={
                     "model_type": case.model_type,
                     "data_normalization": config.data_normalization,
@@ -499,6 +530,7 @@ class TransportStudy(Study):
                     "history_len": 20,  # Attention window over past profiles
                     "nn_depth": 2,  # MLP head after attention
                     "nn_width": 16,
+                    "multiobjective": case.multiobjective,
                     "prng_seed": 42,
                 },
             )
@@ -506,7 +538,7 @@ class TransportStudy(Study):
             transport_model = case.model_type.removeprefix("torax-")
             return ModelTrainSpec(
                 train_run_builder=trb,
-                dataloader_config=self._transport_dataloader_config(dataloader_config_base),
+                dataloader_config=self._transport_dataloader_config(case, dataloader_config_base),
                 model_init_config={
                     "model_type": case.model_type,
                     "data_normalization": config.data_normalization,

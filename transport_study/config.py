@@ -43,10 +43,14 @@ RHO_GRID = np.linspace(0.0, 1.0, N_RHO_POINTS)
 
 # debug runs a whole study cheaply:
 # the target device keeps every shot, each source device keeps only its DEBUG_MAX_SOURCE_SHOTS most recent ones,
-# training and sweep trials stop by DEBUG_MAX_EPOCHS, and each sweep runs DEBUG_HYPERPARAM_SWEEPS trials
+# training and sweep trials stop by DEBUG_MAX_EPOCHS and validate at least every DEBUG_EPOCHS_PER_VAL epochs,
+# each sweep runs DEBUG_HYPERPARAM_SWEEPS trials,
+# and result files average at most the top DEBUG_NUM_RESULT_CHECKPOINTS checkpoints (CaseGridConfig)
 DEBUG_MAX_SOURCE_SHOTS = 100
-DEBUG_MAX_EPOCHS = 100
+DEBUG_MAX_EPOCHS = 12
+DEBUG_EPOCHS_PER_VAL = 3
 DEBUG_HYPERPARAM_SWEEPS = 1
+DEBUG_NUM_RESULT_CHECKPOINTS = 3
 
 
 class FieldRole(StrEnum):
@@ -181,10 +185,11 @@ class StudyConfig(BaseModel):
 
     @model_validator(mode="after")
     def _apply_debug_limits(self):
-        """Cap the epochs and the sweep size of a debug run (get_ds caps the source shots)."""
+        """Cap the epochs, the validation interval and the sweep size of a debug run (get_ds caps the source shots)."""
         if self.debug:
             object.__setattr__(self, "max_epochs", min(self.max_epochs, DEBUG_MAX_EPOCHS))
             object.__setattr__(self, "hyperparam_max_epochs", min(self.hyperparam_max_epochs, DEBUG_MAX_EPOCHS))
+            object.__setattr__(self, "epochs_per_val", min(self.epochs_per_val, DEBUG_EPOCHS_PER_VAL))
             object.__setattr__(self, "hyperparam_sweeps", min(self.hyperparam_sweeps, DEBUG_HYPERPARAM_SWEEPS))
         return self
 

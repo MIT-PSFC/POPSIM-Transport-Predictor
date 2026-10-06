@@ -18,7 +18,6 @@ from transport_study.modules.power_balance.module import (
     MODEL_TYPES_WITH_SUBMODULES,
     MULTIOBJECTIVE_MODEL_TYPES,
     SUBMODULE_MODEL_TYPES,
-    TRANSFORMER_MODEL_TYPES,
 )
 from transport_study.orchestration.case_analysis import run_summary_analysis
 from transport_study.orchestration.study import (
@@ -37,7 +36,7 @@ from transport_study.power_balance_transfer.tables import SPEC as TABLE_SPEC
 POWER_BALANCE_INPUT_VARS = list(NORM_INPUT_VARS)
 
 # Purely data-driven model types, no submodules so nothing to freeze
-MODEL_TYPES_WITHOUT_SUBMODULES = ("mlp", *TRANSFORMER_MODEL_TYPES)
+MODEL_TYPES_WITHOUT_SUBMODULES = ("mlp", "transformer")
 # The measured powers, targets of the anchor terms in the training loss
 POWER_TARGET_VARS = ["power_ohm_MW", "power_radiated_MW"]
 
@@ -77,6 +76,7 @@ class PowerBalanceStudy(Study):
             default_factory=lambda: INPUT_NORMALIZATIONS
         )
         freeze_submodules_options: Annotated[tuple[bool, ...], CaseAxis("freeze_submodules")] = Field(default_factory=lambda: (False,))
+        multiobjective_options: Annotated[tuple[bool, ...], CaseAxis("multiobjective")] = Field(default_factory=lambda: (False,))
         num_target_shots_options: Annotated[tuple[int, ...], CaseAxis("num_target_shots")] = Field(
             default_factory=lambda: (0, 1, 3, 10, 32)
         )
@@ -84,6 +84,7 @@ class PowerBalanceStudy(Study):
         # (hyperparam_domain_adaptation and hyperparam_num_target_shots live on CaseGridConfig)
         hyperparam_data_normalization: str = "physics"
         hyperparam_freeze_submodules: bool = False
+        hyperparam_multiobjective: bool = False
 
         FIELD_CHOICES: ClassVar[dict[str, tuple]] = {
             "model_types": (*MODEL_TYPES_WITH_SUBMODULES, *MODEL_TYPES_WITHOUT_SUBMODULES, *SUBMODULE_MODEL_TYPES),
@@ -99,8 +100,6 @@ class PowerBalanceStudy(Study):
         - sciml-taue-nn: neural network predicts tau_e, and we do the power balance calculation
         - mlp: an MLP predicts the stored-energy evolution from the inputs and its own predicted stored energy
         - transformer: the current inputs attend over a buffer of past predicted stored energies to predict its evolution
-        - transformer-multiobjective: the transformer with two more head outputs predicting P_oh and P_rad,
-          anchored to the measured powers in the training loss like the sciml submodules
         - p_oh / p_rad: submodule predictors, appear only as prereq cases of sciml-taue-scalinglaw and sciml-taue-nn
 
         training_data: The historic dataset(s) used for training
@@ -127,6 +126,10 @@ class PowerBalanceStudy(Study):
         freeze_submodules: Whether to freeze the p_oh/p_rad submodules of the model during training.
         The P_oh and P_rad signals are hard to quantify, we might want to let them drift from the original targets to better match energy_mhd_MJ
 
+        multiobjective: Whether the transformer's head also predicts P_oh and P_rad,
+        anchored to the measured powers in the training loss like the sciml submodules (MULTIOBJECTIVE_MODEL_TYPES only).
+        Shares the plain case's sweep, only multiobjective cases show it in the name
+
         num_target_shots: The number of shots included in the training data from the target dataset, never any of the held-out test shots.
 
         target_shot_order: The order the target training shots are added in as num_target_shots grows, see orchestration/target_shots.py
@@ -137,11 +140,16 @@ class PowerBalanceStudy(Study):
 
         data_normalization: str
         freeze_submodules: bool
+        multiobjective: bool
 
         VALID_MODEL_TYPES = (*MODEL_TYPES_WITH_SUBMODULES, *MODEL_TYPES_WITHOUT_SUBMODULES, *SUBMODULE_MODEL_TYPES)
-        # Unfrozen submodules are the default, so only frozen ones show in the name
-        STR_TOKEN_FIELDS = (("norm_", "data_normalization"), ("freeze_", "freeze_submodules", False))
-        HYPERPARAM_FIELDS = ("data_normalization", "domain_adaptation", "freeze_submodules", "num_target_shots")
+        # Unfrozen submodules and single-objective training are the defaults, so only the others show in the name
+        STR_TOKEN_FIELDS = (
+            ("norm_", "data_normalization"),
+            ("freeze_", "freeze_submodules", False),
+            ("mo_", "multiobjective", False),
+        )
+        HYPERPARAM_FIELDS = ("data_normalization", "domain_adaptation", "freeze_submodules", "multiobjective", "num_target_shots")
 
         # The dataclass decorator would null an inherited __hash__
         __hash__ = Study.Case.__hash__
@@ -155,9 +163,11 @@ class PowerBalanceStudy(Study):
             freeze_submodules: bool,
             num_target_shots: int,
             target_shot_order: str = BASE_TARGET_SHOT_ORDER,
+            multiobjective: bool = False,
         ):
             self.data_normalization = data_normalization
             self.freeze_submodules = freeze_submodules
+            self.multiobjective = multiobjective
             self.init_common(model_type, training_data, domain_adaptation, num_target_shots, target_shot_order)
 
         def normalization_method(self) -> str | None:
@@ -171,13 +181,20 @@ class PowerBalanceStudy(Study):
                 raise ValueError(
                     f"freeze_submodules should be a dummy value ({config.hyperparam_freeze_submodules}) for submodule {self.model_type}"
                 )
+            if self.model_type not in MULTIOBJECTIVE_MODEL_TYPES and self.multiobjective != config.hyperparam_multiobjective:
+                raise ValueError(
+                    f"multiobjective should be a dummy value ({config.hyperparam_multiobjective}) for {self.model_type}, "
+                    f"only {MULTIOBJECTIVE_MODEL_TYPES} have multiobjective heads"
+                )
 
         @classmethod
         def pin_inapplicable_axes(cls, fields: dict) -> dict:
             pinned = super().pin_inapplicable_axes(fields)
             # Only the structured models have submodules to freeze
             if fields["model_type"] not in MODEL_TYPES_WITH_SUBMODULES:
-                return pinned | {"freeze_submodules": config.hyperparam_freeze_submodules}
+                pinned |= {"freeze_submodules": config.hyperparam_freeze_submodules}
+            if fields["model_type"] not in MULTIOBJECTIVE_MODEL_TYPES:
+                pinned |= {"multiobjective": config.hyperparam_multiobjective}
             return pinned
 
         def model_type_prereqs(self) -> list[Study.Case]:
@@ -226,7 +243,7 @@ class PowerBalanceStudy(Study):
         return {
             # [MJ] on the scale of a Wtot error, C-Mod and MAST medians are 0.03-0.05 MJ
             "huber_delta": 0.05,
-            # Anchor terms keeping the predicted P_oh / P_rad (the sciml submodules, the multiobjective transformer's heads)
+            # Anchor terms keeping the predicted P_oh / P_rad (the sciml submodules, a multiobjective transformer's heads)
             # close to the measured signals while the whole module trains on Wtot.
             # Training loss only, and a no-op for model types whose target_vars carry no power_ohm_MW / power_radiated_MW.
             # Sized to the Wtot term in the trained state,
@@ -307,10 +324,10 @@ class PowerBalanceStudy(Study):
                     "prng_seed": 42,
                 },
             )
-        elif case.model_type in TRANSFORMER_MODEL_TYPES:
+        elif case.model_type == "transformer":
             # The multiobjective head predicts the measured powers, so they are targets its training loss anchors.
             # For the plain transformer they only keep the training segments identical to the structured models', see mlp
-            if case.model_type in MULTIOBJECTIVE_MODEL_TYPES:
+            if case.multiobjective:
                 power_vars = {"target_vars": ["energy_mhd_MJ", *POWER_TARGET_VARS, "ds_source_idx"]}
             else:
                 power_vars = {"target_vars": ["energy_mhd_MJ", "ds_source_idx"], "extra_vars": POWER_TARGET_VARS}
@@ -332,6 +349,7 @@ class PowerBalanceStudy(Study):
                     "nn_depth": 2,  # MLP head after attention
                     "nn_width": 16,
                     "prng_seed": 42,
+                    "multiobjective": case.multiobjective,
                 },
             )
         else:
@@ -340,10 +358,10 @@ class PowerBalanceStudy(Study):
     def tuned_model_init_updates(self, case: Case, tuned_config: TrainConfig) -> dict:
         # sciml-taue-scalinglaw has no NN of its own (its submodules carry their own tuned configs)
         updates = {}
-        if case.model_type in [*SUBMODULE_MODEL_TYPES, "mlp", "sciml-taue-nn", *TRANSFORMER_MODEL_TYPES]:
+        if case.model_type in [*SUBMODULE_MODEL_TYPES, "mlp", "sciml-taue-nn", "transformer"]:
             updates["nn_depth"] = tuned_config.model_init_config["nn_depth"]
             updates["nn_width"] = tuned_config.model_init_config["nn_width"]
-        if case.model_type in TRANSFORMER_MODEL_TYPES:
+        if case.model_type == "transformer":
             updates["d_model"] = tuned_config.model_init_config["d_model"]
             updates["num_heads"] = tuned_config.model_init_config["num_heads"]
             updates["history_len"] = tuned_config.model_init_config["history_len"]

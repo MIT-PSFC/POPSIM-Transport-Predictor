@@ -85,6 +85,31 @@ ORDER_MARKERS = {
     "spanning": "D",
 }
 
+# The training_data values of the hs1 studies, others fall back to tab10 and their raw string
+TD_COLORS = {
+    "cmod": "#ff4d4d",
+    "mast": "#0095ff",
+    "tcv": "#ffb347",
+    "cmod_tcv": "#ff60ec",
+    "cmod_mast_tcv": "#8dff36",
+    "exnihilo": "#c0c0c0",
+}
+
+TD_LABELS = {
+    "cmod": "C-Mod",
+    "mast": "MAST",
+    "tcv": "TCV",
+    "cmod_tcv": "C-Mod + TCV",
+    "cmod_mast_tcv": "All historic",
+    "exnihilo": "Ex nihilo",
+}
+
+# Boolean case axes: the default False against the alternative
+FREEZE_COLORS = {False: "#0095ff", True: "#ff8c1a"}
+FREEZE_LABELS = {False: "Unfrozen submodules", True: "Frozen submodules"}
+MULTIOBJECTIVE_COLORS = {False: "#c0c0c0", True: "#c77dff"}
+MULTIOBJECTIVE_LABELS = {False: "Single objective", True: "Multiobjective"}
+
 
 @dataclass(frozen=True)
 class ComparisonLayout:
@@ -116,6 +141,8 @@ class ComparisonFamily:
     series_colors None colors the values present with tab10.
     model_types restricts the cases to those model types, None keeps every main model.
     Figures with fewer than min_series lines are skipped.
+    include_exnihilo also draws the exnihilo cases matching a figure's other fixed fields whatever its domain_adaptation:
+    exnihilo only exists without adaptation, so this puts it beside the historic sets' adapted ladders.
     """
 
     name: str
@@ -124,6 +151,7 @@ class ComparisonFamily:
     series_colors: dict | None = None
     model_types: tuple[str, ...] | None = None
     min_series: int = 1
+    include_exnihilo: bool = False
 
 
 def coord_values(ds: xr.Dataset, name: str) -> list:
@@ -249,13 +277,21 @@ def comparison_figures(ds: xr.Dataset, layout: ComparisonLayout, family: Compari
     fixed_fields = [f for f in layout.grid_fields if f != family.series_field]
     fixed_values = [coord_values(ds_models, f) for f in fixed_fields]
 
+    mask_exnihilo = field_mask(ds_models, "training_data", "exnihilo")
     for combo in product(*fixed_values):
         mask = np.ones(ds_models.sizes["case_idx"], dtype=bool)
+        mask_exnihilo_combo = mask_exnihilo.copy()
         for fixed_field, value in zip(fixed_fields, combo, strict=True):
-            mask = mask & field_mask(ds_models, fixed_field, value)
-        sub = mask_select(ds_models, mask)
-        if sub.sizes["case_idx"] == 0:
+            mask_field = field_mask(ds_models, fixed_field, value)
+            mask = mask & mask_field
+            if fixed_field != "domain_adaptation":
+                mask_exnihilo_combo = mask_exnihilo_combo & mask_field
+        # A figure exists for the combination's own cases, exnihilo only joins one
+        if not mask.any():
             continue
+        if family.include_exnihilo:
+            mask = mask | mask_exnihilo_combo
+        sub = mask_select(ds_models, mask)
         present = [value for value in series_values if value in coord_values(sub, family.series_field)]
         if len(present) < family.min_series:
             continue
@@ -274,10 +310,13 @@ def comparison_figures(ds: xr.Dataset, layout: ComparisonLayout, family: Compari
         if not drew:
             plt.close(fig)
             continue
+        # The title names only the fields that vary across the study, the filename keeps every field
         fixed_desc = " / ".join(
             f"{fixed_field}: {layout.value_labels.get(fixed_field, {}).get(value, value)}"
-            for fixed_field, value in zip(fixed_fields, combo, strict=True)
+            for fixed_field, values, value in zip(fixed_fields, fixed_values, combo, strict=True)
+            if len(values) > 1
         )
+        title = f"{family.title} - {fixed_desc}" if fixed_desc else family.title
         filename = ".".join(layout.field_tokens[f].format(value) for f, value in zip(fixed_fields, combo, strict=True))
-        finalize_grid(fig, axes, sub, f"{family.title} - {fixed_desc}", out_dir / f"{filename}.png")
+        finalize_grid(fig, axes, sub, title, out_dir / f"{filename}.png")
     logger.info(f"Saved {family.name} figures to {out_dir}")

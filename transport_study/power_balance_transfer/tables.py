@@ -1,8 +1,9 @@
 """Per-axis comparison tables for power balance transfer study results.
 
 For every case axis (model type, training dataset, data normalization, domain
-adaptation, number of target shots) and every combination of the remaining
-axes, one markdown table comparing the cases that differ only along that axis.
+adaptation, frozen submodules, multiobjective, number of target shots, target shot order)
+and every combination of the remaining axes,
+one markdown table comparing the cases that differ only along that axis.
 Columns combine the stage-resolved TIME-AVERAGED errors from
 collected_metrics.nc (per-timeslice means, free of the shot-duration confound
 in the raw time-integrated per-shot errors) with the time-integrated
@@ -22,14 +23,22 @@ CASE_FIELD_ORDER = (
     "data_normalization",
     "domain_adaptation",
     "freeze_submodules",
+    "multiobjective",
     "num_target_shots",
     "target_shot_order",
 )
 
 SPEC = ComparisonTableSpec(
-    # freeze_submodules only has one value in practice so it stays a grouping
-    # field rather than an axis
-    axis_names=("model_type", "training_data", "data_normalization", "domain_adaptation", "num_target_shots", "target_shot_order"),
+    axis_names=(
+        "model_type",
+        "training_data",
+        "data_normalization",
+        "domain_adaptation",
+        "freeze_submodules",
+        "multiobjective",
+        "num_target_shots",
+        "target_shot_order",
+    ),
     case_field_order=CASE_FIELD_ORDER,
     # Filename tokens per grouping field, mirroring the case-string vocabulary
     field_tokens={
@@ -38,6 +47,7 @@ SPEC = ComparisonTableSpec(
         "data_normalization": "norm_{}",
         "domain_adaptation": "da_{}",
         "freeze_submodules": "freeze_{}",
+        "multiobjective": "mo_{}",
         "num_target_shots": "targ_{}",
         "target_shot_order": "order_{}",
     },

@@ -168,7 +168,9 @@ TORAX_CONFIG_BASE: dict[str, Any] = {
     },
     "plasma_composition": {
         "main_ion": {"D": 1.0},  # Assuming DD and minor impurities
-        "Z_eff": 1.1,
+        # Sets the impurity density (TORAX's default neon impurity) and so the dilution,
+        # bremsstrahlung, Spitzer resistivity and the collisionality the transport models see
+        "Z_eff": 1.5,
     },
     "geometry": {
         "geometry_type": "circular",

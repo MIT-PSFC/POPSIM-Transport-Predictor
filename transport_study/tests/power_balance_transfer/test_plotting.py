@@ -26,10 +26,15 @@ def results_ds() -> xr.Dataset:
             continue
         if (da == "transfer" or td == "exnihilo") and shots == 0:
             continue
-        rows.append((mt, td, dn, da, True, shots, "ascending"))
+        rows.append((mt, td, dn, da, False, shots, "ascending", False))
         # Without target shots every case takes the base order
         if shots > 0:
-            rows.append((mt, td, dn, da, True, shots, "spanning"))
+            rows.append((mt, td, dn, da, False, shots, "spanning", False))
+        # The child-study axes: frozen sciml submodules and multiobjective transformers
+        if mt.startswith("sciml"):
+            rows.append((mt, td, dn, da, True, shots, "ascending", False))
+        if mt == "transformer":
+            rows.append((mt, td, dn, da, False, shots, "ascending", True))
 
     rng = np.random.default_rng(0)
     n = len(rows)
@@ -43,8 +48,9 @@ def results_ds() -> xr.Dataset:
             "freeze_submodules",
             "num_target_shots",
             "target_shot_order",
+            "multiobjective",
         ),
-        range(7),
+        range(8),
         strict=True,
     ):
         ds = ds.assign_coords({coord_name: ("case_idx", [row[idx] for row in rows])})

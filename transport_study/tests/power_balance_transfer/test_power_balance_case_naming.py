@@ -62,3 +62,23 @@ def test_target_shot_order_case_name(loaded_config):
 def test_cases_are_hashable_and_set_stable(loaded_config):
     assert _case() in {_case()}
     assert hash(_case()) == hash(_case())
+
+
+def test_multiobjective_case_name_and_shared_sweep(loaded_config):
+    """A multiobjective transformer carries mo_True and tunes on the plain transformer's sweep."""
+    case = _case(
+        model_type="transformer",
+        data_normalization="physics",
+        freeze_submodules=False,
+        domain_adaptation="weighted",
+        num_target_shots=3,
+        multiobjective=True,
+    )
+    assert str(case) == "case.transformer.td_cmod-low1.norm_physics.mo_True.targ_3.da_weighted"
+    assert str(case.prereqs[0]) == "case.transformer.td_cmod-low1.norm_physics"
+
+
+def test_sciml_rejects_multiobjective(loaded_config):
+    # The sciml types anchor their submodules regardless, the axis does not apply to them
+    with pytest.raises(ValueError, match="multiobjective should be a dummy value"):
+        _case(multiobjective=True)

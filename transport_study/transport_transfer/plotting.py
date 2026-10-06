@@ -1,7 +1,7 @@
 """Case-comparison figures of transport transfer study results (see orchestration.comparison_figures).
 
 The power balance study's 2x2 error grid over the transport case-grid fields
-(no data_normalization, plus geometry_builder and torax_state).
+(no data_normalization, plus geometry_builder, torax_state and multiobjective).
 Consumes the per-case scalar summary of TransportStudy.collect_results (collected_results.nc).
 """
 
@@ -9,8 +9,12 @@ from transport_study.modules.transport_predictor.module import SUBMODULE_MODEL_T
 from transport_study.orchestration.comparison_figures import (
     DA_COLORS,
     DA_LABELS,
+    MULTIOBJECTIVE_COLORS,
+    MULTIOBJECTIVE_LABELS,
     ORDER_COLORS,
     ORDER_LABELS,
+    TD_COLORS,
+    TD_LABELS,
     ComparisonFamily,
     ComparisonLayout,
 )
@@ -48,6 +52,7 @@ LAYOUT = ComparisonLayout(
         "freeze_submodules",
         "geometry_builder",
         "torax_state",
+        "multiobjective",
         "target_shot_order",
     ),
     field_tokens={
@@ -57,16 +62,25 @@ LAYOUT = ComparisonLayout(
         "freeze_submodules": "freeze_{}",
         "geometry_builder": "geom_{}",
         "torax_state": "tstate_{}",
+        "multiobjective": "mo_{}",
         "target_shot_order": "order_{}",
     },
-    value_labels={"model_type": MODEL_LABELS, "domain_adaptation": DA_LABELS, "target_shot_order": ORDER_LABELS},
+    value_labels={
+        "model_type": MODEL_LABELS,
+        "training_data": TD_LABELS,
+        "domain_adaptation": DA_LABELS,
+        "multiobjective": MULTIOBJECTIVE_LABELS,
+        "target_shot_order": ORDER_LABELS,
+    },
     excluded_model_types=SUBMODULE_MODEL_TYPES,
 )
 
 COMPARISON_FAMILIES = (
-    ComparisonFamily("training_dataset_comparison", "training_data", "Training dataset comparison"),
+    ComparisonFamily("training_dataset_comparison", "training_data", "Training dataset comparison", TD_COLORS, include_exnihilo=True),
     ComparisonFamily("model_comparison", "model_type", "Model comparison", MODEL_COLORS),
     ComparisonFamily("domain_adaptation_comparison", "domain_adaptation", "Domain adaptation comparison", DA_COLORS),
     # Without target shots every case takes the base order, so the other orders start at 1 target shot
     ComparisonFamily("target_shot_order_comparison", "target_shot_order", "Target shot order comparison", ORDER_COLORS, min_series=2),
+    # Only renders in a study that varies it (hs1_transport_multiobjective)
+    ComparisonFamily("multiobjective_comparison", "multiobjective", "Multiobjective comparison", MULTIOBJECTIVE_COLORS, min_series=2),
 )

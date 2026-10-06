@@ -138,4 +138,4 @@ For installation, run `git submodule update --init` (popsim, torax and transport
 
 # Generative AI Disclosure
 
-GitHub Copilot and Claude Code were used for code completion, snippet generation, and code review. However, the results of this were carefully vetted. A human has read and understands every line in this repo (except for plots, which were fully vibe coded).
+Github Copilot and Claude Code were used for code completion, snippet generation, and refactoring. However, the results of this were carefully vetted. Plots were entirely vibe-coded, but critical functionality (primarily related to data integrity and the training pipeline) has been hand-reviewed by a human.

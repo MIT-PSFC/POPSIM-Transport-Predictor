@@ -25,6 +25,8 @@ from transport_study.orchestration.comparison_figures import (
     ORDER_COLORS,
     ORDER_LABELS,
     ORDER_MARKERS,
+    TD_COLORS,
+    TD_LABELS,
     ComparisonFamily,
     ComparisonLayout,
     coord_values,
@@ -112,6 +114,7 @@ LAYOUT = ComparisonLayout(
     },
     value_labels={
         "model_type": MODEL_LABELS,
+        "training_data": TD_LABELS,
         "data_normalization": NORM_LABELS,
         "domain_adaptation": DA_LABELS,
         "geometry_builder": GEOM_LABELS,
@@ -120,7 +123,7 @@ LAYOUT = ComparisonLayout(
 )
 
 COMPARISON_FAMILIES = (
-    ComparisonFamily("training_dataset_comparison", "training_data", "Training dataset comparison"),
+    ComparisonFamily("training_dataset_comparison", "training_data", "Training dataset comparison", TD_COLORS, include_exnihilo=True),
     ComparisonFamily("model_comparison", "model_type", "Model comparison", MODEL_COLORS),
     # The no-adaptation baseline only exists at num_target_shots = 0 for non-exnihilo training data,
     # so it typically shows up as a single point rather than a trend

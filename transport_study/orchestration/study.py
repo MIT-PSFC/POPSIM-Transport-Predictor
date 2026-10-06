@@ -28,6 +28,7 @@ from pydantic import Field, field_serializer, field_validator, model_validator
 
 from transport_study import PACKAGE_ROOT, TIME_DIM
 from transport_study.config import (
+    DEBUG_NUM_RESULT_CHECKPOINTS,
     ROLE_TABLES,
     CaseAxis,
     FieldRole,
@@ -225,6 +226,13 @@ class CaseGridConfig(StudyConfig):
             invalid = [item for item in values if item not in valid]
             if invalid:
                 raise ValueError(f"Invalid {field_name}: {invalid}. Must be among {valid}.")
+        return self
+
+    @model_validator(mode="after")
+    def _apply_debug_checkpoint_limit(self):
+        """Cap the averaged checkpoints of a debug run, see DEBUG_NUM_RESULT_CHECKPOINTS."""
+        if self.debug:
+            object.__setattr__(self, "num_result_checkpoints", min(self.num_result_checkpoints, DEBUG_NUM_RESULT_CHECKPOINTS))
         return self
 
     @model_validator(mode="after")
@@ -1356,8 +1364,10 @@ class Study:
             else:
                 capacity = min(spillover_budget(), spillover_slots(partition))
             # Keep MIN_RUNNING_AGENTS going (up to capacity) to finish out the sweep,
-            # one agent at a time may get pruned
-            sweep_jobs = min(capacity, max(outstanding_trials, MIN_RUNNING_AGENTS - running_agents))
+            # one agent at a time may get pruned.
+            # A sweep smaller than that (debug) never runs more agents than it has trials
+            min_running_agents = min(MIN_RUNNING_AGENTS, config.hyperparam_sweeps)
+            sweep_jobs = min(capacity, max(outstanding_trials, min_running_agents - running_agents))
             if sweep_jobs <= 0:
                 logger.debug(f"No agent jobs needed for case {case} ({running_agents} agents already running)")
                 return
