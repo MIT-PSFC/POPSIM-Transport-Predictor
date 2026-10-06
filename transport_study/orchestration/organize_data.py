@@ -609,7 +609,9 @@ def _split_target_shots(target_split: TargetSplit, study_type: str):
     The split is decided on the power balance view of the target device (see orchestration/target_shots.py),
     then the study's own view is indexed by those shot numbers,
     so every study trains and tests on the same target shots.
-    Returns (train_ds_target, test_ds).
+    Returns (target_train_parts, test_ds).
+    target_train_parts is empty without target training shots,
+    since a zero-shot part would still carry the target's full time axis.
     """
     target = config.target_device
     if target is None:
@@ -631,8 +633,9 @@ def _split_target_shots(target_split: TargetSplit, study_type: str):
     train_ds_target = ds_target.sel({EPISODE_DIM: train_shots})
     test_ds = ds_target.sel({EPISODE_DIM: test_shots})
     assert not (set(train_shots.tolist()) & set(test_shots.tolist())), "Target train and test shot pools overlap - data leakage"
+    target_train_parts = [train_ds_target] if train_shots.size else []
 
-    return train_ds_target, test_ds
+    return target_train_parts, test_ds
 
 
 def get_train_test_datasets(
@@ -655,12 +658,12 @@ def get_train_test_datasets(
     We treat the test set as a validation set for checkpoint selection, which is slightly optimistic
     but consistent across all models so comparisons are fair.
     """
-    train_ds_target, test_ds = _split_target_shots(target_split, study_type)
+    target_train_parts, test_ds = _split_target_shots(target_split, study_type)
     if domain_adaptation == "transfer" or training_data.exnihilo:
-        train_parts = [train_ds_target]
+        train_parts = target_train_parts
     else:
         source_train_parts, source_val_parts = _source_split_parts(training_data, study_type)
-        train_parts = [*source_train_parts, *source_val_parts, train_ds_target]
+        train_parts = [*source_train_parts, *source_val_parts, *target_train_parts]
 
     logger.debug("Training shots: {}", sum(part.sizes[EPISODE_DIM] for part in train_parts))
     logger.debug("Test shots: {}", test_ds.sizes[EPISODE_DIM])
@@ -684,11 +687,11 @@ def get_transfer_pretrain_datasets(
     Returns (train_parts_hist, train_ds_combined, test_ds),
     the historic training parts (each source's training then validation shots) and the merged normalizer-fit dataset.
     """
-    train_ds_target, test_ds = _split_target_shots(target_split, study_type)
+    target_train_parts, test_ds = _split_target_shots(target_split, study_type)
 
     source_train_parts, source_val_parts = _source_split_parts(training_data, study_type)
     train_parts_hist = [*source_train_parts, *source_val_parts]
-    train_ds_combined = merge_parts([*train_parts_hist, train_ds_target])
+    train_ds_combined = merge_parts([*train_parts_hist, *target_train_parts])
 
     logger.debug("Transfer pretrain historic shots: {}", sum(part.sizes[EPISODE_DIM] for part in train_parts_hist))
     logger.debug("Transfer pretrain normalizer-fit shots: {}", train_ds_combined.sizes[EPISODE_DIM])

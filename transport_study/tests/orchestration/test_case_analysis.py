@@ -60,6 +60,31 @@ def test_launches_every_case_capped_at_max_analysis_jobs(study, monkeypatch, emp
     assert max(len(batch) for batch in batches) <= MAX_JOBS, "per-pass submissions must respect the cap"
 
 
+def test_job_finishing_before_the_queue_query_is_not_relaunched(study, monkeypatch):
+    """A job that leaves the queue after its case was last checked must count as done, not run again (hs1_pb_primary, 2026-10-06)."""
+    launched: list[str] = []
+    queue = {}
+
+    def launch_into_queue(study_arg, case):
+        launched.append(str(case))
+        queue[study_arg.analysis_job_name(case)] = case
+
+    def queue_whose_jobs_just_finished(partition=None):
+        """Every queued job finishes right before squeue reports, after the previous pass checked its case."""
+        for case in queue.values():
+            mark_analysis_done(study, case)
+        queue.clear()
+        return set()
+
+    monkeypatch.setattr(case_analysis, "launch_case_analysis_parallel", launch_into_queue)
+    monkeypatch.setattr(case_analysis, "get_running_job_names", queue_whose_jobs_just_finished)
+    monkeypatch.setattr(case_analysis.time, "sleep", lambda seconds: None)
+
+    run_case_analysis_parallel(study)
+
+    assert sorted(launched) == sorted(str(case) for case in study.cases), "every case must be analyzed exactly once"
+
+
 def test_no_pending_cases_submits_nothing(study, monkeypatch, empty_queue):
     batches = launch_batches_per_pass(monkeypatch)
     for case in study.cases:

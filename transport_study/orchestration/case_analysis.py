@@ -64,6 +64,11 @@ def run_case_analysis_parallel(study) -> None:
             logger.warning("Could not query SLURM job state, waiting before trying again...")
             time.sleep(ANALYSIS_POLL_INTERVAL_S)
             continue
+        # The done check follows the queue snapshot,
+        # so a job finishing during the (slow, hundreds of cases) check counts as done or as queued, never as a relaunch.
+        pending = [case for case in pending if not analysis_case_done(study, case, study.figure_dir)]
+        if not pending:
+            break
 
         in_flight = [case for case in pending if study.analysis_job_name(case) in running_job_names]
         launchable = [
@@ -86,7 +91,6 @@ def run_case_analysis_parallel(study) -> None:
         logger.info(f"{len(pending)} analysis cases remain ({len(in_flight)} jobs in flight)")
 
         time.sleep(ANALYSIS_POLL_INTERVAL_S)
-        pending = [case for case in pending if not analysis_case_done(study, case, study.figure_dir)]
 
     if not pending:
         logger.info("Parallel analysis finished for all cases")

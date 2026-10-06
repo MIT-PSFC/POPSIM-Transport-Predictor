@@ -147,6 +147,45 @@ def test_reserved_room_keeper_shot_is_refused():
         segmented_train_dataloader([prepared_for_dataloader(part)], time_dep_train_loader_kwargs(DATALOADER_CONFIG, INPUT_VARS))
 
 
+@pytest.mark.parametrize("domain_adaptation", ["addition", "weighted"])
+def test_zero_target_shots_train_on_the_sources_alone(synthetic_device_stores, tmp_path, monkeypatch, domain_adaptation):
+    """A zero-shot target contributes no training part, a zero-shot part fails the segmenting (hs1_pb_primary, 2026-10-06)."""
+    from transport_study.config import config
+    from transport_study.modules.power_balance.trb import PowerBalanceTRB
+    from transport_study.power_balance_transfer.power_balance_study import (
+        PowerBalanceStudy,
+    )
+
+    # Two target test shots, popsim rejects a single-shot whole-episode test set
+    study = PowerBalanceStudy(
+        PowerBalanceStudy.Config(
+            study_name="test-zero-target-shots",
+            working_dir_base=tmp_path,
+            dataset_paths=synthetic_device_stores,
+            target_device="mast",
+            target_test_set_size=2,
+            training_datasets=("cmod",),
+            model_types=("mlp",),
+            data_normalization_methods=("physics",),
+            domain_adaptation_methods=(domain_adaptation,),
+            num_target_shots_options=(0,),
+        )
+    )
+    # The synthetic shots are shorter than the study's training segments
+    base_dataloader_config = study.base_dataloader_config
+    monkeypatch.setattr(
+        study,
+        "base_dataloader_config",
+        lambda case: {**base_dataloader_config(case), "segment_length_train": 20, "segment_overlap_train": 10},
+    )
+    case = next(case for case in study.cases if case.domain_adaptation == domain_adaptation)
+    train_config = study.make_train_config(case)
+    _, train_dl, _, _ = PowerBalanceTRB.get_dataloaders(train_config.dataloader_config)
+
+    train_device_idxs = np.unique(train_dl.ds["ds_source_idx"].values)
+    assert train_device_idxs.tolist() == [config.ds_source_to_idx["cmod"]]
+
+
 HS1_TOMLS = Path(__file__).parents[3] / "studies" / "hs1"
 
 
