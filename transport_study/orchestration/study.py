@@ -56,13 +56,13 @@ from transport_study.orchestration.organize_data import (
 )
 from transport_study.orchestration.slurm_utils import (
     cancel_job,
-    count_idle_gpus,
     count_running_jobs,
     get_pending_job_pending_s,
     get_running_job_elapsed_s,
     get_running_job_names,
     launch_agent_parallel,
     launch_train_parallel,
+    open_gpu_slots,
     pick_partition,
     spillover_budget,
     spillover_slots,
@@ -1306,7 +1306,8 @@ class Study:
         """Launch a wandb hyperparameter sweep for the given case.
 
         With parallelism, launches at most as many agent jobs as sweep trials
-        still outstanding, capped by idle GPUs. Outstanding is the larger of the
+        still outstanding, capped by the open GPU slots (idle GPUs beyond
+        buffer_gpus less this user's pending jobs). Outstanding is the larger of the
         two remaining targets (both net of agents already running): trials to
         reach the completed-count target (hyperparam_sweeps - completed) and
         trials to reach the finished-run quota (min_finished - finished). Once
@@ -1366,7 +1367,7 @@ class Study:
             outstanding_for_finished = min_finished - n_finished_runs - running_agents
             outstanding_trials = max(outstanding_for_count, outstanding_for_finished)
             if partition == config.partition:
-                capacity = count_idle_gpus(config.partition, config.buffer_gpus)
+                capacity = open_gpu_slots(config.partition, config.buffer_gpus)
             else:
                 capacity = min(spillover_budget(), spillover_slots(partition))
             # Keep MIN_RUNNING_AGENTS going (up to capacity) to finish out the sweep,

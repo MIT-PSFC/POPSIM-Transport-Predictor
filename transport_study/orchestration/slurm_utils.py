@@ -321,41 +321,107 @@ def cancel_job(job_name: str, partition: str | None = None, state: str = "RUNNIN
         _slurm_stdout(["scancel", "-p", single_partition, "-u", getpass.getuser(), "-n", job_name, f"--state={state}"], level="ERROR")
 
 
-def count_idle_gpus(partition: str | None = None, buffer_gpus: int | None = None) -> int:
-    """Count the number of idle GPUs on this partition.
+# One GPU entry of a sinfo gres field, e.g. gpu:a100:4(S:1,3,5,7), the groups are the type and the count
+GPU_GRES_PATTERN = r"gpu:([\w.]+):(\d+)"
 
-    An 'idle' GPU is one that is either not allocated to any job, or is allocated to a job that is not part of this partition.
-    This is so we actively boot preemptable jobs from this partition.
+# Node states that take new jobs.
+# A trailing "-" (planned by backfill for a pending job) is stripped first, any other flag such as "*" excludes the node.
+SCHEDULABLE_NODE_STATES = ("idle", "mix", "alloc", "comp")
+
+# One per-node group of scontrol -d -o show job, the groups are the hostlist and the GPUs held on each of its nodes
+JOB_NODE_GPUS_PATTERN = r" Nodes=(\S+) CPU_IDs=\S+ Mem=\S+ GRES=gpu:(?:[\w.]+:)?(\d+)"
+
+
+def _gres_gpu_count(gres: str) -> int:
+    """GPUs of every type in a sinfo gres or gresused field."""
+    type_counts = re.findall(GPU_GRES_PATTERN, gres)
+    return sum(int(count) for _, count in type_counts)
+
+
+def _schedulable_node_free_gpus(partition: str) -> dict[str, int] | None:
+    """Unallocated GPUs on each node of the partition that takes new jobs, None if sinfo fails."""
+    stdout = _slurm_stdout(["sinfo", "-p", partition, "-N", "--noheader", "--Format=nodehost:64,gres:128,gresused:128,statecompact:16"])
+    if stdout is None:
+        return None
+    node_free_gpus: dict[str, int] = {}
+    for line in stdout.splitlines():
+        fields = line.split()
+        if len(fields) != 4:
+            continue
+        node, gres_total, gres_used, state = fields
+        if state.removesuffix("-") not in SCHEDULABLE_NODE_STATES:
+            continue
+        gpus_total = _gres_gpu_count(gres_total)
+        gpus_used = _gres_gpu_count(gres_used)
+        node_free_gpus[node] = gpus_total - gpus_used
+    return node_free_gpus
+
+
+def _expand_hostlist(hostlist: str) -> list[str] | None:
+    """Node names of a SLURM hostlist expression, None if scontrol fails."""
+    if "[" not in hostlist:
+        return hostlist.split(",")
+    stdout = _slurm_stdout(["scontrol", "show", "hostnames", hostlist], level="WARNING")
+    if stdout is None:
+        return None
+    return stdout.split()
+
+
+def _evictable_node_gpus(nodes: list[str], partitions: tuple[str, ...]) -> dict[str, int] | None:
+    """GPUs held on each of these nodes by running jobs of these partitions, None if a query fails.
+
+    squeue tres-alloc is the job total over all its nodes,
+    so the per-node split comes from the job's scontrol detail groups.
+    """
+    if not nodes or not partitions:
+        return {}
+    node_list = ",".join(nodes)
+    partition_list = ",".join(partitions)
+    squeue_stdout = _slurm_stdout(
+        ["squeue", "-w", node_list, "-p", partition_list, "--states=RUNNING", "--noheader", "-O", "JobID:20,tres-alloc:200"]
+    )
+    if squeue_stdout is None:
+        return None
+    gpu_job_ids = [line.split()[0] for line in squeue_stdout.splitlines() if "gres/gpu=" in line]
+    node_gpus: dict[str, int] = {}
+    for job_id in gpu_job_ids:
+        job_stdout = _slurm_stdout(["scontrol", "-d", "-o", "show", "job", job_id], level="WARNING")
+        if job_stdout is None:
+            return None
+        for group_hostlist, gpus_per_node in re.findall(JOB_NODE_GPUS_PATTERN, job_stdout):
+            group_nodes = _expand_hostlist(group_hostlist)
+            if group_nodes is None:
+                return None
+            for node in group_nodes:
+                node_gpus[node] = node_gpus.get(node, 0) + int(gpus_per_node)
+    # A multi-node job may also hold GPUs outside these nodes
+    queried_nodes = set(nodes)
+    return {node: gpus for node, gpus in node_gpus.items() if node in queried_nodes}
+
+
+def count_idle_gpus(partition: str | None = None, buffer_gpus: int | None = None) -> int:
+    """GPUs a job submitted to this partition could take now, minus buffer_gpus.
+
+    A GPU counts when it sits on a node of the partition that takes new jobs,
+    and either no job holds it or a job of a partition this one preempts holds it.
+    sinfo gresused covers every job on a node, whatever its partition, GPU request style or node count.
+    Any failed query counts as no idle GPUs, so nothing launches.
     """
     if partition is None:
         partition = config.partition
     if buffer_gpus is None:
         buffer_gpus = config.buffer_gpus
-    sinfo_stdout = _slurm_stdout(["sinfo", "-p", partition, "-N", "--Format=gres", "--noheader"])
-    if sinfo_stdout is None:
-        return 0  # Return 0 to prevent launching more jobs if sinfo fails
-    total = 0
-    for line in sinfo_stdout.strip().split("\n"):
-        counts = re.findall(r"gpu:\w+:(\d+)", line)
-        if counts:
-            total += int(counts[0])
-
-    # gresused (from sinfo) counts GPUs busy on the node regardless of which
-    # partition the job landed in, so a node shared with another partition
-    # would look fully busy even when this partition's jobs hold none of it.
-    # Instead, sum GPU allocations only from jobs actually RUNNING in this
-    # partition (squeue resolves %P to the single assigned partition for
-    # running jobs, unlike the requested-partition list shown for pending ones).
-    squeue_stdout = _slurm_stdout(["squeue", "-p", partition, "--states=RUNNING", "-o", "%b", "--noheader"])
-    if squeue_stdout is None:
-        return 0  # Return 0 to prevent launching more jobs if squeue fails
-    used = 0
-    for line in squeue_stdout.strip().split("\n"):
-        for count in re.findall(r"gpu:(?:\w+:)?(\d+)", line):
-            used += int(count)
-
-    avail = total - used
-    return max(avail - buffer_gpus, 0)  # Don't report negative available GPUs, just 0
+    node_free_gpus = _schedulable_node_free_gpus(partition)
+    evictable_partitions = _preemptable_partitions(partition)
+    if node_free_gpus is None or evictable_partitions is None:
+        return 0
+    schedulable_nodes = list(node_free_gpus)
+    node_evictable_gpus = _evictable_node_gpus(schedulable_nodes, evictable_partitions)
+    if node_evictable_gpus is None:
+        return 0
+    free_gpus = sum(node_free_gpus.values())
+    evictable_gpus = sum(node_evictable_gpus.values())
+    return max(free_gpus + evictable_gpus - buffer_gpus, 0)
 
 
 def count_pending_jobs(partition: str | None = None) -> int:
@@ -368,12 +434,19 @@ def count_pending_jobs(partition: str | None = None) -> int:
     return _count_lines(stdout)
 
 
-def resources_available(partition: str | None = None, buffer_gpus: int | None = None) -> bool:
+def open_gpu_slots(partition: str | None = None, buffer_gpus: int | None = None) -> int:
+    """GPU jobs worth submitting to this partition now: idle GPUs beyond buffer_gpus less this user's pending jobs.
+
+    Pending jobs will take idle GPUs once scheduled, so they claim slots already.
+    A negative buffer_gpus keeps that many jobs pending on a full partition.
+    """
     idle_gpus = count_idle_gpus(partition, buffer_gpus)
     pending_jobs = count_pending_jobs(partition)
-    # Pending jobs will consume idle GPUs once scheduled, so only launch more
-    # when there are more idle GPUs than jobs already queued.
-    return idle_gpus > pending_jobs
+    return max(idle_gpus - pending_jobs, 0)
+
+
+def resources_available(partition: str | None = None, buffer_gpus: int | None = None) -> bool:
+    return open_gpu_slots(partition, buffer_gpus) > 0
 
 
 def count_user_jobs() -> int:
@@ -388,13 +461,48 @@ def count_user_jobs() -> int:
     return _count_lines(stdout)
 
 
+def _scontrol_fields(text: str) -> dict[str, str]:
+    """key=value fields of scontrol show output."""
+    return dict(token.split("=", 1) for token in text.split() if "=" in token)
+
+
 @_cache_resolved
 def _partition_info(partition: str) -> dict[str, str] | None:
     """key=value fields from scontrol show partition, None if scontrol failed."""
     stdout = _slurm_stdout(["scontrol", "show", "partition", partition], level="WARNING")
     if not stdout or not stdout.strip():
         return None
-    return dict(token.split("=", 1) for token in stdout.split() if "=" in token)
+    return _scontrol_fields(stdout)
+
+
+@_cache_resolved
+def _preemptable_partitions(partition: str) -> tuple[str, ...] | None:
+    """Partitions whose running jobs a job in this partition preempts, None if scontrol fails.
+
+    Under preempt/partition_prio that is every partition with a lower PriorityTier and a PreemptMode other than OFF.
+    Any other preemption type gives none, so only unallocated GPUs count as idle.
+    """
+    config_stdout = _slurm_stdout(["scontrol", "show", "config"], level="WARNING")
+    if config_stdout is None:
+        return None
+    preempt_type = re.search(r"^PreemptType\s*=\s*(\S+)", config_stdout, re.MULTILINE)
+    if preempt_type is None:
+        return None
+    if preempt_type.group(1) != "preempt/partition_prio":
+        return ()
+    table_stdout = _slurm_stdout(["scontrol", "show", "partition", "-o"], level="WARNING")
+    if table_stdout is None:
+        return None
+    partition_table = [_scontrol_fields(line) for line in table_stdout.splitlines() if "PartitionName=" in line]
+    tiers = {fields["PartitionName"]: int(fields["PriorityTier"]) for fields in partition_table}
+    if partition not in tiers:
+        return None
+    own_tier = tiers[partition]
+    return tuple(
+        fields["PartitionName"]
+        for fields in partition_table
+        if fields.get("PreemptMode") != "OFF" and tiers[fields["PartitionName"]] < own_tier
+    )
 
 
 _partition_user_gpu_cap_cache: dict[str, int | None] = {}
@@ -496,15 +604,13 @@ def spillover_slots(partition: str) -> int:
     cap = partition_user_gpu_cap(partition)
     if cap is not None:
         return max(cap - count_user_gpus(partition), 0)
-    idle = count_idle_gpus(partition, buffer_gpus=0)
-    pending = count_pending_jobs(partition)
-    return max(idle - pending, 0)
+    return open_gpu_slots(partition, buffer_gpus=0)
 
 
 def pick_partition() -> str | None:
     """Partition the next GPU job should go to, or None to hold off launching.
 
-    The primary partition wins while it has idle GPUs beyond buffer_gpus.
+    The primary partition wins while it has open GPU slots (open_gpu_slots).
     Otherwise the spillover partitions are tried in configured order, each
     limited to its own slot count, all limited by the user-wide job ceiling.
     """
@@ -569,7 +675,7 @@ def partition_gpu_type_counts(partition: str) -> tuple[tuple[str, int], ...] | N
         return None
     counts: dict[str, int] = {}
     for line in stdout.splitlines():
-        for gpu_type, count in re.findall(r"gpu:([\w.]+):(\d+)", line):
+        for gpu_type, count in re.findall(GPU_GRES_PATTERN, line):
             counts[gpu_type.lower()] = counts.get(gpu_type.lower(), 0) + int(count)
     return tuple(sorted(counts.items(), key=lambda item: -item[1]))
 
