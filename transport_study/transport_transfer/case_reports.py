@@ -2,8 +2,9 @@
 
 The power balance study's shot PDF with a transport-specific page:
 the best and worst holdout shots by the best checkpoint's TIME-AVERAGED chi (the validation loss),
-each page the measured vs predicted Te and ne profile evolution as (time, rho) maps,
-plus the per-timeslice chi and relative error traces with the discharge stages shaded and aux-heated spans marked.
+each page the per-timeslice chi over the shot with the discharge stages shaded,
+aux-heated spans and diverged timeslices marked.
+The predicted profiles are left out: their (time, rho) maps took most of a report's rendering time.
 """
 
 from pathlib import Path
@@ -12,7 +13,6 @@ import matplotlib.pyplot as plt
 import numpy as np
 import xarray as xr
 
-from transport_study import EPISODE_DIM, RADIAL_DIM, TIME_DIM
 from transport_study.orchestration.case_reports import TITLE_FONTSIZE, shade_stages
 from transport_study.plot_style import (
     BACKGROUND_COLOR,
@@ -29,16 +29,18 @@ from transport_study.power_balance_transfer.case_reports import (  # noqa: F401 
     shot_records,
     shot_title,
 )
-from transport_study.transport_transfer.study_metrics import CaseTimesliceMetrics
+from transport_study.transport_transfer.study_metrics import (
+    METRIC_VARS,
+    CaseTimesliceMetrics,
+)
 
-PROFILE_CMAPS = {"t_e_keV": "magma", "n_e_1e20": "viridis"}
-PROFILE_LABELS = {"t_e_keV": "Te [keV]", "n_e_1e20": "ne [1e20 m^-3]"}
-
-
-def _profile_map(ax, times: np.ndarray, rho: np.ndarray, values: np.ndarray, cmap: str, vmin: float, vmax: float):
-    """One (time, rho) profile evolution map on a styled axis."""
-    style_axis(ax)
-    return ax.pcolormesh(times, rho, values.T, cmap=cmap, vmin=vmin, vmax=vmax, shading="auto")
+# Chi traces of a page: metric name, label, color, line width
+CHI_TRACES = (
+    ("combined", "Chi (value + gradient)", "#0095ff", 2.0),
+    ("value", "Value chi", "#8dff36", 1.0),
+    ("grad", "Gradient chi", "#ffb347", 1.0),
+)
+DIVERGED_COLOR = "#ff4d4d"
 
 
 def _shot_page(
@@ -47,67 +49,43 @@ def _shot_page(
     shot,
     title_prefix: str = "",
 ) -> plt.Figure:
-    """Profile-evolution page for one holdout shot.
+    """Chi page for one holdout shot, the best checkpoint's.
 
-    Rows 1-2: measured vs predicted Te and ne over (time, rho), each channel
-    on a shared color scale taken from the measurement.
-    Row 3: per-timeslice chi and combined relative error with the shot
-    stages shaded and aux-heated spans marked.
+    The combined chi and its value and gradient parts over time on a log scale
+    (chi spans orders of magnitude across a discharge), each a line through the fresh timeslices,
+    with the shot stages shaded, the aux-heated spans along the bottom and the diverged timeslices as red lines.
     """
-    shot_res = result_ds.sel({EPISODE_DIM: shot})
-    res_time = shot_res["time"].values
-    rho = shot_res[RADIAL_DIM].values
-    valid = np.isfinite(res_time)
-    for signal in PROFILE_CMAPS:
-        valid &= np.isfinite(shot_res[f"{signal}_targ"].transpose(TIME_DIM, RADIAL_DIM).values).any(axis=-1)
-
     records = shot_records(ts_metrics, shot)
     record_time = ts_metrics.time[records]
-    device = str(ts_metrics.ds_source[records[0]]) if len(records) else str(shot_res["ds_source"].values)
+    device = str(ts_metrics.ds_source[records[0]])
 
-    fig, axes = plt.subplots(3, 2, figsize=(11, 10), sharex=True)
+    fig, ax = plt.subplots(figsize=(11, 5))
     fig.patch.set_facecolor(BACKGROUND_COLOR)
+    style_axis(ax)
+    # Chi is NaN at the stale timeslices, a line through the finite ones only keeps it visible
+    for name, label, color, linewidth in CHI_TRACES:
+        values = ts_metrics.best(name)[records]
+        mask_finite = np.isfinite(values) & (values > 0)
+        ax.plot(record_time[mask_finite], values[mask_finite], color=color, linewidth=linewidth, marker=".", markersize=3, label=label)
+    for diverged_time in record_time[ts_metrics.best("diverged")[records] == 1]:
+        ax.axvline(diverged_time, color=DIVERGED_COLOR, linewidth=0.8, alpha=0.6, zorder=1)
+    ax.set_yscale("log")
+    ax.set_xlabel("Time [s]", color=TEXT_COLOR, fontsize=LABEL_FONTSIZE)
+    ax.set_ylabel("Chi", color=TEXT_COLOR, fontsize=LABEL_FONTSIZE)
 
-    for row, signal in enumerate(PROFILE_CMAPS):
-        targ = shot_res[f"{signal}_targ"].transpose(TIME_DIM, RADIAL_DIM).values[valid]
-        pred = shot_res[f"{signal}_pred"].transpose(TIME_DIM, RADIAL_DIM).values[valid]
-        finite_targ = targ[np.isfinite(targ)]
-        vmin = float(finite_targ.min()) if len(finite_targ) else 0.0
-        vmax = float(finite_targ.max()) if len(finite_targ) else 1.0
-        cmap = PROFILE_CMAPS[signal]
-        _profile_map(axes[row, 0], res_time[valid], rho, targ, cmap, vmin, vmax)
-        im = _profile_map(axes[row, 1], res_time[valid], rho, pred, cmap, vmin, vmax)
-        axes[row, 0].set_ylabel(r"$\rho_{tor,N}$", color=TEXT_COLOR, fontsize=LABEL_FONTSIZE)
-        axes[row, 0].set_title(f"Measured {PROFILE_LABELS[signal]}", color=TEXT_COLOR, fontsize=LABEL_FONTSIZE)
-        axes[row, 1].set_title(f"Predicted {PROFILE_LABELS[signal]}", color=TEXT_COLOR, fontsize=LABEL_FONTSIZE)
-        cbar = fig.colorbar(im, ax=axes[row, :].tolist(), pad=0.02)
-        cbar.ax.tick_params(colors=TEXT_COLOR, labelsize=TICK_FONTSIZE)
-
-    # Error traces on the left, the right slot repeats them on a log scale
-    # (the errors span orders of magnitude across a discharge)
-    for ax_err, log_scale in ((axes[2, 0], False), (axes[2, 1], True)):
-        style_axis(ax_err)
-        ax_err.plot(record_time, ts_metrics.best("combined")[records], color="#0095ff", linewidth=1.5, label="Chi (value + gradient)")
-        ax_err.plot(record_time, ts_metrics.best("rel")[records], color="#ff60ec", linewidth=1.5, label="Rel error (rho integral)")
-        ax_err.set_xlabel("Time [s]", color=TEXT_COLOR, fontsize=LABEL_FONTSIZE)
-        if log_scale:
-            ax_err.set_yscale("log")
-        else:
-            ax_err.set_ylabel("Error", color=TEXT_COLOR, fontsize=LABEL_FONTSIZE)
-
-    # Stage shading and aux-heated spans on the error panels
-    stage_handles = shade_stages((axes[2, 0], axes[2, 1]), axes[2, 0], ts_metrics, records)
-    handles, _ = axes[2, 0].get_legend_handles_labels()
-    axes[2, 0].legend(handles=handles + stage_handles, fontsize=TICK_FONTSIZE, loc="upper right", **LEGEND_STYLE)
+    stage_handles = shade_stages((ax,), ax, ts_metrics, records)
+    handles, _ = ax.get_legend_handles_labels()
+    ax.legend(handles=handles + stage_handles, fontsize=TICK_FONTSIZE, loc="upper right", **LEGEND_STYLE)
 
     title = shot_title(ts_metrics, records, shot, device, title_prefix, title_metrics=(("combined", "chi"), ("rel", "rel err")))
     fig.suptitle(title, color=TEXT_COLOR, fontsize=TITLE_FONTSIZE)
+    fig.tight_layout(rect=(0, 0, 1, 0.9))
     return fig
 
 
 def render_case_report(result_ds: xr.Dataset, ts_metrics: CaseTimesliceMetrics, case_dir: Path):
-    # The power_balance / p_oh / p_rad prereq cases write scalar result files, which get the power balance page
-    if all(f"{signal}_targ" in result_ds for signal in PROFILE_CMAPS):
+    # The power_balance / p_oh / p_rad prereq cases write scalar result files without chi, which get the power balance page
+    if METRIC_VARS["combined"] in result_ds:
         shot_pdf(result_ds, ts_metrics, case_dir / REPORT_FILENAME, page_fn=_shot_page, rank_metric="combined")
     else:
         shot_pdf(result_ds, ts_metrics, case_dir / REPORT_FILENAME)
