@@ -13,7 +13,9 @@ from transport_study.modules.normalization import make_normalizer
 from transport_study.modules.power_balance.module import (
     MODEL_TYPES_WITH_ENERGY_INPUT,
     MODEL_TYPES_WITH_SUBMODULES,
+    MULTIOBJECTIVE_MODEL_TYPES,
     SCALING_LAW_FIELDS,
+    TRANSFORMER_MODEL_TYPES,
     PowerBalanceEnv,
     PowerBalanceMLP,
     PowerBalanceScalingLaw,
@@ -99,7 +101,7 @@ class PowerBalanceTRB(TrainRunBuilder):
                 normalizer=normalizer,
                 prng_seed=model_init_config["prng_seed"],
             )
-        if model_type == "transformer":
+        if model_type in TRANSFORMER_MODEL_TYPES:
             return PowerBalanceTransformer.init(
                 d_model=model_init_config["d_model"],
                 num_heads=model_init_config["num_heads"],
@@ -107,6 +109,7 @@ class PowerBalanceTRB(TrainRunBuilder):
                 nn_width=model_init_config["nn_width"],
                 nn_depth=model_init_config["nn_depth"],
                 normalizer=normalizer,
+                predicts_powers=model_type in MULTIOBJECTIVE_MODEL_TYPES,
                 prng_seed=model_init_config["prng_seed"],
             )
         raise ValueError(f"Invalid model type: {model_type}")

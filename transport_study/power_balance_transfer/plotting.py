@@ -36,6 +36,7 @@ MODEL_COLORS = {
     "sciml-taue-nn": "#0095ff",
     "mlp": "#ff4d4d",
     "transformer": "#ffb347",
+    "transformer-multiobjective": "#c77dff",
 }
 
 MODEL_LABELS = {
@@ -43,6 +44,7 @@ MODEL_LABELS = {
     "sciml-taue-nn": "SciML (tau_e NN)",
     "mlp": "MLP",
     "transformer": "Transformer",
+    "transformer-multiobjective": "Transformer (+ P_oh, P_rad)",
 }
 
 

@@ -19,8 +19,11 @@ from transport_study.modules.power_balance.p_rad.module import RadiatedPower
 MODEL_TYPES_WITH_SUBMODULES = ("sciml-taue-scalinglaw", "sciml-taue-nn")
 # The submodule pseudo-model-types of those prereq cases
 SUBMODULE_MODEL_TYPES = ("p_oh", "p_rad")
+# The transformer and its multiobjective copy, whose head also predicts P_oh and P_rad for the loss to anchor
+TRANSFORMER_MODEL_TYPES = ("transformer", "transformer-multiobjective")
+MULTIOBJECTIVE_MODEL_TYPES = ("transformer-multiobjective",)
 # Model types fed their own predicted Wtot, their normalizer is built with_energy
-MODEL_TYPES_WITH_ENERGY_INPUT = ("mlp", "transformer")
+MODEL_TYPES_WITH_ENERGY_INPUT = ("mlp", *TRANSFORMER_MODEL_TYPES)
 
 MIN_TAUE = 0.001  # Minimum reasonable value for tau_e [s]
 MAX_TAUE = 0.8  # Maximum reasonable value for tau_e [s]
@@ -454,6 +457,10 @@ class PowerBalanceTransformer(PowerBalance):
     permutation-invariant over the history and unable to read trends.
     As in the mlp, the normalizer (built with_energy) scales every buffered Wtot at the current inputs
     and maps the head output back to dW/dt (normalize_with_energy, energy_rate_scale).
+
+    With predicts_powers (the transformer-multiobjective model type) the head has two more outputs,
+    P_oh and P_rad on the same normalized power scale as dW/dt.
+    They do not enter the Wtot update, they only give the training loss extra targets to anchor.
     """
 
     normalizer: InputNormalizer
@@ -464,6 +471,7 @@ class PowerBalanceTransformer(PowerBalance):
     head: eqx.nn.MLP
     history_len: int = eqx.field(static=True)
     d_model: int = eqx.field(static=True)
+    predicts_powers: bool = eqx.field(static=True)
 
     @chex.dataclass
     class State:
@@ -484,15 +492,20 @@ class PowerBalanceTransformer(PowerBalance):
         tokens = jax.vmap(self.wtot_embed)(normalized_history[:, None]) + self.pos_embed
         attn_out = self.attention(query[None, :], tokens, tokens)[0]
         latent = query + attn_out
+        # [dW/dt] or, with predicts_powers, [dW/dt, P_oh, P_rad], all on the normalized power scale
         nn_out = self.head(latent)
         energy_rate_scale = self.normalizer.energy_rate_scale(inputs)
-        energy_mhd_MJ_dot_unbounded = energy_rate_scale * nn_out.squeeze()
+        energy_mhd_MJ_dot_unbounded = energy_rate_scale * nn_out[0]
         energy_mhd_MJ_dot = self.bound_wtot_dot(state.energy_mhd_MJ, energy_mhd_MJ_dot_unbounded)
         state_out = PowerBalanceTransformer.State(energy_mhd_MJ=energy_mhd_MJ_dot, history=new_history)
+        power_ohm_MW_pred = energy_rate_scale * nn_out[1] if self.predicts_powers else jnp.nan
+        power_radiated_MW_pred = energy_rate_scale * nn_out[2] if self.predicts_powers else jnp.nan
         output = PowerBalance.Output(
             energy_mhd_MJ_pred=wtot_now,
             P_cond_MW=jnp.nan,  # Not predicted in this model
-            taue_predictor_output=TauePredictorOutputs(taue_pred=jnp.nan, debug_info={"nn_out": nn_out.squeeze()}),
+            taue_predictor_output=TauePredictorOutputs(taue_pred=jnp.nan, debug_info={"nn_out": nn_out[0]}),
+            power_ohm_MW_pred=power_ohm_MW_pred,
+            power_radiated_MW_pred=power_radiated_MW_pred,
         )
         return state_out, output
 
@@ -505,6 +518,7 @@ class PowerBalanceTransformer(PowerBalance):
         nn_width: int,
         nn_depth: int,
         normalizer: InputNormalizer,
+        predicts_powers: bool,
         prng_seed: int = 42,
     ) -> "PowerBalanceTransformer":
         key_embed, key_wtot, key_pos, key_attn, key_head = jax.random.split(jax.random.PRNGKey(prng_seed), 5)
@@ -516,7 +530,7 @@ class PowerBalanceTransformer(PowerBalance):
         attention = eqx.nn.MultiheadAttention(num_heads=num_heads, query_size=d_model, key=key_attn)
         head = eqx.nn.MLP(
             in_size=d_model,
-            out_size=1,
+            out_size=3 if predicts_powers else 1,
             width_size=nn_width,
             depth=nn_depth,
             key=key_head,
@@ -530,6 +544,7 @@ class PowerBalanceTransformer(PowerBalance):
             head=head,
             history_len=history_len,
             d_model=d_model,
+            predicts_powers=predicts_powers,
         )
 
 

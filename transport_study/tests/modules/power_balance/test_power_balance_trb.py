@@ -189,11 +189,15 @@ def test_structured_outputs_carry_submodule_predictions():
     assert np.isnan(float(output.power_ohm_MW_pred))
     assert np.isnan(float(output.power_radiated_MW_pred))
 
-    transformer = PowerBalanceTransformer.init(d_model=8, num_heads=2, history_len=4, nn_width=4, nn_depth=1, normalizer=energy_normalizer)
     transformer_state = PowerBalanceTransformer.State(energy_mhd_MJ=jnp.asarray(0.1), history=jnp.full((4,), 0.1))
-    _, output = transformer(transformer_state, inputs)
-    assert np.isnan(float(output.power_ohm_MW_pred))
-    assert np.isnan(float(output.power_radiated_MW_pred))
+    for predicts_powers in (False, True):
+        transformer = PowerBalanceTransformer.init(
+            d_model=8, num_heads=2, history_len=4, nn_width=4, nn_depth=1, normalizer=energy_normalizer, predicts_powers=predicts_powers
+        )
+        _, output = transformer(transformer_state, inputs)
+        # Only the multiobjective head predicts the powers the training loss anchors
+        assert np.isfinite(float(output.power_ohm_MW_pred)) == predicts_powers
+        assert np.isfinite(float(output.power_radiated_MW_pred)) == predicts_powers
 
 
 def test_mlp_feeds_back_its_predicted_wtot():

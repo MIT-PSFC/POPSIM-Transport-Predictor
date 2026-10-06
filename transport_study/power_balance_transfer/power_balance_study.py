@@ -16,7 +16,9 @@ from transport_study.config import CaseAxis, config
 from transport_study.modules.normalization import INPUT_NORMALIZATIONS, NORM_INPUT_VARS
 from transport_study.modules.power_balance.module import (
     MODEL_TYPES_WITH_SUBMODULES,
+    MULTIOBJECTIVE_MODEL_TYPES,
     SUBMODULE_MODEL_TYPES,
+    TRANSFORMER_MODEL_TYPES,
 )
 from transport_study.orchestration.case_analysis import run_summary_analysis
 from transport_study.orchestration.study import (
@@ -34,7 +36,9 @@ from transport_study.power_balance_transfer.tables import SPEC as TABLE_SPEC
 POWER_BALANCE_INPUT_VARS = list(NORM_INPUT_VARS)
 
 # Purely data-driven model types, no submodules so nothing to freeze
-MODEL_TYPES_WITHOUT_SUBMODULES = ("mlp", "transformer")
+MODEL_TYPES_WITHOUT_SUBMODULES = ("mlp", *TRANSFORMER_MODEL_TYPES)
+# The measured powers, targets of the anchor terms in the training loss
+POWER_TARGET_VARS = ["power_ohm_MW", "power_radiated_MW"]
 
 
 # Per-submodule train settings shared with the transport study, which trains
@@ -94,6 +98,8 @@ class PowerBalanceStudy(Study):
         - sciml-taue-nn: neural network predicts tau_e, and we do the power balance calculation
         - mlp: an MLP predicts the stored-energy evolution from the inputs and its own predicted stored energy
         - transformer: the current inputs attend over a buffer of past predicted stored energies to predict its evolution
+        - transformer-multiobjective: the transformer with two more head outputs predicting P_oh and P_rad,
+          anchored to the measured powers in the training loss like the sciml submodules
         - p_oh / p_rad: submodule predictors, appear only as prereq cases of sciml-taue-scalinglaw and sciml-taue-nn
 
         training_data: The historic dataset(s) used for training
@@ -215,10 +221,9 @@ class PowerBalanceStudy(Study):
         return {
             # [MJ] on the scale of a Wtot error, C-Mod and MAST medians are 0.03-0.05 MJ
             "huber_delta": 0.05,
-            # Anchor terms keeping the p_oh/p_rad submodule predictions close
-            # to the measured signals while the whole module trains on Wtot.
-            # Training loss only, and a no-op for model types without
-            # submodules (their target_vars carry no power_ohm_MW / power_radiated_MW).
+            # Anchor terms keeping the predicted P_oh / P_rad (the sciml submodules, the multiobjective transformer's heads)
+            # close to the measured signals while the whole module trains on Wtot.
+            # Training loss only, and a no-op for model types whose target_vars carry no power_ohm_MW / power_radiated_MW.
             # Sized to the Wtot term in the trained state,
             # at 0.1 the anchors outweighed it ~100x and unfrozen submodules barely moved toward Wtot
             "anchor_weight_power_ohm": 2e-3,
@@ -258,7 +263,7 @@ class PowerBalanceStudy(Study):
                     # The measured powers are targets so the training loss can
                     # anchor the submodule predictions to them (anchor_weight_*
                     # in the loss config)
-                    "target_vars": ["energy_mhd_MJ", "power_ohm_MW", "power_radiated_MW", "ds_source_idx"],
+                    "target_vars": ["energy_mhd_MJ", *POWER_TARGET_VARS, "ds_source_idx"],
                     "state_vars": ["energy_mhd_MJ"],
                     **dataloader_config_base,
                 },
@@ -285,7 +290,7 @@ class PowerBalanceStudy(Study):
                     "state_vars": ["energy_mhd_MJ"],
                     # Unused by the model, but the dataloader drops the NaN slices of every loaded variable,
                     # so the measured powers keep the training segments identical to the structured models'
-                    "extra_vars": ["power_ohm_MW", "power_radiated_MW"],
+                    "extra_vars": POWER_TARGET_VARS,
                     **dataloader_config_base,
                 },
                 model_init_config={
@@ -297,15 +302,19 @@ class PowerBalanceStudy(Study):
                     "prng_seed": 42,
                 },
             )
-        elif case.model_type == "transformer":
+        elif case.model_type in TRANSFORMER_MODEL_TYPES:
+            # The multiobjective head predicts the measured powers, so they are targets its training loss anchors.
+            # For the plain transformer they only keep the training segments identical to the structured models', see mlp
+            if case.model_type in MULTIOBJECTIVE_MODEL_TYPES:
+                power_vars = {"target_vars": ["energy_mhd_MJ", *POWER_TARGET_VARS, "ds_source_idx"]}
+            else:
+                power_vars = {"target_vars": ["energy_mhd_MJ", "ds_source_idx"], "extra_vars": POWER_TARGET_VARS}
             return ModelTrainSpec(
                 train_run_builder=trb,
                 dataloader_config={
                     "input_vars": POWER_BALANCE_INPUT_VARS,
-                    "target_vars": ["energy_mhd_MJ", "ds_source_idx"],
                     "state_vars": ["energy_mhd_MJ"],
-                    # Same training segments as the structured models, see mlp
-                    "extra_vars": ["power_ohm_MW", "power_radiated_MW"],
+                    **power_vars,
                     **dataloader_config_base,
                 },
                 model_init_config={
@@ -326,10 +335,10 @@ class PowerBalanceStudy(Study):
     def tuned_model_init_updates(self, case: Case, tuned_config: TrainConfig) -> dict:
         # sciml-taue-scalinglaw has no NN of its own (its submodules carry their own tuned configs)
         updates = {}
-        if case.model_type in [*SUBMODULE_MODEL_TYPES, "mlp", "sciml-taue-nn", "transformer"]:
+        if case.model_type in [*SUBMODULE_MODEL_TYPES, "mlp", "sciml-taue-nn", *TRANSFORMER_MODEL_TYPES]:
             updates["nn_depth"] = tuned_config.model_init_config["nn_depth"]
             updates["nn_width"] = tuned_config.model_init_config["nn_width"]
-        if case.model_type == "transformer":
+        if case.model_type in TRANSFORMER_MODEL_TYPES:
             updates["d_model"] = tuned_config.model_init_config["d_model"]
             updates["num_heads"] = tuned_config.model_init_config["num_heads"]
             updates["history_len"] = tuned_config.model_init_config["history_len"]
