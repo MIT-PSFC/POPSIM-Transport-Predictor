@@ -17,7 +17,7 @@ from transport_study.modules.profile_predictor.module import Outputs
 from transport_study.modules.profile_predictor.trb import ProfilePredictorTRB
 from transport_study.modules.trb_utils import (
     CHI_ERROR_VARS,
-    CHI_GRAD_RHO_MAX,
+    GRAD_RHO_MAX,
     chi_sigma_floors,
 )
 from transport_study.orchestration.organize_data import (
@@ -325,7 +325,7 @@ def test_measured_gradient_signal_is_the_gradient_target():
 
     The prediction matches the target values exactly, so any loss can only come
     from the measured gradient signal disagreeing with the prediction's slope.
-    In chi that disagreement counts in units of the gradient error bar, out to CHI_GRAD_RHO_MAX.
+    In chi that disagreement counts in units of the gradient error bar, out to GRAD_RHO_MAX like in training.
     """
     ne = 1.5 * (1 - RHO**2)
     te = 3.0 * (1 - RHO**2)
@@ -346,7 +346,7 @@ def test_measured_gradient_signal_is_the_gradient_target():
     assert float(ProfilePredictorTRB.get_loss_fn(TRAIN_CONFIG)(pred, targ)) > 0.0
 
     # Peak normalization divides offset and error bar alike, so each midpoint scores offset / sigma
-    chi_grad_channel = np.trapezoid((RHO_MID < CHI_GRAD_RHO_MAX) * grad_offset / grad_sigma, x=RHO_MID)
+    chi_grad_channel = np.trapezoid((RHO_MID < GRAD_RHO_MAX) * grad_offset / grad_sigma, x=RHO_MID)
     expected = 0.1 * 2.0 * chi_grad_channel
     assert float(ProfilePredictorTRB.get_val_loss_fn(_val_config())(pred, targ)) == pytest.approx(expected, rel=1e-6)
 
@@ -354,13 +354,13 @@ def test_measured_gradient_signal_is_the_gradient_target():
 @pytest.mark.parametrize(
     ("make_loss_fn", "loss_config", "rho_cut"),
     [
-        (ProfilePredictorTRB.get_loss_fn, TRAIN_CONFIG, ProfilePredictorTRB.GRAD_LOSS_RHO_MAX),
-        (ProfilePredictorTRB.get_val_loss_fn, None, CHI_GRAD_RHO_MAX),
+        (ProfilePredictorTRB.get_loss_fn, TRAIN_CONFIG, GRAD_RHO_MAX),
+        (ProfilePredictorTRB.get_val_loss_fn, None, GRAD_RHO_MAX),
     ],
     ids=["train", "chi"],
 )
 def test_gradient_terms_count_only_inside_their_rho_cut(make_loss_fn, loss_config, rho_cut):
-    """Gradient mismatch beyond the cut (0.9 in training, 0.95 in chi) must not contribute, the same mismatch in the core must.
+    """Gradient mismatch beyond GRAD_RHO_MAX must not contribute, in training or in chi, the same mismatch in the core must.
 
     The measured gradients at the edge are unreliable.
     The offset sits on the grid points at and beyond the next point past the cut,

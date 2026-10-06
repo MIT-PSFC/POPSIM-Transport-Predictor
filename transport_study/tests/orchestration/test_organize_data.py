@@ -6,6 +6,7 @@ from transport_study import EPISODE_DIM, RADIAL_DIM, TIME_COORD, TIME_DIM
 from transport_study.config import RHO_GRID, StudyConfig, load_config
 from transport_study.orchestration.organize_data import (
     HAZARD_VARS,
+    PROFILE_SHAPE_VARS,
     REQUIRED_SIGNALS,
     TrainingData,
     add_hazard,
@@ -14,6 +15,7 @@ from transport_study.orchestration.organize_data import (
     get_train_test_datasets,
     get_train_val_datasets,
     keep_fresh_timeslices,
+    merge_parts,
     parse_training_data,
 )
 from transport_study.orchestration.target_shots import TargetSplit
@@ -142,7 +144,9 @@ class TestGetTrainValDatasets:
     @requires_sample_data
     def test_get_train_val_datasets_returns_split(self, sample_dataset_config):
         td = TrainingData(sources=["cmod-low1", "cmod-low2"])
-        train_ds, val_ds = get_train_val_datasets(td, study_type="power_balance_transfer")
+        train_parts, val_ds = get_train_val_datasets(td, study_type="power_balance_transfer")
+        assert len(train_parts) == 2, "one training part per source"
+        train_ds = merge_parts(train_parts)
         assert train_ds.sizes[EPISODE_DIM] > 0
         assert val_ds.sizes[EPISODE_DIM] > 0
         # Train and val sets are disjoint per source
@@ -165,12 +169,15 @@ class TestGetTrainValDatasets:
 class TestGetTrainTestDatasets:
     def test_get_train_test_datasets_returns_split(self, sample_dataset_config):
         td = TrainingData(sources=["cmod-low1", "cmod-low2"])
-        train_ds, test_ds = get_train_test_datasets(
+        train_parts, test_ds = get_train_test_datasets(
             td,
             domain_adaptation="addition",
             target_split=TargetSplit(num_target_shots=2, target_shot_order="ascending", target_test_set_size=5, target_test_shots=()),
             study_type="power_balance_transfer",
         )
+        # Each source's training then validation shots, then the target training shots
+        assert len(train_parts) == 5
+        train_ds = merge_parts(train_parts)
         assert train_ds.sizes[EPISODE_DIM] > 0
         assert test_ds.sizes[EPISODE_DIM] == 5
 
@@ -260,8 +267,40 @@ def test_keep_fresh_timeslices_masks_only_the_time_dependent_variables():
     assert ds_fresh[EPISODE_DIM].values.tolist() == [100], "a shot without a fresh slice is dropped"
     assert ds_fresh["hazard"].dims == (EPISODE_DIM,)
     np.testing.assert_allclose(ds_fresh["hazard"].values, [0.5])
-    # The time_idx column no shot is fresh at is dropped with the shot
+    # The fresh slices move to the front of the time axis, which is cut to the most any shot holds
     np.testing.assert_allclose(ds_fresh["energy_mhd_MJ"].values, [[1.0, 3.0]])
+    np.testing.assert_allclose(ds_fresh[TIME_COORD].values, [[0.1, 0.102]])
+
+
+def test_fresh_timeslice_compaction_keeps_every_fresh_sample_in_order():
+    """Compacting each shot's fresh slices changes no timeslice sample the time-independent dataloader stacks.
+
+    The reference masks the stale slices in place, as the profile prep did before the compaction.
+    popsim stacks (shot, time_idx) shot-major and drops every sample with a NaN,
+    so both layouts must give the same samples, values and times, in the same order.
+    Only the time_idx label of a sample changes, to its position among its shot's fresh slices.
+    """
+    rng = np.random.default_rng(3)
+    n_shots, n_times = 6, 40
+    times = 0.1 + 1e-3 * np.tile(np.arange(n_times), (n_shots, 1))
+    ds = _time_series_ds(times, rng.normal(size=(n_shots, n_times)))
+    fresh = (rng.uniform(size=(n_shots, n_times)) < 0.2).astype(np.float32)
+    fresh[2] = 0.0
+    ds["fresh_profile"] = ((EPISODE_DIM, TIME_DIM), fresh)
+    ds["ip_MA"][4, 7] = np.nan
+
+    reference = ds.where(ds["fresh_profile"] == 1)
+    reference = reference.set_coords(TIME_COORD).isel({EPISODE_DIM: fresh.any(axis=1)})
+    compact = keep_fresh_timeslices(ds).set_coords(TIME_COORD)
+    assert compact.sizes[TIME_DIM] == int(fresh.sum(axis=1).max())
+
+    def stacked(ds_layout):
+        return ds_layout.drop_vars(TIME_DIM, errors="ignore").stack(sample=(EPISODE_DIM, TIME_DIM)).dropna("sample")
+
+    samples_reference, samples_compact = stacked(reference), stacked(compact)
+    np.testing.assert_array_equal(samples_reference[EPISODE_DIM].values, samples_compact[EPISODE_DIM].values)
+    for name in ("energy_mhd_MJ", "ip_MA", "fresh_profile", TIME_COORD):
+        np.testing.assert_array_equal(samples_reference[name].values, samples_compact[name].values)
 
 
 @pytest.fixture
@@ -313,9 +352,9 @@ class TestGetDsSyntheticStore:
     @pytest.mark.parametrize("study_type", list(REQUIRED_SIGNALS))
     def test_train_val_split_holds_out_the_highest_hazard_shots(self, synthetic_store_config, study_type):
         """The 80/20 split runs end to end on a real store and the val shots are the top-hazard fifth."""
-        train_ds, val_ds = get_train_val_datasets(TrainingData(sources=["synthetic"]), study_type=study_type)
+        train_parts, val_ds = get_train_val_datasets(TrainingData(sources=["synthetic"]), study_type=study_type)
 
-        shots_train = set(train_ds[EPISODE_DIM].values.tolist())
+        shots_train = set(merge_parts(train_parts)[EPISODE_DIM].values.tolist())
         shots_val = set(val_ds[EPISODE_DIM].values.tolist())
         assert shots_train | shots_val == set(SHOT_LENGTHS)
         assert shots_train.isdisjoint(shots_val)
@@ -323,11 +362,15 @@ class TestGetDsSyntheticStore:
         assert shots_val == {list(SHOT_LENGTHS)[-1]}
 
     @pytest.mark.parametrize("study_type", ["profile_transfer", "transport_transfer"])
-    def test_profiles_on_rho_grid_with_shapes(self, synthetic_store_config, study_type):
+    def test_profiles_on_rho_grid(self, synthetic_store_config, study_type):
         ds = get_ds("synthetic", study_type)
 
         np.testing.assert_allclose(ds[RADIAL_DIM].values, RHO_GRID)
-        assert {"t_e_shape", "n_e_shape"} <= set(ds.data_vars)
+        # Only the profile view's shape-init families read the shapes
+        if study_type == "profile_transfer":
+            assert set(PROFILE_SHAPE_VARS) <= set(ds.data_vars)
+        else:
+            assert not set(PROFILE_SHAPE_VARS) & set(ds.data_vars)
         assert all(not ds[name].attrs for name in ds.variables), "attrs are static jit metadata"
 
 

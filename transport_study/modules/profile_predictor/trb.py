@@ -29,22 +29,21 @@ from transport_study.modules.trb_utils import (
     CHI_ERROR_VARS,
     PROFILE_SCALE_FLOOR,
     attach_normalizer_fit_ds,
-    chi_gradient,
-    chi_value,
+    chi_profile_loss,
     ds_source_per_shot,
+    huber_profile_loss,
     integrate_error_over_time,
     make_exponential_adamw,
     make_loss_eval_suite,
     normalizer_fit_dataset,
-    peak_scale,
     per_sample_device_values,
     per_sample_sigma_floor,
     resolve_case_datasets,
     restore_from_checkpoint,
     target_device_idx,
-    to_mid,
     unstack_samples,
 )
+from transport_study.orchestration.organize_data import merge_parts
 
 # Profile relaxation solver step [s].
 # The Pereverzev linear step makes the same progress per step at any dt,
@@ -73,11 +72,12 @@ class ProfilePredictorTRB(TrainRunBuilder):
         Dataset selection and preparation is the shared
         trb_utils.resolve_case_datasets, this only builds the
         time-independent dataloaders on top.
+        The training parts are merged first, cheap since the profile view keeps only the fresh timeslices of each shot.
         """
-        ds_train, ds_val, input_vars, normalizer_fit_ds = resolve_case_datasets(dataloader_config, "profile_transfer")
+        train_parts, ds_val, input_vars, normalizer_fit_ds = resolve_case_datasets(dataloader_config, "profile_transfer")
 
         train_dl, val_dl = make_dataloaders(
-            datasets=(ds_train, ds_val),
+            datasets=(merge_parts(train_parts), ds_val),
             time_coord=TIME_COORD,
             episode_coord=EPISODE_DIM,
             input_vars=input_vars,
@@ -200,48 +200,38 @@ class ProfilePredictorTRB(TrainRunBuilder):
     # so it reads as the same relative amount for ne and Te on every device
     REL_ERROR_FLOOR_FRAC = 0.1
 
-    # The training gradient loss only applies below this rho.
-    # Beyond it the GP fits extrapolate into the pedestal and scrape-off layer, where the measured gradients are unreliable
-    GRAD_LOSS_RHO_MAX = 0.9
-
     @staticmethod
     def get_loss_fn(loss_config: dict) -> Callable[[Any, Any], jnp.ndarray]:
-        """Training loss: huber on the peak-normalized residual of the values and of the gradients.
+        """Training loss: huber on the peak-normalized residual of the values and of the gradients (trb_utils.huber_profile_loss).
 
         Each target profile is scaled so its peak is 1 and the prediction by the same per-sample scale,
         so the channels and devices are commensurate and huber_delta / huber_delta_grad read as fractional errors.
-        The gradient targets are the GP-fit gradients, masked to rho below GRAD_LOSS_RHO_MAX.
+        The gradient targets are the GP-fit gradients, masked to rho below GRAD_RHO_MAX.
         The swept deltas make this loss unfit for the sweep metric, validation uses get_val_loss_fn.
         """
         device_weights = loss_config.get("device_weights", {})
-        gradient_weight = loss_config["gradient_weight"]
-        huber_delta = loss_config["huber_delta"]
-        # Normalized gradients are larger than normalized values (a pedestal can reach d/drho of order 10),
-        # so the gradient huber transition has its own delta
-        huber_delta_grad = loss_config["huber_delta_grad"]
 
         def loss_fn(pred, targ):
             rho = pred.ne[RADIAL_DIM].data
-            rho_mid = to_mid(rho)
-            mask_grad_rho = rho_mid < ProfilePredictorTRB.GRAD_LOSS_RHO_MAX
             sample_weights = per_sample_device_values(targ["ds_source_idx"].data, device_weights, 1.0)
             loss = 0.0
             for channel, pred_channel in (("n_e_1e20", pred.ne.data), ("t_e_keV", pred.te.data)):
-                targ_channel = targ[channel].data
-                scale = peak_scale(targ_channel)
-                value_err = optax.huber_loss(pred_channel / scale - targ_channel / scale, delta=huber_delta)
-                grad_pred = jnp.diff(pred_channel / scale, axis=-1) / jnp.diff(rho)
-                grad_targ = to_mid(targ[f"{channel}_gradient"].data) / scale
-                grad_err = optax.huber_loss(grad_pred - grad_targ, delta=huber_delta_grad)
-                loss = loss + jnp.trapezoid(value_err, x=rho, axis=-1)
-                loss = loss + gradient_weight * jnp.trapezoid(mask_grad_rho * grad_err, x=rho_mid, axis=-1)
+                loss = loss + huber_profile_loss(
+                    pred_channel,
+                    targ[channel].data,
+                    targ[f"{channel}_gradient"].data,
+                    rho,
+                    loss_config["huber_delta"],
+                    loss_config["huber_delta_grad"],
+                    loss_config["gradient_weight"],
+                )
             return sample_weights * loss
 
         return loss_fn
 
     @staticmethod
     def get_val_loss_fn(loss_config: dict) -> Callable[[Any, Any], jnp.ndarray]:
-        """Validation loss: chi, the residual in units of the GP-fit error bar (trb_utils.chi_value / chi_gradient).
+        """Validation loss: chi, the residual in units of the GP-fit error bar (trb_utils.chi_profile_loss).
 
         Summed over ne and Te, value chi plus gradient_weight times gradient chi, device-weighted.
         The error bars are floored per device at chi_sigma_floors from the loss config.
@@ -261,14 +251,16 @@ class ProfilePredictorTRB(TrainRunBuilder):
                 value_error_var, grad_error_var = CHI_ERROR_VARS[channel]
                 value_floor = per_sample_sigma_floor(ds_source_idx, sigma_floors, value_error_var)
                 grad_floor = per_sample_sigma_floor(ds_source_idx, sigma_floors, grad_error_var)
-                loss = loss + chi_value(pred_channel, targ_channel, targ[value_error_var].data, value_floor, rho)
-                loss = loss + gradient_weight * chi_gradient(
+                loss = loss + chi_profile_loss(
                     pred_channel,
                     targ_channel,
+                    targ[value_error_var].data,
                     targ[f"{channel}_gradient"].data,
                     targ[grad_error_var].data,
+                    value_floor,
                     grad_floor,
                     rho,
+                    gradient_weight,
                 )
             return sample_weights * loss
 

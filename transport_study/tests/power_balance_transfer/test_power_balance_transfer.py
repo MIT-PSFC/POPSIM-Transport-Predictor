@@ -262,9 +262,11 @@ def test_addition_no_device_weights(tmp_path):
             study_type=PowerBalanceStudy.STUDY_TYPE,
         )
 
-    train_ds_weighted, test_ds_weighted = _datasets(case_weighted)
-    train_ds_addition, test_ds_addition = _datasets(case_addition)
-    xr.testing.assert_identical(train_ds_weighted, train_ds_addition)
+    train_parts_weighted, test_ds_weighted = _datasets(case_weighted)
+    train_parts_addition, test_ds_addition = _datasets(case_addition)
+    assert len(train_parts_weighted) == len(train_parts_addition)
+    for part_weighted, part_addition in zip(train_parts_weighted, train_parts_addition, strict=True):
+        xr.testing.assert_identical(part_weighted, part_addition)
     xr.testing.assert_identical(test_ds_weighted, test_ds_addition)
 
 

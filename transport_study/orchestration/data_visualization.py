@@ -9,7 +9,7 @@ from loguru import logger
 from matplotlib import patches
 from scipy.spatial import ConvexHull
 
-from transport_study import EPISODE_DIM, TIME_DIM
+from transport_study import EPISODE_DIM, RADIAL_DIM, TIME_DIM
 from transport_study.config import config
 from transport_study.orchestration.organize_data import (
     TrainingData,
@@ -330,10 +330,15 @@ def domain_plot(
 
 def _combined_raw_dataset(study_type: str) -> xr.Dataset:
     """Concatenate every device (sources + target) into one dataset with a per-shot
-    ds_source coordinate, the hazard/p95 metrics come with get_ds."""
+    ds_source coordinate, the hazard/p95 metrics come with get_ds.
+
+    Only the variables off the radial grid are kept: the plots read 0D signals alone,
+    and NaN-padding every device's profiles to the longest device's time axis would take tens of GB.
+    """
     datasets = []
     for device in _all_devices():
         ds = get_ds(device, study_type=study_type)
+        ds = ds.drop_vars([name for name in ds.data_vars if RADIAL_DIM in ds[name].dims])
         ds = ds.assign_coords(ds_source=device)
         datasets.append(ds)
 
@@ -380,11 +385,11 @@ class DataVisualizationBase:
             fig_path = save_dir / f"{source}_hazard_extrapolation.png"
             if fig_path.exists():
                 continue
-            train_ds, val_ds = get_train_val_datasets(training_data=_td([source]), study_type=cls.STUDY_TYPE)
+            train_parts, val_ds = get_train_val_datasets(training_data=_td([source]), study_type=cls.STUDY_TYPE)
             hazard_extrapolation_plot(
                 save_path=fig_path,
-                ds_list=[train_ds, val_ds],
-                ds_type_list=["train", "val"],
+                ds_list=[*train_parts, val_ds],
+                ds_type_list=[*["train"] * len(train_parts), "val"],
                 source_colors=colors,
             )
 
@@ -392,11 +397,11 @@ class DataVisualizationBase:
         if len(sources) > 1:
             fig_path = save_dir / f"{'_'.join(sources)}_hazard_extrapolation.png"
             if not fig_path.exists():
-                train_ds, val_ds = get_train_val_datasets(training_data=_td(sources), study_type=cls.STUDY_TYPE)
+                train_parts, val_ds = get_train_val_datasets(training_data=_td(sources), study_type=cls.STUDY_TYPE)
                 hazard_extrapolation_plot(
                     save_path=fig_path,
-                    ds_list=[train_ds, val_ds],
-                    ds_type_list=["train", "val"],
+                    ds_list=[*train_parts, val_ds],
+                    ds_type_list=[*["train"] * len(train_parts), "val"],
                     source_colors=colors,
                 )
 
@@ -409,7 +414,7 @@ class DataVisualizationBase:
             if not fig_path.exists():
                 # num_target_shots=0 keeps the target purely in the test split so it reads
                 # as one distinct target dataset against the source training data.
-                train_ds, test_ds = get_train_test_datasets(
+                train_parts, test_ds = get_train_test_datasets(
                     training_data=_td(sources),
                     domain_adaptation="addition",
                     target_split=configured_target_split(0),
@@ -417,8 +422,8 @@ class DataVisualizationBase:
                 )
                 hazard_extrapolation_plot(
                     save_path=fig_path,
-                    ds_list=[train_ds, test_ds],
-                    ds_type_list=["train", "test"],
+                    ds_list=[*train_parts, test_ds],
+                    ds_type_list=[*["train"] * len(train_parts), "test"],
                     source_colors=colors,
                 )
 

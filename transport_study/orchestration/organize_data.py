@@ -111,6 +111,10 @@ PROFILE_BASE_SIGNALS = ["t_e_keV", "n_e_1e20"]
 PROFILE_GRAD_SIGNALS = [f"{v}_gradient" for v in PROFILE_BASE_SIGNALS]
 PROFILE_ERROR_SIGNALS = [f"{v}_error" for v in PROFILE_BASE_SIGNALS] + [f"{v}_gradient_error" for v in PROFILE_BASE_SIGNALS]
 
+# Unit-integral profile shapes to_rho_grid adds, one per PROFILE_BASE_SIGNALS entry,
+# the shape-init families fit their shape basis on them
+PROFILE_SHAPE_VARS = ["t_e_shape", "n_e_shape"]
+
 # Everything the profile-predictor loss reads from the target side:
 # the profiles themselves plus their gradients and error-bars
 PROFILE_TARGET_VARS = [*PROFILE_BASE_SIGNALS, *PROFILE_GRAD_SIGNALS, *PROFILE_ERROR_SIGNALS]
@@ -241,20 +245,33 @@ def to_rho_grid(ds: xr.Dataset) -> xr.Dataset:
     and array-valued ones break the treedef equality check.
     """
     ds_rho = ds.interp({RADIAL_DIM: RHO_GRID})
-    ds_rho["t_e_shape"] = ds_rho["t_e_keV"] / ds_rho["t_e_keV"].integrate(RADIAL_DIM)
-    ds_rho["n_e_shape"] = ds_rho["n_e_1e20"] / ds_rho["n_e_1e20"].integrate(RADIAL_DIM)
+    for shape_var, profile_var in zip(PROFILE_SHAPE_VARS, PROFILE_BASE_SIGNALS, strict=True):
+        ds_rho[shape_var] = ds_rho[profile_var] / ds_rho[profile_var].integrate(RADIAL_DIM)
     return ds_rho.drop_attrs()
 
 
 def keep_fresh_timeslices(ds: xr.Dataset) -> xr.Dataset:
-    """NaN the forward-filled profile timeslices and drop the shots without a fresh one.
+    """Each shot's fresh profile timeslices, moved to the front of the time axis in time order, and drop the shots without one.
 
-    Only the time-dependent variables are masked:
-    a whole-dataset where would broadcast the per-shot variables (hazard) against time.
+    The time axis is cut to the most fresh slices any shot holds and the rest is NaN,
+    so the forward-filled slices (about 98 percent of a DIII-D shot) take no memory.
+    time_idx counts the fresh slices of a shot, the time coordinate keeps each slice's time.
+    Only the time-dependent variables are reordered:
+    a whole-dataset operation would broadcast the per-shot variables (hazard) against time.
     """
-    mask_fresh = ds["fresh_profile"] == 1
     names_per_shot = [name for name in ds.data_vars if TIME_DIM not in ds[name].dims]
-    ds_time_dep = ds.drop_vars(names_per_shot).where(mask_fresh, drop=True)
+    mask_fresh = (ds["fresh_profile"] == 1).transpose(EPISODE_DIM, TIME_DIM).values
+    n_fresh = mask_fresh.sum(axis=1)
+    n_kept = int(n_fresh.max(initial=0))
+    # A stable sort of the stale flags puts each shot's fresh slices first without reordering them
+    fresh_first = np.argsort(~mask_fresh, axis=1, kind="stable")[:, :n_kept]
+    indexer = xr.DataArray(fresh_first, dims=(EPISODE_DIM, TIME_DIM))
+    mask_kept = xr.DataArray(np.arange(n_kept)[np.newaxis, :] < n_fresh[:, np.newaxis], dims=(EPISODE_DIM, TIME_DIM))
+    ds_time_dep = ds.drop_vars([*names_per_shot, TIME_DIM], errors="ignore").isel({TIME_DIM: indexer}).where(mask_kept)
+    # where leaves coordinates alone, the time coordinate of the slots past a shot's fresh slices must be NaN too
+    if TIME_COORD in ds_time_dep.coords:
+        ds_time_dep = ds_time_dep.assign_coords({TIME_COORD: ds_time_dep[TIME_COORD].where(mask_kept)})
+    ds_time_dep = ds_time_dep.assign_coords({TIME_DIM: np.arange(n_kept)}).isel({EPISODE_DIM: n_fresh > 0})
     return ds_time_dep.merge(ds[names_per_shot], join="left")
 
 
@@ -270,13 +287,15 @@ def _power_balance(ds: xr.Dataset) -> xr.Dataset:
 
 
 def _transport_transfer(ds: xr.Dataset) -> xr.Dataset:
-    """Every timeslice on RHO_GRID.
+    """Every timeslice on RHO_GRID, without the shape variables.
 
     No fresh-profile filter: the time-dependent rollouts need contiguous segments,
     so the forward-filled profile timeslices stay in as targets
     and fresh_profile rides along as data for masking downstream.
+    Nothing in the transport study reads the shapes:
+    the sciml profile submodule is restored with the shape basis its profile prereq case fitted on the profile view.
     """
-    return to_rho_grid(ds)
+    return to_rho_grid(ds).drop_vars(PROFILE_SHAPE_VARS)
 
 
 STUDY_PREPS = {
@@ -510,20 +529,13 @@ def normalize_domain(ds: xr.Dataset, method: str = "raw", feature_space: str = "
     return ds
 
 
-def get_train_val_datasets(
-    training_data: TrainingData,
-    study_type: str = "profile_transfer",
-):
-    """
-    Split each source device into training and validation sets by a deterministic hazard sort:
-    the TRAIN_VAL_SPLIT highest-hazard shots of every source are its validation set.
+def _source_split_parts(training_data: TrainingData, study_type: str) -> tuple[list[xr.Dataset], list[xr.Dataset]]:
+    """Each source device split into training and validation shots by a deterministic hazard sort.
 
-    There is no test set here because the true test set is the
-    high-hazard target device shots, handled separately.
-    That means all historic source data can be used for training and validation.
+    The TRAIN_VAL_SPLIT highest-hazard shots of every source are its validation set.
+    Returns (train_parts, val_parts), one dataset per source in training_data.sources order.
     """
-    ds_sources: dict[str, tuple] = {}
-
+    train_parts, val_parts = [], []
     for source in training_data.sources:
         ds = get_ds(source, study_type)
         # popsim requires a seed, the hazard sort makes the split deterministic and leaves it unused
@@ -543,24 +555,39 @@ def get_train_val_datasets(
             EPISODE_DIM,
             np.full(val_src.sizes[EPISODE_DIM], src_idx),
         )
-        train_src = train_src.assign_coords(ds_source=source)
-        val_src = val_src.assign_coords(ds_source=source)
-        ds_sources[source] = (train_src, val_src)
-
-    if not ds_sources:
+        train_parts.append(train_src.assign_coords(ds_source=source))
+        val_parts.append(val_src.assign_coords(ds_source=source))
+    if not train_parts:
         raise ValueError("training_data.sources is empty - cannot build train/val datasets")
+    return train_parts, val_parts
 
-    if len(ds_sources) == 1:
-        source = next(iter(ds_sources))
-        train_ds, val_ds = ds_sources[source]
-    else:
-        train_ds = concat_with_nan_padding([pair[0] for pair in ds_sources.values()], concat_dim=EPISODE_DIM)
-        val_ds = concat_with_nan_padding([pair[1] for pair in ds_sources.values()], concat_dim=EPISODE_DIM)
 
-    logger.debug("Historic Training dataset size: {}", train_ds.sizes[EPISODE_DIM])
-    logger.debug("Historic Validation dataset size: {}", val_ds.sizes[EPISODE_DIM])
+def merge_parts(parts: list[xr.Dataset]) -> xr.Dataset:
+    """Training parts in one dataset along the shot dim, the shorter shots NaN-padded to the longest.
 
-    return train_ds, val_ds
+    Only for parts that are small on the time axis (the validation sets, the 0D and the compacted profile views):
+    the time-dependent training parts go through trb_utils.segmented_train_dataloader instead.
+    """
+    return parts[0] if len(parts) == 1 else concat_with_nan_padding(parts, concat_dim=EPISODE_DIM)
+
+
+def get_train_val_datasets(
+    training_data: TrainingData,
+    study_type: str = "profile_transfer",
+) -> tuple[list[xr.Dataset], xr.Dataset]:
+    """The historic training parts and the merged historic validation set (see _source_split_parts).
+
+    There is no test set here because the true test set is the
+    high-hazard target device shots, handled separately.
+    That means all historic source data can be used for training and validation.
+    The training data stays one part per source device,
+    so no source is NaN-padded to the time axis of another (see merge_parts).
+    """
+    train_parts, val_parts = _source_split_parts(training_data, study_type)
+    val_ds = merge_parts(val_parts)
+    logger.debug("Historic training shots: {}", sum(part.sizes[EPISODE_DIM] for part in train_parts))
+    logger.debug("Historic validation shots: {}", val_ds.sizes[EPISODE_DIM])
+    return train_parts, val_ds
 
 
 def get_loaded_shot_count(source_ds: str, study_type: str = "profile_transfer") -> int:
@@ -613,44 +640,31 @@ def get_train_test_datasets(
     domain_adaptation: str | None,
     target_split: TargetSplit,
     study_type: str = "profile_transfer",
-):
-    """
-    Split dataset into training and test sets for the target learning case.
-    If domain adaptation is 'weighted' or 'addition', makes a combined training set of historic
-    data and target device shots (the two methods share this dataset, 'weighted' additionally
-    gets per-device loss weights injected in make_train_config). If domain adaptation is
-    'transfer' or training_data.exnihilo is True, removes all historic data from the training
-    set, leaving only the target device shots.
+) -> tuple[list[xr.Dataset], xr.Dataset]:
+    """The training parts and the test set of a target learning case.
+
+    If domain adaptation is 'weighted' or 'addition', the training parts are the historic data
+    (each source's training then validation shots) followed by the target device's training shots
+    (the two methods share them, 'weighted' additionally gets per-device loss weights injected in make_train_config).
+    If domain adaptation is 'transfer' or training_data.exnihilo is True, the target training shots are the only part,
+    and no source device is loaded.
     target_split picks the target shots included in training and the held-out test set (see orchestration/target_shots.py).
 
     The test set is always the same set of target device shots.
-    The training set is the historic data from training_data.sources plus the target_split's training shots.
-
     There is no validation set here since hyperparameters are not tuned on transfer learning data.
     We treat the test set as a validation set for checkpoint selection, which is slightly optimistic
     but consistent across all models so comparisons are fair.
     """
     train_ds_target, test_ds = _split_target_shots(target_split, study_type)
-
-    # Load historic source data for training (for exnihilo it is stripped again below)
-    # exnihilo.sources contains all non-target devices, so we can pass training_data directly
-    train_ds_hist, val_ds_hist = get_train_val_datasets(training_data, study_type=study_type)
-    train_ds = concat_with_nan_padding(
-        [train_ds_hist, val_ds_hist, train_ds_target],
-        concat_dim=EPISODE_DIM,
-    )
-
-    # For 'transfer' and exnihilo: strip historic data, train only on target device shots
     if domain_adaptation == "transfer" or training_data.exnihilo:
-        train_ds = train_ds.where(
-            train_ds["ds_source_idx"] == config.ds_source_to_idx[config.target_device],
-            drop=True,
-        )
+        train_parts = [train_ds_target]
+    else:
+        source_train_parts, source_val_parts = _source_split_parts(training_data, study_type)
+        train_parts = [*source_train_parts, *source_val_parts, train_ds_target]
 
-    logger.debug("HP Training dataset size: {}", train_ds.sizes[EPISODE_DIM])
-    logger.debug("HP Test dataset size: {}", test_ds.sizes[EPISODE_DIM])
-
-    return train_ds, test_ds
+    logger.debug("Training shots: {}", sum(part.sizes[EPISODE_DIM] for part in train_parts))
+    logger.debug("Test shots: {}", test_ds.sizes[EPISODE_DIM])
+    return train_parts, test_ds
 
 
 def get_transfer_pretrain_datasets(
@@ -667,16 +681,17 @@ def get_transfer_pretrain_datasets(
     exists only to fit the normalization statistics, which the transfer case
     then inherits through the checkpoint restore.
 
-    Returns (train_ds_hist, train_ds_combined, test_ds).
+    Returns (train_parts_hist, train_ds_combined, test_ds),
+    the historic training parts (each source's training then validation shots) and the merged normalizer-fit dataset.
     """
     train_ds_target, test_ds = _split_target_shots(target_split, study_type)
 
-    train_ds_hist, val_ds_hist = get_train_val_datasets(training_data, study_type=study_type)
-    train_ds_hist = concat_with_nan_padding([train_ds_hist, val_ds_hist], concat_dim=EPISODE_DIM)
-    train_ds_combined = concat_with_nan_padding([train_ds_hist, train_ds_target], concat_dim=EPISODE_DIM)
+    source_train_parts, source_val_parts = _source_split_parts(training_data, study_type)
+    train_parts_hist = [*source_train_parts, *source_val_parts]
+    train_ds_combined = merge_parts([*train_parts_hist, train_ds_target])
 
-    logger.debug("Transfer pretrain historic dataset size: {}", train_ds_hist.sizes[EPISODE_DIM])
-    logger.debug("Transfer pretrain normalizer-fit dataset size: {}", train_ds_combined.sizes[EPISODE_DIM])
-    logger.debug("Transfer pretrain test dataset size: {}", test_ds.sizes[EPISODE_DIM])
+    logger.debug("Transfer pretrain historic shots: {}", sum(part.sizes[EPISODE_DIM] for part in train_parts_hist))
+    logger.debug("Transfer pretrain normalizer-fit shots: {}", train_ds_combined.sizes[EPISODE_DIM])
+    logger.debug("Transfer pretrain test shots: {}", test_ds.sizes[EPISODE_DIM])
 
-    return train_ds_hist, train_ds_combined, test_ds
+    return train_parts_hist, train_ds_combined, test_ds

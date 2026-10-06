@@ -23,12 +23,13 @@ from transport_study.modules.transport_predictor.module import (
     make_transport_nn_input_normalizer,
 )
 from transport_study.modules.trb_utils import (
-    chi_value,
+    CHI_ERROR_VARS,
+    chi_profile_loss,
     get_time_dep_dataloaders,
+    huber_profile_loss,
     make_grouped_exponential_adamw,
     make_loss_eval_suite,
     normalizer_fit_dataset,
-    peak_scale,
     per_sample_device_values,
     per_sample_sigma_floor,
     restore_from_checkpoint,
@@ -147,10 +148,11 @@ class TransportPredictorTRB(TrainRunBuilder):
     def _make_profile_loss_fn(loss_config: dict, use_chi: bool) -> IntegralLoss:
         """Device-weighted loss on the predicted ne/te profiles, wrapped for time integration.
 
-        Training (use_chi False): huber on the peak-normalized residual with the swept huber_delta,
-        the same convention as the profile study training loss, plus the anchor terms.
-        Validation (use_chi True): value chi, the residual in units of the GP-fit error bar
-        floored per device at chi_sigma_floors (trb_utils.chi_value), so no swept delta can shrink the sweep metric.
+        Training (use_chi False): huber on the peak-normalized residual of the values and of the GP-fit gradients
+        with the swept huber_delta / huber_delta_grad (trb_utils.huber_profile_loss, the profile study's training loss),
+        plus the anchor terms.
+        Validation (use_chi True): value plus gradient chi, the residuals in units of the GP-fit error bars
+        floored per device at chi_sigma_floors (trb_utils.chi_profile_loss), so no swept delta can shrink the sweep metric.
 
         Both count only timeslices with a fresh profile measurement:
         the profile terms are multiplied by the fresh_profile target var,
@@ -164,12 +166,12 @@ class TransportPredictorTRB(TrainRunBuilder):
         and drop out at trace time for cases whose target_vars lack the signals (the plain transformer and torax-*).
         """
         device_weights = loss_config.get("device_weights", {})
+        gradient_weight = loss_config["gradient_weight"]
         if use_chi:
             sigma_floors = loss_config["chi_sigma_floors"]
             divergence_penalty = loss_config["divergence_penalty_val"]
             anchor_weights = {}
         else:
-            huber_delta = loss_config["huber_delta"]
             divergence_penalty = loss_config["divergence_penalty"]
             anchor_weights = {signal: loss_config[weight_key] for signal, (_, weight_key) in ANCHOR_SIGNALS.items()}
 
@@ -189,30 +191,38 @@ class TransportPredictorTRB(TrainRunBuilder):
             te_pred = jnp.where(te_finite, pred.te, te_targ)
             diverged = ~(jnp.all(ne_finite, axis=-1) & jnp.all(te_finite, axis=-1))
 
-            # Only timeslices with a fresh profile measurement count for the profile terms
+            # Only timeslices with a fresh profile measurement count for the profile terms, values and gradients alike
             profile_weights = sample_weights * targ["fresh_profile"].data
-            if use_chi:
-                chi_ne = chi_value(
-                    ne_pred,
-                    ne_targ,
-                    targ["n_e_1e20_error"].data,
-                    per_sample_sigma_floor(ds_source_idx, sigma_floors, "n_e_1e20_error"),
-                    pred.rho,
-                )
-                chi_te = chi_value(
-                    te_pred,
-                    te_targ,
-                    targ["t_e_keV_error"].data,
-                    per_sample_sigma_floor(ds_source_idx, sigma_floors, "t_e_keV_error"),
-                    pred.rho,
-                )
-                loss = jnp.mean(profile_weights * (chi_ne + chi_te))
-            else:
-                ne_scale = peak_scale(ne_targ)
-                te_scale = peak_scale(te_targ)
-                ne_err = optax.huber_loss(ne_pred / ne_scale - ne_targ / ne_scale, delta=huber_delta)
-                te_err = optax.huber_loss(te_pred / te_scale - te_targ / te_scale, delta=huber_delta)
-                loss = 0.5 * (jnp.mean(profile_weights[..., None] * ne_err) + jnp.mean(profile_weights[..., None] * te_err))
+            channel_losses = []
+            for channel, pred_channel, targ_channel in (("n_e_1e20", ne_pred, ne_targ), ("t_e_keV", te_pred, te_targ)):
+                grad_targ = targ[f"{channel}_gradient"].data
+                if use_chi:
+                    value_error_var, grad_error_var = CHI_ERROR_VARS[channel]
+                    channel_loss = chi_profile_loss(
+                        pred_channel,
+                        targ_channel,
+                        targ[value_error_var].data,
+                        grad_targ,
+                        targ[grad_error_var].data,
+                        per_sample_sigma_floor(ds_source_idx, sigma_floors, value_error_var),
+                        per_sample_sigma_floor(ds_source_idx, sigma_floors, grad_error_var),
+                        pred.rho,
+                        gradient_weight,
+                    )
+                else:
+                    channel_loss = huber_profile_loss(
+                        pred_channel,
+                        targ_channel,
+                        grad_targ,
+                        pred.rho,
+                        loss_config["huber_delta"],
+                        loss_config["huber_delta_grad"],
+                        gradient_weight,
+                    )
+                channel_losses.append(channel_loss)
+            # Training averages the two channels, chi sums them, the scales the divergence penalties are sized to
+            channel_sum = channel_losses[0] + channel_losses[1]
+            loss = jnp.mean(profile_weights * (channel_sum if use_chi else 0.5 * channel_sum))
 
             for signal, anchor_weight in anchor_weights.items():
                 if anchor_weight <= 0.0 or signal not in targ:

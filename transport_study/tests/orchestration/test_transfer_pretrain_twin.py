@@ -15,6 +15,7 @@ from transport_study.config import config
 from transport_study.orchestration.organize_data import (
     TrainingData,
     get_transfer_pretrain_datasets,
+    merge_parts,
 )
 from transport_study.orchestration.study import HYPERPARAM_TARGET_SHOTS
 from transport_study.orchestration.target_shots import TargetSplit
@@ -123,9 +124,10 @@ def test_finetune_restores_the_twin_and_twin_trains_from_scratch(synthetic_devic
 def test_zero_shot_pretrain_datasets(study):
     """With no target shots the normalizer-fit set is the historic set, and the empty target selection concatenates cleanly."""
     target_split = TargetSplit(num_target_shots=0, target_shot_order="ascending", target_test_set_size=1, target_test_shots=())
-    train_ds, normalizer_fit_ds, test_ds = get_transfer_pretrain_datasets(
+    train_parts, normalizer_fit_ds, test_ds = get_transfer_pretrain_datasets(
         TrainingData(sources=["cmod"]), target_split=target_split, study_type="power_balance_transfer"
     )
+    train_ds = merge_parts(train_parts)
 
     assert np.atleast_1d(train_ds["ds_source"].values).tolist() == ["cmod"]
     assert normalizer_fit_ds[EPISODE_DIM].values.tolist() == train_ds[EPISODE_DIM].values.tolist()

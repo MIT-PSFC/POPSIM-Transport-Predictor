@@ -68,16 +68,10 @@ TRANSPORT_INPUT_VARS = [
 TRANSPORT_PROFILE_TARGETS = ["n_e_1e20", "t_e_keV"]
 
 # Everything the transport loss reads from the target side:
-# the profiles, their error bars (the chi validation loss divides by them),
+# the profiles, their GP-fit gradients and every error bar (the chi validation loss divides by them),
 # the freshness flag masking both losses to timeslices with a fresh profile measurement,
 # and the device label for per-device weighting
-TRANSPORT_TARGET_VARS = [
-    *TRANSPORT_PROFILE_TARGETS,
-    "n_e_1e20_error",
-    "t_e_keV_error",
-    "fresh_profile",
-    "ds_source_idx",
-]
+TRANSPORT_TARGET_VARS = [*PROFILE_TARGET_VARS, "fresh_profile", "ds_source_idx"]
 
 # The measured powers every top-level case loads (the stored energy is a state var of every case),
 # so the training segments are the same whatever a case anchors (a NaN in any loaded variable drops a segment)

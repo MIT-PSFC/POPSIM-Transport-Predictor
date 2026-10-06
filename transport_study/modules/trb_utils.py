@@ -11,18 +11,21 @@ import xarray as xr
 from loguru import logger
 from popsim.ml import DataLoader, TrainConfig
 from popsim.ml.checkpointing import create_default_checkpoint_manager, restore_model
-from popsim.ml.dataloading import make_dataloaders
+from popsim.ml.dataloading import XarrayPreppedDataset, make_dataloaders
 from popsim.ml.eval import EvalData, EvaluationSuite, batched_model_eval_and_loss
 from popsim.ml.preprocess_utils import mask_to_largest_group_mask
+from transport_validation_datasets.machine.generic import UNIFORM_TIMEBASE_DT
 
 from transport_study import EPISODE_DIM, RADIAL_DIM, TIME_COORD, TIME_DIM
 from transport_study.config import config
 from transport_study.orchestration.organize_data import (
     TrainingData,
+    concat_with_nan_padding,
     get_ds,
     get_train_test_datasets,
     get_train_val_datasets,
     get_transfer_pretrain_datasets,
+    merge_parts,
 )
 from transport_study.orchestration.target_shots import TargetSplit
 
@@ -35,10 +38,9 @@ PROFILE_SCALE_FLOOR = 1e-2
 # Each error bar is floored at this percentile of its own peak-normalized distribution per device,
 # so a single overconfident fit point cannot carry unbounded weight
 CHI_SIGMA_FLOOR_PERCENTILE = 5.0
-# Chi gradients count below this rho.
-# Dividing by the error bar already discounts where the fit stops resolving the slope,
-# so only the extrapolation right at the edge is dropped
-CHI_GRAD_RHO_MAX = 0.95
+# Profile gradients count below this rho, in the training losses, the validation chi and the analysis chi alike.
+# Beyond it the GP fits extrapolate into the pedestal and scrape-off layer, where the measured gradients are unreliable
+GRAD_RHO_MAX = 0.8
 # Floor added to |target| in the relative error of the scalar study results, in the signal's units.
 # Each sits below the signal's typical size so the error stays relative,
 # Wtot medians are 0.03-0.05 MJ on C-Mod and MAST
@@ -53,6 +55,9 @@ CHI_ERROR_VARS = {
     "n_e_1e20": ("n_e_1e20_error", "n_e_1e20_gradient_error"),
     "t_e_keV": ("t_e_keV_error", "t_e_keV_gradient_error"),
 }
+
+# Shot number of the room-keeper episode segmented_train_dataloader adds to each training part, below every real shot
+ROOM_KEEPER_SHOT = -1
 
 
 def peak_scale(targ: jnp.ndarray) -> jnp.ndarray:
@@ -95,7 +100,7 @@ def chi_value(pred: jnp.ndarray, targ: jnp.ndarray, sigma: jnp.ndarray, floor: j
 def chi_gradient(
     pred: jnp.ndarray, targ: jnp.ndarray, grad_targ: jnp.ndarray, grad_sigma: jnp.ndarray, floor: jnp.ndarray, rho: jnp.ndarray
 ) -> jnp.ndarray:
-    """int_0^CHI_GRAD_RHO_MAX |pred' - targ'| / max(sigma', floor) drho on peak-normalized profiles.
+    """int_0^GRAD_RHO_MAX |pred' - targ'| / max(sigma', floor) drho on peak-normalized profiles.
 
     pred' is the finite difference of the prediction at the rho midpoints,
     targ' and sigma' are the GP-fit gradient and its error bar averaged to the same midpoints.
@@ -104,7 +109,51 @@ def chi_gradient(
     rho_mid = to_mid(rho)
     grad_pred = jnp.diff(pred / scale, axis=-1) / jnp.diff(rho, axis=-1)
     chi = jnp.abs(grad_pred - to_mid(grad_targ) / scale) / jnp.maximum(to_mid(grad_sigma) / scale, floor)
-    return jnp.trapezoid((rho_mid < CHI_GRAD_RHO_MAX) * chi, x=rho_mid, axis=-1)
+    return jnp.trapezoid((rho_mid < GRAD_RHO_MAX) * chi, x=rho_mid, axis=-1)
+
+
+def huber_profile_loss(
+    pred: jnp.ndarray,
+    targ: jnp.ndarray,
+    grad_targ: jnp.ndarray,
+    rho: jnp.ndarray,
+    huber_delta: float,
+    huber_delta_grad: float,
+    gradient_weight: float,
+) -> jnp.ndarray:
+    """Training loss of one profile channel per timeslice, the profile and transport studies' shared form.
+
+    int_0^1 huber(pred - targ) drho on peak-normalized profiles,
+    plus gradient_weight times int huber(pred' - targ') drho below GRAD_RHO_MAX,
+    pred' the finite difference of the prediction at the rho midpoints and targ' the GP-fit gradient averaged there.
+    Profiles are (..., rho), the gradient huber transition has its own delta
+    since normalized gradients are larger than normalized values (a pedestal can reach d/drho of order 10).
+    """
+    scale = peak_scale(targ)
+    rho_mid = to_mid(rho)
+    value_err = optax.huber_loss(pred / scale - targ / scale, delta=huber_delta)
+    grad_pred = jnp.diff(pred / scale, axis=-1) / jnp.diff(rho, axis=-1)
+    grad_err = optax.huber_loss(grad_pred - to_mid(grad_targ) / scale, delta=huber_delta_grad)
+    value_term = jnp.trapezoid(value_err, x=rho, axis=-1)
+    grad_term = jnp.trapezoid((rho_mid < GRAD_RHO_MAX) * grad_err, x=rho_mid, axis=-1)
+    return value_term + gradient_weight * grad_term
+
+
+def chi_profile_loss(
+    pred: jnp.ndarray,
+    targ: jnp.ndarray,
+    sigma: jnp.ndarray,
+    grad_targ: jnp.ndarray,
+    grad_sigma: jnp.ndarray,
+    value_floor: jnp.ndarray,
+    grad_floor: jnp.ndarray,
+    rho: jnp.ndarray,
+    gradient_weight: float,
+) -> jnp.ndarray:
+    """Validation loss of one profile channel per timeslice: value chi plus gradient_weight times gradient chi."""
+    value_chi = chi_value(pred, targ, sigma, value_floor, rho)
+    grad_chi = chi_gradient(pred, targ, grad_targ, grad_sigma, grad_floor, rho)
+    return value_chi + gradient_weight * grad_chi
 
 
 def chi_sigma_floors(device: str) -> dict[str, float]:
@@ -388,8 +437,8 @@ def mask_to_largest_contiguous_segment(ds: xr.Dataset, training_vars: list[str])
 def resolve_case_datasets(
     dataloader_config: dict,
     study_type: str,
-) -> tuple[xr.Dataset, xr.Dataset, list[str], xr.Dataset | None]:
-    """Select and prepare the train/val datasets for a case, shared by every study TRB.
+) -> tuple[list[xr.Dataset], xr.Dataset, list[str], xr.Dataset | None]:
+    """Select and prepare the training parts and the val dataset for a case, shared by every study TRB.
 
     Selection by domain_adaptation:
     - transfer_pretrain: train on historic data only, plus a combined
@@ -402,7 +451,9 @@ def resolve_case_datasets(
     selection and final evaluation share it (no separate test split, slightly
     optimistic but consistent across cases).
 
-    Preparation applied to both datasets:
+    The training data stays one part per source split plus the target training shots (see organize_data.merge_parts).
+
+    Preparation applied to every training part and the val dataset:
     - drop the time_idx coordinate (duplicate values across shots break
       groupby("shot") on reassembly, the dataloader uses "time" instead)
     - broadcast the per-shot ds_source_idx against time as a float so the
@@ -410,7 +461,7 @@ def resolve_case_datasets(
       and append it to input_vars (the modules consume it to select
       per-device normalization stats)
 
-    Returns (ds_train, ds_val, input_vars, normalizer_fit_ds), the last one
+    Returns (train_parts, ds_val, input_vars, normalizer_fit_ds), the last one
     None except for transfer_pretrain.
     """
     training_data = dataloader_config["training_data"]
@@ -423,7 +474,7 @@ def resolve_case_datasets(
     target_split = TargetSplit.from_dataloader_config(dataloader_config)
     if domain_adaptation == "transfer_pretrain":
         logger.info("Using transfer pretrain dataloader (trains on historic data, normalizer fit on historic + target shots)")
-        ds_train, normalizer_fit_ds, ds_val = get_transfer_pretrain_datasets(
+        train_parts, normalizer_fit_ds, ds_val = get_transfer_pretrain_datasets(
             training_data=training_data,
             target_split=target_split,
             study_type=study_type,
@@ -431,12 +482,12 @@ def resolve_case_datasets(
     elif domain_adaptation is None:
         logger.info("Using standard learning dataloader")
         if not training_data.exnihilo:
-            ds_train, ds_val = get_train_val_datasets(
+            train_parts, ds_val = get_train_val_datasets(
                 training_data=training_data,
                 study_type=study_type,
             )
         else:
-            ds_train, ds_val = get_train_test_datasets(
+            train_parts, ds_val = get_train_test_datasets(
                 training_data=training_data,
                 domain_adaptation=None,
                 target_split=target_split,
@@ -444,29 +495,32 @@ def resolve_case_datasets(
             )
             # Double check there's no source (non-target) data anywhere in here
             non_target = set(config.dataset_paths.keys()) - {config.target_device}
-            if any((ds_train["ds_source"] == src).any() for src in non_target):
+            if any((part["ds_source"] == src).any() for part in train_parts for src in non_target):
                 raise ValueError(
                     "Historic data found in training set for exnihilo training_data option. Please check the dataset construction logic."
                 )
     else:
         logger.info(f"Using transfer learning dataloader with domain adaptation {domain_adaptation}")
-        ds_train, ds_val = get_train_test_datasets(
+        train_parts, ds_val = get_train_test_datasets(
             training_data=training_data,
             domain_adaptation=domain_adaptation,
             target_split=target_split,
             study_type=study_type,
         )
 
-    ds_train = ds_train.drop_vars(TIME_DIM, errors="ignore")
-    ds_val = ds_val.drop_vars(TIME_DIM, errors="ignore")
-
     input_vars = list(dataloader_config["input_vars"])
     if "ds_source_idx" not in input_vars:
         input_vars.append("ds_source_idx")
-    for ds in (ds_train, ds_val):
-        ds["ds_source_idx"] = ds["ds_source_idx"].broadcast_like(ds["ip_MA"]).astype(ds["ip_MA"].dtype)
+    train_parts = [prepared_for_dataloader(part) for part in train_parts]
+    ds_val = prepared_for_dataloader(ds_val)
+    return train_parts, ds_val, input_vars, normalizer_fit_ds
 
-    return ds_train, ds_val, input_vars, normalizer_fit_ds
+
+def prepared_for_dataloader(ds: xr.Dataset) -> xr.Dataset:
+    """ds without the time_idx coordinate and with ds_source_idx broadcast against time, see resolve_case_datasets."""
+    ds = ds.drop_vars(TIME_DIM, errors="ignore")
+    ds["ds_source_idx"] = ds["ds_source_idx"].broadcast_like(ds["ip_MA"]).astype(ds["ip_MA"].dtype)
+    return ds
 
 
 def get_time_dep_dataloaders(
@@ -476,11 +530,20 @@ def get_time_dep_dataloaders(
     """Dataset and dataloaders shared by the time-dependent (state-carrying) TRBs.
 
     Used by the power balance and transport predictor TrainRunBuilders, which
-    differ only in the study_type their datasets are prepared with.
+    differ only in the study_type their datasets are prepared with,
+    and by the p_oh / p_rad TRBs, whose configs carry no state_vars and get time-independent dataloaders.
     """
-    ds_train, ds_val, input_vars, normalizer_fit_ds = resolve_case_datasets(dataloader_config, study_type)
+    train_parts, ds_val, input_vars, normalizer_fit_ds = resolve_case_datasets(dataloader_config, study_type)
+    loader_vars = {
+        "input_vars": input_vars,
+        "target_vars": dataloader_config["target_vars"],
+        "extra_vars": dataloader_config.get("extra_vars"),
+        "state_init_vars": dataloader_config.get("state_vars"),
+    }
+    common = {"time_coord": TIME_COORD, "episode_coord": EPISODE_DIM, "convert_xr_to_jnp": False, **loader_vars}
 
     if "state_vars" in dataloader_config.keys():
+        train_dl = segmented_train_dataloader(train_parts, time_dep_train_loader_kwargs(dataloader_config, input_vars))
         # Validation samples are whole episodes.
         # The stores are contiguous in time, but a profile NaN beyond the store's
         # forward-fill hold would either be stitched over or drop the whole episode under drop_segment.
@@ -496,41 +559,162 @@ def get_time_dep_dataloaders(
             if v in ds_val
         )
         ds_val = mask_to_largest_contiguous_segment(ds_val, val_vars)
-
-        segment_length = [dataloader_config["segment_length_train"], dataloader_config["segment_length_val"]]
-        segment_overlap = [dataloader_config["segment_overlap_train"], dataloader_config["segment_overlap_val"]]
+        (val_dl,) = make_dataloaders(
+            datasets=(ds_val,),
+            **common,
+            batch_size=dataloader_config["batch_size"],
+            segment_length=dataloader_config["segment_length_val"],
+            segment_overlap=dataloader_config["segment_overlap_val"],
+            shuffle=False,
+            # drop_slice_any only clears the leading and trailing padding of the masked episodes
+            nan_handling="drop_slice_any",
+            # Pad the ragged final batch so the jitted eval step keeps one shape, consumers trim the duplicates
+            drop_last=False,
+            pad_last=True,
+        )
     else:
-        # Segments only apply to time-dependent (state-carrying) dataloaders
-        segment_length = None
-        segment_overlap = 0
-
-    train_dl, val_dl = make_dataloaders(
-        datasets=(ds_train, ds_val),
-        time_coord=TIME_COORD,
-        episode_coord=EPISODE_DIM,
-        input_vars=input_vars,
-        target_vars=dataloader_config["target_vars"],
-        extra_vars=dataloader_config.get("extra_vars"),
-        state_init_vars=dataloader_config.get("state_vars"),
-        batch_size=dataloader_config["batch_size"],
-        segment_length=segment_length,
-        segment_overlap=segment_overlap,
-        shuffle=[True, False],
-        convert_xr_to_jnp=False,  # Needed to keep the coords for calculating loss
-        # Every shot is one contiguous 1 kHz segment (organize_data.check_uniform_timebase),
-        # so NaN only marks the trailing padding and the profile slices beyond the store's forward-fill hold.
-        # drop_segment discards the train segments touching those,
-        # val episodes were already masked to their longest contiguous run above,
-        # drop_slice_any there only clears the leading and trailing padding.
-        nan_handling=["drop_segment", "drop_slice_any"],
-        # Keep every batch the same shape so the jitted train step never
-        # retraces on a ragged final batch (whose static xr metadata is not
-        # comparable across calls). Train drops the ragged tail (reshuffled
-        # every epoch, so no data is permanently lost), val pads it and
-        # consumers trim the duplicates.
-        drop_last=[True, False],
-        pad_last=[False, True],
-    )
+        # Time-independent samples: each part is stacked into timeslices, so merging the 0D parts costs no padding of note
+        train_dl, val_dl = make_dataloaders(
+            datasets=(merge_parts(train_parts), ds_val),
+            **common,
+            batch_size=dataloader_config["batch_size"],
+            shuffle=[True, False],
+            drop_last=[True, False],
+            pad_last=[False, True],
+        )
     attach_normalizer_fit_ds(train_dl, normalizer_fit_ds)
     # The validation set doubles as the test set (see resolve_case_datasets)
     return ds_val, train_dl, val_dl, val_dl
+
+
+def time_dep_train_loader_kwargs(dataloader_config: dict, input_vars: list[str]) -> dict:
+    """popsim make_dataloaders kwargs of a time-dependent case's training dataloader."""
+    return {
+        "time_coord": TIME_COORD,
+        "episode_coord": EPISODE_DIM,
+        "input_vars": input_vars,
+        "target_vars": dataloader_config["target_vars"],
+        "extra_vars": dataloader_config.get("extra_vars"),
+        "state_init_vars": dataloader_config["state_vars"],
+        "batch_size": dataloader_config["batch_size"],
+        "segment_length": dataloader_config["segment_length_train"],
+        "segment_overlap": dataloader_config["segment_overlap_train"],
+        "shuffle": True,
+        "convert_xr_to_jnp": False,  # Needed to keep the coords for calculating loss
+        # Every shot is one contiguous 1 kHz segment (organize_data.check_uniform_timebase),
+        # so NaN only marks the trailing padding and the profile slices beyond the store's forward-fill hold.
+        # drop_segment discards the segments touching an interior NaN,
+        # while the partial segments at a shot's end are forward-filled with epsilon-padded times and kept
+        "nan_handling": "drop_segment",
+        # Keep every batch the same shape so the jitted train step never
+        # retraces on a ragged final batch (whose static xr metadata is not
+        # comparable across calls). The ragged tail is dropped,
+        # reshuffled every epoch, so no data is permanently lost
+        "drop_last": True,
+        "pad_last": False,
+    }
+
+
+def segmented_train_dataloader(train_parts: list[xr.Dataset | None], loader_kwargs: dict) -> DataLoader:
+    """The training dataloader popsim builds on the parts merged into one dataset, without ever merging them.
+
+    Merged, every shot is NaN-padded to the longest shot of any part (a DIII-D shot is 20x a MAST one).
+    Instead each part is segmented on its own, and the segments are merged and put back in popsim's order.
+    The only coupling between episodes in popsim's segmenting is the time axis length T:
+    windows start every segment_length - segment_overlap steps from an episode's first all-finite slice,
+    up to T - segment_length, and a window reaching past the episode's last all-finite slice is forward-filled and kept.
+    So a shot of trimmed length L gets window starts up to min(T - segment_length, L - 1), and T depends on the other parts.
+    Merged, ds_source_idx (broadcast over the whole time axis) keeps every column up to the merged length less the smallest shift.
+    A room-keeper episode, finite over min(that T, the part's longest L + segment_length - 1) steps,
+    gives every shot of its part the same window starts, and its own segments are dropped.
+    The samples are then concatenated in popsim's window-major order (window, then episode in part order),
+    so the shuffled batches are the merged ones too (see tests/modules/test_segmented_dataloader.py).
+    The list is consumed: each part is released (set to None) once segmented,
+    so the raw parts and the segments never all sit in memory at once.
+    """
+    segment_length = loader_kwargs["segment_length"]
+    training_vars = sorted(
+        {
+            *loader_kwargs["input_vars"],
+            *loader_kwargs["target_vars"],
+            *loader_kwargs["state_init_vars"],
+            *(loader_kwargs["extra_vars"] or []),
+        }
+    )
+    if "ds_source_idx" not in training_vars:
+        raise ValueError("segmented_train_dataloader relies on the time-broadcast ds_source_idx being a training variable")
+    shot_lengths = [_trimmed_shot_lengths(part, training_vars) for part in train_parts]
+    merged_length = max(part.sizes[TIME_DIM] for part in train_parts)
+    smallest_shift = min(int(shifts.min()) for shifts, _ in shot_lengths if shifts.size)
+    merged_time_length = merged_length - smallest_shift
+
+    part_samples = []
+    for part_idx, (_, lengths) in enumerate(shot_lengths):
+        part = train_parts[part_idx]
+        train_parts[part_idx] = None
+        if ROOM_KEEPER_SHOT in part[EPISODE_DIM].values:
+            raise ValueError(f"Shot {ROOM_KEEPER_SHOT} is reserved for the room-keeper episode")
+        if not lengths.size:
+            continue
+        keeper_length = min(merged_time_length, int(lengths.max()) + segment_length - 1)
+        part_kept = concat_with_nan_padding([part[training_vars], _room_keeper(part, training_vars, keeper_length)], concat_dim=EPISODE_DIM)
+        del part
+        (part_dl,) = make_dataloaders(datasets=(part_kept.drop_vars(TIME_DIM),), **loader_kwargs)
+        del part_kept
+        part_samples.append(part_dl.ds)
+        training_metadata = part_dl.metadata
+
+    # Each part's samples are window-major already, its shots in part order with the room-keeper last in every window,
+    # so popsim's merged order is one slice per (window, part), each cut short of the room-keeper
+    windows = np.unique(np.concatenate([samples["input_batch"].values for samples in part_samples]))
+    blocks = []
+    for window in windows:
+        for samples in part_samples:
+            window_idxs = samples["input_batch"].values
+            start, stop = np.searchsorted(window_idxs, window, side="left"), np.searchsorted(window_idxs, window, side="right")
+            if stop > start and samples[EPISODE_DIM].values[stop - 1] == ROOM_KEEPER_SHOT:
+                stop -= 1
+            if stop > start:
+                blocks.append(samples.isel(sample=slice(start, stop)))
+    if not blocks:
+        raise ValueError("All samples were dropped due to NaN values. Cannot create DataLoader.")
+    merged_samples = xr.concat(blocks, dim="sample", coords="different", compat="equals")
+    del blocks, part_samples
+    return DataLoader(
+        XarrayPreppedDataset(merged_samples, training_metadata),
+        batch_size=loader_kwargs["batch_size"],
+        shuffle=loader_kwargs["shuffle"],
+        drop_last=loader_kwargs["drop_last"],
+        pad_last=loader_kwargs["pad_last"],
+    )
+
+
+def _trimmed_shot_lengths(part: xr.Dataset, training_vars: list[str]) -> tuple[np.ndarray, np.ndarray]:
+    """Per shot with an all-finite slice: popsim's leading shift, and the trimmed length from it to the last all-finite slice."""
+    mask_all_finite = np.ones((part.sizes[EPISODE_DIM], part.sizes[TIME_DIM]), dtype=bool)
+    for name in training_vars:
+        da = part[name]
+        if TIME_DIM not in da.dims:
+            da = da.broadcast_like(part[TIME_COORD])
+        finite = np.isfinite(da.transpose(EPISODE_DIM, TIME_DIM, ...).values)
+        mask_all_finite &= finite.reshape(finite.shape[0], finite.shape[1], -1).all(axis=-1)
+    mask_valid_shot = mask_all_finite.any(axis=1)
+    mask_all_finite = mask_all_finite[mask_valid_shot]
+    first = np.argmax(mask_all_finite, axis=1)
+    last = mask_all_finite.shape[1] - 1 - np.argmax(mask_all_finite[:, ::-1], axis=1)
+    return first, last + 1 - first
+
+
+def _room_keeper(part: xr.Dataset, training_vars: list[str], length: int) -> xr.Dataset:
+    """One episode of zeros in every training variable over length steps, on the part's other dims and shot-free coords."""
+    data_vars = {}
+    for name in training_vars:
+        other_dims = [dim for dim in part[name].dims if dim not in (EPISODE_DIM, TIME_DIM)]
+        shape = (1, length, *(part.sizes[dim] for dim in other_dims))
+        data_vars[name] = ((EPISODE_DIM, TIME_DIM, *other_dims), np.zeros(shape, dtype=part[name].dtype))
+    time = np.nanmin(part[TIME_COORD].values) + UNIFORM_TIMEBASE_DT * np.arange(length)
+    coords = {EPISODE_DIM: [ROOM_KEEPER_SHOT], TIME_COORD: ((EPISODE_DIM, TIME_DIM), time[np.newaxis, :])}
+    for coord_name, coord in part.coords.items():
+        if coord_name not in coords and EPISODE_DIM not in coord.dims and TIME_DIM not in coord.dims:
+            coords[coord_name] = coord
+    return xr.Dataset(data_vars, coords=coords)

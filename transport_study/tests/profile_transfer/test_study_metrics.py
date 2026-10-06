@@ -14,7 +14,7 @@ import xarray as xr
 
 from transport_study import RADIAL_DIM
 from transport_study.config import RHO_GRID
-from transport_study.modules.trb_utils import CHI_ERROR_VARS, CHI_GRAD_RHO_MAX
+from transport_study.modules.trb_utils import CHI_ERROR_VARS, GRAD_RHO_MAX
 from transport_study.orchestration.case_metrics import (
     case_metrics_path,
     compute_and_save_case_metrics,
@@ -172,14 +172,14 @@ class TestComputeCaseTimesliceMetrics:
 
     def test_gradient_error_beyond_rho_max_is_masked(self, patched_eval):
         # GP gradient targets disagree with the (perfect-value) prediction only
-        # beyond CHI_GRAD_RHO_MAX, where the mask must zero the contribution
+        # beyond GRAD_RHO_MAX, where the mask must zero the contribution
         rho_mid = 0.5 * (RHO_GRID[:-1] + RHO_GRID[1:])
         ne_grad = np.full(len(RHO_GRID), -1.0)
         te_grad = np.full(len(RHO_GRID), -2.0)
         # Corrupt the gradient targets only where every midpoint average of
         # adjacent points is beyond the mask
         edge = RHO_GRID > 0.97
-        assert rho_mid[np.flatnonzero(edge)[0] - 1] >= CHI_GRAD_RHO_MAX
+        assert rho_mid[np.flatnonzero(edge)[0] - 1] >= GRAD_RHO_MAX
         ne_grad[edge] = 50.0
         te_grad[edge] = 50.0
 

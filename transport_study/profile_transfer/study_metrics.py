@@ -5,7 +5,7 @@ joined back to the device datasets for the measurement error bars, GP-fit gradie
 Each test timeslice gets three metrics:
 
 - metric_value: value chi integrated over rho, summed over the ne and Te channels
-- metric_grad: gradient chi at the rho midpoints, masked to rho below CHI_GRAD_RHO_MAX, summed over the channels
+- metric_grad: gradient chi at the rho midpoints, masked to rho below GRAD_RHO_MAX, summed over the channels
 - metric_combined: metric_value + gradient_weight * metric_grad, the validation loss itself
 
 and a shot-stage label (rampup / flattop / rampdown, with an aux-heating flag subdividing the flattop).
