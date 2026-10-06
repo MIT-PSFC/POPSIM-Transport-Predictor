@@ -230,6 +230,9 @@ class _StubStudy:
     def result_path(self, case) -> Path:
         return self.result_dir / str(case) / "result_data.nc"
 
+    def is_borrowed(self, case) -> bool:
+        return False
+
     def make_train_config(self, case):
         return SimpleNamespace(loss_config=dict(LOSS_CONFIG))
 

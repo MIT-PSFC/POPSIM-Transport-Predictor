@@ -1,5 +1,7 @@
 """Shared helpers for the study TrainRunBuilders."""
 
+from pathlib import Path
+
 import equinox as eqx
 import jax
 import jax.numpy as jnp
@@ -125,7 +127,13 @@ def chi_sigma_floors(device: str) -> dict[str, float]:
 
 
 def restore_from_checkpoint(module, checkpoint_dir: str):
-    """module with every leaf restored from the best checkpoint in checkpoint_dir, module supplies the pytree structure."""
+    """module with every leaf restored from the best checkpoint in checkpoint_dir, module supplies the pytree structure.
+
+    A missing dir raises instead of being created by the checkpoint manager,
+    since it may sit in another study's working dir, which a restore must never write (see orchestration/lineage.py).
+    """
+    if not Path(checkpoint_dir).is_dir():
+        raise FileNotFoundError(f"No checkpoint dir to restore from at {checkpoint_dir}")
     return restore_model(create_default_checkpoint_manager(checkpoint_dir), module)
 
 

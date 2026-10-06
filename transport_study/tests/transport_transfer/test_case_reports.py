@@ -45,6 +45,7 @@ def test_scalar_prereq_case_gets_a_report(tmp_path, monkeypatch):
     _scalar_result_ds().to_netcdf(result_path)
     study = SimpleNamespace(
         result_path=lambda case: result_path,
+        is_borrowed=lambda case: False,
         ANALYSIS_METRICS_MODULE=TransportStudy.ANALYSIS_METRICS_MODULE,
         ANALYSIS_REPORTS_MODULE=TransportStudy.ANALYSIS_REPORTS_MODULE,
     )

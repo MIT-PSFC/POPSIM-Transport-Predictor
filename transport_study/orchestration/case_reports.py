@@ -21,7 +21,7 @@ from matplotlib.patches import Patch
 
 from transport_study.orchestration.case_metrics import (
     StagedTimesliceMetrics,
-    case_metrics_path,
+    cached_case_metrics_path,
     case_timeslice_metrics,
 )
 from transport_study.orchestration.study import Study
@@ -101,9 +101,13 @@ def case_report_dir(figure_dir: Path, case) -> Path:
 
 
 def generate_case_report(study: Study, case, figure_dir: Path):
-    """The study's report for one case, a no-op without a result file or when the report is already on disk."""
+    """The study's report for one case.
+
+    A no-op without a result file, when the report is already on disk,
+    or for a borrowed case, whose home study renders its own report.
+    """
     result_path = study.result_path(case)
-    if not result_path.exists():
+    if not result_path.exists() or study.is_borrowed(case):
         return
     reports_module = import_module(study.ANALYSIS_REPORTS_MODULE)
     case_dir = case_report_dir(figure_dir, case)
@@ -131,13 +135,14 @@ def generate_case_reports(study: Study, figure_dir: Path):
 def analysis_case_done(study: Study, case, figure_dir: Path) -> bool:
     """Whether a case needs no more analysis work.
 
-    Its metrics cache exists and either it is the empty 'nothing valid' marker or the case report is on disk.
+    Its metrics cache exists, and either it is the empty 'nothing valid' marker,
+    the case is borrowed (no report here), or the case report is on disk.
     """
-    cache_path = case_metrics_path(study, case)
-    if not cache_path.exists():
+    cache_path = cached_case_metrics_path(study, case)
+    if cache_path is None:
         return False
     case_metrics = xr.load_dataset(cache_path)
-    if not case_metrics.data_vars:
+    if not case_metrics.data_vars or study.is_borrowed(case):
         return True
     reports_module = import_module(study.ANALYSIS_REPORTS_MODULE)
     case_dir = case_report_dir(figure_dir, case)

@@ -5,9 +5,11 @@ The identity and locked fields (see transport_study/config.py) must match on eve
 The case-grid axes are kept current by the orchestrator as the record of the study's grid.
 Orchestration fields are left out, they never change what a case produces.
 
-The [lock] table, written last, holds the study type and a stamp.
+The [lock] table, written last, holds the study type, a stamp and the parent's stamp.
 The lock is deleted whenever models or results are cleaned and written fresh with a new stamp,
 so a stamp identifies one consistent set of results.
+A child study records its parent's stamp when its own lock is created (see lineage.py),
+so a reset parent is caught by every descendant.
 """
 
 import tomllib
@@ -30,6 +32,8 @@ class ConfigLock:
     config: StudyConfig
     study_type: str
     stamp: str
+    # The parent study's stamp when this lock was created, None without a parent
+    parent_stamp: str | None
 
 
 def new_stamp() -> str:
@@ -70,13 +74,20 @@ def read_config_lock(path: Path, config_cls: type[StudyConfig]) -> ConfigLock:
             f"Config lock {path} has no [{LOCK_TABLE}] table. Clean the study (clean_models and clean_results) to recreate it."
         )
     lock_config = config_from_lock_data(config_cls, data)
-    return ConfigLock(config=lock_config, study_type=lock_table["study_type"], stamp=lock_table["stamp"])
+    return ConfigLock(
+        config=lock_config,
+        study_type=lock_table["study_type"],
+        stamp=lock_table["stamp"],
+        parent_stamp=lock_table.get("parent_stamp"),
+    )
 
 
 def write_config_lock(path: Path, lock: ConfigLock) -> None:
     """Write the lock through a uniquely named temporary file, so a concurrent reader never sees a partial lock."""
     lock_data = lock.config.toml_data(LOCK_ROLES)
     lock_data[LOCK_TABLE] = {"study_type": lock.study_type, "stamp": lock.stamp}
+    if lock.parent_stamp is not None:
+        lock_data[LOCK_TABLE]["parent_stamp"] = lock.parent_stamp
     tmp_path = path.with_name(f"{path.name}.{new_stamp()}.tmp")
     with open(tmp_path, "w") as f:
         toml.dump(lock_data, f)

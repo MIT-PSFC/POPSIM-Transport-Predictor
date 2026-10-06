@@ -142,12 +142,25 @@ def collected_metrics_path(study: Study) -> Path:
 
 
 def case_metrics_path(study: Study, case) -> Path:
-    """Per-case stage-aggregate cache, next to the case's result file.
+    """Per-case stage-aggregate cache, always in this study's own result dir.
 
+    A borrowed case's result file sits in its home study (see orchestration/lineage.py), which this study never writes.
     An empty dataset marks 'computed, but no valid timeslices',
     so parallel analysis jobs can signal completion either way.
     """
-    return study.result_path(case).parent / CASE_METRICS_FILENAME
+    return study.result_dir / str(case) / CASE_METRICS_FILENAME
+
+
+def cached_case_metrics_path(study: Study, case) -> Path | None:
+    """The case's metrics cache, this study's own or else, read-only, the one its home study wrote next to the result file.
+
+    None when neither exists yet.
+    """
+    home_cache_path = study.result_path(case).parent / CASE_METRICS_FILENAME
+    for cache_path in (case_metrics_path(study, case), home_cache_path):
+        if cache_path.exists():
+            return cache_path
+    return None
 
 
 def compute_and_save_case_metrics(study: Study, case) -> xr.Dataset:
@@ -157,10 +170,11 @@ def compute_and_save_case_metrics(study: Study, case) -> xr.Dataset:
     A result file without valid timeslices caches an empty dataset so the work is not retried.
     A case without a result file returns an empty dataset without caching, results may still appear later.
     """
-    cache_path = case_metrics_path(study, case)
-    if cache_path.exists():
-        return xr.load_dataset(cache_path)
+    existing_cache_path = cached_case_metrics_path(study, case)
+    if existing_cache_path is not None:
+        return xr.load_dataset(existing_cache_path)
 
+    cache_path = case_metrics_path(study, case)
     result_path = study.result_path(case)
     if not result_path.exists():
         return xr.Dataset()

@@ -6,7 +6,8 @@ import math
 import os
 import shutil
 import time
-from dataclasses import dataclass, fields
+from collections import Counter
+from dataclasses import dataclass, fields, replace
 from itertools import product
 from pathlib import Path
 from typing import Annotated, ClassVar
@@ -27,8 +28,10 @@ from pydantic import Field, field_serializer, field_validator, model_validator
 
 from transport_study import PACKAGE_ROOT, TIME_DIM
 from transport_study.config import (
+    ROLE_TABLES,
     CaseAxis,
     FieldRole,
+    Identity,
     Orchestration,
     StudyConfig,
     config,
@@ -44,6 +47,7 @@ from transport_study.orchestration.config_lock import (
     read_config_lock,
     write_config_lock,
 )
+from transport_study.orchestration.lineage import StudyArchive
 from transport_study.orchestration.organize_data import (
     TrainingData,
     get_loaded_shot_count,
@@ -174,6 +178,8 @@ class CaseGridConfig(StudyConfig):
     Field roles (identity, locked, case axis, orchestration) are explained in transport_study/config.py.
     """
 
+    # A study of the same type under the same working_dir_base whose cases this study borrows (see orchestration/lineage.py)
+    parent_study: Identity[str | None] = None
     # Organization for datasets and wandb projects
     working_dir_base: Orchestration[Path] = Field(
         default_factory=lambda: Path(os.environ.get("PTPS_WORKING_DIR_BASE", str(PACKAGE_ROOT / "popsim_studies" / "working_dir")))
@@ -462,13 +468,15 @@ class Study:
     ####################
     # PATHING / NAMING #
     ####################
+    # The three paths every read of a case's artifacts goes through, routed to the study the case lives in (case_home)
+
     def trained_model_dir(self, case: Case) -> Path:
-        """Given a case, return the path where the trained model checkpoints for that case should be stored."""
-        return Path(self.model_dir) / str(case)
+        """The case's checkpoint dir, in the working dir of the study it lives in."""
+        return self.case_home(case).model_dir / str(case)
 
     def result_path(self, case: Case) -> Path:
-        """Given a case, return the path where the results for that case should be stored."""
-        return Path(self.result_dir) / str(case) / "result_data.nc"
+        """The case's result file, in the working dir of the study it lives in."""
+        return self.case_home(case).result_path(str(case))
 
     def _latest_checkpoint_dir_info(self, case: Case) -> tuple[int, float] | None:
         """(epoch, mtime) of the newest checkpoint of the case,
@@ -499,9 +507,8 @@ class Study:
         return Path(self.result_dir) / "collected_results.nc"
 
     def tuned_config_path(self, case: Case) -> Path:
-        """Given a case, return the path where the tuned hyperparameters for that case should be stored"""
-        hyperparam_case = case.get_hyperparam_prereq()
-        return Path(self.model_dir) / str(hyperparam_case) / "tuned_config.yaml"
+        """The tuned hyperparameters of the case's hyperparam case, in the working dir of the study that case lives in."""
+        return self.trained_model_dir(case.get_hyperparam_prereq()) / "tuned_config.yaml"
 
     def wandb_project_name(self, case: Case) -> str:
         """Given a case, return the wandb project name to use for that case"""
@@ -590,7 +597,10 @@ class Study:
             )
 
         if clean_sweeps:
-            project_names = {self.wandb_project_name(case) for case in self.cases if case.is_hyperparam_case()}
+            # Only this study's own sweeps, a borrowed hyperparam case's sweep belongs to its home study
+            project_names = {
+                self.wandb_project_name(case) for case in self.cases if case.is_hyperparam_case() and not self.is_borrowed(case)
+            }
             run_clean_sweeps(project_names)
 
         for directory in [self.model_dir, self.result_dir, self.figure_dir]:
@@ -1051,24 +1061,30 @@ class Study:
         before it can be relaunched: its result file may already be written but
         not yet visible across nodes, and relaunching in that window submits a
         duplicate job for a finished case.
+
+        Borrowed cases (see case_home) are only waited on, their home study trains them.
+        The ancestor chain is reloaded every pass, so a reset ancestor stops the loop.
         """
         unfinished = self.get_unfinished_cases()
         # train job name -> monotonic time the job was last seen in the queue
         last_in_flight: dict[str, float] = {}
         while unfinished:
+            self.refresh_lineage()
+            borrowed = [case for case in unfinished if self.is_borrowed(case)]
+            local = [case for case in unfinished if not self.is_borrowed(case)]
             if enable_parallelism:
                 running_job_names = get_running_job_names()
                 if running_job_names is None:
                     logger.warning("Could not query SLURM job state, waiting before trying again...")
                     time.sleep(ORCHESTRATION_POLL_INTERVAL_S)
                     continue
-                self.kill_stuck_jobs(unfinished)
-                self._kill_stuck_agents(unfinished)
-                self._kill_long_pending_jobs(unfinished)
+                self.kill_stuck_jobs(local)
+                self._kill_stuck_agents(local)
+                self._kill_long_pending_jobs(local)
             else:
                 running_job_names = set()
 
-            runnable = [case for case in unfinished if self.check_prereq_satisfied(case)]
+            runnable = [case for case in local if self.check_prereq_satisfied(case)]
             now = time.monotonic()
             in_flight, in_grace, to_launch = [], [], []
             for case in runnable:
@@ -1079,11 +1095,13 @@ class Study:
                     in_grace.append(case)
                 else:
                     to_launch.append(case)
-            n_blocked = len(unfinished) - len(runnable)
+            n_blocked = len(local) - len(runnable)
+            waiting = Counter(self.case_home(case).name for case in borrowed)
+            waiting_summary = "".join(f", {n} waiting on {name}" for name, n in waiting.items())
             logger.opt(colors=True).info(
                 f"<bold><green>{len(unfinished)} cases remain</green></bold> "
                 f"({len(in_flight)} in flight, {len(in_grace)} awaiting results, "
-                f"{len(to_launch)} ready to launch, {n_blocked} blocked on prereqs)"
+                f"{len(to_launch)} ready to launch, {n_blocked} blocked on prereqs{waiting_summary})"
             )
 
             for case in to_launch:
@@ -1108,6 +1126,7 @@ class Study:
         """
         if not self.check_data_requirements(case):
             raise ValueError(f"Case {case} does not have the required data to run. This should have been caught earlier!")
+        self._require_local(case)
         if self.result_path(case).exists():
             logger.warning(f"Case {case} already has results, skipping.")
             return
@@ -1132,6 +1151,7 @@ class Study:
 
     def _ensure_hyperparams_ready(self, case: Case, skip_tuning: bool, enable_parallelism: bool) -> bool:
         """Ensure tuned config exists. Returns True if ready to proceed to training."""
+        self._require_local(case)
         tuned_config_path = self.tuned_config_path(case)
         if tuned_config_path.exists():
             logger.debug(f"Tuned config found at {tuned_config_path}")
@@ -1188,6 +1208,7 @@ class Study:
 
     def _write_tuned_config(self, case: Case, train_config: TrainConfig):
         """Write a train config to the tuned config path for the given case."""
+        self._require_local(case)
         tuned_config_path = self.tuned_config_path(case)
         tuned_config_path.parent.mkdir(parents=True, exist_ok=True)
         with open(tuned_config_path, "w") as f:
@@ -1231,6 +1252,7 @@ class Study:
         that partition's remaining per-user slots (its QOS GPU allowance minus
         jobs already there), bounded by the user-wide job ceiling.
         """
+        self._require_local(case)
         train_config = self.make_train_config(case)
         # Remove the test_eval_suite_config since that's for final results only.
         # Trials get the same wall-clock budget as production jobs, making the
@@ -1308,6 +1330,7 @@ class Study:
             raise ValueError(
                 f"Case {case} is not a possible case to run, check the logic in the Case dataclass to see why this is. This should have been caught earlier!"
             )
+        self._require_local(case)
 
         # Only reached when no result file exists and no job for this case is
         # running (see _no_blocking_jobs), so every call is a fresh (re)launch.
@@ -1612,24 +1635,39 @@ class Study:
         self.log_dir = self.working_dir / "logs"
 
         self.working_dir.mkdir(parents=True, exist_ok=True)
-        self.lock = self._open_config_lock()
+        # Ancestor grids are rebuilt only when their recorded axes change, see _load_archive
+        self._ancestor_case_names: dict[tuple, frozenset[str]] = {}
+        parent = self._load_parent_archive()
+        self.lock = self._open_config_lock(parent)
         self.cases = self.make_cases(config.get_instance())
+        self.archive = StudyArchive(
+            name=self.name,
+            working_dir=self.working_dir,
+            stamp=self.lock.stamp,
+            parent=parent,
+            case_names=frozenset(str(case) for case in self.cases),
+        )
+        # str(case) -> the study it lives in, cleared whenever the ancestor chain is reloaded
+        self._case_homes: dict[str, StudyArchive] = {}
 
         self.log_dir.mkdir(parents=True, exist_ok=True)
         log_path = self.log_dir / f"{os.getpid()}_run_study.log"
-        logger.add(log_path)
+        self.log_sink_id = logger.add(log_path)
 
         logger.info("INITIALIZING STUDY")
         logger.info(f"Study name: {self.name}")
         logger.info(f"Working directory base: {config.working_dir_base}")
         logger.info(f"Total number of cases: {len(self.cases)}")
+        if parent is not None:
+            homes = Counter(self.case_home(case).name for case in self.cases)
+            logger.info(f"Case homes: {dict(homes)} ({homes[self.name]} train here, the rest are borrowed)")
         logger.info(f"Target test set size: {config.target_test_set_size}")
         logger.info(f"Dataset paths: {config.dataset_paths}")
         logger.info(f"Target device: {config.target_device}")
         for axis_field in config.fields_with_role(FieldRole.CASE_AXIS):
             logger.info(f"{axis_field}: {getattr(config, axis_field)}")
 
-    def _open_config_lock(self) -> ConfigLock:
+    def _open_config_lock(self, parent: StudyArchive | None) -> ConfigLock:
         """Check the current config against the study's config lock, or write the lock on the study's first run.
 
         The lock pins the identity and locked fields (see transport_study/config.py),
@@ -1644,7 +1682,12 @@ class Study:
                     f"Study {self.name} has no config lock, but {[str(d) for d in stale_dirs]} hold artifacts of an unknown setup.\n"
                     "Clean the study (clean_models and clean_results) to start it over."
                 )
-            lock = ConfigLock(config=config.get_instance(), study_type=self.STUDY_TYPE, stamp=new_stamp())
+            lock = ConfigLock(
+                config=config.get_instance(),
+                study_type=self.STUDY_TYPE,
+                stamp=new_stamp(),
+                parent_stamp=parent.stamp if parent is not None else None,
+            )
             write_config_lock(lock_path, lock)
             return lock
 
@@ -1658,15 +1701,125 @@ class Study:
                 f"Study {self.name} was locked under a different config, these fields changed:\n{details}\n"
                 "Revert them, or clean the study (clean_models and clean_results) to start over under the new config."
             )
+        if parent is not None:
+            self._check_parent_stamp(self.name, lock.parent_stamp, parent)
         return lock
 
     def record_case_grid(self) -> None:
         """Rewrite the config lock when the case-grid axes changed, so it records the grid of the latest orchestrator run.
 
+        Descendant studies read that record to know which cases this study will train.
         Only run_study calls this, analysis jobs and plotting entry points never change the record.
         """
         current = config.get_instance()
         if not current.differing_fields(self.lock.config, FieldRole.CASE_AXIS):
             return
-        self.lock = ConfigLock(config=current, study_type=self.lock.study_type, stamp=self.lock.stamp)
+        self.lock = ConfigLock(config=current, study_type=self.lock.study_type, stamp=self.lock.stamp, parent_stamp=self.lock.parent_stamp)
         write_config_lock(self.working_dir / CONFIG_LOCK_FILENAME, self.lock)
+
+    ###########
+    # LINEAGE #
+    ###########
+    @staticmethod
+    def _check_parent_stamp(child_name: str, recorded_stamp: str | None, parent: StudyArchive) -> None:
+        """Raise when the parent was reset after the child's lock recorded its stamp."""
+        if recorded_stamp != parent.stamp:
+            raise RuntimeError(
+                f"Study {parent.name} was reset after study {child_name} was created on top of it, "
+                f"so every case {child_name} borrowed or trained from it is stale.\n"
+                f"Clean {child_name} (clean_models and clean_results) to start it over on {parent.name}'s current results."
+            )
+
+    def _load_parent_archive(self) -> StudyArchive | None:
+        """The read-only chain of studies above this one, None without a parent_study."""
+        if config.parent_study is None:
+            return None
+        return self._load_archive(config.parent_study, descendants=(self.name,))
+
+    def _load_archive(self, name: str, descendants: tuple[str, ...]) -> StudyArchive:
+        """An ancestor's read-only view, from its config lock, with the chain above it.
+
+        No Study object is built for an ancestor: the global config can only be loaded once per process,
+        and Study.__init__ writes into its working dir.
+        Its grid is rebuilt here under the global config, which is safe because every locked field is equal.
+        """
+        if name in descendants:
+            raise RuntimeError(f"Study {name} is its own ancestor through {' -> '.join(descendants)}")
+        working_dir = Path(config.working_dir_base) / name
+        lock_path = working_dir / CONFIG_LOCK_FILENAME
+        if not lock_path.exists():
+            raise RuntimeError(f"Parent study {name} has no config lock at {lock_path}, run it before its descendants.")
+        lock = read_config_lock(lock_path, self.Config)
+        if lock.study_type != self.STUDY_TYPE:
+            raise RuntimeError(
+                f"Parent study {name} is a {lock.study_type} study, a {self.STUDY_TYPE} study can only borrow from its own type."
+            )
+        changed = config.differing_fields(lock.config, FieldRole.LOCKED)
+        if changed:
+            details = "\n".join(
+                f"  {field}: {name} has {getattr(lock.config, field)!r}, {self.name} has {getattr(config, field)!r}" for field in changed
+            )
+            raise RuntimeError(
+                f"Study {self.name} can only borrow from {name} when every locked config field matches, these differ:\n{details}"
+            )
+
+        # read_config_lock built it with self.Config, a CaseGridConfig
+        ancestor_config = lock.config
+        assert isinstance(ancestor_config, CaseGridConfig)
+        parent = None
+        if ancestor_config.parent_study is not None:
+            parent = self._load_archive(ancestor_config.parent_study, descendants=(*descendants, name))
+            self._check_parent_stamp(name, lock.parent_stamp, parent)
+
+        axes = lock.config.toml_data((FieldRole.CASE_AXIS,))[ROLE_TABLES[FieldRole.CASE_AXIS]]
+        grid_key = (name, lock.stamp, json.dumps(axes, sort_keys=True, default=str))
+        if grid_key not in self._ancestor_case_names:
+            self._ancestor_case_names[grid_key] = frozenset(str(case) for case in self.make_cases(lock.config))
+        return StudyArchive(
+            name=name, working_dir=working_dir, stamp=lock.stamp, parent=parent, case_names=self._ancestor_case_names[grid_key]
+        )
+
+    def refresh_lineage(self) -> None:
+        """Reload the ancestor chain from the ancestors' config locks, every orchestration pass.
+
+        A reset ancestor stops the run, and a changed ancestor grid moves cases between borrowed and local.
+        """
+        if self.archive.parent is None:
+            return
+        parent = self._load_parent_archive()
+        assert parent is not None
+        self._check_parent_stamp(self.name, self.lock.parent_stamp, parent)
+        self.archive = replace(self.archive, parent=parent)
+        self._case_homes.clear()
+
+    def case_home(self, case: Case) -> StudyArchive:
+        """The study whose working dir holds this case's checkpoints, tuned config and result.
+
+        Root-first: the root-most ancestor that claims the case (has its result, or its current grid holds it),
+        this study when no ancestor does.
+        A study nearer than the home that holds its own copy means two studies of the chain disagree on the case,
+        which raises rather than mixing their artifacts.
+        """
+        case_name = str(case)
+        if case_name in self._case_homes:
+            return self._case_homes[case_name]
+        chain = self.archive.chain()
+        home_idx = next((idx for idx in reversed(range(1, len(chain))) if chain[idx].claims(case_name)), 0)
+        home = chain[home_idx]
+        for study in chain[:home_idx]:
+            own_copy = study.has_result(case_name) or (study is self.archive and (self.model_dir / case_name).exists())
+            if own_copy:
+                raise RuntimeError(
+                    f"Study {study.name} holds its own copy of case {case_name}, but its ancestor {home.name} now claims it.\n"
+                    f"Drop the case from {home.name}'s grid, or clean {study.name} so it borrows the case instead."
+                )
+        self._case_homes[case_name] = home
+        return home
+
+    def is_borrowed(self, case: Case) -> bool:
+        return self.case_home(case) is not self.archive
+
+    def _require_local(self, case: Case) -> None:
+        """Guard on every path that writes a case's artifacts, a borrowed case's home is never written."""
+        if self.is_borrowed(case):
+            raise RuntimeError(f"Case {case} belongs to study {self.case_home(case).name}, study {self.name} must not write it.")
