@@ -40,7 +40,7 @@ PROFILE_SCALE_FLOOR = 1e-2
 CHI_SIGMA_FLOOR_PERCENTILE = 5.0
 # Profile gradients count below this rho, in the training losses, the validation chi and the analysis chi alike.
 # Beyond it the GP fits extrapolate into the pedestal and scrape-off layer, where the measured gradients are unreliable
-GRAD_RHO_MAX = 0.8
+GRAD_RHO_MAX = 0.9
 # Floor added to |target| in the relative error of the scalar study results, in the signal's units.
 # Each sits below the signal's typical size so the error stays relative,
 # Wtot medians are 0.03-0.05 MJ on C-Mod and MAST
@@ -251,12 +251,16 @@ def scalar_study_results(eval_data: EvalData, signal: str, pred_var: str) -> xr.
 
     Target vs predicted signal, absolute and relative error per timeslice,
     and their per-shot time integrals (NaN-padded entries ignored).
+    A non-finite prediction diverged: its errors are NaN, never inf,
+    and error_diverged_ts (1 diverged, 0 finite, NaN without a target) counts it instead.
     """
     targ = unstack_samples(eval_data.input_ds[signal])
     pred = unstack_samples(eval_data.output_ds[pred_var])
     time_2d = unstack_samples(eval_data.input_ds[TIME_COORD])
 
-    error_abs_ts = xr.apply_ufunc(np.abs, pred - targ)
+    mask_pred_finite = xr.apply_ufunc(np.isfinite, pred)
+    error_diverged_ts = (~mask_pred_finite).astype(float).where(targ.notnull())
+    error_abs_ts = xr.apply_ufunc(np.abs, pred - targ).where(mask_pred_finite)
     error_rel_ts = error_abs_ts / (xr.apply_ufunc(np.abs, targ) + SCALAR_REL_ERROR_FLOORS[signal])
     ds = xr.Dataset(
         data_vars={
@@ -264,6 +268,7 @@ def scalar_study_results(eval_data: EvalData, signal: str, pred_var: str) -> xr.
             f"{signal}_pred": pred,
             "error_abs_ts": error_abs_ts,
             "error_rel_ts": error_rel_ts,
+            "error_diverged_ts": error_diverged_ts,
             "error_abs_shot": integrate_error_over_time(error_abs_ts, time_2d),
             "error_rel_shot": integrate_error_over_time(error_rel_ts, time_2d),
         }

@@ -102,12 +102,14 @@ def run_summary_analysis(
     layout: ComparisonLayout,
     families: tuple[ComparisonFamily, ...],
     table_spec: ComparisonTableSpec,
+    figures_from_metrics: bool = False,
 ) -> None:
     """Analysis of a study whose collect_results is the per-case scalar summary (dims case_idx).
 
     The per-case stage metrics and reports fan out over SLURM with parallelism,
     the serial paths after it skip the completed cases.
-    Then the comparison figures over the collected results, the case reports and the per-axis comparison tables.
+    Then the comparison figures, the case reports and the per-axis comparison tables.
+    The figures read the collected results, or with figures_from_metrics the stage-resolved collected metrics.
     """
     if enable_parallelism:
         run_case_analysis_parallel(study)
@@ -115,9 +117,10 @@ def run_summary_analysis(
     # Stage-resolved time-averaged errors of every finished case, cached to collected_metrics.nc
     metrics_ds = collect_metrics(study)
     results_ds = xr.load_dataset(study.collected_results_path())
+    figures_ds = metrics_ds if figures_from_metrics else results_ds
     for family in families:
         log_section(family.title)
-        comparison_figures(results_ds, layout, family, study.figure_dir)
+        comparison_figures(figures_ds, layout, family, study.figure_dir)
 
     log_section("Case reports")
     generate_case_reports(study, study.figure_dir)

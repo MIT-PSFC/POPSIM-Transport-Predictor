@@ -8,6 +8,7 @@ Columns combine the stage-resolved TIME-AVERAGED errors from
 collected_metrics.nc (per-timeslice means, free of the shot-duration confound
 in the raw time-integrated per-shot errors) with the time-integrated
 medians from collected_results.nc.
+The headline metric also gets its best checkpoint's value and its std over the top-K checkpoints (orchestration.topk_results).
 
 A flat case_stats.csv with one row per case and every column is written next to the tables for ad hoc analysis.
 The frame, table and csv writing is the shared orchestration.tables machinery, this module only declares the spec.
@@ -53,12 +54,15 @@ SPEC = ComparisonTableSpec(
     },
     columns=(
         ("rel err (time avg)", "rel_mean_all"),
+        ("best", "rel_mean_best_all"),
+        ("ckpt std", "rel_mean_ckpt_std_all"),
         ("rampup", "rel_mean_rampup"),
         ("flattop", "rel_mean_flattop"),
         ("flattop ohmic", "rel_mean_flattop_ohmic"),
         ("flattop aux", "rel_mean_flattop_aux"),
         ("rampdown", "rel_mean_rampdown"),
         ("abs err (time avg) [MJ]", "abs_mean_all"),
+        ("diverged", "diverged_mean_all"),
         ("rel err (integral, med)", "err_rel_shot_med"),
         ("abs err (integral, med)", "err_abs_shot_med"),
     ),

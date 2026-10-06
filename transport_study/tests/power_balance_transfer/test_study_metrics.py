@@ -11,18 +11,25 @@ import xarray as xr
 
 from transport_study.orchestration.case_metrics import aggregate_case_metrics
 from transport_study.orchestration.stages import STAGE_AGG_NAMES
-from transport_study.orchestration.tables import write_summary_comparison_tables
+from transport_study.orchestration.tables import (
+    TOPK_SUFFIXES,
+    write_summary_comparison_tables,
+)
+from transport_study.orchestration.topk_results import aggregate_topk_results
 from transport_study.power_balance_transfer import study_metrics
 from transport_study.power_balance_transfer.case_reports import shot_pdf
 from transport_study.power_balance_transfer.study_metrics import (
     METRIC_NAMES,
     compute_case_timeslice_metrics,
-    shot_time_averaged_errors,
+    shot_time_averaged,
 )
 from transport_study.power_balance_transfer.tables import SPEC
 
 N_TS = 100
 SHOTS = [101, 102]
+# The best checkpoint's errors are the constants below, the other retained checkpoint's are twice them
+BEST_EPOCH = 7
+OTHER_EPOCH = 3
 
 
 @pytest.fixture()
@@ -43,16 +50,20 @@ def device_ds() -> xr.Dataset:
     )
 
 
-@pytest.fixture()
-def result_ds() -> xr.Dataset:
-    """Synthetic case result file: constant abs error 0.1 on shot 101,
-    0.3 on shot 102, with the last 20 timeslices of shot 102 NaN-padded."""
+def _step_result(error_scale: float, n_diverged_101: int = 0) -> xr.Dataset:
+    """One checkpoint's study_results: constant abs error 0.1 on shot 101 and 0.3 on shot 102 times error_scale,
+    the last 20 timeslices of shot 102 NaN-padded, and the last n_diverged_101 of shot 101 diverged."""
     time = np.arange(N_TS) * 1e-3
     targ = np.full((N_TS, 2), 1.0)
-    err = np.stack([np.full(N_TS, 0.1), np.full(N_TS, 0.3)], axis=1)
+    err = np.stack([np.full(N_TS, 0.1), np.full(N_TS, 0.3)], axis=1) * error_scale
     err[80:, 1] = np.nan
     targ[80:, 1] = np.nan
     pred = targ + err
+    diverged = np.where(np.isfinite(targ), 0.0, np.nan)
+    if n_diverged_101:
+        pred[N_TS - n_diverged_101 :, 0] = np.nan
+        err[N_TS - n_diverged_101 :, 0] = np.nan
+        diverged[N_TS - n_diverged_101 :, 0] = 1.0
 
     return xr.Dataset(
         data_vars={
@@ -60,6 +71,7 @@ def result_ds() -> xr.Dataset:
             "energy_mhd_MJ_pred": (("time_idx", "shot"), pred),
             "error_abs_ts": (("time_idx", "shot"), err),
             "error_rel_ts": (("time_idx", "shot"), err / 1.1),
+            "error_diverged_ts": (("time_idx", "shot"), diverged),
         },
         coords={
             "shot": SHOTS,
@@ -67,6 +79,12 @@ def result_ds() -> xr.Dataset:
             "ds_source": ("shot", ["testdev", "testdev"]),
         },
     )
+
+
+@pytest.fixture()
+def result_ds() -> xr.Dataset:
+    """Synthetic case result file of two retained checkpoints, the best one with the constant errors."""
+    return aggregate_topk_results({BEST_EPOCH: _step_result(1.0), OTHER_EPOCH: _step_result(2.0)}, BEST_EPOCH)
 
 
 @pytest.fixture()
@@ -86,9 +104,10 @@ def test_compute_case_timeslice_metrics(ts_metrics):
     assert ts_metrics.aux_heated[shot_101][40:60].all()
     assert not ts_metrics.aux_heated[shot_101][:40].any()
 
-    # Errors ride along unchanged
-    assert np.allclose(ts_metrics.err_abs[shot_101], 0.1)
-    assert np.allclose(ts_metrics.err_abs[~shot_101], 0.3)
+    # Errors ride along unchanged, one column per retained checkpoint
+    assert np.allclose(ts_metrics.best("abs")[shot_101], 0.1)
+    assert np.allclose(ts_metrics.best("abs")[~shot_101], 0.3)
+    assert np.allclose(ts_metrics.metric("abs")[shot_101], [0.2, 0.1])
 
 
 def test_first_real_timeslice_after_leading_padding_is_kept(monkeypatch, device_ds, result_ds):
@@ -120,15 +139,38 @@ def test_aggregate_case_metrics(ts_metrics):
     assert by_stage["rampup"] + by_stage["flattop"] + by_stage["rampdown"] == by_stage["all"]
 
     # Pooled mean over both shots sits between the per-shot constants
-    all_mean = float(case_ds["abs_mean"].sel(stage="all"))
-    assert 0.1 < all_mean < 0.3
+    best_mean = float(case_ds["abs_mean_best"].sel(stage="all"))
+    assert 0.1 < best_mean < 0.3
+
+    # Each checkpoint scores the case on its own, the other checkpoint's errors are twice the best one's
+    other_mean = 2.0 * best_mean
+    assert np.isclose(case_ds["abs_mean"].sel(stage="all"), 0.5 * (best_mean + other_mean))
+    assert np.isclose(case_ds["abs_mean_ckpt_std"].sel(stage="all"), 0.5 * (other_mean - best_mean))
+    assert np.isclose(case_ds["diverged_mean"].sel(stage="all"), 0.0)
 
 
-def test_shot_time_averaged_errors(ts_metrics):
-    shots, avg_abs, avg_rel, n_ts = shot_time_averaged_errors(ts_metrics)
+def test_diverged_timeslices_stay_records_and_count_as_the_fraction(monkeypatch, device_ds):
+    """A rollout that diverges keeps its timeslices as records:
+    NaN in the errors, which the error means skip, and 1 in the diverged flag, whose stage mean is the fraction."""
+    monkeypatch.setattr(study_metrics, "load_stage_dataset", lambda device: device_ds)
+    n_diverged = 15
+    result_ds = aggregate_topk_results({BEST_EPOCH: _step_result(1.0, n_diverged), OTHER_EPOCH: _step_result(2.0)}, BEST_EPOCH)
+
+    ts_metrics = compute_case_timeslice_metrics(result_ds)
+    case_ds = aggregate_case_metrics(ts_metrics, METRIC_NAMES)
+
+    assert len(ts_metrics) == N_TS + 80
+    assert np.isclose(case_ds["diverged_mean_best"].sel(stage="all"), n_diverged / (N_TS + 80))
+    assert np.isclose(case_ds["diverged_mean"].sel(stage="all"), 0.5 * n_diverged / (N_TS + 80))
+    assert case_ds["abs_count_best"].sel(stage="all") == N_TS + 80 - n_diverged
+
+
+def test_shot_time_averaged(ts_metrics):
+    shots, avg_abs, n_ts = shot_time_averaged(ts_metrics, "abs")
+    _, avg_rel, _ = shot_time_averaged(ts_metrics, "rel")
 
     assert list(shots) == SHOTS
-    # Time-averaged errors are duration-free: the constants come back exactly
+    # Time-averaged errors are duration-free: the best checkpoint's constants come back exactly
     assert np.allclose(avg_abs, [0.1, 0.3])
     assert np.allclose(avg_rel, np.array([0.1, 0.3]) / 1.1)
     assert list(n_ts) == [N_TS, 80]
@@ -170,13 +212,12 @@ def collected_datasets() -> tuple[xr.Dataset, xr.Dataset]:
     # Metrics cover every case except the last (simulates a diverged case)
     n_metrics = n - 1
     metrics = xr.Dataset(coords={"case_idx": np.arange(n_metrics), "stage": list(STAGE_AGG_NAMES)})
-    for metric in ("abs", "rel"):
-        for stat in ("mean", "std", "med"):
-            metrics[f"{metric}_{stat}"] = (
+    for metric in METRIC_NAMES:
+        for suffix in TOPK_SUFFIXES:
+            metrics[f"{metric}_mean{suffix}"] = (
                 ("case_idx", "stage"),
                 rng.uniform(0.01, 1.0, (n_metrics, len(STAGE_AGG_NAMES))),
             )
-        metrics[f"{metric}_count"] = (("case_idx", "stage"), np.full((n_metrics, len(STAGE_AGG_NAMES)), 10))
     return results, metrics
 
 
@@ -204,6 +245,8 @@ def test_write_comparison_tables(tmp_path, collected_datasets):
     assert "transformer" in model_table
     assert "rel err (time avg)" in model_table
     assert "flattop ohmic" in model_table
+    assert "| ckpt std |" in model_table
+    assert "| diverged |" in model_table
 
     # Axes with a single value (training_data, domain_adaptation) produce no tables
     assert not (tables_dir / "training_data").exists()

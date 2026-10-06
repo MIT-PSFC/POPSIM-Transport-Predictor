@@ -1,8 +1,10 @@
 """Case-comparison figures of transport transfer study results (see orchestration.comparison_figures).
 
-The power balance study's 2x2 error grid over the transport case-grid fields
-(no data_normalization, plus geometry_builder, torax_state and multiobjective).
-Consumes the per-case scalar summary of TransportStudy.collect_results (collected_results.nc).
+A grid with one row per metric (combined chi, relative error, diverged fraction, see study_metrics)
+and one column per shot stage (all, rampup, flattop, flattop ohmic, flattop aux, rampdown),
+each line the top-K mean with the top-K std as its error bar.
+Consumes the stage-resolved collected metrics (collected_metrics.nc, dims case_idx x stage),
+over the transport case-grid fields (no data_normalization, plus geometry_builder, torax_state and multiobjective).
 """
 
 from transport_study.modules.transport_predictor.module import SUBMODULE_MODEL_TYPES
@@ -13,16 +15,14 @@ from transport_study.orchestration.comparison_figures import (
     MULTIOBJECTIVE_LABELS,
     ORDER_COLORS,
     ORDER_LABELS,
+    STAGE_LABELS,
     TD_COLORS,
     TD_LABELS,
     ComparisonFamily,
     ComparisonLayout,
+    stage_series_stats,
 )
-from transport_study.power_balance_transfer.plotting import (
-    DOMAIN_LABELS,
-    METRIC_LABELS,
-    summary_series_stats,
-)
+from transport_study.orchestration.stages import STAGE_AGG_NAMES
 
 MODEL_COLORS = {
     "transformer": "#ffb347",
@@ -40,11 +40,18 @@ MODEL_LABELS = {
     "torax-qlknn": "TORAX QLKNN",
 }
 
+# Rows of the comparison grid
+METRIC_LABELS = {
+    "combined": "Chi (value + gradient)",
+    "rel": "Relative error",
+    "diverged": "Diverged fraction",
+}
+
 LAYOUT = ComparisonLayout(
     row_labels=METRIC_LABELS,
-    col_labels=DOMAIN_LABELS,
-    cell_size=(4.6, 3.4),
-    series_stats=summary_series_stats,
+    col_labels={stage: STAGE_LABELS[stage] for stage in STAGE_AGG_NAMES},
+    cell_size=(3.4, 2.9),
+    series_stats=stage_series_stats,
     grid_fields=(
         "model_type",
         "training_data",

@@ -7,6 +7,7 @@ along that axis. Columns combine the stage-resolved TIME-AVERAGED errors from
 collected_metrics.nc (per-timeslice means, free of the shot-duration confound
 in the raw time-integrated per-shot errors) with the time-integrated medians
 from collected_results.nc.
+The headline metric also gets its best checkpoint's value and its std over the top-K checkpoints (orchestration.topk_results).
 
 A flat case_stats.csv with one row per case and every column is written next to the tables for ad hoc analysis.
 The frame, table and csv writing is the shared orchestration.tables machinery, this module only declares the spec.
@@ -14,7 +15,7 @@ The frame, table and csv writing is the shared orchestration.tables machinery, t
 
 from transport_study.modules.transport_predictor.module import SUBMODULE_MODEL_TYPES
 from transport_study.orchestration.tables import ComparisonTableSpec
-from transport_study.power_balance_transfer.study_metrics import METRIC_NAMES
+from transport_study.transport_transfer.study_metrics import METRIC_NAMES
 
 CASE_FIELD_ORDER = (
     "model_type",
@@ -55,13 +56,19 @@ SPEC = ComparisonTableSpec(
         "target_shot_order": "order_{}",
     },
     columns=(
+        ("combined chi (time avg)", "combined_mean_all"),
+        ("best", "combined_mean_best_all"),
+        ("ckpt std", "combined_mean_ckpt_std_all"),
+        ("rampup", "combined_mean_rampup"),
+        ("flattop", "combined_mean_flattop"),
+        ("flattop ohmic", "combined_mean_flattop_ohmic"),
+        ("flattop aux", "combined_mean_flattop_aux"),
+        ("rampdown", "combined_mean_rampdown"),
+        ("value chi (time avg)", "value_mean_all"),
+        ("grad chi (time avg)", "grad_mean_all"),
         ("rel err (time avg)", "rel_mean_all"),
-        ("rampup", "rel_mean_rampup"),
-        ("flattop", "rel_mean_flattop"),
-        ("flattop ohmic", "rel_mean_flattop_ohmic"),
-        ("flattop aux", "rel_mean_flattop_aux"),
-        ("rampdown", "rel_mean_rampdown"),
         ("abs err (time avg)", "abs_mean_all"),
+        ("diverged", "diverged_mean_all"),
         ("rel err (integral, med)", "err_rel_shot_med"),
         ("abs err (integral, med)", "err_abs_shot_med"),
     ),

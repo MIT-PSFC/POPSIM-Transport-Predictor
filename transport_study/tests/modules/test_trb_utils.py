@@ -1,10 +1,16 @@
-"""Tests for the dataloader helpers shared by every study's TrainRunBuilder."""
+"""Tests for the helpers shared by every study's TrainRunBuilder."""
+
+from types import SimpleNamespace
 
 import numpy as np
+import pytest
 import xarray as xr
 
 from transport_study import EPISODE_DIM, TIME_COORD, TIME_DIM
-from transport_study.modules.trb_utils import mask_to_largest_contiguous_segment
+from transport_study.modules.trb_utils import (
+    mask_to_largest_contiguous_segment,
+    scalar_study_results,
+)
 
 nan = np.nan
 
@@ -68,3 +74,21 @@ def test_per_shot_vars_keep_their_dims():
     # force_drop_nans-style ds.where would broadcast this to (shot, time)
     assert ds["hazard"].dims == (EPISODE_DIM,)
     assert np.allclose(ds["hazard"].values, [0.0])
+
+
+@pytest.mark.parametrize("bad_value", [np.nan, np.inf])
+def test_scalar_results_flag_non_finite_predictions(bad_value):
+    """A non-finite prediction is flagged diverged with NaN errors, never inf, and a missing target is neither."""
+    targ = np.array([[1.0, 1.0, 1.0, nan]])
+    pred = np.array([[1.5, bad_value, 1.0, nan]])
+    coords = {EPISODE_DIM: [7], TIME_DIM: np.arange(4), TIME_COORD: ((EPISODE_DIM, TIME_DIM), 1e-3 * np.arange(4)[None, :])}
+    dims = (EPISODE_DIM, TIME_DIM)
+    stack = {"sample": dims}
+    input_ds = xr.Dataset({"energy_mhd_MJ": (dims, targ)}, coords=coords).assign_coords(ds_source="mast").stack(stack)
+    output_ds = xr.Dataset({"output.energy_mhd_MJ_pred": (dims, pred)}, coords=coords).stack(stack)
+
+    ds = scalar_study_results(SimpleNamespace(input_ds=input_ds, output_ds=output_ds), "energy_mhd_MJ", "output.energy_mhd_MJ_pred")
+
+    np.testing.assert_array_equal(ds["error_diverged_ts"].values[0], [0.0, 1.0, 0.0, nan])
+    np.testing.assert_array_equal(np.isnan(ds["error_abs_ts"].values[0]), [False, True, False, True])
+    assert np.isfinite(ds["error_abs_shot"].values).all()

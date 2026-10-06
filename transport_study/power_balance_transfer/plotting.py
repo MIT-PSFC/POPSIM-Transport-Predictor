@@ -1,7 +1,8 @@
 """Case-comparison figures of power balance transfer study results (see orchestration.comparison_figures).
 
 A 2x2 grid with one row per error kind (absolute / relative)
-and one column per error domain (per-shot time-integrated / per-timeslice).
+and one column per error domain (per-shot time-integrated / per-timeslice),
+each line the top-K mean of the domain mean with the top-K std as its error bar.
 Consumes the per-case scalar summary of PowerBalanceStudy.collect_results (collected_results.nc):
 dims case_idx, the case-grid coords and the err_E_D_S data vars.
 """
@@ -55,8 +56,8 @@ MODEL_LABELS = {
 
 
 def summary_series_stats(ds: xr.Dataset, metric: str, domain: str) -> tuple[np.ndarray, np.ndarray]:
-    """Per-case mean and std of one error kind and domain of a per-case scalar summary."""
-    return ds[f"{metric}_{domain}_mean"].values, ds[f"{metric}_{domain}_std"].values
+    """Per-case top-K mean and top-K std of one error kind's mean over one domain of a per-case scalar summary."""
+    return ds[f"{metric}_{domain}_mean"].values, ds[f"{metric}_{domain}_mean_ckpt_std"].values
 
 
 LAYOUT = ComparisonLayout(

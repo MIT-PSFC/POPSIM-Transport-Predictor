@@ -275,7 +275,7 @@ class TransportPredictorTRB(TrainRunBuilder):
         )
 
     @staticmethod
-    def get_test_eval_suite(suite_config) -> EvaluationSuite:
+    def get_test_eval_suite(suite_config) -> EvaluationSuite | None:
         """The profile study's test suite, scored on fresh profile timeslices only like the losses.
 
         It already handles the time-dependent outputs (renaming the stepper's _input dims back)

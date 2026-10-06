@@ -12,10 +12,11 @@ from transport_study import EPISODE_DIM, TIME_COORD, TIME_DIM
 from transport_study.config import StudyConfig, load_config
 from transport_study.modules.trb_utils import integrate_error_over_time
 from transport_study.orchestration.study import real_timeslice_mask, write_netcdf_atomic
+from transport_study.orchestration.topk_results import aggregate_topk_results
 from transport_study.power_balance_transfer.study_metrics import (
     compute_case_timeslice_metrics,
     load_stage_dataset,
-    shot_time_averaged_errors,
+    shot_time_averaged,
 )
 from transport_study.tests.datasets.synthetic_store import DT, SHOT_LENGTHS, T_START
 from transport_study.tests.stubs import StubCase
@@ -24,20 +25,23 @@ N_PAD_REPEATS = 20
 
 
 def padded_result(errors_real: np.ndarray, time_real: np.ndarray, shot: int) -> xr.Dataset:
-    """One-shot result file whose final timeslice repeats N_PAD_REPEATS times at a clamped time, as the rollout batches pad."""
+    """One-shot, one-checkpoint result file whose final timeslice repeats N_PAD_REPEATS times at a clamped time,
+    as the rollout batches pad."""
     errors = np.concatenate([errors_real, np.full(N_PAD_REPEATS, errors_real[-1])])
     time = np.concatenate([time_real, np.full(N_PAD_REPEATS, time_real[-1])])
     dims = (EPISODE_DIM, TIME_DIM)
-    return xr.Dataset(
+    step_ds = xr.Dataset(
         {
             "error_abs_ts": (dims, errors[None, :]),
             "error_rel_ts": (dims, 0.1 * errors[None, :]),
+            "error_diverged_ts": (dims, np.zeros((1, errors.size))),
             "error_abs_shot": ((EPISODE_DIM,), [1.0]),
             "error_rel_shot": ((EPISODE_DIM,), [0.1]),
             TIME_COORD: (dims, time[None, :]),
         },
         coords={EPISODE_DIM: [shot]},
     ).assign_coords(ds_source=(EPISODE_DIM, ["mast"]))
+    return aggregate_topk_results({1: step_ds}, best_step=1)
 
 
 def test_real_timeslice_mask_drops_padded_tails():
@@ -71,8 +75,8 @@ def test_shot_time_integral_unchanged_by_padding():
     ds_padded = padded_result(errors_real, time_real, shot=101)
     ds_unpadded = padded_result(errors_real, time_real, shot=101).isel({TIME_DIM: slice(0, errors_real.size)})
 
-    integral_padded = integrate_error_over_time(ds_padded["error_abs_ts"], ds_padded[TIME_COORD])
-    integral_unpadded = integrate_error_over_time(ds_unpadded["error_abs_ts"], ds_unpadded[TIME_COORD])
+    integral_padded = integrate_error_over_time(ds_padded["error_abs_ts"].squeeze("ckpt"), ds_padded[TIME_COORD])
+    integral_unpadded = integrate_error_over_time(ds_unpadded["error_abs_ts"].squeeze("ckpt"), ds_unpadded[TIME_COORD])
 
     np.testing.assert_allclose(integral_padded.values, integral_unpadded.values)
 
@@ -102,7 +106,7 @@ def test_stage_metrics_count_each_real_timeslice_once(synthetic_device_stores):
     time_real = T_START + DT * np.arange(errors_real.size)
 
     ts_metrics = compute_case_timeslice_metrics(padded_result(errors_real, time_real, shot))
-    _shots, avg_abs, _avg_rel, n_ts = shot_time_averaged_errors(ts_metrics)
+    _shots, avg_abs, n_ts = shot_time_averaged(ts_metrics, "abs")
 
     assert len(ts_metrics.shot) == errors_real.size
     assert n_ts.tolist() == [errors_real.size]

@@ -6,9 +6,11 @@ import xarray as xr
 
 from transport_study.orchestration.stages import STAGE_AGG_NAMES
 from transport_study.orchestration.tables import (
+    TOPK_SUFFIXES,
     summary_case_stats_frame,
     write_summary_comparison_tables,
 )
+from transport_study.power_balance_transfer.study_metrics import METRIC_NAMES
 from transport_study.power_balance_transfer.tables import SPEC
 
 
@@ -37,11 +39,13 @@ def _results_ds() -> xr.Dataset:
 
 
 def _metrics_ds() -> xr.Dataset:
+    """Per-stage means offset by 10 per metric, the best checkpoint's by 100 more and the top-K stds by 1000."""
     n_stages = len(STAGE_AGG_NAMES)
     data_vars = {}
-    for i, metric in enumerate(("abs", "rel")):
+    for i, metric in enumerate(METRIC_NAMES):
         values = np.arange(3 * n_stages, dtype=float).reshape(3, n_stages) + 10 * i
-        data_vars[f"{metric}_mean"] = (("case_idx", "stage"), values)
+        for suffix, offset in zip(TOPK_SUFFIXES, (0.0, 100.0, 1000.0), strict=True):
+            data_vars[f"{metric}_mean{suffix}"] = (("case_idx", "stage"), values + offset)
     return xr.Dataset(data_vars=data_vars, coords={"case_idx": [0, 1, 2], "stage": list(STAGE_AGG_NAMES)})
 
 
@@ -53,6 +57,9 @@ def test_case_stats_frame_excludes_submodules_and_merges_metrics():
     df = df.set_index("case_idx")
     assert df.loc[0, "abs_mean_all"] == 0.0
     assert df.loc[1, "rel_mean_all"] == float(len(STAGE_AGG_NAMES)) + 10
+    # The best checkpoint's and the top-K std columns come from their own variables
+    assert df.loc[1, "rel_mean_best_all"] == float(len(STAGE_AGG_NAMES)) + 110
+    assert df.loc[1, "rel_mean_ckpt_std_all"] == float(len(STAGE_AGG_NAMES)) + 1010
 
 
 def test_write_comparison_tables(tmp_path):

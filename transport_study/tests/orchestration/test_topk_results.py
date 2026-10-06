@@ -1,4 +1,4 @@
-"""Tests for orchestration/topk_results.py, the top-K checkpoint result averaging.
+"""Tests for orchestration/topk_results.py, the top-K checkpoint results.
 
 Aggregation is driven with small hand-built xr.Datasets shaped like the
 study_results outputs (data vars error_abs_ts / error_rel_shot / energy_mhd_MJ_pred /
@@ -23,13 +23,14 @@ from popsim.ml.checkpointing import (
 
 import transport_study.orchestration.study as study_module
 from transport_study.orchestration.topk_results import (
+    BEST_EPOCH_ATTR,
+    CKPT_DIM,
     aggregate_topk_results,
     compute_topk_study_results,
     topk_checkpoint_steps,
+    topk_statistics,
 )
 from transport_study.tests.stubs import StubCase
-
-CKPT_STD_012 = float(np.std([0.0, 1.0, 2.0]))
 
 
 def _result_ds(error_offset: float, pred_value: float) -> xr.Dataset:
@@ -51,84 +52,48 @@ def _three_checkpoint_results() -> dict[int, xr.Dataset]:
     return {10: _result_ds(0.0, 10.0), 40: _result_ds(1.0, 40.0), 25: _result_ds(2.0, 25.0)}
 
 
-def test_aggregate_error_vars_are_checkpoint_means():
-    """Build per-step datasets for 3 fake checkpoints whose error variables
-    differ by known offsets. aggregate_topk_results must replace every data
-    variable whose name contains 'error' with the elementwise mean over the
-    3 checkpoints, under the ORIGINAL variable name (downstream consumers
-    like _summarize_case_errors read these names unchanged), and the values
-    must match a hand-computed mean."""
-    out = aggregate_topk_results(_three_checkpoint_results(), best_step=25)
-    expected_ts = np.arange(6, dtype=float).reshape(2, 3) + 1.0
-    assert np.allclose(out["error_abs_ts"].values, expected_ts)
-    assert np.allclose(out["error_rel_shot"].values, [2.0, 3.0])
-
-
-def test_aggregate_adds_ckpt_std_companions():
-    """Same setup as the mean test: every error variable gains a
-    <name>_ckpt_std companion holding the per-point std over checkpoints
-    (ddof 0), and non-error variables gain no companion."""
-    out = aggregate_topk_results(_three_checkpoint_results(), best_step=25)
-    assert np.allclose(out["error_abs_ts_ckpt_std"].values, CKPT_STD_012)
-    assert np.allclose(out["error_rel_shot_ckpt_std"].values, CKPT_STD_012)
-    assert "energy_mhd_MJ_pred_ckpt_std" not in out.data_vars
-    assert "energy_mhd_MJ_targ_ckpt_std" not in out.data_vars
-
-
-def test_aggregate_pred_and_targ_from_best_checkpoint():
-    """Give each fake checkpoint a distinct energy_mhd_MJ_pred. The aggregated
-    dataset's energy_mhd_MJ_pred and energy_mhd_MJ_targ must be bit-identical to the
-    best checkpoint's (predictions are never averaged across checkpoints,
-    a mean trajectory would be smoother than any actual model), where
-    'best' is the step passed as best_step, not the lowest or highest."""
+def test_aggregate_stacks_error_vars_over_checkpoints(tmp_path: Path):
+    """Every error variable keeps each checkpoint's values on CKPT_DIM, epochs in order, as float32,
+    the predictions and targets stay the best checkpoint's (a mean trajectory would be smoother than any model),
+    and the ckpt coord and best epoch survive a netcdf round trip."""
     per_step = _three_checkpoint_results()
     out = aggregate_topk_results(per_step, best_step=25)
+    assert out[CKPT_DIM].values.tolist() == [10, 25, 40]
+    assert out["error_abs_ts"].dtype == np.float32
+    np.testing.assert_allclose(out["error_abs_ts"].sel({CKPT_DIM: 40}).values, np.arange(6).reshape(2, 3) + 1.0)
+    np.testing.assert_allclose(out["error_rel_shot"].sel({CKPT_DIM: 25}).values, [3.0, 4.0])
+    assert CKPT_DIM not in out["energy_mhd_MJ_pred"].dims
     assert (out["energy_mhd_MJ_pred"].values == 25.0).all()
-    assert (out["energy_mhd_MJ_targ"].values == per_step[25]["energy_mhd_MJ_targ"].values).all()
 
-
-def test_aggregate_records_checkpoint_epochs_in_attrs(tmp_path: Path):
-    """The aggregated dataset attrs must carry result_checkpoint_epochs
-    (sorted list of retained epochs) and result_checkpoint_best_epoch, and
-    both must survive a to_netcdf round trip."""
-    out = aggregate_topk_results(_three_checkpoint_results(), best_step=25)
-    assert out.attrs["result_checkpoint_epochs"] == [10, 25, 40]
-    assert out.attrs["result_checkpoint_best_epoch"] == 25
     nc_path = tmp_path / "result.nc"
     out.to_netcdf(nc_path)
     back = xr.load_dataset(nc_path)
-    assert list(back.attrs["result_checkpoint_epochs"]) == [10, 25, 40]
-    assert int(back.attrs["result_checkpoint_best_epoch"]) == 25
+    assert back[CKPT_DIM].values.tolist() == [10, 25, 40]
+    assert int(back.attrs[BEST_EPOCH_ATTR]) == 25
 
 
-def test_aggregate_nan_handling():
-    """A timeslice that is NaN in one checkpoint but finite in the others
-    averages over the finite ones (skipna), while a timeslice that is NaN
-    in every checkpoint (the padded tail) stays NaN in both the mean and
-    the _ckpt_std companion."""
-    per_step = _three_checkpoint_results()
-    for step in per_step:
-        per_step[step]["error_abs_ts"].values[0, 0] = np.nan
-    per_step[40]["error_abs_ts"].values[1, 2] = np.nan
-    out = aggregate_topk_results(per_step, best_step=25)
-    assert np.isnan(out["error_abs_ts"].values[0, 0])
-    assert np.isnan(out["error_abs_ts_ckpt_std"].values[0, 0])
-    # Element (1, 2) is 5.0 + offset, finite only in the offset 0 and 2 checkpoints
-    assert np.isclose(out["error_abs_ts"].values[1, 2], 6.0)
+def test_topk_statistics_are_best_mean_and_std_of_the_case_scores():
+    """One case score per checkpoint gives the top-K mean, the best epoch's score and the std over checkpoints (ddof 0).
+    A checkpoint whose score is NaN (nothing finite to score) is skipped by the mean and std."""
+    per_ckpt = xr.Dataset({"score": (CKPT_DIM, [1.0, 2.0, 4.0, np.nan])}, coords={CKPT_DIM: [10, 25, 40, 55]})
+    out = topk_statistics(per_ckpt, best_epoch=25)
+    assert np.isclose(out["score"], 7.0 / 3.0)
+    assert np.isclose(out["score_best"], 2.0)
+    assert np.isclose(out["score_ckpt_std"], np.std([1.0, 2.0, 4.0]))
 
 
-def test_compute_topk_single_checkpoint_passthrough():
-    """With max_to_keep 1 the manager retains the best step plus the latest one,
-    and compute_topk_study_results must return result_dict['test/study_results']
-    unchanged without restoring anything, recovering the old best-only
-    behavior byte for byte."""
+def test_compute_topk_single_checkpoint_keeps_the_ckpt_dim():
+    """With max_to_keep 1 nothing is restored or re-evaluated,
+    and the best result still comes back on a length-1 ckpt dim so every consumer reads one layout."""
     best_ds = _result_ds(0.0, 7.0)
     step_losses = {7: 0.1, 9: 0.5}
-    manager = SimpleNamespace(all_steps=lambda: list(step_losses), metrics=lambda step: {"loss": step_losses[step]})
+    manager = SimpleNamespace(all_steps=lambda: list(step_losses), metrics=lambda step: {"loss": step_losses[step]}, best_step=lambda: 7)
     trainer = SimpleNamespace(checkpoint_manager=manager)
     train_config = SimpleNamespace(checkpoint_max_to_keep=1)
     out = compute_topk_study_results(trainer, None, train_config, {"test/study_results": best_ds})
-    assert out is best_ds
+    assert out[CKPT_DIM].values.tolist() == [7]
+    assert out.attrs[BEST_EPOCH_ATTR] == 7
+    np.testing.assert_allclose(out["error_abs_ts"].sel({CKPT_DIM: 7}).values, best_ds["error_abs_ts"].values)
 
 
 def test_topk_steps_exclude_latest_outside_top_k(tmp_path: Path):

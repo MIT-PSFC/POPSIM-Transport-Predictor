@@ -41,6 +41,7 @@ from transport_study.orchestration.study import (
     Study,
 )
 from transport_study.orchestration.target_shots import BASE_TARGET_SHOT_ORDER
+from transport_study.orchestration.topk_results import BEST_EPOCH_ATTR, CKPT_DIM
 from transport_study.profile_transfer.case_reports import torax_relaxation_report
 from transport_study.profile_transfer.data_visualization import DataVisualization
 from transport_study.profile_transfer.plotting import (
@@ -357,14 +358,14 @@ class ProfileStudy(Study):
           domain_adaptation, freeze_shapes, geometry_builder,
           num_target_shots (identify the case)
         - shot (device shot id), ds_source (which dataset the shot came from)
-        Data variables (along record):
+        Data variables (along record), top-K means over the retained checkpoints:
         - err_abs_shot / err_rel_shot: time-integrated combined (ne+Te) error for the shot
           (duration-weighted, longer shots score larger at equal instantaneous error)
         - ne_err_abs_shot / te_err_abs_shot / ne_err_rel_shot / te_err_rel_shot: per-channel
           time-integrated errors (see which channel drives a bad shot)
         - err_abs_ts_max / err_rel_ts_max: worst single timeslice in the shot
         - err_abs_ts_mean / err_rel_ts_mean: mean over the shot's timeslices
-        - n_valid_ts: number of non-NaN timeslices contributing to the shot
+        - n_valid_ts: number of non-NaN timeslices contributing to the shot, at the best checkpoint
         """
         data_var_names = [
             "err_abs_shot",
@@ -388,22 +389,25 @@ class ProfileStudy(Study):
 
             ds = xr.load_dataset(result_path)
 
-            # Reduce per-timeslice errors to per-shot summaries (worst and mean timeslice)
+            # Reduce per-timeslice errors to per-shot summaries (worst and mean timeslice) of each checkpoint,
+            # then take their top-K mean
             err_abs_ts = ds["error_abs_ts"]
             err_rel_ts = ds["error_rel_ts"]
-            per_shot = {
-                "err_abs_shot": ds["error_abs_shot"].values,
-                "err_rel_shot": ds["error_rel_shot"].values,
-                "ne_err_abs_shot": ds["ne_error_abs_shot"].values,
-                "te_err_abs_shot": ds["te_error_abs_shot"].values,
-                "ne_err_rel_shot": ds["ne_error_rel_shot"].values,
-                "te_err_rel_shot": ds["te_error_rel_shot"].values,
-                "err_abs_ts_max": err_abs_ts.max(TIME_DIM, skipna=True).values,
-                "err_rel_ts_max": err_rel_ts.max(TIME_DIM, skipna=True).values,
-                "err_abs_ts_mean": err_abs_ts.mean(TIME_DIM, skipna=True).values,
-                "err_rel_ts_mean": err_rel_ts.mean(TIME_DIM, skipna=True).values,
-                "n_valid_ts": err_abs_ts.notnull().sum(TIME_DIM).values,
+            per_shot_per_ckpt = {
+                "err_abs_shot": ds["error_abs_shot"],
+                "err_rel_shot": ds["error_rel_shot"],
+                "ne_err_abs_shot": ds["ne_error_abs_shot"],
+                "te_err_abs_shot": ds["te_error_abs_shot"],
+                "ne_err_rel_shot": ds["ne_error_rel_shot"],
+                "te_err_rel_shot": ds["te_error_rel_shot"],
+                "err_abs_ts_max": err_abs_ts.max(TIME_DIM, skipna=True),
+                "err_rel_ts_max": err_rel_ts.max(TIME_DIM, skipna=True),
+                "err_abs_ts_mean": err_abs_ts.mean(TIME_DIM, skipna=True),
+                "err_rel_ts_mean": err_rel_ts.mean(TIME_DIM, skipna=True),
             }
+            per_shot = {name: per_ckpt.mean(CKPT_DIM).values for name, per_ckpt in per_shot_per_ckpt.items()}
+            best_err_abs_ts = err_abs_ts.sel({CKPT_DIM: int(ds.attrs[BEST_EPOCH_ATTR])})
+            per_shot["n_valid_ts"] = best_err_abs_ts.notnull().sum(TIME_DIM).values
 
             shot_ids = ds["shot"].values
             n_shots = len(shot_ids)

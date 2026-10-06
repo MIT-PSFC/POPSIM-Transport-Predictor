@@ -102,8 +102,8 @@ class TransportStudy(Study):
     SWEEP_CONFIG_DIR = Path(PACKAGE_ROOT) / "transport_transfer" / "sweep_configs"
     STUDY_TYPE = "transport_transfer"
     DATA_VISUALIZATION = DataVisualization
-    # The result files carry the power balance error variables, scored by its metrics module
-    ANALYSIS_METRICS_MODULE = "transport_study.power_balance_transfer.study_metrics"
+    # Scored with the validation chi, plus the power balance error metrics
+    ANALYSIS_METRICS_MODULE = "transport_study.transport_transfer.study_metrics"
     ANALYSIS_REPORTS_MODULE = "transport_study.transport_transfer.case_reports"
     CHI_VALIDATION_LOSS = True
     TUNED_DATALOADER_KEYS = ("segment_length_train", "segment_overlap_train", "batch_size")
@@ -570,7 +570,8 @@ class TransportStudy(Study):
     ############
 
     def run_analysis(self, enable_parallelism: bool) -> None:
-        run_summary_analysis(self, enable_parallelism, LAYOUT, COMPARISON_FAMILIES, TABLE_SPEC)
+        # The figures are the stage grid of the collected metrics, the headline being the chi it was selected on
+        run_summary_analysis(self, enable_parallelism, LAYOUT, COMPARISON_FAMILIES, TABLE_SPEC, figures_from_metrics=True)
 
 
 run_study = TransportStudy.run_study

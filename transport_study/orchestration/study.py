@@ -72,7 +72,12 @@ from transport_study.orchestration.target_shots import (
     TARGET_SHOT_ORDERS,
     configured_target_split,
 )
-from transport_study.orchestration.topk_results import compute_topk_study_results
+from transport_study.orchestration.topk_results import (
+    BEST_EPOCH_ATTR,
+    CKPT_DIM,
+    compute_topk_study_results,
+    topk_statistics,
+)
 from transport_study.orchestration.wandb_utils import (
     SweepReadError,
     get_best_train_config,
@@ -327,8 +332,8 @@ class Study:
     # the study's DataVisualization class
     DATA_VISUALIZATION: ClassVar[type]
     # dotted paths of the per-case analysis modules dispatched over SLURM (see orchestration.case_analysis)
-    # The metrics module must export a compute_and_save_case_metrics function
-    # The reports module a generate_case_report and an analysis_case_done function
+    # The metrics module exports METRIC_NAMES and case_timeslice_metrics (see orchestration.case_metrics)
+    # The reports module case_report_done and render_case_report (see orchestration.case_reports)
     ANALYSIS_METRICS_MODULE: ClassVar[str]
     ANALYSIS_REPORTS_MODULE: ClassVar[str]
 
@@ -882,8 +887,9 @@ class Study:
             model_init_config=spec.model_init_config,
             loss_config=loss_config,
             optimizer_config=optimizer_config,
+            # The test suites score the validation chi too, so they share the same loss_config
             val_eval_suite_config={"loss_config": loss_config},
-            test_eval_suite_config={"result_path": str(self.result_path(case))},
+            test_eval_suite_config={"result_path": str(self.result_path(case)), "loss_config": loss_config},
         )
 
         if case.domain_adaptation == "transfer":
@@ -1469,6 +1475,8 @@ class Study:
         (error_{abs,rel}_{shot,ts}) and emits err_E_D_S scalars where E is
         'abs' or 'rel', D is 'shot' or 'ts', and S is one of mean, std, med,
         p25, p75, min, max.
+        Each statistic is computed per retained checkpoint, one case score per checkpoint,
+        then reduced by topk_statistics to err_E_D_S (the top-K mean), err_E_D_S_best and err_E_D_S_ckpt_std.
 
         The per-timeslice stats only count timeslices that advance the shot
         clock: the padded rollout tail repeats each shot's final timeslice
@@ -1484,16 +1492,20 @@ class Study:
             "abs_ts": ds["error_abs_ts"].where(real),
             "rel_ts": ds["error_rel_ts"].where(real),
         }
-        summary = {}
+        per_ckpt = {}
         for error_name, error in errors.items():
-            summary[f"err_{error_name}_mean"] = error.mean()
-            summary[f"err_{error_name}_std"] = error.std()
-            summary[f"err_{error_name}_med"] = error.median()
-            summary[f"err_{error_name}_p25"] = error.quantile(0.25).drop_vars("quantile")
-            summary[f"err_{error_name}_p75"] = error.quantile(0.75).drop_vars("quantile")
-            summary[f"err_{error_name}_min"] = error.min()
-            summary[f"err_{error_name}_max"] = error.max()
-        return xr.Dataset(summary)
+            # Every dim but the checkpoints is reduced, each checkpoint keeps its own statistics
+            error_flat = error.stack(point=[dim for dim in error.dims if dim != CKPT_DIM])
+            per_ckpt[f"err_{error_name}_mean"] = error_flat.mean("point")
+            per_ckpt[f"err_{error_name}_std"] = error_flat.std("point")
+            per_ckpt[f"err_{error_name}_med"] = error_flat.median("point")
+            per_ckpt[f"err_{error_name}_p25"] = error_flat.quantile(0.25, dim="point").drop_vars("quantile")
+            per_ckpt[f"err_{error_name}_p75"] = error_flat.quantile(0.75, dim="point").drop_vars("quantile")
+            per_ckpt[f"err_{error_name}_min"] = error_flat.min("point")
+            per_ckpt[f"err_{error_name}_max"] = error_flat.max("point")
+        # Only the checkpoint index survives as a coordinate
+        per_ckpt_ds = xr.Dataset(per_ckpt).reset_coords(drop=True)
+        return topk_statistics(per_ckpt_ds, int(ds.attrs[BEST_EPOCH_ATTR]))
 
     def restore_trainer(self, case: Case, restore_best_checkpoint: bool = True) -> tuple[Trainer, DataLoader]:
         """Restore a given case's trainer and the test dataloader"""

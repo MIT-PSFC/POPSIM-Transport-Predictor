@@ -1,9 +1,9 @@
 """Per-case reports of transport transfer study results (its ANALYSIS_REPORTS_MODULE, see orchestration.case_reports).
 
 The power balance study's shot PDF with a transport-specific page:
-the best and worst holdout shots by TIME-AVERAGED relative error,
+the best and worst holdout shots by the best checkpoint's TIME-AVERAGED chi (the validation loss),
 each page the measured vs predicted Te and ne profile evolution as (time, rho) maps,
-plus the per-timeslice error traces with the discharge stages shaded and aux-heated spans marked.
+plus the per-timeslice chi and relative error traces with the discharge stages shaded and aux-heated spans marked.
 """
 
 from pathlib import Path
@@ -29,7 +29,7 @@ from transport_study.power_balance_transfer.case_reports import (  # noqa: F401 
     shot_records,
     shot_title,
 )
-from transport_study.power_balance_transfer.study_metrics import CaseTimesliceMetrics
+from transport_study.transport_transfer.study_metrics import CaseTimesliceMetrics
 
 PROFILE_CMAPS = {"t_e_keV": "magma", "n_e_1e20": "viridis"}
 PROFILE_LABELS = {"t_e_keV": "Te [keV]", "n_e_1e20": "ne [1e20 m^-3]"}
@@ -51,7 +51,7 @@ def _shot_page(
 
     Rows 1-2: measured vs predicted Te and ne over (time, rho), each channel
     on a shared color scale taken from the measurement.
-    Row 3: per-timeslice combined absolute and relative error with the shot
+    Row 3: per-timeslice chi and combined relative error with the shot
     stages shaded and aux-heated spans marked.
     """
     shot_res = result_ds.sel({EPISODE_DIM: shot})
@@ -84,11 +84,11 @@ def _shot_page(
         cbar.ax.tick_params(colors=TEXT_COLOR, labelsize=TICK_FONTSIZE)
 
     # Error traces on the left, the right slot repeats them on a log scale
-    # (relative errors span orders of magnitude across a discharge)
+    # (the errors span orders of magnitude across a discharge)
     for ax_err, log_scale in ((axes[2, 0], False), (axes[2, 1], True)):
         style_axis(ax_err)
-        ax_err.plot(record_time, ts_metrics.err_abs[records], color="#0095ff", linewidth=1.5, label="Abs error (rho integral)")
-        ax_err.plot(record_time, ts_metrics.err_rel[records], color="#ff60ec", linewidth=1.5, label="Rel error (rho integral)")
+        ax_err.plot(record_time, ts_metrics.best("combined")[records], color="#0095ff", linewidth=1.5, label="Chi (value + gradient)")
+        ax_err.plot(record_time, ts_metrics.best("rel")[records], color="#ff60ec", linewidth=1.5, label="Rel error (rho integral)")
         ax_err.set_xlabel("Time [s]", color=TEXT_COLOR, fontsize=LABEL_FONTSIZE)
         if log_scale:
             ax_err.set_yscale("log")
@@ -100,7 +100,7 @@ def _shot_page(
     handles, _ = axes[2, 0].get_legend_handles_labels()
     axes[2, 0].legend(handles=handles + stage_handles, fontsize=TICK_FONTSIZE, loc="upper right", **LEGEND_STYLE)
 
-    title = shot_title(ts_metrics, records, shot, device, title_prefix)
+    title = shot_title(ts_metrics, records, shot, device, title_prefix, title_metrics=(("combined", "chi"), ("rel", "rel err")))
     fig.suptitle(title, color=TEXT_COLOR, fontsize=TITLE_FONTSIZE)
     return fig
 
@@ -108,6 +108,6 @@ def _shot_page(
 def render_case_report(result_ds: xr.Dataset, ts_metrics: CaseTimesliceMetrics, case_dir: Path):
     # The power_balance / p_oh / p_rad prereq cases write scalar result files, which get the power balance page
     if all(f"{signal}_targ" in result_ds for signal in PROFILE_CMAPS):
-        shot_pdf(result_ds, ts_metrics, case_dir / REPORT_FILENAME, page_fn=_shot_page)
+        shot_pdf(result_ds, ts_metrics, case_dir / REPORT_FILENAME, page_fn=_shot_page, rank_metric="combined")
     else:
         shot_pdf(result_ds, ts_metrics, case_dir / REPORT_FILENAME)

@@ -3,6 +3,7 @@
 For every finished case: a PDF of the best and worst holdout shots by TIME-AVERAGED relative error.
 The per-shot errors in the result files are raw time integrals, which penalize long shots,
 the time-averaged form removes that duration confound.
+Every page shows the best checkpoint, whose predictions the result file holds.
 Each page shows the predicted vs measured trajectory with the discharge stages shaded,
 plus the per-timeslice error traces with the aux-heated spans marked.
 """
@@ -30,7 +31,7 @@ from transport_study.plot_style import (
 )
 from transport_study.power_balance_transfer.study_metrics import (
     CaseTimesliceMetrics,
-    shot_time_averaged_errors,
+    shot_time_averaged,
 )
 
 REPORT_FILENAME = "best_worst_shots.pdf"
@@ -51,19 +52,33 @@ def shot_records(ts_metrics: CaseTimesliceMetrics, shot) -> np.ndarray:
     return records[np.argsort(ts_metrics.time[records])]
 
 
-def shot_title(ts_metrics: CaseTimesliceMetrics, records: np.ndarray, shot, device: str, title_prefix: str, unit: str = "") -> str:
-    """Page title with the time-averaged errors and the span of one shot's records."""
-    finite_rel = ts_metrics.err_rel[records][np.isfinite(ts_metrics.err_rel[records])]
-    finite_abs = ts_metrics.err_abs[records][np.isfinite(ts_metrics.err_abs[records])]
-    avg_rel = float(np.mean(finite_rel)) if len(finite_rel) else np.nan
-    avg_abs = float(np.mean(finite_abs)) if len(finite_abs) else np.nan
+def shot_title(
+    ts_metrics: CaseTimesliceMetrics,
+    records: np.ndarray,
+    shot,
+    device: str,
+    title_prefix: str,
+    unit: str = "",
+    title_metrics: tuple[tuple[str, str], ...] = (("rel", "rel err"), ("abs", "abs err")),
+) -> str:
+    """Page title with the best checkpoint's time-averaged title_metrics (name, label) and the span of one shot's records.
+
+    unit labels the abs metric.
+    """
+    averages = []
+    for name, label in title_metrics:
+        values = ts_metrics.best(name)[records]
+        finite_values = values[np.isfinite(values)]
+        average = float(np.mean(finite_values)) if len(finite_values) else np.nan
+        metric_unit = f" {unit}" if unit and name == "abs" else ""
+        averages.append(f"time-avg {label}={average:.3f}{metric_unit}")
+    n_diverged = int(np.sum(ts_metrics.best("diverged")[records] == 1))
     record_time = ts_metrics.time[records]
     duration = float(record_time[-1] - record_time[0]) if len(record_time) > 1 else 0.0
-    abs_unit = f" {unit}" if unit else ""
     return (
         f"{title_prefix}shot {shot} ({device})\n"
-        f"time-avg rel err={avg_rel:.3f}  time-avg abs err={avg_abs:.3f}{abs_unit}  "
-        f"{len(records)} timeslices over {duration:.2f} s"
+        f"{'  '.join(averages)}  "
+        f"{len(records)} timeslices ({n_diverged} diverged) over {duration:.2f} s"
     )
 
 
@@ -100,8 +115,8 @@ def _shot_page(
     ax_traj.set_ylabel(f"{signal.rsplit('_', 1)[0]} [{unit}]", color=TEXT_COLOR, fontsize=LABEL_FONTSIZE)
 
     style_axis(ax_err)
-    ax_err.plot(record_time, ts_metrics.err_abs[records], color="#0095ff", linewidth=1.5, label=f"Abs error [{unit}]")
-    ax_err.plot(record_time, ts_metrics.err_rel[records], color="#ff60ec", linewidth=1.5, label="Rel error")
+    ax_err.plot(record_time, ts_metrics.best("abs")[records], color="#0095ff", linewidth=1.5, label=f"Abs error [{unit}]")
+    ax_err.plot(record_time, ts_metrics.best("rel")[records], color="#ff60ec", linewidth=1.5, label="Rel error")
     ax_err.set_ylabel("Error", color=TEXT_COLOR, fontsize=LABEL_FONTSIZE)
     ax_err.set_xlabel("Time [s]", color=TEXT_COLOR, fontsize=LABEL_FONTSIZE)
 
@@ -117,15 +132,15 @@ def _shot_page(
     return fig
 
 
-def shot_pdf(result_ds: xr.Dataset, ts_metrics: CaseTimesliceMetrics, pdf_path: Path, page_fn=_shot_page):
-    """Best and worst holdout shot pages by time-averaged relative error.
+def shot_pdf(result_ds: xr.Dataset, ts_metrics: CaseTimesliceMetrics, pdf_path: Path, page_fn=_shot_page, rank_metric: str = "rel"):
+    """Best and worst holdout shot pages by the best checkpoint's time-averaged rank_metric.
 
     page_fn(result_ds, ts_metrics, shot, title_prefix=...) renders one shot,
-    the transport study passes its profile-evolution page.
+    the transport study passes its profile-evolution page ranked by chi.
     """
-    shots, _avg_abs, avg_rel, _n_ts = shot_time_averaged_errors(ts_metrics)
+    shots, shot_averages, _n_ts = shot_time_averaged(ts_metrics, rank_metric)
     shot_page = partial(page_fn, result_ds, ts_metrics)
-    best_worst_pdf(shots, avg_rel, shot_page, pdf_path)
+    best_worst_pdf(shots, shot_averages, shot_page, pdf_path)
 
 
 def case_report_done(case_dir: Path) -> bool:

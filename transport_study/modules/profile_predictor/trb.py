@@ -29,7 +29,9 @@ from transport_study.modules.trb_utils import (
     CHI_ERROR_VARS,
     PROFILE_SCALE_FLOOR,
     attach_normalizer_fit_ds,
+    chi_gradient,
     chi_profile_loss,
+    chi_value,
     ds_source_per_shot,
     huber_profile_loss,
     integrate_error_over_time,
@@ -56,6 +58,30 @@ RELAXATION_DT_S = 0.025
 def relaxation_numerics(n_solver_steps: int) -> dict:
     """TORAX numerics window of an n_solver_steps relaxation at the fixed RELAXATION_DT_S step."""
     return {"t_final": n_solver_steps * RELAXATION_DT_S, "fixed_dt": RELAXATION_DT_S}
+
+
+def _per_shot_sigma_floor(
+    sigma_floors: dict[str, dict[str, float]], ds_source: np.ndarray, error_var: str, shots: np.ndarray
+) -> xr.DataArray:
+    """The chi_sigma_floors entry of error_var for each shot's device, on EPISODE_DIM."""
+    floors = np.array([sigma_floors[device][error_var] for device in ds_source])
+    return xr.DataArray(floors, dims=EPISODE_DIM, coords={EPISODE_DIM: shots})
+
+
+def _profile_chi(chi_fn: Callable, profiles: tuple[xr.DataArray, ...], floor: xr.DataArray, rho: np.ndarray) -> xr.DataArray:
+    """chi_fn (trb_utils.chi_value or chi_gradient) of every timeslice of the profiles, the floor given per shot.
+
+    Evaluated on the CPU, the whole test set at once would otherwise land on the training GPU.
+    """
+
+    def chi_of_arrays(*arrays: np.ndarray) -> np.ndarray:
+        *profile_arrays, floor_array = arrays
+        with jax.default_device(jax.devices("cpu")[0]):
+            chi = chi_fn(*profile_arrays, floor_array[..., None], rho)
+        return np.asarray(chi)
+
+    core_dims = [[RADIAL_DIM]] * len(profiles)
+    return xr.apply_ufunc(chi_of_arrays, *profiles, floor, input_core_dims=[*core_dims, []])
 
 
 class ProfilePredictorTRB(TrainRunBuilder):
@@ -340,22 +366,31 @@ class ProfilePredictorTRB(TrainRunBuilder):
         return make_loss_eval_suite(ProfilePredictorTRB.get_val_loss_fn(suite_config["loss_config"]))
 
     @staticmethod
-    def get_test_eval_suite(suite_config) -> EvaluationSuite:
+    def get_test_eval_suite(suite_config) -> EvaluationSuite | None:
         """Evaluation suite for testing after training."""
         return ProfilePredictorTRB.make_test_eval_suite(suite_config, fresh_only=False)
 
     @staticmethod
-    def make_test_eval_suite(suite_config, fresh_only: bool) -> EvaluationSuite:
+    def make_test_eval_suite(suite_config, fresh_only: bool) -> EvaluationSuite | None:
         """The test suite, with fresh_only scoring only the timeslices whose target is a fresh profile.
 
         The transport study keeps forward-filled timeslices for contiguous rollouts,
         its targets there are stale measurements, so it scores with fresh_only.
+        The chi reads gradient_weight and chi_sigma_floors from the suite's loss_config.
+        None for sweep trials, which run no test evals.
         """
+        if not suite_config:
+            return None
+        gradient_weight = suite_config["loss_config"]["gradient_weight"]
+        sigma_floors = suite_config["loss_config"]["chi_sigma_floors"]
 
         def study_results(eval_data: EvalData) -> xr.Dataset:
             """Calculate final study results for profile prediction.
                 - Target vs predicted n_e_1e20 and t_e_keV profiles
                 - Per-timeslice profile-integrated absolute/relative errors
+                - Per-timeslice chi summed over the channels (error_chi_value_ts, error_chi_grad_ts),
+                  and error_chi_ts = value + gradient_weight * grad, the validation loss less the device weight
+                - error_diverged_ts: 1 where the prediction went non-finite, 0 where finite, NaN without a target
                 - Per-shot time-integrated errors
             Keeps shot and ds_source coordinates for downstream analysis.
             """
@@ -376,20 +411,30 @@ class ProfilePredictorTRB(TrainRunBuilder):
             ne_targ = unstack_samples(eval_data.input_ds["n_e_1e20"])
             te_targ = unstack_samples(eval_data.input_ds["t_e_keV"])
             time_2d = unstack_samples(eval_data.input_ds[TIME_COORD])
+            ds_source = ds_source_per_shot(eval_data.input_ds["ds_source"], ne_targ.sizes[EPISODE_DIM])
 
             # The time-dependent modules (the transport study) nest their outputs under output.
             output_prefix = "" if "ne" in eval_data.output_ds else "output."
             ne_pred = _ensure_rho_dim(unstack_samples(eval_data.output_ds[f"{output_prefix}ne"]), ne_targ)
             te_pred = _ensure_rho_dim(unstack_samples(eval_data.output_ds[f"{output_prefix}te"]), te_targ)
 
-            # Per-point profile errors
-            ne_error_abs_profile = xr.apply_ufunc(np.abs, ne_pred - ne_targ)
-            te_error_abs_profile = xr.apply_ufunc(np.abs, te_pred - te_targ)
+            # A prediction with any non-finite point in either channel diverged.
+            # Its errors are NaN, never inf, and error_diverged_ts counts it instead,
+            # outside the freshness mask like the validation divergence penalty
+            ne_pred_finite = xr.apply_ufunc(np.isfinite, ne_pred).all(RADIAL_DIM)
+            te_pred_finite = xr.apply_ufunc(np.isfinite, te_pred).all(RADIAL_DIM)
+            mask_pred_finite = ne_pred_finite & te_pred_finite
+            mask_targ_present = ne_targ.notnull().all(RADIAL_DIM) & te_targ.notnull().all(RADIAL_DIM)
+            error_diverged_ts = (~mask_pred_finite).astype(float).where(mask_targ_present)
+            mask_scored = mask_pred_finite
             if fresh_only:
                 # Stale timeslices score NaN, every error below and the shot integrals then skip them
                 mask_fresh = unstack_samples(eval_data.input_ds["fresh_profile"]) == 1
-                ne_error_abs_profile = ne_error_abs_profile.where(mask_fresh)
-                te_error_abs_profile = te_error_abs_profile.where(mask_fresh)
+                mask_scored = mask_scored & mask_fresh
+
+            # Per-point profile errors
+            ne_error_abs_profile = xr.apply_ufunc(np.abs, ne_pred - ne_targ).where(mask_scored)
+            te_error_abs_profile = xr.apply_ufunc(np.abs, te_pred - te_targ).where(mask_scored)
 
             # Softening floor scales with each profile's own peak (per timeslice)
             # instead of a fixed absolute value, so it means the same relative
@@ -412,6 +457,24 @@ class ProfilePredictorTRB(TrainRunBuilder):
             error_abs_ts = 0.5 * (ne_error_abs_ts + te_error_abs_ts)
             error_rel_ts = 0.5 * (ne_error_rel_ts + te_error_rel_ts)
 
+            # Chi of the validation loss (chi_profile_loss), summed over the channels
+            rho = ne_targ[RADIAL_DIM].values
+            shots = ne_targ[EPISODE_DIM].values
+            chi_value_ts = xr.zeros_like(error_abs_ts)
+            chi_grad_ts = xr.zeros_like(error_abs_ts)
+            for channel, pred_channel, targ_channel in (("n_e_1e20", ne_pred, ne_targ), ("t_e_keV", te_pred, te_targ)):
+                value_error_var, grad_error_var = CHI_ERROR_VARS[channel]
+                sigma = unstack_samples(eval_data.input_ds[value_error_var])
+                grad_targ = unstack_samples(eval_data.input_ds[f"{channel}_gradient"])
+                grad_sigma = unstack_samples(eval_data.input_ds[grad_error_var])
+                value_floor = _per_shot_sigma_floor(sigma_floors, ds_source, value_error_var, shots)
+                grad_floor = _per_shot_sigma_floor(sigma_floors, ds_source, grad_error_var, shots)
+                chi_value_ts = chi_value_ts + _profile_chi(chi_value, (pred_channel, targ_channel, sigma), value_floor, rho)
+                chi_grad_ts = chi_grad_ts + _profile_chi(chi_gradient, (pred_channel, targ_channel, grad_targ, grad_sigma), grad_floor, rho)
+            error_chi_value_ts = chi_value_ts.where(mask_scored)
+            error_chi_grad_ts = chi_grad_ts.where(mask_scored)
+            error_chi_ts = error_chi_value_ts + gradient_weight * error_chi_grad_ts
+
             # Integrate over time for each shot, handling NaN-padded entries safely
             ne_error_abs_shot = integrate_error_over_time(ne_error_abs_ts, time_2d)
             te_error_abs_shot = integrate_error_over_time(te_error_abs_ts, time_2d)
@@ -433,6 +496,10 @@ class ProfilePredictorTRB(TrainRunBuilder):
                     "te_error_rel_ts": te_error_rel_ts,
                     "error_abs_ts": error_abs_ts,
                     "error_rel_ts": error_rel_ts,
+                    "error_chi_value_ts": error_chi_value_ts,
+                    "error_chi_grad_ts": error_chi_grad_ts,
+                    "error_chi_ts": error_chi_ts,
+                    "error_diverged_ts": error_diverged_ts,
                     "ne_error_abs_shot": ne_error_abs_shot,
                     "te_error_abs_shot": te_error_abs_shot,
                     "ne_error_rel_shot": ne_error_rel_shot,
@@ -441,15 +508,6 @@ class ProfilePredictorTRB(TrainRunBuilder):
                     "error_rel_shot": error_rel_shot,
                 }
             )
-
-            ds_source = ds_source_per_shot(eval_data.input_ds["ds_source"], ne_targ.sizes[EPISODE_DIM])
             return ds.assign_coords(ds_source=(EPISODE_DIM, ds_source)).drop_vars(["quantile", "input_batch"], errors="ignore")
 
-        if suite_config:
-            eval_suite = {
-                "study_results": study_results,
-            }
-            return eval_suite
-        else:
-            # Hyperparameter tuning, do not run test evals
-            return None
+        return {"study_results": study_results}

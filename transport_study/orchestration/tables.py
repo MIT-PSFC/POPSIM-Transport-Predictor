@@ -31,7 +31,7 @@ class ComparisonTableSpec:
     field_tokens: per-field filename token template (e.g. "td_{}"), mirroring
         the case-string vocabulary so table filenames read like case names
     columns: (table header, dataframe column) pairs
-    stage_metrics: the metrics of the collected metrics dataset, merged in as <metric>_mean_<stage> columns
+    stage_metrics: the metrics of the collected metrics dataset, merged in as <metric>_mean<suffix>_<stage> columns
     excluded_model_types: submodule prereq case types, whose errors are not comparable to the main models
     """
 
@@ -43,20 +43,27 @@ class ComparisonTableSpec:
     excluded_model_types: tuple[str, ...] = ()
 
 
+# The three top-K values of a per-stage mean (orchestration.topk_results.topk_statistics)
+TOPK_SUFFIXES = ("", "_best", "_ckpt_std")
+
+
 def merge_stage_metrics(df: pd.DataFrame, metrics_ds: xr.Dataset, metric_names: tuple[str, ...]) -> pd.DataFrame:
-    """Merge the per-stage means from a collected metrics dataset (dims
-    case_idx x stage, variables <metric>_mean) into a per-case frame as
-    <metric>_mean_<stage> columns, NaN for cases without valid metrics."""
+    """Merge the per-stage means from a collected metrics dataset (dims case_idx x stage)
+    into a per-case frame as <metric>_mean<suffix>_<stage> columns, one per TOPK_SUFFIXES entry:
+    the top-K mean, the best checkpoint's and the top-K std.
+    NaN for cases without valid metrics."""
+    column_sources = [
+        (f"{metric}_mean{suffix}_{stage}", f"{metric}_mean{suffix}", stage)
+        for metric in metric_names
+        for suffix in TOPK_SUFFIXES
+        for stage in STAGE_AGG_NAMES
+    ]
     if metrics_ds.data_vars and "case_idx" in metrics_ds.dims:
-        stage_cols = {}
-        for metric in metric_names:
-            for stage in STAGE_AGG_NAMES:
-                stage_cols[f"{metric}_mean_{stage}"] = metrics_ds[f"{metric}_mean"].sel(stage=stage).values
+        stage_cols = {column: metrics_ds[var].sel(stage=stage).values for column, var, stage in column_sources}
         stage_df = pd.DataFrame({"case_idx": metrics_ds["case_idx"].values, **stage_cols})
         return df.merge(stage_df, on="case_idx", how="left")
-    for metric in metric_names:
-        for stage in STAGE_AGG_NAMES:
-            df[f"{metric}_mean_{stage}"] = np.nan
+    for column, _, _ in column_sources:
+        df[column] = np.nan
     return df
 
 

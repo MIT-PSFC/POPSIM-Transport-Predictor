@@ -77,9 +77,9 @@ def _record_title(ts_metrics: CaseTimesliceMetrics, record_idx: int) -> str:
         stage = "flattop (aux)" if ts_metrics.aux_heated[record_idx] else "flattop (ohmic)"
     return (
         f"shot {ts_metrics.shot[record_idx]} @ t={ts_metrics.time[record_idx]:.3f}s - {stage}\n"
-        f"value={ts_metrics.metric_value[record_idx]:.3f}  "
-        f"grad={ts_metrics.metric_grad[record_idx]:.3f}  "
-        f"combined={ts_metrics.metric_combined[record_idx]:.3f}"
+        f"value={ts_metrics.best('value')[record_idx]:.3f}  "
+        f"grad={ts_metrics.best('grad')[record_idx]:.3f}  "
+        f"combined={ts_metrics.best('combined')[record_idx]:.3f}"
     )
 
 
@@ -201,11 +201,12 @@ def _fig_to_image(fig: plt.Figure) -> Image.Image:
 
 
 def _select_gif_shots(ts_metrics: CaseTimesliceMetrics) -> list:
-    """Best, median, and worst test shots by shot-mean combined metric."""
+    """Best, median, and worst test shots by the best checkpoint's shot-mean combined metric."""
     shots = np.unique(ts_metrics.shot)
+    combined = ts_metrics.best("combined")
 
     def _shot_mean(shot) -> float:
-        values = ts_metrics.metric_combined[ts_metrics.shot == shot]
+        values = combined[ts_metrics.shot == shot]
         values = values[np.isfinite(values)]
         return float(np.mean(values)) if len(values) else np.nan
 
@@ -251,10 +252,13 @@ def case_report_done(case_dir: Path) -> bool:
 
 
 def render_case_report(result_ds: xr.Dataset, ts_metrics: CaseTimesliceMetrics, case_dir: Path):
-    """The best and worst test timeslices by the combined metric, then the profile evolution GIFs."""
+    """The best and worst test timeslices by the combined metric, then the profile evolution GIFs.
+
+    Both score the best checkpoint, whose predictions the result file holds.
+    """
     timeslice_page = partial(_timeslice_panel, result_ds, ts_metrics)
     record_idxs = np.arange(len(ts_metrics))
-    best_worst_pdf(record_idxs, ts_metrics.metric_combined, timeslice_page, case_dir / REPORT_FILENAME)
+    best_worst_pdf(record_idxs, ts_metrics.best("combined"), timeslice_page, case_dir / REPORT_FILENAME)
     evolution_gifs(result_ds, ts_metrics, case_dir)
 
 
@@ -262,8 +266,8 @@ def torax_relaxation_report(study, metrics_ds: xr.Dataset, figure_dir: Path):
     """Relaxation figure for the best torax case at its best timeslice.
 
     Picks the torax-* case with the lowest combined-metric mean over all test
-    timeslices, restores its trained module, reruns the TORAX solve step by
-    step on the timeslice where the fit is best, and plots the profile
+    timeslices (top-K mean), restores its trained module, reruns the TORAX solve step by
+    step on the timeslice where the best checkpoint fits best, and plots the profile
     relaxation into the measured target shape.
     """
     if not metrics_ds.data_vars or "case_idx" not in metrics_ds.dims:
@@ -288,12 +292,13 @@ def torax_relaxation_report(study, metrics_ds: xr.Dataset, figure_dir: Path):
 
     result_ds = xr.load_dataset(study.result_path(case))
     train_config = study.make_train_config(case)
-    ts_metrics = compute_case_timeslice_metrics(result_ds, train_config.loss_config)
-    finite_records = np.flatnonzero(np.isfinite(ts_metrics.metric_combined))
+    ts_metrics = compute_case_timeslice_metrics(result_ds)
+    combined = ts_metrics.best("combined")
+    finite_records = np.flatnonzero(np.isfinite(combined))
     if len(finite_records) == 0:
         logger.warning(f"No valid test timeslices for torax case {case}, skipping relaxation report")
         return
-    best_record = int(finite_records[np.argmin(ts_metrics.metric_combined[finite_records])])
+    best_record = int(finite_records[np.argmin(combined[finite_records])])
 
     shot = ts_metrics.shot[best_record]
     device = ts_metrics.ds_source[best_record]

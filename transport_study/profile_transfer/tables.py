@@ -7,6 +7,7 @@ collected_metrics.nc (per-timeslice means of the value / gradient / combined
 validation loss components, free of the shot-duration confound in the
 time-integrated per-shot errors) with the time-integrated per-shot error
 medians from the long-form collected_results.nc.
+The headline metric also gets its best checkpoint's value and its std over the top-K checkpoints (orchestration.topk_results).
 
 A flat case_stats.csv with one row per case and every column is written next
 to the tables for ad hoc analysis.
@@ -58,6 +59,8 @@ SPEC = ComparisonTableSpec(
     },
     columns=(
         ("combined (time avg)", "combined_mean_all"),
+        ("best", "combined_mean_best_all"),
+        ("ckpt std", "combined_mean_ckpt_std_all"),
         ("rampup", "combined_mean_rampup"),
         ("flattop", "combined_mean_flattop"),
         ("flattop ohmic", "combined_mean_flattop_ohmic"),
@@ -65,6 +68,7 @@ SPEC = ComparisonTableSpec(
         ("rampdown", "combined_mean_rampdown"),
         ("value (time avg)", "value_mean_all"),
         ("grad (time avg)", "grad_mean_all"),
+        ("diverged", "diverged_mean_all"),
         ("rel err (integral, med)", "err_rel_shot_med"),
         ("abs err (integral, med)", "err_abs_shot_med"),
     ),

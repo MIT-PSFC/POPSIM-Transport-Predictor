@@ -110,6 +110,22 @@ FREEZE_LABELS = {False: "Unfrozen submodules", True: "Frozen submodules"}
 MULTIOBJECTIVE_COLORS = {False: "#c0c0c0", True: "#c77dff"}
 MULTIOBJECTIVE_LABELS = {False: "Single objective", True: "Multiobjective"}
 
+# Columns of the stage-resolved grids (collected_metrics.nc, see orchestration.case_metrics)
+STAGE_LABELS = {
+    "all": "All",
+    "rampup": "Rampup",
+    "flattop": "Flattop",
+    "flattop_ohmic": "Flattop (ohmic)",
+    "flattop_aux": "Flattop (aux)",
+    "rampdown": "Rampdown",
+}
+
+
+def stage_series_stats(ds: xr.Dataset, metric: str, stage: str) -> tuple[np.ndarray, np.ndarray]:
+    """Per-case top-K mean and top-K std of one metric's per-timeslice mean in one stage of a collected metrics dataset."""
+    stage_ds = ds.sel(stage=stage)
+    return stage_ds[f"{metric}_mean"].values, stage_ds[f"{metric}_mean_ckpt_std"].values
+
 
 @dataclass(frozen=True)
 class ComparisonLayout:
@@ -117,7 +133,7 @@ class ComparisonLayout:
 
     row_labels / col_labels: panel rows and columns, name -> axis label
     cell_size: (width, height) of one panel in inches
-    series_stats(ds, row, col): per-case (means, stds) of one panel
+    series_stats(ds, row, col): per-case (top-K means, top-K stds) of one panel, the std drawn as the error bar
     grid_fields: every case-grid field a figure compares along or holds fixed
     field_tokens: per-field filename token template (e.g. "td_{}"), mirroring the case-string vocabulary
     value_labels: per-field value -> display label, in titles and legends

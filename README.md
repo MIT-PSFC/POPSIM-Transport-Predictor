@@ -92,9 +92,7 @@ TODO(ZanderKeith)
 
 # Repo Organization:
 
-For robots, see `CLAUDE.md`.
-
-For humans, read on. (or check out `.ua/`)
+For robots, see `CLAUDE.md`. For humans, read on.
 
 ## `transport_study/datasets`
 

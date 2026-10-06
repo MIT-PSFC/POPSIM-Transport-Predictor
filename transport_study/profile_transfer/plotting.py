@@ -1,7 +1,8 @@
 """Case-comparison figures of profile transfer study results (see orchestration.comparison_figures).
 
 A grid with one row per chi metric (value / gradient / combined, see study_metrics)
-and one column per shot stage (all, rampup, flattop, flattop ohmic, flattop aux, rampdown).
+and one column per shot stage (all, rampup, flattop, flattop ohmic, flattop aux, rampdown),
+each line the top-K mean with the top-K std as its error bar.
 Consumes the stage-resolved collected metrics (collected_metrics.nc, dims case_idx x stage).
 freeze_shapes_comparison plots the frozen - unfrozen difference on the same grid.
 """
@@ -25,6 +26,7 @@ from transport_study.orchestration.comparison_figures import (
     ORDER_COLORS,
     ORDER_LABELS,
     ORDER_MARKERS,
+    STAGE_LABELS,
     TD_COLORS,
     TD_LABELS,
     ComparisonFamily,
@@ -33,10 +35,10 @@ from transport_study.orchestration.comparison_figures import (
     finalize_grid,
     grid_figure,
     mask_select,
+    stage_series_stats,
 )
 from transport_study.orchestration.stages import STAGE_AGG_NAMES
 from transport_study.plot_style import LABEL_FONTSIZE, TEXT_COLOR
-from transport_study.profile_transfer.study_metrics import METRIC_NAMES
 
 MODEL_COLORS = {
     "shape-init-pca": "#0095ff",
@@ -68,32 +70,18 @@ GEOM_LABELS = {
     "miller": "Miller",
 }
 
+# Rows of the comparison grids, the chi metrics (the diverged fraction is a table column only)
 METRIC_LABELS = {
     "value": "Value loss",
     "grad": "Gradient loss",
     "combined": "Combined loss",
 }
 
-STAGE_LABELS = {
-    "all": "All",
-    "rampup": "Rampup",
-    "flattop": "Flattop",
-    "flattop_ohmic": "Flattop (ohmic)",
-    "flattop_aux": "Flattop (aux)",
-    "rampdown": "Rampdown",
-}
-
-
-def _stage_series_stats(ds: xr.Dataset, metric: str, stage: str) -> tuple[np.ndarray, np.ndarray]:
-    stage_ds = ds.sel(stage=stage)
-    return stage_ds[f"{metric}_mean"].values, stage_ds[f"{metric}_std"].values
-
-
 LAYOUT = ComparisonLayout(
-    row_labels={metric: METRIC_LABELS[metric] for metric in METRIC_NAMES},
+    row_labels=METRIC_LABELS,
     col_labels={stage: STAGE_LABELS[stage] for stage in STAGE_AGG_NAMES},
     cell_size=(3.4, 2.9),
-    series_stats=_stage_series_stats,
+    series_stats=stage_series_stats,
     grid_fields=(
         "model_type",
         "training_data",
@@ -205,7 +193,7 @@ def freeze_shapes_comparison(metrics_ds: xr.Dataset, figure_dir: Path):
             if len(orders) > 1:
                 label = f"{label} / {ORDER_LABELS.get(order, order)}"
 
-            for row, metric in enumerate(METRIC_NAMES):
+            for row, metric in enumerate(METRIC_LABELS):
                 for col, stage in enumerate(STAGE_AGG_NAMES):
                     frozen_means = np.atleast_1d(frozen.sel(stage=stage)[f"{metric}_mean"].values).astype(float)
                     unfrozen_means = np.atleast_1d(unfrozen.sel(stage=stage)[f"{metric}_mean"].values).astype(float)
@@ -230,7 +218,7 @@ def freeze_shapes_comparison(metrics_ds: xr.Dataset, figure_dir: Path):
             continue
         for ax in axes.flat:
             ax.axhline(0, color=TEXT_COLOR, linewidth=0.8, linestyle=":")
-        for row, metric in enumerate(METRIC_NAMES):
+        for row, metric in enumerate(METRIC_LABELS):
             axes[row, 0].set_ylabel(
                 f"Delta {METRIC_LABELS[metric].lower()}\n(frozen - unfrozen)",
                 color=TEXT_COLOR,

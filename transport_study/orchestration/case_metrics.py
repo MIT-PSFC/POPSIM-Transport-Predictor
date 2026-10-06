@@ -5,10 +5,14 @@ and exports two names:
     METRIC_NAMES: the per-timeslice metrics it scores
     case_timeslice_metrics(study, case, result_ds): a StagedTimesliceMetrics subclass holding them
 Everything else lives here:
+the per-timeslice records read off a result file (staged_result_records),
 the nearest-time join back to the device datasets, the shot-stage labels, the per-stage aggregation,
 the per-case cache and the collected metrics of a whole study.
+Every metric keeps one value per retained checkpoint (orchestration.topk_results),
+and the per-stage aggregation reduces each case score to its best, top-K mean and top-K std.
 """
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from importlib import import_module
 from pathlib import Path
@@ -18,8 +22,18 @@ import numpy as np
 import xarray as xr
 from loguru import logger
 
+from transport_study import EPISODE_DIM, TIME_COORD, TIME_DIM
 from transport_study.orchestration.stages import STAGE_AGG_NAMES, segment_stages
-from transport_study.orchestration.study import Study, write_netcdf_atomic
+from transport_study.orchestration.study import (
+    Study,
+    real_timeslice_mask,
+    write_netcdf_atomic,
+)
+from transport_study.orchestration.topk_results import (
+    BEST_EPOCH_ATTR,
+    CKPT_DIM,
+    topk_statistics,
+)
 from transport_study.signals import POWER_ADDITIONAL_MW
 
 # Joined dataset timeslice must be within this of the result timeslice.
@@ -29,12 +43,19 @@ TIME_JOIN_TOLERANCE_S = 6e-4
 COLLECTED_METRICS_FILENAME = "collected_metrics.nc"
 CASE_METRICS_FILENAME = "case_metrics.nc"
 
+# Result variable every test suite writes, 1 diverged, 0 finite and NaN without a target
+DIVERGED_VAR = "error_diverged_ts"
+
+# The StagedTimesliceMetrics fields every staged_result_records call fills
+RECORD_FIELDS = ("shot", "ds_source", "time", "stage", "aux_heated", "ckpt_epochs", "best_epoch")
+
 
 @dataclass
 class StagedTimesliceMetrics:
     """Long-form per-timeslice metrics of one case, one record per valid test timeslice.
 
-    Subclasses add one array per metric, named METRIC_PREFIX + metric name.
+    Subclasses add one (records, checkpoints) array per metric, named METRIC_PREFIX + metric name,
+    one column per retained checkpoint epoch in ckpt_epochs.
     """
 
     METRIC_PREFIX: ClassVar[str]
@@ -44,6 +65,15 @@ class StagedTimesliceMetrics:
     time: np.ndarray
     stage: np.ndarray
     aux_heated: np.ndarray
+    ckpt_epochs: np.ndarray
+    best_epoch: int
+
+    @classmethod
+    def from_records(cls, records: dict, metric_names: tuple[str, ...], **extra_fields):
+        """The metrics of staged_result_records, metric_names becoming the METRIC_PREFIX fields."""
+        base_fields = {name: records[name] for name in RECORD_FIELDS}
+        metric_fields = {f"{cls.METRIC_PREFIX}{name}": records[name] for name in metric_names}
+        return cls(**base_fields, **metric_fields, **extra_fields)
 
     def __len__(self) -> int:
         return len(self.shot)
@@ -58,7 +88,13 @@ class StagedTimesliceMetrics:
         return self.stage == stage
 
     def metric(self, name: str) -> np.ndarray:
+        """One metric of every record at every retained checkpoint, (records, checkpoints)."""
         return getattr(self, f"{self.METRIC_PREFIX}{name}")
+
+    def best(self, name: str) -> np.ndarray:
+        """One metric of every record at the best checkpoint, the one whose predictions the case reports plot."""
+        best_column = int(np.flatnonzero(self.ckpt_epochs == self.best_epoch)[0])
+        return self.metric(name)[:, best_column]
 
 
 def nearest_time_positions(dataset_time: np.ndarray, result_times: np.ndarray, shot, device: str) -> tuple[np.ndarray, np.ndarray]:
@@ -100,35 +136,108 @@ def concat_records(chunks: list, dtype=None) -> np.ndarray:
     return np.concatenate(chunks)
 
 
+def staged_result_records(result_ds: xr.Dataset, device_dataset: Callable[[str], xr.Dataset], metric_vars: dict[str, str]) -> dict:
+    """The per-timeslice records of one case result file, the shared part of every study's case_timeslice_metrics.
+
+    device_dataset(device) is a working-unit device dataset with ip_MA, the auxiliary power and time,
+    each result timeslice is joined to it by (shot, nearest time) for its stage label.
+    metric_vars maps each metric name to the result variable it reads, NaN when a result file lacks it.
+    A record is a timeslice that advances its shot's clock (the padded rollout tail would weight the shot end
+    hundreds of times) and has a target, read off the best checkpoint's DIVERGED_VAR.
+    A diverged timeslice therefore stays a record, NaN in the errors and 1 in the diverged flag.
+
+    Returns the RECORD_FIELDS, result_time_idx / device_time_idx (positions in the result file and the device dataset)
+    and one (records, checkpoints) array per metric name.
+    """
+    ckpt_epochs = result_ds[CKPT_DIM].values
+    best_epoch = int(result_ds.attrs[BEST_EPOCH_ATTR])
+    record_names = ("shot", "ds_source", "time", "stage", "aux_heated", "result_time_idx", "device_time_idx")
+    chunks: dict[str, list] = {name: [] for name in (*record_names, *metric_vars)}
+
+    for shot_pos, shot in enumerate(result_ds[EPISODE_DIM].values):
+        shot_res = result_ds.isel({EPISODE_DIM: shot_pos})
+        device = str(shot_res["ds_source"].values)
+        device_ds = device_dataset(device)
+        if shot not in device_ds[EPISODE_DIM].values:
+            logger.warning(f"Shot {shot} not found in dataset for device {device}, skipping")
+            continue
+        shot_device = device_ds.sel({EPISODE_DIM: shot})
+
+        res_time = shot_res[TIME_COORD].values
+        diverged_best = shot_res[DIVERGED_VAR].sel({CKPT_DIM: best_epoch}).values
+        mask_valid = real_timeslice_mask(shot_res[TIME_COORD]).values & np.isfinite(diverged_best)
+        result_idxs = np.flatnonzero(mask_valid)
+        if len(result_idxs) == 0:
+            continue
+
+        mask_joined, device_idxs = nearest_time_positions(shot_device[TIME_COORD].values, res_time[result_idxs], shot, device)
+        result_idxs = result_idxs[mask_joined]
+        if len(result_idxs) == 0:
+            continue
+
+        # Stage labels over the full shot, then picked at the joined timeslices
+        stage_full, aux_full = shot_stages(shot_device)
+
+        n = len(result_idxs)
+        chunks["shot"].append(np.full(n, shot))
+        chunks["ds_source"].append(np.full(n, device, dtype=object))
+        chunks["time"].append(res_time[result_idxs])
+        chunks["stage"].append(stage_full[device_idxs])
+        chunks["aux_heated"].append(aux_full[device_idxs])
+        chunks["result_time_idx"].append(result_idxs)
+        chunks["device_time_idx"].append(device_idxs)
+        for name, var in metric_vars.items():
+            if var in shot_res:
+                values = shot_res[var].transpose(TIME_DIM, CKPT_DIM).values[result_idxs]
+            else:
+                values = np.full((n, len(ckpt_epochs)), np.nan)
+            chunks[name].append(values)
+
+    records = {
+        "shot": concat_records(chunks["shot"]),
+        "ds_source": concat_records(chunks["ds_source"], dtype=object).astype(str),
+        "time": concat_records(chunks["time"]),
+        "stage": concat_records(chunks["stage"], dtype=object).astype(str),
+        "aux_heated": concat_records(chunks["aux_heated"], dtype=bool),
+        "result_time_idx": concat_records(chunks["result_time_idx"], dtype=int),
+        "device_time_idx": concat_records(chunks["device_time_idx"], dtype=int),
+        "ckpt_epochs": ckpt_epochs,
+        "best_epoch": best_epoch,
+    }
+    for name in metric_vars:
+        records[name] = np.concatenate(chunks[name]) if chunks[name] else np.full((0, len(ckpt_epochs)), np.nan)
+    return records
+
+
 def aggregate_case_metrics(ts_metrics: StagedTimesliceMetrics, metric_names: tuple[str, ...]) -> xr.Dataset:
     """Reduce one case's per-timeslice metrics to per-stage statistics.
 
+    Each stat (mean / std / med / count over the finite values of a stage's records) is computed per checkpoint,
+    one case score per retained checkpoint,
+    then reduced by topk_statistics to <metric>_<stat> (the top-K mean), <metric>_<stat>_best and <metric>_<stat>_ckpt_std.
     Dims: stage (STAGE_AGG_NAMES).
-    Data variables <metric>_<stat> for every metric and stat in mean / std / med / count.
     collect_metrics attaches the case-identifying coords, it knows the case_idx.
     """
-    data_vars = {}
+    n_ckpt = len(ts_metrics.ckpt_epochs)
+    per_ckpt_vars = {}
     for metric in metric_names:
         values = ts_metrics.metric(metric)
-        means, stds, meds, counts = [], [], [], []
-        for stage in STAGE_AGG_NAMES:
+        stats = {stat: np.full((len(STAGE_AGG_NAMES), n_ckpt), np.nan) for stat in ("mean", "std", "med", "count")}
+        for stage_pos, stage in enumerate(STAGE_AGG_NAMES):
             stage_values = values[ts_metrics.stage_mask(stage)]
-            stage_values = stage_values[np.isfinite(stage_values)]
-            counts.append(len(stage_values))
-            if len(stage_values) == 0:
-                means.append(np.nan)
-                stds.append(np.nan)
-                meds.append(np.nan)
-            else:
-                means.append(float(np.mean(stage_values)))
-                stds.append(float(np.std(stage_values)))
-                meds.append(float(np.median(stage_values)))
-        data_vars[f"{metric}_mean"] = ("stage", np.array(means))
-        data_vars[f"{metric}_std"] = ("stage", np.array(stds))
-        data_vars[f"{metric}_med"] = ("stage", np.array(meds))
-        data_vars[f"{metric}_count"] = ("stage", np.array(counts))
+            for ckpt_pos in range(n_ckpt):
+                ckpt_values = stage_values[:, ckpt_pos]
+                ckpt_values = ckpt_values[np.isfinite(ckpt_values)]
+                stats["count"][stage_pos, ckpt_pos] = len(ckpt_values)
+                if len(ckpt_values):
+                    stats["mean"][stage_pos, ckpt_pos] = np.mean(ckpt_values)
+                    stats["std"][stage_pos, ckpt_pos] = np.std(ckpt_values)
+                    stats["med"][stage_pos, ckpt_pos] = np.median(ckpt_values)
+        for stat, per_ckpt_values in stats.items():
+            per_ckpt_vars[f"{metric}_{stat}"] = (("stage", CKPT_DIM), per_ckpt_values)
 
-    return xr.Dataset(data_vars=data_vars, coords={"stage": list(STAGE_AGG_NAMES)})
+    per_ckpt = xr.Dataset(per_ckpt_vars, coords={"stage": list(STAGE_AGG_NAMES), CKPT_DIM: ts_metrics.ckpt_epochs})
+    return topk_statistics(per_ckpt, ts_metrics.best_epoch)
 
 
 def case_timeslice_metrics(study: Study, case, result_ds: xr.Dataset) -> StagedTimesliceMetrics:
