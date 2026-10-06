@@ -60,6 +60,11 @@ def test_weighted_case_name(loaded_config):
     assert str(case) == "case.shape-init-pca.td_cmod-low1.norm_physics-coral.freeze_True.geom_circular.targ_3.da_weighted"
 
 
+def test_target_shot_order_case_name(loaded_config):
+    case = _case(model_type="mlp", training_data="exnihilo", num_target_shots=7, target_shot_order="descending")
+    assert str(case) == "case.mlp.td_exnihilo.norm_physics.freeze_True.geom_circular.targ_7.order_descending"
+
+
 @pytest.mark.parametrize(
     "overrides",
     [
@@ -71,6 +76,8 @@ def test_weighted_case_name(loaded_config):
         # Unfrozen shapes leave no freeze token
         {"freeze_shapes": False},
         {"freeze_shapes": False, "domain_adaptation": "transfer", "num_target_shots": 3},
+        {"domain_adaptation": "weighted", "num_target_shots": 3, "target_shot_order": "spanning"},
+        {"model_type": "mlp", "training_data": "exnihilo", "num_target_shots": 7, "target_shot_order": "descending"},
     ],
 )
 def test_checkpoint_parser_round_trip(loaded_config, overrides):

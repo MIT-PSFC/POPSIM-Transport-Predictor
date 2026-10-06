@@ -9,6 +9,8 @@ from transport_study.modules.transport_predictor.module import SUBMODULE_MODEL_T
 from transport_study.orchestration.comparison_figures import (
     DA_COLORS,
     DA_LABELS,
+    ORDER_COLORS,
+    ORDER_LABELS,
     ComparisonFamily,
     ComparisonLayout,
 )
@@ -39,7 +41,15 @@ LAYOUT = ComparisonLayout(
     col_labels=DOMAIN_LABELS,
     cell_size=(4.6, 3.4),
     series_stats=summary_series_stats,
-    grid_fields=("model_type", "training_data", "domain_adaptation", "freeze_submodules", "geometry_builder", "torax_state"),
+    grid_fields=(
+        "model_type",
+        "training_data",
+        "domain_adaptation",
+        "freeze_submodules",
+        "geometry_builder",
+        "torax_state",
+        "target_shot_order",
+    ),
     field_tokens={
         "model_type": "{}",
         "training_data": "td_{}",
@@ -47,8 +57,9 @@ LAYOUT = ComparisonLayout(
         "freeze_submodules": "freeze_{}",
         "geometry_builder": "geom_{}",
         "torax_state": "tstate_{}",
+        "target_shot_order": "order_{}",
     },
-    value_labels={"model_type": MODEL_LABELS, "domain_adaptation": DA_LABELS},
+    value_labels={"model_type": MODEL_LABELS, "domain_adaptation": DA_LABELS, "target_shot_order": ORDER_LABELS},
     excluded_model_types=SUBMODULE_MODEL_TYPES,
 )
 
@@ -56,4 +67,6 @@ COMPARISON_FAMILIES = (
     ComparisonFamily("training_dataset_comparison", "training_data", "Training dataset comparison"),
     ComparisonFamily("model_comparison", "model_type", "Model comparison", MODEL_COLORS),
     ComparisonFamily("domain_adaptation_comparison", "domain_adaptation", "Domain adaptation comparison", DA_COLORS),
+    # Without target shots every case takes the base order, so the other orders start at 1 target shot
+    ComparisonFamily("target_shot_order_comparison", "target_shot_order", "Target shot order comparison", ORDER_COLORS, min_series=2),
 )

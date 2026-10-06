@@ -16,7 +16,7 @@ def results_ds() -> xr.Dataset:
     training_datasets = ["cmod", "exnihilo"]
     normalizations = ["raw", "coral"]
     adaptations = ["none", "weighted", "addition", "transfer"]
-    shots_options = [0, 1, 10, -1]
+    shots_options = [0, 1, 10]
 
     rows = []
     for mt, td, dn, da, shots in product(model_types, training_datasets, normalizations, adaptations, shots_options):
@@ -26,14 +26,25 @@ def results_ds() -> xr.Dataset:
             continue
         if (da == "transfer" or td == "exnihilo") and shots == 0:
             continue
-        rows.append((mt, td, dn, da, True, shots))
+        rows.append((mt, td, dn, da, True, shots, "ascending"))
+        # Without target shots every case takes the base order
+        if shots > 0:
+            rows.append((mt, td, dn, da, True, shots, "spanning"))
 
     rng = np.random.default_rng(0)
     n = len(rows)
     ds = xr.Dataset(coords={"case_idx": np.arange(n)})
     for coord_name, idx in zip(
-        ("model_type", "training_data", "data_normalization", "domain_adaptation", "freeze_submodules", "num_target_shots"),
-        range(6),
+        (
+            "model_type",
+            "training_data",
+            "data_normalization",
+            "domain_adaptation",
+            "freeze_submodules",
+            "num_target_shots",
+            "target_shot_order",
+        ),
+        range(7),
         strict=True,
     ):
         ds = ds.assign_coords({coord_name: ("case_idx", [row[idx] for row in rows])})

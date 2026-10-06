@@ -16,12 +16,20 @@ from transport_study.modules.power_balance.module import SUBMODULE_MODEL_TYPES
 from transport_study.orchestration.tables import ComparisonTableSpec
 from transport_study.power_balance_transfer.study_metrics import METRIC_NAMES
 
-CASE_FIELD_ORDER = ("model_type", "training_data", "data_normalization", "domain_adaptation", "freeze_submodules", "num_target_shots")
+CASE_FIELD_ORDER = (
+    "model_type",
+    "training_data",
+    "data_normalization",
+    "domain_adaptation",
+    "freeze_submodules",
+    "num_target_shots",
+    "target_shot_order",
+)
 
 SPEC = ComparisonTableSpec(
     # freeze_submodules only has one value in practice so it stays a grouping
     # field rather than an axis
-    axis_names=("model_type", "training_data", "data_normalization", "domain_adaptation", "num_target_shots"),
+    axis_names=("model_type", "training_data", "data_normalization", "domain_adaptation", "num_target_shots", "target_shot_order"),
     case_field_order=CASE_FIELD_ORDER,
     # Filename tokens per grouping field, mirroring the case-string vocabulary
     field_tokens={
@@ -31,6 +39,7 @@ SPEC = ComparisonTableSpec(
         "domain_adaptation": "da_{}",
         "freeze_submodules": "freeze_{}",
         "num_target_shots": "targ_{}",
+        "target_shot_order": "order_{}",
     },
     columns=(
         ("rel err (time avg)", "rel_mean_all"),

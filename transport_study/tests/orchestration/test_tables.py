@@ -21,7 +21,7 @@ def _example_frame() -> pd.DataFrame:
         {
             "a": ["x", "y", "x", "x"],
             "b": ["b1", "b1", "b1", "b1"],
-            "num_target_shots": [0, 0, 5, -1],
+            "num_target_shots": [0, 0, 10, 5],
             "case_idx": [0, 1, 2, 3],
             "metric": [1.0, 2.5, 0.5, float("nan")],
         }
@@ -37,12 +37,11 @@ def test_writes_case_stats_csv(tmp_path):
     assert list(df.columns) == ["a", "b", "num_target_shots", "case_idx", "metric"]
 
 
-def test_group_table_content_and_sentinel_ordering(tmp_path):
+def test_group_table_content_and_numeric_ordering(tmp_path):
     write_case_comparison_tables(_example_frame(), SPEC, tmp_path)
 
     # Three rows share (a=x, b=b1) so the num_target_shots axis gets a table,
-    # with the -1 all-shots sentinel listed after the real counts and the NaN
-    # metric rendered as a dash
+    # with the shot counts sorted as numbers (5 before 10) and the NaN metric rendered as a dash
     table_path = tmp_path / "tables" / "num_target_shots" / "a_x.b_b1.md"
     expected = (
         "# num_target_shots comparison\n"
@@ -52,8 +51,8 @@ def test_group_table_content_and_sentinel_ordering(tmp_path):
         "| num_target_shots | metric |\n"
         "|---|---|\n"
         "| 0 | 1 |\n"
-        "| 5 | 0.5 |\n"
-        "| -1 | - |\n"
+        "| 5 | - |\n"
+        "| 10 | 0.5 |\n"
     )
     assert table_path.read_text() == expected
 

@@ -53,6 +53,12 @@ def test_domain_adaptation_case_name(loaded_config):
     assert str(case) == "case.sciml-taue-nn.td_cmod-low1.norm_coral.freeze_True.targ_3.da_transfer"
 
 
+def test_target_shot_order_case_name(loaded_config):
+    # The base (ascending) order leaves no token, every other order follows targ_
+    case = _case(domain_adaptation="transfer", num_target_shots=3, target_shot_order="spanning")
+    assert str(case) == "case.sciml-taue-nn.td_cmod-low1.norm_coral.freeze_True.targ_3.order_spanning.da_transfer"
+
+
 def test_cases_are_hashable_and_set_stable(loaded_config):
     assert _case() in {_case()}
     assert hash(_case()) == hash(_case())

@@ -12,6 +12,10 @@ from transport_study.config import config
 from transport_study.modules.normalization import STAT_NORMALIZATIONS
 from transport_study.orchestration.organize_data import get_train_test_datasets
 from transport_study.orchestration.study import HYPERPARAM_TARGET_SHOTS
+from transport_study.orchestration.target_shots import (
+    BASE_TARGET_SHOT_ORDER,
+    configured_target_split,
+)
 from transport_study.power_balance_transfer.power_balance_study import PowerBalanceStudy
 from transport_study.tests.sample_data import SAMPLE_DIR, requires_sample_data
 
@@ -80,9 +84,11 @@ def test_power_balance_transfer_cases(tmp_path):
             model_types=("sciml-taue-nn", "mlp", "transformer"),
             data_normalization_methods=("raw", "coral"),
             freeze_submodules_options=(True, False),
-            num_target_shots_options=(0, -1),
+            num_target_shots_options=(0, 1),
+            target_shot_orders=("ascending", "spanning"),
         )
     )
+    assert any(case.target_shot_order == "spanning" for case in study.cases)
 
     # Ensure that each case with a prereq, has that prereq in the list of cases
     for case in study.cases:
@@ -93,7 +99,7 @@ def test_power_balance_transfer_cases(tmp_path):
     # Ensure that there are no duplicate cases
     assert len(study.cases) == len(set(study.cases)), "There are duplicate cases in the study"
 
-    # Ensure there is only one hyperparameter tuning case per model type
+    # Ensure there is only one hyperparameter tuning case per model type, shared by every target shot order
     hp_tuning_cases_by_model = {}
     for case in study.cases:
         if case.is_hyperparam_case():
@@ -120,6 +126,7 @@ def test_power_balance_transfer_cases(tmp_path):
                 domain_adaptation=case.domain_adaptation,
                 freeze_submodules=config.hyperparam_freeze_submodules,
                 num_target_shots=case.num_target_shots,
+                target_shot_order=case.target_shot_order,
             )
             for submodule_type in ("p_oh", "p_rad")
         ]
@@ -132,17 +139,21 @@ def test_power_balance_transfer_cases(tmp_path):
                 continue
             expected_prereqs = _submodule_prereqs(case)
         elif case.domain_adaptation == "transfer":
+            # Stat normalizations fit their per-device statistics on the
+            # combined historic + target data of THIS case, so their twin
+            # keeps its target shots. Stateless normalizations have
+            # nothing to fit, so all their transfer cases share one twin
+            if case.data_normalization in STAT_NORMALIZATIONS:
+                twin_shots = {"num_target_shots": case.num_target_shots, "target_shot_order": case.target_shot_order}
+            else:
+                twin_shots = {"num_target_shots": HYPERPARAM_TARGET_SHOTS, "target_shot_order": BASE_TARGET_SHOT_ORDER}
             twin = PowerBalanceStudy.Case(
                 model_type=case.model_type,
                 training_data=case.training_data,
                 data_normalization=case.data_normalization,
                 domain_adaptation="transfer_pretrain",
                 freeze_submodules=case.freeze_submodules,
-                # Stat normalizations fit their per-device statistics on the
-                # combined historic + target data of THIS case, so their twin
-                # keeps its num_target_shots. Stateless normalizations have
-                # nothing to fit, so all their transfer cases share one twin
-                num_target_shots=case.num_target_shots if case.data_normalization in STAT_NORMALIZATIONS else HYPERPARAM_TARGET_SHOTS,
+                **twin_shots,
             )
             expected_prereqs = [_hyperparam_case(study, case.model_type), twin]
             if case.model_type in ("sciml-taue-nn", "sciml-taue-scalinglaw"):
@@ -247,8 +258,7 @@ def test_addition_no_device_weights(tmp_path):
         return get_train_test_datasets(
             case.training_data,
             domain_adaptation=case.domain_adaptation,
-            num_target_shots=case.num_target_shots,
-            target_test_set_size=config.target_test_set_size,
+            target_split=configured_target_split(case.num_target_shots, case.target_shot_order),
             study_type=PowerBalanceStudy.STUDY_TYPE,
         )
 

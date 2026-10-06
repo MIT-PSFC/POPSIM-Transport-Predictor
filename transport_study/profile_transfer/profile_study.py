@@ -40,6 +40,7 @@ from transport_study.orchestration.study import (
     ModelTrainSpec,
     Study,
 )
+from transport_study.orchestration.target_shots import BASE_TARGET_SHOT_ORDER
 from transport_study.profile_transfer.case_reports import torax_relaxation_report
 from transport_study.profile_transfer.data_visualization import DataVisualization
 from transport_study.profile_transfer.plotting import (
@@ -86,7 +87,7 @@ class ProfileStudy(Study):
         # Per-sample geometry builders to compare for torax-* model types, ignored
         # by every other model type (see VALID_GEOMETRY_BUILDERS)
         geometry_builders: Annotated[tuple[str, ...], CaseAxis("geometry_builder")] = Field(default_factory=lambda: ("circular",))
-        num_target_shots_options: Annotated[tuple[int, ...], CaseAxis("num_target_shots")] = Field(default_factory=lambda: (0, 1, 10, -1))
+        num_target_shots_options: Annotated[tuple[int, ...], CaseAxis("num_target_shots")] = Field(default_factory=lambda: (0, 1, 10))
         # Input normalization case axis over the 10 dimensionless nn_inputs (see FEATURE_NORMALIZATIONS)
         data_normalization_methods: Annotated[tuple[str, ...], CaseAxis("data_normalization")] = Field(default_factory=lambda: ("physics",))
         # Hyperparameter tuning case configuration
@@ -139,7 +140,12 @@ class ProfileStudy(Study):
         - circular: large-aspect-ratio analytic geometry (delta = 0 everywhere)
         - miller: shaped Miller geometry driven by triangularity_upper/triangularity_lower
 
-        num_target_shots: The number of shots included in the training data from the target dataset, or -1 to include all shots (including all shots in training is cheating, but again answers the question of what is the best possible performance).
+        num_target_shots: The number of shots included in the training data from the target dataset, never any of the held-out test shots.
+
+        target_shot_order: The order the target training shots are added in as num_target_shots grows, see orchestration/target_shots.py
+        - ascending: the base extrapolation, lowest hazard first, suppressed from the case name
+        - descending: the highest-hazard non-test shots first, the ones closest to the test regime
+        - spanning: the shots whose timeslice footprints span the power balance input and output space
         """
 
         data_normalization: str
@@ -168,7 +174,7 @@ class ProfileStudy(Study):
 
         @classmethod
         def pin_inapplicable_axes(cls, fields: dict) -> dict:
-            pinned = dict(fields)
+            pinned = super().pin_inapplicable_axes(fields)
             # Only the shape-init families have shapes to freeze
             if fields["model_type"] in MODEL_TYPES_WITHOUT_SHAPES:
                 pinned["freeze_shapes"] = config.hyperparam_freeze_shapes
@@ -191,11 +197,12 @@ class ProfileStudy(Study):
             num_target_shots: int,
             geometry_builder: str = "circular",
             data_normalization: str = "physics",
+            target_shot_order: str = BASE_TARGET_SHOT_ORDER,
         ):
             self.data_normalization = data_normalization
             self.freeze_shapes = freeze_shapes
             self.geometry_builder = geometry_builder
-            self.init_common(model_type, training_data, domain_adaptation, num_target_shots)
+            self.init_common(model_type, training_data, domain_adaptation, num_target_shots, target_shot_order)
 
     #############
     # EXECUTION #
@@ -205,10 +212,7 @@ class ProfileStudy(Study):
         return {
             # Profiles plus their gradient and error-bar companions, the chi validation loss divides by the error bars
             "target_vars": [*PROFILE_TARGET_VARS, "ds_source_idx"],
-            "training_data": case.training_data,
-            "domain_adaptation": case.domain_adaptation,
-            "num_target_shots": case.num_target_shots,
-            "target_test_set_size": config.target_test_set_size,
+            **self.target_split_config(case),
             # Hyperparameters
             # 2048 measured 34.7 GB on the worst torax case
             # (qlknn, nn 64x4, 8 solver steps),

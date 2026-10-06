@@ -79,6 +79,19 @@ def test_submodule_prereq_case_names(loaded_config):
     assert {"case.p_oh.td_cmod-low1", "case.p_rad.td_cmod-low1"} <= power_balance_prereq_names
 
 
+def test_target_shot_order_reaches_every_prereq(loaded_config):
+    """A sciml case's power_balance and profile prereqs, and their p_oh and p_rad, train on the same target shots."""
+    case = _case(domain_adaptation="weighted", num_target_shots=3, target_shot_order="spanning")
+    assert str(case) == "case.sciml.td_cmod-low1.freeze_True.targ_3.order_spanning.da_weighted"
+
+    prereq_names = {str(prereq) for prereq in case.prereqs}
+    assert "case.power_balance.td_cmod-low1.targ_3.order_spanning.da_weighted" in prereq_names
+    assert "case.profile.td_cmod-low1.targ_3.order_spanning.da_weighted" in prereq_names
+    power_balance_case = next(prereq for prereq in case.prereqs if prereq.model_type == "power_balance")
+    power_balance_prereq_names = {str(prereq) for prereq in power_balance_case.prereqs}
+    assert "case.p_oh.td_cmod-low1.targ_3.order_spanning.da_weighted" in power_balance_prereq_names
+
+
 @pytest.mark.parametrize("torax_axis", [{"geometry_builder": "miller"}, {"torax_state": "carry"}])
 def test_non_torax_rejects_torax_axes(loaded_config, torax_axis):
     with pytest.raises(ValueError, match="only applies to torax model types"):

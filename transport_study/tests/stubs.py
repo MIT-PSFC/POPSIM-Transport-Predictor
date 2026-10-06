@@ -22,6 +22,7 @@ from transport_study.orchestration.study import (
     Study,
     write_netcdf_atomic,
 )
+from transport_study.orchestration.target_shots import BASE_TARGET_SHOT_ORDER
 
 
 class StubConfig(CaseGridConfig):
@@ -30,7 +31,7 @@ class StubConfig(CaseGridConfig):
     The case grid is injected, so the axes carry inert defaults.
     """
 
-    target_test_set_size: int = 0
+    target_test_set_size: int | None = 1
     training_datasets: Annotated[tuple[str, ...], CaseAxis("training_data")] = ()
 
 
@@ -41,13 +42,14 @@ class StubCase:
     Deliberately not a Study.Case subclass: the base dataclass validates
     model_type against VALID_MODEL_TYPES and builds a prereq chain, neither of
     which these tests want. check_data_requirements reads training_data and
-    domain_adaptation, so both carry inert defaults.
+    domain_adaptation and case_coords reads the case-axis fields, so they carry inert defaults.
     """
 
     name: str
     prereqs: list[StubCase] | None = None
     training_data: SimpleNamespace = field(default_factory=lambda: SimpleNamespace(sources=[], exnihilo=False))
     domain_adaptation: str | None = None
+    target_shot_order: str = BASE_TARGET_SHOT_ORDER
     # A hyperparam case also owns sweep agent jobs
     hyperparam: bool = False
 

@@ -6,6 +6,7 @@ Consumes the stage-resolved collected metrics (collected_metrics.nc, dims case_i
 freeze_shapes_comparison plots the frozen - unfrozen difference on the same grid.
 """
 
+from itertools import product
 from pathlib import Path
 
 import matplotlib.pyplot as plt
@@ -21,6 +22,9 @@ from transport_study.orchestration.comparison_figures import (
     DIVERGED_THRESHOLD,
     NORM_COLORS,
     NORM_LABELS,
+    ORDER_COLORS,
+    ORDER_LABELS,
+    ORDER_MARKERS,
     ComparisonFamily,
     ComparisonLayout,
     coord_values,
@@ -88,7 +92,15 @@ LAYOUT = ComparisonLayout(
     col_labels={stage: STAGE_LABELS[stage] for stage in STAGE_AGG_NAMES},
     cell_size=(3.4, 2.9),
     series_stats=_stage_series_stats,
-    grid_fields=("model_type", "training_data", "data_normalization", "domain_adaptation", "freeze_shapes", "geometry_builder"),
+    grid_fields=(
+        "model_type",
+        "training_data",
+        "data_normalization",
+        "domain_adaptation",
+        "freeze_shapes",
+        "geometry_builder",
+        "target_shot_order",
+    ),
     field_tokens={
         "model_type": "{}",
         "training_data": "td_{}",
@@ -96,12 +108,14 @@ LAYOUT = ComparisonLayout(
         "domain_adaptation": "da_{}",
         "freeze_shapes": "freeze_{}",
         "geometry_builder": "geom_{}",
+        "target_shot_order": "order_{}",
     },
     value_labels={
         "model_type": MODEL_LABELS,
         "data_normalization": NORM_LABELS,
         "domain_adaptation": DA_LABELS,
         "geometry_builder": GEOM_LABELS,
+        "target_shot_order": ORDER_LABELS,
     },
 )
 
@@ -116,6 +130,8 @@ COMPARISON_FAMILIES = (
     ComparisonFamily(
         "geometry_builder_comparison", "geometry_builder", "Geometry builder comparison", GEOM_COLORS, TORAX_MODEL_TYPES, min_series=2
     ),
+    # Without target shots every case takes the base order, so the other orders start at 1 target shot
+    ComparisonFamily("target_shot_order_comparison", "target_shot_order", "Target shot order comparison", ORDER_COLORS, min_series=2),
 )
 
 
@@ -129,10 +145,11 @@ def _freeze_diff(frozen_by_shot: dict, unfrozen_by_shot: dict, shot) -> float:
 
 
 def freeze_shapes_comparison(metrics_ds: xr.Dataset, figure_dir: Path):
-    """Effect of freezing shapes: (frozen - unfrozen) metric difference vs
-    num_target_shots, one line per (training_data, domain_adaptation), one
-    figure per model type that has shapes. Positive difference means the
-    unfrozen model is better."""
+    """Effect of freezing shapes: (frozen - unfrozen) metric difference vs num_target_shots.
+
+    One line per combination of the other case-grid fields, one figure per model type that has shapes.
+    Positive difference means the unfrozen model is better.
+    """
     if not metrics_ds.data_vars or "case_idx" not in metrics_ds.dims:
         logger.warning("No stage-resolved metrics available, skipping freeze shapes comparison figures")
         return
@@ -148,63 +165,62 @@ def freeze_shapes_comparison(metrics_ds: xr.Dataset, figure_dir: Path):
         model_sub = mask_select(metrics_ds, metrics_ds["model_type"] == model_type)
         norms = coord_values(model_sub, "data_normalization")
         geoms = coord_values(model_sub, "geometry_builder")
+        orders = coord_values(model_sub, "target_shot_order")
+        line_fields = product(
+            coord_values(model_sub, "training_data"),
+            norms,
+            coord_values(model_sub, "domain_adaptation"),
+            geoms,
+            orders,
+        )
         fig, axes = grid_figure(LAYOUT)
         drew = False
-        for td in coord_values(model_sub, "training_data"):
-            for dn in norms:
-                for da in coord_values(model_sub, "domain_adaptation"):
-                    for geom in geoms:
-                        combo_mask = (
-                            (model_sub["training_data"] == td)
-                            & (model_sub["data_normalization"] == dn)
-                            & (model_sub["domain_adaptation"] == da)
-                            & (model_sub["geometry_builder"] == geom)
+        for td, dn, da, geom, order in line_fields:
+            combo_mask = (
+                (model_sub["training_data"] == td)
+                & (model_sub["data_normalization"] == dn)
+                & (model_sub["domain_adaptation"] == da)
+                & (model_sub["geometry_builder"] == geom)
+                & (model_sub["target_shot_order"] == order)
+            )
+            frozen = mask_select(model_sub, combo_mask & model_sub["freeze_shapes"])
+            unfrozen = mask_select(model_sub, combo_mask & ~model_sub["freeze_shapes"])
+            if frozen.sizes.get("case_idx", 0) == 0 or unfrozen.sizes.get("case_idx", 0) == 0:
+                continue
+
+            frozen_shots = np.atleast_1d(frozen["num_target_shots"].values)
+            unfrozen_shots = np.atleast_1d(unfrozen["num_target_shots"].values)
+            shared = sorted(set(frozen_shots.tolist()) & set(unfrozen_shots.tolist()))
+
+            color = td_colors[td]
+            linestyle = da_linestyles.get(da, "-")
+            label = f"{td} / {DA_LABELS.get(da, da)}"
+            if len(norms) > 1:
+                label = f"{label} / {NORM_LABELS.get(dn, dn)}"
+            if len(geoms) > 1:
+                label = f"{label} / {GEOM_LABELS.get(geom, geom)}"
+            if len(orders) > 1:
+                label = f"{label} / {ORDER_LABELS.get(order, order)}"
+
+            for row, metric in enumerate(METRIC_NAMES):
+                for col, stage in enumerate(STAGE_AGG_NAMES):
+                    frozen_means = np.atleast_1d(frozen.sel(stage=stage)[f"{metric}_mean"].values).astype(float)
+                    unfrozen_means = np.atleast_1d(unfrozen.sel(stage=stage)[f"{metric}_mean"].values).astype(float)
+                    frozen_by_shot = dict(zip(frozen_shots.tolist(), frozen_means.tolist(), strict=True))
+                    unfrozen_by_shot = dict(zip(unfrozen_shots.tolist(), unfrozen_means.tolist(), strict=True))
+                    diffs = np.array([_freeze_diff(frozen_by_shot, unfrozen_by_shot, s) for s in shared])
+                    if np.isfinite(diffs).any():
+                        axes[row, col].plot(
+                            shared,
+                            diffs,
+                            color=color,
+                            linestyle=linestyle,
+                            linewidth=1.6,
+                            marker=ORDER_MARKERS.get(order, "o"),
+                            markersize=4,
+                            label=label,
                         )
-                        frozen = mask_select(model_sub, combo_mask & model_sub["freeze_shapes"])
-                        unfrozen = mask_select(model_sub, combo_mask & ~model_sub["freeze_shapes"])
-                        if frozen.sizes.get("case_idx", 0) == 0 or unfrozen.sizes.get("case_idx", 0) == 0:
-                            continue
-
-                        frozen_shots = np.atleast_1d(frozen["num_target_shots"].values)
-                        unfrozen_shots = np.atleast_1d(unfrozen["num_target_shots"].values)
-                        shared = sorted(set(frozen_shots.tolist()) & set(unfrozen_shots.tolist()))
-                        shared_line = [s for s in shared if s >= 0]
-
-                        color = td_colors[td]
-                        linestyle = da_linestyles.get(da, "-")
-                        label = f"{td} / {DA_LABELS.get(da, da)}"
-                        if len(norms) > 1:
-                            label = f"{label} / {NORM_LABELS.get(dn, dn)}"
-                        if len(geoms) > 1:
-                            label = f"{label} / {GEOM_LABELS.get(geom, geom)}"
-
-                        for row, metric in enumerate(METRIC_NAMES):
-                            for col, stage in enumerate(STAGE_AGG_NAMES):
-                                ax = axes[row, col]
-                                frozen_means = np.atleast_1d(frozen.sel(stage=stage)[f"{metric}_mean"].values).astype(float)
-                                unfrozen_means = np.atleast_1d(unfrozen.sel(stage=stage)[f"{metric}_mean"].values).astype(float)
-                                frozen_by_shot = dict(zip(frozen_shots.tolist(), frozen_means.tolist(), strict=True))
-                                unfrozen_by_shot = dict(zip(unfrozen_shots.tolist(), unfrozen_means.tolist(), strict=True))
-
-                                if shared_line:
-                                    diffs = np.array([_freeze_diff(frozen_by_shot, unfrozen_by_shot, s) for s in shared_line])
-                                    if np.isfinite(diffs).any():
-                                        ax.plot(
-                                            shared_line,
-                                            diffs,
-                                            color=color,
-                                            linestyle=linestyle,
-                                            linewidth=1.6,
-                                            marker="o",
-                                            markersize=4,
-                                            label=label,
-                                        )
-                                        drew = True
-                                if -1 in shared:
-                                    ref = _freeze_diff(frozen_by_shot, unfrozen_by_shot, -1)
-                                    if np.isfinite(ref):
-                                        ax.axhline(ref, color=color, linestyle="--", linewidth=1.2, alpha=0.6)
-                                        drew = True
+                        drew = True
 
         if not drew:
             plt.close(fig)

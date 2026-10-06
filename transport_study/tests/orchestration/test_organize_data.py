@@ -16,6 +16,7 @@ from transport_study.orchestration.organize_data import (
     keep_fresh_timeslices,
     parse_training_data,
 )
+from transport_study.orchestration.target_shots import TargetSplit
 from transport_study.tests.datasets.synthetic_store import (
     DT,
     SHOT_LENGTHS,
@@ -167,8 +168,7 @@ class TestGetTrainTestDatasets:
         train_ds, test_ds = get_train_test_datasets(
             td,
             domain_adaptation="addition",
-            num_target_shots=2,
-            target_test_set_size=5,
+            target_split=TargetSplit(num_target_shots=2, target_shot_order="ascending", target_test_set_size=5, target_test_shots=()),
             study_type="power_balance_transfer",
         )
         assert train_ds.sizes[EPISODE_DIM] > 0
@@ -186,17 +186,6 @@ class TestGetTrainTestDatasets:
 
         # The test set holds the highest-hazard target shots
         assert test_ds["hazard"].values.min() >= train_target["hazard"].values.max()
-
-    def test_get_train_test_datasets_zero_test_size_keeps_test_empty(self, sample_dataset_config):
-        td = TrainingData(sources=["cmod-low1"])
-        _, test_ds = get_train_test_datasets(
-            td,
-            domain_adaptation="addition",
-            num_target_shots=2,
-            target_test_set_size=0,
-            study_type="power_balance_transfer",
-        )
-        assert test_ds.sizes[EPISODE_DIM] == 0
 
 
 def _time_series_ds(times, values) -> xr.Dataset:

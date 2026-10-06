@@ -66,6 +66,11 @@ from transport_study.orchestration.slurm_utils import (
     spillover_budget,
     spillover_slots,
 )
+from transport_study.orchestration.target_shots import (
+    BASE_TARGET_SHOT_ORDER,
+    TARGET_SHOT_ORDERS,
+    configured_target_split,
+)
 from transport_study.orchestration.topk_results import compute_topk_study_results
 from transport_study.orchestration.wandb_utils import (
     SweepReadError,
@@ -189,7 +194,13 @@ class CaseGridConfig(StudyConfig):
     domain_adaptation_methods: Annotated[tuple[str | None, ...], CaseAxis("domain_adaptation")] = Field(
         default_factory=lambda: (None, "weighted", "addition", "transfer")
     )
-    target_test_set_size: int
+    # The orders a case adds its target training shots in, see orchestration/target_shots.py
+    target_shot_orders: Annotated[tuple[str, ...], CaseAxis("target_shot_order")] = (BASE_TARGET_SHOT_ORDER,)
+    # The held-out target test set, never trained on, defined by exactly one of the two:
+    # the target_test_set_size highest-hazard target shots,
+    # or every target shot at or above the hazard of the lowest named target_test_shots shot
+    target_test_set_size: int | None = Field(default=None, ge=1)
+    target_test_shots: tuple[int, ...] = ()
     # Hyperparameter tuning case axes shared by every study of this shape
     hyperparam_domain_adaptation: str | None = None
     hyperparam_num_target_shots: int = HYPERPARAM_TARGET_SHOTS
@@ -215,6 +226,22 @@ class CaseGridConfig(StudyConfig):
             if invalid:
                 raise ValueError(f"Invalid {field_name}: {invalid}. Must be among {valid}.")
         return self
+
+    @model_validator(mode="after")
+    def _validate_test_set_source(self):
+        if (self.target_test_set_size is None) == (not self.target_test_shots):
+            raise ValueError(
+                "Set exactly one of target_test_set_size and target_test_shots, the two ways to define the held-out target test set"
+            )
+        return self
+
+    @field_validator("target_shot_orders")
+    @classmethod
+    def _validate_target_shot_orders(cls, v: tuple[str, ...]) -> tuple[str, ...]:
+        invalid = [order for order in v if order not in TARGET_SHOT_ORDERS]
+        if invalid:
+            raise ValueError(f"Invalid target shot orders: {invalid}. Must be among {TARGET_SHOT_ORDERS}.")
+        return v
 
     @field_validator("domain_adaptation_methods")
     @classmethod
@@ -323,7 +350,10 @@ class Study:
         # (transfer_pretrain is never a case-grid axis value, it arises only as the
         # pretrain prereq of a transfer case, see transfer_pretrain_case)
         domain_adaptation: str | None
-        num_target_shots: int  # Target shots included in training, or -1 for all (HYPERPARAM_TARGET_SHOTS when domain_adaptation is None)
+        num_target_shots: int  # Target shots included in training (HYPERPARAM_TARGET_SHOTS when domain_adaptation is None)
+        # The order the target training shots are added in (see orchestration/target_shots.py),
+        # always the base order without target shots in training
+        target_shot_order: str
         # Cases this one depends on, run first (None when independent)
         prereqs: list[Study.Case] | None
 
@@ -338,7 +368,7 @@ class Study:
         # Per-case fields with a config.hyperparam_<name> counterpart
         HYPERPARAM_FIELDS: ClassVar[tuple[str, ...]] = ()
 
-        def init_common(self, model_type, training_data, domain_adaptation, num_target_shots):
+        def init_common(self, model_type, training_data, domain_adaptation, num_target_shots, target_shot_order):
             """Shared between every subclass __init__: parse, validate, build prereqs."""
             if isinstance(training_data, str):
                 training_data = parse_training_data(training_data, dict(config.dataset_paths), config.target_device)
@@ -346,6 +376,7 @@ class Study:
             self.training_data = training_data
             self.domain_adaptation = domain_adaptation
             self.num_target_shots = num_target_shots
+            self.target_shot_order = target_shot_order
             self.validate()
             prereqs = self._build_prereqs()
             self.prereqs = prereqs if prereqs else None
@@ -353,6 +384,12 @@ class Study:
         def validate(self):
             if self.model_type not in self.VALID_MODEL_TYPES:
                 raise ValueError(f"Unknown model type: {self.model_type}")
+            if self.num_target_shots < 0:
+                raise ValueError(f"num_target_shots must be >= 0, got {self.num_target_shots}")
+            if self.target_shot_order not in TARGET_SHOT_ORDERS:
+                raise ValueError(f"Unknown target shot order: {self.target_shot_order}")
+            if self.num_target_shots == 0 and self.target_shot_order != BASE_TARGET_SHOT_ORDER:
+                raise ValueError(f"target_shot_order {self.target_shot_order} needs target shots in training, this case has none")
             if self.domain_adaptation is None:
                 if not self.training_data.exnihilo and self.num_target_shots != HYPERPARAM_TARGET_SHOTS:
                     raise ValueError(
@@ -394,7 +431,11 @@ class Study:
             """
             if self.normalization_method() in STAT_NORMALIZATIONS:
                 return self.replace(domain_adaptation="transfer_pretrain")
-            return self.replace(domain_adaptation="transfer_pretrain", num_target_shots=HYPERPARAM_TARGET_SHOTS)
+            return self.replace(
+                domain_adaptation="transfer_pretrain",
+                num_target_shots=HYPERPARAM_TARGET_SHOTS,
+                target_shot_order=BASE_TARGET_SHOT_ORDER,
+            )
 
         def replace(self, **changes) -> Study.Case:
             """Rebuild through the real constructor with some fields changed, so validation and prereqs stay consistent."""
@@ -404,7 +445,8 @@ class Study:
 
         @classmethod
         def _hyperparam_field_values(cls) -> dict:
-            values = {"training_data": Study._hyperparam_training_data()}
+            # Every target shot order shares the base order's hyperparam case and sweep
+            values = {"training_data": Study._hyperparam_training_data(), "target_shot_order": BASE_TARGET_SHOT_ORDER}
             for name in cls.HYPERPARAM_FIELDS:
                 values[name] = getattr(config, f"hyperparam_{name}")
             return values
@@ -419,10 +461,14 @@ class Study:
 
         @classmethod
         def pin_inapplicable_axes(cls, fields: dict) -> dict:
-            """A case-grid point's Case fields with every axis its model type ignores pinned to the one value that type always takes.
+            """A case-grid point's Case fields with every axis it ignores pinned to the one value it always takes.
 
             The pinned duplicates of a grid point collapse into one case in finalize_cases.
+            Subclass overrides pin their own axes on top of this.
             """
+            # Without target shots in training there is nothing to order
+            if fields["num_target_shots"] == 0:
+                return fields | {"target_shot_order": BASE_TARGET_SHOT_ORDER}
             return fields
 
         def is_impossible(self) -> bool:
@@ -455,11 +501,12 @@ class Study:
                 if len(token) == 3 and value == token[2]:
                     continue
                 parts.append(f"{prefix}{value}")
+            if self.domain_adaptation or self.training_data.exnihilo:
+                parts.append(f"targ_{self.num_target_shots}")
+                if self.target_shot_order != BASE_TARGET_SHOT_ORDER:
+                    parts.append(f"order_{self.target_shot_order}")
             if self.domain_adaptation:
-                parts.append(f"targ_{self.num_target_shots}")
                 parts.append(f"da_{self.domain_adaptation}")
-            elif self.training_data.exnihilo:
-                parts.append(f"targ_{self.num_target_shots}")
             return ".".join(parts)
 
         def __hash__(self):
@@ -662,7 +709,7 @@ class Study:
         Mirrors the actual training-set composition of get_train_test_datasets:
         every loaded shot of each source device in case.training_data (the
         historic train and val splits are both concatenated into the combined
-        training set) plus case.num_target_shots target shots.
+        training set) plus case.num_target_shots target shots, whichever they are.
         Shot counts come from get_loaded_shot_count, so max_ds_size truncation
         and study-type filtering are accounted for.
 
@@ -681,10 +728,7 @@ class Study:
 
         # Shot counts as the training set actually sees them
         shot_counts = {source: get_loaded_shot_count(source, study_type=self.STUDY_TYPE) for source in case.training_data.sources}
-        if case.num_target_shots == -1:
-            # All loaded target shots end up in training (CHEATING reference case)
-            shot_counts[target] = get_loaded_shot_count(target, study_type=self.STUDY_TYPE)
-        elif case.num_target_shots > 0:
+        if case.num_target_shots > 0:
             shot_counts[target] = case.num_target_shots
         # num_target_shots == 0: no target samples in training, so the target
         # device gets no weight entry and the sources split the full budget
@@ -891,8 +935,17 @@ class Study:
         }
 
     def base_dataloader_config(self, case: Case) -> dict:
-        """Dataloader settings shared by every model type of this study."""
+        """Dataloader settings shared by every model type of this study, starting from target_split_config."""
         raise NotImplementedError
+
+    def target_split_config(self, case: Case) -> dict:
+        """The dataloader-config entries that pick a case's training data and its held-out target test set."""
+        target_split = configured_target_split(case.num_target_shots, case.target_shot_order)
+        return {
+            "training_data": case.training_data,
+            "domain_adaptation": case.domain_adaptation,
+            **target_split.dataloader_config(),
+        }
 
     def base_loss_config(self) -> dict:
         """Fallback loss hyperparameters for cases run without a tuned config."""
@@ -1518,6 +1571,7 @@ class Study:
 
     def _visualize_data(self):
         self.DATA_VISUALIZATION.hazard_extrapolation(self.figure_dir)
+        self.DATA_VISUALIZATION.target_shot_orders(self.figure_dir)
         self.DATA_VISUALIZATION.domain_overlap(self.figure_dir)
 
     @classmethod
@@ -1662,6 +1716,7 @@ class Study:
             homes = Counter(self.case_home(case).name for case in self.cases)
             logger.info(f"Case homes: {dict(homes)} ({homes[self.name]} train here, the rest are borrowed)")
         logger.info(f"Target test set size: {config.target_test_set_size}")
+        logger.info(f"Target test shots: {config.target_test_shots}")
         logger.info(f"Dataset paths: {config.dataset_paths}")
         logger.info(f"Target device: {config.target_device}")
         for axis_field in config.fields_with_role(FieldRole.CASE_AXIS):

@@ -20,6 +20,7 @@ FIXED_CASE_FIELDS = {
     "freeze_shapes": True,
     "geometry_builder": "circular",
     "num_target_shots": 0,
+    "target_shot_order": "ascending",
 }
 MODEL_TYPES = ["shape-init-pca", "mlp"]
 SHOTS = [101, 102, 103]
@@ -81,7 +82,7 @@ def test_write_comparison_tables(tmp_path):
     assert len(pd.read_csv(csv_path)) == len(MODEL_TYPES)
 
     # The two cases differ only along model_type, so exactly that axis gets a table
-    table_path = tmp_path / "tables" / "model_type" / "td_cmod.norm_physics.da_none.freeze_True.geom_circular.targ_0.md"
+    table_path = tmp_path / "tables" / "model_type" / "td_cmod.norm_physics.da_none.freeze_True.geom_circular.targ_0.order_ascending.md"
     content = table_path.read_text()
     for model_type in MODEL_TYPES:
         assert f"| {model_type} |" in content

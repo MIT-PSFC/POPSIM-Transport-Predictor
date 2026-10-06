@@ -26,6 +26,7 @@ from transport_study.orchestration.study import (
     ModelTrainSpec,
     Study,
 )
+from transport_study.orchestration.target_shots import BASE_TARGET_SHOT_ORDER
 from transport_study.power_balance_transfer.data_visualization import DataVisualization
 from transport_study.power_balance_transfer.plotting import COMPARISON_FAMILIES, LAYOUT
 from transport_study.power_balance_transfer.tables import SPEC as TABLE_SPEC
@@ -77,7 +78,7 @@ class PowerBalanceStudy(Study):
         )
         freeze_submodules_options: Annotated[tuple[bool, ...], CaseAxis("freeze_submodules")] = Field(default_factory=lambda: (False,))
         num_target_shots_options: Annotated[tuple[int, ...], CaseAxis("num_target_shots")] = Field(
-            default_factory=lambda: (0, 1, 3, 10, 32, -1)
+            default_factory=lambda: (0, 1, 3, 10, 32)
         )
         # Hyperparameter tuning case configuration
         # (hyperparam_domain_adaptation and hyperparam_num_target_shots live on CaseGridConfig)
@@ -126,7 +127,12 @@ class PowerBalanceStudy(Study):
         freeze_submodules: Whether to freeze the p_oh/p_rad submodules of the model during training.
         The P_oh and P_rad signals are hard to quantify, we might want to let them drift from the original targets to better match energy_mhd_MJ
 
-        num_target_shots: The number of shots included in the training data from the target dataset, or -1 to include all shots (including all shots in training is cheating, but again answers the question of what is the best possible performance).
+        num_target_shots: The number of shots included in the training data from the target dataset, never any of the held-out test shots.
+
+        target_shot_order: The order the target training shots are added in as num_target_shots grows, see orchestration/target_shots.py
+        - ascending: the base extrapolation, lowest hazard first, suppressed from the case name
+        - descending: the highest-hazard non-test shots first, the ones closest to the test regime
+        - spanning: the shots whose timeslice footprints span the power balance input and output space
         """
 
         data_normalization: str
@@ -148,10 +154,11 @@ class PowerBalanceStudy(Study):
             domain_adaptation: str | None,
             freeze_submodules: bool,
             num_target_shots: int,
+            target_shot_order: str = BASE_TARGET_SHOT_ORDER,
         ):
             self.data_normalization = data_normalization
             self.freeze_submodules = freeze_submodules
-            self.init_common(model_type, training_data, domain_adaptation, num_target_shots)
+            self.init_common(model_type, training_data, domain_adaptation, num_target_shots, target_shot_order)
 
         def normalization_method(self) -> str | None:
             return self.data_normalization
@@ -167,10 +174,11 @@ class PowerBalanceStudy(Study):
 
         @classmethod
         def pin_inapplicable_axes(cls, fields: dict) -> dict:
+            pinned = super().pin_inapplicable_axes(fields)
             # Only the structured models have submodules to freeze
             if fields["model_type"] not in MODEL_TYPES_WITH_SUBMODULES:
-                return fields | {"freeze_submodules": config.hyperparam_freeze_submodules}
-            return fields
+                return pinned | {"freeze_submodules": config.hyperparam_freeze_submodules}
+            return pinned
 
         def model_type_prereqs(self) -> list[Study.Case]:
             # The structured models restore pre-trained p_oh/p_rad submodules
@@ -187,10 +195,7 @@ class PowerBalanceStudy(Study):
 
     def base_dataloader_config(self, case: Case) -> dict:
         return {
-            "training_data": case.training_data,
-            "domain_adaptation": case.domain_adaptation,
-            "num_target_shots": case.num_target_shots,
-            "target_test_set_size": config.target_test_set_size,
+            **self.target_split_config(case),
             # Hyperparameters
             "segment_length_train": 100,
             "segment_overlap_train": 50,

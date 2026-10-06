@@ -4,9 +4,6 @@ Every figure is a grid of panels with the number of target-device shots in train
 A ComparisonLayout holds one study's panel rows and columns and its case-grid vocabulary,
 a ComparisonFamily one kind of comparison:
 a line per value of its series field, a figure per combination of the remaining case-grid fields.
-
-The num_target_shots = -1 sentinel (all target shots in training, the cheating reference) has no x position,
-it is drawn as a dashed horizontal line in the series color.
 """
 
 from collections.abc import Callable
@@ -66,6 +63,26 @@ NORM_LABELS = {
     "coral": "CORAL",
     "physics-coral": "Physics CORAL",
     "physics-zscore": "Physics z-score",
+}
+
+# The target shot orders (see orchestration/target_shots.py)
+ORDER_COLORS = {
+    "ascending": "#c0c0c0",
+    "descending": "#ff8c1a",
+    "spanning": "#1ad1ff",
+}
+
+ORDER_LABELS = {
+    "ascending": "Lowest hazard first",
+    "descending": "Highest hazard first",
+    "spanning": "Spanning",
+}
+
+# Markers that tell the orders apart where the line color already encodes another field
+ORDER_MARKERS = {
+    "ascending": "o",
+    "descending": "v",
+    "spanning": "D",
 }
 
 
@@ -148,7 +165,7 @@ def grid_figure(layout: ComparisonLayout) -> tuple[plt.Figure, np.ndarray]:
 def plot_series(ax, shots: np.ndarray, means: np.ndarray, stds: np.ndarray, color, label: str, linestyle: str = "-") -> bool:
     """One comparison member on one axis.
 
-    An errorbar line over num_target_shots >= 0, plus a dashed horizontal reference for the -1 sentinel.
+    An errorbar line over num_target_shots.
     Diverged cases are masked out. Returns whether anything was drawn.
     """
     shots = np.atleast_1d(shots)
@@ -158,36 +175,29 @@ def plot_series(ax, shots: np.ndarray, means: np.ndarray, stds: np.ndarray, colo
     means[diverged] = np.nan
     stds[diverged] = np.nan
 
-    drew = False
-    line_mask = shots >= 0
-    if line_mask.any() and np.isfinite(means[line_mask]).any():
-        order = np.argsort(shots[line_mask])
-        ax.errorbar(
-            shots[line_mask][order],
-            means[line_mask][order],
-            yerr=stds[line_mask][order],
-            label=label,
-            color=color,
-            linestyle=linestyle,
-            marker="o",
-            markersize=4,
-            linewidth=1.6,
-            capsize=3,
-            capthick=1.0,
-        )
-        drew = True
-
-    for ref_mean in means[shots == -1]:
-        if np.isfinite(ref_mean):
-            ax.axhline(ref_mean, color=color, linestyle="--", linewidth=1.2, alpha=0.8)
-            drew = True
-    return drew
+    if not np.isfinite(means).any():
+        return False
+    order = np.argsort(shots)
+    ax.errorbar(
+        shots[order],
+        means[order],
+        yerr=stds[order],
+        label=label,
+        color=color,
+        linestyle=linestyle,
+        marker="o",
+        markersize=4,
+        linewidth=1.6,
+        capsize=3,
+        capthick=1.0,
+    )
+    return True
 
 
 def finalize_grid(fig, axes, sub: xr.Dataset, title: str, save_path: Path):
-    """Shared x ticks, one figure legend, the title and the dashed-line note, then save and close."""
+    """Shared x ticks, one figure legend and the title, then save and close."""
     shots = np.atleast_1d(sub["num_target_shots"].values)
-    tick_shots = sorted({int(s) for s in shots if s >= 0})
+    tick_shots = sorted({int(s) for s in shots})
     for ax in axes.flat:
         ax.set_xscale("symlog", linthresh=1)
         if tick_shots:
@@ -205,7 +215,6 @@ def finalize_grid(fig, axes, sub: xr.Dataset, title: str, save_path: Path):
     if handles:
         fig.legend(handles, labels, loc="lower center", ncols=min(len(labels), 4), fontsize=LEGEND_FONTSIZE, **LEGEND_STYLE)
     fig.suptitle(title, color=TEXT_COLOR, fontsize=TITLE_FONTSIZE)
-    fig.text(0.99, 0.01, "dashed: trained on all target shots", color=TEXT_COLOR, fontsize=TICK_FONTSIZE, ha="right")
     fig.tight_layout(rect=(0, 0.06, 1, 0.96))
     save_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(save_path, dpi=200, facecolor=fig.get_facecolor())

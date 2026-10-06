@@ -9,7 +9,7 @@ from loguru import logger
 from matplotlib import patches
 from scipy.spatial import ConvexHull
 
-from transport_study import EPISODE_DIM
+from transport_study import EPISODE_DIM, TIME_DIM
 from transport_study.config import config
 from transport_study.orchestration.organize_data import (
     TrainingData,
@@ -19,7 +19,17 @@ from transport_study.orchestration.organize_data import (
     get_train_val_datasets,
     normalize_domain,
 )
-from transport_study.plot_style import BACKGROUND_COLOR, FACE_COLOR, TEXT_COLOR
+from transport_study.orchestration.target_shots import (
+    configured_target_split,
+    target_shot_split,
+)
+from transport_study.plot_style import (
+    BACKGROUND_COLOR,
+    FACE_COLOR,
+    LEGEND_STYLE,
+    TEXT_COLOR,
+    style_axis,
+)
 
 TITLE_FONTSIZE = 22
 LABEL_FONTSIZE = 18
@@ -402,8 +412,7 @@ class DataVisualizationBase:
                 train_ds, test_ds = get_train_test_datasets(
                     training_data=_td(sources),
                     domain_adaptation="addition",
-                    num_target_shots=0,
-                    target_test_set_size=config.target_test_set_size,
+                    target_split=configured_target_split(0),
                     study_type=cls.STUDY_TYPE,
                 )
                 hazard_extrapolation_plot(
@@ -412,6 +421,65 @@ class DataVisualizationBase:
                     ds_type_list=["train", "test"],
                     source_colors=colors,
                 )
+
+    @classmethod
+    def target_shot_orders(cls, figure_dir: Path | str):
+        """Plot which target shots each configured target shot order trains on.
+
+        One figure per order, one column per positive num_target_shots option.
+        Each target shot is drawn in the hazard plane (top)
+        and in the heating plane (bottom), P_aux against stored energy, which splits ohmic from heated shots,
+        marked as test, pool or picked.
+        """
+        target = config.target_device
+        shot_counts = sorted(n for n in config.num_target_shots_options if n > 0)
+        if not target or not shot_counts:
+            return
+        save_dir = Path(figure_dir) / "data_visualization" / "target_shot_orders"
+        fig_paths = {order: save_dir / f"{target}_order_{order}.png" for order in config.target_shot_orders}
+        if all(fig_path.exists() for fig_path in fig_paths.values()):
+            return
+
+        # The split is decided on the power balance view in every study (see orchestration/target_shots.py)
+        ds_power_balance = get_ds(target, "power_balance_transfer")
+        shots = ds_power_balance[EPISODE_DIM].values
+        power_additional_MW_p95 = ds_power_balance["power_additional_MW"].quantile(0.95, dim=TIME_DIM, skipna=True).values
+        energy_mhd_MJ_p95 = ds_power_balance["energy_mhd_MJ_p95"].values
+        planes = (
+            (ds_power_balance["ip_MA_p95"].values, energy_mhd_MJ_p95, "ip_MA (hazard p95)"),
+            (power_additional_MW_p95, energy_mhd_MJ_p95, "power_additional_MW (p95)"),
+        )
+        color_by_role = {"pool": "#808080", "test": "#ff4d4d", "picked": "#1ad1ff"}
+        marker_by_role = {"pool": ("o", 8), "test": ("*", 30), "picked": ("s", 30)}
+
+        for order, fig_path in fig_paths.items():
+            if fig_path.exists():
+                continue
+            fig, axes = plt.subplots(2, len(shot_counts), figsize=(3.6 * len(shot_counts), 7), squeeze=False)
+            fig.patch.set_facecolor(BACKGROUND_COLOR)
+            for col, num_target_shots in enumerate(shot_counts):
+                target_split = configured_target_split(num_target_shots, order)
+                train_shots, test_shots = target_shot_split(ds_power_balance, target_split)
+                mask_by_role = {"test": np.isin(shots, test_shots), "picked": np.isin(shots, train_shots)}
+                mask_by_role["pool"] = ~mask_by_role["test"] & ~mask_by_role["picked"]
+                for row, (x_values, y_values, x_label) in enumerate(planes):
+                    ax = axes[row, col]
+                    style_axis(ax)
+                    for role in ("pool", "test", "picked"):
+                        marker, size = marker_by_role[role]
+                        mask = mask_by_role[role]
+                        ax.scatter(x_values[mask], y_values[mask], c=color_by_role[role], marker=marker, s=size, label=role)
+                    ax.set_xlabel(x_label, color=TEXT_COLOR)
+                    if col == 0:
+                        ax.set_ylabel("energy_mhd_MJ (hazard p95)", color=TEXT_COLOR)
+                shot_noun = "shot" if num_target_shots == 1 else "shots"
+                axes[0, col].set_title(f"{num_target_shots} target {shot_noun}", color=TEXT_COLOR)
+            axes[0, 0].legend(loc="upper left", **LEGEND_STYLE)
+            fig.suptitle(f"{target} training shots, {order} order", color=TEXT_COLOR)
+            fig.tight_layout()
+            fig_path.parent.mkdir(parents=True, exist_ok=True)
+            fig.savefig(fig_path, dpi=200, facecolor=fig.get_facecolor())
+            plt.close(fig)
 
     @classmethod
     def domain_overlap(cls, figure_dir: Path | str):

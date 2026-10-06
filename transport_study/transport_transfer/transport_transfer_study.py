@@ -35,6 +35,7 @@ from transport_study.orchestration.study import (
     ModelTrainSpec,
     Study,
 )
+from transport_study.orchestration.target_shots import BASE_TARGET_SHOT_ORDER
 from transport_study.power_balance_transfer.power_balance_study import (
     POWER_BALANCE_INPUT_VARS,
     SCALAR_SUBMODULE_SETTINGS,
@@ -120,7 +121,7 @@ class TransportStudy(Study):
         # ignored by every other model type (see VALID_TORAX_STATES)
         torax_state_options: Annotated[tuple[str, ...], CaseAxis("torax_state")] = Field(default_factory=lambda: ("rebuild",))
         num_target_shots_options: Annotated[tuple[int, ...], CaseAxis("num_target_shots")] = Field(
-            default_factory=lambda: (0, 1, 3, 10, 32, -1)
+            default_factory=lambda: (0, 1, 3, 10, 32)
         )
         # Input normalization applied to the 11 dimensionless transport
         # features, one setting for the whole study run (not a case axis, so
@@ -193,7 +194,12 @@ class TransportStudy(Study):
         - rebuild: carry only ne/te and rebuild a TORAX initial state each step (T_i := T_e, psi from Ip)
         - carry: also carry T_i and psi, so the ion channel and the current evolve over the rollout
 
-        num_target_shots: The number of shots included in the training data from the target dataset, or -1 to include all shots (including all shots in training is cheating, but again answers the question of what is the best possible performance).
+        num_target_shots: The number of shots included in the training data from the target dataset, never any of the held-out test shots.
+
+        target_shot_order: The order the target training shots are added in as num_target_shots grows, see orchestration/target_shots.py
+        - ascending: the base extrapolation, lowest hazard first, suppressed from the case name
+        - descending: the highest-hazard non-test shots first, the ones closest to the test regime
+        - spanning: the shots whose timeslice footprints span the power balance input and output space
         """
 
         freeze_submodules: bool
@@ -225,11 +231,12 @@ class TransportStudy(Study):
             num_target_shots: int,
             geometry_builder: str = "circular",
             torax_state: str = "rebuild",
+            target_shot_order: str = BASE_TARGET_SHOT_ORDER,
         ):
             self.freeze_submodules = freeze_submodules
             self.geometry_builder = geometry_builder
             self.torax_state = torax_state
-            self.init_common(model_type, training_data, domain_adaptation, num_target_shots)
+            self.init_common(model_type, training_data, domain_adaptation, num_target_shots, target_shot_order)
 
         def normalization_method(self) -> str | None:
             # Study-wide settings, not case axes
@@ -255,7 +262,7 @@ class TransportStudy(Study):
 
         @classmethod
         def pin_inapplicable_axes(cls, fields: dict) -> dict:
-            pinned = dict(fields)
+            pinned = super().pin_inapplicable_axes(fields)
             # Only sciml has submodules to freeze
             if fields["model_type"] != "sciml":
                 pinned["freeze_submodules"] = config.hyperparam_freeze_submodules
@@ -285,10 +292,7 @@ class TransportStudy(Study):
 
     def base_dataloader_config(self, case: Case) -> dict:
         return {
-            "training_data": case.training_data,
-            "domain_adaptation": case.domain_adaptation,
-            "num_target_shots": case.num_target_shots,
-            "target_test_set_size": config.target_test_set_size,
+            **self.target_split_config(case),
             # Hyperparameters
             "segment_length_train": 100,
             "segment_overlap_train": 50,

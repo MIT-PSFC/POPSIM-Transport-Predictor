@@ -8,6 +8,7 @@ from transport_study.modules.profile_predictor.trb import (
     ProfilePredictorTRB,
 )
 from transport_study.orchestration.study import HYPERPARAM_TARGET_SHOTS
+from transport_study.orchestration.target_shots import BASE_TARGET_SHOT_ORDER
 from transport_study.profile_transfer.profile_study import ProfileStudy
 
 
@@ -15,11 +16,12 @@ def checkpoint_to_profile_case(checkpoint_dir: Path | str) -> ProfileStudy.Case:
     """Parse a case directory name back into a ProfileStudy.Case.
 
     Mirrors ProfileStudy.Case.__str__:
-    case.{model_type}.td_{td}.norm_{n}[.freeze_True].geom_{g}                   source-trained, no adaptation
-    case.{model_type}.td_{td}.norm_{n}[.freeze_True].geom_{g}.targ_{n}          exnihilo
-    case.{model_type}.td_{td}.norm_{n}[.freeze_True].geom_{g}.targ_{n}.da_{da}  domain adaptation
+    case.{model_type}.td_{td}.norm_{n}[.freeze_True].geom_{g}                                 source-trained, no adaptation
+    case.{model_type}.td_{td}.norm_{n}[.freeze_True].geom_{g}.targ_{n}[.order_{o}]            exnihilo
+    case.{model_type}.td_{td}.norm_{n}[.freeze_True].geom_{g}.targ_{n}[.order_{o}].da_{da}    domain adaptation
 
     The freeze_ token is suppressed for unfrozen shapes (see Study.Case.STR_TOKEN_FIELDS),
+    the order_ token for the base target shot order,
     norm_ and geom_ are mandatory and fixed in position.
     """
     case_name = Path(checkpoint_dir).name
@@ -45,10 +47,14 @@ def checkpoint_to_profile_case(checkpoint_dir: Path | str) -> ProfileStudy.Case:
     idx += 1
 
     num_target_shots = HYPERPARAM_TARGET_SHOTS
+    target_shot_order = BASE_TARGET_SHOT_ORDER
     domain_adaptation = None
     if idx < len(pieces) and pieces[idx].startswith("targ_"):
         num_target_shots = int(pieces[idx].removeprefix("targ_"))
         idx += 1
+        if idx < len(pieces) and pieces[idx].startswith("order_"):
+            target_shot_order = pieces[idx].removeprefix("order_")
+            idx += 1
         if idx < len(pieces) and pieces[idx].startswith("da_"):
             domain_adaptation = pieces[idx].removeprefix("da_")
             idx += 1
@@ -64,6 +70,7 @@ def checkpoint_to_profile_case(checkpoint_dir: Path | str) -> ProfileStudy.Case:
         freeze_shapes=freeze_shapes,
         num_target_shots=num_target_shots,
         geometry_builder=geometry_builder,
+        target_shot_order=target_shot_order,
     )
 
 

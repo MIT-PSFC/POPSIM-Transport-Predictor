@@ -15,6 +15,8 @@ from transport_study.orchestration.comparison_figures import (
     DA_LABELS,
     NORM_COLORS,
     NORM_LABELS,
+    ORDER_COLORS,
+    ORDER_LABELS,
     ComparisonFamily,
     ComparisonLayout,
 )
@@ -58,15 +60,21 @@ LAYOUT = ComparisonLayout(
     col_labels=DOMAIN_LABELS,
     cell_size=(4.6, 3.4),
     series_stats=summary_series_stats,
-    grid_fields=("model_type", "training_data", "data_normalization", "domain_adaptation", "freeze_submodules"),
+    grid_fields=("model_type", "training_data", "data_normalization", "domain_adaptation", "freeze_submodules", "target_shot_order"),
     field_tokens={
         "model_type": "{}",
         "training_data": "td_{}",
         "data_normalization": "norm_{}",
         "domain_adaptation": "da_{}",
         "freeze_submodules": "freeze_{}",
+        "target_shot_order": "order_{}",
     },
-    value_labels={"model_type": MODEL_LABELS, "data_normalization": NORM_LABELS, "domain_adaptation": DA_LABELS},
+    value_labels={
+        "model_type": MODEL_LABELS,
+        "data_normalization": NORM_LABELS,
+        "domain_adaptation": DA_LABELS,
+        "target_shot_order": ORDER_LABELS,
+    },
     excluded_model_types=SUBMODULE_MODEL_TYPES,
 )
 
@@ -77,4 +85,6 @@ COMPARISON_FAMILIES = (
     # The no-adaptation baseline only exists at num_target_shots = 0 for non-exnihilo training data,
     # so it typically shows up as a single point rather than a trend
     ComparisonFamily("domain_adaptation_comparison", "domain_adaptation", "Domain adaptation comparison", DA_COLORS),
+    # Without target shots every case takes the base order, so the other orders start at 1 target shot
+    ComparisonFamily("target_shot_order_comparison", "target_shot_order", "Target shot order comparison", ORDER_COLORS, min_series=2),
 )

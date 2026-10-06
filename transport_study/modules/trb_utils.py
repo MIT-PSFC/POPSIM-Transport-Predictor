@@ -24,6 +24,7 @@ from transport_study.orchestration.organize_data import (
     get_train_val_datasets,
     get_transfer_pretrain_datasets,
 )
+from transport_study.orchestration.target_shots import TargetSplit
 
 # Floor on the per-timeslice profile peak used for peak normalization.
 # In channel units (1e20 m^-3 for ne, keV for Te) any real profile peaks far above it,
@@ -419,12 +420,12 @@ def resolve_case_datasets(
 
     normalizer_fit_ds = None
     domain_adaptation = dataloader_config["domain_adaptation"]
+    target_split = TargetSplit.from_dataloader_config(dataloader_config)
     if domain_adaptation == "transfer_pretrain":
         logger.info("Using transfer pretrain dataloader (trains on historic data, normalizer fit on historic + target shots)")
         ds_train, normalizer_fit_ds, ds_val = get_transfer_pretrain_datasets(
             training_data=training_data,
-            num_target_shots=dataloader_config["num_target_shots"],
-            target_test_set_size=dataloader_config["target_test_set_size"],
+            target_split=target_split,
             study_type=study_type,
         )
     elif domain_adaptation is None:
@@ -438,8 +439,7 @@ def resolve_case_datasets(
             ds_train, ds_val = get_train_test_datasets(
                 training_data=training_data,
                 domain_adaptation=None,
-                num_target_shots=dataloader_config["num_target_shots"],
-                target_test_set_size=dataloader_config["target_test_set_size"],
+                target_split=target_split,
                 study_type=study_type,
             )
             # Double check there's no source (non-target) data anywhere in here
@@ -453,8 +453,7 @@ def resolve_case_datasets(
         ds_train, ds_val = get_train_test_datasets(
             training_data=training_data,
             domain_adaptation=domain_adaptation,
-            num_target_shots=dataloader_config["num_target_shots"],
-            target_test_set_size=dataloader_config["target_test_set_size"],
+            target_split=target_split,
             study_type=study_type,
         )
 

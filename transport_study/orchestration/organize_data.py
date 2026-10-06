@@ -34,6 +34,7 @@ from transport_study.modules.profile_predictor.module import (
     NN_INPUT_SOURCE_VARS,
     nn_input_matrix,
 )
+from transport_study.orchestration.target_shots import TargetSplit, target_shot_split
 from transport_study.signals import convert_to_working_units, store_signals_for
 
 if TYPE_CHECKING:
@@ -575,16 +576,12 @@ def get_loaded_shot_count(source_ds: str, study_type: str = "profile_transfer") 
     return int(ds.sizes[EPISODE_DIM])
 
 
-def _split_target_shots(
-    num_target_shots: int,
-    target_test_set_size: int,
-    study_type: str,
-):
+def _split_target_shots(target_split: TargetSplit, study_type: str):
     """Load the target device and split it into training shots and the held-out test set.
 
-    A deterministic hazard sort: the test set is the target_test_set_size highest-hazard shots,
-    the training shots are the first num_target_shots of the remaining pool
-    (or every shot for -1, the cheating upper-bound reference).
+    The split is decided on the power balance view of the target device (see orchestration/target_shots.py),
+    then the study's own view is indexed by those shot numbers,
+    so every study trains and tests on the same target shots.
     Returns (train_ds_target, test_ds).
     """
     target = config.target_device
@@ -592,34 +589,21 @@ def _split_target_shots(
         raise ValueError("config.target_device must be set before transfer learning")
 
     ds_target = get_ds(target, study_type=study_type)
+    ds_power_balance = ds_target if study_type == "power_balance_transfer" else get_ds(target, study_type="power_balance_transfer")
+    train_shots, test_shots = target_shot_split(ds_power_balance, target_split)
+    split_shots = {*train_shots.tolist(), *test_shots.tolist()}
+    missing = sorted(split_shots - set(ds_target[EPISODE_DIM].values.tolist()))
+    if missing:
+        raise ValueError(f"The {study_type} prep dropped target shots {missing} that the target split uses")
+
     ds_target["ds_source_idx"] = (
         EPISODE_DIM,
         np.full(ds_target.sizes[EPISODE_DIM], config.ds_source_to_idx[target]),
     )
     ds_target = ds_target.assign_coords(ds_source=target)
-    sorted_shots = np.argsort(ds_target["hazard"].values)
-
-    test_shot_pool = sorted_shots[-target_test_set_size:] if target_test_set_size else sorted_shots[:0]
-    test_ds = ds_target.isel({EPISODE_DIM: test_shot_pool})
-
-    if num_target_shots == -1:
-        # All available target shots in training and testing (upper-bound reference, CHEATING!)
-        train_ds_target = ds_target.isel({EPISODE_DIM: sorted_shots})
-    else:
-        # Exclude the held-out test shots before selecting training shots so the two pools
-        # never overlap (otherwise a large num_target_shots would leak high-hazard test
-        # shots into training)
-        train_candidate_pool = sorted_shots[:-target_test_set_size] if target_test_set_size else sorted_shots
-        if num_target_shots > len(train_candidate_pool):
-            raise ValueError(
-                f"num_target_shots={num_target_shots} requested but only {len(train_candidate_pool)} target "
-                f"shots remain after holding out target_test_set_size={target_test_set_size} of "
-                f"{len(sorted_shots)} loaded shots. Is the dataset smaller than expected "
-                f"(max_ds_size truncation)?"
-            )
-        train_shot_pool = train_candidate_pool[:num_target_shots]
-        assert not (set(train_shot_pool.tolist()) & set(test_shot_pool.tolist())), "Target train and test shot pools overlap - data leakage"
-        train_ds_target = ds_target.isel({EPISODE_DIM: train_shot_pool})
+    train_ds_target = ds_target.sel({EPISODE_DIM: train_shots})
+    test_ds = ds_target.sel({EPISODE_DIM: test_shots})
+    assert not (set(train_shots.tolist()) & set(test_shots.tolist())), "Target train and test shot pools overlap - data leakage"
 
     return train_ds_target, test_ds
 
@@ -627,8 +611,7 @@ def _split_target_shots(
 def get_train_test_datasets(
     training_data: "TrainingData",
     domain_adaptation: str | None,
-    num_target_shots: int,
-    target_test_set_size: int,
+    target_split: TargetSplit,
     study_type: str = "profile_transfer",
 ):
     """
@@ -638,16 +621,16 @@ def get_train_test_datasets(
     gets per-device loss weights injected in make_train_config). If domain adaptation is
     'transfer' or training_data.exnihilo is True, removes all historic data from the training
     set, leaving only the target device shots.
-    The number of target shots included in training is specified by `num_target_shots`.
+    target_split picks the target shots included in training and the held-out test set (see orchestration/target_shots.py).
 
     The test set is always the same set of target device shots.
-    The training set is the historic data from training_data.sources plus num_target_shots target shots.
+    The training set is the historic data from training_data.sources plus the target_split's training shots.
 
     There is no validation set here since hyperparameters are not tuned on transfer learning data.
     We treat the test set as a validation set for checkpoint selection, which is slightly optimistic
     but consistent across all models so comparisons are fair.
     """
-    train_ds_target, test_ds = _split_target_shots(num_target_shots, target_test_set_size, study_type)
+    train_ds_target, test_ds = _split_target_shots(target_split, study_type)
 
     # Load historic source data for training (for exnihilo it is stripped again below)
     # exnihilo.sources contains all non-target devices, so we can pass training_data directly
@@ -672,8 +655,7 @@ def get_train_test_datasets(
 
 def get_transfer_pretrain_datasets(
     training_data: "TrainingData",
-    num_target_shots: int,
-    target_test_set_size: int,
+    target_split: TargetSplit,
     study_type: str = "profile_transfer",
 ):
     """Datasets for a transfer_pretrain case (the pretrain half of a stat-normalized transfer).
@@ -681,13 +663,13 @@ def get_transfer_pretrain_datasets(
     The case trains on ALL historic data (train and val splits together, the
     source val split is not needed because checkpoint selection uses the
     target test set, like every other domain-adaptation case). The combined
-    dataset (historic + the transfer case's num_target_shots target shots)
+    dataset (historic + the transfer case's target training shots)
     exists only to fit the normalization statistics, which the transfer case
     then inherits through the checkpoint restore.
 
     Returns (train_ds_hist, train_ds_combined, test_ds).
     """
-    train_ds_target, test_ds = _split_target_shots(num_target_shots, target_test_set_size, study_type)
+    train_ds_target, test_ds = _split_target_shots(target_split, study_type)
 
     train_ds_hist, val_ds_hist = get_train_val_datasets(training_data, study_type=study_type)
     train_ds_hist = concat_with_nan_padding([train_ds_hist, val_ds_hist], concat_dim=EPISODE_DIM)

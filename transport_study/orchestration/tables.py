@@ -103,10 +103,8 @@ def _group_filename(spec: ComparisonTableSpec, axis: str, group_key: tuple) -> s
 
 
 def _axis_sort_key(axis: str, value):
-    if axis == "num_target_shots":
-        # The -1 sentinel means all target shots, list it after the real counts
-        return (1, 0) if value == -1 else (0, int(value))
-    return (0, str(value))
+    # Shot counts sort numerically, every other axis by its string
+    return int(value) if axis == "num_target_shots" else str(value)
 
 
 def _write_group_table(spec: ComparisonTableSpec, axis: str, group_key: tuple, group: pd.DataFrame, out_path: Path):

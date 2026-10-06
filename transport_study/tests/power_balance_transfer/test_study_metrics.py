@@ -147,7 +147,7 @@ def collected_datasets() -> tuple[xr.Dataset, xr.Dataset]:
     case_idx, with a p_oh submodule case and one case missing from metrics."""
     model_types = ["sciml-taue-nn", "transformer", "p_oh"]
     normalizations = ["raw", "coral"]
-    shots_options = [0, 3, -1]
+    shots_options = [0, 3, 10]
 
     rows = [(mt, "cmod_tcv", dn, "addition", True, n) for mt, dn, n in product(model_types, normalizations, shots_options)]
     n = len(rows)
@@ -160,6 +160,8 @@ def collected_datasets() -> tuple[xr.Dataset, xr.Dataset]:
         strict=True,
     ):
         results = results.assign_coords({coord_name: ("case_idx", [row[idx] for row in rows])})
+    # A single configured order is a scalar coord in real collected files
+    results = results.assign_coords(target_shot_order="ascending")
     for err in ("err_abs", "err_rel"):
         for domain in ("shot", "ts"):
             for stat in ("mean", "std", "med", "p25", "p75", "min", "max"):

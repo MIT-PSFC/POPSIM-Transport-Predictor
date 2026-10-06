@@ -39,6 +39,7 @@ CASE_FIELD_ORDER = (
     "freeze_shapes",
     "geometry_builder",
     "num_target_shots",
+    "target_shot_order",
 )
 
 SPEC = ComparisonTableSpec(
@@ -53,6 +54,7 @@ SPEC = ComparisonTableSpec(
         "freeze_shapes": "freeze_{}",
         "geometry_builder": "geom_{}",
         "num_target_shots": "targ_{}",
+        "target_shot_order": "order_{}",
     },
     columns=(
         ("combined (time avg)", "combined_mean_all"),
