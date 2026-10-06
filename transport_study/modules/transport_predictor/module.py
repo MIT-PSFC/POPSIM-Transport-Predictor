@@ -45,6 +45,7 @@ from transport_study.modules.profile_predictor.torax_module import (
     cell_centers,
     check_torax_choices,
     clamp_core_profiles,
+    geometry_shape_coefficients,
     interp_cell_plus_boundaries,
     interp_core_profiles,
     make_step_fn_and_grid,
@@ -656,6 +657,7 @@ class TransportPredictorToraxBase(TransportPredictor):
             **bound_edge_coefficients(
                 self.nn_edge(nn_inputs), inputs.n_e_line_average_1e20, inputs.te_approx_from_energy_mhd(energy_mhd_MJ)
             ),
+            **geometry_shape_coefficients(self.geometry_builder, inputs, energy_mhd_MJ),
         }
 
     def build_provider_and_geo(
@@ -689,7 +691,9 @@ class TransportPredictorToraxBase(TransportPredictor):
             )
         provider_step_fn = self.step_fn if step_fn is None else step_fn
         new_provider = provider_step_fn.runtime_params_provider.update_provider_from_mapping(mapping)
-        geo_provider = build_geometry_provider(self.geometry_builder, inputs, self._face_centers, self._rho_hires_norm, self.delta_exponent)
+        geo_provider = build_geometry_provider(
+            self.geometry_builder, inputs, coeffs, self._face_centers, self._rho_hires_norm, self.delta_exponent
+        )
         return new_provider, geo_provider
 
     def seed_initial_state(self, inputs: Inputs, ne: Array, te: Array, step_fn: SimulationStepFn | None = None) -> tuple:

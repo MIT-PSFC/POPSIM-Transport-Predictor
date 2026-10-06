@@ -1,4 +1,5 @@
 import dataclasses
+from typing import NamedTuple
 
 import equinox as eqx
 import jax
@@ -18,6 +19,7 @@ from torax._src.orchestration.step_function import SimulationStepFn
 from torax._src.torax_pydantic import torax_pydantic
 
 from transport_study import RADIAL_DIM
+from transport_study.modules import plasma_parameters
 from transport_study.modules.normalization import FeatureNormalizer
 from transport_study.modules.profile_predictor.module import (
     N_NN_INPUTS,
@@ -204,6 +206,159 @@ def build_circular_geometry_jax(
 # points is overkill-safe and cheap (geometry built once per sample)
 _MILLER_NTHETA = 64
 
+# Surfaces on the uniform midplane-radius grid the Miller builder inverts the toroidal-flux label on.
+# Linear interpolation of the inverse on 257 points is accurate to ~1e-6 in the surface radius
+_MILLER_N_LABEL = 257
+
+# Miller shape-profile closures (miller_shape_coefficients).
+# The magnetic axis keeps AXIS_ELONGATION_FRACTION of the LCFS elongation excess,
+# reconstructed equilibria keep roughly 0.6 - 0.9 of it.
+# The axis Shafranov shift is the large-aspect-ratio (a^2 / 2 R)(beta_p + l_i / 2) at a fixed internal inductance,
+# capped at MAX_SHAFRANOV_SHIFT_NORM of the minor radius, where |dR0 / dr| = 0.6 keeps the surfaces nested
+AXIS_ELONGATION_FRACTION = 0.7
+SHAFRANOV_INTERNAL_INDUCTANCE = 0.8
+MAX_SHAFRANOV_SHIFT_NORM = 0.3
+
+
+def miller_shape_coefficients(inputs, energy_mhd_MJ: ArrayLike) -> dict:
+    """Dimensionless shape-profile closures of the Miller builder for one sample.
+
+      axis_elongation_fraction: fraction of the LCFS elongation excess kept at the magnetic axis
+      shafranov_shift_norm: outward shift of the magnetic axis from the LCFS center over the minor radius
+    Any Inputs with the 0D shape fields, with the stored energy the beta_p of the shift comes from.
+    """
+    beta_poloidal = plasma_parameters.beta_poloidal(
+        energy_mhd_MJ, inputs.volume_approx, inputs.ip_MA, inputs.minor_radius, inputs.elongation
+    )
+    shift_norm = 0.5 * inputs.epsilon * (beta_poloidal + 0.5 * SHAFRANOV_INTERNAL_INDUCTANCE)
+    return {
+        "axis_elongation_fraction": jnp.full((1,), AXIS_ELONGATION_FRACTION),
+        "shafranov_shift_norm": jnp.atleast_1d(jnp.minimum(shift_norm, MAX_SHAFRANOV_SHIFT_NORM)),
+    }
+
+
+def geometry_shape_coefficients(geometry_builder: str, inputs, energy_mhd_MJ: ArrayLike) -> dict:
+    """The shape coefficients build_geometry_provider reads, none for the circular builder."""
+    if geometry_builder == "miller":
+        return miller_shape_coefficients(inputs, energy_mhd_MJ)
+    return {}
+
+
+class _MillerShape(NamedTuple):
+    """Per-sample Miller shape parameters and the poloidal quadrature grid, see build_miller_geometry_jax."""
+
+    R_major: jax.Array
+    a_minor: jax.Array
+    F: jax.Array
+    elongation_excess: jax.Array
+    axis_elongation_fraction: jax.Array
+    shift: jax.Array
+    delta_mean: jax.Array
+    delta_diff: jax.Array
+    delta_exponent: ArrayLike
+    theta: jax.Array
+
+
+def _miller_shape_profiles(shape: _MillerShape, rn: jax.Array) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """kappa, R0 and rn**p of the surfaces at rn, the power safe at rn = 0 for a traced exponent."""
+    kappa = 1.0 + shape.elongation_excess * (shape.axis_elongation_fraction + (1.0 - shape.axis_elongation_fraction) * rn**2)
+    center_r = shape.R_major + shape.shift * (1.0 - rn**2)
+    rn_safe = jnp.where(rn > 0.0, rn, 1.0)
+    rn_pow = jnp.where(rn > 0.0, rn_safe**shape.delta_exponent, 0.0)
+    return kappa, center_r, rn_pow
+
+
+def _miller_contour(shape: _MillerShape, rn_col: jax.Array) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+    """R, the poloidal-plane Jacobian |d(R, Z) / d(r, theta)|, dR / dtheta and dZ / dtheta of each surface.
+
+    rn_col has shape (n_rho, 1) and broadcasts against the theta grid.
+    """
+    sin_t = jnp.sin(shape.theta)
+    cos_t = jnp.cos(shape.theta)
+    r = rn_col * shape.a_minor
+    kappa, center_r, rn_pow = _miller_shape_profiles(shape, rn_col)
+    # r * dkappa / dr and dR0 / dr of the radial profiles
+    r_dkappa_dr = 2.0 * shape.elongation_excess * (1.0 - shape.axis_elongation_fraction) * rn_col**2
+    dcenter_dr = -2.0 * shape.shift * rn_col / shape.a_minor
+    delta_edge_t = shape.delta_mean + shape.delta_diff * sin_t
+    delta = rn_pow * delta_edge_t
+    sd = jnp.arcsin(delta)
+    u = shape.theta + sd * sin_t
+    sin_u = jnp.sin(u)
+    R = center_r + r * jnp.cos(u)
+    inv_sqrt = 1.0 / jnp.sqrt(1.0 - delta**2)
+    dsd_dtheta = rn_pow * shape.delta_diff * cos_t * inv_sqrt
+    # dsd_dr alone is singular at the axis for p < 1, but it only ever
+    # appears multiplied by r, and r*dsd_dr = p*rn^p*(...) is regular
+    r_dsd_dr = shape.delta_exponent * rn_pow * delta_edge_t * inv_sqrt
+    du_dtheta = 1.0 + sd * cos_t + dsd_dtheta * sin_t
+    dR_dr = dcenter_dr + jnp.cos(u) - sin_u * sin_t * r_dsd_dr
+    dR_dt = -r * sin_u * du_dtheta
+    dZ_dr = (kappa + r_dkappa_dr) * sin_t
+    dZ_dt = kappa * r * cos_t
+    Jp = jnp.abs(dR_dr * dZ_dt - dR_dt * dZ_dr)
+    return R, Jp, dR_dt, dZ_dt
+
+
+def _miller_enclosed_flux(shape: _MillerShape, rn_1d: jax.Array) -> jax.Array:
+    """Vacuum toroidal flux F * int dA / R inside each surface, by Green's theorem the loop integral of ln(R) dZ."""
+    R, _, _, dZ_dt = _miller_contour(shape, rn_1d[:, None])
+    w_theta = 2.0 * jnp.pi / shape.theta.shape[0]
+    return shape.F * jnp.sum(jnp.log(R) * dZ_dt, axis=1) * w_theta
+
+
+def _miller_metrics(shape: _MillerShape, rho_norm_1d: jax.Array, rho_norm_label: jax.Array, rn_label: jax.Array, phi_b: jax.Array) -> dict:
+    """Geometry quantities of the surfaces at the toroidal-flux radii rho_norm_1d.
+
+    rho_norm_label is the monotonic rho_norm(rn) on the rn_label grid, inverted by interpolation.
+    """
+    w_theta = 2.0 * jnp.pi / shape.theta.shape[0]
+    rn_1d = jnp.interp(rho_norm_1d, rho_norm_label, rn_label)
+    rn_col = rn_1d[:, None]
+    # Exact contour for integral quantities,
+    # all vanish at the axis without division so no floor is needed
+    R, _, _, dZ_dt = _miller_contour(shape, rn_col)
+    # Green's theorem over the closed contour, exact for this shape
+    volume = jnp.pi * jnp.sum(R**2 * dZ_dt, axis=1) * w_theta
+    area = jnp.sum(R * dZ_dt, axis=1) * w_theta
+    # Floored contour for flux-surface averages and flux-derivative ratios,
+    # all degree-0 homogeneous in r near the axis so a tiny floor evaluates the correct limit instead of 0/0
+    Rf, Jpf, dR_dtf, dZ_dtf = _miller_contour(shape, jnp.maximum(rn_col, 1e-6))
+    Jpf = jnp.maximum(Jpf, 1e-12)
+    Jf = Rf * Jpf
+    denom = jnp.sum(Jf, axis=1)
+    grad_r = jnp.sqrt(dR_dtf**2 + dZ_dtf**2) / Jpf
+
+    def fsa(integrand: jax.Array) -> jax.Array:
+        return jnp.sum(integrand * Jf, axis=1) / denom
+
+    # dV / dPhi and dA / dPhi, the shared factor a_minor drn cancels
+    flux_weight = shape.F * jnp.sum(Jpf / Rf, axis=1)
+    dphi_drho_norm = 2.0 * phi_b * rho_norm_1d
+    # |grad V| = (dV / dr) |grad r|, so these metrics do not depend on the radial label.
+    # The exact dV / dr is 0 at the axis, masked there since the floored contour gives a tiny nonzero value
+    mask_off_axis = rn_1d > 0.0
+    dv_dr = jnp.where(mask_off_axis, 2.0 * jnp.pi * denom * w_theta, 0.0)
+    g2 = dv_dr**2 * fsa(grad_r**2 / Rf**2)
+    g3 = fsa(1.0 / Rf**2)
+    kappa, center_r, rn_pow = _miller_shape_profiles(shape, rn_1d)
+    return {
+        "rn": rn_1d,
+        "vpr": 2.0 * jnp.pi * denom / flux_weight * dphi_drho_norm,
+        "spr": jnp.sum(Jpf, axis=1) / flux_weight * dphi_drho_norm,
+        "volume": volume,
+        "area": area,
+        "g0": dv_dr * fsa(grad_r),
+        "g1": dv_dr**2 * fsa(grad_r**2),
+        "g2": g2,
+        "g3": g3,
+        "R2_avg": fsa(Rf**2),
+        "g2g3_over_rhon": jnp.where(rho_norm_1d > 0.0, g2 * g3 / jnp.maximum(rho_norm_1d, 1e-12), 0.0),
+        "elongation": kappa,
+        "center_r": center_r,
+        "rn_pow": rn_pow,
+    }
+
 
 def build_miller_geometry_jax(
     R_major: jax.Array,
@@ -212,157 +367,89 @@ def build_miller_geometry_jax(
     elongation_LCFS: jax.Array,
     triangularity_upper: jax.Array,
     triangularity_lower: jax.Array,
+    axis_elongation_fraction: jax.Array,
+    shafranov_shift_norm: jax.Array,
     torax_mesh: torax_pydantic.Grid1D,
     rho_hires_norm_np: np.ndarray,
-    delta_exponent: float = 2.0,
+    delta_exponent: ArrayLike = 2.0,
 ) -> torax_geometry.Geometry:
     """Miller shaped geometry builder using JAX ops for differentiability.
 
     Up-down asymmetric Miller parameterization
     (R.L. Miller et al., Phys. Plasmas 5, 973 (1998), with Turnbull-style asymmetric triangularity):
 
+        R = R0(rn) + r*cos(theta + arcsin(delta)*sin(theta)),   Z = kappa(rn)*r*sin(theta)
+        R0(rn) = R_major + shift*(1 - rn**2)
+        kappa(rn) = 1 + (elongation_LCFS - 1)*(f + (1 - f)*rn**2)
         delta(rn, theta) = rn**p * (delta_mean + delta_diff*sin(theta))
-        R = R_major + r*cos(theta + arcsin(delta)*sin(theta))
-        Z = kappa(rn)*r*sin(theta)
 
-    where rn is normalized rho, r = rn*a_minor, p = delta_exponent, and the sin(theta) blend
-    gives exactly triangularity_upper at the top, triangularity_lower at the bottom, and their mean at the midplane.
+    where rn = r / a_minor is the midplane half-width, R_major the LCFS center, shift = shafranov_shift_norm*a_minor,
+    f = axis_elongation_fraction and p = delta_exponent.
+    The sin(theta) blend gives exactly triangularity_upper at the top, triangularity_lower at the bottom, and their mean at the midplane.
     Flux-surface metrics come from poloidal quadrature with closed-form contour derivatives.
-    The toroidal field model matches the circular builder
-    (vacuum B = B_0*R_major/R with F = R_major*B_0), so gm4 = <R^2>/F^2 and gm5 = F^2*<1/R^2>.
+    The toroidal field model is vacuum (B = B_0*R_major/R with F = R_major*B_0), so gm4 = <R^2>/F^2 and gm5 = F^2*<1/R^2>.
+
+    TORAX's radial coordinate is rho_norm = sqrt(Phi / Phi_b),
+    the normalized toroidal flux radius the profile data is stored on, not rn.
+    Phi(rn) = F * int dA / R comes from Green's theorem on each contour,
+    the builder inverts rho_norm(rn) on a fine rn grid to find the surface of every mesh point,
+    and vpr / spr are dV / dPhi and dA / dPhi times dPhi / drho_norm = 2 Phi_b rho_norm.
     """
     rho_face_norm = jnp.array(torax_mesh.face_centers)
     rho_norm = jnp.array(torax_mesh.cell_centers)
     rho_hires_norm = jnp.array(rho_hires_norm_np)
-    rho_b = a_minor
-
-    theta = jnp.array(np.linspace(0.0, 2.0 * np.pi, _MILLER_NTHETA, endpoint=False))
-    sin_t = jnp.sin(theta)
-    cos_t = jnp.cos(theta)
-    w_theta = 2.0 * jnp.pi / _MILLER_NTHETA
 
     # Clip triangularities for arcsin safety,
     # |delta| <= 0.9 everywhere keeps 1 - delta^2 >= 0.19 and avoids self-intersecting contours
     triangularity_upper_c = jnp.clip(triangularity_upper, -0.9, 0.9)
     triangularity_lower_c = jnp.clip(triangularity_lower, -0.9, 0.9)
-    delta_mean = 0.5 * (triangularity_upper_c + triangularity_lower_c)
-    delta_diff = 0.5 * (triangularity_upper_c - triangularity_lower_c)
-    dkappa_dr = (elongation_LCFS - 1.0) / rho_b
+    shape = _MillerShape(
+        R_major=R_major,
+        a_minor=a_minor,
+        F=R_major * B_0,
+        elongation_excess=elongation_LCFS - 1.0,
+        axis_elongation_fraction=axis_elongation_fraction,
+        shift=shafranov_shift_norm * a_minor,
+        delta_mean=0.5 * (triangularity_upper_c + triangularity_lower_c),
+        delta_diff=0.5 * (triangularity_upper_c - triangularity_lower_c),
+        delta_exponent=delta_exponent,
+        theta=jnp.array(np.linspace(0.0, 2.0 * np.pi, _MILLER_NTHETA, endpoint=False)),
+    )
 
-    def contour(rn_col: jax.Array) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
-        # rn_col shape (n_rho, 1), broadcast against theta arrays (n_theta,)
-        r = rn_col * rho_b
-        rn_pow = rn_col**delta_exponent
-        kappa = 1.0 + rn_col * (elongation_LCFS - 1.0)
-        delta_edge_t = delta_mean + delta_diff * sin_t
-        delta = rn_pow * delta_edge_t
-        sd = jnp.arcsin(delta)
-        u = theta + sd * sin_t
-        sin_u = jnp.sin(u)
-        R = R_major + r * jnp.cos(u)
-        inv_sqrt = 1.0 / jnp.sqrt(1.0 - delta**2)
-        dsd_dtheta = rn_pow * delta_diff * cos_t * inv_sqrt
-        # dsd_dr alone is singular at the axis for p < 1, but it only ever
-        # appears multiplied by r, and r*dsd_dr = p*rn^p*(...) is regular
-        r_dsd_dr = delta_exponent * rn_pow * delta_edge_t * inv_sqrt
-        du_dtheta = 1.0 + sd * cos_t + dsd_dtheta * sin_t
-        dR_dr = jnp.cos(u) - sin_u * sin_t * r_dsd_dr
-        dR_dt = -r * sin_u * du_dtheta
-        dZ_dr = (kappa + r * dkappa_dr) * sin_t
-        dZ_dt = kappa * r * cos_t
-        Jp = jnp.abs(dR_dr * dZ_dt - dR_dt * dZ_dr)
-        return R, Jp, dR_dt, dZ_dt
+    # Normalized toroidal flux radius of every surface on the label grid, with a safe sqrt at the axis where Phi = 0
+    rn_label = jnp.array(np.linspace(0.0, 1.0, _MILLER_N_LABEL))
+    phi_label = _miller_enclosed_flux(shape, rn_label)
+    phi_b = phi_label[-1]
+    phi_ratio = phi_label / phi_b
+    phi_ratio_safe = jnp.where(phi_ratio > 0.0, phi_ratio, 1.0)
+    rho_norm_label = jnp.where(phi_ratio > 0.0, jnp.sqrt(phi_ratio_safe), 0.0)
 
-    def metrics(rn_1d: jax.Array) -> dict[str, jax.Array]:
-        rn_col = rn_1d[:, None]
-        # Exact contour for integral quantities,
-        # all vanish at the axis without division so no floor is needed
-        R, Jp, _, dZ_dt = contour(rn_col)
-        vpr = rho_b * 2.0 * jnp.pi * jnp.sum(R * Jp, axis=1) * w_theta
-        spr = rho_b * jnp.sum(Jp, axis=1) * w_theta
-        # Green's theorem over the closed contour, exact for this shape
-        volume = jnp.pi * jnp.sum(R**2 * dZ_dt, axis=1) * w_theta
-        area = jnp.sum(R * dZ_dt, axis=1) * w_theta
-        # Floored contour for flux-surface averages,
-        # the ratios are degree-0 homogeneous in r near the axis
-        # so a tiny floor evaluates the correct limit instead of 0/0
-        Rf, Jpf, dR_dtf, dZ_dtf = contour(jnp.maximum(rn_col, 1e-6))
-        Jpf = jnp.maximum(Jpf, 1e-12)
-        Jf = Rf * Jpf
-        denom = jnp.sum(Jf, axis=1)
-        grad_r = jnp.sqrt(dR_dtf**2 + dZ_dtf**2) / Jpf
+    cell = _miller_metrics(shape, rho_norm, rho_norm_label, rn_label, phi_b)
+    face = _miller_metrics(shape, rho_face_norm, rho_norm_label, rn_label, phi_b)
+    hires = _miller_metrics(shape, rho_hires_norm, rho_norm_label, rn_label, phi_b)
 
-        def fsa(integrand: jax.Array) -> jax.Array:
-            return jnp.sum(integrand * Jf, axis=1) / denom
-
-        dv_dr = vpr / rho_b
-        g0 = dv_dr * fsa(grad_r)
-        g1 = dv_dr**2 * fsa(grad_r**2)
-        g2 = dv_dr**2 * fsa(grad_r**2 / Rf**2)
-        g3 = fsa(1.0 / Rf**2)
-        R2_avg = fsa(Rf**2)
-        g2g3_over_rhon = jnp.where(rn_1d > 0.0, g2 * g3 / jnp.maximum(rn_1d, 1e-12), 0.0)
-        return {
-            "vpr": vpr,
-            "spr": spr,
-            "volume": volume,
-            "area": area,
-            "g0": g0,
-            "g1": g1,
-            "g2": g2,
-            "g3": g3,
-            "R2_avg": R2_avg,
-            "g2g3_over_rhon": g2g3_over_rhon,
-        }
-
-    cell = metrics(rho_norm)
-    face = metrics(rho_face_norm)
-    hires = metrics(rho_hires_norm)
-
-    rho = rho_norm * rho_b
-    rho_face = rho_face_norm * rho_b
-    rho_hires = rho_hires_norm * rho_b
-
-    # Phi = pi*B_0*rho^2 must be kept exact,
-    # the Geometry.rho_b property recovers a_minor from Phi_face[-1]
-    Phi = jnp.pi * B_0 * rho**2
-    Phi_face = jnp.pi * B_0 * rho_face**2
-
-    elongation = 1.0 + rho_norm * (elongation_LCFS - 1.0)
-    elongation_face = 1.0 + rho_face_norm * (elongation_LCFS - 1.0)
-    delta_face = rho_face_norm**delta_exponent * delta_mean
-
-    n = rho_norm.shape[0]
-    n_face = rho_face_norm.shape[0]
-    n_hires = rho_hires_norm.shape[0]
-    F = jnp.ones(n) * R_major * B_0
-    F_face = jnp.ones(n_face) * R_major * B_0
-    F_hires = jnp.ones(n_hires) * R_major * B_0
-
-    gm4 = cell["R2_avg"] / (R_major * B_0) ** 2
-    gm4_face = face["R2_avg"] / (R_major * B_0) ** 2
-    gm5 = (R_major * B_0) ** 2 * cell["g3"]
-    gm5_face = (R_major * B_0) ** 2 * face["g3"]
-
-    # theta = 0 and pi give exactly R_major +/- r since sd*sin(theta) = 0,
-    # so rho_norm stays the normalized midplane minor radius
-    R_out = R_major + rho
-    R_out_face = R_major + rho_face
-    R_in = R_major - rho
-    R_in_face = R_major - rho_face
+    # theta = 0 and pi give exactly R0 +/- r since sd*sin(theta) = 0
+    r_cell = cell["rn"] * a_minor
+    r_face = face["rn"] * a_minor
+    R_out_face = face["center_r"] + r_face
+    R_in_face = face["center_r"] - r_face
+    delta_face = face["rn_pow"] * shape.delta_mean
     epsilon_face = (R_out_face - R_in_face) / (R_out_face + R_in_face)
-    trapped_fraction_face = torax_trapped_fraction.calculate_sauter_trapped_fraction(epsilon=epsilon_face, delta=delta_face)
+    # Sauter's effective inverse aspect ratio 0.67 (1 - 1.4 delta |delta|) epsilon turns negative above |delta| = 0.845
+    # and NaNs the trapped fraction (DIII-D stores hold edge triangularities up to 0.9),
+    # so the fit sees the triangularity clipped to 0.8, inside its range
+    delta_trapped_face = jnp.clip(delta_face, -0.8, 0.8)
 
     return torax_geometry.Geometry(
-        # Deliberately kept CIRCULAR even though the metric is shaped
-        # a non-CIRCULAR type would set q_correction_factor to 1.0 instead of 1.25 (geometry.py property),
-        # which shrinks q and with it the Bohm diffusivity and the q input of QLKNN
-        geometry_type=torax_geometry.GeometryType.CIRCULAR,
+        # A non-CIRCULAR type sets q_correction_factor to 1,
+        # the circular model's 1.25 would inflate q on top of exact metrics (TORAX reads the type nowhere else at runtime)
+        geometry_type=torax_geometry.GeometryType.CHEASE,
         torax_mesh=torax_mesh,
-        Phi=Phi,
-        Phi_face=Phi_face,
+        # Phi = Phi_b * rho_norm^2 exactly, the Geometry.rho_b property recovers sqrt(Phi_b / (pi B_0)) from Phi_face[-1]
+        Phi=phi_b * rho_norm**2,
+        Phi_face=phi_b * rho_face_norm**2,
         R_major=R_major,
-        a_minor=rho_b,
+        a_minor=a_minor,
         B_0=B_0,
         volume=cell["volume"],
         volume_face=face["volume"],
@@ -373,7 +460,7 @@ def build_miller_geometry_jax(
         spr=cell["spr"],
         spr_face=face["spr"],
         delta_face=delta_face,
-        trapped_fraction_face=trapped_fraction_face,
+        trapped_fraction_face=torax_trapped_fraction.calculate_sauter_trapped_fraction(epsilon=epsilon_face, delta=delta_trapped_face),
         g0=cell["g0"],
         g0_face=face["g0"],
         g1=cell["g1"],
@@ -382,25 +469,25 @@ def build_miller_geometry_jax(
         g2_face=face["g2"],
         g3=cell["g3"],
         g3_face=face["g3"],
-        gm4=gm4,
-        gm4_face=gm4_face,
-        gm5=gm5,
-        gm5_face=gm5_face,
+        gm4=cell["R2_avg"] / shape.F**2,
+        gm4_face=face["R2_avg"] / shape.F**2,
+        gm5=shape.F**2 * cell["g3"],
+        gm5_face=shape.F**2 * face["g3"],
         g2g3_over_rhon=cell["g2g3_over_rhon"],
         g2g3_over_rhon_face=face["g2g3_over_rhon"],
         g2g3_over_rhon_hires=hires["g2g3_over_rhon"],
-        F=F,
-        F_face=F_face,
-        F_hires=F_hires,
-        R_in=R_in,
+        F=jnp.full(rho_norm.shape, shape.F),
+        F_face=jnp.full(rho_face_norm.shape, shape.F),
+        F_hires=jnp.full(rho_hires_norm.shape, shape.F),
+        R_in=cell["center_r"] - r_cell,
         R_in_face=R_in_face,
-        R_out=R_out,
+        R_out=cell["center_r"] + r_cell,
         R_out_face=R_out_face,
-        elongation=elongation,
-        elongation_face=elongation_face,
+        elongation=cell["elongation"],
+        elongation_face=face["elongation"],
         spr_hires=hires["spr"],
         rho_hires_norm=rho_hires_norm,
-        rho_hires=rho_hires,
+        rho_hires=rho_hires_norm * jnp.sqrt(phi_b / (jnp.pi * B_0)),
         Phi_b_dot=jnp.asarray(0.0),
         _z_magnetic_axis=jnp.asarray(0.0),
     )
@@ -696,9 +783,12 @@ def cell_centers(face_centers: tuple) -> np.ndarray:
 
 
 def build_geometry_provider(
-    geometry_builder: str, inputs, face_centers: tuple, rho_hires_norm: tuple, delta_exponent: float
+    geometry_builder: str, inputs, coeffs: dict, face_centers: tuple, rho_hires_norm: tuple, delta_exponent: float
 ) -> geometry_provider_lib.ConstantGeometryProvider:
-    """The JAX-differentiable per-sample geometry of inputs (any Inputs with the shape fields), circular or miller."""
+    """The JAX-differentiable per-sample geometry of inputs (any Inputs with the shape fields), circular or miller.
+
+    The miller builder reads its shape-profile coefficients from coeffs (geometry_shape_coefficients).
+    """
     torax_mesh = torax_pydantic.Grid1D(face_centers=np.array(face_centers))
     rho_hires_norm_np = np.array(rho_hires_norm)
     if geometry_builder == "miller":
@@ -709,6 +799,8 @@ def build_geometry_provider(
             elongation_LCFS=inputs.elongation,
             triangularity_upper=inputs.triangularity_upper,
             triangularity_lower=inputs.triangularity_lower,
+            axis_elongation_fraction=jnp.squeeze(coeffs["axis_elongation_fraction"]),
+            shafranov_shift_norm=jnp.squeeze(coeffs["shafranov_shift_norm"]),
             torax_mesh=torax_mesh,
             rho_hires_norm_np=rho_hires_norm_np,
             delta_exponent=delta_exponent,
@@ -893,6 +985,7 @@ class ProfilePredictorTorax(TimeIndepModule):
             **bound_source_coefficients(SOURCE_COEFFICIENT_NAMES, nn_sources_out, inputs.n_e_line_average_1e20, inputs.volume_approx),
             "P_aux_total": 4.0 * jax.nn.sigmoid(nn_sources_out[p_aux_idx : p_aux_idx + 1] - 2.0) * inputs.w_approx / TAU_REF_S,
             **bound_edge_coefficients(self.nn_edge(nn_inputs), inputs.n_e_line_average_1e20, inputs.te_approx),
+            **geometry_shape_coefficients(self.geometry_builder, inputs, inputs.w_approx),
         }
         if debug:
             fmt = " ".join(f"{name}={{{name}}}" for name in coeffs)
@@ -936,7 +1029,9 @@ class ProfilePredictorTorax(TimeIndepModule):
             "sources.generic_heat.P_total": torax_experimental.TimeVaryingScalarUpdate(value=coeffs["P_aux_total"] * 1e6),
         }
         new_provider = self.step_fn.runtime_params_provider.update_provider_from_mapping(mapping)
-        geo_provider = build_geometry_provider(self.geometry_builder, inputs, self._face_centers, self._rho_hires_norm, self.delta_exponent)
+        geo_provider = build_geometry_provider(
+            self.geometry_builder, inputs, coeffs, self._face_centers, self._rho_hires_norm, self.delta_exponent
+        )
         return new_provider, geo_provider
 
     @property

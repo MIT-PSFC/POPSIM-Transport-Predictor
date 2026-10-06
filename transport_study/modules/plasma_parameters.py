@@ -52,6 +52,18 @@ def volume_approx(geometric_axis_r, minor_radius, elongation):
     )
 
 
+def beta_poloidal(energy_mhd_MJ, volume_m3, ip_MA, minor_radius, elongation):
+    """Poloidal beta 2 mu0 <p> / B_pa^2 of a stored energy.
+
+    <p> = 2 W / (3 V) and B_pa = mu0 Ip / L,
+    with L the perimeter of an ellipse of the LCFS minor radius and elongation, 2 pi a sqrt((1 + kappa^2) / 2).
+    """
+    perimeter = 2.0 * jnp.pi * minor_radius * jnp.sqrt(0.5 * (1.0 + elongation**2))
+    pressure_Pa = 2.0 * energy_mhd_MJ * 1e6 / (3.0 * volume_m3)
+    b_pol = mu_0 * abs(ip_MA) * 1e6 / perimeter
+    return 2.0 * mu_0 * pressure_Pa / b_pol**2
+
+
 def beta_tor_from_beta_tor_norm(beta_tor_norm, ip_MA, minor_radius, b0):
     """Toroidal beta as a fraction from the IMAS percent beta_tor_norm = 100 beta_tor a |b0| / |Ip|[MA]."""
     return beta_tor_norm * abs(ip_MA) / (100.0 * minor_radius * abs(b0))
