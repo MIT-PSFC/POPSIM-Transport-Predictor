@@ -246,19 +246,18 @@ def count_running_jobs(job_name: str, partition: str | None = None) -> int:
     return _count_lines(stdout)
 
 
-def get_running_job_names(partition: str | None = None) -> set[str] | None:
-    """Names of this user's running and pending jobs, in one squeue call.
+def get_running_job_names() -> set[str] | None:
+    """Names of this user's running and pending jobs on every partition, in one squeue call.
 
     Orchestration loops poll job state for every case each pass. One squeue
     call returning all names (checked by set membership) replaces hundreds of
     per-case squeue calls. Returns None when squeue fails, so callers can tell
     "no jobs" apart from "scheduler unreachable" and hold off launching.
-    Defaults to the primary plus spillover partitions.
+    Every job name ends with its study's name, so no partition filter is needed,
+    and a job on a partition the config no longer names still counts.
     """
-    if partition is None:
-        partition = query_partitions()
     # Default %j truncates long names, and case names run long
-    stdout = _slurm_stdout(["squeue", "-p", partition, "-u", getpass.getuser(), "--state=RUNNING,PENDING", "--noheader", "--format=%512j"])
+    stdout = _slurm_stdout(["squeue", "-u", getpass.getuser(), "--state=RUNNING,PENDING", "--noheader", "--format=%512j"])
     if stdout is None:
         return None
     return {line.strip() for line in stdout.splitlines() if line.strip()}

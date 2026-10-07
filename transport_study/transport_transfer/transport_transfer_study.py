@@ -577,12 +577,10 @@ class TransportStudy(Study):
         run_summary_analysis(self, enable_parallelism, LAYOUT, COMPARISON_FAMILIES, TABLE_SPEC, figures_from_metrics=True)
 
 
-run_study = TransportStudy.run_study
-
-
 if __name__ == "__main__":
     fire.Fire(
         {
-            "run_study": run_study,
+            "run_study": TransportStudy.run_study,
+            "reset_study": TransportStudy.reset_study,
         }
     )

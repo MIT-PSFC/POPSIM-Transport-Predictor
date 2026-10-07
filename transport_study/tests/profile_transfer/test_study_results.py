@@ -7,7 +7,7 @@ import xarray as xr
 from transport_study import PACKAGE_ROOT
 from transport_study.orchestration.case_metrics import collected_metrics_path
 from transport_study.orchestration.stages import STAGE_AGG_NAMES
-from transport_study.profile_transfer.profile_study import ProfileStudy, run_study
+from transport_study.profile_transfer.profile_study import ProfileStudy
 from transport_study.tests.sample_data import SAMPLE_DIR, requires_sample_data
 
 
@@ -58,7 +58,7 @@ class TestCmodToCmod:
         )
 
         # Run study, reusing the same working directory to test that results are not overwritten and figures are regenerated
-        run_study(
+        ProfileStudy.run_study(
             config=study_config,
             enable_parallelism=True,
             skip_tuning=True,

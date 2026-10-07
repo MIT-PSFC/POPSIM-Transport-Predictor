@@ -378,12 +378,10 @@ class PowerBalanceStudy(Study):
         run_summary_analysis(self, enable_parallelism, LAYOUT, COMPARISON_FAMILIES, TABLE_SPEC)
 
 
-run_study = PowerBalanceStudy.run_study
-
-
 if __name__ == "__main__":
     fire.Fire(
         {
-            "run_study": run_study,
+            "run_study": PowerBalanceStudy.run_study,
+            "reset_study": PowerBalanceStudy.reset_study,
         }
     )

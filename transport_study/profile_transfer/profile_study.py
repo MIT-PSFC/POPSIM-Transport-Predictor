@@ -461,12 +461,10 @@ class ProfileStudy(Study):
         write_comparison_tables(results_ds, metrics_ds, self.figure_dir)
 
 
-run_study = ProfileStudy.run_study
-
-
 if __name__ == "__main__":
     fire.Fire(
         {
-            "run_study": run_study,
+            "run_study": ProfileStudy.run_study,
+            "reset_study": ProfileStudy.reset_study,
         }
     )

@@ -34,7 +34,7 @@ def quiet_scheduler(monkeypatch):
 def set_queue_snapshots(monkeypatch, snapshots):
     """Serve one squeue snapshot per pass, then an empty queue forever."""
     remaining = iter(snapshots)
-    monkeypatch.setattr(study_module, "get_running_job_names", lambda partition=None: next(remaining, set()))
+    monkeypatch.setattr(study_module, "get_running_job_names", lambda: next(remaining, set()))
 
 
 def record_and_finish_cases(monkeypatch, study: Study, order: list[str]):
@@ -96,7 +96,7 @@ def test_result_lag_does_not_relaunch(make_stub_study, monkeypatch, fake_clock, 
             yield set()
 
     snapshot_iter = snapshots()
-    monkeypatch.setattr(study_module, "get_running_job_names", lambda partition=None: next(snapshot_iter))
+    monkeypatch.setattr(study_module, "get_running_job_names", lambda: next(snapshot_iter))
 
     order: list[str] = []
     record_and_finish_cases(monkeypatch, study, order)
@@ -207,7 +207,7 @@ def test_gpu_only_cases_take_the_gpu_before_cpu_capable_ones(make_stub_study, mo
         result_path.touch()
 
     monkeypatch.setattr(study_module, "pick_partition", pick_partition)
-    monkeypatch.setattr(study_module, "get_running_job_names", lambda partition=None: set())
+    monkeypatch.setattr(study_module, "get_running_job_names", lambda: set())
     monkeypatch.setattr(study_module, "get_running_job_elapsed_s", lambda partition=None: {})
     monkeypatch.setattr(study_module.time, "sleep", lambda s: setattr(gpu_slots, "open", 1))
     monkeypatch.setattr(study, "run_case", run_case)

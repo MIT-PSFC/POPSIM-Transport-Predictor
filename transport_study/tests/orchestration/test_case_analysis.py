@@ -33,7 +33,7 @@ def study(make_stub_study):
 @pytest.fixture
 def empty_queue(monkeypatch):
     """squeue reports nothing running, so every pending case is launchable."""
-    monkeypatch.setattr(case_analysis, "get_running_job_names", lambda partition=None: set())
+    monkeypatch.setattr(case_analysis, "get_running_job_names", lambda: set())
 
 
 def launch_batches_per_pass(monkeypatch, finish_immediately: bool = True) -> list[list[str]]:
@@ -69,7 +69,7 @@ def test_job_finishing_before_the_queue_query_is_not_relaunched(study, monkeypat
         launched.append(str(case))
         queue[study_arg.analysis_job_name(case)] = case
 
-    def queue_whose_jobs_just_finished(partition=None):
+    def queue_whose_jobs_just_finished():
         """Every queued job finishes right before squeue reports, after the previous pass checked its case."""
         for case in queue.values():
             mark_analysis_done(study, case)
@@ -103,7 +103,7 @@ def test_scheduler_failure_waits_instead_of_launching(make_stub_study, monkeypat
     result_path.touch()
 
     snapshots = iter([None])  # first pass: squeue failed, then an empty queue
-    monkeypatch.setattr(case_analysis, "get_running_job_names", lambda partition=None: next(snapshots, set()))
+    monkeypatch.setattr(case_analysis, "get_running_job_names", lambda: next(snapshots, set()))
 
     launched: list[str] = []
     sleeps: list[float] = []

@@ -172,7 +172,7 @@ def run_one_pass(monkeypatch, study: Study, pending: dict[str, int] | None) -> S
 
     monkeypatch.setattr(study_module, "get_pending_job_pending_s", pending_job_pending_s)
     monkeypatch.setattr(study_module, "cancel_job", cancel_job)
-    monkeypatch.setattr(study_module, "get_running_job_names", lambda partition=None: set())
+    monkeypatch.setattr(study_module, "get_running_job_names", lambda: set())
     monkeypatch.setattr(study_module, "get_running_job_elapsed_s", lambda partition=None: {})
     monkeypatch.setattr(study_module, "pick_partition", lambda *args, **kwargs: "primary")
     monkeypatch.setattr(study_module.time, "sleep", lambda s: None)

@@ -59,7 +59,7 @@ def run_case_analysis_parallel(study) -> None:
 
     attempts: dict[str, int] = {}
     while pending:
-        running_job_names = get_running_job_names(partition)
+        running_job_names = get_running_job_names()
         if running_job_names is None:
             logger.warning("Could not query SLURM job state, waiting before trying again...")
             time.sleep(ANALYSIS_POLL_INTERVAL_S)

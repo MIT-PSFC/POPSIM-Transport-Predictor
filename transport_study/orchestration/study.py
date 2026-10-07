@@ -1783,6 +1783,38 @@ class Study:
 
         study.run_analysis(enable_parallelism=bool(enable_parallelism))
 
+    @classmethod
+    def reset_study(cls, config: CaseGridConfig | str | Path) -> None:
+        """Start a study over from a clean slate, ready for run_study.
+
+        Deletes the whole working dir (models, results, figures, logs and the config lock)
+        and the wandb sweeps of the study's own hyperparam cases, then writes a fresh config lock.
+        Refuses while any job of the study is queued or running.
+        Reset a lineage root-first, so each child's fresh lock records its parent's fresh stamp
+        and no child orchestrator can open a parent lock that is about to be replaced.
+
+        Parameters
+        ----------
+        config : CaseGridConfig | str | Path
+            The study config, or a path to its TOML file.
+        """
+        if isinstance(config, (str, Path)):
+            config = cls.Config.from_toml(Path(config))
+        job_names = get_running_job_names()
+        if job_names is None:
+            raise RuntimeError(f"squeue failed, so whether a job of study {config.study_name} is still queued or running is unknown")
+        # Every job name of a study ends with the study name (see train_job_name)
+        study_job_names = sorted(name for name in job_names if name.endswith(f".{config.study_name}"))
+        if study_job_names:
+            raise RuntimeError(
+                f"Study {config.study_name} has jobs queued or running, cancel them before resetting it:\n" + "\n".join(study_job_names)
+            )
+        working_dir = Path(config.working_dir_base) / config.study_name
+        if working_dir.exists():
+            shutil.rmtree(working_dir)
+        study = cls(config)
+        study.setup_directories(clean_sweeps=True)
+
     def __init__(self, cfg: str | Path | CaseGridConfig):
         """
         Initialize this study from its Config object or a path to its TOML file.
