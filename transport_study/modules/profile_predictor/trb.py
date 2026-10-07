@@ -33,6 +33,7 @@ from transport_study.modules.trb_utils import (
     chi_profile_loss,
     chi_value,
     ds_source_per_shot,
+    fixed_steps_train_dataloader,
     huber_profile_loss,
     integrate_error_over_time,
     make_exponential_adamw,
@@ -119,6 +120,7 @@ class ProfilePredictorTRB(TrainRunBuilder):
             drop_last=[True, False],
             pad_last=[False, True],
         )
+        train_dl = fixed_steps_train_dataloader(train_dl, dataloader_config["steps_per_epoch"])
         attach_normalizer_fit_ds(train_dl, normalizer_fit_ds)
         # The validation set doubles as the test set (see resolve_case_datasets)
         return ds_val, train_dl, val_dl, val_dl

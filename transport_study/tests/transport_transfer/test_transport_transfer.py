@@ -66,15 +66,16 @@ def test_power_balance_data_normalization_is_validated():
 
 
 @pytest.fixture
-def grid_study(synthetic_device_stores, tmp_path) -> TransportStudy:
+def grid_study(synthetic_device_stores, tmp_path, monkeypatch) -> TransportStudy:
     """Every case-grid axis with two values, on the synthetic stores (cmod the source, mast the target)."""
-    return TransportStudy(
+    study = TransportStudy(
         TransportStudy.Config(
             study_name="test-transport-transfer-grid",
             working_dir_base=tmp_path,
             dataset_paths=synthetic_device_stores,
             target_device="mast",
-            target_test_set_size=1,
+            # Two target test shots, popsim rejects a single-shot whole-episode test set
+            target_test_set_size=2,
             training_datasets=("cmod",),
             model_types=("sciml", "transformer", "torax-gyrobohm"),
             freeze_submodules_options=(True, False),
@@ -84,6 +85,14 @@ def grid_study(synthetic_device_stores, tmp_path) -> TransportStudy:
             num_target_shots_options=(1,),
         )
     )
+    # The synthetic shots are shorter than the study's training segments, which make_train_config builds to measure its steps per epoch
+    base_dataloader_config = study.base_dataloader_config
+    monkeypatch.setattr(
+        study,
+        "base_dataloader_config",
+        lambda case: {**base_dataloader_config(case), "segment_length_train": 20, "segment_overlap_train": 10},
+    )
+    return study
 
 
 def test_case_grid_axes_apply_only_to_their_model_types(grid_study):

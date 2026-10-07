@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import functools
+import hashlib
 import json
 import math
 import os
 import shutil
 import time
+import tomllib
 from collections import Counter
 from dataclasses import dataclass, fields, replace
 from itertools import product
@@ -26,7 +28,7 @@ from popsim.ml.launch import (
 from popsim.ml.train_config import load_dict
 from pydantic import Field, field_serializer, field_validator, model_validator
 
-from transport_study import PACKAGE_ROOT, TIME_DIM
+from transport_study import EPISODE_DIM, PACKAGE_ROOT, TIME_DIM
 from transport_study.config import (
     DEBUG_NUM_RESULT_CHECKPOINTS,
     ROLE_TABLES,
@@ -47,10 +49,12 @@ from transport_study.orchestration.config_lock import (
     new_stamp,
     read_config_lock,
     write_config_lock,
+    write_toml_atomic,
 )
 from transport_study.orchestration.lineage import StudyArchive
 from transport_study.orchestration.organize_data import (
     TrainingData,
+    get_ds,
     get_loaded_shot_count,
     parse_training_data,
 )
@@ -71,6 +75,7 @@ from transport_study.orchestration.target_shots import (
     BASE_TARGET_SHOT_ORDER,
     TARGET_SHOT_ORDERS,
     configured_target_split,
+    held_out_shot_mask,
 )
 from transport_study.orchestration.topk_results import (
     BEST_EPOCH_ATTR,
@@ -110,11 +115,12 @@ ORCHESTRATION_POLL_INTERVAL_S = 20
 # Result files can lag job exit by ~1 min on NFS, so wait this long after a case leaves the queue before relaunching it
 RELAUNCH_GRACE_S = 180
 
-# Tuned learning rates were swept for from-scratch training. Fine-tuning scales
-# the schedule by a step budget instead of a fixed factor: keep lr x total_steps
-# at roughly lr0 x max_epochs, so a step-starved finetune (batch_size larger
-# than the finetune dataset, 1 optimizer step per epoch) runs at the full tuned
-# LR while a step-rich one cools toward this floor. See _scale_transfer_lr
+# Measured steps per epoch of each loader config, kept between runs in the study's working dir.
+# A fresh config lock starts it over (see Study.steps_per_epoch)
+STEPS_PER_EPOCH_FILENAME = "steps_per_epoch.toml"
+
+# Tuned learning rates were swept for from-scratch training.
+# Fine-tuning scales lr0 by max_epochs / total_steps, clipped below at this floor. See _scale_transfer_lr
 TRANSFER_LR_FLOOR = 0.1
 
 # A training job is considered stuck once it has run at least this long with no progress (e.g. OpenBLAS or XLA compile-pool deadlocks)
@@ -151,6 +157,15 @@ def real_timeslice_mask(time_2d: xr.DataArray, time_dim: str = TIME_DIM) -> xr.D
     """
     prev = time_2d.shift({time_dim: 1})
     return time_2d.notnull() & (prev.isnull() | ((time_2d - prev) > PAD_TIME_STEP_S))
+
+
+def recorded_steps_per_epoch(working_dir: Path) -> dict[str, dict]:
+    """The steps per epoch a study recorded in its working dir, by loader config hash (see Study.steps_per_epoch)."""
+    path = working_dir / STEPS_PER_EPOCH_FILENAME
+    if not path.exists():
+        return {}
+    with open(path, "rb") as f:
+        return tomllib.load(f)
 
 
 def transfer_lr_scale(steps_per_epoch: int, max_epochs: int) -> float:
@@ -805,33 +820,67 @@ class Study:
             }
         )
 
-    def _transfer_steps_per_epoch(self, train_config: TrainConfig) -> int:
-        """Optimizer steps per epoch of the finetune train dataloader, measured from the data.
+    @functools.cached_property
+    def target_pool_size(self) -> int:
+        """Target shots outside the test set, the most any case trains on.
 
-        Builds the train dataloader exactly as popsim launch will (same TRB
-        resolution including the data_train_run_builder override), so the
-        count reflects segmentation, NaN culling, and drop_last rather than
-        an estimate from shot counts. Cached per dataloader config because
-        building the dataloaders loads the datasets (relaunches and freeze
-        twins share a config, so they share a cache entry).
+        Counted on the power balance view of the target, which every study splits on (see target_shots.py).
         """
-        dataloader_config = train_config.dataloader_config
+        ds_power_balance = get_ds(config.target_device, "power_balance_transfer")
+        shots = ds_power_balance[EPISODE_DIM].values
+        hazard = ds_power_balance["hazard"].values
+        mask_test = held_out_shot_mask(shots, hazard, configured_target_split(0))
+        return int((~mask_test).sum())
+
+    def steps_per_epoch(self, train_config: TrainConfig) -> int:
+        """The optimizer steps per epoch of every case trained with this loader config.
+
+        It is the natural steps per epoch of the largest training set the locked fields allow:
+        every non-target device's training and validation shots plus the whole target pool.
+        Every case's training set is a subset of it, repeated in reshuffled passes up to steps_per_epoch (trb_utils.FixedStepsDataLoader),
+        so the LR schedule, the validation cadence and the patience count the same steps in every case.
+        Only locked fields enter, so it follows neither the case grid nor the study of a lineage.
+        Measured on the case's final loader config (batch size, segments, variables), so each loader family gets its own.
+
+        A measurement loads every device, so it is recorded in the working dir (STEPS_PER_EPOCH_FILENAME) for later runs.
+        The root-most study of the lineage that recorded it wins, like case_home,
+        so a child trains its own cases with the steps its borrowed cases trained with.
+        A fresh config lock deletes the record (_open_config_lock), so a reset study measures again.
+        """
+        target_split = configured_target_split(self.target_pool_size)
+        dataloader_config_largest = {
+            **train_config.dataloader_config,
+            "training_data": self._hyperparam_training_data(),
+            "domain_adaptation": "addition",
+            **target_split.dataloader_config(),
+            "steps_per_epoch": None,
+        }
         data_trb = data_train_run_builder(train_config)
-        cache_key = json.dumps([str(data_trb), dataloader_config], sort_keys=True, default=str)
-        if cache_key not in self._transfer_steps_cache:
-            _, train_dl, _, _ = data_trb.get_dataloaders(dataloader_config)
-            self._transfer_steps_cache[cache_key] = max(1, len(train_dl))
-        return self._transfer_steps_cache[cache_key]
+        config_json = json.dumps([str(data_trb), dataloader_config_largest], sort_keys=True, default=str)
+        config_hash = hashlib.sha256(config_json.encode()).hexdigest()
+        if config_hash not in self._steps_per_epoch_cache:
+            recorded = [recorded_steps_per_epoch(archive.working_dir) for archive in reversed(self.archive.chain())]
+            steps_per_epoch = next((record[config_hash]["steps_per_epoch"] for record in recorded if config_hash in record), None)
+            if steps_per_epoch is None:
+                _, train_dl, _, _ = data_trb.get_dataloaders(dataloader_config_largest)
+                steps_per_epoch = len(train_dl)
+                self._record_steps_per_epoch(config_hash, data_trb.__name__, steps_per_epoch)
+                logger.info(f"{steps_per_epoch} training steps per epoch for every case on {data_trb.__name__} loaders of this config")
+            self._steps_per_epoch_cache[config_hash] = steps_per_epoch
+        return self._steps_per_epoch_cache[config_hash]
+
+    def _record_steps_per_epoch(self, config_hash: str, data_train_run_builder_name: str, steps_per_epoch: int) -> None:
+        recorded = recorded_steps_per_epoch(self.working_dir)
+        recorded[config_hash] = {"data_train_run_builder": data_train_run_builder_name, "steps_per_epoch": steps_per_epoch}
+        write_toml_atomic(self.working_dir / STEPS_PER_EPOCH_FILENAME, recorded)
 
     def _scale_transfer_lr(self, train_config: TrainConfig) -> TrainConfig:
         """Step-budget the learning-rate schedule for fine-tuning from a pretrained checkpoint.
 
         Tuned learning rates were swept for from-scratch training.
-        A fixed cooling factor starves a step-poor finetune:
-        with batch_size above the finetune dataset size there is 1 optimizer step per epoch,
-        so a 0.1 factor leaves the pretrained model essentially unmoved.
         The scale keeps lr x total_steps near lr0 x max_epochs,
-        scale = max_epochs / total_steps from the measured train dataloader, clipped to [TRANSFER_LR_FLOOR, 1].
+        scale = max_epochs / total_steps clipped to [TRANSFER_LR_FLOOR, 1].
+        Every case trains the study's steps_per_epoch, so the scale is 1 / steps_per_epoch clipped the same way.
 
         The schedule is also flattened (lrf_frac = 1, a constant under optax exponential_decay),
         so the whole step budget is spent at working LR.
@@ -840,7 +889,7 @@ class Study:
 
         Applied after the tuned-config merge so the swept optimizer_config cannot overwrite it.
         """
-        steps_per_epoch = self._transfer_steps_per_epoch(train_config)
+        steps_per_epoch = train_config.dataloader_config["steps_per_epoch"]
         total_steps = steps_per_epoch * train_config.max_epochs
         scale = transfer_lr_scale(steps_per_epoch, train_config.max_epochs)
         logger.info(
@@ -863,8 +912,8 @@ class Study:
 
         Builds the shared scaffold (dataloader/loss/optimizer bases, weighted
         device weights, transfer checkpoint wiring, tuned-config merge,
-        transfer LR scaling) around the per-model-type pieces supplied by
-        the model_train_spec hook.
+        the study's training steps per epoch, transfer LR scaling)
+        around the per-model-type pieces supplied by the model_train_spec hook.
         """
         dataloader_config_base = self.base_dataloader_config(case)
         loss_config = self.base_loss_config()
@@ -906,6 +955,11 @@ class Study:
             train_config_base = self._set_transfer_checkpoint(train_config_base, case.transfer_pretrain_case())
 
         train_config = self._apply_tuned_config(case, train_config_base)
+
+        # Every case trains the same steps per epoch, measured on the final loader config (see steps_per_epoch)
+        steps_per_epoch = self.steps_per_epoch(train_config)
+        dataloader_config = {**train_config.dataloader_config, "steps_per_epoch": steps_per_epoch}
+        train_config = train_config.model_copy(update={"dataloader_config": dataloader_config})
 
         # Fine-tuning from a pretrained checkpoint gets a step-budgeted flat
         # learning rate instead of the swept schedule (see _scale_transfer_lr).
@@ -1748,9 +1802,9 @@ class Study:
         # Latest-checkpoint epoch per case as of its last launch.
         # A relaunch whose checkpoint advanced past this is a resume making progress, not a failure
         self.train_attempt_epochs: dict[str, int | None] = {}
-        # Measured steps-per-epoch per transfer dataloader config,
-        # so repeated make_train_config calls do not rebuild dataloaders (see _transfer_steps_per_epoch)
-        self._transfer_steps_cache: dict[str, int] = {}
+        # Measured steps per epoch per largest-training-set loader config,
+        # so repeated make_train_config calls do not reread the records (see steps_per_epoch)
+        self._steps_per_epoch_cache: dict[str, int] = {}
 
         self.working_dir = Path(config.working_dir_base) / self.name
         self.model_dir = self.working_dir / "models"
@@ -1814,6 +1868,8 @@ class Study:
                 parent_stamp=parent.stamp if parent is not None else None,
             )
             write_config_lock(lock_path, lock)
+            # Steps per epoch recorded under an earlier setup or dataset do not carry over to a fresh lock
+            (self.working_dir / STEPS_PER_EPOCH_FILENAME).unlink(missing_ok=True)
             return lock
 
         lock = read_config_lock(lock_path, self.Config)

@@ -88,7 +88,12 @@ def write_config_lock(path: Path, lock: ConfigLock) -> None:
     lock_data[LOCK_TABLE] = {"study_type": lock.study_type, "stamp": lock.stamp}
     if lock.parent_stamp is not None:
         lock_data[LOCK_TABLE]["parent_stamp"] = lock.parent_stamp
+    write_toml_atomic(path, lock_data)
+
+
+def write_toml_atomic(path: Path, data: dict) -> None:
+    """Write data through a uniquely named temporary file, so a concurrent reader never sees a partial file."""
     tmp_path = path.with_name(f"{path.name}.{new_stamp()}.tmp")
     with open(tmp_path, "w") as f:
-        toml.dump(lock_data, f)
+        toml.dump(data, f)
     tmp_path.replace(path)

@@ -528,6 +528,54 @@ def prepared_for_dataloader(ds: xr.Dataset) -> xr.Dataset:
     return ds
 
 
+class FixedStepsDataLoader(DataLoader):
+    """A training DataLoader whose every epoch is exactly steps_per_epoch batches of the natural loader's batch size.
+
+    Every case of a study trains the same steps per epoch (Study.steps_per_epoch),
+    so the LR schedule, the validation cadence and the patience count the same optimizer steps
+    whatever the size of the case's training set.
+    An epoch chains reshuffled passes over the samples until steps_per_epoch batches are out,
+    and the rest of its last pass is dropped.
+    """
+
+    def __init__(self, train_dl: DataLoader, steps_per_epoch: int):
+        n_batches_natural = len(train_dl)
+        if n_batches_natural > steps_per_epoch:
+            raise ValueError(
+                f"One pass over this training set is {n_batches_natural} batches, more than the study's {steps_per_epoch} steps per epoch, "
+                "which come from the largest training set its locked fields allow"
+            )
+        super().__init__(
+            train_dl.dataset,
+            batch_size=train_dl.batch_size,
+            shuffle=train_dl.shuffle,
+            drop_last=train_dl.drop_last,
+            pad_last=train_dl.pad_last,
+            key=train_dl.key,
+            generate_prng=train_dl.generate_prng,
+        )
+        self.steps_per_epoch = steps_per_epoch
+
+    def __len__(self) -> int:
+        return self.steps_per_epoch
+
+    def __iter__(self):
+        n_batches = 0
+        while True:
+            for batch in super().__iter__():
+                yield batch
+                n_batches += 1
+                if n_batches == self.steps_per_epoch:
+                    return
+
+
+def fixed_steps_train_dataloader(train_dl: DataLoader, steps_per_epoch: int | None) -> DataLoader:
+    """train_dl at the study's steps per epoch, as built when None (only Study.steps_per_epoch measures it so)."""
+    if steps_per_epoch is None:
+        return train_dl
+    return FixedStepsDataLoader(train_dl, steps_per_epoch)
+
+
 def get_time_dep_dataloaders(
     dataloader_config: dict,
     study_type: str,
@@ -587,6 +635,7 @@ def get_time_dep_dataloaders(
             drop_last=[True, False],
             pad_last=[False, True],
         )
+    train_dl = fixed_steps_train_dataloader(train_dl, dataloader_config["steps_per_epoch"])
     attach_normalizer_fit_ds(train_dl, normalizer_fit_ds)
     # The validation set doubles as the test set (see resolve_case_datasets)
     return ds_val, train_dl, val_dl, val_dl

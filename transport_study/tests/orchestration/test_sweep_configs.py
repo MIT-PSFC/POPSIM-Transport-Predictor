@@ -64,5 +64,7 @@ def test_sweep_config_is_valid(study, path):
     assert cfg["metric"]["goal"] == "minimize"
 
     assert cfg.get("parameters"), f"{path.name}: no parameters"
+    # Every case's steps per epoch are measured on the unswept loader config
+    assert "dataloader_config" not in cfg["parameters"], f"{path.name}: sweeps must not change the training loader"
     for name, spec in cfg["parameters"].items():
         check_parameter(name, spec, path)

@@ -315,6 +315,7 @@ def test_scaling_law_coefficients_skip_weight_decay():
     assert float(jnp.abs(updates.p_oh_predictor.nn.layers[0].weight).max()) > 0.0
 
 
+@requires_sample_data
 def test_base_optimizer_config_carries_lr_factors(tmp_path):
     study = PowerBalanceStudy(
         PowerBalanceStudy.Config(

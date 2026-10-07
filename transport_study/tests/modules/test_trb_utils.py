@@ -5,9 +5,11 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 import xarray as xr
+from popsim.ml.dataloading import make_dataloaders
 
 from transport_study import EPISODE_DIM, TIME_COORD, TIME_DIM
 from transport_study.modules.trb_utils import (
+    FixedStepsDataLoader,
     mask_to_largest_contiguous_segment,
     scalar_study_results,
 )
@@ -92,3 +94,48 @@ def test_scalar_results_flag_non_finite_predictions(bad_value):
     np.testing.assert_array_equal(ds["error_diverged_ts"].values[0], [0.0, 1.0, 0.0, nan])
     np.testing.assert_array_equal(np.isnan(ds["error_abs_ts"].values[0]), [False, True, False, True])
     assert np.isfinite(ds["error_abs_shot"].values).all()
+
+
+def _timeslice_loader(n_shots: int, n_times: int, batch_size: int):
+    """A shuffled time-independent training loader whose sample_id variable names each timeslice."""
+    sample_id = np.arange(n_shots * n_times, dtype=np.float32).reshape(n_shots, n_times)
+    times = np.tile(1e-3 * np.arange(n_times), (n_shots, 1))
+    ds = xr.Dataset(
+        {"sample_id": ((EPISODE_DIM, TIME_DIM), sample_id), "target": ((EPISODE_DIM, TIME_DIM), sample_id)},
+        coords={EPISODE_DIM: np.arange(n_shots), TIME_COORD: ((EPISODE_DIM, TIME_DIM), times)},
+    )
+    (train_dl,) = make_dataloaders(
+        datasets=(ds,),
+        time_coord=TIME_COORD,
+        episode_coord=EPISODE_DIM,
+        input_vars=["sample_id"],
+        target_vars=["target"],
+        convert_xr_to_jnp=False,
+        batch_size=batch_size,
+        shuffle=True,
+        drop_last=True,
+    )
+    return train_dl
+
+
+def test_fixed_steps_epochs_chain_reshuffled_passes():
+    """Every epoch is exactly steps_per_epoch full batches, and each complete pass inside it covers every sample once in a new order."""
+    natural_dl = _timeslice_loader(n_shots=3, n_times=4, batch_size=4)
+    assert len(natural_dl) == 3
+    fixed_dl = FixedStepsDataLoader(natural_dl, steps_per_epoch=7)
+
+    assert len(fixed_dl) == 7
+    for _ in range(2):
+        batch_ids = [batch.ds["sample_id"].values for batch in fixed_dl]
+        assert [ids.size for ids in batch_ids] == [4] * 7
+        first_pass = np.concatenate(batch_ids[0:3])
+        second_pass = np.concatenate(batch_ids[3:6])
+        for pass_ids in (first_pass, second_pass):
+            assert sorted(pass_ids.tolist()) == list(range(12))
+        assert first_pass.tolist() != second_pass.tolist()
+
+
+def test_fixed_steps_refuse_a_training_set_above_the_study_steps():
+    natural_dl = _timeslice_loader(n_shots=3, n_times=4, batch_size=4)
+    with pytest.raises(ValueError, match="more than the study's 2 steps per epoch"):
+        FixedStepsDataLoader(natural_dl, steps_per_epoch=2)
