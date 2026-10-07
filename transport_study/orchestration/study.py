@@ -57,15 +57,15 @@ from transport_study.orchestration.organize_data import (
 from transport_study.orchestration.slurm_utils import (
     cancel_job,
     count_running_jobs,
+    cpu_partitions,
     get_pending_job_pending_s,
     get_running_job_elapsed_s,
     get_running_job_names,
     launch_agent_parallel,
     launch_train_parallel,
-    open_gpu_slots,
+    open_slots,
+    partition_exists,
     pick_partition,
-    spillover_budget,
-    spillover_slots,
 )
 from transport_study.orchestration.target_shots import (
     BASE_TARGET_SHOT_ORDER,
@@ -126,10 +126,15 @@ WATCHDOG_STALL_S = 60 * 60
 # wandb heartbeats every ~30s during a live run, so 10 min of silence on a "running" run is already well past any legitimate gap
 AGENT_HEARTBEAT_STALL_S = 10 * 60
 
-# A job parked PENDING on a busy spillover partition can sit in the queue indefinitely. After
-# this long, cancel it so the orchestration loop re-queues it (pick_partition then re-decides
-# placement). Jobs pending on the primary partition are exempt and keep their queue position
+# A job parked PENDING on a busy spillover or CPU fallback partition can sit in the queue indefinitely.
+# After this long, cancel it so the orchestration loop re-queues it (pick_partition then re-decides placement).
+# Jobs pending on a primary partition keep their queue position,
+# except the jobs of a case that can also train on CPU pending for a GPU
 WATCHDOG_PENDING_S = 30 * 60
+
+# A CPU job runs its epochs several times slower, so one validation interval can outlast the GPU stall threshold.
+# The stuck-job watchdog scales both of its thresholds by this for jobs on the CPU partitions.
+CPU_WATCHDOG_SCALE = 4
 
 # The time-dep rollout batches pad every shot to a common length by repeating its
 # final timeslice with a clamped time value (not NaN). A real timeslice advances the
@@ -566,6 +571,10 @@ class Study:
         """Return the path where the collected results for all cases should be stored."""
         return Path(self.result_dir) / "collected_results.nc"
 
+    def sweep_checkpoint_dir(self, case: Case) -> Path:
+        """Where the sweep trials of a hyperparam case keep their checkpoints, one subdirectory per wandb run id."""
+        return Path(self.log_dir) / "sweep_checkpoints" / str(case)
+
     def tuned_config_path(self, case: Case) -> Path:
         """The tuned hyperparameters of the case's hyperparam case, in the working dir of the study that case lives in."""
         return self.trained_model_dir(case.get_hyperparam_prereq()) / "tuned_config.yaml"
@@ -658,10 +667,10 @@ class Study:
 
         if clean_sweeps:
             # Only this study's own sweeps, a borrowed hyperparam case's sweep belongs to its home study
-            project_names = {
-                self.wandb_project_name(case) for case in self.cases if case.is_hyperparam_case() and not self.is_borrowed(case)
-            }
-            run_clean_sweeps(project_names)
+            own_hyperparam_cases = [case for case in self.cases if case.is_hyperparam_case() and not self.is_borrowed(case)]
+            run_clean_sweeps({self.wandb_project_name(case) for case in own_hyperparam_cases})
+            for case in own_hyperparam_cases:
+                shutil.rmtree(self.sweep_checkpoint_dir(case), ignore_errors=True)
 
         for directory in [self.model_dir, self.result_dir, self.figure_dir]:
             directory.mkdir(parents=True, exist_ok=True)
@@ -1019,6 +1028,7 @@ class Study:
         A job counts as deadlocked once it has run at least WATCHDOG_MIN_AGE_S
         with no checkpoint written in the last WATCHDOG_STALL_S (including one
         that never wrote a first checkpoint at all).
+        Both thresholds are CPU_WATCHDOG_SCALE times longer for a job on a CPU partition.
         Killing it frees the case to be relaunched as a fresh process by the normal orchestration loop.
         launch_train's attempt counter only resets on checkpoint progress,
         so a job that keeps deadlocking still hits MAX_TRAIN_ATTEMPTS and aborts the study rather than looping forever.
@@ -1026,19 +1036,23 @@ class Study:
         elapsed = get_running_job_elapsed_s()
         if not elapsed:
             return
+        cpu_job_names = set(get_running_job_elapsed_s(partition=",".join(cpu_partitions())) or {}) if cpu_partitions() else set()
         now = time.time()
         for case in cases:
             job_name = self.train_job_name(case)
             job_elapsed = elapsed.get(job_name)
-            if job_elapsed is None or job_elapsed < WATCHDOG_MIN_AGE_S:
+            watchdog_scale = CPU_WATCHDOG_SCALE if job_name in cpu_job_names else 1
+            min_age_s = WATCHDOG_MIN_AGE_S * watchdog_scale
+            stall_s = WATCHDOG_STALL_S * watchdog_scale
+            if job_elapsed is None or job_elapsed < min_age_s:
                 continue
             info = self._latest_checkpoint_dir_info(case)
             last_progress = info[1] if info else None
-            if last_progress is not None and now - last_progress < WATCHDOG_STALL_S:
+            if last_progress is not None and now - last_progress < stall_s:
                 continue
             logger.warning(
                 f"Job {job_name} has run {job_elapsed}s with no checkpoint progress in "
-                f"the last {WATCHDOG_STALL_S}s, likely deadlocked. Killing so it can be resubmitted.\n"
+                f"the last {stall_s}s, likely deadlocked. Killing so it can be resubmitted.\n"
                 f"Case:\t{case}"
             )
             cancel_job(job_name)
@@ -1072,12 +1086,13 @@ class Study:
             cancel_job(job_name)
 
     def _kill_long_pending_jobs(self, cases: list[Case]):
-        """Cancel jobs stuck PENDING on a spillover partition longer than WATCHDOG_PENDING_S.
+        """Cancel jobs stuck PENDING longer than WATCHDOG_PENDING_S where waiting on does not pay off.
 
-        A job submitted when a spillover partition looked free can pend
-        indefinitely once other users grab the capacity. Cancelling it hands
-        the case back to the normal launch path, where pick_partition
-        re-decides placement. The primary partition is deliberately exempt:
+        That is a GPU spillover or CPU fallback partition, any case's job can pend there
+        indefinitely once other users grab the capacity it was placed on,
+        and the primary GPU partition for a case that can also train on CPU.
+        Cancelling hands the case back to the normal launch path, where pick_partition re-decides placement.
+        The primary partitions are otherwise exempt:
         jobs there keep their queue position (and accrued age priority)
         instead of cycling to the back every 30 min. A cancelled pending job
         never started training, so its launch attempt is refunded, otherwise a
@@ -1085,33 +1100,39 @@ class Study:
         without a single actual training failure. Agent jobs need no refund,
         launch_sweep tops agents back up to the remaining trial count on its own.
         """
-        spillover = ",".join(p for p in config.spillover_partitions if p and p != config.partition)
-        if not spillover:
-            return
-        pending = get_pending_job_pending_s(partition=spillover)
-        if not pending:
-            return
-        for case in cases:
-            job_names = [self.train_job_name(case)]
-            if case.is_hyperparam_case():
-                job_names.append(self.agent_job_name(case))
-            for job_name in job_names:
-                pending_s = pending.get(job_name)
-                if pending_s is None or pending_s < WATCHDOG_PENDING_S:
-                    continue
-                logger.warning(
-                    f"Job {job_name} has been pending {pending_s}s on a spillover partition, "
-                    f"cancelling so the orchestration loop can re-queue it.\nCase:\t{case}"
-                )
-                # Scoped to the spillover partitions so a same-named job
-                # pending on the primary partition can never be caught
-                cancel_job(job_name, partition=spillover, state="PENDING")
-                # scancel --state=PENDING is a no-op if the job started since
-                # the squeue snapshot, so at worst this refund is one attempt
-                # too generous and the case gets one extra retry
-                if job_name == self.train_job_name(case):
-                    attempts = self.train_attempts.get(str(case), 0)
-                    self.train_attempts[str(case)] = max(attempts - 1, 0)
+        fallback = ",".join(p for p in (*config.spillover_partitions, *config.cpu_fallback_partitions) if p and p != config.partition)
+        watched = [(fallback, cases)] if fallback else []
+        cpu_capable_cases = [case for case in cases if self.trains_on_cpu(case)]
+        if cpu_capable_cases and config.partition:
+            watched.append((config.partition, cpu_capable_cases))
+        for partition, partition_cases in watched:
+            pending = get_pending_job_pending_s(partition=partition)
+            if not pending:
+                continue
+            for case in partition_cases:
+                job_names = [self.train_job_name(case)]
+                if case.is_hyperparam_case():
+                    job_names.append(self.agent_job_name(case))
+                for job_name in job_names:
+                    pending_s = pending.get(job_name)
+                    if pending_s is None or pending_s < WATCHDOG_PENDING_S:
+                        continue
+                    logger.warning(
+                        f"Job {job_name} has been pending {pending_s}s on {partition}, "
+                        f"cancelling so the orchestration loop can re-queue it.\nCase:\t{case}"
+                    )
+                    # Scoped to the watched partitions so a same-named job pending elsewhere can never be caught
+                    cancel_job(job_name, partition=partition, state="PENDING")
+                    # scancel --state=PENDING is a no-op if the job started since
+                    # the squeue snapshot, so at worst this refund is one attempt
+                    # too generous and the case gets one extra retry
+                    if job_name == self.train_job_name(case):
+                        attempts = self.train_attempts.get(str(case), 0)
+                        self.train_attempts[str(case)] = max(attempts - 1, 0)
+
+    def trains_on_cpu(self, case: Case) -> bool:
+        """Whether the case's training and sweep agents may also run on the CPU partitions (cpu_model_types)."""
+        return bool(config.cpu_partition) and case.model_type in config.cpu_model_types
 
     def run_unfinished_cases(self, skip_tuning: bool, enable_parallelism: bool):
         """Loop until every runnable case has a result file.
@@ -1171,25 +1192,51 @@ class Study:
                 f"{len(to_launch)} ready to launch, {n_blocked} blocked on prereqs{waiting_summary})"
             )
 
-            for case in to_launch:
-                if enable_parallelism and pick_partition() is None:
-                    logger.info(f"No idle resources or spillover budget, holding {len(to_launch)} ready cases until the next pass")
-                    break
-                self.run_case(case, skip_tuning=skip_tuning, enable_parallelism=enable_parallelism)
+            if enable_parallelism:
+                self._launch_ready_cases(to_launch, skip_tuning)
+            else:
+                for case in to_launch:
+                    self.run_case(case, skip_tuning=skip_tuning, enable_parallelism=False)
 
             # Sleep for a bit before checking again to avoid spamming slurm
             time.sleep(ORCHESTRATION_POLL_INTERVAL_S)
             unfinished = [case for case in unfinished if not self.result_path(case).exists()]
+
+    def _launch_ready_cases(self, to_launch: list[Case], skip_tuning: bool):
+        """Give each ready case a partition and launch it, GPU-only cases first.
+
+        A case that can also train on CPU only takes the primary GPUs the GPU-only cases of this pass leave,
+        beyond cpu_capable_buffer_gpus, and the CPU partitions otherwise.
+        A GPU-only case finding no partition holds the remaining GPU-only cases until the next pass,
+        a CPU-capable one finding none holds every case left.
+        """
+        launch_order = sorted(to_launch, key=self.trains_on_cpu)
+        gpu_full = False
+        for case in launch_order:
+            cpu_capable = self.trains_on_cpu(case)
+            if gpu_full and not cpu_capable:
+                continue
+            partition = pick_partition(cpu_capable, skip_gpu=gpu_full)
+            if partition is None and not cpu_capable:
+                logger.info("No open GPU slots or spillover budget, holding the ready GPU-only cases until the next pass")
+                gpu_full = True
+                continue
+            if partition is None:
+                logger.info("No open GPU or CPU slots, holding the remaining ready cases until the next pass")
+                break
+            self.run_case(case, skip_tuning=skip_tuning, enable_parallelism=True, partition=partition)
 
     def run_case(
         self,
         case: Case,
         skip_tuning: bool,
         enable_parallelism: bool,
+        partition: str | None = None,
     ):
         """Run a single case of the study, including hyperparameter tuning, training, and evaluation as needed.
 
         If case or a prereq is in progress, simply return and let orchestration loop try again later.
+        With parallelism the case's jobs go to partition, picked here when None.
         """
         if not self.check_data_requirements(case):
             raise ValueError(f"Case {case} does not have the required data to run. This should have been caught earlier!")
@@ -1198,25 +1245,26 @@ class Study:
             logger.warning(f"Case {case} already has results, skipping.")
             return
         if self.check_prereq_satisfied(case):
-            self._run_ready_case(case, skip_tuning, enable_parallelism)
+            self._run_ready_case(case, skip_tuning, enable_parallelism, partition)
         else:
             logger.debug(f"Case blocked on unmet prereqs, skipping until they finish.\nCase:\t{case}")
 
-    def _run_ready_case(self, case: Case, skip_tuning: bool, enable_parallelism: bool):
+    def _run_ready_case(self, case: Case, skip_tuning: bool, enable_parallelism: bool, partition: str | None):
         """Execute a case whose prereqs are satisfied."""
-        if case.is_hyperparam_case() and not self._ensure_hyperparams_ready(case, skip_tuning, enable_parallelism):
+        if enable_parallelism and partition is None:
+            partition = pick_partition(self.trains_on_cpu(case))
+            if partition is None:
+                logger.debug("No resources currently available, waiting before trying again...")
+                return
+        if case.is_hyperparam_case() and not self._ensure_hyperparams_ready(case, skip_tuning, enable_parallelism, partition):
             return
         if not self._no_blocking_jobs(case, enable_parallelism):
             logger.debug(f"Jobs already in flight for case {case}, waiting before trying again...")
             return
-        partition = pick_partition() if enable_parallelism else None
-        if enable_parallelism and partition is None:
-            logger.debug("No resources currently available, waiting before trying again...")
-            return
         logger.opt(colors=True).info(f"<bold><cyan>RUNNING CASE:</cyan></bold>\n{case}")
         self.launch_train(case, enable_parallelism=enable_parallelism, partition=partition)
 
-    def _ensure_hyperparams_ready(self, case: Case, skip_tuning: bool, enable_parallelism: bool) -> bool:
+    def _ensure_hyperparams_ready(self, case: Case, skip_tuning: bool, enable_parallelism: bool, partition: str | None) -> bool:
         """Ensure tuned config exists. Returns True if ready to proceed to training."""
         self._require_local(case)
         tuned_config_path = self.tuned_config_path(case)
@@ -1236,10 +1284,6 @@ class Study:
                 f"({len(completed_runs)}/{config.hyperparam_sweeps} runs, "
                 f"{len(finished_runs)}/{min_finished} finished)"
             )
-            partition = pick_partition() if enable_parallelism else None
-            if enable_parallelism and partition is None:
-                logger.debug("No resources currently available for sweep agents, waiting before trying again...")
-                return False
             self.launch_sweep(
                 case,
                 enable_parallelism=enable_parallelism,
@@ -1270,6 +1314,8 @@ class Study:
                 "check the project for runs stuck crashing, pruning or diverging."
             )
         self._write_tuned_config(case, best_train_config)
+        # Every trial is over, so their resume checkpoints are no longer needed
+        shutil.rmtree(self.sweep_checkpoint_dir(case), ignore_errors=True)
         logger.success(f"Saved best hyperparameter config for {case}")
         return True
 
@@ -1316,21 +1362,22 @@ class Study:
         outstanding cap the orchestration loop would submit another batch of
         agents every pass until the queue filled, far past what is needed.
 
-        When partition is a spillover partition the idle-GPU cap is replaced by
-        that partition's remaining per-user slots (its QOS GPU allowance minus
-        jobs already there), bounded by the user-wide job ceiling.
+        On any other partition the cap is that partition's open slots (open_slots):
+        the remaining per-user GPU allowance of a spillover partition,
+        or the CPU jobs that fit on a CPU partition, bounded by the user-wide job ceiling.
         """
         self._require_local(case)
         train_config = self.make_train_config(case)
         # Remove the test_eval_suite_config since that's for final results only.
-        # Trials get the same wall-clock budget as production jobs, making the
-        # sweep an anytime comparison: best val loss reachable within one job.
-        # Resume stays off, a trial is a fresh sample of its hyperparameters.
+        # A trial stopped by the wall-clock budget ends preempted, the sweep requeues it,
+        # and the next agent resumes it from its own checkpoint subdirectory (popsim keys it by run id).
+        # So every trial trains to max_epochs or patience, whatever device and job length it ran on.
         train_config = train_config.model_copy(
             update={
                 "test_eval_suite_config": None,
                 "max_epochs": min(config.max_epochs, config.hyperparam_max_epochs),
-                "resume": False,
+                "resume": True,
+                "checkpoint_dir": str(self.sweep_checkpoint_dir(case)),
                 "max_wall_seconds": float(config.train_wall_budget_s),
                 # Sweep trials are compared on val loss only, no need to keep
                 # the top-K checkpoints production runs retain for results
@@ -1366,10 +1413,7 @@ class Study:
             outstanding_for_count = config.hyperparam_sweeps - n_completed_runs - running_agents
             outstanding_for_finished = min_finished - n_finished_runs - running_agents
             outstanding_trials = max(outstanding_for_count, outstanding_for_finished)
-            if partition == config.partition:
-                capacity = open_gpu_slots(config.partition, config.buffer_gpus)
-            else:
-                capacity = min(spillover_budget(), spillover_slots(partition))
+            capacity = open_slots(partition, self.trains_on_cpu(case))
             # Keep MIN_RUNNING_AGENTS going (up to capacity) to finish out the sweep,
             # one agent at a time may get pruned.
             # A sweep smaller than that (debug) never runs more agents than it has trials
@@ -1665,6 +1709,9 @@ class Study:
 
         if enable_parallelism and not config.partition:
             raise ValueError("enable_parallelism is True but no SLURM partition is specified in the config")
+        missing_cpu_partitions = [p for p in cpu_partitions() if not partition_exists(p)]
+        if enable_parallelism and missing_cpu_partitions:
+            raise ValueError(f"CPU partitions {missing_cpu_partitions} are unknown to scontrol")
 
         if not skip_visualization:
             logger.opt(colors=True).info("<bold><magenta>DATA VISUALIZATION</magenta></bold>")

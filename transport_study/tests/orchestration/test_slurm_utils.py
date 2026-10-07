@@ -10,6 +10,8 @@ from transport_study.orchestration import slurm_utils
 from transport_study.orchestration.slurm_utils import (
     count_idle_gpus,
     importable_module,
+    open_cpu_slots,
+    open_slots,
     parse_slurm_time_s,
     resources_available,
 )
@@ -85,7 +87,8 @@ def _fake_slurm_stdout(cmd: list[str]) -> str:
             lines.append(f"{node}  gpu:a100:4(S:0-1)  gpu:a100:{gpus_used}(IDX:N/A)  {state}")
         return "\n".join(lines) + "\n"
     if cmd[0] == "squeue":
-        queried_nodes = cmd[cmd.index("-w") + 1].split(",")
+        # Only the user's pending-job query has no node list, and this user has no pending jobs
+        queried_nodes = cmd[cmd.index("-w") + 1].split(",") if "-w" in cmd else []
         queried_partitions = cmd[cmd.index("-p") + 1].split(",")
         lines = []
         for job_id, partition, _, nodes, gpus in FAKE_RUNNING_JOBS:
@@ -100,20 +103,96 @@ def _fake_slurm_stdout(cmd: list[str]) -> str:
     raise AssertionError(f"unexpected SLURM command {cmd}")
 
 
-def test_count_idle_gpus_counts_free_and_preemptable_gpus_on_schedulable_nodes(monkeypatch):
+def _fake_config(**overrides):
+    return load_config(StudyConfig(study_name="test_slurm_utils", dataset_paths={}, target_device="test_device", **overrides))
+
+
+def _serve_fake_slurm(monkeypatch, fake_stdout):
+    def run(cmd, **kwargs):
+        return SimpleNamespace(returncode=0, stdout=fake_stdout(cmd), stderr="")
+
+    monkeypatch.setattr(slurm_utils.subprocess, "run", run)
+
+
+@pytest.mark.parametrize(("exclude_nodes", "idle_gpus"), [((), 2), (("node04",), 1), (("node01",), 0)])
+def test_count_idle_gpus_counts_free_and_preemptable_gpus_on_schedulable_nodes(monkeypatch, exclude_nodes, idle_gpus):
     """Free GPUs on nodes taking jobs plus those held there by lower-tier preemptable partitions.
 
     node01 holds 2 preemptable GPUs (job 101 and job 102's node01 share, its node99 share is outside).
     node04 has 1 free GPU, the shared, quicktest and normal jobs there are not preemptable from tier 50.
     node02 / node03 are full (the 2-node job holds 8), drained node05 counts nothing.
-    2 + 1 less a buffer of 1 leaves 2.
+    2 + 1 less a buffer of 1 leaves 2, and an excluded node's GPUs count for nothing.
     """
+    _fake_config(exclude_nodes=exclude_nodes)
+    _serve_fake_slurm(monkeypatch, _fake_slurm_stdout)
+    assert count_idle_gpus("fake_psfc_gpu", 1) == idle_gpus
 
-    def run(cmd, **kwargs):
-        return SimpleNamespace(returncode=0, stdout=_fake_slurm_stdout(cmd), stderr="")
 
-    monkeypatch.setattr(slurm_utils.subprocess, "run", run)
-    assert count_idle_gpus("fake_psfc_gpu", 1) == 2
+def test_cpu_capable_cases_keep_their_own_gpu_buffer(monkeypatch):
+    """A negative buffer_gpus queues GPU-only jobs past the 3 idle GPUs,
+    while cpu_capable_buffer_gpus keeps the last 3 for them."""
+    _fake_config(partition="fake_psfc_gpu", buffer_gpus=-1, cpu_partition="fake_cpu", cpu_capable_buffer_gpus=3)
+    _serve_fake_slurm(monkeypatch, _fake_slurm_stdout)
+    assert open_slots("fake_psfc_gpu") == 4
+    assert open_slots("fake_psfc_gpu", cpu_capable=True) == 0
+
+
+# (node, allocated/idle/other/total CPUs, memory MB, allocated memory MB, state) of a CPU partition
+FAKE_CPU_NODES = [
+    # 100000 MB free fits 2 jobs of 48G although 40 CPUs are idle
+    ("cpu01", "24/40/0/64", 249087, 149087, "mix"),
+    # 40 idle CPUs fit 10 jobs of 4, 400000 MB only 8
+    ("cpu02", "24/40/0/64", 507002, 107002, "idle"),
+    ("cpu03", "0/64/0/64", 507002, 0, "drain"),
+    # Planned by backfill but still taking jobs, room for exactly one
+    ("cpu04", "60/4/0/64", 249087, 199935, "mix-"),
+]
+# This user's TRES on the CPU partition, 2 running jobs and 1 pending one
+FAKE_USER_CPU_TRES = ["cpu=4,mem=48G,node=1,billing=4"] * 3
+
+
+def _fake_cpu_slurm_stdout(qos_caps: str):
+    def fake_stdout(cmd: list[str]) -> str:
+        if cmd[:3] == ["scontrol", "show", "partition"]:
+            qos = "fake_qos" if qos_caps else "N/A"
+            return f"PartitionName={cmd[3]} QoS={qos} MaxTime=12:00:00\n"
+        if cmd[0] == "sacctmgr":
+            return qos_caps + "\n"
+        if cmd[0] == "sinfo":
+            return "".join(f"{node}  {cpus}  {memory}  {alloc}  {state}\n" for node, cpus, memory, alloc, state in FAKE_CPU_NODES)
+        if cmd[0] == "squeue" and "--state=PENDING" in cmd:
+            return "1001\n"
+        if cmd[0] == "squeue" and "tres-alloc:200" in cmd:
+            return "\n".join(FAKE_USER_CPU_TRES) + "\n"
+        if cmd[0] == "squeue":
+            # Every job of this user anywhere, for the user-wide job budget
+            return "".join(f"{job_id}\n" for job_id in range(7))
+        raise AssertionError(f"unexpected SLURM command {cmd}")
+
+    return fake_stdout
+
+
+# The partition QOS lookups are cached per partition name, so every scenario gets its own partition
+@pytest.mark.parametrize(
+    ("partition", "qos_caps", "slots"),
+    [
+        # 2 + 8 + 1 node slots, less the 1 pending job
+        ("fake_cpu_uncapped", "", 10),
+        # (386G - 3 x 48G) // 48G = 5 jobs of memory left under the QOS cap, CPUs would allow 21
+        ("fake_cpu_capped", "cpu=96,mem=386G", 5),
+    ],
+)
+def test_open_cpu_slots_fits_jobs_by_cpus_memory_and_qos(monkeypatch, partition, qos_caps, slots):
+    _fake_config(cpu_partition=partition, cpu_train_cpus=4, train_mem="48G")
+    _serve_fake_slurm(monkeypatch, _fake_cpu_slurm_stdout(qos_caps))
+    assert open_cpu_slots(partition) == slots
+
+
+def test_cpu_partitions_keep_the_user_job_budget_without_spillover(monkeypatch):
+    """With no GPU spillover configured the user-wide job ceiling still bounds a CPU partition: 10 - 2 - 7 jobs leaves 1."""
+    _fake_config(cpu_partition="fake_cpu_budget", max_user_jobs=10, spillover_job_headroom=2, spillover_partitions=(), train_mem="48G")
+    _serve_fake_slurm(monkeypatch, _fake_cpu_slurm_stdout(""))
+    assert open_slots("fake_cpu_budget") == 1
 
 
 def test_importable_module_normal():

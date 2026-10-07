@@ -40,7 +40,7 @@ def set_queue_snapshots(monkeypatch, snapshots):
 def record_and_finish_cases(monkeypatch, study: Study, order: list[str]):
     """Replace run_case with a stand-in that records pickup order and finishes the case."""
 
-    def run_case(case, skip_tuning, enable_parallelism):
+    def run_case(case, skip_tuning, enable_parallelism, partition=None):
         order.append(str(case))
         result_path = study.result_path(case)
         result_path.parent.mkdir(parents=True, exist_ok=True)
@@ -118,7 +118,7 @@ def test_relaunch_after_grace_when_no_result(make_stub_study, monkeypatch, fake_
     record_and_finish_cases(monkeypatch, study, order)
     finish_case = study.run_case
 
-    def run_case(case, skip_tuning, enable_parallelism):
+    def run_case(case, skip_tuning, enable_parallelism, partition=None):
         launch_times.append(fake_clock.t)
         finish_case(case, skip_tuning=skip_tuning, enable_parallelism=enable_parallelism)
 
@@ -179,3 +179,39 @@ def test_rejected_submission_refunds_train_attempt(make_stub_study, monkeypatch,
     study.launch_train(case, enable_parallelism=True, partition="test_partition")
 
     assert study.train_attempts.get(str(case), 0) == expected_attempts
+
+
+def test_gpu_only_cases_take_the_gpu_before_cpu_capable_ones(make_stub_study, monkeypatch):
+    """One GPU slot opens per pass.
+
+    The GPU-only case.b takes it ahead of the alphabetically earlier CPU-capable case.a,
+    which goes to the CPU partition instead of waiting, and GPU-only case.c holds for the next pass.
+    """
+    cpu_capable = StubCase(name="case.a", model_type="cpu_type")
+    gpu_only = [StubCase(name="case.b", model_type="gpu_type"), StubCase(name="case.c", model_type="gpu_type")]
+    study = make_stub_study([cpu_capable, *gpu_only], partition="gpu", cpu_partition="cpu", cpu_model_types=("cpu_type",))
+    gpu_slots = SimpleNamespace(open=1)
+
+    def pick_partition(cpu_capable=False, skip_gpu=False):
+        if not skip_gpu and gpu_slots.open > 0:
+            gpu_slots.open -= 1
+            return "gpu"
+        return "cpu" if cpu_capable else None
+
+    launches: list[tuple[str, str]] = []
+
+    def run_case(case, skip_tuning, enable_parallelism, partition=None):
+        launches.append((str(case), partition))
+        result_path = study.result_path(case)
+        result_path.parent.mkdir(parents=True, exist_ok=True)
+        result_path.touch()
+
+    monkeypatch.setattr(study_module, "pick_partition", pick_partition)
+    monkeypatch.setattr(study_module, "get_running_job_names", lambda partition=None: set())
+    monkeypatch.setattr(study_module, "get_running_job_elapsed_s", lambda partition=None: {})
+    monkeypatch.setattr(study_module.time, "sleep", lambda s: setattr(gpu_slots, "open", 1))
+    monkeypatch.setattr(study, "run_case", run_case)
+
+    study.run_unfinished_cases(skip_tuning=True, enable_parallelism=True)
+
+    assert launches == [("case.b", "gpu"), ("case.a", "cpu"), ("case.c", "gpu")]

@@ -165,7 +165,7 @@ def run_one_pass(monkeypatch, study: Study, pending: dict[str, int] | None) -> S
     def cancel_job(job_name, partition=None, state="RUNNING"):
         calls.cancels.append((job_name, partition, state))
 
-    def finish_case(case, skip_tuning, enable_parallelism):
+    def finish_case(case, skip_tuning, enable_parallelism, partition=None):
         result_path = study.result_path(case)
         result_path.parent.mkdir(parents=True, exist_ok=True)
         result_path.touch()
@@ -268,3 +268,19 @@ def test_cancel_job_runs_one_scancel_per_partition_in_the_given_state(slurm_comm
     states = [next(arg for arg in cmd if arg.startswith("--state=")) for cmd in slurm_commands.commands]
     assert partitions == ["spill_a", "spill_b", "spill_a"]
     assert states == ["--state=PENDING", "--state=PENDING", "--state=RUNNING"]
+
+
+def test_cpu_capable_job_pending_for_a_gpu_is_cancelled(make_stub_study, monkeypatch):
+    """A case that can also train on CPU stops waiting for a primary GPU past the threshold, so it can be re-placed on CPU.
+
+    A GPU-only case pending there keeps its queue position.
+    """
+    cpu_capable = StubCase(name="case.cpu", model_type="cpu_type")
+    gpu_only = StubCase(name="case.gpu", model_type="gpu_type")
+    study = make_stub_study([cpu_capable, gpu_only], partition="primary", cpu_partition="cpu_primary", cpu_model_types=("cpu_type",))
+    pending = {study.train_job_name(case): WATCHDOG_PENDING_S for case in (cpu_capable, gpu_only)}
+
+    calls = run_one_pass(monkeypatch, study, pending)
+
+    assert calls.pending_queries == ["primary"]
+    assert calls.cancels == [(study.train_job_name(cpu_capable), "primary", "PENDING")]

@@ -77,7 +77,7 @@ def test_child_waits_for_borrowed_cases_and_launches_only_its_own(tmp_path, monk
 
     launched = []
 
-    def fake_run_case(case, skip_tuning, enable_parallelism):
+    def fake_run_case(case, skip_tuning, enable_parallelism, partition=None):
         launched.append(str(case))
         finish(child, case)
 

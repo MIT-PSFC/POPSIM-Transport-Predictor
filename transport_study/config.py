@@ -88,28 +88,24 @@ def env_dataset_paths() -> dict[str, Path]:
     return {k: Path(v) for k, v in json.loads(os.environ.get("PTPS_DATASET_PATHS", "{}")).items()}
 
 
-def _env_spillover_partitions() -> tuple[str, ...]:
-    """Parse PTPS_SPILLOVER_PARTITIONS, a comma-separated ordered list of
-    partitions, e.g. "mit_preemptable,mit_normal_gpu"
-    """
-    raw = os.environ.get("PTPS_SPILLOVER_PARTITIONS", "")
-    return tuple(p.strip() for p in raw.split(",") if p.strip())
+def _env_list(var_name: str, default: str = "", lower: bool = False) -> tuple[str, ...]:
+    """Parse a comma-separated environment variable, e.g. PTPS_SPILLOVER_PARTITIONS="mit_preemptable,mit_normal_gpu"."""
+    raw = os.environ.get(var_name, default)
+    items = tuple(item.strip() for item in raw.split(",") if item.strip())
+    return tuple(item.lower() for item in items) if lower else items
 
 
-def _env_gpu_types() -> tuple[str, ...]:
-    """Parse PTPS_GPU_TYPES, a comma-separated list of SLURM gres GPU type
-    names GPU jobs may land on, e.g. "a100,h100,h200"
-    """
-    raw = os.environ.get("PTPS_GPU_TYPES", "a100,h100,h200")
-    return tuple(t.strip().lower() for t in raw.split(",") if t.strip())
+# SLURM memory size suffixes in MB, a bare number is MB
+SLURM_MEM_UNITS_MB = {"K": 1 / 1024, "M": 1, "G": 1024, "T": 1024 * 1024}
 
 
-def _env_exclude_nodes() -> tuple[str, ...]:
-    """Parse PTPS_EXCLUDE_NODES, a comma-separated list of SLURM node names
-    GPU jobs must avoid, e.g. a node with a GPU that faults on startup
-    """
-    raw = os.environ.get("PTPS_EXCLUDE_NODES", "")
-    return tuple(n.strip() for n in raw.split(",") if n.strip())
+def slurm_mem_MB(mem: str) -> int:
+    """MB of a SLURM memory size like "48G", "64000M" or "386G", raising on anything else."""
+    unit = mem[-1].upper() if mem and mem[-1].isalpha() else "M"
+    number = mem[:-1] if mem and mem[-1].isalpha() else mem
+    if unit not in SLURM_MEM_UNITS_MB or not number.replace(".", "", 1).isdigit():
+        raise ValueError(f"Not a SLURM memory size: {mem!r}")
+    return int(float(number) * SLURM_MEM_UNITS_MB[unit])
 
 
 # Main config for environment variables
@@ -154,17 +150,36 @@ class StudyConfig(BaseModel):
     # SLURM gres GPU type names training and agent jobs may land on.
     # The default keeps float64 TORAX training off cards with slow fp64 pipelines (l40s, a40, l4, rtx_pro_6000).
     # Empty disables the exclusion.
-    gpu_types: Orchestration[tuple[str, ...]] = Field(default_factory=_env_gpu_types)
+    gpu_types: Orchestration[tuple[str, ...]] = Field(default_factory=lambda: _env_list("PTPS_GPU_TYPES", "a100,h100,h200", lower=True))
     # SLURM node names GPU jobs must never land on, e.g. a node whose GPU faults every job at startup.
     # Unlike the gpu_types exclusion it applies to every gres request, typed fallbacks included.
     # sbatch has no SBATCH_EXCLUDE environment variable, so it reaches the job as an #SBATCH --exclude line.
     # Empty disables it.
-    exclude_nodes: Orchestration[tuple[str, ...]] = Field(default_factory=_env_exclude_nodes)
+    exclude_nodes: Orchestration[tuple[str, ...]] = Field(default_factory=lambda: _env_list("PTPS_EXCLUDE_NODES"))
     # Overflow partitions for GPU jobs once `partition` has no idle GPUs beyond buffer_gpus, tried in order.
     # Jobs there can be preempted at any time, so training relies on resume-from-checkpoint.
     # Submissions per partition are capped at its per-user GPU allowance (QOS MaxTRESPU gres/gpu).
     # Empty disables spillover.
-    spillover_partitions: Orchestration[tuple[str, ...]] = Field(default_factory=_env_spillover_partitions)
+    spillover_partitions: Orchestration[tuple[str, ...]] = Field(default_factory=lambda: _env_list("PTPS_SPILLOVER_PARTITIONS"))
+    # Model types whose training and sweep agent jobs may also run on the CPU partitions.
+    # Prereq pseudo types count by their own name (p_oh, power_balance, profile).
+    # A listed type takes a primary GPU only after the study's GPU-only cases and while
+    # more than cpu_capable_buffer_gpus are idle, else the first CPU partition with room.
+    # No env var, the valid names differ per study.
+    cpu_model_types: Orchestration[tuple[str, ...]] = ()
+    # Primary CPU partition for cpu_model_types, then the fallbacks in order
+    cpu_partition: Orchestration[str | None] = Field(default_factory=lambda: os.environ.get("PTPS_CPU_PARTITION"))
+    cpu_fallback_partitions: Orchestration[tuple[str, ...]] = Field(default_factory=lambda: _env_list("PTPS_CPU_FALLBACK_PARTITIONS"))
+    # CPUs per CPU training or agent job.
+    # XLA's CPU thread pool follows the job's cgroup, and the sequential rollouts barely speed up past 4.
+    cpu_train_cpus: Orchestration[int] = Field(default_factory=lambda: int(os.environ.get("PTPS_CPU_TRAIN_CPUS", "4")), ge=1)
+    # Idle primary GPUs a CPU-capable case leaves for GPU-only cases, for this running study or another running in parallel
+    cpu_capable_buffer_gpus: Orchestration[int] = Field(
+        default_factory=lambda: int(os.environ.get("PTPS_CPU_CAPABLE_BUFFER_GPUS", "0")), ge=0
+    )
+    # sbatch --mem of every training and agent job, GPU or CPU.
+    # A CPU job also holds the device arrays in host RAM, so size it from the CPU peak.
+    train_mem: Orchestration[str] = Field(default_factory=lambda: os.environ.get("PTPS_TRAIN_MEM", "120G"))
     # Ceiling on this user's running + pending jobs across all partitions.
     # The default is the mit_preemptable QOS MaxSubmitPU (448), the tightest limit that applies.
     max_user_jobs: Orchestration[int] = Field(default_factory=lambda: int(os.environ.get("PTPS_MAX_USER_JOBS", "448")))
@@ -181,6 +196,19 @@ class StudyConfig(BaseModel):
     @model_validator(mode="after")
     def _freeze_paths(self):
         object.__setattr__(self, "dataset_paths", MappingProxyType(self.dataset_paths))
+        return self
+
+    @model_validator(mode="after")
+    def _check_cpu_partitions(self):
+        """CPU training needs a CPU partition, and no partition may serve both devices, since submission picks the device by partition."""
+        if (self.cpu_model_types or self.cpu_fallback_partitions) and not self.cpu_partition:
+            raise ValueError("cpu_model_types and cpu_fallback_partitions need a cpu_partition")
+        # Unset partitions are None, a config rebuilt from its lock carries no orchestration fields at all
+        gpu_partitions = {p for p in (self.partition, *self.spillover_partitions) if p}
+        shared = sorted(p for p in (self.cpu_partition, *self.cpu_fallback_partitions) if p and p in gpu_partitions)
+        if shared:
+            raise ValueError(f"Partitions {shared} are both CPU and GPU partitions")
+        slurm_mem_MB(self.train_mem)
         return self
 
     @model_validator(mode="after")

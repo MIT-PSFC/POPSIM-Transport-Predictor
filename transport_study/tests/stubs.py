@@ -47,6 +47,7 @@ class StubCase:
 
     name: str
     prereqs: list[StubCase] | None = None
+    model_type: str = "stub"
     training_data: SimpleNamespace = field(default_factory=lambda: SimpleNamespace(sources=[], exnihilo=False))
     domain_adaptation: str | None = None
     target_shot_order: str = BASE_TARGET_SHOT_ORDER

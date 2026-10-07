@@ -87,3 +87,25 @@ def test_launch_train_parallel_script_compiles(tmp_path, loaded_config, train_co
     scripts = list(tmp_path.glob("train_test_job_script_*.py"))
     assert len(scripts) == 1
     assert_script_valid(scripts[0])
+
+
+def test_cpu_partition_job_requests_cpus_and_no_gpu(tmp_path, train_config, submitted_scripts):
+    """A training job on a CPU partition asks for no GPU and pins jax to the CPU, with the configured CPUs and memory."""
+    load_config(
+        StudyConfig(
+            study_name="launch_script_test",
+            dataset_paths={},
+            target_device="cmod",
+            partition="fake_gpu_partition",
+            cpu_partition="fake_cpu_partition",
+            cpu_train_cpus=8,
+            train_mem="48G",
+        )
+    )
+    slurm_utils.launch_train_parallel(train_config, "train_cpu_job", tmp_path / "result.nc", tmp_path, partition="fake_cpu_partition")
+
+    (script,) = submitted_scripts
+    assert "--gres" not in script
+    assert "export JAX_PLATFORMS=cpu" in script
+    assert "#SBATCH --cpus-per-task=8" in script
+    assert "#SBATCH --mem=48G" in script

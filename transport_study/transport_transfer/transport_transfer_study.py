@@ -88,6 +88,8 @@ TRANSPORT_STATE_VARS = ["energy_mhd_MJ", *TRANSPORT_PROFILE_TARGETS, *TRANSPORT_
 
 # Model types that appear on the study's case grid
 TOP_LEVEL_MODEL_TYPES = ("transformer", "sciml", *TORAX_MODEL_TYPES)
+# Every model type a case of this study can have, the prereq pseudo types included
+STUDY_MODEL_TYPES = (*TOP_LEVEL_MODEL_TYPES, *SUBMODULE_MODEL_TYPES)
 # The submodule cases that train with power_balance_data_normalization instead of the study-wide data_normalization
 POWER_BALANCE_SUBMODULE_TYPES = ("power_balance", "p_oh", "p_rad")
 
@@ -151,7 +153,8 @@ class TransportStudy(Study):
         profile_model_type: str = "shape-init-pca"
 
         FIELD_CHOICES: ClassVar[dict[str, tuple]] = {
-            "model_types": (*TOP_LEVEL_MODEL_TYPES, *SUBMODULE_MODEL_TYPES),
+            "model_types": STUDY_MODEL_TYPES,
+            "cpu_model_types": STUDY_MODEL_TYPES,
             "geometry_builders": VALID_GEOMETRY_BUILDERS,
             "torax_state_options": VALID_TORAX_STATES,
             "data_normalization": FEATURE_NORMALIZATIONS,
@@ -218,7 +221,7 @@ class TransportStudy(Study):
         torax_state: str
         multiobjective: bool
 
-        VALID_MODEL_TYPES = (*TOP_LEVEL_MODEL_TYPES, *SUBMODULE_MODEL_TYPES)
+        VALID_MODEL_TYPES = STUDY_MODEL_TYPES
         # Unfrozen submodules and the geometry_builder and torax_state defaults are suppressed from the case name,
         # so the default grid keeps clean case names and new axes never rename pre-existing cases
         STR_TOKEN_FIELDS = (

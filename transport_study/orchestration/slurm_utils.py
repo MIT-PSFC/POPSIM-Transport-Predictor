@@ -13,7 +13,7 @@ import yaml
 from loguru import logger
 from popsim.ml import TrainConfig
 
-from transport_study.config import config
+from transport_study.config import config, slurm_mem_MB
 
 # A hung SLURM controller must not freeze the orchestration loop
 SLURM_COMMAND_TIMEOUT_S = 120
@@ -48,6 +48,19 @@ export XLA_PYTHON_CLIENT_PREALLOCATE=true
 export XLA_PYTHON_CLIENT_MEM_FRACTION=0.80
 """
 )
+
+# Environment of every CPU job (training, sweep agents, analysis).
+# Pinning jax to the cpu skips the CUDA plugin, whose version check hangs at the first JAX op on a node without a GPU.
+CPU_JOB_ENV = SINGLE_THREAD_BLAS_ENV + "export JAX_PLATFORMS=cpu\n"
+
+# Start banner of a CPU training or agent job.
+# nproc without the OpenMP variables is the cgroup's core count, which XLA's CPU thread pool sizes itself to.
+# An OMP_NUM_THREADS inherited through --export=ALL would otherwise override it.
+# Not an f-string, job_name is filled in with str.format.
+CPU_JOB_BANNER = """\
+echo "=== $(date) job $SLURM_JOB_ID ({job_name}) start ==="
+echo "=== node $SLURMD_NODENAME cpus $(env -u OMP_NUM_THREADS -u OMP_THREAD_LIMIT nproc) ==="
+"""
 
 # Start banner of a GPU job.
 # SLURM_JOB_GPUS is the physical index on the node, the uuid names the exact card for bad-hardware reports.
@@ -112,6 +125,7 @@ def sbatch_script(
     mem: str = "120G",
     gres: str | None = None,
     requeue: bool = False,
+    cpus: int = 4,
 ) -> str:
     """sbatch script that runs script_path with this interpreter after the setup shell lines, then deletes it.
 
@@ -126,7 +140,7 @@ def sbatch_script(
 #SBATCH --job-name={job_name}
 #SBATCH --partition={partition}{time_line}{gres_line}
 #SBATCH --mem={mem}
-#SBATCH --cpus-per-task=4
+#SBATCH --cpus-per-task={cpus}
 #SBATCH --export=ALL
 #SBATCH --output={log_path}
 #SBATCH --error={log_path}
@@ -200,15 +214,22 @@ def _config_reload_script(study_config_path: Path) -> str:
     return code_str
 
 
+def cpu_partitions() -> list[str]:
+    """The CPU partitions for the cpu_model_types, the primary first, empty without a cpu_partition."""
+    if not config.cpu_partition:
+        return []
+    return [config.cpu_partition, *config.cpu_fallback_partitions]
+
+
 def query_partitions() -> str:
     """Comma-separated partition list for squeue queries tracking this study's jobs.
 
-    Covers the primary partition plus the spillover partitions when configured,
+    Covers the primary partition plus the GPU spillover and CPU partitions when configured,
     so in-flight checks see jobs regardless of where they were submitted.
     squeue -p accepts a comma-separated list.
     """
-    partitions = [config.partition, *config.spillover_partitions]
-    return ",".join(p for p in partitions if p)
+    partitions = [config.partition, *config.spillover_partitions, *cpu_partitions()]
+    return ",".join(dict.fromkeys(p for p in partitions if p))
 
 
 def count_running_jobs(job_name: str, partition: str | None = None) -> int:
@@ -339,7 +360,7 @@ def _gres_gpu_count(gres: str) -> int:
 
 
 def _schedulable_node_free_gpus(partition: str) -> dict[str, int] | None:
-    """Unallocated GPUs on each node of the partition that takes new jobs, None if sinfo fails."""
+    """Unallocated GPUs on each node of the partition that takes new jobs and is not excluded, None if sinfo fails."""
     stdout = _slurm_stdout(["sinfo", "-p", partition, "-N", "--noheader", "--Format=nodehost:64,gres:128,gresused:128,statecompact:16"])
     if stdout is None:
         return None
@@ -349,7 +370,8 @@ def _schedulable_node_free_gpus(partition: str) -> dict[str, int] | None:
         if len(fields) != 4:
             continue
         node, gres_total, gres_used, state = fields
-        if state.removesuffix("-") not in SCHEDULABLE_NODE_STATES:
+        # An excluded node's GPUs are not free to this study's jobs, which can never land there
+        if node in config.exclude_nodes or state.removesuffix("-") not in SCHEDULABLE_NODE_STATES:
             continue
         gpus_total = _gres_gpu_count(gres_total)
         gpus_used = _gres_gpu_count(gres_used)
@@ -475,6 +497,11 @@ def _partition_info(partition: str) -> dict[str, str] | None:
     return _scontrol_fields(stdout)
 
 
+def partition_exists(partition: str) -> bool:
+    """Whether scontrol knows the partition, False also when the query failed."""
+    return _partition_info(partition) is not None
+
+
 @_cache_resolved
 def _preemptable_partitions(partition: str) -> tuple[str, ...] | None:
     """Partitions whose running jobs a job in this partition preempts, None if scontrol fails.
@@ -505,39 +532,45 @@ def _preemptable_partitions(partition: str) -> tuple[str, ...] | None:
     )
 
 
-_partition_user_gpu_cap_cache: dict[str, int | None] = {}
+def _tres_amounts(tres: str) -> dict[str, int]:
+    """Amounts of a SLURM TRES string like cpu=4,mem=120G,node=1,gres/gpu=1, memory in MB.
 
-
-def partition_user_gpu_cap(partition: str) -> int | None:
-    """Per-user GPU cap on a partition (its QOS MaxTRESPU gres/gpu), None if uncapped.
-
-    E.g. mit_preemptable's QOS allows 4 running GPUs per user, mit_normal_gpu's
-    allows 2. Submitting more jobs than this just parks them pending on the QOS
-    limit, so the spillover logic treats it as that partition's submission cap.
-    Only resolved lookups are cached. On a transient scontrol/sacctmgr failure
-    this returns None UNcached: None means "uncapped", which routes
-    spillover_slots to the idle-minus-pending estimate (~0 on busy public
-    partitions), so a cached failure would silently disable spillover.
+    Typed entries like gres/gpu:a100=1 are skipped, they repeat the generic gres/gpu count.
     """
-    if partition in _partition_user_gpu_cap_cache:
-        return _partition_user_gpu_cap_cache[partition]
+    amounts: dict[str, int] = {}
+    for item in tres.strip().split(","):
+        key, _, value = item.partition("=")
+        if not value or ":" in key:
+            continue
+        if key == "mem":
+            amounts[key] = slurm_mem_MB(value)
+        elif value.isdigit():
+            amounts[key] = int(value)
+    return amounts
+
+
+@_cache_resolved
+def partition_user_tres_caps(partition: str) -> dict[str, int] | None:
+    """Per-user caps of the partition's QOS MaxTRESPU, memory in MB, empty when uncapped, None if a query failed.
+
+    E.g. mit_preemptable's QOS allows 4 running GPUs per user and mit_normal's 96 CPUs and 386G.
+    Submitting more than this just parks jobs pending on the QOS limit,
+    so the cap bounds the submissions to the partition.
+    A failed query is never cached, the next call retries it.
+    """
     info = _partition_info(partition)
     if not info:
         return None
     qos = info.get("QoS")
     if qos in (None, "N/A"):
-        _partition_user_gpu_cap_cache[partition] = None
-        return None
+        return {}
     stdout = _slurm_stdout(["sacctmgr", "-nP", "show", "qos", qos, "format=MaxTRESPU"], level="WARNING")
     if stdout is None:
         return None
     if not stdout.strip():
         logger.warning(f"sacctmgr show qos {qos} returned no output, not caching")
         return None
-    match = re.search(r"gres/gpu=(\d+)", stdout)
-    cap = int(match.group(1)) if match else None
-    _partition_user_gpu_cap_cache[partition] = cap
-    return cap
+    return _tres_amounts(stdout)
 
 
 # Clock fields of a SLURM time string by field count, without and with a day prefix (the sbatch --time grammar)
@@ -575,22 +608,30 @@ def partition_time_limit_s(partition: str) -> int | None:
     return parse_slurm_time_s(info.get("MaxTime"))
 
 
-def count_user_gpus(partition: str) -> int:
-    """This user's allocated + requested GPUs among running and pending jobs on a partition."""
+def count_user_tres(partition: str) -> dict[str, int] | None:
+    """This user's allocated + requested TRES summed over running and pending jobs on a partition, None if squeue fails."""
     stdout = _slurm_stdout(
         ["squeue", "-p", partition, "-u", getpass.getuser(), "--state=RUNNING,PENDING", "--noheader", "-O", "tres-alloc:200"]
     )
     if stdout is None:
-        return 999999  # Return a large number to prevent launching more jobs if squeue fails
-    # Generic gres/gpu=N only, the typed gres/gpu:<type>=N entry would double count
-    return sum(int(n) for n in re.findall(r"gres/gpu=(\d+)", stdout))
+        return None
+    totals: dict[str, int] = {}
+    for line in stdout.splitlines():
+        for key, amount in _tres_amounts(line).items():
+            totals[key] = totals.get(key, 0) + amount
+    return totals
+
+
+def user_job_budget() -> int:
+    """Jobs still submittable anywhere before hitting the user-wide MaxSubmit ceiling."""
+    return max(config.max_user_jobs - config.spillover_job_headroom - count_user_jobs(), 0)
 
 
 def spillover_budget() -> int:
-    """Jobs still submittable anywhere before hitting the user-wide MaxSubmit ceiling."""
+    """The user-wide job budget for GPU spillover, none without spillover partitions."""
     if not config.spillover_partitions:
         return 0
-    return max(config.max_user_jobs - config.spillover_job_headroom - count_user_jobs(), 0)
+    return user_job_budget()
 
 
 def spillover_slots(partition: str) -> int:
@@ -601,26 +642,93 @@ def spillover_slots(partition: str) -> int:
     cap, only submit what could start immediately, so an unbounded partition
     doesn't accumulate a deep pending queue either.
     """
-    cap = partition_user_gpu_cap(partition)
-    if cap is not None:
-        return max(cap - count_user_gpus(partition), 0)
-    return open_gpu_slots(partition, buffer_gpus=0)
+    caps = partition_user_tres_caps(partition) or {}
+    if "gres/gpu" not in caps:
+        return open_gpu_slots(partition, buffer_gpus=0)
+    used = count_user_tres(partition)
+    if used is None:
+        return 0
+    return max(caps["gres/gpu"] - used.get("gres/gpu", 0), 0)
 
 
-def pick_partition() -> str | None:
-    """Partition the next GPU job should go to, or None to hold off launching.
+def _schedulable_node_free_cpus_mem(partition: str) -> dict[str, tuple[int, int]] | None:
+    """Idle CPUs and unallocated memory in MB on each node of the partition that takes new jobs, None if sinfo fails.
 
-    The primary partition wins while it has open GPU slots (open_gpu_slots).
-    Otherwise the spillover partitions are tried in configured order, each
-    limited to its own slot count, all limited by the user-wide job ceiling.
+    Unallocated memory is the configured memory less what jobs hold.
+    The OS FreeMem is another number, off in both directions for scheduling.
     """
-    if resources_available():
-        return config.partition
-    if spillover_budget() <= 0:
+    stdout = _slurm_stdout(
+        ["sinfo", "-p", partition, "-N", "--noheader", "--Format=nodehost:64,cpusstate:32,memory:16,allocmem:16,statecompact:16"]
+    )
+    if stdout is None:
         return None
-    for spillover in config.spillover_partitions:
-        if spillover_slots(spillover) > 0:
-            return spillover
+    node_free: dict[str, tuple[int, int]] = {}
+    for line in stdout.splitlines():
+        fields = line.split()
+        if len(fields) != 5:
+            continue
+        node, cpus_state, memory_MB, alloc_mem_MB, state = fields
+        if state.removesuffix("-") not in SCHEDULABLE_NODE_STATES:
+            continue
+        # cpusstate is allocated/idle/other/total
+        idle_cpus = int(cpus_state.split("/")[1])
+        node_free[node] = (idle_cpus, int(memory_MB) - int(alloc_mem_MB))
+    return node_free
+
+
+def open_cpu_slots(partition: str) -> int:
+    """CPU training or agent jobs worth submitting to this partition now, 0 if a query fails.
+
+    Each node fits as many cpu_train_cpus x train_mem jobs as its idle CPUs and unallocated memory allow.
+    This user's pending jobs there claim slots already,
+    and the partition's per-user QOS cpu and mem caps bound the rest.
+    """
+    node_free = _schedulable_node_free_cpus_mem(partition)
+    caps = partition_user_tres_caps(partition)
+    if node_free is None or caps is None:
+        return 0
+    job_mem_MB = slurm_mem_MB(config.train_mem)
+    node_slots = [min(idle_cpus // config.cpu_train_cpus, free_mem_MB // job_mem_MB) for idle_cpus, free_mem_MB in node_free.values()]
+    slots = sum(node_slots) - count_pending_jobs(partition)
+    job_tres = {"cpu": config.cpu_train_cpus, "mem": job_mem_MB}
+    capped_tres = [key for key in job_tres if key in caps]
+    if capped_tres:
+        used = count_user_tres(partition)
+        if used is None:
+            return 0
+        for key in capped_tres:
+            slots = min(slots, (caps[key] - used.get(key, 0)) // job_tres[key])
+    return max(slots, 0)
+
+
+def open_slots(partition: str, cpu_capable: bool = False) -> int:
+    """Training or agent jobs worth submitting to this partition now.
+
+    The primary GPU partition holds buffer_gpus idle GPUs back from GPU-only cases,
+    and cpu_capable_buffer_gpus from cases that can also train on CPU.
+    Every partition but the primary is bounded by the user-wide job budget too.
+    """
+    if partition == config.partition:
+        buffer_gpus = config.cpu_capable_buffer_gpus if cpu_capable else config.buffer_gpus
+        return open_gpu_slots(partition, buffer_gpus)
+    if partition in cpu_partitions():
+        return min(open_cpu_slots(partition), user_job_budget())
+    return min(spillover_budget(), spillover_slots(partition))
+
+
+def pick_partition(cpu_capable: bool = False, skip_gpu: bool = False) -> str | None:
+    """Partition the next training or agent job should go to, or None to hold off launching.
+
+    The first candidate with open slots wins:
+    the primary GPU partition, then the GPU spillover partitions for a GPU-only case,
+    or the CPU partitions in order for a case that can also train on CPU.
+    skip_gpu drops the primary GPU partition, once this pass found it full.
+    """
+    fallbacks = cpu_partitions() if cpu_capable else list(config.spillover_partitions)
+    candidates = fallbacks if skip_gpu else [config.partition, *fallbacks]
+    for partition in candidates:
+        if open_slots(partition, cpu_capable) > 0:
+            return partition
     return None
 
 
@@ -725,6 +833,30 @@ def _sbatch_gpu_job(build_script: Callable[[str], str], job_name: str, partition
     return False
 
 
+def _submit_training_job(
+    job_name: str, partition: str, time_limit: str, log_path: Path | str, script_path: Path | str, job_setup: str, kind: str
+) -> bool:
+    """Submit a training or agent job, returns whether SLURM accepted it.
+
+    On a CPU partition it is a CPU job of cpu_train_cpus CPUs, anywhere else a one-GPU job.
+    job_setup holds the job's own shell lines, the device banner goes in front and the device environment after.
+    """
+    if partition in cpu_partitions():
+        setup = CPU_JOB_BANNER.format(job_name=job_name) + job_setup + CPU_JOB_ENV
+        script = sbatch_script(
+            job_name, partition, time_limit, log_path, script_path, setup, mem=config.train_mem, requeue=True, cpus=config.cpu_train_cpus
+        )
+        return submit_sbatch(script, job_name, kind)
+    setup = GPU_JOB_BANNER.format(job_name=job_name) + job_setup + GPU_JOB_ENV
+
+    def build_script(gres_fragment: str) -> str:
+        return sbatch_script(
+            job_name, partition, time_limit, log_path, script_path, setup, mem=config.train_mem, gres=gres_fragment, requeue=True
+        )
+
+    return _sbatch_gpu_job(build_script, job_name, partition, kind)
+
+
 def clamp_time_for_partition(partition: str, train_config: TrainConfig) -> tuple[str, TrainConfig]:
     """sbatch --time and in-job wall budget fitted to the partition's MaxTime.
 
@@ -821,12 +953,7 @@ Path({str(study_config_path)!r}).unlink()
     log_path = log_dir / f"{job_name}.log"
 
     # Save results to netcdf only, no need to sync wandb runs online from batch jobs
-    setup = GPU_JOB_BANNER.format(job_name=job_name) + "\nexport WANDB_MODE=offline\n\n" + GPU_JOB_ENV
-
-    def build_script(gres_fragment: str) -> str:
-        return sbatch_script(job_name, partition, time_limit, log_path, script_path, setup, gres=gres_fragment, requeue=True)
-
-    return _sbatch_gpu_job(build_script, job_name, partition, "training")
+    return _submit_training_job(job_name, partition, time_limit, log_path, script_path, "\nexport WANDB_MODE=offline\n\n", "training")
 
 
 def launch_agent_parallel(
@@ -888,12 +1015,7 @@ Path({str(study_config_path)!r}).unlink()
     with open(script_path, "w") as f:
         f.write(py_script)
 
-    setup = GPU_JOB_BANNER.format(job_name=job_name) + "\n" + GPU_JOB_ENV
-
-    def build_script(gres_fragment: str) -> str:
-        return sbatch_script(job_name, partition, time_limit, log_path, script_path, setup, gres=gres_fragment, requeue=True)
-
-    return _sbatch_gpu_job(build_script, job_name, partition, "agent")
+    return _submit_training_job(job_name, partition, time_limit, log_path, script_path, "\n", "agent")
 
 
 def launch_case_analysis_parallel(study, case) -> None:
@@ -946,7 +1068,6 @@ Path({study_config_path!r}).unlink()
     setup = f"""\
 echo "=== $(date) job $SLURM_JOB_ID ({job_name}) start on $SLURMD_NODENAME ==="
 export MPLBACKEND=Agg
-export JAX_PLATFORMS=cpu
-{SINGLE_THREAD_BLAS_ENV}"""
+{CPU_JOB_ENV}"""
     script = sbatch_script(job_name, partition, config.analysis_time_limit, log_path, script_path, setup, mem="32G")
     submit_sbatch(script, job_name, "analysis")

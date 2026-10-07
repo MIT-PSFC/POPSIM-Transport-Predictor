@@ -67,10 +67,15 @@ def test_case_axis_change_is_accepted_and_recorded(study, tmp_path):
 
 
 def test_lock_round_trips_every_locked_and_axis_field(study, tmp_path, monkeypatch):
-    """The lock reads back exactly what it recorded, without the env dataset paths a later run happens to have."""
+    """The lock reads back exactly what it recorded, without the env dataset paths a later run happens to have.
+
+    It carries no orchestration fields, so it must also read back with no partition set anywhere.
+    """
     cfg = make_config(study, tmp_path, dataset_fractions={"cmod-low": 0.25, "cmod-high": 0.75}, max_ds_size=100)
     build_study(study, cfg)
     monkeypatch.setenv("PTPS_DATASET_PATHS", '{"mast": "path/to/mast.nc"}')
+    monkeypatch.delenv("PTPS_PARTITION", raising=False)
+    monkeypatch.delenv("PTPS_CPU_PARTITION", raising=False)
 
     lock = read_config_lock(cfg.working_dir_base / cfg.study_name / CONFIG_LOCK_FILENAME, study.Config)
     assert lock.study_type == study.STUDY_TYPE

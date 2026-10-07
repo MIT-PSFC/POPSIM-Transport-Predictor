@@ -53,6 +53,7 @@ from transport_study.profile_transfer.tables import write_comparison_tables
 
 # Model families without freezable shape bases (the shape-init ones are MODEL_TYPES_WITH_SHAPES)
 MODEL_TYPES_WITHOUT_SHAPES = ("mlp", "reservoir", *TORAX_MODEL_TYPES)
+STUDY_MODEL_TYPES = (*MODEL_TYPES_WITH_SHAPES, *MODEL_TYPES_WITHOUT_SHAPES)
 
 # Input normalization applied to the 10 dimensionless nn_inputs. The physics
 # transform is built into the feature set itself, so unlike power balance
@@ -97,7 +98,8 @@ class ProfileStudy(Study):
         hyperparam_freeze_shapes: bool = True
 
         FIELD_CHOICES: ClassVar[dict[str, tuple]] = {
-            "model_types": (*MODEL_TYPES_WITH_SHAPES, *MODEL_TYPES_WITHOUT_SHAPES),
+            "model_types": STUDY_MODEL_TYPES,
+            "cpu_model_types": STUDY_MODEL_TYPES,
             "geometry_builders": VALID_GEOMETRY_BUILDERS,
             "data_normalization_methods": FEATURE_NORMALIZATIONS,
             "hyperparam_data_normalization": FEATURE_NORMALIZATIONS,
@@ -153,7 +155,7 @@ class ProfileStudy(Study):
         freeze_shapes: bool
         geometry_builder: str
 
-        VALID_MODEL_TYPES = (*MODEL_TYPES_WITH_SHAPES, *MODEL_TYPES_WITHOUT_SHAPES)
+        VALID_MODEL_TYPES = STUDY_MODEL_TYPES
         # Only frozen shapes show in the name, unfrozen is the default
         STR_TOKEN_FIELDS = (
             ("norm_", "data_normalization"),

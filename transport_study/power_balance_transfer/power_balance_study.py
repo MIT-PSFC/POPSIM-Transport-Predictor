@@ -37,6 +37,8 @@ POWER_BALANCE_INPUT_VARS = list(NORM_INPUT_VARS)
 
 # Purely data-driven model types, no submodules so nothing to freeze
 MODEL_TYPES_WITHOUT_SUBMODULES = ("mlp", "transformer")
+# Every model type a case of this study can have, the prereq submodules included
+STUDY_MODEL_TYPES = (*MODEL_TYPES_WITH_SUBMODULES, *MODEL_TYPES_WITHOUT_SUBMODULES, *SUBMODULE_MODEL_TYPES)
 # The measured powers, targets of the anchor terms in the training loss
 POWER_TARGET_VARS = ["power_ohm_MW", "power_radiated_MW"]
 
@@ -87,7 +89,8 @@ class PowerBalanceStudy(Study):
         hyperparam_multiobjective: bool = False
 
         FIELD_CHOICES: ClassVar[dict[str, tuple]] = {
-            "model_types": (*MODEL_TYPES_WITH_SUBMODULES, *MODEL_TYPES_WITHOUT_SUBMODULES, *SUBMODULE_MODEL_TYPES),
+            "model_types": STUDY_MODEL_TYPES,
+            "cpu_model_types": STUDY_MODEL_TYPES,
             "data_normalization_methods": INPUT_NORMALIZATIONS,
             "hyperparam_data_normalization": INPUT_NORMALIZATIONS,
         }
@@ -142,7 +145,7 @@ class PowerBalanceStudy(Study):
         freeze_submodules: bool
         multiobjective: bool
 
-        VALID_MODEL_TYPES = (*MODEL_TYPES_WITH_SUBMODULES, *MODEL_TYPES_WITHOUT_SUBMODULES, *SUBMODULE_MODEL_TYPES)
+        VALID_MODEL_TYPES = STUDY_MODEL_TYPES
         # Unfrozen submodules and single-objective training are the defaults, so only the others show in the name
         STR_TOKEN_FIELDS = (
             ("norm_", "data_normalization"),
