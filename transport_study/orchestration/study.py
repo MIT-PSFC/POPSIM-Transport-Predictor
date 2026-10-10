@@ -1798,12 +1798,17 @@ class Study:
         Dataset paths come from the global config's dataset_paths
         (TOML [datasets] table, with the PTPS_DATASET_PATHS JSON env var as defaults).
         """
+        # load_config(Path) only knows how to build the base StudyConfig,
+        # which forbids this study's extra fields, so parse with the subclass
+        if isinstance(cfg, (str, Path)):
+            cfg = self.Config.from_toml(Path(cfg))
         if not config.initialized:
-            # load_config(Path) only knows how to build the base StudyConfig,
-            # which forbids this study's extra fields, so parse with the subclass
-            if isinstance(cfg, (str, Path)):
-                cfg = self.Config.from_toml(Path(cfg))
             load_config(cfg)
+        elif cfg != config.get_instance():
+            raise RuntimeError(
+                f"Study {cfg.study_name} got a different config than the one this process already loaded (study {config.study_name}), "
+                "the global config is loaded once per process"
+            )
 
         self.name = config.study_name
         # Launch counter per case (str(case) -> count) backing MAX_TRAIN_ATTEMPTS
