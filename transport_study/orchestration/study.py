@@ -626,9 +626,14 @@ class Study:
 
         It runs before Study.__init__ checks the config lock,
         so a study whose lock refuses the current config can still be reset.
-        Cleaning models or results also deletes the lock, since the results it vouched for are gone,
+        Results are scored from the models, so cleaning models cleans results too.
+        It also deletes the lock, since the models it corresponded to are gone,
         and the next init writes a fresh one with a new stamp.
+        Cleaning results alone keeps the models and the lock, so the next run recomputes every result from the kept checkpoints.
         """
+        if clean_models and not clean_results:
+            logger.info("Cleaning models cleans results too, results are scored from the models")
+            clean_results = True
         logger.info(f"Clean models: {clean_models}")
         logger.info(f"Clean results: {clean_results}")
         logger.info(f"Clean figures: {clean_figures}")
@@ -643,7 +648,7 @@ class Study:
             shutil.rmtree(working_dir / "results", ignore_errors=True)
         if clean_figures:
             shutil.rmtree(working_dir / "figures", ignore_errors=True)
-        if clean_models or clean_results:
+        if clean_models:
             (working_dir / CONFIG_LOCK_FILENAME).unlink(missing_ok=True)
 
     def setup_directories(
@@ -1705,10 +1710,10 @@ class Study:
             If True, delete any existing wandb sweeps for this project before running.
         clean_models : bool | None
             If True, delete any existing trained models in the working directory before running.
-            Also deletes the config lock, so the study starts over under the current config.
+            Also deletes the results and the config lock, so the study starts over under the current config.
         clean_results : bool | None
-            If True, delete any existing intermediate results in the working directory before running.
-            Also deletes the config lock, so the study starts over under the current config.
+            If True, delete any existing results in the working directory before running.
+            Keeps the models and the config lock, so every result is recomputed from the kept checkpoints.
         clean_figures : bool | None
             If True, delete any existing figures in the figure directory before running.
         """

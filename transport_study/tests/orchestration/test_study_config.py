@@ -96,6 +96,31 @@ def test_lock_is_never_created_over_existing_artifacts(study, tmp_path):
     build_study(study, cfg)
 
 
+def test_cleaning_results_keeps_models_and_lock(study, tmp_path):
+    """Results are recomputed from kept checkpoints, which the unchanged lock still corresponeds to.
+
+    Cleaning models cleans results too and starts a fresh lock,
+    since results scored from deleted models must not survive them.
+    """
+    cfg = make_config(study, tmp_path)
+    built = build_study(study, cfg)
+    built.setup_directories()
+    (built.model_dir / "some_case").mkdir()
+    (built.result_dir / "some_case").mkdir()
+    stamp = built.lock.stamp
+
+    study.clean_working_dir(cfg, clean_results=True)
+    assert (built.model_dir / "some_case").exists()
+    assert not built.result_dir.exists()
+    assert build_study(study, cfg).lock.stamp == stamp
+
+    (built.result_dir / "some_case").mkdir(parents=True)
+    study.clean_working_dir(cfg, clean_models=True)
+    assert not built.model_dir.exists()
+    assert not built.result_dir.exists()
+    assert build_study(study, cfg).lock.stamp != stamp
+
+
 def test_config_toml_round_trip(study, tmp_path, monkeypatch):
     # from_toml fills devices missing from [datasets] in from PTPS_DATASET_PATHS, which this round trip must not see
     monkeypatch.delenv("PTPS_DATASET_PATHS", raising=False)
