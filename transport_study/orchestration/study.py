@@ -18,12 +18,12 @@ import wandb
 import xarray as xr
 import yaml
 from loguru import logger
-from popsim.ml import DataLoader, TrainConfig, Trainer, TrainRunBuilder
+from popsim.ml import DataLoader, TrainConfig, Trainer
 from popsim.ml.launch import (
-    get_train_run_builder_class,
+    build_train_run,
+    get_data_train_run_builder_class,
     launch_agent,
     launch_train,
-    resolve_transition_frac,
 )
 from popsim.ml.train_config import load_dict
 from pydantic import Field, field_serializer, field_validator, model_validator
@@ -308,15 +308,6 @@ class CaseGridConfig(StudyConfig):
     @field_serializer("domain_adaptation_methods")
     def _serialize_domain_adaptation_methods(self, v):
         return ["none" if da is None else da for da in v]
-
-
-def data_train_run_builder(train_config: TrainConfig) -> type[TrainRunBuilder]:
-    """The TRB that builds a train config's dataloaders, as popsim launch resolves it.
-
-    Submodule cases load their data through dataloader_config["data_train_run_builder"], every other case through its own TRB.
-    """
-    builder = train_config.dataloader_config.get("data_train_run_builder") or train_config.train_run_builder
-    return get_train_run_builder_class(builder)
 
 
 @dataclass
@@ -855,7 +846,7 @@ class Study:
             **target_split.dataloader_config(),
             "steps_per_epoch": None,
         }
-        data_trb = data_train_run_builder(train_config)
+        data_trb = get_data_train_run_builder_class(train_config.train_run_builder, train_config.dataloader_config)
         config_json = json.dumps([str(data_trb), dataloader_config_largest], sort_keys=True, default=str)
         config_hash = hashlib.sha256(config_json.encode()).hexdigest()
         if config_hash not in self._steps_per_epoch_cache:
@@ -1613,22 +1604,7 @@ class Study:
         if not self.result_path(case).exists():
             logger.warning(f"Result file for case\n{case}\nnot found at\n{self.result_path(case)}\nTraining may be incomplete!")
         training_config = self.make_train_config(case)
-        train_run_builder = get_train_run_builder_class(training_config.train_run_builder)
-        data_trb = data_train_run_builder(training_config)
-        _, train_dl, _val_dl, test_dl = data_trb.get_dataloaders(training_config.dataloader_config)
-        model = train_run_builder.model_init(train_dl, training_config.model_init_config)
-        loss_fn = train_run_builder.get_loss_fn(training_config.loss_config)
-        # Tuned configs sweep transition_frac, which launch_train resolves to
-        # transition_steps before get_optimizer, so mirror that here
-        optimizer_config = resolve_transition_frac(training_config.optimizer_config, len(train_dl), training_config.max_epochs)
-        opt = train_run_builder.get_optimizer(optimizer_config)
-        trainer = Trainer(
-            model=model,
-            loss_fn=loss_fn,
-            optimizer=opt,
-            checkpoint_dir=training_config.checkpoint_dir,
-            trainable_getter=train_run_builder.get_trainable_getter(training_config.model_init_config),
-        )
+        trainer, _, _, test_dl = build_train_run(training_config)
         if restore_best_checkpoint:
             trainer.restore_best_checkpoint(path=self.trained_model_dir(case))
 
