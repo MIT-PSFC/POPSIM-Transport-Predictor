@@ -98,6 +98,10 @@ from transport_study.orchestration.wandb_utils import (
 # hyperparameter tuning is done, so 0 is the canonical value
 HYPERPARAM_TARGET_SHOTS = 0
 
+# The domain adaptation methods of the case grid, None trains and tests on the same devices (a TOML spells it "none").
+# A case can also be a transfer_pretrain twin, which no grid lists (see Study.Case.transfer_pretrain_case)
+DOMAIN_ADAPTATION_METHODS = (None, "weighted", "addition", "transfer")
+
 # Abort the run once a single case has been launched this many times without a result file, guards against deterministically failing jobs being resubmitted forever
 MAX_TRAIN_ATTEMPTS = 3
 
@@ -202,9 +206,7 @@ class CaseGridConfig(StudyConfig):
     )
     # Case-grid axes shared by every study of this shape
     training_datasets: Annotated[tuple[TrainingData, ...], CaseAxis("training_data")]
-    domain_adaptation_methods: Annotated[tuple[str | None, ...], CaseAxis("domain_adaptation")] = Field(
-        default_factory=lambda: (None, "weighted", "addition", "transfer")
-    )
+    domain_adaptation_methods: Annotated[tuple[str | None, ...], CaseAxis("domain_adaptation")] = DOMAIN_ADAPTATION_METHODS
     # The orders a case adds its target training shots in, see orchestration/target_shots.py
     target_shot_orders: Annotated[tuple[str, ...], CaseAxis("target_shot_order")] = (BASE_TARGET_SHOT_ORDER,)
     # The held-out target test set, never trained on, defined by exactly one of the two:
@@ -261,15 +263,16 @@ class CaseGridConfig(StudyConfig):
             raise ValueError(f"Invalid target shot orders: {invalid}. Must be among {TARGET_SHOT_ORDERS}.")
         return v
 
-    @field_validator("domain_adaptation_methods")
+    @field_validator("domain_adaptation_methods", "hyperparam_domain_adaptation")
     @classmethod
-    def _validate_domain_adaptation(cls, v: tuple[str | None, ...]) -> tuple[str | None, ...]:
-        valid = {None, "weighted", "addition", "transfer"}
-        converted = tuple(None if da == "none" else da for da in v)
-        for da in converted:
-            if da not in valid:
-                raise ValueError(f"Invalid domain adaptation: {da}. Must be one of {valid}.")
-        return converted
+    def _validate_domain_adaptation(cls, v: tuple[str | None, ...] | str | None) -> tuple[str | None, ...] | str | None:
+        """The TOML spelling "none" becomes None, anything outside DOMAIN_ADAPTATION_METHODS raises."""
+        methods = v if isinstance(v, tuple) else (v,)
+        converted = tuple(None if da == "none" else da for da in methods)
+        invalid = [da for da in converted if da not in DOMAIN_ADAPTATION_METHODS]
+        if invalid:
+            raise ValueError(f"Invalid domain adaptation: {invalid}. Must be among {DOMAIN_ADAPTATION_METHODS}.")
+        return converted if isinstance(v, tuple) else converted[0]
 
     @model_validator(mode="before")
     @classmethod
@@ -397,6 +400,8 @@ class Study:
                 raise ValueError(f"num_target_shots must be >= 0, got {self.num_target_shots}")
             if self.target_shot_order not in TARGET_SHOT_ORDERS:
                 raise ValueError(f"Unknown target shot order: {self.target_shot_order}")
+            if self.domain_adaptation not in (*DOMAIN_ADAPTATION_METHODS, "transfer_pretrain"):
+                raise ValueError(f"Unknown domain adaptation: {self.domain_adaptation!r}")
             if self.num_target_shots == 0 and self.target_shot_order != BASE_TARGET_SHOT_ORDER:
                 raise ValueError(f"target_shot_order {self.target_shot_order} needs target shots in training, this case has none")
             if self.domain_adaptation is None:
