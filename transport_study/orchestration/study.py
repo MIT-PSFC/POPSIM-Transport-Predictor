@@ -186,21 +186,6 @@ def write_netcdf_atomic(ds: xr.Dataset, path: Path | str) -> None:
     tmp_path.replace(path)
 
 
-def configure_jax_platforms(enable_parallelism: bool) -> None:
-    """Pick the jax backend for the orchestrator process before jax initializes it.
-
-    An explicit JAX_PLATFORMS in the environment always wins.
-    With parallelism the orchestrator does no GPU compute, so pin cpu
-    (submitted jobs re-export their own value in their sbatch scripts, see slurm_utils)
-    Without parallelism training runs in this process, so leave jax to its
-    default backend selection: gpu when one exists, cpu fallback otherwise.
-    """
-    if "JAX_PLATFORMS" in os.environ:
-        return
-    if enable_parallelism:
-        os.environ["JAX_PLATFORMS"] = "cpu"
-
-
 class CaseGridConfig(StudyConfig):
     """Config base for studies built on a case grid (model_type x training_data x ...).
 
@@ -1714,9 +1699,6 @@ class Study:
         clean_figures : bool | None
             If True, delete any existing figures in the figure directory before running.
         """
-        # Must run before anything touches jax so the backend is still unset
-        configure_jax_platforms(bool(enable_parallelism))
-
         # Parse with the concrete Config subclass so the local `config` name holds a
         # real config object (it shadows the module-level proxy)
         if isinstance(config, (str, Path)):
