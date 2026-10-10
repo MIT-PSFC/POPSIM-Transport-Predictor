@@ -4,7 +4,7 @@ Both exist so a case can never be stranded by a job that will not finish:
 
 - The stall watchdog (Study.kill_stuck_jobs) kills a RUNNING training job that
   deadlocks (e.g. an OpenBLAS or XLA compile-pool hang) and so sits in the
-  queue forever without checkpointing.
+  queue forever without checkpointing or writing its train log.
 - The pending watchdog (Study._kill_long_pending_jobs) cancels a job stuck
   PENDING on a spillover partition, handing the case back to the launch path
   so pick_partition can re-decide placement. The primary partition is exempt.
@@ -65,6 +65,15 @@ def write_checkpoint(study: Study, case, epoch: int, age_s: float):
     os.utime(epoch_dir, (mtime, mtime))
 
 
+def write_train_log(study: Study, case, age_s: float):
+    """Create the case's train log, last written age_s seconds ago."""
+    train_log_path = study.train_log_path(case)
+    train_log_path.parent.mkdir(parents=True, exist_ok=True)
+    train_log_path.touch()
+    mtime = time.time() - age_s
+    os.utime(train_log_path, (mtime, mtime))
+
+
 # ----------------------------------------------------------------------
 # Stall watchdog (Study.kill_stuck_jobs)
 # ----------------------------------------------------------------------
@@ -104,6 +113,21 @@ def test_old_job_with_no_checkpoint_killed(study, case, killed, monkeypatch):
     study.kill_stuck_jobs([case])
 
     assert killed == [study.train_job_name(case)]
+
+
+@pytest.mark.parametrize(("log_age_s", "is_killed"), [(WATCHDOG_STALL_S - 1, False), (WATCHDOG_STALL_S + 1, True)])
+def test_train_log_progress_spares_a_job_between_checkpoints(study, case, killed, monkeypatch, log_age_s, is_killed):
+    """A job writes its train log every epoch but checkpoints once per validation interval,
+    which can outlast the stall window on a slow model.
+    Only a job whose log is stale too is deadlocked.
+    """
+    write_checkpoint(study, case, epoch=40, age_s=WATCHDOG_STALL_S + 1)
+    write_train_log(study, case, age_s=log_age_s)
+    set_job_elapsed(monkeypatch, study, case, WATCHDOG_MIN_AGE_S + 1)
+
+    study.kill_stuck_jobs([case])
+
+    assert killed == ([study.train_job_name(case)] if is_killed else [])
 
 
 def test_job_absent_from_elapsed_map_not_killed(study, case, killed, monkeypatch):

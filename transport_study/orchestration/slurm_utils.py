@@ -892,7 +892,7 @@ def launch_train_parallel(
     train_config: TrainConfig,
     job_name: str,
     result_path: Path | str,
-    log_dir: Path | str,
+    log_path: Path | str,
     partition: str | None = None,
 ) -> bool:
     """Submit a SLURM job that runs training serially and saves results to result_path, returns whether SLURM accepted it.
@@ -901,7 +901,7 @@ def launch_train_parallel(
         train_config: The training configuration.
         job_name: The SLURM job name.
         result_path: Path where the result xarray Dataset will be saved as NetCDF.
-        log_dir: Directory for SLURM stdout/stderr logs.
+        log_path: The job's SLURM stdout/stderr log, its directory also holds the job's script and configs.
         partition: The SLURM partition to submit to.
     """
     if partition is None:
@@ -909,7 +909,8 @@ def launch_train_parallel(
     time_limit, train_config = clamp_time_for_partition(partition, train_config)
     # All temp files must live on the shared filesystem (not /tmp which is
     # node-local), so that compute nodes can read them.
-    log_dir = Path(log_dir)
+    log_path = Path(log_path)
+    log_dir = log_path.parent
     log_dir.mkdir(parents=True, exist_ok=True)
 
     # Serialize the train config so the job can reconstruct it
@@ -958,7 +959,6 @@ Path({str(study_config_path)!r}).unlink()
     with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False, prefix=f"{job_name}_script_", dir=log_dir) as f:
         f.write(py_script)
         script_path = f.name
-    log_path = log_dir / f"{job_name}.log"
 
     # Save results to netcdf only, no need to sync wandb runs online from batch jobs
     return _submit_training_job(job_name, partition, time_limit, log_path, script_path, "\nexport WANDB_MODE=offline\n\n", "training")

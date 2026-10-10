@@ -130,7 +130,8 @@ TRANSFER_LR_FLOOR = 0.1
 # A training job is considered stuck once it has run at least this long with no progress (e.g. OpenBLAS or XLA compile-pool deadlocks)
 WATCHDOG_MIN_AGE_S = 80 * 60
 
-# Checkpoints are only written at the validation cadence, so stall detection is a coarse "no epochs completed recently" signal
+# A running job writes its train log every epoch (popsim's Epochs bar) and checkpoints at the validation cadence.
+# A job that wrote neither for this long counts as stalled.
 WATCHDOG_STALL_S = 60 * 60
 
 # wandb heartbeats every ~30s during a live run, so 10 min of silence on a "running" run is already well past any legitimate gap
@@ -557,6 +558,10 @@ class Study:
             return None
         newest = max(epoch_dirs, key=lambda p: int(p.name))
         return int(newest.name), newest.stat().st_mtime
+
+    def train_log_path(self, case: Case) -> Path:
+        """The SLURM log of the case's training jobs, every launch attempt appends to it."""
+        return self.log_dir / "logs_train" / f"{self.train_job_name(case)}.log"
 
     def latest_checkpoint_epoch(self, case: Case) -> int | None:
         """Epoch of the newest resume checkpoint, or None if empty."""
@@ -1071,11 +1076,11 @@ class Study:
         return self.train_job_name(case) in running_job_names
 
     def kill_stuck_jobs(self, cases: list[Case]):
-        """Kill training jobs that are running but making no checkpoint progress.
+        """Kill training jobs that are running but making no progress.
 
         A job counts as deadlocked once it has run at least WATCHDOG_MIN_AGE_S
-        with no checkpoint written in the last WATCHDOG_STALL_S (including one
-        that never wrote a first checkpoint at all).
+        with neither a checkpoint nor a train log write in the last WATCHDOG_STALL_S.
+        The log advances every epoch, so a slow model whose validation interval outlasts the stall window survives.
         Both thresholds are CPU_WATCHDOG_SCALE times longer for a job on a CPU partition.
         Killing it frees the case to be relaunched as a fresh process by the normal orchestration loop.
         launch_train's attempt counter only resets on checkpoint progress,
@@ -1101,12 +1106,18 @@ class Study:
             stall_s = WATCHDOG_STALL_S * watchdog_scale
             if job_elapsed is None or job_elapsed < min_age_s:
                 continue
-            info = self._latest_checkpoint_dir_info(case)
-            last_progress = info[1] if info else None
-            if last_progress is not None and now - last_progress < stall_s:
+            progress_mtimes = []
+            checkpoint_info = self._latest_checkpoint_dir_info(case)
+            if checkpoint_info is not None:
+                progress_mtimes.append(checkpoint_info[1])
+            train_log_path = self.train_log_path(case)
+            if train_log_path.exists():
+                progress_mtimes.append(train_log_path.stat().st_mtime)
+            last_progress = max(progress_mtimes, default=-math.inf)
+            if now - last_progress < stall_s:
                 continue
             logger.warning(
-                f"Job {job_name} has run {job_elapsed}s with no checkpoint progress in "
+                f"Job {job_name} has run {job_elapsed}s with no checkpoint or train log progress in "
                 f"the last {stall_s}s, likely deadlocked. Killing so it can be resubmitted.\n"
                 f"Case:\t{case}"
             )
@@ -1523,7 +1534,7 @@ class Study:
             attempts = 0
         self.train_attempt_epochs[str(case)] = latest_epoch
         if attempts >= MAX_TRAIN_ATTEMPTS:
-            train_log_path = Path(self.log_dir) / "logs_train" / f"{self.train_job_name(case)}.log"
+            train_log_path = self.train_log_path(case)
             summary = (
                 f"ABORTING STUDY: case failed training {attempts} times without producing a result.\n"
                 f"Case:      {case}\n"
@@ -1558,7 +1569,7 @@ class Study:
                 train_config,
                 train_job_name,
                 result_path,
-                Path(self.log_dir) / "logs_train",
+                self.train_log_path(case),
                 partition=partition,
             )
             # Nothing ran, so a rejected submission does not count toward MAX_TRAIN_ATTEMPTS
