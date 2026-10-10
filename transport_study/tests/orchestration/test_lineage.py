@@ -7,7 +7,6 @@ Each test builds the studies in order, as separate runs would, resetting the one
 
 import pytest
 import xarray as xr
-from loguru import logger
 
 from transport_study.config import reset_config
 from transport_study.orchestration import study as study_module
@@ -36,11 +35,9 @@ def make_config(tmp_path, study_name, parent_study=None, **overrides):
 
 
 def build(cfg) -> PowerBalanceStudy:
-    """The study as a fresh run builds it, detached from its log file so a study left behind writes nothing more."""
+    """The study as a fresh run builds it."""
     reset_config()
-    study = PowerBalanceStudy(cfg)
-    logger.remove(study.log_sink_id)
-    return study
+    return PowerBalanceStudy(cfg)
 
 
 def finish(study, case) -> None:

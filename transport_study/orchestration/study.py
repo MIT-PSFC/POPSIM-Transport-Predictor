@@ -1703,6 +1703,11 @@ class Study:
         # real config object (it shadows the module-level proxy)
         if isinstance(config, (str, Path)):
             config = cls.Config.from_toml(Path(config))
+        # One log file per orchestrator run, the processes that only build a Study (analysis jobs) log to SLURM alone
+        run_log_dir = Path(config.working_dir_base) / config.study_name / "logs"
+        run_log_dir.mkdir(parents=True, exist_ok=True)
+        run_log_path = run_log_dir / f"{os.getpid()}_run_study.log"
+        logger.add(run_log_path)
         # The partition checks read the global config, and run before anything is cleaned or written
         load_config(config)
         if enable_parallelism:
@@ -1820,10 +1825,6 @@ class Study:
         )
         # str(case) -> the study it lives in, cleared whenever the ancestor chain is reloaded
         self._case_homes: dict[str, StudyArchive] = {}
-
-        self.log_dir.mkdir(parents=True, exist_ok=True)
-        log_path = self.log_dir / f"{os.getpid()}_run_study.log"
-        self.log_sink_id = logger.add(log_path)
 
         logger.info("INITIALIZING STUDY")
         logger.info(f"Study name: {self.name}")
