@@ -1703,6 +1703,15 @@ class Study:
         # real config object (it shadows the module-level proxy)
         if isinstance(config, (str, Path)):
             config = cls.Config.from_toml(Path(config))
+        # The partition checks read the global config, and run before anything is cleaned or written
+        load_config(config)
+        if enable_parallelism:
+            if not config.partition:
+                raise ValueError("enable_parallelism is True but no SLURM partition is specified in the config")
+            missing_cpu_partitions = [p for p in cpu_partitions() if not partition_exists(p)]
+            if missing_cpu_partitions:
+                raise ValueError(f"CPU partitions {missing_cpu_partitions} are unknown to scontrol")
+
         cls.clean_working_dir(
             config,
             enable_parallelism=bool(enable_parallelism),
@@ -1718,12 +1727,6 @@ class Study:
             skip_visualization=bool(skip_visualization),
             clean_sweeps=bool(clean_sweeps),
         )
-
-        if enable_parallelism and not config.partition:
-            raise ValueError("enable_parallelism is True but no SLURM partition is specified in the config")
-        missing_cpu_partitions = [p for p in cpu_partitions() if not partition_exists(p)]
-        if enable_parallelism and missing_cpu_partitions:
-            raise ValueError(f"CPU partitions {missing_cpu_partitions} are unknown to scontrol")
 
         if not skip_visualization:
             logger.opt(colors=True).info("<bold><magenta>DATA VISUALIZATION</magenta></bold>")
