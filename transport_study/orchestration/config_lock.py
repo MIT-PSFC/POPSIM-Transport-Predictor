@@ -40,14 +40,17 @@ def new_stamp() -> str:
     return uuid.uuid4().hex
 
 
-def config_from_lock_data(config_cls: type[StudyConfig], data: dict) -> StudyConfig:
-    """A config from the tables of a config lock.
+def config_from_lock_data(current_config: StudyConfig, data: dict) -> StudyConfig:
+    """A config of current_config's class from the tables of a config lock.
 
     Unlike from_toml it reads the [datasets] paths alone, without PTPS_DATASET_PATHS,
     so a comparison sees exactly the devices the lock recorded.
+    The lock records no orchestration fields, so they come from current_config,
+    and the lock's config validates exactly when current_config does, whatever the environment holds.
     Fields the class no longer has are dropped with a warning,
     so removing a config field never makes every existing lock unreadable.
     """
+    config_cls = type(current_config)
     data = dict(data)
     datasets = dict(data.pop("datasets", {}))
     target_device = datasets.pop("target", None)
@@ -61,11 +64,16 @@ def config_from_lock_data(config_cls: type[StudyConfig], data: dict) -> StudyCon
     if unknown:
         logger.warning(f"Ignoring config lock fields {config_cls.__qualname__} no longer has: {unknown}")
     kwargs = {name: value for name, value in entries.items() if name in config_cls.model_fields}
+    orchestration = {name: getattr(current_config, name) for name in config_cls.fields_with_role(FieldRole.ORCHESTRATION)}
     dataset_paths = {device: Path(path) for device, path in datasets.items()}
-    return config_cls(**kwargs, dataset_paths=dataset_paths, target_device=target_device)
+    return config_cls(**kwargs, **orchestration, dataset_paths=dataset_paths, target_device=target_device)
 
 
-def read_config_lock(path: Path, config_cls: type[StudyConfig]) -> ConfigLock:
+def read_config_lock(path: Path, current_config: StudyConfig, study_type: str) -> ConfigLock:
+    """The config lock at path, its config built by config_from_lock_data.
+
+    A lock of another study type raises before its config is built, its fields would not validate.
+    """
     with open(path, "rb") as f:
         data = tomllib.load(f)
     lock_table = data.pop(LOCK_TABLE, None)
@@ -73,7 +81,12 @@ def read_config_lock(path: Path, config_cls: type[StudyConfig]) -> ConfigLock:
         raise RuntimeError(
             f"Config lock {path} has no [{LOCK_TABLE}] table. Clean the study (clean_models and clean_results) to recreate it."
         )
-    lock_config = config_from_lock_data(config_cls, data)
+    if lock_table["study_type"] != study_type:
+        raise RuntimeError(
+            f"{path} is the config lock of a {lock_table['study_type']} study, not of a {study_type} study.\n"
+            "A study only works in, and borrows from, studies of its own type."
+        )
+    lock_config = config_from_lock_data(current_config, data)
     return ConfigLock(
         config=lock_config,
         study_type=lock_table["study_type"],

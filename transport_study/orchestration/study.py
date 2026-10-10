@@ -1882,9 +1882,7 @@ class Study:
             (self.working_dir / STEPS_PER_EPOCH_FILENAME).unlink(missing_ok=True)
             return lock
 
-        lock = read_config_lock(lock_path, self.Config)
-        if lock.study_type != self.STUDY_TYPE:
-            raise RuntimeError(f"Working dir {self.working_dir} holds a {lock.study_type} study, not a {self.STUDY_TYPE} study.")
+        lock = read_config_lock(lock_path, config.get_instance(), self.STUDY_TYPE)
         changed = config.differing_fields(lock.config, FieldRole.IDENTITY, FieldRole.LOCKED)
         if changed:
             details = "\n".join(f"  {name}: locked {getattr(lock.config, name)!r}, now {getattr(config, name)!r}" for name in changed)
@@ -1940,11 +1938,7 @@ class Study:
         lock_path = working_dir / CONFIG_LOCK_FILENAME
         if not lock_path.exists():
             raise RuntimeError(f"Parent study {name} has no config lock at {lock_path}, run it before its descendants.")
-        lock = read_config_lock(lock_path, self.Config)
-        if lock.study_type != self.STUDY_TYPE:
-            raise RuntimeError(
-                f"Parent study {name} is a {lock.study_type} study, a {self.STUDY_TYPE} study can only borrow from its own type."
-            )
+        lock = read_config_lock(lock_path, config.get_instance(), self.STUDY_TYPE)
         changed = config.differing_fields(lock.config, FieldRole.LOCKED)
         if changed:
             details = "\n".join(
@@ -1954,7 +1948,7 @@ class Study:
                 f"Study {self.name} can only borrow from {name} when every locked config field matches, these differ:\n{details}"
             )
 
-        # read_config_lock built it with self.Config, a CaseGridConfig
+        # read_config_lock built it with the running config's class, a CaseGridConfig
         ancestor_config = lock.config
         assert isinstance(ancestor_config, CaseGridConfig)
         parent = None

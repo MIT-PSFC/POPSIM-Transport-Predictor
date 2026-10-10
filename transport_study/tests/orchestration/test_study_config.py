@@ -62,7 +62,7 @@ def test_case_axis_change_is_accepted_and_recorded(study, tmp_path):
     grown = make_config(study, tmp_path, num_target_shots_options=(0, 1, 3))
     build_study(study, grown).record_case_grid()
 
-    lock = read_config_lock(grown.working_dir_base / grown.study_name / CONFIG_LOCK_FILENAME, study.Config)
+    lock = read_config_lock(grown.working_dir_base / grown.study_name / CONFIG_LOCK_FILENAME, grown, study.STUDY_TYPE)
     assert lock.config.num_target_shots_options == (0, 1, 3)
 
 
@@ -77,7 +77,7 @@ def test_lock_round_trips_every_locked_and_axis_field(study, tmp_path, monkeypat
     monkeypatch.delenv("PTPS_PARTITION", raising=False)
     monkeypatch.delenv("PTPS_CPU_PARTITION", raising=False)
 
-    lock = read_config_lock(cfg.working_dir_base / cfg.study_name / CONFIG_LOCK_FILENAME, study.Config)
+    lock = read_config_lock(cfg.working_dir_base / cfg.study_name / CONFIG_LOCK_FILENAME, cfg, study.STUDY_TYPE)
     assert lock.study_type == study.STUDY_TYPE
     assert cfg.differing_fields(lock.config, *LOCK_ROLES) == []
 
