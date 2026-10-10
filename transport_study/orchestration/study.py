@@ -1084,7 +1084,14 @@ class Study:
         elapsed = get_running_job_elapsed_s()
         if not elapsed:
             return
-        cpu_job_names = set(get_running_job_elapsed_s(partition=",".join(cpu_partitions())) or {}) if cpu_partitions() else set()
+        cpu_job_names: set[str] = set()
+        if cpu_partitions():
+            # A failed query holds the pass, it must not judge a CPU job at the GPU thresholds
+            cpu_partition_list = ",".join(cpu_partitions())
+            cpu_elapsed = get_running_job_elapsed_s(partition=cpu_partition_list)
+            if cpu_elapsed is None:
+                return
+            cpu_job_names = set(cpu_elapsed)
         now = time.time()
         for case in cases:
             job_name = self.train_job_name(case)
@@ -1350,6 +1357,9 @@ class Study:
             # Picking the best config while agents still run would ignore
             # their trials (and the last trials are often the best ones)
             running_jobs = count_running_jobs(self.agent_job_name(case))
+            if running_jobs is None:
+                logger.info("Could not query the agent jobs, holding the sweep finalization until the next pass")
+                return False
             if running_jobs > 0:
                 logger.info(f"Found {running_jobs} running agent jobs, waiting for them to complete before proceeding")
                 return False
@@ -1384,6 +1394,9 @@ class Study:
             (self.train_job_name(case), "training"),
         ]:
             running = count_running_jobs(job_name)
+            if running is None:
+                logger.info(f"Could not query the {label} jobs, holding the launch until the next pass")
+                return False
             if running > 0:
                 logger.info(f"Found {running} running {label} jobs, waiting for them to complete before proceeding")
                 return False
@@ -1452,6 +1465,9 @@ class Study:
                 partition = config.partition
             agent_job_name = self.agent_job_name(case)
             running_agents = count_running_jobs(agent_job_name)
+            if running_agents is None:
+                logger.info(f"Could not query the agent jobs, holding the agent launches for case {case} until the next pass")
+                return
             # Each agent runs exactly one trial (count=1), so outstanding trials
             # bound how many more agents are worth submitting. Take the larger of
             # the count target and the finished-quota target so a sweep whose

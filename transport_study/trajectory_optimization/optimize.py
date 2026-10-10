@@ -901,7 +901,7 @@ def run_trajectory_optimization(
                 continue
             if enable_parallelism:
                 running = count_running_jobs(trajopt.train_job_name(case), config.partition)
-                if running > 0:
+                if running is None or running > 0:
                     logger.info(f"Job already running for {case}, skipping")
                     continue
                 if not resources_available():

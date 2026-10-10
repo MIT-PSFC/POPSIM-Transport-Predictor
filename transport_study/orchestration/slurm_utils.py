@@ -232,8 +232,8 @@ def query_partitions() -> str:
     return ",".join(dict.fromkeys(p for p in partitions if p))
 
 
-def count_running_jobs(job_name: str, partition: str | None = None) -> int:
-    """Run squeue to list running jobs on the partition(s) with the specific name.
+def count_running_jobs(job_name: str, partition: str | None = None) -> int | None:
+    """Running and pending jobs with this name on the partition(s), None if squeue fails.
 
     Defaults to the primary plus spillover partitions so a case whose job
     spilled over still counts as in flight.
@@ -242,7 +242,7 @@ def count_running_jobs(job_name: str, partition: str | None = None) -> int:
         partition = query_partitions()
     stdout = _slurm_stdout(["squeue", "-p", partition, "-n", job_name, "--state=RUNNING,PENDING", "--noheader"])
     if stdout is None:
-        return 999999  # Return a large number to prevent launching more jobs if squeue fails
+        return None
     return _count_lines(stdout)
 
 
@@ -269,6 +269,7 @@ def get_running_job_elapsed_s(partition: str | None = None) -> dict[str, int] | 
     Pending jobs are excluded, they haven't started accumulating epochs yet.
     Returns None when squeue fails, so callers can tell "no running jobs" apart
     from "scheduler unreachable" (mirrors get_running_job_names).
+    Duplicate job names (e.g. multiple agent jobs) keep the largest value, as in get_pending_job_pending_s.
     """
     if partition is None:
         partition = query_partitions()
@@ -286,7 +287,8 @@ def get_running_job_elapsed_s(partition: str | None = None) -> dict[str, int] | 
         name, _, time_str = line.rpartition(" ")
         elapsed_s = parse_slurm_time_s(time_str.strip())
         if elapsed_s is not None:
-            elapsed[name.strip()] = elapsed_s
+            job_name = name.strip()
+            elapsed[job_name] = max(elapsed_s, elapsed.get(job_name, 0))
     return elapsed
 
 
@@ -445,13 +447,13 @@ def count_idle_gpus(partition: str | None = None, buffer_gpus: int | None = None
     return max(free_gpus + evictable_gpus - buffer_gpus, 0)
 
 
-def count_pending_jobs(partition: str | None = None) -> int:
-    """Count this user's pending jobs on the partition."""
+def count_pending_jobs(partition: str | None = None) -> int | None:
+    """This user's pending jobs on the partition, None if squeue fails."""
     if partition is None:
         partition = config.partition
     stdout = _slurm_stdout(["squeue", "-p", partition, "-u", getpass.getuser(), "--state=PENDING", "--noheader"])
     if stdout is None:
-        return 999999  # Return a large number to prevent launching more jobs if squeue fails
+        return None
     return _count_lines(stdout)
 
 
@@ -460,9 +462,12 @@ def open_gpu_slots(partition: str | None = None, buffer_gpus: int | None = None)
 
     Pending jobs will take idle GPUs once scheduled, so they claim slots already.
     A negative buffer_gpus keeps that many jobs pending on a full partition.
+    Any failed query gives no slots, so nothing launches.
     """
     idle_gpus = count_idle_gpus(partition, buffer_gpus)
     pending_jobs = count_pending_jobs(partition)
+    if pending_jobs is None:
+        return 0
     return max(idle_gpus - pending_jobs, 0)
 
 
@@ -470,15 +475,15 @@ def resources_available(partition: str | None = None, buffer_gpus: int | None = 
     return open_gpu_slots(partition, buffer_gpus) > 0
 
 
-def count_user_jobs() -> int:
-    """This user's running + pending jobs across all partitions.
+def count_user_jobs() -> int | None:
+    """This user's running + pending jobs across all partitions, None if squeue fails.
 
     Every job counts toward the association/QOS MaxSubmit ceilings no matter
     which partition it went to, so the spillover budget is based on this total.
     """
     stdout = _slurm_stdout(["squeue", "-u", getpass.getuser(), "--state=RUNNING,PENDING", "--noheader"])
     if stdout is None:
-        return 999999  # Return a large number to prevent launching more jobs if squeue fails
+        return None
     return _count_lines(stdout)
 
 
@@ -622,8 +627,11 @@ def count_user_tres(partition: str) -> dict[str, int] | None:
 
 
 def user_job_budget() -> int:
-    """Jobs still submittable anywhere before hitting the user-wide MaxSubmit ceiling."""
-    return max(config.max_user_jobs - config.spillover_job_headroom - count_user_jobs(), 0)
+    """Jobs still submittable anywhere before hitting the user-wide MaxSubmit ceiling, 0 if squeue fails."""
+    user_jobs = count_user_jobs()
+    if user_jobs is None:
+        return 0
+    return max(config.max_user_jobs - config.spillover_job_headroom - user_jobs, 0)
 
 
 def spillover_budget() -> int:
@@ -684,11 +692,12 @@ def open_cpu_slots(partition: str) -> int:
     """
     node_free = _schedulable_node_free_cpus_mem(partition)
     caps = partition_user_tres_caps(partition)
-    if node_free is None or caps is None:
+    pending_jobs = count_pending_jobs(partition)
+    if node_free is None or caps is None or pending_jobs is None:
         return 0
     job_mem_MB = slurm_mem_MB(config.train_mem)
     node_slots = [min(idle_cpus // config.cpu_train_cpus, free_mem_MB // job_mem_MB) for idle_cpus, free_mem_MB in node_free.values()]
-    slots = sum(node_slots) - count_pending_jobs(partition)
+    slots = sum(node_slots) - pending_jobs
     job_tres = {"cpu": config.cpu_train_cpus, "mem": job_mem_MB}
     capped_tres = [key for key in job_tres if key in caps]
     if capped_tres:
