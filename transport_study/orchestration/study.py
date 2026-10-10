@@ -559,8 +559,16 @@ class Study:
         return info[0] if info else None
 
     def collected_results_path(self) -> Path:
-        """Return the path where the collected results for all cases should be stored."""
-        return Path(self.result_dir) / "collected_results.nc"
+        """The collected results of every finished case, rebuilt by every run_study."""
+        return self.result_dir / "collected_results.nc"
+
+    def collected_metrics_path(self) -> Path:
+        """The stage-resolved metrics of every finished case, rebuilt by every analysis (case_metrics.collect_metrics)."""
+        return self.result_dir / "collected_metrics.nc"
+
+    def study_complete_path(self) -> Path:
+        """Written once run_study finished its analysis, the orchestrator wrappers stop resubmitting on it."""
+        return self.result_dir / "study_complete"
 
     def sweep_checkpoint_dir(self, case: Case) -> Path:
         """Where the sweep trials of a hyperparam case keep their checkpoints, one subdirectory per wandb run id."""
@@ -1733,21 +1741,24 @@ class Study:
             clean_sweeps=bool(clean_sweeps),
         )
 
+        # The files of an earlier run, possibly over another grid, never stand in for this run's
+        for stale_path in (study.collected_results_path(), study.collected_metrics_path(), study.study_complete_path()):
+            stale_path.unlink(missing_ok=True)
+
         if not skip_visualization:
             logger.opt(colors=True).info("<bold><magenta>DATA VISUALIZATION</magenta></bold>")
             study._visualize_data()
 
-        if study.collected_results_path().exists():
-            logger.info(
-                f"Collected results file found at\n{study.collected_results_path()}\nSkipping orchestration and going straight to analysis"
-            )
-        else:
-            logger.opt(colors=True).info("<bold><magenta>ORCHESTRATION</magenta></bold>")
-            study.run_unfinished_cases(skip_tuning=bool(skip_tuning), enable_parallelism=bool(enable_parallelism))
-            ds_final = study.collect_results()
-            write_netcdf_atomic(ds_final, study.collected_results_path())
+        # Returns at once when every case already has a result
+        logger.opt(colors=True).info("<bold><magenta>ORCHESTRATION</magenta></bold>")
+        study.run_unfinished_cases(skip_tuning=bool(skip_tuning), enable_parallelism=bool(enable_parallelism))
+        ds_final = study.collect_results()
+        if not ds_final.data_vars:
+            raise RuntimeError(f"Study {study.name} has no case result to collect, check its [datasets] table and the logs above")
+        write_netcdf_atomic(ds_final, study.collected_results_path())
 
         study.run_analysis(enable_parallelism=bool(enable_parallelism))
+        study.study_complete_path().touch()
 
     @classmethod
     def reset_study(cls, config: CaseGridConfig | str | Path) -> None:

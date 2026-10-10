@@ -40,7 +40,6 @@ from transport_study.signals import POWER_ADDITIONAL_MW
 # Timebases are 1 kHz, so anything beyond half a sample is a bad join.
 TIME_JOIN_TOLERANCE_S = 6e-4
 
-COLLECTED_METRICS_FILENAME = "collected_metrics.nc"
 CASE_METRICS_FILENAME = "case_metrics.nc"
 
 # Result variable every test suite writes, 1 diverged, 0 finite and NaN without a target
@@ -246,10 +245,6 @@ def case_timeslice_metrics(study: Study, case, result_ds: xr.Dataset) -> StagedT
     return metrics_module.case_timeslice_metrics(study, case, result_ds)
 
 
-def collected_metrics_path(study: Study) -> Path:
-    return study.result_dir / COLLECTED_METRICS_FILENAME
-
-
 def case_metrics_path(study: Study, case) -> Path:
     """Per-case stage-aggregate cache, always in this study's own result dir.
 
@@ -311,7 +306,7 @@ def collect_metrics(study: Study) -> xr.Dataset:
     The combined dataset is rebuilt and written to collected_metrics.nc on every call,
     so a partial file from an interrupted run never masks newly finished cases.
     """
-    cache_path = collected_metrics_path(study)
+    cache_path = study.collected_metrics_path()
 
     results = []
     for case_idx, case in enumerate(study.cases):

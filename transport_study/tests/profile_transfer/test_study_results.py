@@ -5,7 +5,6 @@ import pytest
 import xarray as xr
 
 from transport_study import PACKAGE_ROOT
-from transport_study.orchestration.case_metrics import collected_metrics_path
 from transport_study.orchestration.stages import STAGE_AGG_NAMES
 from transport_study.profile_transfer.profile_study import ProfileStudy
 from transport_study.tests.sample_data import SAMPLE_DIR, requires_sample_data
@@ -76,7 +75,7 @@ class TestCmodToCmod:
         assert any((figure_dir / "data_visualization" / "domain_overlap").glob("*.png")), "Data visualization figures were not generated"
 
         # Stage-resolved metrics collected and cached for every finished case
-        metrics_path = collected_metrics_path(study)
+        metrics_path = study.collected_metrics_path()
         assert metrics_path.exists(), "collected_metrics.nc was not generated"
         metrics_ds = xr.load_dataset(metrics_path)
         assert list(metrics_ds["stage"].values) == list(STAGE_AGG_NAMES)
