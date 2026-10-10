@@ -2089,7 +2089,7 @@ wheels = [
 
 [[package]]
 name = "mkgp"
-version = "3.1.4"
+version = "3.1.5"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "ipython" },
@@ -2099,9 +2099,9 @@ dependencies = [
     { name = "scipy" },
     { name = "tables" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/5e/b1/0c2ec749502f05958e426d9da12b618d6e87556783804e27691dd74cb763/mkgp-3.1.4.tar.gz", hash = "sha256:01c7e70ed4f24fa7e98d467b650af8c801348d4abcb53cb1599ef51796f4dd1a", size = 807233, upload-time = "2026-02-21T20:41:35.055Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/df/6f/169c03a189446ecaa956f8969e215cb4feadc95d3be18040cf7f7f5d70db/mkgp-3.1.5.tar.gz", hash = "sha256:1189cda8a97b190b659fe73183c0433178ddfeb3372586ba7ae35b65b830a0c1", size = 808007, upload-time = "2026-09-02T18:44:02.222Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/16/c7/5574babefbc70fc4946fc7efe6d8a0f7c177c9af9bd3ddabb0ec4446f910/mkgp-3.1.4-py3-none-any.whl", hash = "sha256:7f541dba57a899e01ee992dee6fc42eff947e46981dde77408b60b37f3471910", size = 69712, upload-time = "2026-02-21T20:41:33.766Z" },
+    { url = "https://files.pythonhosted.org/packages/c9/45/d04333d1990a5cb4761f2d96b36ebdac95ccab42c104f5e2ac9b6ff347bd/mkgp-3.1.5-py3-none-any.whl", hash = "sha256:e2a3e9ade83495925565ded52ac18048eee3d5251a09b426ebd1cfcbf34a987f", size = 70180, upload-time = "2026-09-02T18:44:01.067Z" },
 ]
 
 [[package]]
@@ -4464,7 +4464,7 @@ requires-dist = [
     { name = "loguru" },
     { name = "matplotlib", specifier = ">=3.11.1" },
     { name = "mdsthin", specifier = ">=1.7.1" },
-    { name = "mkgp", specifier = "==3.1.4" },
+    { name = "mkgp", specifier = "==3.1.5" },
     { name = "numpy", specifier = ">=1.26" },
     { name = "s3fs", specifier = ">=2026.7.0" },
     { name = "scipy", specifier = ">=1.14" },
