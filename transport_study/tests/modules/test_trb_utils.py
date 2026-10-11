@@ -2,14 +2,18 @@
 
 from types import SimpleNamespace
 
+import jax.numpy as jnp
 import numpy as np
 import pytest
 import xarray as xr
+import xarray_jax
 from popsim.ml.dataloading import make_dataloaders
+from transport_validation_datasets.machine.generic import UNIFORM_TIMEBASE_DT
 
 from transport_study import EPISODE_DIM, TIME_COORD, TIME_DIM
 from transport_study.modules.trb_utils import (
     CaseTrainDataLoader,
+    TimeAveragedLoss,
     mask_to_largest_contiguous_segment,
     scalar_study_results,
 )
@@ -139,3 +143,35 @@ def test_fixed_steps_refuse_a_training_set_above_the_study_steps():
     natural_dl = _timeslice_loader(n_shots=3, n_times=4, batch_size=4)
     with pytest.raises(ValueError, match="more than the study's 2 steps per epoch"):
         CaseTrainDataLoader(natural_dl, steps_per_epoch=2)
+
+
+def _fresh_abs_error(pred, targ):
+    return targ["fresh"].data * jnp.abs(pred["value"].data - targ["value"].data)
+
+
+def _episode(step_errors: np.ndarray, fresh: np.ndarray):
+    """pred, targ and time of an episode on the 1 kHz grid, its prediction off by step_errors, fresh the 0 / 1 freshness flag."""
+    time = UNIFORM_TIMEBASE_DT * jnp.arange(step_errors.size)
+    pred = {"value": xarray_jax.DataArray(jnp.asarray(step_errors), dims=(TIME_DIM,))}
+    targ = {
+        "value": xarray_jax.DataArray(jnp.zeros(step_errors.size), dims=(TIME_DIM,)),
+        "fresh": xarray_jax.DataArray(jnp.asarray(fresh, dtype=float), dims=(TIME_DIM,)),
+    }
+    return pred, targ, time
+
+
+def test_time_averaged_loss_is_the_mean_over_fresh_time():
+    """Short and long episodes off by one error score that error, whatever the stale steps hold, and no fresh time scores 0."""
+    loss_fn = TimeAveragedLoss(_fresh_abs_error, "fresh")
+    step_error = 0.3
+
+    for n_steps in (10, 400):
+        steps_all_fresh = np.full(n_steps, step_error)
+        assert float(loss_fn(*_episode(steps_all_fresh, np.ones(n_steps)))) == pytest.approx(step_error)
+
+    # Every fifth step fresh, the stale steps off by far more
+    fresh = np.zeros(400)
+    fresh[::5] = 1.0
+    steps_stale_worse = np.where(fresh == 1.0, step_error, 5.0)
+    assert float(loss_fn(*_episode(steps_stale_worse, fresh))) == pytest.approx(step_error)
+    assert float(loss_fn(*_episode(steps_stale_worse, np.zeros(400)))) == 0.0

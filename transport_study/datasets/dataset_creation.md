@@ -17,7 +17,7 @@ IMAS names in SI units on `(shot, time_idx[, rho_tor_norm])`, with `time` on `(s
 one contiguous 1 kHz segment per shot padded with NaN to the longest shot,
 and ip and b0 with their source sign (the per-shot `cocos` records the convention).
 The build here (`workflow.StoreWorkflow`) is a lazy xarray pass over that store:
-it keeps only the signals the studies read (`signals.STUDY_STORE_SIGNALS`, the shared schema less `fresh_equilibrium`),
+it keeps only the shared schema's signals (TVD `store_schema.STORE_SIGNALS`),
 cuts the time axis back to the longest shot, rechunks into `ds.zarr` with TVD's chunked writer
 and checks the written shot count against the source.
 It refuses a store whose `fit_mode` is not `sample`, since the windowed fit modes are not contiguous in time.

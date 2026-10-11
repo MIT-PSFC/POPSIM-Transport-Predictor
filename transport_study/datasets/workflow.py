@@ -5,7 +5,7 @@ C-Mod and MAST up to a published store, TCV and DIII-D up to an internal one.
 Each holds the shared schema, IMAS names in SI units on (shot, time_idx[, rho_tor_norm]) with time on (shot, time_idx),
 already filtered and fitted, one contiguous 1 kHz segment per shot padded with NaN to the longest shot,
 and the internal one also carries the raw readings and the equilibrium.
-The build here is a lazy xarray pass: it selects the signals the studies read (signals.STUDY_STORE_SIGNALS),
+The build here is a lazy xarray pass: it selects the shared schema's signals (store_schema.STORE_SIGNALS),
 cuts the time axis back to the longest shot and rechunks into ds.zarr.
 Shot quality is the TVD store's responsibility, nothing is culled here,
 and the studies convert units and take the ip and b0 magnitudes on load (signals.convert_to_working_units).
@@ -21,6 +21,7 @@ from transport_validation_datasets.dataset_utils import (
     episode_chunk_specs,
     write_rechunked_store,
 )
+from transport_validation_datasets.store_schema import STORE_SIGNALS
 
 from transport_study import EPISODE_DIM, TIME_COORD, TIME_DIM
 from transport_study.datasets.plotting import (
@@ -29,7 +30,6 @@ from transport_study.datasets.plotting import (
     ds_summary_report,
     variable_stats,
 )
-from transport_study.signals import STUDY_STORE_SIGNALS
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -89,7 +89,7 @@ class StoreWorkflow:
             raise ValueError(
                 f"{self.source_store_path} has fit_mode {fit_mode!r}, only {CONTIGUOUS_FIT_MODE!r} stores are one contiguous segment per shot"
             )
-        ds_selected = ds_store[[*STUDY_STORE_SIGNALS, TIME_COORD]]
+        ds_selected = ds_store[[*STORE_SIGNALS, TIME_COORD]]
         # time is written as a data variable, the store writer keeps only the index coordinates in memory.
         # The source encoding would still list it as a coordinate on read-back, so it goes
         if TIME_COORD in ds_selected.coords:

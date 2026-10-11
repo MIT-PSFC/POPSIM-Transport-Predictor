@@ -90,6 +90,7 @@ REQUIRED_SIGNALS_POWER_BALANCE = [
     "energy_mhd_MJ",
     "power_ohm_MW",
     "power_radiated_MW",
+    "fresh_equilibrium",  # The Wtot and P_oh losses count only the timeslices a reconstruction landed on
     # Inputs
     "ip_MA",
     "b_geo",
@@ -151,6 +152,7 @@ REQUIRED_SIGNALS_TRANSPORT_TRANSFER = [
     *PROFILE_GRAD_SIGNALS,
     *PROFILE_ERROR_SIGNALS,
     "fresh_profile",  # Kept as data (not a filter) so downstream losses or metrics can mask stale forward-filled profiles
+    "fresh_equilibrium",  # The stored-energy and ohmic power anchors count only the timeslices a reconstruction landed on
     # Inputs
     "ip_MA",
     "b0",

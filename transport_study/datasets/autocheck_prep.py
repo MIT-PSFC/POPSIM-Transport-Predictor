@@ -1,4 +1,4 @@
-"""Prepare a device store (signals.STUDY_STORE_SIGNALS) for popsim-autocheck.
+"""Prepare a device store (store_schema.STORE_SIGNALS) for popsim-autocheck.
 
 Writes two Zarr stores next to each other:
     <label>_indep.zarr: the shots as episodes on the store's time_idx layout, for time_indep mode.
@@ -26,7 +26,6 @@ from transport_study import EPISODE_DIM, RADIAL_DIM, TIME_COORD, TIME_DIM
 from transport_study.signals import SIGNED_SIGNALS
 
 # Bookkeeping flags and the profile error bars, only the profiles and gradients are checked.
-# The study stores leave fresh_equilibrium out, the TVD stores keep it.
 EXCLUDED_VARS = (
     "fresh_profile",
     "fresh_equilibrium",

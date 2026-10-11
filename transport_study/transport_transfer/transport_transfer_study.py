@@ -70,8 +70,9 @@ TRANSPORT_PROFILE_TARGETS = ["n_e_1e20", "t_e_keV"]
 # Everything the transport loss reads from the target side:
 # the profiles, their GP-fit gradients and every error bar (the chi validation loss divides by them),
 # the freshness flag masking both losses to timeslices with a fresh profile measurement,
+# the one masking the stored-energy and ohmic power anchors to fresh reconstructions (trb_utils.freshness_weight),
 # and the device label for per-device weighting
-TRANSPORT_TARGET_VARS = [*PROFILE_TARGET_VARS, "fresh_profile", "ds_source_idx"]
+TRANSPORT_TARGET_VARS = [*PROFILE_TARGET_VARS, "fresh_profile", "fresh_equilibrium", "ds_source_idx"]
 
 # The measured powers every top-level case loads (the stored energy is a state var of every case),
 # so the training segments are the same whatever a case anchors (a NaN in any loaded variable drops a segment)
@@ -416,6 +417,7 @@ class TransportStudy(Study):
                 train_run_builder=submodule_settings["train_run_builder"],
                 dataloader_config={
                     "target_vars": submodule_settings["target_vars"],
+                    "fresh_var": submodule_settings["fresh_var"],
                     "input_vars": POWER_BALANCE_INPUT_VARS,
                     "data_train_run_builder": pb_trb,  # Needed for submodules
                     **dataloader_config_base,
@@ -441,7 +443,7 @@ class TransportStudy(Study):
                     # anchor the p_oh/p_rad submodule predictions to them
                     # (anchor_weight_* in the loss config), matching the power
                     # balance study's structured cases
-                    "target_vars": ["energy_mhd_MJ", "power_ohm_MW", "power_radiated_MW", "ds_source_idx"],
+                    "target_vars": ["energy_mhd_MJ", "fresh_equilibrium", "power_ohm_MW", "power_radiated_MW", "ds_source_idx"],
                     "state_vars": ["energy_mhd_MJ"],
                     **dataloader_config_base,
                     # Scalar-signal training is cheap, match the power balance study

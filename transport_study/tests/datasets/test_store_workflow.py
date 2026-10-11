@@ -9,11 +9,10 @@ import numpy as np
 import pytest
 import xarray as xr
 from loguru import logger
-from transport_validation_datasets.store_schema import STORE_SIGNAL_ATTRS
+from transport_validation_datasets.store_schema import STORE_SIGNAL_ATTRS, STORE_SIGNALS
 
 from transport_study.datasets import workflow as workflow_module
 from transport_study.datasets.workflow import StoreWorkflow
-from transport_study.signals import STUDY_STORE_SIGNALS
 from transport_study.tests.datasets.synthetic_store import (
     SHOT_LENGTHS,
     write_synthetic_store,
@@ -32,12 +31,12 @@ def built_store(tmp_path_factory):
 
 
 def test_store_holds_exactly_the_study_signals(built_store):
-    """Every study signal with its SI unit plus time, nothing the source store carries beyond them."""
+    """Every schema signal with its SI unit plus time, nothing the source store carries beyond them."""
     _, ds_built, _ = built_store
 
-    assert set(ds_built.data_vars) == {*STUDY_STORE_SIGNALS, "time"}
+    assert set(ds_built.data_vars) == {*STORE_SIGNALS, "time"}
     assert set(ds_built.dims) == {"shot", "time_idx", "rho_tor_norm"}
-    for name in STUDY_STORE_SIGNALS:
+    for name in STORE_SIGNALS:
         assert ds_built[name].attrs["units"] == STORE_SIGNAL_ATTRS[name]["units"], name
 
 

@@ -44,15 +44,19 @@ POWER_TARGET_VARS = ["power_ohm_MW", "power_radiated_MW"]
 
 
 # Per-submodule train settings shared with the transport study, which trains
-# the same p_oh/p_rad prereq cases for its power balance submodule
+# the same p_oh/p_rad prereq cases for its power balance submodule.
+# fresh_var keeps the training and validation samples to the timeslices where it is 1 (see trb_utils.get_time_dep_dataloaders):
+# P_oh comes from the reconstruction, which the stores hold between reconstructions, P_rad from bolometry
 SCALAR_SUBMODULE_SETTINGS = {
     "p_oh": {
         "train_run_builder": "transport_study.modules.power_balance.p_oh.trb.OhmicPowerTRB",
         "target_vars": ["power_ohm_MW", "ds_source_idx"],
+        "fresh_var": "fresh_equilibrium",
     },
     "p_rad": {
         "train_run_builder": "transport_study.modules.power_balance.p_rad.trb.RadiatedPowerTRB",
         "target_vars": ["power_radiated_MW", "ds_source_idx"],
+        "fresh_var": None,
     },
 }
 
@@ -268,6 +272,7 @@ class PowerBalanceStudy(Study):
                 train_run_builder=submodule_settings["train_run_builder"],
                 dataloader_config={
                     "target_vars": submodule_settings["target_vars"],
+                    "fresh_var": submodule_settings["fresh_var"],
                     "input_vars": POWER_BALANCE_INPUT_VARS,
                     "data_train_run_builder": trb,  # Needed for submodules
                     **dataloader_config_base,
@@ -288,7 +293,7 @@ class PowerBalanceStudy(Study):
                     # The measured powers are targets so the training loss can
                     # anchor the submodule predictions to them (anchor_weight_*
                     # in the loss config)
-                    "target_vars": ["energy_mhd_MJ", *POWER_TARGET_VARS, "ds_source_idx"],
+                    "target_vars": ["energy_mhd_MJ", "fresh_equilibrium", *POWER_TARGET_VARS, "ds_source_idx"],
                     "state_vars": ["energy_mhd_MJ"],
                     **dataloader_config_base,
                 },
@@ -311,7 +316,7 @@ class PowerBalanceStudy(Study):
                 train_run_builder=trb,
                 dataloader_config={
                     "input_vars": POWER_BALANCE_INPUT_VARS,
-                    "target_vars": ["energy_mhd_MJ", "ds_source_idx"],
+                    "target_vars": ["energy_mhd_MJ", "fresh_equilibrium", "ds_source_idx"],
                     "state_vars": ["energy_mhd_MJ"],
                     # Unused by the model, but the dataloader drops the NaN slices of every loaded variable,
                     # so the measured powers keep the training segments identical to the structured models'
@@ -331,9 +336,9 @@ class PowerBalanceStudy(Study):
             # The multiobjective head predicts the measured powers, so they are targets its training loss anchors.
             # For the plain transformer they only keep the training segments identical to the structured models', see mlp
             if case.multiobjective:
-                power_vars = {"target_vars": ["energy_mhd_MJ", *POWER_TARGET_VARS, "ds_source_idx"]}
+                power_vars = {"target_vars": ["energy_mhd_MJ", "fresh_equilibrium", *POWER_TARGET_VARS, "ds_source_idx"]}
             else:
-                power_vars = {"target_vars": ["energy_mhd_MJ", "ds_source_idx"], "extra_vars": POWER_TARGET_VARS}
+                power_vars = {"target_vars": ["energy_mhd_MJ", "fresh_equilibrium", "ds_source_idx"], "extra_vars": POWER_TARGET_VARS}
             return ModelTrainSpec(
                 train_run_builder=trb,
                 dataloader_config={

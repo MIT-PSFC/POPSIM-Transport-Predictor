@@ -24,7 +24,9 @@ from transport_study.modules.transport_predictor.module import (
 )
 from transport_study.modules.trb_utils import (
     CHI_ERROR_VARS,
+    TimeAveragedLoss,
     chi_profile_loss,
+    freshness_weight,
     get_time_dep_dataloaders,
     huber_profile_loss,
     make_grouped_exponential_adamw,
@@ -166,11 +168,14 @@ class TransportPredictorTRB(TrainRunBuilder):
         Both count only timeslices with a fresh profile measurement:
         the profile terms are multiplied by the fresh_profile target var,
         so forward-filled (stale) slices steer neither training nor checkpoint selection.
+        Training integrates over the equal-length segments,
+        validation averages over each episode's fresh profile time (TimeAveragedLoss), so a long shot weighs no more than a short one.
 
         The anchor terms pull the sciml submodule predictions (the power balance Wtot and its own p_oh / p_rad)
         and a multiobjective case's stored energy and ohmic power toward the measured signals,
         weighted by the anchor_weight_* loss_config keys.
-        They are training only, measured at every timeslice so exempt from the freshness mask,
+        They are training only, the stored energy and ohmic power counted at the fresh equilibrium timeslices
+        and P_rad at every one (trb_utils.freshness_weight),
         plain absolute error (huber_delta is sized for the profile residuals, not MJ / MW signals),
         and drop out at trace time for cases whose target_vars lack the signals (the plain transformer and torax-*).
         """
@@ -241,14 +246,22 @@ class TransportPredictorTRB(TrainRunBuilder):
                 anchor_targ = targ[signal].data
                 # Same sanitize-then-charge treatment as the profiles
                 anchor_errors = jnp.abs(jnp.where(anchor_finite, anchor_pred, anchor_targ) - anchor_targ)
-                loss = loss + anchor_weight * jnp.mean(sample_weights * anchor_errors)
+                anchor_sample_weights = sample_weights * freshness_weight(signal, targ)
+                loss = loss + anchor_weight * jnp.mean(anchor_sample_weights * anchor_errors)
                 diverged = diverged | ~anchor_finite
 
-            # The divergence penalty is deliberately outside the freshness mask:
+            # Training charges the divergence penalty outside the freshness mask:
             # a rollout that went non-finite is broken whether or not those slices carry a fresh measurement.
-            # It applies to validation too, so a diverged trial cannot win the sweep
-            return loss + divergence_penalty * jnp.mean(sample_weights * diverged.astype(loss.dtype))
+            # Validation charges it at the fresh slices, so the whole validation loss is one fresh-time average,
+            # a fully diverged episode scoring the penalty itself, and a diverged trial cannot win the sweep
+            diverged_weights = profile_weights if use_chi else sample_weights
+            return loss + divergence_penalty * jnp.mean(diverged_weights * diverged.astype(loss.dtype))
 
+        # Validation scores whole episodes, where an integral would weigh each shot by its length,
+        # so it divides by the fresh profile time and every shot counts once.
+        # Training stays an integral, its segments are equal length so dividing by their duration would only rescale the loss.
+        if use_chi:
+            return TimeAveragedLoss(loss_fn, "fresh_profile")
         return IntegralLoss(loss_fn)
 
     @staticmethod

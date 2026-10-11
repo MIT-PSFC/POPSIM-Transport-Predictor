@@ -16,9 +16,6 @@ from transport_validation_datasets.store_schema import (
     STORE_SIGNALS,
 )
 
-# The shared schema's signals the studies read, every one but fresh_equilibrium
-STUDY_STORE_SIGNALS = tuple(name for name in STORE_SIGNALS if name != "fresh_equilibrium")
-
 # Signals the stores keep signed, taken as magnitudes on conversion
 SIGNED_SIGNALS = ("ip", "b0")
 
@@ -66,7 +63,7 @@ def store_signals_for(study_signals: list[str] | tuple[str, ...]) -> list[str]:
             store_names.update(HEATING_POWERS)
         else:
             store_names.add(STORE_NAMES.get(study_name, study_name))
-    ordered = [name for name in STUDY_STORE_SIGNALS if name in store_names]
+    ordered = [name for name in STORE_SIGNALS if name in store_names]
     return ordered + sorted(store_names - set(ordered))
 
 

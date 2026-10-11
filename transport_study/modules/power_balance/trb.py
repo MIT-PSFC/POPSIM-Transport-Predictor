@@ -23,6 +23,8 @@ from transport_study.modules.power_balance.module import (
 from transport_study.modules.power_balance.p_oh.trb import OhmicPowerTRB
 from transport_study.modules.power_balance.p_rad.trb import RadiatedPowerTRB
 from transport_study.modules.trb_utils import (
+    TimeAveragedLoss,
+    freshness_weight,
     get_time_dep_dataloaders,
     make_grouped_exponential_adamw,
     make_loss_eval_suite,
@@ -156,8 +158,14 @@ class PowerBalanceTRB(TrainRunBuilder):
         or the delta-free validation loss (plain absolute error),
         so the sweep metric val/loss.mean cannot be gamed by shrinking delta.
 
+        Wtot counts only the timeslices a reconstruction landed on (trb_utils.freshness_weight),
+        the stores hold it forward between reconstructions.
+        Training integrates over the equal-length segments,
+        validation averages over each episode's fresh time (TimeAveragedLoss), so a long shot weighs no more than a short one.
+
         The training loss adds the ANCHOR_SIGNALS terms pulling the submodule
-        predictions toward the measured signals, weighted by the anchor_weight_* loss_config keys.
+        predictions toward the measured signals, weighted by the anchor_weight_* loss_config keys,
+        P_oh at the fresh timeslices only and P_rad at every one.
         Validation stays pure Wtot so the sweep metric is comparable across model types.
         The terms drop out at trace time for cases whose target_vars do not
         carry the measured signals (mlp, the plain transformer).
@@ -171,16 +179,24 @@ class PowerBalanceTRB(TrainRunBuilder):
             residual = pred.energy_mhd_MJ_pred - targ["energy_mhd_MJ"].data
             errors = optax.huber_loss(residual, delta=loss_config["huber_delta"]) if use_huber else jnp.abs(residual)
             sample_weights = per_sample_device_values(targ["ds_source_idx"].data, device_weights, 1.0)
-            loss = jnp.mean(sample_weights * errors)
+            wtot_weights = sample_weights * freshness_weight("energy_mhd_MJ", targ)
+            loss = jnp.mean(wtot_weights * errors)
 
             for signal, anchor_weight in anchor_weights.items():
                 if anchor_weight <= 0.0 or signal not in targ:
                     continue
                 anchor_errors = jnp.abs(getattr(pred, ANCHOR_SIGNALS[signal][0]) - targ[signal].data)
-                loss = loss + anchor_weight * jnp.mean(sample_weights * anchor_errors)
+                anchor_sample_weights = sample_weights * freshness_weight(signal, targ)
+                loss = loss + anchor_weight * jnp.mean(anchor_sample_weights * anchor_errors)
             return loss
 
-        return IntegralLoss(loss_fn)
+        # Validation scores whole episodes, where an integral would weigh each shot by its length,
+        # so it divides by the fresh time and every shot counts once.
+        # Training stays an integral, its segments are equal length so dividing by their duration would only rescale the loss.
+        # Dividing by their fresh time would weigh each fresh timeslice by 1 / (fresh time of its segment)
+        if use_huber:
+            return IntegralLoss(loss_fn)
+        return TimeAveragedLoss(loss_fn, "fresh_equilibrium")
 
     @staticmethod
     def get_loss_fn(loss_config: dict) -> Callable[[Any, Any], jnp.ndarray]:

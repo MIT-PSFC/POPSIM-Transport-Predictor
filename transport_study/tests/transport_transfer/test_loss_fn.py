@@ -3,7 +3,7 @@
 Hand-built predictions and targets so the expected values are exact. Covers
 the freshness masking: the time-dependent rollouts keep forward-filled
 (stale) profile timeslices in the data for segment contiguity, so both
-losses must zero them out, the anchor terms that are exempt from it,
+losses must zero them out, the anchor terms that are exempt from it but follow the equilibrium freshness,
 the value chi of the validation loss and the gradient terms of both losses.
 """
 
@@ -151,11 +151,10 @@ def test_fresh_mask_zeroes_only_stale_slices():
         assert half_fresh == pytest.approx(0.5 * all_fresh, rel=1e-6)
 
 
-def test_anchor_terms_exempt_from_fresh_mask():
-    """The sciml anchor signals are measured at every timeslice, so a stale
-    profile slice keeps its anchor loss: with fresh_profile 0 the training
-    loss reduces to exactly the weighted anchor errors, and the validation
-    loss (no anchors) stays zero."""
+def test_anchor_terms_follow_equilibrium_freshness():
+    """A stale profile slice keeps its anchor loss: with fresh_profile 0 the training loss is exactly the weighted anchor errors.
+    The stored energy and ohmic power anchors count only at a fresh reconstruction (fresh_equilibrium 1),
+    the bolometer P_rad anchor at every slice, and the validation loss (no anchors) stays zero."""
     loss_config = _loss_config(anchor_weight_energy_mhd=0.2, anchor_weight_power_ohm=0.3, anchor_weight_power_radiated=0.5)
     train_loss = TransportPredictorTRB.get_loss_fn(loss_config).instantaneous_loss
     val_loss = TransportPredictorTRB.get_val_loss_fn(loss_config).instantaneous_loss
@@ -170,9 +169,12 @@ def test_anchor_terms_exempt_from_fresh_mask():
     targ["power_ohm_MW"] = xr.DataArray(1.0)
     targ["power_radiated_MW"] = xr.DataArray(0.4)
 
-    expected = 0.2 * abs(0.10 - 0.15) + 0.3 * abs(1.5 - 1.0) + 0.5 * abs(0.9 - 0.4)
-    assert float(train_loss(pred, targ)) == pytest.approx(expected, rel=1e-6)
-    assert float(val_loss(pred, targ)) == 0.0
+    equilibrium_anchors = 0.2 * abs(0.10 - 0.15) + 0.3 * abs(1.5 - 1.0)
+    radiated_anchor = 0.5 * abs(0.9 - 0.4)
+    for fresh_equilibrium, expected in ((1.0, equilibrium_anchors + radiated_anchor), (0.0, radiated_anchor)):
+        targ["fresh_equilibrium"] = xr.DataArray(fresh_equilibrium)
+        assert float(train_loss(pred, targ)) == pytest.approx(expected, rel=1e-6)
+        assert float(val_loss(pred, targ)) == 0.0
 
 
 def test_val_loss_is_value_chi():

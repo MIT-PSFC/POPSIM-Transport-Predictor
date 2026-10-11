@@ -9,7 +9,7 @@ import numpy as np
 import optax
 import xarray as xr
 from loguru import logger
-from popsim.ml import DataLoader, TrainConfig
+from popsim.ml import DataLoader, IntegralLoss, TrainConfig
 from popsim.ml.checkpointing import create_default_checkpoint_manager, restore_model
 from popsim.ml.dataloading import XarrayPreppedDataset, make_dataloaders
 from popsim.ml.eval import EvalData, EvaluationSuite, batched_model_eval_and_loss
@@ -60,6 +60,11 @@ CHI_ERROR_VARS = {
 # Shot number of the room-keeper episode segmented_train_dataloader adds to each training part, below every real shot
 ROOM_KEEPER_SHOT = -1
 
+# Signals of the equilibrium reconstruction, which the stores hold between reconstructions,
+# so their losses count only the timeslices a reconstruction landed on (fresh_equilibrium).
+# P_rad comes from bolometry which may be really slow anyway, just counting it on every timeslice.
+EQUILIBRIUM_SIGNALS = ("energy_mhd_MJ", "power_ohm_MW")
+
 
 def peak_scale(targ: jnp.ndarray) -> jnp.ndarray:
     """Per-timeslice peak of a target profile (..., rho), floored, the scale every profile loss normalizes by."""
@@ -77,6 +82,13 @@ def per_sample_device_values(ds_source_idx: jnp.ndarray, values_by_device: dict[
     for device, value in values_by_device.items():
         values = jnp.where(ds_source_idx == config.ds_source_to_idx[device], value, values)
     return values
+
+
+def freshness_weight(signal: str, targ) -> jnp.ndarray | float:
+    """A loss step's weight on the measured signal: its fresh_equilibrium flag for an EQUILIBRIUM_SIGNALS entry, else 1."""
+    if signal in EQUILIBRIUM_SIGNALS:
+        return targ["fresh_equilibrium"].data
+    return 1.0
 
 
 def per_sample_sigma_floor(ds_source_idx: jnp.ndarray, sigma_floors: dict[str, dict[str, float]], error_var: str) -> jnp.ndarray:
@@ -281,6 +293,29 @@ def integrate_error_over_time(error_ts: xr.DataArray, time_2d: xr.DataArray) -> 
         input_core_dims=[[TIME_DIM], [TIME_DIM]],
         vectorize=True,
     )
+
+
+class TimeAveragedLoss(IntegralLoss):
+    """An IntegralLoss divided by the time integral of the 0 / 1 target var weight_var, the loss averaged over that time.
+
+    So an episode scores the mean of its counted timeslices, and a long DIII-D shot weighs no more than a short MAST one.
+    The weight integral is floored at one timebase step, so an episode with no counted time scores 0.
+    """
+
+    weight_integral: IntegralLoss
+
+    def __init__(self, instantaneous_loss, weight_var: str):
+        super().__init__(instantaneous_loss)
+
+        def step_weight(pred, targ):
+            return targ[weight_var].data
+
+        self.weight_integral = IntegralLoss(step_weight)
+
+    def __call__(self, predictions, targets, time) -> jnp.ndarray:
+        loss_integral = super().__call__(predictions, targets, time)
+        counted_time = self.weight_integral(predictions, targets, time)
+        return loss_integral / jnp.maximum(counted_time, UNIFORM_TIMEBASE_DT)
 
 
 def path_names(path: tuple) -> set:
@@ -610,6 +645,8 @@ def get_time_dep_dataloaders(
     Used by the power balance and transport predictor TrainRunBuilders, which
     differ only in the study_type their datasets are prepared with,
     and by the p_oh / p_rad TRBs, whose configs carry no state_vars and get time-independent dataloaders.
+    Their fresh_var, when set, keeps the training and validation samples to the timeslices where it is 1,
+    while the test samples are every timeslice, so the result files score the whole shot.
     """
     train_parts, ds_val, input_vars, normalizer_fit_ds = resolve_case_datasets(dataloader_config, study_type)
     loader_vars = {
@@ -650,19 +687,33 @@ def get_time_dep_dataloaders(
             drop_last=False,
             pad_last=True,
         )
+        # The validation set doubles as the test set (see resolve_case_datasets)
+        test_dl = val_dl
     else:
         # Time-independent samples: each part is stacked into timeslices, so merging the 0D parts costs no padding of note
-        train_dl, val_dl = make_dataloaders(
-            datasets=(merge_parts(train_parts), ds_val),
+        ds_train = merge_parts(train_parts)
+        ds_val_counted = ds_val
+        fresh_var = dataloader_config["fresh_var"]
+        if fresh_var is not None:
+            ds_train = _targets_on_fresh_timeslices(ds_train, fresh_var, dataloader_config["target_vars"])
+            ds_val_counted = _targets_on_fresh_timeslices(ds_val, fresh_var, dataloader_config["target_vars"])
+        # The validation shots double as the test shots (see resolve_case_datasets)
+        train_dl, val_dl, test_dl = make_dataloaders(
+            datasets=(ds_train, ds_val_counted, ds_val),
             **common,
             batch_size=dataloader_config["batch_size"],
-            shuffle=[True, False],
-            drop_last=[True, False],
-            pad_last=[False, True],
+            shuffle=[True, False, False],
+            drop_last=[True, False, False],
+            pad_last=[False, True, True],
         )
     train_dl = CaseTrainDataLoader(train_dl, dataloader_config["steps_per_epoch"], normalizer_fit_ds)
-    # The validation set doubles as the test set (see resolve_case_datasets)
-    return ds_val, train_dl, val_dl, val_dl
+    return ds_val, train_dl, val_dl, test_dl
+
+
+def _targets_on_fresh_timeslices(ds: xr.Dataset, fresh_var: str, target_vars: list[str]) -> xr.Dataset:
+    """ds with every target var NaN where fresh_var is not 1, so a time-independent loader samples only the fresh timeslices."""
+    mask_fresh = ds[fresh_var] == 1
+    return ds.assign({name: ds[name].where(mask_fresh) for name in target_vars})
 
 
 def time_dep_train_loader_kwargs(dataloader_config: dict, input_vars: list[str]) -> dict:

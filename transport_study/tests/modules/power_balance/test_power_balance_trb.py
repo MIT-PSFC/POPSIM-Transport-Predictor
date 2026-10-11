@@ -63,6 +63,7 @@ def _make_targets(n: int, with_powers: bool = True, ds_source_idx=None) -> dict:
         ds_source_idx = np.zeros(n, dtype=np.float32)
     targ = {
         "energy_mhd_MJ": xr.DataArray(np.ones(n, dtype=np.float32)),
+        "fresh_equilibrium": xr.DataArray(np.ones(n, dtype=np.float32)),
         "ds_source_idx": xr.DataArray(np.asarray(ds_source_idx, dtype=np.float32)),
     }
     if with_powers:
