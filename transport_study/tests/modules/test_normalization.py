@@ -8,6 +8,7 @@ import xarray as xr
 from transport_study.modules import plasma_parameters
 from transport_study.modules.normalization import (
     CORAL_DEGENERATE_STD_FRAC,
+    CORAL_EIGVAL_FLOOR,
     FEATURE_NORMALIZATIONS,
     INPUT_NORMALIZATIONS,
     MIN_CORAL_SHOTS,
@@ -226,6 +227,32 @@ def test_coral_whitening_gain_bounded():
     assert gains.max() <= 1.5 / CORAL_DEGENERATE_STD_FRAC
     # The scenario really exercises the cap, device 0 does get whitened hard
     assert gains[0].max() > 5.0
+
+
+def test_coral_recoloring_stays_full_rank_for_a_collinear_target():
+    """A target whose features 0 and 1 are collinear (a rank-deficient covariance, as a few target shots can give)
+    still gives a well-spread source device a full-rank transform.
+    Unfloored, the target re-coloring C_t^{1/2} has a zero eigenvalue and projects the device onto a plane.
+    This pins the CORAL_EIGVAL_FLOOR on the target side, which bounds the smallest singular value in target-std units.
+    """
+    rng = np.random.default_rng(19)
+    n_shots, n_time = 20, 30
+    n_rows = n_shots * n_time
+    rows0 = _three_feature_rows(rng, n_shots, n_time, [1.0, 2.0, 0.5], [1.0, 1.5, 0.7])
+    target_base = rng.normal(2.0, 0.5, n_rows)
+    rows_target = np.column_stack([target_base, 2.0 * target_base + 1.0, rng.normal(1.0, 0.3, n_rows)])
+    features = np.concatenate([rows0, rows_target])
+    source_idx = np.repeat([0, 1], n_rows)
+    shot_idx = np.repeat(np.arange(2 * n_shots), n_time)
+
+    stats = fit_coral_stats(features, source_idx, n_devices=2, shot_idx=shot_idx, target_idx=1)
+    assert stats is not None
+    _, transforms = (np.asarray(arr) for arr in stats)
+
+    scale = np.std(rows_target, axis=0)
+    transform_target_units = scale[:, None] * transforms[0] / scale[None, :]
+    singular_values = np.linalg.svd(transform_target_units, compute_uv=False)
+    assert singular_values.min() > 0.1 * np.sqrt(CORAL_EIGVAL_FLOOR)
 
 
 def test_coral_shot_gates():

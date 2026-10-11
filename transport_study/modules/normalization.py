@@ -68,9 +68,11 @@ TAU_REF_S = 0.03
 # is treated as constant for that device.
 # Whitening it would amplify measurement noise by more than 1/frac, so it keeps the identity slot.
 CORAL_DEGENERATE_STD_FRAC = 0.05
-# Eigenvalue floor for the device covariance in target-std units.
-# Guards non-axis-aligned degeneracy (collinear features) the same way,
+# Eigenvalue floor for the device and target covariances in target-std units.
+# On the device side it guards non-axis-aligned degeneracy (collinear features) the same way,
 # capping the whitening gain of any direction at 1/CORAL_DEGENERATE_STD_FRAC.
+# On the target side it keeps the re-coloring full rank,
+# so a target whose few shots leave features collinear does not project every device onto a subspace.
 CORAL_EIGVAL_FLOOR = CORAL_DEGENERATE_STD_FRAC**2
 # A source device needs at least this many distinct shots for a meaningful covariance,
 # below it the device keeps the identity transform.
@@ -378,7 +380,7 @@ def _sym_matrix_power(mat: np.ndarray, power: float, eigval_floor: float) -> np.
     """Symmetric matrix power via eigh with an eigenvalue floor.
 
     The floor bounds the gain of negative powers on near-singular matrices
-    (and clips roundoff-negative eigenvalues for positive powers).
+    and keeps positive powers full rank.
     """
     eigvals, eigvecs = np.linalg.eigh(mat)
     eigvals = np.maximum(eigvals, eigval_floor)
@@ -405,7 +407,8 @@ def fit_coral_stats(
     - a feature without target spread has no covariance to align to, it keeps the identity slot on every device
     - a feature whose within-device std is below CORAL_DEGENERATE_STD_FRAC of the target std
       keeps the identity slot on that device (whitening it would amplify noise by more than 1/frac)
-    - CORAL_EIGVAL_FLOOR bounds the whitening gain of any remaining near-degenerate direction
+    - CORAL_EIGVAL_FLOOR bounds the whitening gain of any remaining near-degenerate direction,
+      and keeps the re-coloring by a rank-deficient target covariance full rank
     """
     n_features = features.shape[1]
     valid = ~np.any(np.isnan(features), axis=1)
@@ -437,7 +440,7 @@ def fit_coral_stats(
             continue
         cov_device = np.atleast_2d(np.cov(rows[:, live] / scale[live], rowvar=False))
         cd_neg_half = _sym_matrix_power(cov_device, -0.5, eigval_floor=CORAL_EIGVAL_FLOOR)
-        ct_pos_half = _sym_matrix_power(np.atleast_2d(cov_target[np.ix_(live, live)]), 0.5, eigval_floor=0.0)
+        ct_pos_half = _sym_matrix_power(np.atleast_2d(cov_target[np.ix_(live, live)]), 0.5, eigval_floor=CORAL_EIGVAL_FLOOR)
         # Compose back to raw units: the transform rows and columns carry the per-feature scale,
         # so apply_coral stays a single (vec - mean) @ T + mean.
         # The identity slots keep the initial identity rows and columns

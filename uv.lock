@@ -4475,11 +4475,16 @@ provides-extras = ["imas"]
 
 [package.metadata.requires-dev]
 dev = [
+    { name = "black", specifier = ">=26.5.1" },
     { name = "isort", specifier = ">=8.0.1" },
+    { name = "mypy", specifier = ">=2.3.0" },
     { name = "pre-commit", specifier = ">=4.6.2" },
     { name = "pylint", specifier = ">=4.0.7" },
     { name = "pytest", specifier = ">=9.1.1" },
     { name = "ruff", specifier = ">=0.16.3" },
+    { name = "shellcheck-py", specifier = ">=0.11.0.1" },
+    { name = "tomllint", specifier = ">=0.3.6" },
+    { name = "yamllint", specifier = ">=1.38.0" },
 ]
 
 [[package]]
