@@ -11,6 +11,7 @@ from popsim.ml.eval import EvaluationSuite
 from transport_study.config import config
 from transport_study.modules.normalization import make_normalizer
 from transport_study.modules.power_balance.module import (
+    FREEZABLE_SUBMODULES,
     MODEL_TYPES_WITH_ENERGY_INPUT,
     MODEL_TYPES_WITH_SUBMODULES,
     SCALING_LAW_FIELDS,
@@ -132,7 +133,7 @@ class PowerBalanceTRB(TrainRunBuilder):
         which ran their own pretrain and finetune on the target device.
         Under skip_data_init it is an unrestored skeleton.
         """
-        freeze_submodules = ["p_oh_predictor", "p_rad_predictor"] if model_init_config.get("freeze_submodules", False) else []
+        freeze_submodules = list(FREEZABLE_SUBMODULES) if model_init_config.get("freeze_submodules", False) else []
         build_config = module_build_config(model_init_config)
         env = PowerBalanceEnv(
             module=PowerBalanceTRB._build_module(train_dl, build_config),

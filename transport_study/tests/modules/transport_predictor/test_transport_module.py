@@ -28,6 +28,7 @@ from transport_study.modules.normalization import (
     feature_fit_arrays,
 )
 from transport_study.modules.power_balance.module import (
+    FREEZABLE_SUBMODULES,
     PowerBalance,
     PowerBalanceSciML,
 )
@@ -257,7 +258,7 @@ def test_env_get_trainable_selections(transformer_module, sciml_module, torax_re
     """get_trainable never includes normalizer statistics.
 
     For transfer it returns only last-layer leaves (transformer head, the three torax MLPs, sciml taue/profile last layers).
-    For sciml with freeze_submodules both submodules drop out of the selection entirely.
+    For sciml with freeze_submodules only the p_oh / p_rad predictors drop out, the tau_E network and the profile predictor still train.
     For the transformer at da=none the selection is exactly feature_embed, profile_embed, pos_embed, attention and head.
     """
     # Transformer, da=none: exactly the five architecture components
@@ -293,15 +294,17 @@ def test_env_get_trainable_selections(transformer_module, sciml_module, torax_re
     for leaf in normalizer_leaves(torax_rebuild_module):
         assert not leaf_in_selection(sel_tx, leaf)
 
-    # Sciml, da=none: both submodule subtrees present, dropped when frozen
+    # Sciml, da=none: both submodule subtrees present, frozen ones keep the tau_E network but drop p_oh / p_rad
     sel_sciml = TransportPredictorEnv(module=sciml_module, domain_adaptation="none").get_trainable()
     assert sorted(sel_sciml.keys()) == ["power_balance", "profile_predictor"]
+    assert sorted(sel_sciml["power_balance"].keys()) == ["p_oh_predictor", "p_rad_predictor", "taue_predictor"]
     sel_sciml_frozen = TransportPredictorEnv(
         module=sciml_module,
         domain_adaptation="none",
-        freeze_submodules=["power_balance", "profile_predictor"],
+        freeze_submodules=list(FREEZABLE_SUBMODULES),
     ).get_trainable()
-    assert sel_sciml_frozen == {}
+    assert sorted(sel_sciml_frozen.keys()) == ["power_balance", "profile_predictor"]
+    assert sorted(sel_sciml_frozen["power_balance"].keys()) == ["taue_predictor"]
 
     # Sciml, transfer: taue / p_oh / p_rad / profile last layers only
     sel_sciml_transfer = TransportPredictorEnv(module=sciml_module, domain_adaptation="transfer").get_trainable()
@@ -323,13 +326,21 @@ def test_env_get_trainable_selections(transformer_module, sciml_module, torax_re
         assert not leaf_in_selection(sel_sciml_transfer, leaf)
         assert not leaf_in_selection(sel_sciml, leaf)
 
-    # Sciml, transfer with both submodules frozen: nothing left to train
+    # Sciml, transfer with frozen p_oh / p_rad: the taue and profile last layers only
     sel_sciml_transfer_frozen = TransportPredictorEnv(
         module=sciml_module,
         domain_adaptation="transfer",
-        freeze_submodules=["power_balance", "profile_predictor"],
+        freeze_submodules=list(FREEZABLE_SUBMODULES),
     ).get_trainable()
-    assert sel_sciml_transfer_frozen == []
+    expected_sciml_frozen = [
+        pb.taue_predictor.nn.layers[-1].weight,
+        pb.taue_predictor.nn.layers[-1].bias,
+        sciml_module.profile_predictor.nn.layers[-1].weight,
+        sciml_module.profile_predictor.nn.layers[-1].bias,
+    ]
+    assert len(sel_sciml_transfer_frozen) == len(expected_sciml_frozen)
+    for want in expected_sciml_frozen:
+        assert leaf_in_selection(sel_sciml_transfer_frozen, want)
 
 
 def test_transformer_position_embedding_orders_history(transformer_module):

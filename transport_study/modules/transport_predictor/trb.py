@@ -11,7 +11,10 @@ from popsim.ml.eval import EvaluationSuite
 
 from transport_study import RADIAL_DIM
 from transport_study.config import config
-from transport_study.modules.power_balance.module import SCALING_LAW_FIELDS
+from transport_study.modules.power_balance.module import (
+    FREEZABLE_SUBMODULES,
+    SCALING_LAW_FIELDS,
+)
 from transport_study.modules.power_balance.trb import PowerBalanceTRB
 from transport_study.modules.profile_predictor.trb import ProfilePredictorTRB
 from transport_study.modules.transport_predictor.module import (
@@ -137,7 +140,8 @@ class TransportPredictorTRB(TrainRunBuilder):
         which ran their own pretrain and finetune on the target device.
         Under skip_data_init it is an unrestored skeleton.
         """
-        freeze_submodules = ["power_balance", "profile_predictor"] if model_init_config.get("freeze_submodules", False) else []
+        # A frozen sciml case keeps its power balance's p_oh / p_rad predictors fixed, as the power balance study's freeze does
+        freeze_submodules = list(FREEZABLE_SUBMODULES) if model_init_config.get("freeze_submodules", False) else []
         build_config = module_build_config(model_init_config)
         env = TransportPredictorEnv(
             module=TransportPredictorTRB._build_module(train_dl, build_config),

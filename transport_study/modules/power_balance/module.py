@@ -547,6 +547,10 @@ class PowerBalanceTransformer(PowerBalance):
         )
 
 
+# The PowerBalanceTaue submodules a freeze_submodules case keeps out of the trainable selection, in both studies
+FREEZABLE_SUBMODULES = ("p_oh_predictor", "p_rad_predictor")
+
+
 class PowerBalanceEnv(ModuleTrainingEnv):
     module: PowerBalance
     domain_adaptation: str = eqx.field(static=True, default="unset")

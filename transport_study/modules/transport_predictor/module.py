@@ -940,8 +940,8 @@ class TransportPredictorEnv(ModuleTrainingEnv):
 
     module: TransportPredictor
     domain_adaptation: str = eqx.field(static=True, default="unset")
-    # Sciml submodule names ("power_balance", "profile_predictor") excluded
-    # from the trainable selection
+    # The power balance submodules a sciml case keeps out of the trainable selection (FREEZABLE_SUBMODULES),
+    # handed to its PowerBalanceEnv
     freeze_submodules: list[str] = eqx.field(static=True, default_factory=list)
     # Every architecture carries discrete state, so SIMPLE_EULER is required
     stepper: StepperType = eqx.field(static=True, default=StepperType.SIMPLE_EULER)
@@ -1015,16 +1015,14 @@ class TransportPredictorEnv(ModuleTrainingEnv):
                 for nn in (self.module.nn_transport, self.module.nn_sources, self.module.nn_edge):
                     last_layer_leaves += [nn.layers[-1].weight, nn.layers[-1].bias]
             if isinstance(self.module, TransportPredictorSciML):
-                if "power_balance" not in self.freeze_submodules:
-                    pb_env = PowerBalanceEnv(
-                        module=self.module.power_balance,
-                        domain_adaptation="transfer",
-                        freeze_submodules=[],
-                    )
-                    last_layer_leaves += pb_env.get_trainable()
-                if "profile_predictor" not in self.freeze_submodules:
-                    nn = self.module.profile_predictor.nn
-                    last_layer_leaves += [nn.layers[-1].weight, nn.layers[-1].bias]
+                pb_env = PowerBalanceEnv(
+                    module=self.module.power_balance,
+                    domain_adaptation="transfer",
+                    freeze_submodules=self.freeze_submodules,
+                )
+                last_layer_leaves += pb_env.get_trainable()
+                nn = self.module.profile_predictor.nn
+                last_layer_leaves += [nn.layers[-1].weight, nn.layers[-1].bias]
             return last_layer_leaves
 
         trainable_leaves = {}
@@ -1035,14 +1033,12 @@ class TransportPredictorEnv(ModuleTrainingEnv):
             for name in ("nn_transport", "nn_sources", "nn_edge"):
                 trainable_leaves[name] = eqx.filter(getattr(self.module, name), eqx.is_inexact_array)
         elif isinstance(self.module, TransportPredictorSciML):
-            if "power_balance" not in self.freeze_submodules:
-                pb_env = PowerBalanceEnv(
-                    module=self.module.power_balance,
-                    domain_adaptation=self.domain_adaptation,
-                    freeze_submodules=[],
-                )
-                trainable_leaves["power_balance"] = pb_env.get_trainable()
-            if "profile_predictor" not in self.freeze_submodules:
-                trainable_leaves["profile_predictor"] = eqx.filter(self.module.profile_predictor.nn, eqx.is_inexact_array)
+            pb_env = PowerBalanceEnv(
+                module=self.module.power_balance,
+                domain_adaptation=self.domain_adaptation,
+                freeze_submodules=self.freeze_submodules,
+            )
+            trainable_leaves["power_balance"] = pb_env.get_trainable()
+            trainable_leaves["profile_predictor"] = eqx.filter(self.module.profile_predictor.nn, eqx.is_inexact_array)
 
         return trainable_leaves

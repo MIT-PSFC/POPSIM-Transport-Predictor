@@ -189,9 +189,9 @@ class TransportStudy(Study):
         - transfer: Train on source data, freeze all but the last layers of the model, and fine-tune on a small amount of target data
         - transfer_pretrain: The pretrain half of a transfer case, never a case-grid axis value (see Study.Case.transfer_pretrain_case). Trains on historic data only with checkpoint selection on the target test set. Stat normalizations (physics-coral / physics-zscore) fit the stat stage on historic + the transfer case's target shots, stateless ones share one twin at 0 target shots
 
-        freeze_submodules: Whether to freeze the power_balance / profile
-        submodules of the sciml model during training. Only meaningful for
-        sciml, every other model type is pinned to the hyperparam default.
+        freeze_submodules: Whether the sciml model keeps the p_oh / p_rad predictors of its power balance submodule frozen,
+        as the power balance study's freeze does. Its tau_E network and the profile predictor always train.
+        Only meaningful for sciml, every other model type is pinned to the hyperparam default.
 
         geometry_builder: Per-sample TORAX geometry construction, only meaningful for torax-* model
         types (every other model type is pinned to "circular").
