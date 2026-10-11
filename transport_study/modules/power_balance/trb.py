@@ -26,12 +26,14 @@ from transport_study.modules.trb_utils import (
     get_time_dep_dataloaders,
     make_grouped_exponential_adamw,
     make_loss_eval_suite,
+    module_build_config,
     normalizer_fit_dataset,
     per_sample_device_values,
     restore_from_checkpoint,
     scalar_study_results,
     submodule_config_dict,
     target_device_idx,
+    transfer_checkpoint_to_restore,
 )
 
 # Anchor terms in the training loss of the models with p_oh / p_rad submodules, keyed by measured target signal:
@@ -44,14 +46,19 @@ ANCHOR_SIGNALS = {
 }
 
 
-def _restored_submodules(train_dl: DataLoader, model_init_config: dict) -> tuple:
-    """The p_oh and p_rad predictors, built by their own TRBs and restored from their prereq case checkpoints."""
-    restored = []
+def _prereq_submodules(train_dl: DataLoader, model_init_config: dict) -> tuple:
+    """The p_oh and p_rad predictors, built by their own TRBs as skeletons and restored from their prereq case checkpoints.
+
+    A skip_data_init model_init_config gets the unrestored skeletons, its caller restores them (see trb_utils.module_build_config).
+    """
+    submodules = []
     for name, submodule_trb in (("p_oh_predictor", OhmicPowerTRB), ("p_rad_predictor", RadiatedPowerTRB)):
         submodule_config = submodule_config_dict(model_init_config["submodules"][name])
-        submodule = submodule_trb.model_init(train_dl, submodule_config["model_init_config"])
-        restored.append(restore_from_checkpoint(submodule, submodule_config["checkpoint_dir"]))
-    return tuple(restored)
+        submodule = submodule_trb.model_init(train_dl, {**submodule_config["model_init_config"], "skip_data_init": True})
+        if not model_init_config.get("skip_data_init", False):
+            submodule = restore_from_checkpoint(submodule, submodule_config["checkpoint_dir"])
+        submodules.append(submodule)
+    return tuple(submodules)
 
 
 class PowerBalanceTRB(TrainRunBuilder):
@@ -68,48 +75,48 @@ class PowerBalanceTRB(TrainRunBuilder):
         return get_time_dep_dataloaders(dataloader_config, PowerBalanceTRB.STUDY_TYPE)
 
     @staticmethod
-    def _build_module(train_dl: DataLoader, model_init_config: dict) -> Any:
-        """The power balance module of model_init_config["model_type"], normalizer fitted on the training data."""
-        model_type = model_init_config["model_type"]
+    def _build_module(train_dl: DataLoader, build_config: dict) -> Any:
+        """The power balance module of build_config["model_type"], normalizer fitted on the training data (see module_build_config)."""
+        model_type = build_config["model_type"]
         if model_type == "sciml-taue-scalinglaw":
             # The scaling law consumes physical units and holds no normalizer,
             # data_normalization reaches only its p_oh / p_rad prereq cases
-            p_oh_predictor, p_rad_predictor = _restored_submodules(train_dl, model_init_config)
+            p_oh_predictor, p_rad_predictor = _prereq_submodules(train_dl, build_config)
             return PowerBalanceScalingLaw.init(p_oh_predictor=p_oh_predictor, p_rad_predictor=p_rad_predictor)
         normalizer = make_normalizer(
-            model_init_config["data_normalization"],
-            normalizer_fit_dataset(train_dl, model_init_config),
+            build_config["data_normalization"],
+            normalizer_fit_dataset(train_dl, build_config),
             len(config.ds_source_to_idx),
             target_device_idx(),
             with_energy=model_type in MODEL_TYPES_WITH_ENERGY_INPUT,
         )
         if model_type == "sciml-taue-nn":
-            p_oh_predictor, p_rad_predictor = _restored_submodules(train_dl, model_init_config)
+            p_oh_predictor, p_rad_predictor = _prereq_submodules(train_dl, build_config)
             return PowerBalanceSciML.init(
                 p_oh_predictor=p_oh_predictor,
                 p_rad_predictor=p_rad_predictor,
                 normalizer=normalizer,
-                nn_width=model_init_config["nn_width"],
-                nn_depth=model_init_config["nn_depth"],
-                prng_seed=model_init_config["prng_seed"],
+                nn_width=build_config["nn_width"],
+                nn_depth=build_config["nn_depth"],
+                prng_seed=build_config["prng_seed"],
             )
         if model_type == "mlp":
             return PowerBalanceMLP.init(
-                nn_width=model_init_config["nn_width"],
-                nn_depth=model_init_config["nn_depth"],
+                nn_width=build_config["nn_width"],
+                nn_depth=build_config["nn_depth"],
                 normalizer=normalizer,
-                prng_seed=model_init_config["prng_seed"],
+                prng_seed=build_config["prng_seed"],
             )
         if model_type == "transformer":
             return PowerBalanceTransformer.init(
-                d_model=model_init_config["d_model"],
-                num_heads=model_init_config["num_heads"],
-                history_len=model_init_config["history_len"],
-                nn_width=model_init_config["nn_width"],
-                nn_depth=model_init_config["nn_depth"],
+                d_model=build_config["d_model"],
+                num_heads=build_config["num_heads"],
+                history_len=build_config["history_len"],
+                nn_width=build_config["nn_width"],
+                nn_depth=build_config["nn_depth"],
                 normalizer=normalizer,
-                predicts_powers=model_init_config["multiobjective"],
-                prng_seed=model_init_config["prng_seed"],
+                predicts_powers=build_config["multiobjective"],
+                prng_seed=build_config["prng_seed"],
             )
         raise ValueError(f"Invalid model type: {model_type}")
 
@@ -117,23 +124,27 @@ class PowerBalanceTRB(TrainRunBuilder):
     def model_init(train_dl: DataLoader, model_init_config: dict) -> PowerBalanceEnv:
         """The PowerBalanceEnv of a case, its submodules restored from their prereq cases.
 
-        A transfer case restores the whole env from its transfer_pretrain checkpoint,
+        A transfer case builds a skeleton (see trb_utils.module_build_config),
+        restores the whole env from its transfer_pretrain checkpoint,
         then puts back the submodules of its own p_oh / p_rad prereq cases,
         which ran their own pretrain and finetune on the target device.
+        Under skip_data_init it is an unrestored skeleton.
         """
         freeze_submodules = ["p_oh_predictor", "p_rad_predictor"] if model_init_config.get("freeze_submodules", False) else []
+        build_config = module_build_config(model_init_config)
         env = PowerBalanceEnv(
-            module=PowerBalanceTRB._build_module(train_dl, model_init_config),
+            module=PowerBalanceTRB._build_module(train_dl, build_config),
             domain_adaptation=model_init_config["domain_adaptation"],
             freeze_submodules=freeze_submodules,
         )
-        if model_init_config.get("transfer_checkpoint"):
-            env = restore_from_checkpoint(env, model_init_config["transfer_checkpoint"])
+        transfer_checkpoint = transfer_checkpoint_to_restore(model_init_config)
+        if transfer_checkpoint:
+            env = restore_from_checkpoint(env, transfer_checkpoint)
             if model_init_config["model_type"] in MODEL_TYPES_WITH_SUBMODULES:
                 env = eqx.tree_at(
                     lambda e: (e.module.p_oh_predictor, e.module.p_rad_predictor),
                     env,
-                    _restored_submodules(train_dl, model_init_config),
+                    _prereq_submodules(train_dl, model_init_config),
                 )
         return env
 

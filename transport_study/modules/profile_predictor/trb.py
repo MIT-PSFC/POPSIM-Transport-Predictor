@@ -37,12 +37,14 @@ from transport_study.modules.trb_utils import (
     integrate_error_over_time,
     make_exponential_adamw,
     make_loss_eval_suite,
+    module_build_config,
     normalizer_fit_dataset,
     per_sample_device_values,
     per_sample_sigma_floor,
     resolve_case_datasets,
     restore_from_checkpoint,
     target_device_idx,
+    transfer_checkpoint_to_restore,
     unstack_samples,
 )
 from transport_study.orchestration.organize_data import merge_parts
@@ -130,15 +132,15 @@ class ProfilePredictorTRB(TrainRunBuilder):
     def model_init(train_dl: DataLoader, model_init_config: dict) -> Any:
         """The profile predictor of a case, restored from the transfer checkpoint when one is set.
 
-        The data-driven init (normalizer statistics, PCA / k-means shape guess) is skipped when a restore will overwrite it:
-        for a transfer case, and for a skeleton built with skip_data_init on a dataset that cannot support it
-        (the transport sciml submodule, see transport_predictor/trb.py).
+        The data-driven init (normalizer statistics, PCA / k-means shape guess) is skipped when a restore will overwrite it
+        (see trb_utils.module_build_config): for a transfer case,
+        and for a skip_data_init skeleton, which the transport sciml submodule also needs since its dataset cannot support the init.
         """
-        skip_data_init = model_init_config.get("skip_data_init", False)
+        build_config = module_build_config(model_init_config)
         # Stat stage (CORAL or z-score) on the dimensionless nn_inputs
         normalizer = make_nn_input_normalizer(
             model_init_config["data_normalization"],
-            None if skip_data_init else normalizer_fit_dataset(train_dl, model_init_config),
+            normalizer_fit_dataset(train_dl, build_config),
             len(config.ds_source_to_idx),
             target_device_idx(),
         )
@@ -166,7 +168,7 @@ class ProfilePredictorTRB(TrainRunBuilder):
 
             # PCA / k-means initial guess for the shapes, unless a restore overwrites them
             # (a transfer fine-tune dataset can also hold fewer samples than shapes)
-            if not model_init_config.get("transfer_checkpoint") and not skip_data_init:
+            if not build_config.get("skip_data_init", False):
                 ds = train_dl.ds
                 sample_dim = train_dl.dataset.training_metadata.sample_dim
 
@@ -220,8 +222,9 @@ class ProfilePredictorTRB(TrainRunBuilder):
         else:
             raise ValueError(f"Invalid model type {model_init_config['model_type']}")
 
-        if model_init_config.get("transfer_checkpoint"):
-            module = restore_from_checkpoint(module, model_init_config["transfer_checkpoint"])
+        transfer_checkpoint = transfer_checkpoint_to_restore(model_init_config)
+        if transfer_checkpoint:
+            module = restore_from_checkpoint(module, transfer_checkpoint)
         return module
 
     # Softening fraction for the relative-error denominator in study_results.

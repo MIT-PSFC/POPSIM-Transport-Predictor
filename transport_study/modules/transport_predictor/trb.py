@@ -29,12 +29,14 @@ from transport_study.modules.trb_utils import (
     huber_profile_loss,
     make_grouped_exponential_adamw,
     make_loss_eval_suite,
+    module_build_config,
     normalizer_fit_dataset,
     per_sample_device_values,
     per_sample_sigma_floor,
     restore_from_checkpoint,
     submodule_config_dict,
     target_device_idx,
+    transfer_checkpoint_to_restore,
 )
 
 # Anchor terms in the training loss (sciml and multiobjective cases), keyed by measured target signal:
@@ -46,22 +48,24 @@ ANCHOR_SIGNALS = {
 }
 
 
-def _restored_sciml_submodules(train_dl: DataLoader, model_init_config: dict) -> tuple:
+def _sciml_submodules(train_dl: DataLoader, model_init_config: dict) -> tuple:
     """The power balance module and the profile predictor of a sciml case, restored from their prereq case checkpoints.
 
-    The skeletons come from the submodules' own TRBs, the power balance case checkpointed a whole PowerBalanceEnv.
-    The profile skeleton skips its data-driven init (skip_data_init):
+    The skeletons come from the submodules' own TRBs under skip_data_init,
+    and the power balance one is a whole PowerBalanceEnv, as its case checkpointed.
+    The profile skeleton could not take its data-driven init anyway:
     the transport dataloader carries no measured beta_tor_norm and no shape variables,
     and the restore overwrites every leaf with the weights fitted on the profile study's own data.
+    A skip_data_init model_init_config gets the unrestored skeletons, its caller restores them (see trb_utils.module_build_config).
     """
     pb_config = submodule_config_dict(model_init_config["submodules"]["power_balance"])
     profile_config = submodule_config_dict(model_init_config["submodules"]["profile_predictor"])
-    pb_env = PowerBalanceTRB.model_init(train_dl, pb_config["model_init_config"])
-    profile_skeleton = ProfilePredictorTRB.model_init(train_dl, {**profile_config["model_init_config"], "skip_data_init": True})
-    return (
-        restore_from_checkpoint(pb_env, pb_config["checkpoint_dir"]).module,
-        restore_from_checkpoint(profile_skeleton, profile_config["checkpoint_dir"]),
-    )
+    pb_env = PowerBalanceTRB.model_init(train_dl, {**pb_config["model_init_config"], "skip_data_init": True})
+    profile_predictor = ProfilePredictorTRB.model_init(train_dl, {**profile_config["model_init_config"], "skip_data_init": True})
+    if not model_init_config.get("skip_data_init", False):
+        pb_env = restore_from_checkpoint(pb_env, pb_config["checkpoint_dir"])
+        profile_predictor = restore_from_checkpoint(profile_predictor, profile_config["checkpoint_dir"])
+    return pb_env.module, profile_predictor
 
 
 class TransportPredictorTRB(TrainRunBuilder):
@@ -78,46 +82,46 @@ class TransportPredictorTRB(TrainRunBuilder):
         return get_time_dep_dataloaders(dataloader_config, TransportPredictorTRB.STUDY_TYPE)
 
     @staticmethod
-    def _build_module(train_dl: DataLoader, model_init_config: dict) -> Any:
-        """The transport predictor of model_init_config["model_type"]."""
-        model_type = model_init_config["model_type"]
+    def _build_module(train_dl: DataLoader, build_config: dict) -> Any:
+        """The transport predictor of build_config["model_type"] (see trb_utils.module_build_config)."""
+        model_type = build_config["model_type"]
         if model_type == "sciml":
-            power_balance, profile_predictor = _restored_sciml_submodules(train_dl, model_init_config)
+            power_balance, profile_predictor = _sciml_submodules(train_dl, build_config)
             return TransportPredictorSciML.init(power_balance=power_balance, profile_predictor=profile_predictor)
 
         # Stat stage (CORAL or z-score) on the 11 transport features, sciml has none of its own
         normalizer = make_transport_nn_input_normalizer(
-            model_init_config["data_normalization"],
-            normalizer_fit_dataset(train_dl, model_init_config),
+            build_config["data_normalization"],
+            normalizer_fit_dataset(train_dl, build_config),
             len(config.ds_source_to_idx),
             target_device_idx(),
         )
         rhogrid = np.asarray(train_dl.ds[RADIAL_DIM])
         if model_type == "transformer":
             return TransportPredictorTransformer.init(
-                d_model=model_init_config["d_model"],
-                num_heads=model_init_config["num_heads"],
-                history_len=model_init_config["history_len"],
-                nn_width=model_init_config["nn_width"],
-                nn_depth=model_init_config["nn_depth"],
+                d_model=build_config["d_model"],
+                num_heads=build_config["num_heads"],
+                history_len=build_config["history_len"],
+                nn_width=build_config["nn_width"],
+                nn_depth=build_config["nn_depth"],
                 rhogrid=rhogrid,
                 normalizer=normalizer,
-                multiobjective=model_init_config["multiobjective"],
-                prng_seed=model_init_config["prng_seed"],
+                multiobjective=build_config["multiobjective"],
+                prng_seed=build_config["prng_seed"],
             )
         if model_type.startswith("torax-"):
-            torax_cls = {"rebuild": TransportPredictorTorax, "carry": TransportPredictorToraxCarry}[model_init_config["torax_state"]]
+            torax_cls = {"rebuild": TransportPredictorTorax, "carry": TransportPredictorToraxCarry}[build_config["torax_state"]]
             return torax_cls.init(
                 rhogrid=rhogrid,
-                torax_config=model_init_config["torax_config"],
-                nn_width=model_init_config["nn_width"],
-                nn_depth=model_init_config["nn_depth"],
-                prng_seed=model_init_config["prng_seed"],
+                torax_config=build_config["torax_config"],
+                nn_width=build_config["nn_width"],
+                nn_depth=build_config["nn_depth"],
+                prng_seed=build_config["prng_seed"],
                 normalizer=normalizer,
-                sim_dt=model_init_config["sim_dt"],
+                sim_dt=build_config["sim_dt"],
                 transport_model=model_type.removeprefix("torax-"),
-                geometry_builder=model_init_config["geometry_builder"],
-                delta_exponent=model_init_config["delta_exponent"],
+                geometry_builder=build_config["geometry_builder"],
+                delta_exponent=build_config["delta_exponent"],
             )
         raise ValueError(f"Invalid model type: {model_type}")
 
@@ -125,23 +129,27 @@ class TransportPredictorTRB(TrainRunBuilder):
     def model_init(train_dl: DataLoader, model_init_config: dict) -> TransportPredictorEnv:
         """The TransportPredictorEnv of a case, the sciml submodules restored from their prereq cases.
 
-        A transfer case restores the whole env from its transfer_pretrain checkpoint,
+        A transfer case builds a skeleton (see trb_utils.module_build_config),
+        restores the whole env from its transfer_pretrain checkpoint,
         then a sciml case puts back the submodules of its own power_balance / profile prereq cases,
         which ran their own pretrain and finetune on the target device.
+        Under skip_data_init it is an unrestored skeleton.
         """
         freeze_submodules = ["power_balance", "profile_predictor"] if model_init_config.get("freeze_submodules", False) else []
+        build_config = module_build_config(model_init_config)
         env = TransportPredictorEnv(
-            module=TransportPredictorTRB._build_module(train_dl, model_init_config),
+            module=TransportPredictorTRB._build_module(train_dl, build_config),
             domain_adaptation=model_init_config["domain_adaptation"],
             freeze_submodules=freeze_submodules,
         )
-        if model_init_config.get("transfer_checkpoint"):
-            env = restore_from_checkpoint(env, model_init_config["transfer_checkpoint"])
+        transfer_checkpoint = transfer_checkpoint_to_restore(model_init_config)
+        if transfer_checkpoint:
+            env = restore_from_checkpoint(env, transfer_checkpoint)
             if model_init_config["model_type"] == "sciml":
                 env = eqx.tree_at(
                     lambda e: (e.module.power_balance, e.module.profile_predictor),
                     env,
-                    _restored_sciml_submodules(train_dl, model_init_config),
+                    _sciml_submodules(train_dl, model_init_config),
                 )
         return env
 

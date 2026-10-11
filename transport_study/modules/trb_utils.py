@@ -558,17 +558,37 @@ class CaseTrainDataLoader(DataLoader):
                     return
 
 
-def normalizer_fit_dataset(train_dl: CaseTrainDataLoader, model_init_config: dict) -> xr.Dataset | None:
-    """The dataset a model_init fits its normalizer statistics on, None when a transfer checkpoint will overwrite them.
+def module_build_config(model_init_config: dict) -> dict:
+    """The model_init_config a TRB builds its module with, a skip_data_init skeleton when a transfer restore overwrites every leaf.
+
+    A skip_data_init skeleton keeps identity normalizer buffers (normalizer_fit_dataset gives None),
+    skips every other data-driven init (the profile shape guess)
+    and restores nothing, neither a transfer checkpoint nor a submodule prereq,
+    since its caller is gonna restore the whole thing anyway.
+    A transfer case builds one too: a fit on its few target shots would be ill-conditioned,
+    and the statistics restored from its transfer_pretrain prereq are the right ones.
+    """
+    if model_init_config.get("transfer_checkpoint"):
+        return {**model_init_config, "skip_data_init": True}
+    return model_init_config
+
+
+def transfer_checkpoint_to_restore(model_init_config: dict) -> str | None:
+    """The transfer_pretrain checkpoint a model_init restores its built module from, None for none and for a skip_data_init skeleton."""
+    if model_init_config.get("skip_data_init", False):
+        return None
+    return model_init_config.get("transfer_checkpoint")
+
+
+def normalizer_fit_dataset(train_dl: CaseTrainDataLoader, build_config: dict) -> xr.Dataset | None:
+    """The dataset a module build (see module_build_config) fits its normalizer statistics on, None for a skip_data_init skeleton.
 
     A transfer_pretrain case trains on historic data only, but fits its normalizer on historic + target shots,
     so the transfer case it pretrains for inherits target-aware statistics through the checkpoint restore.
     model_init only receives the train dataloader, so that fit dataset rides on it (CaseTrainDataLoader.normalizer_fit_ds).
     Every other case fits on its own training data.
-    A transfer case skips the fit: one on its few target shots would be ill-conditioned,
-    and the statistics restored from its transfer_pretrain prereq are the right ones.
     """
-    if model_init_config.get("transfer_checkpoint"):
+    if build_config.get("skip_data_init", False):
         return None
     return train_dl.normalizer_fit_ds
 

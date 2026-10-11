@@ -13,11 +13,13 @@ from transport_study.modules.normalization import make_normalizer
 from transport_study.modules.trb_utils import (
     make_exponential_adamw,
     make_loss_eval_suite,
+    module_build_config,
     normalizer_fit_dataset,
     per_sample_device_values,
     restore_from_checkpoint,
     scalar_study_results,
     target_device_idx,
+    transfer_checkpoint_to_restore,
 )
 
 
@@ -38,10 +40,14 @@ class ScalarPowerTRB(TrainRunBuilder):
 
     @classmethod
     def model_init(cls, train_dl: DataLoader, model_init_config: dict) -> Any:
-        """The predictor with its normalizer fitted on the training data, restored from the transfer checkpoint when one is set."""
+        """The predictor with its normalizer fitted on the training data, restored from the transfer checkpoint when one is set.
+
+        Under skip_data_init it is an unrestored skeleton (see trb_utils.module_build_config).
+        """
+        build_config = module_build_config(model_init_config)
         normalizer = make_normalizer(
             model_init_config["data_normalization"],
-            normalizer_fit_dataset(train_dl, model_init_config),
+            normalizer_fit_dataset(train_dl, build_config),
             len(config.ds_source_to_idx),
             target_device_idx(),
         )
@@ -51,8 +57,9 @@ class ScalarPowerTRB(TrainRunBuilder):
             prng_seed=model_init_config["prng_seed"],
             normalizer=normalizer,
         )
-        if model_init_config.get("transfer_checkpoint"):
-            module = restore_from_checkpoint(module, model_init_config["transfer_checkpoint"])
+        transfer_checkpoint = transfer_checkpoint_to_restore(model_init_config)
+        if transfer_checkpoint:
+            module = restore_from_checkpoint(module, transfer_checkpoint)
         return module
 
     @classmethod
