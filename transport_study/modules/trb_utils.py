@@ -195,27 +195,6 @@ def submodule_config_dict(submodule_config: TrainConfig | dict) -> dict:
     return submodule_config.model_dump() if isinstance(submodule_config, TrainConfig) else submodule_config
 
 
-def attach_normalizer_fit_ds(train_dl: DataLoader, normalizer_fit_ds: xr.Dataset | None) -> None:
-    """Carry a transfer_pretrain case's normalizer fit dataset on its train dataloader, see normalizer_fit_dataset."""
-    if normalizer_fit_ds is not None:
-        train_dl.normalizer_fit_ds = normalizer_fit_ds
-
-
-def normalizer_fit_dataset(train_dl: DataLoader, model_init_config: dict) -> xr.Dataset | None:
-    """The dataset a model_init fits its normalizer statistics on, None when a transfer checkpoint will overwrite them.
-
-    A transfer_pretrain case trains on historic data only, but fits its normalizer on historic + target shots,
-    so the transfer case it pretrains for inherits target-aware statistics through the checkpoint restore.
-    model_init only receives the train dataloader, so that fit dataset rides on it as an attribute (attach_normalizer_fit_ds).
-    Every other case fits on its own training data.
-    A transfer case skips the fit: one on its few target shots would be ill-conditioned,
-    and the statistics restored from its transfer_pretrain prereq are the right ones.
-    """
-    if model_init_config.get("transfer_checkpoint"):
-        return None
-    return getattr(train_dl, "normalizer_fit_ds", train_dl.ds)
-
-
 def unstack_samples(da: xr.DataArray) -> xr.DataArray:
     """An evaluation variable back on its (shot, time_idx[, rho]) dims.
 
@@ -528,19 +507,23 @@ def prepared_for_dataloader(ds: xr.Dataset) -> xr.Dataset:
     return ds
 
 
-class FixedStepsDataLoader(DataLoader):
-    """A training DataLoader whose every epoch is exactly steps_per_epoch batches of the natural loader's batch size.
+class CaseTrainDataLoader(DataLoader):
+    """Every case's training DataLoader, each epoch exactly steps_per_epoch batches of the natural loader's batch size.
 
     Every case of a study trains the same steps per epoch (Study.steps_per_epoch),
     so the LR schedule, the validation cadence and the patience count the same optimizer steps
     whatever the size of the case's training set.
     An epoch chains reshuffled passes over the samples until steps_per_epoch batches are out,
     and the rest of its last pass is dropped.
+    A steps_per_epoch of None keeps one natural pass per epoch, as Study.steps_per_epoch builds it to measure that length.
+
+    It also carries normalizer_fit_ds, the dataset model_init fits its normalizer statistics on (see normalizer_fit_dataset),
+    its own samples unless resolve_case_datasets returned a separate fit set.
     """
 
-    def __init__(self, train_dl: DataLoader, steps_per_epoch: int):
+    def __init__(self, train_dl: DataLoader, steps_per_epoch: int | None, normalizer_fit_ds: xr.Dataset | None = None):
         n_batches_natural = len(train_dl)
-        if n_batches_natural > steps_per_epoch:
+        if steps_per_epoch is not None and n_batches_natural > steps_per_epoch:
             raise ValueError(
                 f"One pass over this training set is {n_batches_natural} batches, more than the study's {steps_per_epoch} steps per epoch, "
                 "which come from the largest training set its locked fields allow"
@@ -555,11 +538,17 @@ class FixedStepsDataLoader(DataLoader):
             generate_prng=train_dl.generate_prng,
         )
         self.steps_per_epoch = steps_per_epoch
+        self.normalizer_fit_ds = self.ds if normalizer_fit_ds is None else normalizer_fit_ds
 
     def __len__(self) -> int:
+        if self.steps_per_epoch is None:
+            return super().__len__()
         return self.steps_per_epoch
 
     def __iter__(self):
+        if self.steps_per_epoch is None:
+            yield from super().__iter__()
+            return
         n_batches = 0
         while True:
             for batch in super().__iter__():
@@ -569,11 +558,19 @@ class FixedStepsDataLoader(DataLoader):
                     return
 
 
-def fixed_steps_train_dataloader(train_dl: DataLoader, steps_per_epoch: int | None) -> DataLoader:
-    """train_dl at the study's steps per epoch, as built when None (only Study.steps_per_epoch measures it so)."""
-    if steps_per_epoch is None:
-        return train_dl
-    return FixedStepsDataLoader(train_dl, steps_per_epoch)
+def normalizer_fit_dataset(train_dl: CaseTrainDataLoader, model_init_config: dict) -> xr.Dataset | None:
+    """The dataset a model_init fits its normalizer statistics on, None when a transfer checkpoint will overwrite them.
+
+    A transfer_pretrain case trains on historic data only, but fits its normalizer on historic + target shots,
+    so the transfer case it pretrains for inherits target-aware statistics through the checkpoint restore.
+    model_init only receives the train dataloader, so that fit dataset rides on it (CaseTrainDataLoader.normalizer_fit_ds).
+    Every other case fits on its own training data.
+    A transfer case skips the fit: one on its few target shots would be ill-conditioned,
+    and the statistics restored from its transfer_pretrain prereq are the right ones.
+    """
+    if model_init_config.get("transfer_checkpoint"):
+        return None
+    return train_dl.normalizer_fit_ds
 
 
 def get_time_dep_dataloaders(
@@ -635,8 +632,7 @@ def get_time_dep_dataloaders(
             drop_last=[True, False],
             pad_last=[False, True],
         )
-    train_dl = fixed_steps_train_dataloader(train_dl, dataloader_config["steps_per_epoch"])
-    attach_normalizer_fit_ds(train_dl, normalizer_fit_ds)
+    train_dl = CaseTrainDataLoader(train_dl, dataloader_config["steps_per_epoch"], normalizer_fit_ds)
     # The validation set doubles as the test set (see resolve_case_datasets)
     return ds_val, train_dl, val_dl, val_dl
 

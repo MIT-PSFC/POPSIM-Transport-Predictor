@@ -842,7 +842,7 @@ class Study:
 
         It is the natural steps per epoch of the largest training set the locked fields allow:
         every non-target device's training and validation shots plus the whole target pool.
-        Every case's training set is a subset of it, repeated in reshuffled passes up to steps_per_epoch (trb_utils.FixedStepsDataLoader),
+        Every case's training set is a subset of it, repeated in reshuffled passes up to steps_per_epoch (trb_utils.CaseTrainDataLoader),
         so the LR schedule, the validation cadence and the patience count the same steps in every case.
         Only locked fields enter, so it follows neither the case grid nor the study of a lineage.
         Measured on the case's final loader config (batch size, segments, variables), so each loader family gets its own.
