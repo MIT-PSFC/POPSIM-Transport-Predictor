@@ -568,13 +568,16 @@ def partition_user_tres_caps(partition: str) -> dict[str, int] | None:
     qos = info.get("QoS")
     if qos in (None, "N/A"):
         return {}
-    stdout = _slurm_stdout(["sacctmgr", "-nP", "show", "qos", qos, "format=MaxTRESPU"], level="WARNING")
+    # The name column tells a QOS without MaxTRESPU (a "<qos>|" row) from one sacctmgr does not know (no row)
+    stdout = _slurm_stdout(["sacctmgr", "-nP", "show", "qos", qos, "format=Name,MaxTRESPU"], level="WARNING")
     if stdout is None:
         return None
-    if not stdout.strip():
-        logger.warning(f"sacctmgr show qos {qos} returned no output, not caching")
-        return None
-    return _tres_amounts(stdout)
+    for line in stdout.splitlines():
+        name, _, max_tres_per_user = line.partition("|")
+        if name == qos:
+            return _tres_amounts(max_tres_per_user)
+    logger.warning(f"sacctmgr show qos {qos} returned no row for it, not caching")
+    return None
 
 
 # Clock fields of a SLURM time string by field count, without and with a day prefix (the sbatch --time grammar)

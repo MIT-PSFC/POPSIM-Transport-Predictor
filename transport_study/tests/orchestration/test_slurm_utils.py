@@ -151,13 +151,15 @@ FAKE_CPU_NODES = [
 FAKE_USER_CPU_TRES = ["cpu=4,mem=48G,node=1,billing=4"] * 3
 
 
-def _fake_cpu_slurm_stdout(qos_caps: str):
+def _fake_cpu_slurm_stdout(qos_caps: str | None):
+    """qos_caps is the MaxTRESPU of the partition's QOS, None for a partition without a QOS."""
+
     def fake_stdout(cmd: list[str]) -> str:
         if cmd[:3] == ["scontrol", "show", "partition"]:
-            qos = "fake_qos" if qos_caps else "N/A"
+            qos = "N/A" if qos_caps is None else "fake_qos"
             return f"PartitionName={cmd[3]} QoS={qos} MaxTime=12:00:00\n"
         if cmd[0] == "sacctmgr":
-            return qos_caps + "\n"
+            return f"fake_qos|{qos_caps}\n"
         if cmd[0] == "sinfo":
             return "".join(f"{node}  {cpus}  {memory}  {alloc}  {state}\n" for node, cpus, memory, alloc, state in FAKE_CPU_NODES)
         if cmd[0] == "squeue" and "--state=PENDING" in cmd:
@@ -177,6 +179,8 @@ def _fake_cpu_slurm_stdout(qos_caps: str):
     ("partition", "qos_caps", "slots"),
     [
         # 2 + 8 + 1 node slots, less the 1 pending job
+        ("fake_cpu_no_qos", None, 10),
+        # A QOS without MaxTRESPU caps nothing either
         ("fake_cpu_uncapped", "", 10),
         # (386G - 3 x 48G) // 48G = 5 jobs of memory left under the QOS cap, CPUs would allow 21
         ("fake_cpu_capped", "cpu=96,mem=386G", 5),
