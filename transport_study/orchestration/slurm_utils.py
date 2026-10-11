@@ -72,11 +72,14 @@ echo "=== node $SLURMD_NODENAME gpu ${{SLURM_JOB_GPUS:-$CUDA_VISIBLE_DEVICES}} $
 
 
 def _run_slurm(cmd: list[str], stdin: str | None = None) -> subprocess.CompletedProcess | None:
-    """The completed SLURM command, None (logged) when it timed out."""
+    """The completed SLURM command, None (logged) when it timed out or SLURM is not installed."""
     try:
         return subprocess.run(cmd, input=stdin, check=False, capture_output=True, text=True, timeout=SLURM_COMMAND_TIMEOUT_S)
     except subprocess.TimeoutExpired:
         logger.critical(f"{cmd[0]} timed out after {SLURM_COMMAND_TIMEOUT_S} s")
+        return None
+    except FileNotFoundError:
+        logger.critical(f"{cmd[0]} not found, SLURM is not installed on this machine")
         return None
 
 

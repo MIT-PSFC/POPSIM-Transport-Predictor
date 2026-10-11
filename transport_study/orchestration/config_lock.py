@@ -79,7 +79,8 @@ def read_config_lock(path: Path, current_config: StudyConfig, study_type: str) -
     lock_table = data.pop(LOCK_TABLE, None)
     if lock_table is None:
         raise RuntimeError(
-            f"Config lock {path} has no [{LOCK_TABLE}] table. Clean the study (clean_models and clean_results) to recreate it."
+            f"Config lock {path} has no [{LOCK_TABLE}] table. "
+            "Start the study over with clean_models, or with reset_study for a parallel study."
         )
     if lock_table["study_type"] != study_type:
         raise RuntimeError(

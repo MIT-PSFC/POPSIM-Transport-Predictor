@@ -191,6 +191,20 @@ def write_netcdf_atomic(ds: xr.Dataset, path: Path | str) -> None:
     tmp_path.replace(path)
 
 
+def _load_study_config(study_config: CaseGridConfig) -> None:
+    """Load study_config as the global config, which a process loads once.
+
+    A process that already loaded an equal config passes, a different one raises.
+    """
+    if not config.initialized:
+        load_config(study_config)
+    elif study_config != config.get_instance():
+        raise RuntimeError(
+            f"Study {study_config.study_name} got a different config than the one this process already loaded (study {config.study_name}), "
+            "the global config is loaded once per process"
+        )
+
+
 class CaseGridConfig(StudyConfig):
     """Config base for studies built on a case grid (model_type x training_data x ...).
 
@@ -682,7 +696,10 @@ class Study:
         if clean_sweeps:
             # Only this study's own sweeps, a borrowed hyperparam case's sweep belongs to its home study
             own_hyperparam_cases = [case for case in self.cases if case.is_hyperparam_case() and not self.is_borrowed(case)]
-            run_clean_sweeps({self.wandb_project_name(case) for case in own_hyperparam_cases})
+            if config.wandb_entity is None:
+                logger.warning("No wandb entity is set (PTPS_WANDB_ENTITY), so the study's wandb sweeps are left in place")
+            else:
+                run_clean_sweeps({self.wandb_project_name(case) for case in own_hyperparam_cases})
             for case in own_hyperparam_cases:
                 shutil.rmtree(self.sweep_checkpoint_dir(case), ignore_errors=True)
 
@@ -1762,7 +1779,7 @@ class Study:
         run_log_path = run_log_dir / f"{os.getpid()}_run_study.log"
         logger.add(run_log_path)
         # The partition checks read the global config, and run before anything is cleaned or written
-        load_config(config)
+        _load_study_config(config)
         if enable_parallelism:
             if not config.partition:
                 raise ValueError("enable_parallelism is True but no SLURM partition is specified in the config")
@@ -1822,15 +1839,17 @@ class Study:
         """
         if isinstance(config, (str, Path)):
             config = cls.Config.from_toml(Path(config))
-        job_names = get_running_job_names()
-        if job_names is None:
-            raise RuntimeError(f"squeue failed, so whether a job of study {config.study_name} is still queued or running is unknown")
-        # Every job name of a study ends with the study name (see train_job_name)
-        study_job_names = sorted(name for name in job_names if name.endswith(f".{config.study_name}"))
-        if study_job_names:
-            raise RuntimeError(
-                f"Study {config.study_name} has jobs queued or running, cancel them before resetting it:\n" + "\n".join(study_job_names)
-            )
+        # A study without a partition never submitted a job
+        if config.partition:
+            job_names = get_running_job_names()
+            if job_names is None:
+                raise RuntimeError(f"squeue failed, so whether a job of study {config.study_name} is still queued or running is unknown")
+            # Every job name of a study ends with the study name (see train_job_name)
+            study_job_names = sorted(name for name in job_names if name.endswith(f".{config.study_name}"))
+            if study_job_names:
+                raise RuntimeError(
+                    f"Study {config.study_name} has jobs queued or running, cancel them before resetting it:\n" + "\n".join(study_job_names)
+                )
         working_dir = Path(config.working_dir_base) / config.study_name
         if working_dir.exists():
             shutil.rmtree(working_dir)
@@ -1847,13 +1866,7 @@ class Study:
         # which forbids this study's extra fields, so parse with the subclass
         if isinstance(cfg, (str, Path)):
             cfg = self.Config.from_toml(Path(cfg))
-        if not config.initialized:
-            load_config(cfg)
-        elif cfg != config.get_instance():
-            raise RuntimeError(
-                f"Study {cfg.study_name} got a different config than the one this process already loaded (study {config.study_name}), "
-                "the global config is loaded once per process"
-            )
+        _load_study_config(cfg)
 
         self.name = config.study_name
         # Launch counter per case (str(case) -> count) backing MAX_TRAIN_ATTEMPTS
@@ -1916,7 +1929,7 @@ class Study:
             if stale_dirs:
                 raise RuntimeError(
                     f"Study {self.name} has no config lock, but {[str(d) for d in stale_dirs]} hold artifacts of an unknown setup.\n"
-                    "Clean the study (clean_models and clean_results) to start it over."
+                    "Start the study over with clean_models, or with reset_study for a parallel study."
                 )
             lock = ConfigLock(
                 config=config.get_instance(),
@@ -1935,7 +1948,7 @@ class Study:
             details = "\n".join(f"  {name}: locked {getattr(lock.config, name)!r}, now {getattr(config, name)!r}" for name in changed)
             raise RuntimeError(
                 f"Study {self.name} was locked under a different config, these fields changed:\n{details}\n"
-                "Revert them, or clean the study (clean_models and clean_results) to start over under the new config."
+                "Revert them, or start the study over under the new config with clean_models, or with reset_study for a parallel study."
             )
         if parent is not None:
             self._check_parent_stamp(self.name, lock.parent_stamp, parent)
@@ -1963,7 +1976,7 @@ class Study:
             raise RuntimeError(
                 f"Study {parent.name} was reset after study {child_name} was created on top of it, "
                 f"so every case {child_name} borrowed or trained from it is stale.\n"
-                f"Clean {child_name} (clean_models and clean_results) to start it over on {parent.name}'s current results."
+                f"Start {child_name} over on {parent.name}'s current results with clean_models, or with reset_study for a parallel study."
             )
 
     def _load_parent_archive(self) -> StudyArchive | None:
