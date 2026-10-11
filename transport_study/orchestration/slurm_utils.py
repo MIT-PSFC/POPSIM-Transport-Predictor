@@ -124,21 +124,23 @@ def sbatch_script(
     setup: str,
     mem: str = "120G",
     gres: str | None = None,
+    exclude: str | None = None,
     requeue: bool = False,
     cpus: int = 4,
 ) -> str:
     """sbatch script that runs script_path with this interpreter after the setup shell lines, then deletes it.
 
     Resubmitted attempts append to the same log_path.
-    A time_limit of None leaves the partition default.
+    A time_limit of None leaves the partition default, exclude is a comma-separated node list.
     """
     time_line = f"\n#SBATCH --time={time_limit}" if time_limit else ""
     gres_line = f"\n#SBATCH --gres={gres}" if gres else ""
+    exclude_line = f"\n#SBATCH --exclude={exclude}" if exclude else ""
     requeue_line = "\n#SBATCH --requeue" if requeue else ""
     return f"""\
 #!/bin/bash
 #SBATCH --job-name={job_name}
-#SBATCH --partition={partition}{time_line}{gres_line}
+#SBATCH --partition={partition}{time_line}{gres_line}{exclude_line}
 #SBATCH --mem={mem}
 #SBATCH --cpus-per-task={cpus}
 #SBATCH --export=ALL
@@ -343,20 +345,21 @@ def cancel_job(job_name: str, partition: str | None = None, state: str = "RUNNIN
         _slurm_stdout(["scancel", "-p", single_partition, "-u", getpass.getuser(), "-n", job_name, f"--state={state}"], level="ERROR")
 
 
-# One GPU entry of a sinfo gres field, e.g. gpu:a100:4(S:1,3,5,7), the groups are the type and the count
-GPU_GRES_PATTERN = r"gpu:([\w.]+):(\d+)"
+# One GPU entry of a sinfo gres field or a job's GRES, typed (gpu:a100:4(S:1,3,5,7)) or untyped (gpu:4).
+# The groups are the type ("" when untyped) and the count.
+GPU_GRES_ENTRY_PATTERN = r"gpu(?::([\w.]+))?:(\d+)"
 
 # Node states that take new jobs.
 # A trailing "-" (planned by backfill for a pending job) is stripped first, any other flag such as "*" excludes the node.
 SCHEDULABLE_NODE_STATES = ("idle", "mix", "alloc", "comp")
 
-# One per-node group of scontrol -d -o show job, the groups are the hostlist and the GPUs held on each of its nodes
-JOB_NODE_GPUS_PATTERN = r" Nodes=(\S+) CPU_IDs=\S+ Mem=\S+ GRES=gpu:(?:[\w.]+:)?(\d+)"
+# One per-node group of scontrol -d -o show job, the groups are the hostlist and the GPU type and count held on each of its nodes
+JOB_NODE_GPUS_PATTERN = rf" Nodes=(\S+) CPU_IDs=\S+ Mem=\S+ GRES={GPU_GRES_ENTRY_PATTERN}"
 
 
 def _gres_gpu_count(gres: str) -> int:
-    """GPUs of every type in a sinfo gres or gresused field."""
-    type_counts = re.findall(GPU_GRES_PATTERN, gres)
+    """GPUs of every type in a sinfo gres or gresused field, typed or untyped."""
+    type_counts = re.findall(GPU_GRES_ENTRY_PATTERN, gres)
     return sum(int(count) for _, count in type_counts)
 
 
@@ -411,7 +414,7 @@ def _evictable_node_gpus(nodes: list[str], partitions: tuple[str, ...]) -> dict[
         job_stdout = _slurm_stdout(["scontrol", "-d", "-o", "show", "job", job_id], level="WARNING")
         if job_stdout is None:
             return None
-        for group_hostlist, gpus_per_node in re.findall(JOB_NODE_GPUS_PATTERN, job_stdout):
+        for group_hostlist, _, gpus_per_node in re.findall(JOB_NODE_GPUS_PATTERN, job_stdout):
             group_nodes = _expand_hostlist(group_hostlist)
             if group_nodes is None:
                 return None
@@ -743,13 +746,14 @@ def pick_partition(cpu_capable: bool = False) -> str | None:
 
 @_cache_resolved
 def gpu_type_exclude_nodes(partition: str, allowed_gpu_types: tuple[str, ...]) -> str | None:
-    """Comma-separated nodes in the partition whose GPUs are not all in allowed_gpu_types.
+    """Comma-separated nodes in the partition whose GPUs are not all in allowed_gpu_types (lowercase).
 
     Node features on this cluster do not tag GPU models, so sbatch
     --constraint cannot select card types and gres cannot request an OR of
     them. An explicit --exclude list is the only way to keep a job on the
     allowed cards. Returns None (exclude nothing) if sinfo fails:
     a job that lands on a disallowed card still trains, just slowly.
+    A node listing only untyped GPUs names no card, so it is never excluded.
     """
     stdout = _slurm_stdout(["sinfo", "-p", partition, "-N", "--noheader", "-o", "%N %G"], level="WARNING")
     if stdout is None:
@@ -757,14 +761,14 @@ def gpu_type_exclude_nodes(partition: str, allowed_gpu_types: tuple[str, ...]) -
     nodes = set()
     for line in stdout.splitlines():
         node, _, gres = line.strip().partition(" ")
-        gpu_types = re.findall(r"gpu:([A-Za-z0-9_]+):", gres)
-        if gpu_types and not all(t.lower() in allowed_gpu_types for t in gpu_types):
+        node_gpu_types = [gpu_type.lower() for gpu_type, _ in re.findall(GPU_GRES_ENTRY_PATTERN, gres) if gpu_type]
+        if node_gpu_types and not all(gpu_type in allowed_gpu_types for gpu_type in node_gpu_types):
             nodes.add(node)
     return ",".join(sorted(nodes))
 
 
-def _gpu_exclude_directive(partition: str, typed: bool = False) -> str:
-    """The #SBATCH --exclude line for a GPU job, or "".
+def _gpu_exclude_nodes(partition: str, typed: bool = False) -> str | None:
+    """The comma-separated nodes a GPU job must not land on, None for none.
 
     Combines the config.gpu_types card allowlist (untyped requests only, a
     typed request pins the card type by itself) with config.exclude_nodes,
@@ -773,12 +777,12 @@ def _gpu_exclude_directive(partition: str, typed: bool = False) -> str:
     """
     nodes: set[str] = set(config.exclude_nodes)
     if not typed and config.gpu_types:
-        type_nodes = gpu_type_exclude_nodes(partition, tuple(config.gpu_types))
+        type_nodes = gpu_type_exclude_nodes(partition, config.gpu_types)
         if type_nodes:
             nodes.update(type_nodes.split(","))
     if not nodes:
-        return ""
-    return f"\n#SBATCH --exclude={','.join(sorted(nodes))}"
+        return None
+    return ",".join(sorted(nodes))
 
 
 GRES_UNAVAILABLE_ERROR = "Requested node configuration is not available"
@@ -792,13 +796,17 @@ def partition_gpu_type_counts(partition: str) -> tuple[tuple[str, int], ...] | N
         return None
     counts: dict[str, int] = {}
     for line in stdout.splitlines():
-        for gpu_type, count in re.findall(GPU_GRES_PATTERN, line):
-            counts[gpu_type.lower()] = counts.get(gpu_type.lower(), 0) + int(count)
+        for gpu_type, count in re.findall(GPU_GRES_ENTRY_PATTERN, line):
+            # An untyped entry names no card a typed request could ask for
+            if not gpu_type:
+                continue
+            gpu_type_lower = gpu_type.lower()
+            counts[gpu_type_lower] = counts.get(gpu_type_lower, 0) + int(count)
     return tuple(sorted(counts.items(), key=lambda item: -item[1]))
 
 
-def _gres_fragments(partition: str) -> list[str]:
-    """Candidate values for the #SBATCH --gres line of a one-GPU job, in order.
+def _gres_requests(partition: str) -> list[tuple[str, str | None]]:
+    """Candidate (gres, exclude) pairs for a one-GPU job, in order.
 
     First the untyped request plus the exclude list keeping the job on
     config.gpu_types cards. Some partitions (mit_preemptable, mit_normal_gpu)
@@ -809,25 +817,25 @@ def _gres_fragments(partition: str) -> list[str]:
     A typed request pins the card type by itself,
     so its exclude list only carries config.exclude_nodes.
     """
-    fragments = [f"gpu:1{_gpu_exclude_directive(partition)}"]
+    requests = [("gpu:1", _gpu_exclude_nodes(partition))]
     if config.gpu_types:
-        allowed = {t.lower() for t in config.gpu_types}
         gpu_type_counts = partition_gpu_type_counts(partition) or ()
+        typed_exclude = _gpu_exclude_nodes(partition, typed=True)
         for gpu_type, _ in gpu_type_counts:
-            if gpu_type in allowed:
-                fragments.append(f"gpu:{gpu_type}:1{_gpu_exclude_directive(partition, typed=True)}")
-    return fragments
+            if gpu_type in config.gpu_types:
+                requests.append((f"gpu:{gpu_type}:1", typed_exclude))
+    return requests
 
 
-def _sbatch_gpu_job(build_script: Callable[[str], str], job_name: str, partition: str, kind: str) -> bool:
-    """Submit build_script(gres_fragment) via sbatch, falling back to typed gres, returns whether SLURM accepted it.
+def _sbatch_gpu_job(build_script: Callable[[str, str | None], str], job_name: str, partition: str, kind: str) -> bool:
+    """Submit build_script(gres, exclude) via sbatch, falling back to typed gres, returns whether SLURM accepted it.
 
     Only the "Requested node configuration is not available" rejection moves
-    on to the next gres fragment, any other sbatch failure is final.
+    on to the next gres request, any other sbatch failure is final.
     """
     result = None
-    for gres_fragment in _gres_fragments(partition):
-        script = build_script(gres_fragment)
+    for gres, exclude in _gres_requests(partition):
+        script = build_script(gres, exclude)
         result = _run_slurm(["sbatch"], stdin=script)
         if result is None:
             return False
@@ -836,7 +844,7 @@ def _sbatch_gpu_job(build_script: Callable[[str], str], job_name: str, partition
             return True
         if GRES_UNAVAILABLE_ERROR not in result.stderr:
             break
-        logger.info(f"{partition} rejected gres request {gres_fragment.splitlines()[0]!r} for {job_name}, trying next GPU type")
+        logger.info(f"{partition} rejected gres request {gres!r} for {job_name}, trying next GPU type")
     if result is not None:
         logger.error(f"sbatch failed for {kind} job {job_name}: {result.stderr}")
     return False
@@ -858,9 +866,9 @@ def _submit_training_job(
         return submit_sbatch(script, job_name, kind)
     setup = GPU_JOB_BANNER.format(job_name=job_name) + job_setup + GPU_JOB_ENV
 
-    def build_script(gres_fragment: str) -> str:
+    def build_script(gres: str, exclude: str | None) -> str:
         return sbatch_script(
-            job_name, partition, time_limit, log_path, script_path, setup, mem=config.train_mem, gres=gres_fragment, requeue=True
+            job_name, partition, time_limit, log_path, script_path, setup, mem=config.train_mem, gres=gres, exclude=exclude, requeue=True
         )
 
     return _sbatch_gpu_job(build_script, job_name, partition, kind)

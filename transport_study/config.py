@@ -30,7 +30,14 @@ from typing import Annotated, Self, TypeVar
 import numpy as np
 import toml
 from loguru import logger
-from pydantic import BaseModel, ConfigDict, Field, field_serializer, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    field_serializer,
+    field_validator,
+    model_validator,
+)
 
 # 80/20 between train/val, by a deterministic hazard sort: the highest-hazard fifth of each source is its validation set
 TRAIN_VAL_SPLIT = (0.8, 0.2)
@@ -88,11 +95,10 @@ def env_dataset_paths() -> dict[str, Path]:
     return {k: Path(v) for k, v in json.loads(os.environ.get("PTPS_DATASET_PATHS", "{}")).items()}
 
 
-def _env_list(var_name: str, default: str = "", lower: bool = False) -> tuple[str, ...]:
+def _env_list(var_name: str, default: str = "") -> tuple[str, ...]:
     """Parse a comma-separated environment variable, e.g. PTPS_SPILLOVER_PARTITIONS="mit_preemptable,mit_normal_gpu"."""
     raw = os.environ.get(var_name, default)
-    items = tuple(item.strip() for item in raw.split(",") if item.strip())
-    return tuple(item.lower() for item in items) if lower else items
+    return tuple(item.strip() for item in raw.split(",") if item.strip())
 
 
 # SLURM memory size suffixes in MB, a bare number is MB
@@ -150,7 +156,7 @@ class StudyConfig(BaseModel):
     # SLURM gres GPU type names training and agent jobs may land on.
     # The default keeps float64 TORAX training off cards with slow fp64 pipelines (l40s, a40, l4, rtx_pro_6000).
     # Empty disables the exclusion.
-    gpu_types: Orchestration[tuple[str, ...]] = Field(default_factory=lambda: _env_list("PTPS_GPU_TYPES", "a100,h100,h200", lower=True))
+    gpu_types: Orchestration[tuple[str, ...]] = Field(default_factory=lambda: _env_list("PTPS_GPU_TYPES", "a100,h100,h200"))
     # SLURM node names GPU jobs must never land on, e.g. a node whose GPU faults every job at startup.
     # Unlike the gpu_types exclusion it applies to every gres request, typed fallbacks included.
     # sbatch has no SBATCH_EXCLUDE environment variable, so it reaches the job as an #SBATCH --exclude line.
@@ -197,6 +203,12 @@ class StudyConfig(BaseModel):
     def _freeze_paths(self):
         object.__setattr__(self, "dataset_paths", MappingProxyType(self.dataset_paths))
         return self
+
+    @field_validator("gpu_types")
+    @classmethod
+    def _lowercase_gpu_types(cls, gpu_types: tuple[str, ...]) -> tuple[str, ...]:
+        """The sinfo GPU types are compared lowercase, so gpu_types matches in whatever case it is written."""
+        return tuple(gpu_type.lower() for gpu_type in gpu_types)
 
     @model_validator(mode="after")
     def _check_cpu_partitions(self):
