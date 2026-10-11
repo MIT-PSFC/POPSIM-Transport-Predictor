@@ -181,6 +181,9 @@ HAZARD_VARS = ("hazard", "ip_MA_p95", "energy_mhd_MJ_p95")
 # A time step within this of UNIFORM_TIMEBASE_DT is the 1 kHz step, the slack absorbs float32 round-off
 TIMEBASE_STEP_TOLERANCE_S = 1e-5
 
+# The row dim of stack_0d_timeslices, one timeslice of one shot per row
+TIMESLICE_DIM = "timeslice"
+
 
 def concat_with_nan_padding(
     datasets: list[xr.Dataset],
@@ -571,6 +574,24 @@ def merge_parts(parts: list[xr.Dataset]) -> xr.Dataset:
     return parts[0] if len(parts) == 1 else concat_with_nan_padding(parts, concat_dim=EPISODE_DIM)
 
 
+def stack_0d_timeslices(parts: list[xr.Dataset]) -> xr.Dataset:
+    """The 0D variables of every real timeslice of the parts, one row each along TIMESLICE_DIM.
+
+    The normalizer fit set of the time-dependent cases (see trb_utils.normalizer_fit_dataset).
+    The normalizers read 0D signals alone,
+    and merged on one time axis every shot would be NaN-padded to the longest shot of any part.
+    A padding row holds no value, so dropping it leaves every fitted statistic unchanged.
+    Each row keeps its shot as a coordinate, and the per-shot variables are broadcast to every row.
+    """
+    part_rows = []
+    for part in parts:
+        part_0d = part.drop_dims(RADIAL_DIM, errors="ignore")
+        part_stacked = part_0d.stack({TIMESLICE_DIM: (EPISODE_DIM, TIME_DIM)}).reset_index(TIMESLICE_DIM)
+        mask_real_timeslice = np.isfinite(part_stacked[TIME_COORD].values)
+        part_rows.append(part_stacked.isel({TIMESLICE_DIM: mask_real_timeslice}))
+    return xr.concat(part_rows, dim=TIMESLICE_DIM, data_vars="all", coords="different", compat="equals", join="outer")
+
+
 def get_train_val_datasets(
     training_data: TrainingData,
     study_type: str = "profile_transfer",
@@ -677,24 +698,25 @@ def get_transfer_pretrain_datasets(
 ):
     """Datasets for a transfer_pretrain case (the pretrain half of a stat-normalized transfer).
 
-    The case trains on ALL historic data (train and val splits together, the
-    source val split is not needed because checkpoint selection uses the
-    target test set, like every other domain-adaptation case). The combined
-    dataset (historic + the transfer case's target training shots)
-    exists only to fit the normalization statistics, which the transfer case
-    then inherits through the checkpoint restore.
+    The case trains on ALL historic data
+    (train and val splits together, the source val split is not needed because
+    checkpoint selection uses the target test set, like every other domain-adaptation case)
+    The timeslices of the historic and the transfer case's target training shots
+    exist only to fit the normalization statistics,
+    which the transfer case then inherits through the checkpoint restore.
 
-    Returns (train_parts_hist, train_ds_combined, test_ds),
-    the historic training parts (each source's training then validation shots) and the merged normalizer-fit dataset.
+    Returns (train_parts_hist, normalizer_fit_ds, test_ds),
+    the historic training parts (each source's training then validation shots),
+    and their 0D timeslices with the target's (see stack_0d_timeslices)
     """
     target_train_parts, test_ds = _split_target_shots(target_split, study_type)
 
     source_train_parts, source_val_parts = _source_split_parts(training_data, study_type)
     train_parts_hist = [*source_train_parts, *source_val_parts]
-    train_ds_combined = merge_parts([*train_parts_hist, *target_train_parts])
+    normalizer_fit_ds = stack_0d_timeslices([*train_parts_hist, *target_train_parts])
 
     logger.debug("Transfer pretrain historic shots: {}", sum(part.sizes[EPISODE_DIM] for part in train_parts_hist))
-    logger.debug("Transfer pretrain normalizer-fit shots: {}", train_ds_combined.sizes[EPISODE_DIM])
+    logger.debug("Transfer pretrain normalizer-fit timeslices: {}", normalizer_fit_ds.sizes[TIMESLICE_DIM])
     logger.debug("Transfer pretrain test shots: {}", test_ds.sizes[EPISODE_DIM])
 
-    return train_parts_hist, train_ds_combined, test_ds
+    return train_parts_hist, normalizer_fit_ds, test_ds

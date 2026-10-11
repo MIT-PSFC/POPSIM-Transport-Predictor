@@ -26,6 +26,7 @@ from transport_study.orchestration.organize_data import (
     get_train_val_datasets,
     get_transfer_pretrain_datasets,
     merge_parts,
+    stack_0d_timeslices,
 )
 from transport_study.orchestration.target_shots import TargetSplit
 
@@ -445,8 +446,12 @@ def resolve_case_datasets(
       and append it to input_vars (the modules consume it to select
       per-device normalization stats)
 
-    Returns (train_parts, ds_val, input_vars, normalizer_fit_ds), the last one
-    None except for transfer_pretrain.
+    Returns (train_parts, ds_val, input_vars, normalizer_fit_ds).
+    normalizer_fit_ds is the fit set of the normalizer statistics (see organize_data.stack_0d_timeslices):
+    - transfer_pretrain: the historic and the target training timeslices
+    - a segmented case (state_vars): the timeslices of its training parts,
+      since overlapping segments would count a timeslice several times and forward-filled tails would repeat a shot's last one
+    - otherwise None, the loader's own samples (see CaseTrainDataLoader)
     """
     training_data = dataloader_config["training_data"]
 
@@ -491,6 +496,9 @@ def resolve_case_datasets(
             target_split=target_split,
             study_type=study_type,
         )
+
+    if normalizer_fit_ds is None and "state_vars" in dataloader_config:
+        normalizer_fit_ds = stack_0d_timeslices(train_parts)
 
     input_vars = list(dataloader_config["input_vars"])
     if "ds_source_idx" not in input_vars:
@@ -586,7 +594,7 @@ def normalizer_fit_dataset(train_dl: CaseTrainDataLoader, build_config: dict) ->
     A transfer_pretrain case trains on historic data only, but fits its normalizer on historic + target shots,
     so the transfer case it pretrains for inherits target-aware statistics through the checkpoint restore.
     model_init only receives the train dataloader, so that fit dataset rides on it (CaseTrainDataLoader.normalizer_fit_ds).
-    Every other case fits on its own training data.
+    Every other case fits on its own training data, a segmented one on the timeslices of its parts (see resolve_case_datasets).
     """
     if build_config.get("skip_data_init", False):
         return None

@@ -130,7 +130,7 @@ def test_zero_shot_pretrain_datasets(study):
     train_ds = merge_parts(train_parts)
 
     assert np.atleast_1d(train_ds["ds_source"].values).tolist() == ["cmod"]
-    assert normalizer_fit_ds[EPISODE_DIM].values.tolist() == train_ds[EPISODE_DIM].values.tolist()
+    assert np.unique(normalizer_fit_ds[EPISODE_DIM].values).tolist() == sorted(train_ds[EPISODE_DIM].values.tolist())
     assert test_ds.sizes[EPISODE_DIM] == 1
     assert np.atleast_1d(test_ds["ds_source"].values).tolist() == ["mast"]
 
