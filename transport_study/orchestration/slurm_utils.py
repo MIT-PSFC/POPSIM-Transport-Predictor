@@ -98,7 +98,7 @@ def _count_lines(stdout: str) -> int:
 def _cache_resolved(fn):
     """Cache fn per argument tuple, except a None result (a failed SLURM query), which the next call retries.
 
-    The partition inventory and limits are static for a study run,
+    The partition inventory and limits are static for a study run, and so is the allocation of one run of a job,
     but a cached failure would disable the spillover limits or the GPU type exclusion for the rest of it.
     """
     resolved: dict[tuple, object] = {}
@@ -393,6 +393,25 @@ def _expand_hostlist(hostlist: str) -> list[str] | None:
     return stdout.split()
 
 
+@_cache_resolved
+def _job_node_gpus(job_id: str, start_time: str) -> tuple[tuple[str, int], ...] | None:
+    """(node, GPUs held there) of every node of one run of a job, from its scontrol detail groups, None if a query fails.
+
+    A run's allocation never changes, so each is queried once.
+    A requeued job keeps its id but starts a new run, so the start time is part of the key.
+    """
+    job_stdout = _slurm_stdout(["scontrol", "-d", "-o", "show", "job", job_id], level="WARNING")
+    if job_stdout is None:
+        return None
+    node_gpus: list[tuple[str, int]] = []
+    for group_hostlist, _, gpus_per_node in re.findall(JOB_NODE_GPUS_PATTERN, job_stdout):
+        group_nodes = _expand_hostlist(group_hostlist)
+        if group_nodes is None:
+            return None
+        node_gpus.extend((node, int(gpus_per_node)) for node in group_nodes)
+    return tuple(node_gpus)
+
+
 def _evictable_node_gpus(nodes: list[str], partitions: tuple[str, ...]) -> dict[str, int] | None:
     """GPUs held on each of these nodes by running jobs of these partitions, None if a query fails.
 
@@ -404,22 +423,18 @@ def _evictable_node_gpus(nodes: list[str], partitions: tuple[str, ...]) -> dict[
     node_list = ",".join(nodes)
     partition_list = ",".join(partitions)
     squeue_stdout = _slurm_stdout(
-        ["squeue", "-w", node_list, "-p", partition_list, "--states=RUNNING", "--noheader", "-O", "JobID:20,tres-alloc:200"]
+        ["squeue", "-w", node_list, "-p", partition_list, "--states=RUNNING", "--noheader", "-O", "JobID:20,StartTime:25,tres-alloc:200"]
     )
     if squeue_stdout is None:
         return None
-    gpu_job_ids = [line.split()[0] for line in squeue_stdout.splitlines() if "gres/gpu=" in line]
+    gpu_job_runs = [line.split()[:2] for line in squeue_stdout.splitlines() if "gres/gpu=" in line]
     node_gpus: dict[str, int] = {}
-    for job_id in gpu_job_ids:
-        job_stdout = _slurm_stdout(["scontrol", "-d", "-o", "show", "job", job_id], level="WARNING")
-        if job_stdout is None:
+    for job_id, start_time in gpu_job_runs:
+        job_node_gpus = _job_node_gpus(job_id, start_time)
+        if job_node_gpus is None:
             return None
-        for group_hostlist, _, gpus_per_node in re.findall(JOB_NODE_GPUS_PATTERN, job_stdout):
-            group_nodes = _expand_hostlist(group_hostlist)
-            if group_nodes is None:
-                return None
-            for node in group_nodes:
-                node_gpus[node] = node_gpus.get(node, 0) + int(gpus_per_node)
+        for node, gpus in job_node_gpus:
+            node_gpus[node] = node_gpus.get(node, 0) + gpus
     # A multi-node job may also hold GPUs outside these nodes
     queried_nodes = set(nodes)
     return {node: gpus for node, gpus in node_gpus.items() if node in queried_nodes}

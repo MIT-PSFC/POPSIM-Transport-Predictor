@@ -95,7 +95,7 @@ def _fake_slurm_stdout(cmd: list[str]) -> str:
             if partition not in queried_partitions or not set(nodes) & set(queried_nodes):
                 continue
             gpu_tres = f",gres/gpu={gpus * len(nodes)},gres/gpu:a100={gpus * len(nodes)}" if gpus else ""
-            lines.append(f"{job_id}  cpu=4,mem=16G,node={len(nodes)},billing=4{gpu_tres}")
+            lines.append(f"{job_id}  2026-10-01T00:00:00  cpu=4,mem=16G,node={len(nodes)},billing=4{gpu_tres}")
         return "\n".join(lines) + "\n"
     if cmd[:5] == ["scontrol", "-d", "-o", "show", "job"]:
         job_id, partition, hostlist, nodes, gpus = next(job for job in FAKE_RUNNING_JOBS if job[0] == cmd[5])
