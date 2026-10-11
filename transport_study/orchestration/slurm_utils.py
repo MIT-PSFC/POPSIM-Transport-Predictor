@@ -727,17 +727,15 @@ def open_slots(partition: str, cpu_capable: bool = False) -> int:
     return min(spillover_budget(), spillover_slots(partition))
 
 
-def pick_partition(cpu_capable: bool = False, skip_gpu: bool = False) -> str | None:
+def pick_partition(cpu_capable: bool = False) -> str | None:
     """Partition the next training or agent job should go to, or None to hold off launching.
 
     The first candidate with open slots wins:
     the primary GPU partition, then the GPU spillover partitions for a GPU-only case,
     or the CPU partitions in order for a case that can also train on CPU.
-    skip_gpu drops the primary GPU partition, once this pass found it full.
     """
     fallbacks = cpu_partitions() if cpu_capable else list(config.spillover_partitions)
-    candidates = fallbacks if skip_gpu else [config.partition, *fallbacks]
-    for partition in candidates:
+    for partition in [config.partition, *fallbacks]:
         if open_slots(partition, cpu_capable) > 0:
             return partition
     return None

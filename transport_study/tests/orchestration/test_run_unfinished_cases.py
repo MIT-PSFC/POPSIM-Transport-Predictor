@@ -192,8 +192,8 @@ def test_gpu_only_cases_take_the_gpu_before_cpu_capable_ones(make_stub_study, mo
     study = make_stub_study([cpu_capable, *gpu_only], partition="gpu", cpu_partition="cpu", cpu_model_types=("cpu_type",))
     gpu_slots = SimpleNamespace(open=1)
 
-    def pick_partition(cpu_capable=False, skip_gpu=False):
-        if not skip_gpu and gpu_slots.open > 0:
+    def pick_partition(cpu_capable=False):
+        if gpu_slots.open > 0:
             gpu_slots.open -= 1
             return "gpu"
         return "cpu" if cpu_capable else None

@@ -1280,19 +1280,20 @@ class Study:
 
         A case that can also train on CPU only takes the primary GPUs the GPU-only cases of this pass leave,
         beyond cpu_capable_buffer_gpus, and the CPU partitions otherwise.
+        So it still tries the primary after a GPU-only case found it full, since its GPU buffer may be the smaller one.
         A GPU-only case finding no partition holds the remaining GPU-only cases until the next pass,
         a CPU-capable one finding none holds every case left.
         """
         launch_order = sorted(to_launch, key=self.trains_on_cpu)
-        gpu_full = False
+        gpu_only_held = False
         for case in launch_order:
             cpu_capable = self.trains_on_cpu(case)
-            if gpu_full and not cpu_capable:
+            if gpu_only_held and not cpu_capable:
                 continue
-            partition = pick_partition(cpu_capable, skip_gpu=gpu_full)
+            partition = pick_partition(cpu_capable)
             if partition is None and not cpu_capable:
                 logger.info("No open GPU slots or spillover budget, holding the ready GPU-only cases until the next pass")
-                gpu_full = True
+                gpu_only_held = True
                 continue
             if partition is None:
                 logger.info("No open GPU or CPU slots, holding the remaining ready cases until the next pass")
