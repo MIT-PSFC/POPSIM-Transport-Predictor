@@ -263,24 +263,6 @@ def test_weighted_case_weights_reach_loss_config(study_config):
     assert "device_weights" not in study.make_train_config(baseline_case).loss_config
 
 
-@pytest.mark.slow
-@requires_sample_data
-def test_weighted_zero_target_shots_disables_patience(study_config):
-    """A weighted case with num_target_shots == 0 must run to max_epochs.
-
-    With no target samples in training the weighted validation loss cannot
-    track target improvement, so early stopping is disabled (patience None).
-    Every other case keeps the configured patience.
-    """
-    study = ProfileStudy(study_config)
-
-    assert study.make_train_config(weighted_case(study, num_target_shots=0)).patience is None
-    assert study.make_train_config(weighted_case(study, num_target_shots=10)).patience == config.patience
-
-    baseline_case = next(c for c in study.cases if c.domain_adaptation is None)
-    assert study.make_train_config(baseline_case).patience == config.patience
-
-
 def test_chi_counts_the_residual_in_error_bars():
     """A prediction offset by k error bars at every point scores chi k per channel, in units of the GP-fit error bar.
 

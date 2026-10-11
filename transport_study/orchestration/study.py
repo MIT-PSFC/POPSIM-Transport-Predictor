@@ -953,15 +953,12 @@ class Study:
             # Read by the chi validation loss, which val_eval_suite_config shares
             loss_config["chi_sigma_floors"] = self.chi_sigma_floors_by_device
 
-        # Weighted / addition with no target shots runs to max_epochs, early stopping disabled
-        patience = None if case.domain_adaptation in ("weighted", "addition") and case.num_target_shots == 0 else config.patience
-
         train_config_base = TrainConfig(
             project=self.wandb_project_name(case),
             train_run_builder=spec.train_run_builder,
             max_epochs=config.max_epochs,
             epochs_per_val=config.epochs_per_val,
-            patience=patience,
+            patience=config.patience,
             # When doing hyperparameter tuning, this gets overwritten by the wandb agent
             checkpoint_dir=str(self.trained_model_dir(case)),
             dataloader_config=spec.dataloader_config,
