@@ -1,5 +1,5 @@
 from collections.abc import Callable
-from typing import Any
+from typing import Any, ClassVar
 
 import equinox as eqx
 import jax.numpy as jnp
@@ -34,8 +34,6 @@ from transport_study.modules.trb_utils import (
     target_device_idx,
 )
 
-STUDY_TYPE = "power_balance_transfer"
-
 # Anchor terms in the training loss of the models with p_oh / p_rad submodules, keyed by measured target signal:
 # (Output attribute holding the submodule's prediction, loss_config key of its weight).
 # They keep the submodule predictions close to the measured signals.
@@ -59,12 +57,15 @@ def _restored_submodules(train_dl: DataLoader, model_init_config: dict) -> tuple
 class PowerBalanceTRB(TrainRunBuilder):
     """TrainRunBuilder for the power balance modules used in transfer learning"""
 
+    # The organize_data prep its dataloaders load every device with
+    STUDY_TYPE: ClassVar[str] = "power_balance_transfer"
+
     @staticmethod
     def get_dataloaders(
         dataloader_config: dict,
     ) -> tuple[xr.Dataset, DataLoader, DataLoader, DataLoader]:
         """Dataset and dataloaders for training, see trb_utils.get_time_dep_dataloaders."""
-        return get_time_dep_dataloaders(dataloader_config, STUDY_TYPE)
+        return get_time_dep_dataloaders(dataloader_config, PowerBalanceTRB.STUDY_TYPE)
 
     @staticmethod
     def _build_module(train_dl: DataLoader, model_init_config: dict) -> Any:

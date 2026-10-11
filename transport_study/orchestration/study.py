@@ -739,7 +739,7 @@ class Study:
     #############
     # EXECUTION #
     #############
-    def make_weighted_device_weights(self, case: Case) -> dict[str, float]:
+    def make_weighted_device_weights(self, case: Case, study_type: str) -> dict[str, float]:
         """Loss weights per device for weighted domain adaptation.
 
         Mirrors the actual training-set composition of get_train_test_datasets:
@@ -748,6 +748,8 @@ class Study:
         training set) plus case.num_target_shots target shots, whichever they are.
         Shot counts come from get_loaded_shot_count, so max_ds_size truncation
         and study-type filtering are accounted for.
+        study_type is the prep the case's data train run builder loads with,
+        which is not this study's for a prereq trained on another study's view (the transport profile pseudo-type).
 
         Weights are chosen so that each device's effective contribution to the
         loss is F_x = W_x * N_x (N_x the device's shot count in the training
@@ -762,8 +764,12 @@ class Study:
         """
         target = config.target_device
 
-        # Shot counts as the training set actually sees them
-        shot_counts = {source: get_loaded_shot_count(source, study_type=self.STUDY_TYPE) for source in case.training_data.sources}
+        # Shot counts as the training set actually sees them, each loaded once per study since it loads the whole device
+        shot_counts = {}
+        for source in case.training_data.sources:
+            if (source, study_type) not in self._loaded_shot_counts:
+                self._loaded_shot_counts[(source, study_type)] = get_loaded_shot_count(source, study_type=study_type)
+            shot_counts[source] = self._loaded_shot_counts[(source, study_type)]
         if case.num_target_shots > 0:
             shot_counts[target] = case.num_target_shots
         # num_target_shots == 0: no target samples in training, so the target
@@ -917,13 +923,15 @@ class Study:
         dataloader_config_base = self.base_dataloader_config(case)
         loss_config = self.base_loss_config()
         optimizer_config = self.base_optimizer_config()
+        spec = self.model_train_spec(case, dataloader_config_base)
         if case.domain_adaptation == "weighted":
             # Loss function reads these from loss_config as "device_weights".
             # val_eval_suite_config references the same dict, so validation
             # loss is weighted consistently with training.
             # "addition" adds the same target shots but as normal samples,
             # so it deliberately gets no device_weights entry
-            loss_config["device_weights"] = self.make_weighted_device_weights(case)
+            data_trb = get_data_train_run_builder_class(spec.train_run_builder, spec.dataloader_config)
+            loss_config["device_weights"] = self.make_weighted_device_weights(case, data_trb.STUDY_TYPE)
         if self.CHI_VALIDATION_LOSS:
             # Read by the chi validation loss, which val_eval_suite_config shares
             loss_config["chi_sigma_floors"] = self.chi_sigma_floors_by_device
@@ -931,7 +939,6 @@ class Study:
         # Weighted / addition with no target shots runs to max_epochs, early stopping disabled
         patience = None if case.domain_adaptation in ("weighted", "addition") and case.num_target_shots == 0 else config.patience
 
-        spec = self.model_train_spec(case, dataloader_config_base)
         train_config_base = TrainConfig(
             project=self.wandb_project_name(case),
             train_run_builder=spec.train_run_builder,
@@ -1856,6 +1863,8 @@ class Study:
         # Measured steps per epoch per largest-training-set loader config,
         # so repeated make_train_config calls do not reread the records (see steps_per_epoch)
         self._steps_per_epoch_cache: dict[str, int] = {}
+        # get_loaded_shot_count per (device, study type), read by make_weighted_device_weights
+        self._loaded_shot_counts: dict[tuple[str, str], int] = {}
 
         self.working_dir = Path(config.working_dir_base) / self.name
         self.model_dir = self.working_dir / "models"

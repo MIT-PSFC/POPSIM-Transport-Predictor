@@ -1,5 +1,5 @@
 from collections.abc import Callable
-from typing import Any
+from typing import Any, ClassVar
 
 import equinox as eqx
 import jax.numpy as jnp
@@ -37,8 +37,6 @@ from transport_study.modules.trb_utils import (
     target_device_idx,
 )
 
-STUDY_TYPE = "transport_transfer"
-
 # Anchor terms in the training loss (sciml and multiobjective cases), keyed by measured target signal:
 # (Output attribute holding the model's own prediction, loss_config key for the weight)
 ANCHOR_SIGNALS = {
@@ -69,12 +67,15 @@ def _restored_sciml_submodules(train_dl: DataLoader, model_init_config: dict) ->
 class TransportPredictorTRB(TrainRunBuilder):
     """TrainRunBuilder for the transport predictor modules used in transfer learning."""
 
+    # The organize_data prep its dataloaders load every device with
+    STUDY_TYPE: ClassVar[str] = "transport_transfer"
+
     @staticmethod
     def get_dataloaders(
         dataloader_config: dict,
     ) -> tuple[xr.Dataset, DataLoader, DataLoader, DataLoader]:
         """Dataset and dataloaders for training, see trb_utils.get_time_dep_dataloaders."""
-        return get_time_dep_dataloaders(dataloader_config, STUDY_TYPE)
+        return get_time_dep_dataloaders(dataloader_config, TransportPredictorTRB.STUDY_TYPE)
 
     @staticmethod
     def _build_module(train_dl: DataLoader, model_init_config: dict) -> Any:

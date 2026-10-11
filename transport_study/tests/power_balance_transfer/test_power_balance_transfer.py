@@ -10,6 +10,7 @@ import xarray as xr
 from transport_study import PACKAGE_ROOT
 from transport_study.config import config
 from transport_study.modules.normalization import STAT_NORMALIZATIONS
+from transport_study.modules.power_balance.trb import PowerBalanceTRB
 from transport_study.orchestration.organize_data import get_train_test_datasets
 from transport_study.orchestration.study import HYPERPARAM_TARGET_SHOTS
 from transport_study.orchestration.target_shots import (
@@ -196,7 +197,7 @@ def test_weighted_device_weight():
         num_target_shots=3,
     )
 
-    weights = study.make_weighted_device_weights(case_p_oh)
+    weights = study.make_weighted_device_weights(case_p_oh, PowerBalanceTRB.STUDY_TYPE)
     assert set(weights) == {"cmod-low1", "cmod-low2", "cmod-high"}
     assert all(w > 0 for w in weights.values())
     # Target gets the largest per-sample weight (few shots, half the budget)

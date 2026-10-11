@@ -1,6 +1,6 @@
 import copy
 from collections.abc import Callable
-from typing import Any
+from typing import Any, ClassVar
 
 import equinox as eqx
 import jax
@@ -90,6 +90,9 @@ class ProfilePredictorTRB(TrainRunBuilder):
     based on `popsim.modules.profile_predictor.training_run_builder.ProfilePredictorTrainRunBuilder`
     """
 
+    # The organize_data prep its dataloaders load every device with
+    STUDY_TYPE: ClassVar[str] = "profile_transfer"
+
     @staticmethod
     def get_dataloaders(
         dataloader_config: dict,
@@ -101,7 +104,7 @@ class ProfilePredictorTRB(TrainRunBuilder):
         time-independent dataloaders on top.
         The training parts are merged first, cheap since the profile view keeps only the fresh timeslices of each shot.
         """
-        train_parts, ds_val, input_vars, normalizer_fit_ds = resolve_case_datasets(dataloader_config, "profile_transfer")
+        train_parts, ds_val, input_vars, normalizer_fit_ds = resolve_case_datasets(dataloader_config, ProfilePredictorTRB.STUDY_TYPE)
 
         train_dl, val_dl = make_dataloaders(
             datasets=(merge_parts(train_parts), ds_val),
