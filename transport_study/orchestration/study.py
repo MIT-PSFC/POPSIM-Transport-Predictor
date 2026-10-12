@@ -1294,12 +1294,16 @@ class Study:
 
             if enable_parallelism:
                 self._launch_ready_cases(to_launch, skip_tuning)
+                # Sleep for a bit before checking again to avoid spamming slurm
+                time.sleep(ORCHESTRATION_POLL_INTERVAL_S)
             else:
                 for case in to_launch:
                     self.run_case(case, skip_tuning=skip_tuning, enable_parallelism=False)
-
-            # Sleep for a bit before checking again to avoid spamming slurm
-            time.sleep(ORCHESTRATION_POLL_INTERVAL_S)
+                # Nothing runs in the background of a serial run,
+                # so only a pass that finished no case waits (on an ancestor, or between sweep passes)
+                finished_this_pass = [case for case in to_launch if self.result_path(case).exists()]
+                if not finished_this_pass:
+                    time.sleep(ORCHESTRATION_POLL_INTERVAL_S)
             unfinished = [case for case in unfinished if not self.result_path(case).exists()]
 
     def _launch_ready_cases(self, to_launch: list[Case], skip_tuning: bool):

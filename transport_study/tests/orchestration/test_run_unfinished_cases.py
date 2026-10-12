@@ -53,11 +53,13 @@ def record_and_finish_cases(monkeypatch, study: Study, order: list[str]):
 
 
 def test_blocked_case_waits_for_prereq(make_stub_study, monkeypatch):
-    """A case with an unmet prereq is not picked up until its prereq finishes."""
+    """A case with an unmet prereq is not picked up until its prereq finishes.
+    A serial pass that finished a case starts the next one at once, nothing runs in the background to wait for."""
     prereq = StubCase(name="case.prereq")
     dependent = StubCase(name="case.dependent", prereqs=[prereq])
     study = make_stub_study([dependent, prereq])
-    monkeypatch.setattr(study_module.time, "sleep", lambda s: None)
+    sleeps: list[float] = []
+    monkeypatch.setattr(study_module.time, "sleep", sleeps.append)
 
     order: list[str] = []
     record_and_finish_cases(monkeypatch, study, order)
@@ -65,6 +67,7 @@ def test_blocked_case_waits_for_prereq(make_stub_study, monkeypatch):
     study.run_unfinished_cases(skip_tuning=True, enable_parallelism=False)
 
     assert order == ["case.prereq", "case.dependent"]
+    assert sleeps == []
 
 
 def test_in_flight_case_not_picked_up(make_stub_study, monkeypatch, fake_clock, quiet_scheduler):
