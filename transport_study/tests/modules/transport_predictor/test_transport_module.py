@@ -211,19 +211,19 @@ def test_env_create_state_per_model_type(transformer_module, sciml_module, torax
     obs = make_observations()
 
     # Transformer: whole buffer tiled from the raw measured t0 profiles
-    state_tf = TransportPredictorEnv(module=transformer_module).create_state(obs, obs)
+    state_tf = TransportPredictorEnv(module=transformer_module, domain_adaptation=None).create_state(obs, obs)
     assert isinstance(state_tf, TransportPredictorTransformer.State)
     assert state_tf.profiles.shape == (HISTORY_LEN, 2 * N_RHO)
     row = np.concatenate([NE0, TE0])
     np.testing.assert_array_equal(np.asarray(state_tf.profiles), np.tile(row, (HISTORY_LEN, 1)))
 
     # Sciml: PowerBalance.State seeded with the measured stored energy
-    state_sciml = TransportPredictorEnv(module=sciml_module).create_state(obs, obs)
+    state_sciml = TransportPredictorEnv(module=sciml_module, domain_adaptation=None).create_state(obs, obs)
     assert isinstance(state_sciml, PowerBalance.State)
     assert float(state_sciml.energy_mhd_MJ) == pytest.approx(0.15)
 
     # Torax rebuild: measured profiles with the seed floors applied
-    state_rb = TransportPredictorEnv(module=torax_rebuild_module).create_state(obs, obs)
+    state_rb = TransportPredictorEnv(module=torax_rebuild_module, domain_adaptation=None).create_state(obs, obs)
     assert isinstance(state_rb, TransportPredictorTorax.State)
     np.testing.assert_allclose(np.asarray(state_rb.ne), np.maximum(NE0, NE_SEED_FLOOR_20))
     np.testing.assert_allclose(np.asarray(state_rb.te), np.maximum(TE0, TE_SEED_FLOOR_KEV))
@@ -234,7 +234,7 @@ def test_env_create_state_per_model_type(transformer_module, sciml_module, torax
 
     # Torax carry: cell values plus both faces, the edge faces pinned to the NN Dirichlet
     # boundary conditions computed from the floored seeds
-    state_carry = TransportPredictorEnv(module=torax_carry_module).create_state(obs, obs)
+    state_carry = TransportPredictorEnv(module=torax_carry_module, domain_adaptation=None).create_state(obs, obs)
     assert isinstance(state_carry, TransportPredictorToraxCarry.State)
     n_cells = len(torax_carry_module.rho_norm_grid)
     for name in ("ne", "te", "ti"):
@@ -262,7 +262,7 @@ def test_env_get_trainable_selections(transformer_module, sciml_module, torax_re
     For the transformer at da=none the selection is exactly feature_embed, profile_embed, pos_embed, attention and head.
     """
     # Transformer, da=none: exactly the five architecture components
-    sel_tf = TransportPredictorEnv(module=transformer_module, domain_adaptation="none").get_trainable()
+    sel_tf = TransportPredictorEnv(module=transformer_module, domain_adaptation=None).get_trainable()
     assert sorted(sel_tf.keys()) == ["attention", "feature_embed", "head", "pos_embed", "profile_embed"]
     assert leaf_in_selection(sel_tf, transformer_module.pos_embed)
     for leaf in normalizer_leaves(transformer_module):
@@ -289,18 +289,18 @@ def test_env_get_trainable_selections(transformer_module, sciml_module, torax_re
         assert not leaf_in_selection(sel_tx_transfer, leaf)
 
     # Torax, da=none: exactly the three MLPs, normalizer excluded
-    sel_tx = TransportPredictorEnv(module=torax_rebuild_module, domain_adaptation="none").get_trainable()
+    sel_tx = TransportPredictorEnv(module=torax_rebuild_module, domain_adaptation=None).get_trainable()
     assert sorted(sel_tx.keys()) == ["nn_edge", "nn_sources", "nn_transport"]
     for leaf in normalizer_leaves(torax_rebuild_module):
         assert not leaf_in_selection(sel_tx, leaf)
 
     # Sciml, da=none: both submodule subtrees present, frozen ones keep the tau_E network but drop p_oh / p_rad
-    sel_sciml = TransportPredictorEnv(module=sciml_module, domain_adaptation="none").get_trainable()
+    sel_sciml = TransportPredictorEnv(module=sciml_module, domain_adaptation=None).get_trainable()
     assert sorted(sel_sciml.keys()) == ["power_balance", "profile_predictor"]
     assert sorted(sel_sciml["power_balance"].keys()) == ["p_oh_predictor", "p_rad_predictor", "taue_predictor"]
     sel_sciml_frozen = TransportPredictorEnv(
         module=sciml_module,
-        domain_adaptation="none",
+        domain_adaptation=None,
         freeze_submodules=list(FREEZABLE_SUBMODULES),
     ).get_trainable()
     assert sorted(sel_sciml_frozen.keys()) == ["power_balance", "profile_predictor"]
@@ -356,7 +356,7 @@ def test_transformer_position_embedding_orders_history(transformer_module):
 
     inputs = make_inputs()
     obs = make_observations()
-    seeded = TransportPredictorEnv(module=transformer_module).create_state(obs, obs)
+    seeded = TransportPredictorEnv(module=transformer_module, domain_adaptation=None).create_state(obs, obs)
     # Nonconstant history, then swap two rows that are NOT the newest one so
     # the current profile (and the features derived from it) stay identical
     profiles = seeded.profiles.at[0].mul(1.2).at[1].mul(0.8)
@@ -392,7 +392,7 @@ def test_transformer_history_holds_profiles_only(transformer_module):
     assert field_names == ["profiles"]
 
     obs = make_observations()
-    state = TransportPredictorEnv(module=transformer_module).create_state(obs, obs)
+    state = TransportPredictorEnv(module=transformer_module, domain_adaptation=None).create_state(obs, obs)
     assert state.profiles.shape == (HISTORY_LEN, 2 * N_RHO)
 
     # The buffer update is a pure shift plus the newest prediction: the rows
@@ -443,7 +443,7 @@ def test_transformer_multiobjective_heads_leave_the_profiles_alone(transformer_m
 
     obs = make_observations()
     inputs = make_inputs()
-    state = TransportPredictorEnv(module=transformer_module).create_state(obs, obs)
+    state = TransportPredictorEnv(module=transformer_module, domain_adaptation=None).create_state(obs, obs)
     next_plain, output_plain = transformer_module(state, inputs)
     next_twin, output_twin = twin(state, inputs)
 
@@ -471,7 +471,7 @@ def test_torax_inferred_outputs_track_the_state_and_reach_the_transport_network(
     """
     obs = make_observations()
     inputs = TransportPredictorEnv.create_inputs(obs)
-    state = TransportPredictorEnv(module=torax_rebuild_module).create_state(obs, obs)
+    state = TransportPredictorEnv(module=torax_rebuild_module, domain_adaptation=None).create_state(obs, obs)
     _seeded, initial_post, *_rest, energy_mhd_MJ_profiles = torax_rebuild_module.seed_initial_state(inputs, state.ne, state.te)
     _next_state, output = torax_rebuild_module(state, inputs)
 
@@ -577,7 +577,7 @@ def test_torax_p_aux_change_reaches_one_step_output(torax_rebuild_module):
     module weights held fixed, so the measured heating magnitude feeds
     through the whole TORAX solve, not just the runtime params."""
     obs = make_observations()
-    state = TransportPredictorEnv(module=torax_rebuild_module).create_state(obs, obs)
+    state = TransportPredictorEnv(module=torax_rebuild_module, domain_adaptation=None).create_state(obs, obs)
     next_low, _ = torax_rebuild_module(state, make_inputs(power_additional_MW=0.0))
     next_high, _ = torax_rebuild_module(state, make_inputs(power_additional_MW=8.0))
     assert np.all(np.isfinite(np.asarray(next_low.te)))
@@ -603,7 +603,7 @@ def test_torax_rebuild_step_gradients_finite(transport_model):
         delta_exponent=2.0,
     )
     obs = make_observations()
-    state = TransportPredictorEnv(module=module).create_state(obs, obs)
+    state = TransportPredictorEnv(module=module, domain_adaptation=None).create_state(obs, obs)
     inputs = make_inputs()
 
     def loss(mod):
@@ -765,7 +765,7 @@ def test_torax_carry_state_runs_under_popsim_and_evolves_ions_and_current(torax_
     """
     obs = make_observations()
     inputs = make_inputs()
-    state0 = TransportPredictorEnv(module=torax_carry_module).create_state(obs, obs)
+    state0 = TransportPredictorEnv(module=torax_carry_module, domain_adaptation=None).create_state(obs, obs)
     partition_discrete_cont(state0)
     partition_save_no_save(state0)
 

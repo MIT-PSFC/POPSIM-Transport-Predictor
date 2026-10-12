@@ -939,7 +939,8 @@ class TransportPredictorEnv(ModuleTrainingEnv):
     """
 
     module: TransportPredictor
-    domain_adaptation: str = eqx.field(static=True, default="unset")
+    # Keyword-only, ModuleEvalEnv's defaulted stepper precedes it
+    domain_adaptation: str | None = eqx.field(static=True, kw_only=True)
     # The power balance submodules a sciml case keeps out of the trainable selection (FREEZABLE_SUBMODULES),
     # handed to its PowerBalanceEnv
     freeze_submodules: list[str] = eqx.field(static=True, default_factory=list)

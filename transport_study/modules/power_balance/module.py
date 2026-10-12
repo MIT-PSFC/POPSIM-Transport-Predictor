@@ -553,7 +553,8 @@ FREEZABLE_SUBMODULES = ("p_oh_predictor", "p_rad_predictor")
 
 class PowerBalanceEnv(ModuleTrainingEnv):
     module: PowerBalance
-    domain_adaptation: str = eqx.field(static=True, default="unset")
+    # Keyword-only, ModuleEvalEnv's defaulted stepper precedes it
+    domain_adaptation: str | None = eqx.field(static=True, kw_only=True)
     freeze_submodules: list[str] = eqx.field(static=True, default_factory=list)
     stepper: StepperType = eqx.field(static=True, default=StepperType.SIMPLE_EULER)
 
