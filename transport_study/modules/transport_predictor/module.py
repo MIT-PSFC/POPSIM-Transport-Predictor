@@ -7,7 +7,7 @@ import jax.numpy as jnp
 import numpy as np
 import xarray as xr
 from jaxtyping import Array, ArrayLike
-from popsim import TimeDepModule, discrete_no_save_field
+from popsim import TimeDepModule, discrete_no_save_field, no_save_field
 from popsim.math_utils import safe_log
 from popsim.ml.envs import ModuleTrainingEnv
 from popsim.ml.rtd_mlp import RtdMLP
@@ -298,7 +298,9 @@ class Output:
     energy_mhd_MJ_pred: float = float("nan")
     power_ohm_MW_pred: float = float("nan")
     power_radiated_MW_pred: float = float("nan")
-    debug_info: dict | None = None
+    # Per-step diagnostics (the profiles before the positivity clip, the stored-energy state),
+    # no_save keeps them out of the stacked rollout output and the test-eval results
+    debug_info: dict | None = no_save_field(default=None)
 
 
 class TransportPredictor(TimeDepModule):
