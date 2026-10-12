@@ -22,6 +22,7 @@ from popsim.ml import DataLoader, TrainConfig, Trainer
 from popsim.ml.launch import (
     build_train_run,
     get_data_train_run_builder_class,
+    get_train_run_builder_class,
     launch_agent,
     launch_train,
 )
@@ -367,6 +368,10 @@ class Study:
     # Whether the training losses divide power balance residuals by each device's typical value (trb_utils.residual_scales)
     RESIDUAL_SCALE_LOSS: ClassVar[bool] = False
 
+    # The model type predicting each signal a training loss anchors (a TRB's ANCHOR_SIGNALS),
+    # whose hyperparam case's tuned huber_delta the anchor term uses (see anchor_huber_deltas)
+    ANCHOR_DELTA_MODEL_TYPES: ClassVar[dict[str, str]] = {}
+
     # Tuned-config dataloader and loss keys, merged by strict indexing (KeyError when a tuned config lacks one).
     # A loss key merges only into a case whose own base loss config holds it (a transport power balance pseudo-type has no huber_delta_grad)
     TUNED_DATALOADER_KEYS: ClassVar[tuple[str, ...]] = ()
@@ -501,6 +506,12 @@ class Study:
             if self.is_hyperparam_case():
                 return self
             return self.replace(**self._hyperparam_field_values())
+
+        def hyperparam_case_of(self, model_type: str) -> Study.Case:
+            """The study's hyperparam case of another model type, whose tuned config every case of that model type trains with."""
+            case_fields = {field.name: getattr(self, field.name) for field in fields(self) if field.name != "prereqs"}
+            case_fields.update(model_type=model_type, **self._hyperparam_field_values())
+            return type(self)(**type(self).pin_inapplicable_axes(case_fields))
 
         @classmethod
         def pin_inapplicable_axes(cls, fields: dict) -> dict:
@@ -845,6 +856,27 @@ class Study:
         """trb_utils.chi_sigma_floors of every configured device, computed once per study since it loads each device's profiles."""
         return {device: chi_sigma_floors(device) for device in config.dataset_paths}
 
+    def anchor_huber_deltas(self, case: Case, train_run_builder: str, target_vars: list[str]) -> dict[str, float]:
+        """The huber delta of every anchor term in the case's training loss, the TRB's ANCHOR_SIGNALS that target_vars carry.
+
+        Each is the tuned huber_delta of the study's hyperparam case of the model type predicting the signal (ANCHOR_DELTA_MODEL_TYPES),
+        so an anchor is exactly as robust as that model's own training. That case is a prereq of every anchored case.
+        A missing tuned config raises.
+        """
+        trb_class = get_train_run_builder_class(train_run_builder)
+        anchored_signals = [signal for signal in getattr(trb_class, "ANCHOR_SIGNALS", {}) if signal in target_vars]
+        deltas = {}
+        for signal in anchored_signals:
+            source_case = case.hyperparam_case_of(self.ANCHOR_DELTA_MODEL_TYPES[signal])
+            tuned_config_path = self.tuned_config_path(source_case)
+            if not tuned_config_path.exists():
+                raise FileNotFoundError(
+                    f"No tuned config of {source_case} at {tuned_config_path}, the {signal} anchor of {case} takes its huber delta from it"
+                )
+            tuned_config = TrainConfig.load(str(tuned_config_path))
+            deltas[signal] = tuned_config.loss_config["huber_delta"]
+        return deltas
+
     def training_loss_statistics(self, dataloader_config: dict) -> dict[str, dict]:
         """The loss config entries the training losses take from a case's own training data, never its held-out or test shots.
 
@@ -990,6 +1022,9 @@ class Study:
             loss_config["chi_sigma_floors"] = self.chi_sigma_floors_by_device
         # The training losses' statistics of the case's own training data
         loss_config.update(self.training_loss_statistics(spec.dataloader_config))
+        anchor_huber_deltas = self.anchor_huber_deltas(case, spec.train_run_builder, spec.dataloader_config["target_vars"])
+        if anchor_huber_deltas:
+            loss_config["anchor_huber_deltas"] = anchor_huber_deltas
 
         train_config_base = TrainConfig(
             project=self.wandb_project_name(case),

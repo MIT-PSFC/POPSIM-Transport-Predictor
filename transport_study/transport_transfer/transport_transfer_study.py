@@ -111,6 +111,11 @@ class TransportStudy(Study):
     ANALYSIS_REPORTS_MODULE = "transport_study.transport_transfer.case_reports"
     CHI_VALIDATION_LOSS = True
     RESIDUAL_SCALE_LOSS = True
+    ANCHOR_DELTA_MODEL_TYPES: ClassVar[dict[str, str]] = {
+        "energy_mhd_MJ": "power_balance",
+        "power_ohm_MW": "p_oh",
+        "power_radiated_MW": "p_rad",
+    }
     TUNED_DATALOADER_KEYS = ("segment_length_train", "segment_overlap_train", "batch_size")
     # huber_delta_grad only matters for the profile submodule cases, whose sweep tunes it
     TUNED_LOSS_KEYS = ("huber_delta", "huber_delta_grad")
@@ -359,10 +364,8 @@ class TransportStudy(Study):
             # the measured signals while the whole module trains on the
             # profiles: the power balance's Wtot plus its own p_oh/p_rad
             # submodules. A multiobjective case anchors its own Wtot and P_oh with the same weights.
-            # Training loss only, and a no-op for cases
-            # whose target_vars lack the measured signals. The power balance submodule prereq case
-            # also reads anchor_weight_power_ohm/_power_radiated through PowerBalanceTRB,
-            # sized like the power balance study's to its Wtot term
+            # Training loss only, and a no-op for cases whose target_vars lack the measured signals.
+            # The power balance pseudo-types take the power balance study's own weights (POWER_BALANCE_LOSS_DEFAULTS)
             "anchor_weight_energy_mhd": 0.1,
             "anchor_weight_power_ohm": 2e-3,
             "anchor_weight_power_radiated": 2e-3,

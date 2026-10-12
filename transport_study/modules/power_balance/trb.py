@@ -32,21 +32,13 @@ from transport_study.modules.trb_utils import (
     module_build_config,
     normalizer_fit_dataset,
     per_sample_device_values,
+    per_sample_residual_scale,
     restore_from_checkpoint,
     scalar_study_results,
     submodule_config_dict,
     target_device_idx,
     transfer_checkpoint_to_restore,
 )
-
-# Anchor terms in the training loss of the models with p_oh / p_rad submodules, keyed by measured target signal:
-# (Output attribute holding the submodule's prediction, loss_config key of its weight).
-# They keep the submodule predictions close to the measured signals.
-# Not cheating, a real application has these signals for training alongside the target Wtot
-ANCHOR_SIGNALS = {
-    "power_ohm_MW": ("power_ohm_MW_pred", "anchor_weight_power_ohm"),
-    "power_radiated_MW": ("power_radiated_MW_pred", "anchor_weight_power_radiated"),
-}
 
 
 def _prereq_submodules(train_dl: DataLoader, model_init_config: dict) -> tuple:
@@ -69,6 +61,15 @@ class PowerBalanceTRB(TrainRunBuilder):
 
     # The organize_data prep its dataloaders load every device with
     STUDY_TYPE: ClassVar[str] = "power_balance_transfer"
+
+    # Anchor terms in the training loss of the models that predict P_oh / P_rad, keyed by measured target signal:
+    # (Output attribute holding the prediction, loss_config key of its weight).
+    # They keep the submodule predictions close to the measured signals.
+    # Not cheating, a real application has these signals for training alongside the target Wtot
+    ANCHOR_SIGNALS: ClassVar[dict[str, tuple[str, str]]] = {
+        "power_ohm_MW": ("power_ohm_MW_pred", "anchor_weight_power_ohm"),
+        "power_radiated_MW": ("power_radiated_MW_pred", "anchor_weight_power_radiated"),
+    }
 
     @staticmethod
     def get_dataloaders(
@@ -152,41 +153,51 @@ class PowerBalanceTRB(TrainRunBuilder):
         return env
 
     @staticmethod
-    def _make_wtot_loss_fn(loss_config: dict, use_huber: bool) -> IntegralLoss:
+    def _make_wtot_loss_fn(loss_config: dict, training: bool) -> IntegralLoss:
         """Device-weighted loss on energy_mhd_MJ_pred, wrapped for time integration.
 
-        use_huber selects the training loss (huber, with the swept huber_delta)
-        or the delta-free validation loss (plain absolute error),
-        so the sweep metric val/loss.mean cannot be gamed by shrinking delta.
+        Training: huber on the Wtot residual divided by the device's typical stored energy
+        (loss_config residual_scales, from the case's own training data, see trb_utils.residual_scales),
+        so every device weighs alike whatever its scale and the swept huber_delta reads as a fraction of the typical value.
+        Validation: the plain absolute residual [MJ], which reads no delta,
+        so the sweep metric val/loss.mean cannot be gamed by shrinking it.
 
         Wtot counts only the timeslices a reconstruction landed on (trb_utils.freshness_weight),
         the stores hold it forward between reconstructions.
         Training integrates over the equal-length segments,
         validation averages over each episode's fresh time (TimeAveragedLoss), so a long shot weighs no more than a short one.
 
-        The training loss adds the ANCHOR_SIGNALS terms pulling the submodule
-        predictions toward the measured signals, weighted by the anchor_weight_* loss_config keys,
-        P_oh at the fresh timeslices only and P_rad at every one.
+        The training loss adds the ANCHOR_SIGNALS terms pulling the predicted powers toward the measured signals,
+        weighted by the anchor_weight_* loss_config keys, P_oh at the fresh timeslices only and P_rad at every one.
+        Each is a huber on the residual over the device's typical value,
+        with the delta tuned on the study's hyperparam case of the submodule predicting it (loss_config anchor_huber_deltas).
         Validation stays pure Wtot so the sweep metric is comparable across model types.
         The terms drop out at trace time for cases whose target_vars do not
         carry the measured signals (mlp, the plain transformer).
-        Anchor errors are plain absolute error: huber_delta is swept on the MJ-scale Wtot residuals,
-        meaningless for the MW-scale powers, and the anchors are not worth a second delta
         """
         device_weights = loss_config.get("device_weights", {})
-        anchor_weights = {signal: loss_config[weight_key] for signal, (_, weight_key) in ANCHOR_SIGNALS.items()} if use_huber else {}
+        residual_scales = loss_config["residual_scales"] if training else {}
+        anchor_signals = PowerBalanceTRB.ANCHOR_SIGNALS if training else {}
+        anchor_weights = {signal: loss_config[weight_key] for signal, (_, weight_key) in anchor_signals.items()}
 
         def loss_fn(pred, targ):
+            ds_source_idx = targ["ds_source_idx"].data
+            sample_weights = per_sample_device_values(ds_source_idx, device_weights, 1.0)
             residual = pred.energy_mhd_MJ_pred - targ["energy_mhd_MJ"].data
-            errors = optax.huber_loss(residual, delta=loss_config["huber_delta"]) if use_huber else jnp.abs(residual)
-            sample_weights = per_sample_device_values(targ["ds_source_idx"].data, device_weights, 1.0)
+            if training:
+                energy_scale = per_sample_residual_scale(ds_source_idx, residual_scales, "energy_mhd_MJ")
+                errors = optax.huber_loss(residual / energy_scale, delta=loss_config["huber_delta"])
+            else:
+                errors = jnp.abs(residual)
             wtot_weights = sample_weights * freshness_weight("energy_mhd_MJ", targ)
             loss = jnp.mean(wtot_weights * errors)
 
             for signal, anchor_weight in anchor_weights.items():
                 if anchor_weight <= 0.0 or signal not in targ:
                     continue
-                anchor_errors = jnp.abs(getattr(pred, ANCHOR_SIGNALS[signal][0]) - targ[signal].data)
+                anchor_residual = getattr(pred, anchor_signals[signal][0]) - targ[signal].data
+                anchor_scale = per_sample_residual_scale(ds_source_idx, residual_scales, signal)
+                anchor_errors = optax.huber_loss(anchor_residual / anchor_scale, delta=loss_config["anchor_huber_deltas"][signal])
                 anchor_sample_weights = sample_weights * freshness_weight(signal, targ)
                 loss = loss + anchor_weight * jnp.mean(anchor_sample_weights * anchor_errors)
             return loss
@@ -195,17 +206,17 @@ class PowerBalanceTRB(TrainRunBuilder):
         # so it divides by the fresh time and every shot counts once.
         # Training stays an integral, its segments are equal length so dividing by their duration would only rescale the loss.
         # Dividing by their fresh time would weigh each fresh timeslice by 1 / (fresh time of its segment)
-        if use_huber:
+        if training:
             return IntegralLoss(loss_fn)
         return TimeAveragedLoss(loss_fn, "fresh_equilibrium")
 
     @staticmethod
     def get_loss_fn(loss_config: dict) -> Callable[[Any, Any], jnp.ndarray]:
-        return PowerBalanceTRB._make_wtot_loss_fn(loss_config, use_huber=True)
+        return PowerBalanceTRB._make_wtot_loss_fn(loss_config, training=True)
 
     @staticmethod
     def get_val_loss_fn(loss_config: dict) -> Callable[[Any, Any], jnp.ndarray]:
-        return PowerBalanceTRB._make_wtot_loss_fn(loss_config, use_huber=False)
+        return PowerBalanceTRB._make_wtot_loss_fn(loss_config, training=False)
 
     @staticmethod
     def get_val_eval_suite(suite_config) -> EvaluationSuite | None:

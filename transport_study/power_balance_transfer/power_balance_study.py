@@ -63,15 +63,15 @@ SCALAR_SUBMODULE_SETTINGS = {
 # Fallback loss hyperparameters of every power balance case run without a tuned config,
 # also those of the transport study's power balance pseudo-types (p_oh, p_rad, power_balance)
 POWER_BALANCE_LOSS_DEFAULTS = {
-    # [MJ] on the scale of a Wtot error, C-Mod and MAST medians are 0.03-0.05 MJ
-    "huber_delta": 0.05,
+    # The training residuals are divided by the device's typical value (trb_utils.residual_scales),
+    # so the delta is a fraction of it, swept over 1 to 100 percent
+    "huber_delta": 0.1,
     # Anchor terms keeping the predicted P_oh / P_rad (the sciml submodules, a multiobjective transformer's heads)
     # close to the measured signals while the whole module trains on Wtot.
     # Training loss only, and a no-op for model types whose target_vars carry no power_ohm_MW / power_radiated_MW.
-    # Sized to the Wtot term in the trained state,
-    # at 0.1 the anchors outweighed it ~100x and unfrozen submodules barely moved toward Wtot
-    "anchor_weight_power_ohm": 2e-3,
-    "anchor_weight_power_radiated": 2e-3,
+    # A relative P_oh or P_rad miss weighs a tenth of the same relative Wtot miss, an untuned prior
+    "anchor_weight_power_ohm": 0.1,
+    "anchor_weight_power_radiated": 0.1,
 }
 
 
@@ -79,6 +79,7 @@ class PowerBalanceStudy(Study):
     SWEEP_CONFIG_DIR = Path(PACKAGE_ROOT) / "power_balance_transfer" / "sweep_configs"
     STUDY_TYPE = "power_balance_transfer"
     RESIDUAL_SCALE_LOSS = True
+    ANCHOR_DELTA_MODEL_TYPES: ClassVar[dict[str, str]] = {"power_ohm_MW": "p_oh", "power_radiated_MW": "p_rad"}
     DATA_VISUALIZATION = DataVisualization
     ANALYSIS_METRICS_MODULE = "transport_study.power_balance_transfer.study_metrics"
     ANALYSIS_REPORTS_MODULE = "transport_study.power_balance_transfer.case_reports"
@@ -221,12 +222,15 @@ class PowerBalanceStudy(Study):
 
         def model_type_prereqs(self) -> list[Study.Case]:
             # The structured models restore pre-trained p_oh/p_rad submodules
-            if self.model_type not in MODEL_TYPES_WITH_SUBMODULES:
-                return []
-            return [
-                self.replace(model_type=submodule_type, freeze_submodules=config.hyperparam_freeze_submodules)
-                for submodule_type in SUBMODULE_MODEL_TYPES
-            ]
+            if self.model_type in MODEL_TYPES_WITH_SUBMODULES:
+                return [
+                    self.replace(model_type=submodule_type, freeze_submodules=config.hyperparam_freeze_submodules)
+                    for submodule_type in SUBMODULE_MODEL_TYPES
+                ]
+            # A multiobjective case's anchors take the huber deltas the hyperparam p_oh / p_rad cases were tuned with
+            if self.multiobjective:
+                return [self.hyperparam_case_of(submodule_type) for submodule_type in SUBMODULE_MODEL_TYPES]
+            return []
 
     #############
     # EXECUTION #

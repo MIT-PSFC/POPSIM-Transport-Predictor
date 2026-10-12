@@ -105,6 +105,15 @@ def per_sample_sigma_floor(ds_source_idx: jnp.ndarray, sigma_floors: dict[str, d
     return per_sample_device_values(ds_source_idx, floors, jnp.nan)[..., None]
 
 
+def per_sample_residual_scale(ds_source_idx: jnp.ndarray, scales: dict[str, dict[str, float]], signal: str) -> jnp.ndarray:
+    """The residual_scales entry of signal for each sample's device, the typical value its training residual is divided by.
+
+    NaN for a device without one, so a missing entry fails loudly.
+    """
+    signal_scales = {device: device_scales[signal] for device, device_scales in scales.items()}
+    return per_sample_device_values(ds_source_idx, signal_scales, jnp.nan)
+
+
 def chi_value(pred: jnp.ndarray, targ: jnp.ndarray, sigma: jnp.ndarray, floor: jnp.ndarray, rho: jnp.ndarray) -> jnp.ndarray:
     """int_0^1 |pred - targ| / max(sigma, floor) drho on peak-normalized profiles.
 

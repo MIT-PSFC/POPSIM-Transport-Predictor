@@ -92,6 +92,8 @@ def grid_study(synthetic_device_stores, tmp_path, monkeypatch) -> TransportStudy
         "base_dataloader_config",
         lambda case: {**base_dataloader_config(case), "segment_length_train": 20, "segment_overlap_train": 10},
     )
+    # No hyperparam case has trained here, so no tuned config holds the anchor deltas
+    monkeypatch.setattr(study, "anchor_huber_deltas", lambda case, train_run_builder, target_vars: {})
     return study
 
 

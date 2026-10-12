@@ -16,6 +16,7 @@ from transport_study.modules.trb_utils import (
     module_build_config,
     normalizer_fit_dataset,
     per_sample_device_values,
+    per_sample_residual_scale,
     restore_from_checkpoint,
     scalar_study_results,
     target_device_idx,
@@ -63,31 +64,39 @@ class ScalarPowerTRB(TrainRunBuilder):
         return module
 
     @classmethod
-    def _make_loss_fn(cls, loss_config: dict, use_huber: bool) -> Callable[[Any, Any], jnp.ndarray]:
+    def _make_loss_fn(cls, loss_config: dict, training: bool) -> Callable[[Any, Any], jnp.ndarray]:
         """Device-weighted error on the predicted power.
 
-        use_huber selects the training loss (huber with the swept huber_delta)
-        or the delta-free validation loss (plain absolute error),
-        so the sweep metric val/loss.mean cannot be gamed by shrinking delta.
+        Training: huber on the residual divided by the device's typical power
+        (loss_config residual_scales, from the case's own training data, see trb_utils.residual_scales),
+        so every device weighs alike whatever its scale and the swept huber_delta reads as a fraction of the typical value.
+        Validation: the plain absolute residual [MW], which reads no delta,
+        so the sweep metric val/loss.mean cannot be gamed by shrinking it.
         """
         device_weights = loss_config.get("device_weights", {})
+        residual_scales = loss_config["residual_scales"] if training else {}
         signal = cls.SIGNAL
 
         def loss_fn(pred, targ):
+            ds_source_idx = targ["ds_source_idx"].data
             residual = getattr(pred, f"{signal}_pred") - targ[signal].data
-            errors = optax.huber_loss(residual, delta=loss_config["huber_delta"]) if use_huber else jnp.abs(residual)
-            sample_weights = per_sample_device_values(targ["ds_source_idx"].data, device_weights, 1.0)
+            if training:
+                power_scale = per_sample_residual_scale(ds_source_idx, residual_scales, signal)
+                errors = optax.huber_loss(residual / power_scale, delta=loss_config["huber_delta"])
+            else:
+                errors = jnp.abs(residual)
+            sample_weights = per_sample_device_values(ds_source_idx, device_weights, 1.0)
             return jnp.mean(sample_weights * errors)
 
         return loss_fn
 
     @classmethod
     def get_loss_fn(cls, loss_config: dict) -> Callable[[Any, Any], jnp.ndarray]:
-        return cls._make_loss_fn(loss_config, use_huber=True)
+        return cls._make_loss_fn(loss_config, training=True)
 
     @classmethod
     def get_val_loss_fn(cls, loss_config: dict) -> Callable[[Any, Any], jnp.ndarray]:
-        return cls._make_loss_fn(loss_config, use_huber=False)
+        return cls._make_loss_fn(loss_config, training=False)
 
     @staticmethod
     def get_optimizer(optimizer_config: dict) -> optax.GradientTransformation:

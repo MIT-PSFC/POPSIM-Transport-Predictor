@@ -60,6 +60,8 @@ def test_transfer_restores_the_pretrain_then_its_own_submodules(synthetic_device
         "base_dataloader_config",
         lambda case: {**base_dataloader_config(case), "segment_length_train": 20, "segment_overlap_train": 10},
     )
+    # No hyperparam p_oh / p_rad case has trained here, so no tuned config holds the anchor deltas
+    monkeypatch.setattr(study, "anchor_huber_deltas", lambda case, train_run_builder, target_vars: {})
     case = next(case for case in study.cases if case.domain_adaptation == "transfer" and case.model_type == "sciml-taue-nn")
     train_config = study.make_train_config(case)
     _, train_dl, _, _ = PowerBalanceTRB.get_dataloaders(train_config.dataloader_config)

@@ -8,10 +8,11 @@ import equinox as eqx
 import jax
 import jax.numpy as jnp
 import numpy as np
+import pytest
 import xarray as xr
 from popsim.ml.partition import make_partition_by_members
 
-from transport_study.config import StudyConfig, load_config
+from transport_study.config import StudyConfig, config, load_config
 from transport_study.modules.normalization import InputNormalizer, make_normalizer
 from transport_study.modules.power_balance.module import (
     SCALING_LAW_FIELDS,
@@ -34,24 +35,42 @@ from transport_study.tests.sample_data import SAMPLE_DIR, requires_sample_data
 # Loss functions #
 ##################
 
-# device_weights passed explicitly so the loss builder does not consult the
-# global config (only the device-weight test loads one)
+# Unit typical values, so the training residuals keep their plain values
+UNIT_RESIDUAL_SCALES = {device: {"energy_mhd_MJ": 1.0, "power_ohm_MW": 1.0, "power_radiated_MW": 1.0} for device in ("cmod", "mast")}
 BASE_LOSS_CONFIG = {
     "huber_delta": 0.5,
     "anchor_weight_power_ohm": 0.1,
     "anchor_weight_power_radiated": 0.1,
+    "anchor_huber_deltas": {"power_ohm_MW": 0.5, "power_radiated_MW": 0.5},
+    "residual_scales": UNIT_RESIDUAL_SCALES,
     "device_weights": {},
 }
 
 
-def _make_output(n: int, p_oh: float | None = None, p_rad: float | None = None) -> PowerBalance.Output:
+@pytest.fixture
+def loaded_config():
+    """cmod and mast, which the residual scales and device weights are keyed by (ds_source_to_idx sorts them: cmod 0, mast 1)."""
+    return load_config(
+        StudyConfig(
+            study_name="pb_trb_loss_test",
+            dataset_paths={"cmod": Path("unused_a.nc"), "mast": Path("unused_b.nc")},
+            target_device="mast",
+        )
+    )
+
+
+def _huber(residual: float, delta: float) -> float:
+    return 0.5 * residual**2 if abs(residual) <= delta else delta * (abs(residual) - 0.5 * delta)
+
+
+def _make_output(n: int, p_oh: float | None = None, p_rad: float | None = None, energy: float = 1.0) -> PowerBalance.Output:
     kwargs = {}
     if p_oh is not None:
         kwargs["power_ohm_MW_pred"] = jnp.full(n, p_oh)
     if p_rad is not None:
         kwargs["power_radiated_MW_pred"] = jnp.full(n, p_rad)
     return PowerBalance.Output(
-        energy_mhd_MJ_pred=jnp.ones(n),
+        energy_mhd_MJ_pred=jnp.full(n, energy),
         P_cond_MW=jnp.ones(n),
         taue_predictor_output=TauePredictorOutputs(taue_pred=jnp.ones(n), debug_info={}),
         **kwargs,
@@ -72,7 +91,7 @@ def _make_targets(n: int, with_powers: bool = True, ds_source_idx=None) -> dict:
     return targ
 
 
-def test_anchor_terms_enter_train_loss_for_sciml():
+def test_anchor_terms_enter_train_loss_for_sciml(loaded_config):
     inst = PowerBalanceTRB.get_loss_fn(BASE_LOSS_CONFIG).instantaneous_loss
     targ = _make_targets(4)
 
@@ -80,9 +99,32 @@ def test_anchor_terms_enter_train_loss_for_sciml():
     loss_drift = inst(_make_output(4, p_oh=5.0, p_rad=1.0), targ)
 
     # Wtot term is zero (pred == targ), so the difference is exactly the
-    # P_oh anchor: anchor_weight * mean(|5 - 2|)
+    # P_oh anchor: anchor_weight * huber(5 - 2) at the anchor's own delta
     assert float(loss_match) == 0.0
-    assert np.isclose(float(loss_drift), 0.1 * 3.0, atol=1e-6)
+    assert np.isclose(float(loss_drift), 0.1 * _huber(3.0, 0.5), atol=1e-6)
+
+
+def test_training_loss_weighs_relative_misses_alike_across_devices(loaded_config):
+    """A 10 percent Wtot miss costs the same training loss on a 0.03 MJ and a 0.6 MJ device,
+    while the validation loss stays the absolute miss [MJ]."""
+    typical_energies = {"cmod": 0.03, "mast": 0.6}
+    residual_scales = {
+        device: {"energy_mhd_MJ": energy, "power_ohm_MW": 1.0, "power_radiated_MW": 1.0} for device, energy in typical_energies.items()
+    }
+    loss_config = {**BASE_LOSS_CONFIG, "residual_scales": residual_scales}
+    train_inst = PowerBalanceTRB.get_loss_fn(loss_config).instantaneous_loss
+    val_inst = PowerBalanceTRB.get_val_loss_fn(loss_config).instantaneous_loss
+
+    train_losses, val_losses = {}, {}
+    for device, energy in typical_energies.items():
+        targ = _make_targets(4, with_powers=False, ds_source_idx=[float(config.ds_source_to_idx[device])] * 4)
+        targ["energy_mhd_MJ"] = xr.DataArray(np.full(4, energy, dtype=np.float32))
+        pred = _make_output(4, energy=1.1 * energy)
+        train_losses[device] = float(train_inst(pred, targ))
+        val_losses[device] = float(val_inst(pred, targ))
+
+    assert np.isclose(train_losses["cmod"], train_losses["mast"], rtol=1e-5)
+    assert np.isclose(val_losses["mast"], 20.0 * val_losses["cmod"], rtol=1e-5)
 
 
 def test_anchor_terms_absent_from_val_loss():
@@ -95,7 +137,7 @@ def test_anchor_terms_absent_from_val_loss():
     assert np.isclose(float(loss_match), float(loss_drift))
 
 
-def test_anchor_terms_noop_without_power_targets():
+def test_anchor_terms_noop_without_power_targets(loaded_config):
     # mlp / transformer target_vars carry no powers, and their Output keeps
     # the NaN defaults, which must never reach the loss
     inst = PowerBalanceTRB.get_loss_fn(BASE_LOSS_CONFIG).instantaneous_loss
@@ -107,7 +149,7 @@ def test_anchor_terms_noop_without_power_targets():
     assert float(loss) == 0.0
 
 
-def test_anchor_weight_zero_disables_term():
+def test_anchor_weight_zero_disables_term(loaded_config):
     loss_config = {**BASE_LOSS_CONFIG, "anchor_weight_power_ohm": 0.0, "anchor_weight_power_radiated": 0.0}
     inst = PowerBalanceTRB.get_loss_fn(loss_config).instantaneous_loss
     targ = _make_targets(4)
@@ -117,24 +159,16 @@ def test_anchor_weight_zero_disables_term():
     assert float(loss_drift) == 0.0
 
 
-def test_anchor_terms_respect_device_weights():
-    load_config(
-        StudyConfig(
-            study_name="pb_trb_loss_test",
-            dataset_paths={"cmod": Path("unused_a.nc"), "mast": Path("unused_b.nc")},
-            target_device="mast",
-        )
-    )
-    # ds_source_to_idx sorts the dataset names: cmod -> 0, mast -> 1
+def test_anchor_terms_respect_device_weights(loaded_config):
     loss_config = {**BASE_LOSS_CONFIG, "device_weights": {"cmod": 1.0, "mast": 5.0}}
     inst = PowerBalanceTRB.get_loss_fn(loss_config).instantaneous_loss
     targ = _make_targets(4, ds_source_idx=[0.0, 0.0, 1.0, 1.0])
 
     # P_oh anchor error is 1.0 everywhere, so the term is
-    # anchor_weight * mean(sample_weights) = 0.1 * mean([1, 1, 5, 5])
+    # anchor_weight * mean(sample_weights) * huber(1.0) = 0.1 * mean([1, 1, 5, 5]) * huber(1.0)
     loss = inst(_make_output(4, p_oh=3.0, p_rad=1.0), targ)
 
-    assert np.isclose(float(loss), 0.1 * 3.0, atol=1e-6)
+    assert np.isclose(float(loss), 0.1 * 3.0 * _huber(1.0, 0.5), atol=1e-6)
 
 
 ##################
