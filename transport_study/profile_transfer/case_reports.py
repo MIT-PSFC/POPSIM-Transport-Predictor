@@ -46,9 +46,12 @@ from transport_study.profile_transfer.study_metrics import (
     CaseTimesliceMetrics,
     compute_case_timeslice_metrics,
     load_eval_dataset,
+    result_device_shots,
 )
 
 GIF_FRAME_DURATION_MS = 200
+# At most this many frames per GIF, evenly spaced over the shot's records, which bounds the rendering time and memory
+GIF_MAX_FRAMES = 60
 REPORT_FILENAME = "best_worst_timeslices.pdf"
 
 VALUE_LABELS = {
@@ -103,7 +106,8 @@ def _timeslice_panel(
     shot = ts_metrics.shot[record_idx]
     device = ts_metrics.ds_source[record_idx]
     shot_res = result_ds.sel({EPISODE_DIM: shot}).isel({TIME_DIM: int(ts_metrics.result_time_idx[record_idx])})
-    shot_eval = load_eval_dataset(device).sel({EPISODE_DIM: shot}).isel({TIME_DIM: int(ts_metrics.eval_time_idx[record_idx])})
+    device_shots = result_device_shots(result_ds, device)
+    shot_eval = load_eval_dataset(device, device_shots).sel({EPISODE_DIM: shot}).isel({TIME_DIM: int(ts_metrics.eval_time_idx[record_idx])})
 
     rho = result_ds[RADIAL_DIM].values
     rho_mid = 0.5 * (rho[:-1] + rho[1:])
@@ -171,7 +175,8 @@ def _shot_ylims(result_ds: xr.Dataset, ts_metrics: CaseTimesliceMetrics, record_
     shot = ts_metrics.shot[record_idxs[0]]
     device = ts_metrics.ds_source[record_idxs[0]]
     shot_res = result_ds.sel({EPISODE_DIM: shot})
-    shot_eval = load_eval_dataset(device).sel({EPISODE_DIM: shot})
+    device_shots = result_device_shots(result_ds, device)
+    shot_eval = load_eval_dataset(device, device_shots).sel({EPISODE_DIM: shot})
     res_idxs = ts_metrics.result_time_idx[record_idxs]
     eval_idxs = ts_metrics.eval_time_idx[record_idxs]
 
@@ -232,12 +237,13 @@ def evolution_gifs(result_ds: xr.Dataset, ts_metrics: CaseTimesliceMetrics, case
         record_idxs = record_idxs[np.argsort(ts_metrics.time[record_idxs])]
         if len(record_idxs) == 0:
             continue
-        ylims = _shot_ylims(result_ds, ts_metrics, record_idxs)
+        n_frames = min(len(record_idxs), GIF_MAX_FRAMES)
+        frame_positions = np.linspace(0, len(record_idxs) - 1, n_frames).round().astype(int)
+        frame_record_idxs = record_idxs[frame_positions]
+        ylims = _shot_ylims(result_ds, ts_metrics, frame_record_idxs)
         frames = [
-            _fig_to_image(
-                _timeslice_panel(result_ds, ts_metrics, record_idx, title_prefix=f"frame {i + 1}/{len(record_idxs)} - ", ylims=ylims)
-            )
-            for i, record_idx in enumerate(record_idxs)
+            _fig_to_image(_timeslice_panel(result_ds, ts_metrics, record_idx, title_prefix=f"frame {i + 1}/{n_frames} - ", ylims=ylims))
+            for i, record_idx in enumerate(frame_record_idxs)
         ]
         gif_path = case_dir / f"shot_{shot}_evolution.gif"
         # The temporary name hides the extension, so PIL is told the format

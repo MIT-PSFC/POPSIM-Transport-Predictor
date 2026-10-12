@@ -21,7 +21,7 @@ from typing import ClassVar
 import numpy as np
 import xarray as xr
 
-from transport_study import TIME_COORD
+from transport_study import EPISODE_DIM, TIME_COORD
 from transport_study.config import config
 from transport_study.orchestration.case_metrics import (
     DIVERGED_VAR,
@@ -33,7 +33,11 @@ from transport_study.orchestration.organize_data import (
     to_rho_grid,
 )
 from transport_study.orchestration.study import Study
-from transport_study.signals import POWER_ADDITIONAL_MW, convert_to_working_units
+from transport_study.signals import (
+    POWER_ADDITIONAL_MW,
+    convert_to_working_units,
+    store_signals_for,
+)
 
 METRIC_NAMES = ("value", "grad", "combined", "diverged")
 METRIC_VARS = {
@@ -42,23 +46,37 @@ METRIC_VARS = {
     "combined": "error_chi_ts",
     "diverged": DIVERGED_VAR,
 }
+# The profile signals with their gradient and error-bar companions, plus what the stage labels read
+EVAL_SIGNALS = [*PROFILE_TARGET_VARS, POWER_ADDITIONAL_MW, "ip_MA", TIME_COORD]
+
+
+def result_device_shots(result_ds: xr.Dataset, device: str) -> tuple[int, ...]:
+    """A result file's shots of one device, sorted, the key load_eval_dataset caches them under."""
+    mask_device = result_ds["ds_source"].values == device
+    device_shots = result_ds[EPISODE_DIM].values[mask_device]
+    return tuple(sorted(device_shots.tolist()))
 
 
 @cache
-def load_eval_dataset(device: str) -> xr.Dataset:
-    """Device dataset the result timeslices join to, for the stage labels and the case reports' error bars.
+def load_eval_dataset(device: str, shots: tuple[int, ...]) -> xr.Dataset:
+    """The shots of one device the result timeslices join to, for the stage labels and the case reports' error bars.
 
-    Profile signals and their gradient / error-bar companions are put on the
-    same uniform 51-point rho grid as training (organize_data.to_rho_grid,
-    the prep of get_ds). ip_MA, the auxiliary power, and the time coord are
-    kept for stage segmentation. Non-fresh timeslices are kept: the join is by
-    time, so only timeslices that appear in a result file are ever read.
+    shots come from result_device_shots, and repeat across a study's cases (each device's validation shots, the target test set),
+    so the cache holds a few datasets of a result file's shots instead of whole devices,
+    which OOM-killed the 32G profile analysis jobs.
+    Only EVAL_SIGNALS are read, and only these shots, before the unit conversion.
+    A shot the store lacks is left out, staged_result_records skips it with a warning.
+    The profiles go on the uniform rho grid of training (organize_data.to_rho_grid, the prep of get_ds).
+    The time axis stays whole, the records index it (device_time_idx), stale timeslices included.
     """
     ds_path = Path(config.dataset_paths[device])
     ds_store = xr.open_dataset(ds_path)
-    ds_working = convert_to_working_units(ds_store)
-    ds = ds_working[[*PROFILE_TARGET_VARS, POWER_ADDITIONAL_MW, "ip_MA", TIME_COORD]]
-    ds_rho = to_rho_grid(ds)
+    shots_requested = np.asarray(shots)
+    mask_stored = np.isin(shots_requested, ds_store[EPISODE_DIM].values)
+    store_signals = store_signals_for(EVAL_SIGNALS)
+    ds_store_selected = ds_store[store_signals].sel({EPISODE_DIM: shots_requested[mask_stored]})
+    ds_working = convert_to_working_units(ds_store_selected)
+    ds_rho = to_rho_grid(ds_working[EVAL_SIGNALS])
     return ds_rho.load()
 
 
@@ -79,7 +97,12 @@ class CaseTimesliceMetrics(StagedTimesliceMetrics):
 
 def compute_case_timeslice_metrics(result_ds: xr.Dataset) -> CaseTimesliceMetrics:
     """Stage-label every valid test timeslice of one case result file, joined to its device eval dataset by (shot, nearest time)."""
-    records = staged_result_records(result_ds, load_eval_dataset, METRIC_VARS)
+
+    def device_eval_dataset(device: str) -> xr.Dataset:
+        shots = result_device_shots(result_ds, device)
+        return load_eval_dataset(device, shots)
+
+    records = staged_result_records(result_ds, device_eval_dataset, METRIC_VARS)
     return CaseTimesliceMetrics.from_records(
         records,
         METRIC_NAMES,

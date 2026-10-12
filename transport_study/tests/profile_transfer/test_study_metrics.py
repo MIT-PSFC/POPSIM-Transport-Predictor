@@ -89,7 +89,7 @@ def _make_eval_ds() -> xr.Dataset:
 
 @pytest.fixture()
 def patched_eval(monkeypatch):
-    monkeypatch.setattr(study_metrics, "load_eval_dataset", lambda device: _make_eval_ds())
+    monkeypatch.setattr(study_metrics, "load_eval_dataset", lambda device, shots: _make_eval_ds())
 
 
 class TestComputeCaseTimesliceMetrics:

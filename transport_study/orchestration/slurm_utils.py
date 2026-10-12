@@ -1104,5 +1104,5 @@ Path({study_config_path!r}).unlink()
 echo "=== $(date) job $SLURM_JOB_ID ({job_name}) start on $SLURMD_NODENAME ==="
 export MPLBACKEND=Agg
 {CPU_JOB_ENV}"""
-    script = sbatch_script(job_name, partition, config.analysis_time_limit, log_path, script_path, setup, mem="32G")
+    script = sbatch_script(job_name, partition, config.analysis_time_limit, log_path, script_path, setup, mem=config.analysis_mem)
     submit_sbatch(script, job_name, "analysis")
