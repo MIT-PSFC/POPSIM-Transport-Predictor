@@ -305,7 +305,6 @@ def torax_relaxation_report(study, metrics_ds: xr.Dataset, figure_dir: Path):
     logger.info(f"Best torax case by combined metric: {case}")
 
     result_ds = xr.load_dataset(study.result_path(case))
-    train_config = study.make_train_config(case)
     ts_metrics = compute_case_timeslice_metrics(result_ds)
     combined = ts_metrics.best("combined")
     finite_records = np.flatnonzero(np.isfinite(combined))
@@ -328,6 +327,8 @@ def torax_relaxation_report(study, metrics_ds: xr.Dataset, figure_dir: Path):
         logger.info(f"TORAX relaxation figure already exists at {plot_path}, skipping")
         return
 
+    # Only now, since it loads every device (chi_sigma_floors) and the figure may already exist
+    train_config = study.make_train_config(case)
     # Function-level import: restore_predictor imports profile_study, which
     # imports this module at run_study time, so a top-level import would cycle
     from transport_study.profile_transfer.restore_predictor import (

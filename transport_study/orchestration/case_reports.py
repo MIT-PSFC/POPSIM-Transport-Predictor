@@ -124,11 +124,13 @@ def case_report_dir(figure_dir: Path, case) -> Path:
     return Path(figure_dir) / "case_reports" / str(case)
 
 
-def generate_case_report(study: Study, case, figure_dir: Path):
+def generate_case_report(study: Study, case, figure_dir: Path, ts_metrics: StagedTimesliceMetrics | None = None):
     """The study's report for one case.
 
     A no-op without a result file, when the report is already on disk,
     or for a borrowed case, whose home study renders its own report.
+    ts_metrics are the case's per-timeslice scores when the caller has them (compute_and_save_case_metrics),
+    otherwise they are scored here.
     """
     result_path = study.result_path(case)
     if not result_path.exists() or study.is_borrowed(case):
@@ -140,7 +142,8 @@ def generate_case_report(study: Study, case, figure_dir: Path):
         return
 
     result_ds = xr.load_dataset(result_path)
-    ts_metrics = case_timeslice_metrics(study, case, result_ds)
+    if ts_metrics is None:
+        ts_metrics = case_timeslice_metrics(study, case, result_ds)
     if len(ts_metrics) == 0:
         logger.warning(f"No valid test timeslices for case {case}, skipping case report")
         return

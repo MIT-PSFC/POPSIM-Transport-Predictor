@@ -1087,9 +1087,9 @@ from transport_study.orchestration.case_reports import generate_case_report
 study = {study_cls.__name__}(Path({study_config_path!r}))
 case = study.case_by_name({case_str!r})
 
-case_metrics = compute_and_save_case_metrics(study, case)
+case_metrics, ts_metrics = compute_and_save_case_metrics(study, case)
 if case_metrics.data_vars:
-    generate_case_report(study, case, study.figure_dir)
+    generate_case_report(study, case, study.figure_dir, ts_metrics)
 Path({study_config_path!r}).unlink()
 """
 

@@ -267,21 +267,25 @@ def cached_case_metrics_path(study: Study, case) -> Path | None:
     return None
 
 
-def compute_and_save_case_metrics(study: Study, case) -> xr.Dataset:
+def compute_and_save_case_metrics(study: Study, case) -> tuple[xr.Dataset, StagedTimesliceMetrics | None]:
     """Stage-aggregate metrics for one case, cached to case_metrics_path.
 
-    Returns the cached dataset when present, otherwise computes it from the case result file and saves it.
+    Returns (case_ds, ts_metrics).
+    case_ds is the cached dataset when present, otherwise computed from the case result file and saved.
+    ts_metrics are the per-timeslice scores when computed here, so the case report need not score them again,
+    and None when the cache answered.
     A result file without valid timeslices caches an empty dataset so the work is not retried.
     A case without a result file returns an empty dataset without caching, results may still appear later.
     """
     existing_cache_path = cached_case_metrics_path(study, case)
     if existing_cache_path is not None:
-        return xr.load_dataset(existing_cache_path)
+        cached_ds = xr.load_dataset(existing_cache_path)
+        return cached_ds, None
 
     cache_path = case_metrics_path(study, case)
     result_path = study.result_path(case)
     if not result_path.exists():
-        return xr.Dataset()
+        return xr.Dataset(), None
 
     result_ds = xr.load_dataset(result_path)
     ts_metrics = case_timeslice_metrics(study, case, result_ds)
@@ -294,7 +298,7 @@ def compute_and_save_case_metrics(study: Study, case) -> xr.Dataset:
         logger.info(f"Computed stage-resolved metrics for case {case} ({len(ts_metrics)} timeslices)")
 
     write_netcdf_atomic(case_ds, cache_path)
-    return case_ds
+    return case_ds, ts_metrics
 
 
 def collect_metrics(study: Study) -> xr.Dataset:
@@ -310,7 +314,7 @@ def collect_metrics(study: Study) -> xr.Dataset:
 
     results = []
     for case_idx, case in enumerate(study.cases):
-        case_ds = compute_and_save_case_metrics(study, case)
+        case_ds, _ = compute_and_save_case_metrics(study, case)
         if not case_ds.data_vars:
             continue
         results.append(case_ds.assign_coords(study.case_coords(case_idx, case)))

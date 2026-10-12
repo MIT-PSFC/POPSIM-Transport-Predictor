@@ -147,15 +147,18 @@ class TestCaseMetricsCache:
 
     def test_missing_result_returns_empty_without_caching(self, tmp_path):
         study = _StubStudy(tmp_path)
-        case_ds = compute_and_save_case_metrics(study, "case.test")
+        case_ds, ts_metrics = compute_and_save_case_metrics(study, "case.test")
         assert not case_ds.data_vars
+        assert ts_metrics is None
         assert not case_metrics_path(study, "case.test").exists()
 
     def test_computes_aggregates_and_caches(self, tmp_path, patched_eval):
         study = self._stub_with_result(tmp_path)
 
-        case_ds = compute_and_save_case_metrics(study, "case.test")
+        case_ds, ts_metrics = compute_and_save_case_metrics(study, "case.test")
         assert case_metrics_path(study, "case.test").exists()
+        # The scores computed here go back to the caller, so the case report reuses them
+        assert len(ts_metrics) == 4
         assert list(case_ds["stage"].values) == list(STAGE_AGG_NAMES)
         best_mean = CHI_VALUE.mean()
         # The best checkpoint, the top-K mean and std of the two checkpoints' case scores
@@ -171,14 +174,15 @@ class TestCaseMetricsCache:
 
     def test_second_call_uses_cache(self, tmp_path, patched_eval, monkeypatch):
         study = self._stub_with_result(tmp_path)
-        first = compute_and_save_case_metrics(study, "case.test")
+        first, _ = compute_and_save_case_metrics(study, "case.test")
 
         def _boom(*args, **kwargs):
             raise AssertionError("cache should have been used")
 
         monkeypatch.setattr(study_metrics, "compute_case_timeslice_metrics", _boom)
-        second = compute_and_save_case_metrics(study, "case.test")
+        second, second_ts_metrics = compute_and_save_case_metrics(study, "case.test")
         xr.testing.assert_allclose(first, second)
+        assert second_ts_metrics is None
 
     def test_analysis_case_done(self, tmp_path, patched_eval):
         study = _StubStudy(tmp_path)
