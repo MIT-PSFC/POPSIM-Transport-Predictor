@@ -236,7 +236,7 @@ class ProfileStudy(Study):
             "batch_size": 2048,
         }
 
-    def base_loss_config(self) -> dict:
+    def base_loss_config(self, case: Case) -> dict:
         return {
             # The training loss runs on peak-normalized profiles (target scaled to max 1),
             # so both deltas read as fractional errors.

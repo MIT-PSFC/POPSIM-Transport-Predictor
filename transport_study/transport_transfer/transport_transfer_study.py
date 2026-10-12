@@ -41,6 +41,7 @@ from transport_study.orchestration.study import (
 from transport_study.orchestration.target_shots import BASE_TARGET_SHOT_ORDER
 from transport_study.power_balance_transfer.power_balance_study import (
     POWER_BALANCE_INPUT_VARS,
+    POWER_BALANCE_LOSS_DEFAULTS,
     SCALAR_SUBMODULE_SETTINGS,
 )
 from transport_study.profile_transfer.profile_study import PROFILE_INPUT_VARS
@@ -109,6 +110,7 @@ class TransportStudy(Study):
     ANALYSIS_METRICS_MODULE = "transport_study.transport_transfer.study_metrics"
     ANALYSIS_REPORTS_MODULE = "transport_study.transport_transfer.case_reports"
     CHI_VALIDATION_LOSS = True
+    RESIDUAL_SCALE_LOSS = True
     TUNED_DATALOADER_KEYS = ("segment_length_train", "segment_overlap_train", "batch_size")
     # huber_delta_grad only matters for the profile submodule cases, whose sweep tunes it
     TUNED_LOSS_KEYS = ("huber_delta", "huber_delta_grad")
@@ -333,7 +335,10 @@ class TransportStudy(Study):
             "segment_overlap_val": 0,
         }
 
-    def base_loss_config(self) -> dict:
+    def base_loss_config(self, case: Case) -> dict:
+        # The power balance pseudo-types train with the power balance study's losses and fallbacks
+        if case.model_type in POWER_BALANCE_SUBMODULE_TYPES:
+            return dict(POWER_BALANCE_LOSS_DEFAULTS)
         return {
             # The training loss runs on peak-normalized profiles (target scaled to max 1),
             # so the delta reads as a fractional error. Fallback for cases run without a tuned config.

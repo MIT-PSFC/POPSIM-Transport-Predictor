@@ -42,7 +42,12 @@ from transport_study.config import (
     load_config,
 )
 from transport_study.modules.normalization import STAT_NORMALIZATIONS
-from transport_study.modules.trb_utils import chi_sigma_floors
+from transport_study.modules.trb_utils import (
+    chi_sigma_floors,
+    residual_scales,
+    resolve_case_datasets,
+    training_chi_sigma_floors,
+)
 from transport_study.orchestration.config_lock import (
     CONFIG_LOCK_FILENAME,
     ConfigLock,
@@ -74,6 +79,7 @@ from transport_study.orchestration.slurm_utils import (
 from transport_study.orchestration.target_shots import (
     BASE_TARGET_SHOT_ORDER,
     TARGET_SHOT_ORDERS,
+    TargetSplit,
     configured_target_split,
     held_out_shot_mask,
 )
@@ -358,7 +364,11 @@ class Study:
     # Whether the validation loss is chi, which needs the per-device error-bar floors in the loss config
     CHI_VALIDATION_LOSS: ClassVar[bool] = False
 
-    # Tuned-config dataloader and loss keys, merged by strict indexing (KeyError when a tuned config lacks one)
+    # Whether the training losses divide power balance residuals by each device's typical value (trb_utils.residual_scales)
+    RESIDUAL_SCALE_LOSS: ClassVar[bool] = False
+
+    # Tuned-config dataloader and loss keys, merged by strict indexing (KeyError when a tuned config lacks one).
+    # A loss key merges only into a case whose own base loss config holds it (a transport power balance pseudo-type has no huber_delta_grad)
     TUNED_DATALOADER_KEYS: ClassVar[tuple[str, ...]] = ()
     TUNED_LOSS_KEYS: ClassVar[tuple[str, ...]] = ()
 
@@ -835,6 +845,28 @@ class Study:
         """trb_utils.chi_sigma_floors of every configured device, computed once per study since it loads each device's profiles."""
         return {device: chi_sigma_floors(device) for device in config.dataset_paths}
 
+    def training_loss_statistics(self, dataloader_config: dict) -> dict[str, dict]:
+        """The loss config entries the training losses take from a case's own training data, never its held-out or test shots.
+
+        residual_scales (RESIDUAL_SCALE_LOSS studies) from the power balance view,
+        train_chi_sigma_floors (CHI_VALIDATION_LOSS studies) from the profile view.
+        Both read the training parts trb_utils.resolve_case_datasets selects, the ones every TRB trains on,
+        and every view holds the same shots.
+        Cached by that selection (training data, domain adaptation and target split), which many cases share.
+        """
+        target_split = TargetSplit.from_dataloader_config(dataloader_config)
+        selection = (str(dataloader_config["training_data"]), dataloader_config["domain_adaptation"], target_split)
+        if selection not in self._training_statistics_cache:
+            statistics = {}
+            if self.RESIDUAL_SCALE_LOSS:
+                power_balance_parts, _, _, _ = resolve_case_datasets(dataloader_config, "power_balance_transfer")
+                statistics["residual_scales"] = residual_scales(power_balance_parts)
+            if self.CHI_VALIDATION_LOSS:
+                profile_parts, _, _, _ = resolve_case_datasets(dataloader_config, "profile_transfer")
+                statistics["train_chi_sigma_floors"] = training_chi_sigma_floors(profile_parts)
+            self._training_statistics_cache[selection] = statistics
+        return self._training_statistics_cache[selection]
+
     def _set_transfer_checkpoint(self, train_config: TrainConfig, transfer_case: Case) -> TrainConfig:
         """Point model_init at the pretrained checkpoint the transfer case fine-tunes from."""
         return train_config.model_copy(
@@ -942,7 +974,7 @@ class Study:
         around the per-model-type pieces supplied by the model_train_spec hook.
         """
         dataloader_config_base = self.base_dataloader_config(case)
-        loss_config = self.base_loss_config()
+        loss_config = self.base_loss_config(case)
         optimizer_config = self.base_optimizer_config()
         spec = self.model_train_spec(case, dataloader_config_base)
         if case.domain_adaptation == "weighted":
@@ -956,6 +988,8 @@ class Study:
         if self.CHI_VALIDATION_LOSS:
             # Read by the chi validation loss, which val_eval_suite_config shares
             loss_config["chi_sigma_floors"] = self.chi_sigma_floors_by_device
+        # The training losses' statistics of the case's own training data
+        loss_config.update(self.training_loss_statistics(spec.dataloader_config))
 
         train_config_base = TrainConfig(
             project=self.wandb_project_name(case),
@@ -1008,7 +1042,7 @@ class Study:
         logger.info(f"Found tuned hyperparameter config for case {case}, using hyperparameters from that config")
 
         tuned_dataloader = {key: tuned_config.dataloader_config[key] for key in self.TUNED_DATALOADER_KEYS}
-        tuned_loss = {key: tuned_config.loss_config[key] for key in self.TUNED_LOSS_KEYS}
+        tuned_loss = {key: tuned_config.loss_config[key] for key in self.TUNED_LOSS_KEYS if key in train_config_base.loss_config}
         train_config = train_config_base.model_copy(
             update={
                 "dataloader_config": {**train_config_base.dataloader_config, **tuned_dataloader},
@@ -1048,8 +1082,8 @@ class Study:
             **target_split.dataloader_config(),
         }
 
-    def base_loss_config(self) -> dict:
-        """Fallback loss hyperparameters for cases run without a tuned config."""
+    def base_loss_config(self, case: Case) -> dict:
+        """Fallback loss hyperparameters of a case run without a tuned config."""
         raise NotImplementedError
 
     def model_train_spec(self, case: Case, dataloader_config_base: dict) -> ModelTrainSpec:
@@ -1906,6 +1940,8 @@ class Study:
         self._steps_per_epoch_cache: dict[str, int] = {}
         # get_loaded_shot_count per (device, study type), read by make_weighted_device_weights
         self._loaded_shot_counts: dict[tuple[str, str], int] = {}
+        # training_loss_statistics per training-data selection
+        self._training_statistics_cache: dict[tuple, dict[str, dict]] = {}
         # The next time each tuning case's sweep progress (str(case))
         # and each agent job's liveness (job name) may be read from wandb again
         self._next_sweep_poll: dict[str, float] = {}

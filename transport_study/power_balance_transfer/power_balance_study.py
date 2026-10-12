@@ -60,10 +60,25 @@ SCALAR_SUBMODULE_SETTINGS = {
     },
 }
 
+# Fallback loss hyperparameters of every power balance case run without a tuned config,
+# also those of the transport study's power balance pseudo-types (p_oh, p_rad, power_balance)
+POWER_BALANCE_LOSS_DEFAULTS = {
+    # [MJ] on the scale of a Wtot error, C-Mod and MAST medians are 0.03-0.05 MJ
+    "huber_delta": 0.05,
+    # Anchor terms keeping the predicted P_oh / P_rad (the sciml submodules, a multiobjective transformer's heads)
+    # close to the measured signals while the whole module trains on Wtot.
+    # Training loss only, and a no-op for model types whose target_vars carry no power_ohm_MW / power_radiated_MW.
+    # Sized to the Wtot term in the trained state,
+    # at 0.1 the anchors outweighed it ~100x and unfrozen submodules barely moved toward Wtot
+    "anchor_weight_power_ohm": 2e-3,
+    "anchor_weight_power_radiated": 2e-3,
+}
+
 
 class PowerBalanceStudy(Study):
     SWEEP_CONFIG_DIR = Path(PACKAGE_ROOT) / "power_balance_transfer" / "sweep_configs"
     STUDY_TYPE = "power_balance_transfer"
+    RESIDUAL_SCALE_LOSS = True
     DATA_VISUALIZATION = DataVisualization
     ANALYSIS_METRICS_MODULE = "transport_study.power_balance_transfer.study_metrics"
     ANALYSIS_REPORTS_MODULE = "transport_study.power_balance_transfer.case_reports"
@@ -246,18 +261,8 @@ class PowerBalanceStudy(Study):
             "submodule_lr_factors": {"p_oh_predictor": 0.1, "p_rad_predictor": 0.1},
         }
 
-    def base_loss_config(self) -> dict:
-        return {
-            # [MJ] on the scale of a Wtot error, C-Mod and MAST medians are 0.03-0.05 MJ
-            "huber_delta": 0.05,
-            # Anchor terms keeping the predicted P_oh / P_rad (the sciml submodules, a multiobjective transformer's heads)
-            # close to the measured signals while the whole module trains on Wtot.
-            # Training loss only, and a no-op for model types whose target_vars carry no power_ohm_MW / power_radiated_MW.
-            # Sized to the Wtot term in the trained state,
-            # at 0.1 the anchors outweighed it ~100x and unfrozen submodules barely moved toward Wtot
-            "anchor_weight_power_ohm": 2e-3,
-            "anchor_weight_power_radiated": 2e-3,
-        }
+    def base_loss_config(self, case: Case) -> dict:
+        return dict(POWER_BALANCE_LOSS_DEFAULTS)
 
     def _make_submodule_config(self, case: Case, submodule_type: str) -> TrainConfig:
         """Full TrainConfig for a p_oh/p_rad submodule, recursing through make_train_config

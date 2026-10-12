@@ -1,5 +1,6 @@
 """Shared helpers for the study TrainRunBuilders."""
 
+from collections import defaultdict
 from pathlib import Path
 
 import equinox as eqx
@@ -64,6 +65,10 @@ ROOM_KEEPER_SHOT = -1
 # so their losses count only the timeslices a reconstruction landed on (fresh_equilibrium).
 # P_rad comes from bolometry which may be really slow anyway, just counting it on every timeslice.
 EQUILIBRIUM_SIGNALS = ("energy_mhd_MJ", "power_ohm_MW")
+
+# Power balance signals whose training residuals are divided by the device's typical value (residual_scales),
+# so a device with a small stored energy or small powers weighs as much as a large one
+RESIDUAL_SCALE_SIGNALS = ("energy_mhd_MJ", "power_ohm_MW", "power_radiated_MW")
 
 
 def peak_scale(targ: jnp.ndarray) -> jnp.ndarray:
@@ -169,24 +174,84 @@ def chi_profile_loss(
     return value_chi + gradient_weight * grad_chi
 
 
-def chi_sigma_floors(device: str) -> dict[str, float]:
-    """The peak-normalized error-bar floor of every CHI_ERROR_VARS variable for one device.
+def chi_sigma_floors_of(datasets: list[xr.Dataset], label: str) -> dict[str, float]:
+    """The peak-normalized error-bar floor of every CHI_ERROR_VARS variable over one device's fresh profiles in datasets.
 
-    The CHI_SIGMA_FLOOR_PERCENTILE-th percentile of the positive normalized error bars over the device's fresh profiles,
-    a property of the fits rather than of any case.
+    The CHI_SIGMA_FLOOR_PERCENTILE-th percentile of the positive normalized error bars, a property of the fits rather than of any case.
+    label names the data in the log and in the error.
     """
-    ds = get_ds(device, "profile_transfer")
+    sigma_positive_by_var = defaultdict(list)
+    for ds in datasets:
+        for channel, error_vars in CHI_ERROR_VARS.items():
+            scale = np.asarray(peak_scale(ds[channel].transpose(..., RADIAL_DIM).values))
+            for var in error_vars:
+                sigma = (ds[var].transpose(..., RADIAL_DIM).values / scale).ravel()
+                sigma_positive_by_var[var].append(sigma[np.isfinite(sigma) & (sigma > 0)])
     floors = {}
-    for channel, error_vars in CHI_ERROR_VARS.items():
-        scale = np.asarray(peak_scale(ds[channel].transpose(..., RADIAL_DIM).values))
+    for error_vars in CHI_ERROR_VARS.values():
         for var in error_vars:
-            sigma = (ds[var].transpose(..., RADIAL_DIM).values / scale).ravel()
-            sigma_positive = sigma[np.isfinite(sigma) & (sigma > 0)]
+            sigma_positive = np.concatenate(sigma_positive_by_var[var])
             if not sigma_positive.size:
-                raise ValueError(f"{device} has no positive {var} to floor the chi error bars with")
+                raise ValueError(f"{label} has no positive {var} to floor the chi error bars with")
             floors[var] = float(np.percentile(sigma_positive, CHI_SIGMA_FLOOR_PERCENTILE))
-    logger.info(f"Chi sigma floors for {device}: " + ", ".join(f"{var}={floor:.5f}" for var, floor in floors.items()))
+    logger.info(f"Chi sigma floors of {label}: " + ", ".join(f"{var}={floor:.5f}" for var, floor in floors.items()))
     return floors
+
+
+def chi_sigma_floors(device: str) -> dict[str, float]:
+    """chi_sigma_floors_of every fresh profile of one device, the floors of the validation and test chi."""
+    ds = get_ds(device, "profile_transfer")
+    return chi_sigma_floors_of([ds], device)
+
+
+def _parts_by_device(train_parts: list[xr.Dataset]) -> dict[str, list[xr.Dataset]]:
+    """The training parts grouped by their device, each part holds one device's shots (its scalar ds_source)."""
+    parts_by_device = defaultdict(list)
+    for part in train_parts:
+        parts_by_device[str(part["ds_source"].item())].append(part)
+    return parts_by_device
+
+
+def training_chi_sigma_floors(train_parts: list[xr.Dataset]) -> dict[str, dict[str, float]]:
+    """chi_sigma_floors_of each device's training parts (profile view), the floors a case's training loss reads.
+
+    Only the case's own training shots enter, never its held-out or test shots.
+    """
+    parts_by_device = _parts_by_device(train_parts)
+    return {device: chi_sigma_floors_of(parts, f"{device} training data") for device, parts in parts_by_device.items()}
+
+
+def residual_scales(train_parts: list[xr.Dataset]) -> dict[str, dict[str, float]]:
+    """Each training device's typical value of every RESIDUAL_SCALE_SIGNALS signal, the median of |signal| over its training timeslices.
+
+    The training losses divide a device's power balance residuals by these (power balance view parts).
+    Only the case's own training shots enter, never its held-out or test shots.
+    An EQUILIBRIUM_SIGNALS entry counts only its fresh_equilibrium timeslices, the stores hold it forward between reconstructions.
+    A typical value that is not positive raises, it could not scale a residual.
+    """
+    scales = {}
+    for device, parts in _parts_by_device(train_parts).items():
+        values_by_signal = defaultdict(list)
+        for part in parts:
+            mask_in_shot = np.isfinite(part[TIME_COORD].transpose(EPISODE_DIM, TIME_DIM).values)
+            fresh_equilibrium = part["fresh_equilibrium"].transpose(EPISODE_DIM, TIME_DIM).values
+            mask_fresh = mask_in_shot & (fresh_equilibrium == 1)
+            for signal in RESIDUAL_SCALE_SIGNALS:
+                mask_counted = mask_fresh if signal in EQUILIBRIUM_SIGNALS else mask_in_shot
+                signal_values = part[signal].transpose(EPISODE_DIM, TIME_DIM).values
+                values_by_signal[signal].append(np.abs(signal_values[mask_counted]))
+        device_scales = {}
+        for signal in RESIDUAL_SCALE_SIGNALS:
+            counted_values = np.concatenate(values_by_signal[signal])
+            typical = float(np.median(counted_values)) if counted_values.size else np.nan
+            if not typical > 0:
+                raise ValueError(f"The {device} training data has no positive typical {signal} ({typical}) to scale its residuals by")
+            device_scales[signal] = typical
+        logger.info(
+            f"Typical training values of {device}: " + ", ".join(f"{signal}={value:.4g}" for signal, value in device_scales.items())
+        )
+        scales[device] = device_scales
+    return scales
 
 
 def restore_from_checkpoint(module, checkpoint_dir: str):
