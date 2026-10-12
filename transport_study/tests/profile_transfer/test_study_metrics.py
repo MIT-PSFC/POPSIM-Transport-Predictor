@@ -198,9 +198,10 @@ class TestCaseMetricsCache:
         compute_and_save_case_metrics(study, case)
         assert not analysis_case_done(study, case, study.figure_dir)
 
+        # The GIFs are rendered first and the PDF last, so the PDF alone marks a finished report
         case_dir = study.figure_dir / "case_reports" / case
         case_dir.mkdir(parents=True)
-        (case_dir / "best_worst_timeslices.pdf").touch()
-        assert not analysis_case_done(study, case, study.figure_dir)
         (case_dir / "shot_1_evolution.gif").touch()
+        assert not analysis_case_done(study, case, study.figure_dir)
+        (case_dir / "best_worst_timeslices.pdf").touch()
         assert analysis_case_done(study, case, study.figure_dir)

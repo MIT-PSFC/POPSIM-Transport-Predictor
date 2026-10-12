@@ -25,7 +25,11 @@ from PIL import Image
 
 from transport_study import EPISODE_DIM, RADIAL_DIM, TIME_DIM
 from transport_study.modules.trb_utils import GRAD_RHO_MAX
-from transport_study.orchestration.case_reports import TITLE_FONTSIZE, best_worst_pdf
+from transport_study.orchestration.case_reports import (
+    TITLE_FONTSIZE,
+    atomic_output,
+    best_worst_pdf,
+)
 from transport_study.plot_style import (
     BACKGROUND_COLOR,
     LABEL_FONTSIZE,
@@ -236,30 +240,34 @@ def evolution_gifs(result_ds: xr.Dataset, ts_metrics: CaseTimesliceMetrics, case
             for i, record_idx in enumerate(record_idxs)
         ]
         gif_path = case_dir / f"shot_{shot}_evolution.gif"
-        gif_path.parent.mkdir(parents=True, exist_ok=True)
-        frames[0].save(
-            gif_path,
-            save_all=True,
-            append_images=frames[1:],
-            duration=GIF_FRAME_DURATION_MS,
-            loop=0,
-        )
+        # The temporary name hides the extension, so PIL is told the format
+        with atomic_output(gif_path) as tmp_path:
+            frames[0].save(
+                tmp_path,
+                format="GIF",
+                save_all=True,
+                append_images=frames[1:],
+                duration=GIF_FRAME_DURATION_MS,
+                loop=0,
+            )
         logger.info(f"Saved profile evolution GIF to {gif_path}")
 
 
 def case_report_done(case_dir: Path) -> bool:
-    return (case_dir / REPORT_FILENAME).exists() and any(case_dir.glob("shot_*_evolution.gif"))
+    """The PDF is written last, so it alone marks a finished report."""
+    return (case_dir / REPORT_FILENAME).exists()
 
 
 def render_case_report(result_ds: xr.Dataset, ts_metrics: CaseTimesliceMetrics, case_dir: Path):
-    """The best and worst test timeslices by the combined metric, then the profile evolution GIFs.
+    """The profile evolution GIFs, then the best and worst test timeslices by the combined metric.
 
     Both score the best checkpoint, whose predictions the result file holds.
+    The PDF comes last, since case_report_done reads it alone.
     """
+    evolution_gifs(result_ds, ts_metrics, case_dir)
     timeslice_page = partial(_timeslice_panel, result_ds, ts_metrics)
     record_idxs = np.arange(len(ts_metrics))
     best_worst_pdf(record_idxs, ts_metrics.best("combined"), timeslice_page, case_dir / REPORT_FILENAME)
-    evolution_gifs(result_ds, ts_metrics, case_dir)
 
 
 def torax_relaxation_report(study, metrics_ds: xr.Dataset, figure_dir: Path):

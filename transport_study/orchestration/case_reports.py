@@ -8,7 +8,8 @@ the skip and no-result checks, the timeslice scoring through orchestration.case_
 the best / worst PDF assembly and the stage shading of the trajectory pages.
 """
 
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Generator, Sequence
+from contextlib import contextmanager
 from importlib import import_module
 from pathlib import Path
 
@@ -25,6 +26,7 @@ from transport_study.orchestration.case_metrics import (
     case_timeslice_metrics,
 )
 from transport_study.orchestration.study import Study
+from transport_study.plot_style import BACKGROUND_COLOR, TEXT_COLOR
 
 N_BEST_WORST = 10
 TITLE_FONTSIZE = 12
@@ -73,21 +75,43 @@ def shade_stages(stage_axes: Sequence, aux_ax, ts_metrics: StagedTimesliceMetric
     return stage_handles
 
 
+@contextmanager
+def atomic_output(path: Path) -> Generator[Path, None, None]:
+    """A temporary path next to path, renamed onto it once the block finishes.
+
+    A report file marks its case as done by existing, so a job killed mid-write must leave none behind.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_name(path.name + ".tmp")
+    yield tmp_path
+    tmp_path.replace(path)
+
+
+def _message_page(message: str) -> plt.Figure:
+    fig = plt.figure(figsize=(8.5, 2.5))
+    fig.patch.set_facecolor(BACKGROUND_COLOR)
+    fig.text(0.5, 0.5, message, ha="center", va="center", color=TEXT_COLOR, fontsize=TITLE_FONTSIZE)
+    return fig
+
+
 def best_worst_pdf(items: np.ndarray, scores: np.ndarray, page_fn: Callable[..., plt.Figure], pdf_path: Path):
     """The N_BEST_WORST lowest-score pages then the N_BEST_WORST highest-score pages in one PDF.
 
     page_fn(item, title_prefix=...) renders one item's page, items with a non-finite score are left out.
+    Without any finite score the PDF is one page saying so,
+    so the case still counts as reported instead of being relaunched and rescored on every run.
     """
     finite = np.flatnonzero(np.isfinite(scores))
-    if len(finite) == 0:
-        logger.warning(f"No finite scores, skipping {pdf_path}")
-        return
     order = finite[np.argsort(scores[finite])]
     best = order[:N_BEST_WORST]
     worst = order[::-1][:N_BEST_WORST]
 
-    pdf_path.parent.mkdir(parents=True, exist_ok=True)
-    with PdfPages(pdf_path) as pdf:
+    with atomic_output(pdf_path) as tmp_path, PdfPages(tmp_path) as pdf:
+        if len(finite) == 0:
+            logger.warning(f"No finite score among {len(scores)} items for {pdf_path}, writing a one-page report")
+            fig = _message_page(f"No finite score among the {len(scores)} items, nothing to rank")
+            pdf.savefig(fig, facecolor=fig.get_facecolor())
+            plt.close(fig)
         for label, ranked in (("BEST", best), ("WORST", worst)):
             for rank, item_idx in enumerate(ranked, start=1):
                 fig = page_fn(items[item_idx], title_prefix=f"{label} #{rank} - ")
