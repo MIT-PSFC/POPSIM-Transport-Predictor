@@ -117,7 +117,7 @@ class TransportStudy(Study):
         "power_radiated_MW": "p_rad",
     }
     TUNED_DATALOADER_KEYS = ("segment_length_train", "segment_overlap_train", "batch_size")
-    # huber_delta_grad only matters for the profile submodule cases, whose sweep tunes it
+    # huber_delta_grad belongs to the profile chi-huber losses, a power balance pseudo-type's config has none
     TUNED_LOSS_KEYS = ("huber_delta", "huber_delta_grad")
 
     ##################
@@ -313,6 +313,9 @@ class TransportStudy(Study):
                 submodule_types = ("power_balance", "profile")
             elif self.model_type == "power_balance":
                 submodule_types = ("p_oh", "p_rad")
+            elif self.multiobjective:
+                # The Wtot and P_oh anchors take the huber deltas the hyperparam power_balance and p_oh cases were tuned with
+                return [self.hyperparam_case_of(model_type) for model_type in ("power_balance", "p_oh")]
             else:
                 return []
             return [
@@ -345,30 +348,28 @@ class TransportStudy(Study):
         if case.model_type in POWER_BALANCE_SUBMODULE_TYPES:
             return dict(POWER_BALANCE_LOSS_DEFAULTS)
         return {
-            # The training loss runs on peak-normalized profiles (target scaled to max 1),
-            # so the delta reads as a fractional error. Fallback for cases run without a tuned config.
+            # The training loss is the huber of chi (trb_utils.huber_profile_loss), so both deltas are in GP-fit error bars,
+            # with the profile study's fallbacks for cases run without a tuned config.
             # The chi validation loss reads no delta
-            "huber_delta": 0.1,
-            # Only read by the profile submodule cases (ProfilePredictorTRB),
-            # matching the profile study's loss configuration
+            "huber_delta": 1.0,
             "gradient_weight": 0.1,
-            "huber_delta_grad": 1.0,
+            "huber_delta_grad": 3.0,
             # Charged per diverged (non-finite) timeslice, sized to swamp ordinary loss differences
             # so a diverged trial cannot win the sweep.
-            # One per loss scale: converged peak-normalized training losses are ~5e-3,
-            # while chi averaged over the mostly stale timeslices is ~0.1-1.
-            # At these values one diverged timeslice in a thousand adds ~1e-2 to training and ~10 to validation
+            # One per loss: the training penalty carries no gradient and only marks the logged loss,
+            # the validation chi is ~1 per fresh timeslice, so one diverged timeslice in a thousand adds ~10 to it
             "divergence_penalty": 10.0,
             "divergence_penalty_val": 1e4,
             # Anchor terms keeping the sciml submodule predictions close to
             # the measured signals while the whole module trains on the
             # profiles: the power balance's Wtot plus its own p_oh/p_rad
             # submodules. A multiobjective case anchors its own Wtot and P_oh with the same weights.
+            # Each residual is relative to the device's typical value (trb_utils.residual_scales), an untuned prior of 0.1 each.
             # Training loss only, and a no-op for cases whose target_vars lack the measured signals.
             # The power balance pseudo-types take the power balance study's own weights (POWER_BALANCE_LOSS_DEFAULTS)
             "anchor_weight_energy_mhd": 0.1,
-            "anchor_weight_power_ohm": 2e-3,
-            "anchor_weight_power_radiated": 2e-3,
+            "anchor_weight_power_ohm": 0.1,
+            "anchor_weight_power_radiated": 0.1,
         }
 
     def base_optimizer_config(self) -> dict:

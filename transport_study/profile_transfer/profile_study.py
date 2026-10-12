@@ -238,16 +238,15 @@ class ProfileStudy(Study):
 
     def base_loss_config(self, case: Case) -> dict:
         return {
-            # The training loss runs on peak-normalized profiles (target scaled to max 1),
-            # so both deltas read as fractional errors.
+            # The training loss is the huber of chi (trb_utils.huber_profile_loss), so both deltas are in GP-fit error bars.
             # Both are swept (see sweep_configs/*.yaml), these values are the fallback without a tuned config.
             # The chi validation loss reads no delta, so the sweep metric cannot be gamed by shrinking them
-            "huber_delta": 0.1,
+            "huber_delta": 1.0,
             # Profile gradient mismatch counts too, stability predictions depend on dTe/drho and dne/drho.
             # Weighs the gradient term in training and in the chi validation loss alike
             "gradient_weight": 0.1,
-            # Normalized gradients are ~10x the normalized value scale, so they get their own delta
-            "huber_delta_grad": 1.0,
+            # Trained models sat near 1 error bar on the values and 3-4 on the gradients, so the gradients get their own delta
+            "huber_delta_grad": 3.0,
         }
 
     def model_train_spec(self, case: Case, dataloader_config_base: dict) -> ModelTrainSpec:

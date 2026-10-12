@@ -40,6 +40,10 @@ PROFILE_SCALE_FLOOR = 1e-2
 # Each error bar is floored at this percentile of its own peak-normalized distribution per device,
 # so a single overconfident fit point cannot carry unbounded weight
 CHI_SIGMA_FLOOR_PERCENTILE = 5.0
+# The profile training loss (huber_profile_loss, the huber of chi) is multiplied by this, so an untrained network scores about 1.
+# Measured untrained on the hs2 profile hyperparam cases: mlp 73, shape-init-pca 23, shape-init-kmeans 16, reservoir 272, torax-gyrobohm 7.6.
+# It keeps the gradients near popsim's 0.5 global-norm clip, the raw chi-huber ran 48-206 on a training mlp
+CHI_TRAINING_LOSS_SCALE = 0.01
 # Profile gradients count below this rho, in the training losses, the validation chi and the analysis chi alike.
 # Beyond it the GP fits extrapolate into the pedestal and scrape-off layer, where the measured gradients are unreliable
 GRAD_RHO_MAX = 0.9
@@ -114,56 +118,72 @@ def per_sample_residual_scale(ds_source_idx: jnp.ndarray, scales: dict[str, dict
     return per_sample_device_values(ds_source_idx, signal_scales, jnp.nan)
 
 
-def chi_value(pred: jnp.ndarray, targ: jnp.ndarray, sigma: jnp.ndarray, floor: jnp.ndarray, rho: jnp.ndarray) -> jnp.ndarray:
-    """int_0^1 |pred - targ| / max(sigma, floor) drho on peak-normalized profiles.
+def _value_chi_residual(pred: jnp.ndarray, targ: jnp.ndarray, sigma: jnp.ndarray, floor: jnp.ndarray) -> jnp.ndarray:
+    """(pred - targ) / max(sigma, floor) on peak-normalized profiles, signed, at every rho point.
 
     Profiles and sigma are (..., rho), floor is the peak-normalized sigma floor broadcast to (..., 1).
     """
     scale = peak_scale(targ)
-    chi = jnp.abs(pred - targ) / scale / jnp.maximum(sigma / scale, floor)
-    return jnp.trapezoid(chi, x=rho, axis=-1)
+    return (pred - targ) / scale / jnp.maximum(sigma / scale, floor)
+
+
+def _gradient_chi_residual(
+    pred: jnp.ndarray, targ: jnp.ndarray, grad_targ: jnp.ndarray, grad_sigma: jnp.ndarray, floor: jnp.ndarray, rho: jnp.ndarray
+) -> jnp.ndarray:
+    """(pred' - targ') / max(sigma', floor) on peak-normalized profiles, signed, at the rho midpoints.
+
+    pred' is the finite difference of the prediction,
+    targ' and sigma' are the GP-fit gradient and its error bar averaged to the midpoints.
+    """
+    scale = peak_scale(targ)
+    grad_pred = jnp.diff(pred / scale, axis=-1) / jnp.diff(rho, axis=-1)
+    return (grad_pred - to_mid(grad_targ) / scale) / jnp.maximum(to_mid(grad_sigma) / scale, floor)
+
+
+def chi_value(pred: jnp.ndarray, targ: jnp.ndarray, sigma: jnp.ndarray, floor: jnp.ndarray, rho: jnp.ndarray) -> jnp.ndarray:
+    """int_0^1 |pred - targ| / max(sigma, floor) drho on peak-normalized profiles."""
+    value_chi = _value_chi_residual(pred, targ, sigma, floor)
+    return jnp.trapezoid(jnp.abs(value_chi), x=rho, axis=-1)
 
 
 def chi_gradient(
     pred: jnp.ndarray, targ: jnp.ndarray, grad_targ: jnp.ndarray, grad_sigma: jnp.ndarray, floor: jnp.ndarray, rho: jnp.ndarray
 ) -> jnp.ndarray:
-    """int_0^GRAD_RHO_MAX |pred' - targ'| / max(sigma', floor) drho on peak-normalized profiles.
-
-    pred' is the finite difference of the prediction at the rho midpoints,
-    targ' and sigma' are the GP-fit gradient and its error bar averaged to the same midpoints.
-    """
-    scale = peak_scale(targ)
+    """int_0^GRAD_RHO_MAX |pred' - targ'| / max(sigma', floor) drho on peak-normalized profiles, at the rho midpoints."""
     rho_mid = to_mid(rho)
-    grad_pred = jnp.diff(pred / scale, axis=-1) / jnp.diff(rho, axis=-1)
-    chi = jnp.abs(grad_pred - to_mid(grad_targ) / scale) / jnp.maximum(to_mid(grad_sigma) / scale, floor)
-    return jnp.trapezoid((rho_mid < GRAD_RHO_MAX) * chi, x=rho_mid, axis=-1)
+    grad_chi = _gradient_chi_residual(pred, targ, grad_targ, grad_sigma, floor, rho)
+    return jnp.trapezoid((rho_mid < GRAD_RHO_MAX) * jnp.abs(grad_chi), x=rho_mid, axis=-1)
 
 
 def huber_profile_loss(
     pred: jnp.ndarray,
     targ: jnp.ndarray,
+    sigma: jnp.ndarray,
     grad_targ: jnp.ndarray,
+    grad_sigma: jnp.ndarray,
+    value_floor: jnp.ndarray,
+    grad_floor: jnp.ndarray,
     rho: jnp.ndarray,
     huber_delta: float,
     huber_delta_grad: float,
     gradient_weight: float,
 ) -> jnp.ndarray:
-    """Training loss of one profile channel per timeslice, the profile and transport studies' shared form.
+    """Training loss of one profile channel per timeslice, the profile and transport studies' shared form: the huber of chi.
 
-    int_0^1 huber(pred - targ) drho on peak-normalized profiles,
-    plus gradient_weight times int huber(pred' - targ') drho below GRAD_RHO_MAX,
-    pred' the finite difference of the prediction at the rho midpoints and targ' the GP-fit gradient averaged there.
-    Profiles are (..., rho), the gradient huber transition has its own delta
-    since normalized gradients are larger than normalized values (a pedestal can reach d/drho of order 10).
+    CHI_TRAINING_LOSS_SCALE times
+    int_0^1 huber(chi; huber_delta) drho + gradient_weight int_0^GRAD_RHO_MAX huber(chi'; huber_delta_grad) drho,
+    chi and chi' the residuals over their floored error bars as in the validation chi (chi_profile_loss),
+    so both deltas are in units of the error bar.
+    Inside a delta the loss is chi^2 / 2, the Gaussian likelihood,
+    so a point with a large error bar pulls the prediction gently but never with zero force.
+    Beyond it the loss grows linearly, so a few wild points do not dominate.
     """
-    scale = peak_scale(targ)
     rho_mid = to_mid(rho)
-    value_err = optax.huber_loss(pred / scale - targ / scale, delta=huber_delta)
-    grad_pred = jnp.diff(pred / scale, axis=-1) / jnp.diff(rho, axis=-1)
-    grad_err = optax.huber_loss(grad_pred - to_mid(grad_targ) / scale, delta=huber_delta_grad)
-    value_term = jnp.trapezoid(value_err, x=rho, axis=-1)
-    grad_term = jnp.trapezoid((rho_mid < GRAD_RHO_MAX) * grad_err, x=rho_mid, axis=-1)
-    return value_term + gradient_weight * grad_term
+    value_chi = _value_chi_residual(pred, targ, sigma, value_floor)
+    grad_chi = _gradient_chi_residual(pred, targ, grad_targ, grad_sigma, grad_floor, rho)
+    value_term = jnp.trapezoid(optax.huber_loss(value_chi, delta=huber_delta), x=rho, axis=-1)
+    grad_term = jnp.trapezoid((rho_mid < GRAD_RHO_MAX) * optax.huber_loss(grad_chi, delta=huber_delta_grad), x=rho_mid, axis=-1)
+    return CHI_TRAINING_LOSS_SCALE * (value_term + gradient_weight * grad_term)
 
 
 def chi_profile_loss(

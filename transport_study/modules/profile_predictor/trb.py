@@ -234,24 +234,32 @@ class ProfilePredictorTRB(TrainRunBuilder):
 
     @staticmethod
     def get_loss_fn(loss_config: dict) -> Callable[[Any, Any], jnp.ndarray]:
-        """Training loss: huber on the peak-normalized residual of the values and of the gradients (trb_utils.huber_profile_loss).
+        """Training loss: the huber of chi, the residual of the values and of the gradients in GP-fit error bars (trb_utils.huber_profile_loss).
 
-        Each target profile is scaled so its peak is 1 and the prediction by the same per-sample scale,
-        so the channels and devices are commensurate and huber_delta / huber_delta_grad read as fractional errors.
+        Summed over ne and Te, device-weighted.
+        The error bars are floored per device at train_chi_sigma_floors, taken from the case's own training data,
+        and huber_delta / huber_delta_grad are in units of the error bar.
         The gradient targets are the GP-fit gradients, masked to rho below GRAD_RHO_MAX.
         The swept deltas make this loss unfit for the sweep metric, validation uses get_val_loss_fn.
         """
         device_weights = loss_config.get("device_weights", {})
+        sigma_floors = loss_config["train_chi_sigma_floors"]
 
         def loss_fn(pred, targ):
             rho = pred.ne[RADIAL_DIM].data
-            sample_weights = per_sample_device_values(targ["ds_source_idx"].data, device_weights, 1.0)
+            ds_source_idx = targ["ds_source_idx"].data
+            sample_weights = per_sample_device_values(ds_source_idx, device_weights, 1.0)
             loss = 0.0
             for channel, pred_channel in (("n_e_1e20", pred.ne.data), ("t_e_keV", pred.te.data)):
+                value_error_var, grad_error_var = CHI_ERROR_VARS[channel]
                 loss = loss + huber_profile_loss(
                     pred_channel,
                     targ[channel].data,
+                    targ[value_error_var].data,
                     targ[f"{channel}_gradient"].data,
+                    targ[grad_error_var].data,
+                    per_sample_sigma_floor(ds_source_idx, sigma_floors, value_error_var),
+                    per_sample_sigma_floor(ds_source_idx, sigma_floors, grad_error_var),
                     rho,
                     loss_config["huber_delta"],
                     loss_config["huber_delta_grad"],

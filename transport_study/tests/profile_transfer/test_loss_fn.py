@@ -2,7 +2,7 @@
 
 Everything runs on hand-built profiles so the expected loss values are exact,
 plus one end-to-end check against real GP-fit signals from a sample dataset.
-The training loss is huber on the peak-normalized residual, the validation loss is chi.
+The training loss is the huber of chi, the validation loss is chi.
 """
 
 import jax.numpy as jnp
@@ -17,6 +17,7 @@ from transport_study.modules.profile_predictor.module import Outputs
 from transport_study.modules.profile_predictor.trb import ProfilePredictorTRB
 from transport_study.modules.trb_utils import (
     CHI_ERROR_VARS,
+    CHI_TRAINING_LOSS_SCALE,
     GRAD_RHO_MAX,
     chi_sigma_floors,
 )
@@ -30,7 +31,6 @@ from transport_study.tests.sample_data import SAMPLE_DIR, requires_sample_data
 
 RHO = RHO_GRID
 RHO_MID = 0.5 * (RHO[:-1] + RHO[1:])
-TRAIN_CONFIG = {"huber_delta": 0.5, "gradient_weight": 0.1, "huber_delta_grad": 5.0}
 # Fractional (peak-normalized) error bar of the hand-built targets, far above SIGMA_FLOOR
 SIGMA_FRAC = 0.05
 SIGMA_FLOOR = 1e-3
@@ -62,10 +62,30 @@ def loaded_config(request):
         request.getfixturevalue("study_config")
 
 
-def _val_config(gradient_weight: float = 0.1, floor: float = SIGMA_FLOOR, **overrides) -> dict:
-    """Chi validation loss config with the same sigma floor for every device and error bar."""
+def _device_floors(floor: float) -> dict:
+    """The same sigma floor for every device and error bar."""
     floors = {var: floor for error_vars in CHI_ERROR_VARS.values() for var in error_vars}
-    return {"gradient_weight": gradient_weight, "chi_sigma_floors": dict.fromkeys(config.dataset_paths, floors), **overrides}
+    return dict.fromkeys(config.dataset_paths, floors)
+
+
+def _val_config(gradient_weight: float = 0.1, floor: float = SIGMA_FLOOR, **overrides) -> dict:
+    """Chi validation loss config."""
+    return {"gradient_weight": gradient_weight, "chi_sigma_floors": _device_floors(floor), **overrides}
+
+
+def _train_config(gradient_weight: float = 0.1, floor: float = SIGMA_FLOOR, **overrides) -> dict:
+    """Chi-huber training loss config, its deltas in error bars, its floors the training ones."""
+    return {
+        "huber_delta": 1.0,
+        "huber_delta_grad": 3.0,
+        "gradient_weight": gradient_weight,
+        "train_chi_sigma_floors": _device_floors(floor),
+        **overrides,
+    }
+
+
+def _huber(residual: float, delta: float) -> float:
+    return 0.5 * residual**2 if abs(residual) <= delta else delta * (abs(residual) - 0.5 * delta)
 
 
 def _profile_da(values):
@@ -98,7 +118,7 @@ def test_losses_zero_for_perfect_prediction():
     ne = 1.5 * (1 - RHO**2)
     te = 3.0 * (1 - RHO**2)
     pred, targ = _pred_and_targ(ne, te, ne, te)
-    assert float(ProfilePredictorTRB.get_loss_fn(TRAIN_CONFIG)(pred, targ)) == pytest.approx(0.0)
+    assert float(ProfilePredictorTRB.get_loss_fn(_train_config())(pred, targ)) == pytest.approx(0.0)
     assert float(ProfilePredictorTRB.get_val_loss_fn(_val_config())(pred, targ)) == pytest.approx(0.0)
 
 
@@ -119,7 +139,7 @@ def test_gradient_term_penalizes_slope_mismatch():
     pred_alt, _ = _pred_and_targ(ne + offset_alt, te + offset_alt, ne, te)
 
     for value_only, with_grad in (
-        (ProfilePredictorTRB.get_loss_fn({**TRAIN_CONFIG, "gradient_weight": 0.0}), ProfilePredictorTRB.get_loss_fn(TRAIN_CONFIG)),
+        (ProfilePredictorTRB.get_loss_fn(_train_config(gradient_weight=0.0)), ProfilePredictorTRB.get_loss_fn(_train_config())),
         (ProfilePredictorTRB.get_val_loss_fn(_val_config(gradient_weight=0.0)), ProfilePredictorTRB.get_val_loss_fn(_val_config())),
     ):
         assert float(value_only(pred_const, targ)) == pytest.approx(float(value_only(pred_alt, targ)), rel=1e-5)
@@ -146,7 +166,7 @@ def test_device_weights_scale_loss():
     weights_other_device[devices[-1]] = 3.0
 
     for make_loss_fn, loss_config in (
-        (ProfilePredictorTRB.get_loss_fn, TRAIN_CONFIG),
+        (ProfilePredictorTRB.get_loss_fn, _train_config()),
         (ProfilePredictorTRB.get_val_loss_fn, _val_config()),
     ):
         unweighted = float(make_loss_fn(loss_config)(pred, targ))
@@ -171,7 +191,7 @@ def test_channels_balanced_by_peak_normalization():
     pred_te_off, _ = _pred_and_targ(ne, 1.1 * te, ne, te)
 
     for loss_fn in (
-        ProfilePredictorTRB.get_loss_fn({"huber_delta": 0.1, "gradient_weight": 0.1, "huber_delta_grad": 1.0}),
+        ProfilePredictorTRB.get_loss_fn(_train_config()),
         ProfilePredictorTRB.get_val_loss_fn(_val_config()),
     ):
         ne_off_loss = float(loss_fn(pred_ne_off, targ))
@@ -192,30 +212,30 @@ def test_val_loss_independent_of_huber_delta():
     te = 3.0 * (1 - RHO**2)
     pred, targ = _pred_and_targ(ne + 0.3, te - 0.4, ne, te)
 
-    small = {"huber_delta": 0.01, "huber_delta_grad": 0.1, "gradient_weight": 0.1}
-    large = {"huber_delta": 1.0, "huber_delta_grad": 10.0, "gradient_weight": 0.1}
+    small = {"huber_delta": 0.1, "huber_delta_grad": 0.3, "gradient_weight": 0.1}
+    large = {"huber_delta": 10.0, "huber_delta_grad": 30.0, "gradient_weight": 0.1}
 
     val_small = float(ProfilePredictorTRB.get_val_loss_fn(_val_config(**small))(pred, targ))
     val_large = float(ProfilePredictorTRB.get_val_loss_fn(_val_config(**large))(pred, targ))
     assert val_small == pytest.approx(val_large, rel=1e-6)
     assert val_small > 0.0
 
-    train_small = float(ProfilePredictorTRB.get_loss_fn(small)(pred, targ))
-    train_large = float(ProfilePredictorTRB.get_loss_fn(large)(pred, targ))
+    train_small = float(ProfilePredictorTRB.get_loss_fn(_train_config(**small))(pred, targ))
+    train_large = float(ProfilePredictorTRB.get_loss_fn(_train_config(**large))(pred, targ))
     assert train_small != pytest.approx(train_large, rel=1e-3)
 
 
 def test_normalized_loss_magnitude_is_numerically_safe():
-    """Peak normalization shrinks the training loss - check it stays well above float32 resolution.
+    """The scaled training loss must stay well above float32 resolution.
 
-    A typical 5% profile error gives a training huber loss of order 1e-3,
-    and a chi of order one when the error bars are 5% too.
+    A typical 5% profile error with 5% error bars is a chi of order one,
+    so the training loss is of order CHI_TRAINING_LOSS_SCALE.
     """
     ne = 1.5 * (1 - RHO**2)
     te = 3.0 * (1 - RHO**2)
     pred, targ = _pred_and_targ(1.05 * ne, 1.05 * te, ne, te)
 
-    train_loss = float(ProfilePredictorTRB.get_loss_fn({"huber_delta": 0.1, "gradient_weight": 0.1, "huber_delta_grad": 1.0})(pred, targ))
+    train_loss = float(ProfilePredictorTRB.get_loss_fn(_train_config())(pred, targ))
     val_loss = float(ProfilePredictorTRB.get_val_loss_fn(_val_config())(pred, targ))
 
     for loss in (train_loss, val_loss):
@@ -266,26 +286,29 @@ def test_weighted_case_weights_reach_loss_config(study_config):
 def test_chi_counts_the_residual_in_error_bars():
     """A prediction offset by k error bars at every point scores chi k per channel, in units of the GP-fit error bar.
 
-    The offset is constant, so the gradients are untouched and only the value chi counts.
-    The training loss never reads the error bars.
+    The offset is constant, so the gradients are untouched and only the value terms count.
+    Validation integrates |chi| over rho in [0, 1], training CHI_TRAINING_LOSS_SCALE times the huber of chi.
+    So in training a point with wider error bars pulls less, but still pulls inside its bar.
     """
     ne = 1.5 * (1 - RHO**2)
     te = 3.0 * (1 - RHO**2)
     val_loss = ProfilePredictorTRB.get_val_loss_fn(_val_config())
-    train_loss = ProfilePredictorTRB.get_loss_fn(TRAIN_CONFIG)
+    train_loss = ProfilePredictorTRB.get_loss_fn(_train_config())
     ne_sigma = SIGMA_FRAC * 1.5
     te_sigma = SIGMA_FRAC * 3.0
 
     for k in (0.5, 3.0):
         pred, targ = _pred_and_targ(ne + k * ne_sigma, te - k * te_sigma, ne, te)
-        # Value chi is k at every point, integrated over rho in [0, 1], for each of the two channels
         assert float(val_loss(pred, targ)) == pytest.approx(2.0 * k, rel=1e-6)
+        assert float(train_loss(pred, targ)) == pytest.approx(CHI_TRAINING_LOSS_SCALE * 2.0 * _huber(k, 1.0), rel=1e-5)
 
     pred, targ = _pred_and_targ(ne + ne_sigma, te - te_sigma, ne, te)
     _, targ_wide_bars = _pred_and_targ(
         ne, te, ne, te, n_e_1e20_error=np.full_like(RHO, 10 * ne_sigma), t_e_keV_error=np.full_like(RHO, 10 * te_sigma)
     )
-    assert float(train_loss(pred, targ)) == pytest.approx(float(train_loss(pred, targ_wide_bars)), rel=1e-9)
+    loss_tight_bars = float(train_loss(pred, targ))
+    loss_wide_bars = float(train_loss(pred, targ_wide_bars))
+    assert 0.0 < loss_wide_bars < loss_tight_bars
 
 
 def test_chi_floor_caps_tight_error_bars():
@@ -298,8 +321,11 @@ def test_chi_floor_caps_tight_error_bars():
     pred, targ = _pred_and_targ(ne + offset, te + offset, ne, te, **tight)
 
     val_loss = ProfilePredictorTRB.get_val_loss_fn(_val_config(floor=floor))
+    train_loss = ProfilePredictorTRB.get_loss_fn(_train_config(floor=floor))
 
     assert float(val_loss(pred, targ)) == pytest.approx((offset / 1.5 + offset / 3.0) / floor, rel=1e-6)
+    expected_train = CHI_TRAINING_LOSS_SCALE * (_huber(offset / 1.5 / floor, 1.0) + _huber(offset / 3.0 / floor, 1.0))
+    assert float(train_loss(pred, targ)) == pytest.approx(expected_train, rel=1e-5)
 
 
 def test_measured_gradient_signal_is_the_gradient_target():
@@ -324,8 +350,8 @@ def test_measured_gradient_signal_is_the_gradient_target():
         t_e_keV_gradient_error=np.full_like(RHO, grad_sigma),
     )
 
-    assert float(ProfilePredictorTRB.get_loss_fn({**TRAIN_CONFIG, "gradient_weight": 0.0})(pred, targ)) == pytest.approx(0.0, abs=1e-9)
-    assert float(ProfilePredictorTRB.get_loss_fn(TRAIN_CONFIG)(pred, targ)) > 0.0
+    assert float(ProfilePredictorTRB.get_loss_fn(_train_config(gradient_weight=0.0))(pred, targ)) == pytest.approx(0.0, abs=1e-9)
+    assert float(ProfilePredictorTRB.get_loss_fn(_train_config())(pred, targ)) > 0.0
 
     # Peak normalization divides offset and error bar alike, so each midpoint scores offset / sigma
     chi_grad_channel = np.trapezoid((RHO_MID < GRAD_RHO_MAX) * grad_offset / grad_sigma, x=RHO_MID)
@@ -334,14 +360,14 @@ def test_measured_gradient_signal_is_the_gradient_target():
 
 
 @pytest.mark.parametrize(
-    ("make_loss_fn", "loss_config", "rho_cut"),
+    ("make_loss_fn", "make_loss_config", "rho_cut"),
     [
-        (ProfilePredictorTRB.get_loss_fn, TRAIN_CONFIG, GRAD_RHO_MAX),
-        (ProfilePredictorTRB.get_val_loss_fn, None, GRAD_RHO_MAX),
+        (ProfilePredictorTRB.get_loss_fn, _train_config, GRAD_RHO_MAX),
+        (ProfilePredictorTRB.get_val_loss_fn, _val_config, GRAD_RHO_MAX),
     ],
     ids=["train", "chi"],
 )
-def test_gradient_terms_count_only_inside_their_rho_cut(make_loss_fn, loss_config, rho_cut):
+def test_gradient_terms_count_only_inside_their_rho_cut(make_loss_fn, make_loss_config, rho_cut):
     """Gradient mismatch beyond GRAD_RHO_MAX must not contribute, in training or in chi, the same mismatch in the core must.
 
     The measured gradients at the edge are unreliable.
@@ -350,7 +376,7 @@ def test_gradient_terms_count_only_inside_their_rho_cut(make_loss_fn, loss_confi
     """
     ne = 1.5 * (1 - RHO**2)
     te = 3.0 * (1 - RHO**2)
-    loss_fn = make_loss_fn(_val_config() if loss_config is None else loss_config)
+    loss_fn = make_loss_fn(make_loss_config())
     first_offset_point = RHO[np.flatnonzero(RHO > rho_cut)[0] + 1]
 
     edge_offset = np.where(RHO >= first_offset_point, 50.0, 0.0)
@@ -390,7 +416,9 @@ def test_loss_on_prepared_sample_dataset():
 
     floors = {device: chi_sigma_floors(device) for device in config.dataset_paths}
     val_loss = ProfilePredictorTRB.get_val_loss_fn({"gradient_weight": 0.1, "chi_sigma_floors": floors})
-    train_loss = ProfilePredictorTRB.get_loss_fn({"huber_delta": 0.1, "gradient_weight": 0.1, "huber_delta_grad": 1.0})
+    train_loss = ProfilePredictorTRB.get_loss_fn(
+        {"huber_delta": 1.0, "huber_delta_grad": 3.0, "gradient_weight": 0.1, "train_chi_sigma_floors": floors}
+    )
 
     pred_perfect, targ = _pred_and_targ(ne, te, ne, te, **extras)
     assert float(val_loss(pred_perfect, targ)) == pytest.approx(0.0, abs=1e-9)

@@ -20,6 +20,7 @@ from transport_study.modules.transport_predictor.module import Output
 from transport_study.modules.transport_predictor.trb import TransportPredictorTRB
 from transport_study.modules.trb_utils import (
     CHI_ERROR_VARS,
+    CHI_TRAINING_LOSS_SCALE,
     GRAD_RHO_MAX,
     to_mid,
 )
@@ -30,8 +31,8 @@ RHO_MID = np.asarray(to_mid(RHO))
 SIGMA_FRAC = 0.05
 SIGMA_FLOOR = 1e-3
 LOSS_CONFIG = {
-    "huber_delta": 0.1,
-    "huber_delta_grad": 1.0,
+    "huber_delta": 1.0,
+    "huber_delta_grad": 3.0,
     "gradient_weight": 0.1,
     "divergence_penalty": 10.0,
     "divergence_penalty_val": 1e4,
@@ -56,8 +57,22 @@ def loaded_config():
 
 
 def _loss_config(**overrides) -> dict:
+    """Every device with the same validation and training floors, unit typical values and the anchors' deltas."""
     floors = {var: SIGMA_FLOOR for error_vars in CHI_ERROR_VARS.values() for var in error_vars}
-    return {**LOSS_CONFIG, "chi_sigma_floors": dict.fromkeys(("cmod-low", "cmod-high"), floors), **overrides}
+    device_floors = dict.fromkeys(("cmod-low", "cmod-high"), floors)
+    unit_scales = {"energy_mhd_MJ": 1.0, "power_ohm_MW": 1.0, "power_radiated_MW": 1.0}
+    return {
+        **LOSS_CONFIG,
+        "chi_sigma_floors": device_floors,
+        "train_chi_sigma_floors": device_floors,
+        "residual_scales": dict.fromkeys(("cmod-low", "cmod-high"), unit_scales),
+        "anchor_huber_deltas": {"energy_mhd_MJ": 0.5, "power_ohm_MW": 0.5, "power_radiated_MW": 0.5},
+        **overrides,
+    }
+
+
+def _huber(residual: float, delta: float) -> float:
+    return 0.5 * residual**2 if abs(residual) <= delta else delta * (abs(residual) - 0.5 * delta)
 
 
 def _error_bars(profile: np.ndarray) -> np.ndarray:
@@ -152,10 +167,17 @@ def test_fresh_mask_zeroes_only_stale_slices():
 
 
 def test_anchor_terms_follow_equilibrium_freshness():
-    """A stale profile slice keeps its anchor loss: with fresh_profile 0 the training loss is exactly the weighted anchor errors.
+    """A stale profile slice keeps its anchor loss: with fresh_profile 0 the training loss is exactly the weighted anchor errors,
+    each the huber of the residual over the device's typical value at the anchor's own delta.
     The stored energy and ohmic power anchors count only at a fresh reconstruction (fresh_equilibrium 1),
     the bolometer P_rad anchor at every slice, and the validation loss (no anchors) stays zero."""
-    loss_config = _loss_config(anchor_weight_energy_mhd=0.2, anchor_weight_power_ohm=0.3, anchor_weight_power_radiated=0.5)
+    typical = {"energy_mhd_MJ": 0.1, "power_ohm_MW": 2.0, "power_radiated_MW": 0.5}
+    loss_config = _loss_config(
+        anchor_weight_energy_mhd=0.2,
+        anchor_weight_power_ohm=0.3,
+        anchor_weight_power_radiated=0.5,
+        residual_scales=dict.fromkeys(("cmod-low", "cmod-high"), typical),
+    )
     train_loss = TransportPredictorTRB.get_loss_fn(loss_config).instantaneous_loss
     val_loss = TransportPredictorTRB.get_val_loss_fn(loss_config).instantaneous_loss
 
@@ -169,8 +191,8 @@ def test_anchor_terms_follow_equilibrium_freshness():
     targ["power_ohm_MW"] = xr.DataArray(1.0)
     targ["power_radiated_MW"] = xr.DataArray(0.4)
 
-    equilibrium_anchors = 0.2 * abs(0.10 - 0.15) + 0.3 * abs(1.5 - 1.0)
-    radiated_anchor = 0.5 * abs(0.9 - 0.4)
+    equilibrium_anchors = 0.2 * _huber((0.10 - 0.15) / 0.1, 0.5) + 0.3 * _huber((1.5 - 1.0) / 2.0, 0.5)
+    radiated_anchor = 0.5 * _huber((0.9 - 0.4) / 0.5, 0.5)
     for fresh_equilibrium, expected in ((1.0, equilibrium_anchors + radiated_anchor), (0.0, radiated_anchor)):
         targ["fresh_equilibrium"] = xr.DataArray(fresh_equilibrium)
         assert float(train_loss(pred, targ)) == pytest.approx(expected, rel=1e-6)
@@ -199,7 +221,8 @@ def test_val_loss_is_value_chi():
 def test_gradient_terms_score_a_gradient_only_residual():
     """Exact profile values with GP-fit gradients offset by g score only the gradient terms.
 
-    Training: half the channel sum of gradient_weight x the huber of the peak-normalized offset below GRAD_RHO_MAX.
+    Training: half the channel sum of CHI_TRAINING_LOSS_SCALE x gradient_weight x the huber of the offset in gradient error bars
+    below GRAD_RHO_MAX.
     Validation: gradient_weight x the offset in gradient error bars below GRAD_RHO_MAX, summed over the channels.
     A stale slice scores neither.
     """
@@ -211,13 +234,13 @@ def test_gradient_terms_score_a_gradient_only_residual():
 
     expected_train = 0.0
     expected_val = 0.0
-    for targ_profile, targ_grad in ((NE_TARG, NE_GRAD), (TE_TARG, TE_GRAD)):
-        scale = np.max(np.abs(targ_profile))
-        normalized_offset = grad_offset / scale
-        huber = np.where(normalized_offset <= 1.0, 0.5 * normalized_offset**2, normalized_offset - 0.5)
-        expected_train += 0.5 * 0.1 * np.trapezoid((RHO_MID < GRAD_RHO_MAX) * huber, x=RHO_MID)
+    for targ_grad in (NE_GRAD, TE_GRAD):
+        # Peak normalization divides the offset and the error bar alike
         grad_sigma = SIGMA_FRAC * np.max(np.abs(targ_grad))
-        expected_val += 0.1 * np.trapezoid((RHO_MID < GRAD_RHO_MAX) * grad_offset / grad_sigma, x=RHO_MID)
+        grad_chi = grad_offset / grad_sigma
+        train_integrand = (RHO_MID < GRAD_RHO_MAX) * _huber(grad_chi, LOSS_CONFIG["huber_delta_grad"])
+        expected_train += 0.5 * CHI_TRAINING_LOSS_SCALE * 0.1 * np.trapezoid(train_integrand, x=RHO_MID)
+        expected_val += 0.1 * np.trapezoid((RHO_MID < GRAD_RHO_MAX) * grad_chi, x=RHO_MID)
     assert float(train_loss(pred, targ)) == pytest.approx(expected_train, rel=1e-6)
     assert float(val_loss(pred, targ)) == pytest.approx(expected_val, rel=1e-6)
 
