@@ -285,20 +285,12 @@ class TransportPredictorTRB(TrainRunBuilder):
 
     @staticmethod
     def get_optimizer(optimizer_config: dict) -> optax.GradientTransformation:
-        # zero_nans first, the global-norm cap cannot fix a non-finite gradient (clip_by_global_norm(NaN) is NaN).
-        # A finite loss can still have a NaN derivative (the transformer rollout does this),
-        # so zeroing makes that step a no-op for the affected leaves instead of ending the run.
-        # The divergence_penalty term still charges the sample, so the sweep metric sees it.
-        # Then the global-norm cap as in the profile study, the differentiated TORAX solve can spike gradients.
-        # Last the power balance study's grouped schedule:
+        # The power balance study's grouped schedule, after popsim's clip_by_global_norm(0.5):
         # submodule_lr_factors runs the sciml power_balance subtree at a reduced learning rate,
         # and its scaling-law coefficients skip the weight decay,
         # both no-ops for model types without a matching pytree path.
-        return optax.chain(
-            optax.zero_nans(),
-            optax.clip_by_global_norm(optimizer_config["grad_clip_max_norm"]),
-            make_grouped_exponential_adamw(optimizer_config, no_decay_names=SCALING_LAW_FIELDS),
-        )
+        # A non-finite gradient reaches popsim's NaN skip count and TrainingDivergedError abort unmasked
+        return make_grouped_exponential_adamw(optimizer_config, no_decay_names=SCALING_LAW_FIELDS)
 
     @staticmethod
     def get_test_eval_suite(suite_config) -> EvaluationSuite | None:

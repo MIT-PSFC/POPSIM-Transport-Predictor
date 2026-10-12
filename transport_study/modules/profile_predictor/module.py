@@ -373,12 +373,14 @@ def kmeans_initial_guess(
     te_kmeans = KMeans(n_clusters=n_clusters, random_state=seed).fit(te_data.values)
     ne_kmeans = KMeans(n_clusters=n_clusters, random_state=seed).fit(ne_data.values)
 
+    # The centers are means of unit-integral shapes, so unit-integral already.
+    # normalize is a static field, so it must match the skeleton (ProfilePredictorShapeInit.init) a restore fills
     te_shapes = [
-        ProfileShape.make_points(points=te_kmeans.cluster_centers_[i % n_clusters], grid=te_data[RADIAL_DIM].values)
+        ProfileShape.make_points(points=te_kmeans.cluster_centers_[i % n_clusters], grid=te_data[RADIAL_DIM].values, normalize=False)
         for i in range(n_shapes)
     ]
     ne_shapes = [
-        ProfileShape.make_points(points=ne_kmeans.cluster_centers_[i % n_clusters], grid=ne_data[RADIAL_DIM].values)
+        ProfileShape.make_points(points=ne_kmeans.cluster_centers_[i % n_clusters], grid=ne_data[RADIAL_DIM].values, normalize=False)
         for i in range(n_shapes)
     ]
     return te_shapes, ne_shapes

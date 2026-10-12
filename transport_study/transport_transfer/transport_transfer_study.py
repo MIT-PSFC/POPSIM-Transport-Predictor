@@ -366,9 +366,6 @@ class TransportStudy(Study):
     def base_optimizer_config(self) -> dict:
         return {
             **super().base_optimizer_config(),
-            # Cap on global L2 gradient norm per update, guards against rare
-            # gradient spikes from the differentiated TORAX solve NaN-ing a run
-            "grad_clip_max_norm": 1.0,
             # During joint sciml training the restored power balance submodule
             # (including its own p_oh/p_rad submodules underneath) trains at a
             # reduced rate so profile-loss gradients do not pull the

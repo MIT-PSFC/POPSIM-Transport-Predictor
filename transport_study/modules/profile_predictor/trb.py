@@ -300,27 +300,21 @@ class ProfilePredictorTRB(TrainRunBuilder):
 
     @staticmethod
     def get_optimizer(optimizer_config: dict) -> optax.GradientTransformation:
-        # Standard AdamW plus a global-norm cap
-        # the differentiated TORAX solve can spike gradients and NaN a run without it
-        return optax.chain(
-            optax.clip_by_global_norm(optimizer_config["grad_clip_max_norm"]),
-            make_exponential_adamw(optimizer_config),
-        )
+        # popsim's Trainer chains clip_by_global_norm(0.5) before it
+        return make_exponential_adamw(optimizer_config)
 
     @staticmethod
     def get_trainable_getter(model_init_config: dict) -> Callable[[Any], Any] | None:
         """Optionally return a function that takes in the trainable parameters of your model and returns the trainable parameters."""
 
         def get_trainable_shape_init(module: ProfilePredictorShapeInit):
-            # The normalizer statistics are never trainable,
-            # the shapes only trainable when freeze_shapes is off
-            # Everything else trains.
-            if model_init_config["freeze_shapes"]:
-                frozen = (module.te_shapes, module.ne_shapes, module.normalizer)
-            else:
-                frozen = (module.normalizer,)
-            ids_of_frozen_leaves = [id(x) for x in jax.tree.leaves(frozen)]
-            return [x for x in jax.tree.leaves(module) if id(x) not in ids_of_frozen_leaves]
+            # The network, plus the shape points when freeze_shapes is off.
+            # Never a shape's rho grid (InterpedLinearBasis.grid) or the normalizer statistics
+            trainable = [module.nn]
+            if not model_init_config["freeze_shapes"]:
+                trainable += [shape.coeffs for shape in (*module.te_shapes, *module.ne_shapes)]
+            ids_of_trainable_leaves = {id(x) for x in jax.tree.leaves(trainable)}
+            return [x for x in jax.tree.leaves(module) if id(x) in ids_of_trainable_leaves]
 
         def get_trainable_nn(module: ProfilePredictorUnstructuredNN):
             ids_of_nn_leaves = [id(x) for x in jax.tree.leaves(module.nn)]

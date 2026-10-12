@@ -237,14 +237,6 @@ class ProfileStudy(Study):
             "huber_delta_grad": 1.0,
         }
 
-    def base_optimizer_config(self) -> dict:
-        return {
-            **super().base_optimizer_config(),
-            # Cap on global L2 gradient norm per update, guards against rare
-            # gradient spikes from the differentiated TORAX solve NaN-ing a run
-            "grad_clip_max_norm": 1.0,
-        }
-
     def model_train_spec(self, case: Case, dataloader_config_base: dict) -> ModelTrainSpec:
         trb = "transport_study.modules.profile_predictor.trb.ProfilePredictorTRB"
         if case.model_type in MODEL_TYPES_WITH_SHAPES:

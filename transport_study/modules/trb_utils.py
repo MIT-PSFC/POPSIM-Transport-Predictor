@@ -355,13 +355,14 @@ def make_grouped_exponential_adamw(optimizer_config: dict, no_decay_names: tuple
     """AdamW where selected submodules run a scaled copy of the exponential schedule.
 
     optimizer_config["submodule_lr_factors"] maps a module attribute name
-    (e.g. "p_oh_predictor") to a multiplier on the whole schedule. Any trainable leaf
-    whose pytree path contains that attribute follows the scaled schedule,
-    everything else the base one. Labeling is by pytree path, so it works both
-    for the full-module partition and for the transfer-mode last-layer
-    partition (frozen leaves are None in the trainable pytree and are never
-    labeled). Without the key (or with all factors 1.0) this is exactly
-    make_exponential_adamw.
+    (e.g. "p_oh_predictor") to a multiplier on the whole schedule.
+    Any trainable leaf whose pytree path contains that attribute follows the scaled schedule,
+    everything else the base one.
+
+    Labeling is by pytree path, so it works both for the full-module partition
+    and for the transfer-mode last-layer partition
+    (frozen leaves are None in the trainable pytree and are never labeled)
+    Without the key (or with all factors 1.0) this is exactly make_exponential_adamw.
     no_decay_names passes through to every group.
     """
     factors = optimizer_config.get("submodule_lr_factors") or {}
