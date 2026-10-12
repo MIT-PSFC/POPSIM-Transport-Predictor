@@ -531,21 +531,20 @@ class Study:
             if (self.domain_adaptation == "transfer" or self.training_data.exnihilo) and self.num_target_shots == 0:
                 return True
 
-            # A stat-normalized pretrain twin exists to fit target-aware statistics,
-            # so with 0 target shots it is meaningless. Stateless-normalization twins
-            # fit nothing and canonically run at HYPERPARAM_TARGET_SHOTS (see transfer_pretrain_case)
-            if (
-                self.domain_adaptation == "transfer_pretrain"
-                and self.num_target_shots == 0
-                and self.normalization_method() in STAT_NORMALIZATIONS
-            ):
-                return True
-
             # exnihilo means training from nothing - no source domain to adapt from
             if self.training_data.exnihilo and self.domain_adaptation is not None:
                 return True
 
-            return False
+            # A stat normalization fits nothing of a target it never saw:
+            # a z-score leaves the target unstandardized beside standardized sources,
+            # and CORAL falls back to the identity on every device, a duplicate of its stateless method.
+            # That covers the stat pretrain twins too, a stateless twin runs at HYPERPARAM_TARGET_SHOTS (see transfer_pretrain_case).
+            # The da None cases (hyperparam) never see the target and stay
+            if self.domain_adaptation is not None and self.num_target_shots == 0 and self.normalization_method() in STAT_NORMALIZATIONS:
+                return True
+
+            # A case built on an impossible prereq can never run either
+            return any(prereq.is_impossible() for prereq in self.prereqs or ())
 
         def __str__(self):
             parts = [f"case.{self.model_type}", f"td_{self.training_data}"]

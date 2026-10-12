@@ -92,6 +92,13 @@ def test_case_grid_holds_one_stateless_twin_per_combination(study):
         ("transfer_pretrain", "coral", True),
         # The shared stateless twin
         ("transfer_pretrain", "physics", False),
+        # A z-score has no statistics for the unseen target, CORAL falls back to the stateless method
+        ("weighted", "zscore", True),
+        ("addition", "physics-zscore", True),
+        ("weighted", "coral", True),
+        ("weighted", "physics", False),
+        # The hyperparam case never sees the target
+        (None, "zscore", False),
     ],
 )
 def test_zero_target_shot_impossibility(study, domain_adaptation, data_normalization, impossible):
