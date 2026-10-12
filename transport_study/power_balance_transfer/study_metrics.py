@@ -19,7 +19,6 @@ from typing import ClassVar
 
 import numpy as np
 import xarray as xr
-from transport_validation_datasets.store_schema import HEATING_POWERS
 
 from transport_study import TIME_COORD
 from transport_study.config import config
@@ -29,20 +28,27 @@ from transport_study.orchestration.case_metrics import (
     staged_result_records,
 )
 from transport_study.orchestration.study import Study
-from transport_study.signals import POWER_ADDITIONAL_MW, convert_to_working_units
+from transport_study.signals import (
+    POWER_ADDITIONAL_MW,
+    convert_to_working_units,
+    store_signals_for,
+)
 
 METRIC_NAMES = ("abs", "rel", "diverged")
 METRIC_VARS = {"abs": "error_abs_ts", "rel": "error_rel_ts", "diverged": DIVERGED_VAR}
+# What the stage labels read
+STAGE_SIGNALS = ["ip_MA", POWER_ADDITIONAL_MW, TIME_COORD]
 
 
 @cache
 def load_stage_dataset(device: str) -> xr.Dataset:
-    """Device dataset with only the signals the stage labels need, ip_MA, the auxiliary power and time."""
+    """Device dataset with only the signals the stage labels need (STAGE_SIGNALS)."""
     ds_path = Path(config.dataset_paths[device])
     ds_store = xr.open_dataset(ds_path)
-    ds_store_selected = ds_store[["ip", *HEATING_POWERS, TIME_COORD]]
+    store_signals = store_signals_for(STAGE_SIGNALS)
+    ds_store_selected = ds_store[store_signals]
     ds = convert_to_working_units(ds_store_selected)
-    return ds[["ip_MA", POWER_ADDITIONAL_MW, TIME_COORD]].load()
+    return ds[STAGE_SIGNALS].load()
 
 
 @dataclass
