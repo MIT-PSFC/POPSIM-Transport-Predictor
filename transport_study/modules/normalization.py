@@ -80,6 +80,8 @@ CORAL_EIGVAL_FLOOR = CORAL_DEGENERATE_STD_FRAC**2
 # The target is exempt: its few-shot statistics are poor but still the alignment reference.
 MIN_CORAL_SHOTS = 8
 
+# Methods that align every device to the target device's covariance (see fit_coral_stats)
+CORAL_NORMALIZATIONS = ("coral", "physics-coral")
 # Methods whose per-device statistics are fitted from data
 # Their transfer cases pretrain through a dedicated transfer_pretrain prereq
 # case whose stats are fitted on the combined historic + target data and
@@ -88,7 +90,7 @@ MIN_CORAL_SHOTS = 8
 # z-score over the predictor's dimensionless nn_inputs, see
 # ZScoreFeatureNormalizer) and as the power-balance InputNormalizer
 # method PhysicsZScoreNormalizer
-STAT_NORMALIZATIONS = ("zscore", "coral", "physics-coral", "physics-zscore")
+STAT_NORMALIZATIONS = ("zscore", "physics-zscore", *CORAL_NORMALIZATIONS)
 
 
 class InputNormalizer(TimeIndepModule):

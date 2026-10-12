@@ -145,7 +145,7 @@ class TransportStudy(Study):
         # - physics-coral: per-device CORAL alignment fitted on them
         # - physics-zscore: per-device z-score fitted on them (mean/std only,
         #   no covariance alignment)
-        data_normalization: str = "physics-coral"
+        data_normalization: str = "physics"
         # Hyperparameter tuning case configuration
         # (hyperparam_domain_adaptation and hyperparam_num_target_shots live on CaseGridConfig)
         hyperparam_freeze_submodules: bool = False

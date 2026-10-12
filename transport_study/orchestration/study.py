@@ -42,7 +42,10 @@ from transport_study.config import (
     env_dataset_paths,
     load_config,
 )
-from transport_study.modules.normalization import STAT_NORMALIZATIONS
+from transport_study.modules.normalization import (
+    CORAL_NORMALIZATIONS,
+    STAT_NORMALIZATIONS,
+)
 from transport_study.modules.trb_utils import (
     chi_sigma_floors,
     residual_scales,
@@ -535,11 +538,16 @@ class Study:
             if self.training_data.exnihilo and self.domain_adaptation is not None:
                 return True
 
+            # CORAL aligns every other device to the target, which keeps the identity,
+            # so on the target alone it is a duplicate of its stateless method
+            if self.training_data.exnihilo and self.normalization_method() in CORAL_NORMALIZATIONS:
+                return True
+
             # A stat normalization fits nothing of a target it never saw:
             # a z-score leaves the target unstandardized beside standardized sources,
             # and CORAL falls back to the identity on every device, a duplicate of its stateless method.
             # That covers the stat pretrain twins too, a stateless twin runs at HYPERPARAM_TARGET_SHOTS (see transfer_pretrain_case).
-            # The da None cases (hyperparam) never see the target and stay
+            # The da None cases train and score on the sources alone, so their z-scores are well-posed and they stay
             if self.domain_adaptation is not None and self.num_target_shots == 0 and self.normalization_method() in STAT_NORMALIZATIONS:
                 return True
 

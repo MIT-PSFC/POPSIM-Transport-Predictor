@@ -88,21 +88,40 @@ def test_case_grid_holds_one_stateless_twin_per_combination(study):
     [
         # Nothing to finetune on
         ("transfer", "physics", True),
-        # A stat twin exists to fit target-aware statistics
+        # Transfer pretrain needs at least one target shot of data to set up the stateful normalizer
         ("transfer_pretrain", "coral", True),
-        # The shared stateless twin
+        # Transfer pretrain needs no target shots of data to set up the stateless normalizer
         ("transfer_pretrain", "physics", False),
-        # A z-score has no statistics for the unseen target, CORAL falls back to the stateless method
+        # Stateful normalizers need at least one target shot
         ("weighted", "zscore", True),
         ("addition", "physics-zscore", True),
         ("weighted", "coral", True),
+        ("weighted", "physics-coral", True),
+        # Stateless normalizers work with zero target shots
         ("weighted", "physics", False),
-        # The hyperparam case never sees the target
+        ("addition", "raw"),
+        # A da None case never sees the target
         (None, "zscore", False),
     ],
 )
 def test_zero_target_shot_impossibility(study, domain_adaptation, data_normalization, impossible):
     case = _case(domain_adaptation=domain_adaptation, data_normalization=data_normalization, num_target_shots=0)
+    assert case.is_impossible() == impossible
+
+
+@pytest.mark.parametrize(
+    ("data_normalization", "impossible"),
+    [
+        # CORAL on the target alone is the identity, doesn't need to be run
+        ("coral", True),  # This is the same as 'raw', ignore
+        ("physics-coral", True),  # This is the same as 'physics', ignore
+        # A z-score of the target alone is well-posed
+        ("physics-zscore", False),
+        ("physics", False),
+    ],
+)
+def test_exnihilo_coral_impossibility(study, data_normalization, impossible):
+    case = _case(training_data="exnihilo", domain_adaptation=None, data_normalization=data_normalization, num_target_shots=1)
     assert case.is_impossible() == impossible
 
 
