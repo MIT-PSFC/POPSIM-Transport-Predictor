@@ -27,13 +27,19 @@ API_TIMEOUT_S = 64
 # Metric the sweeps optimize. Also used to tell hyperband-pruned trials apart
 SWEEP_METRIC = "val/loss.mean"
 
+# What a failed wandb read raises: requests errors from the paginators,
+# CommError from every call wandb wraps in normalize_exceptions (a 429 among them, in its exc)
+WANDB_READ_ERRORS = (RequestException, CommError)
+
 
 class SweepReadError(RuntimeError):
     """A project's sweeps could not be read, so whether it has an active sweep is unknown."""
 
 
-def _is_rate_limit(error: HTTPError) -> bool:
-    return error.response is not None and error.response.status_code == 429
+def _is_rate_limit(error: Exception) -> bool:
+    """Whether a wandb read failed on HTTP 429, raised as an HTTPError or as a CommError wrapping one."""
+    http_error = error.exc if isinstance(error, CommError) else error
+    return isinstance(http_error, HTTPError) and http_error.response is not None and http_error.response.status_code == 429
 
 
 def retry_rate_limited(fn):
@@ -48,7 +54,7 @@ def retry_rate_limited(fn):
         for attempt in range(RATE_LIMIT_RETRIES):
             try:
                 return fn(*args, **kwargs)
-            except HTTPError as e:
+            except (HTTPError, CommError) as e:
                 if not _is_rate_limit(e) or attempt == RATE_LIMIT_RETRIES - 1:
                     raise
                 wait_s = RATE_LIMIT_BASE_WAIT_S * 1.2**attempt
@@ -153,8 +159,8 @@ def get_sweep_id(project: str) -> str | None:
     """
     try:
         project_sweeps = _project_sweeps(project)
-    except (RequestException, CommError) as e:
-        if isinstance(e, HTTPError) and _is_rate_limit(e):
+    except WANDB_READ_ERRORS as e:
+        if _is_rate_limit(e):
             raise
         raise SweepReadError(f"Could not read the sweeps of {project}: {e}") from e
 
@@ -181,7 +187,7 @@ def has_live_agent_run(project: str, stall_s: float) -> bool:
     """
     now = datetime.now(UTC)
     for run in _project_runs(project):
-        heartbeat_at = getattr(run, "heartbeat_at", None)
+        heartbeat_at = run.heartbeat_at
         if run.state != "running" or heartbeat_at is None:
             continue
         heartbeat_dt = datetime.fromisoformat(heartbeat_at)
@@ -214,5 +220,5 @@ def run_clean_sweeps(projects: Iterable[str]):
             if project_sweeps:
                 for run in _project_runs(project):
                     run.delete()
-        except (RequestException, CommError) as e:
+        except WANDB_READ_ERRORS as e:
             logger.warning(f"wandb read failed for project {project}, skipping its sweep cleanup: {e}")

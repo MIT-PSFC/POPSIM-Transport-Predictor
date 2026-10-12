@@ -51,12 +51,13 @@ RHO_GRID = np.linspace(0.0, 1.0, N_RHO_POINTS)
 # debug runs a whole study cheaply:
 # the target device keeps every shot, each source device keeps only its DEBUG_MAX_SOURCE_SHOTS most recent ones,
 # training and sweep trials stop by DEBUG_MAX_EPOCHS and validate at least every DEBUG_EPOCHS_PER_VAL epochs,
-# each sweep runs DEBUG_HYPERPARAM_SWEEPS trials,
+# each sweep runs DEBUG_HYPERPARAM_SWEEPS trials and is read from wandb every DEBUG_SWEEP_POLL_INTERVAL_S,
 # and result files average at most the top DEBUG_NUM_RESULT_CHECKPOINTS checkpoints (CaseGridConfig)
 DEBUG_MAX_SOURCE_SHOTS = 100
 DEBUG_MAX_EPOCHS = 12
 DEBUG_EPOCHS_PER_VAL = 3
 DEBUG_HYPERPARAM_SWEEPS = 1
+DEBUG_SWEEP_POLL_INTERVAL_S = 1.0
 DEBUG_NUM_RESULT_CHECKPOINTS = 3
 
 
@@ -194,6 +195,11 @@ class StudyConfig(BaseModel):
     # Spillover submissions stop at max_user_jobs minus this headroom, leaving slack for analysis and interactive jobs
     spillover_job_headroom: Orchestration[int] = Field(default_factory=lambda: int(os.environ.get("PTPS_SPILLOVER_JOB_HEADROOM", "10")))
     wandb_entity: Orchestration[str | None] = Field(default_factory=lambda: os.environ.get("PTPS_WANDB_ENTITY"))
+    # The orchestrator reads a sweep's wandb project at most this often, by the sweep progress check and by the agent watchdog each.
+    # A read costs about one request per run of the project, so reading every pass would hit the wandb rate limit
+    sweep_poll_interval_s: Orchestration[float] = Field(
+        default_factory=lambda: float(os.environ.get("PTPS_SWEEP_POLL_INTERVAL_S", "300")), gt=0
+    )
     # Scratch directory for trajectory-optimization intermediate results
     scratch_dir: Orchestration[Path | None] = None
 
@@ -233,12 +239,13 @@ class StudyConfig(BaseModel):
 
     @model_validator(mode="after")
     def _apply_debug_limits(self):
-        """Cap the epochs, the validation interval and the sweep size of a debug run (get_ds caps the source shots)."""
+        """Cap the epochs, the validation interval, the sweep size and the sweep poll interval of a debug run (get_ds caps the source shots)."""
         if self.debug:
             object.__setattr__(self, "max_epochs", min(self.max_epochs, DEBUG_MAX_EPOCHS))
             object.__setattr__(self, "hyperparam_max_epochs", min(self.hyperparam_max_epochs, DEBUG_MAX_EPOCHS))
             object.__setattr__(self, "epochs_per_val", min(self.epochs_per_val, DEBUG_EPOCHS_PER_VAL))
             object.__setattr__(self, "hyperparam_sweeps", min(self.hyperparam_sweeps, DEBUG_HYPERPARAM_SWEEPS))
+            object.__setattr__(self, "sweep_poll_interval_s", min(self.sweep_poll_interval_s, DEBUG_SWEEP_POLL_INTERVAL_S))
         return self
 
     # dataset_paths is stored as a MappingProxyType for immutability, but the field is typed

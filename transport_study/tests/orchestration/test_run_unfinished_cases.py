@@ -7,9 +7,12 @@ being visited (which previously spammed the logs every pass).
 
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
+import requests
 from popsim.ml import TrainConfig
 
+from transport_study.config import config
 from transport_study.orchestration import study as study_module
 from transport_study.orchestration.study import Study
 from transport_study.tests.stubs import StubCase
@@ -128,6 +131,37 @@ def test_relaunch_after_grace_when_no_result(make_stub_study, monkeypatch, fake_
 
     assert len(launch_times) == 1
     assert launch_times[0] >= study_module.RELAUNCH_GRACE_S
+
+
+def test_tuning_case_reads_its_sweep_once_per_poll_interval(make_stub_study, monkeypatch, fake_clock, quiet_scheduler):
+    """A case still tuning reads its wandb project once per config.sweep_poll_interval_s, not every pass,
+    and a failed read (wandb outage, exhausted rate limit) holds the case instead of ending the orchestrator."""
+    case_a = StubCase(name="case.a", hyperparam=True)
+    study = make_stub_study([case_a])
+    set_queue_snapshots(monkeypatch, [])
+    monkeypatch.setattr(study, "check_data_requirements", lambda case: True)
+    monkeypatch.setattr(study, "tuned_config_path", lambda case: study.working_dir / "untuned.yaml")
+    monkeypatch.setattr(study, "launch_sweep", lambda case, **kwargs: None)
+
+    read_times: list[float] = []
+
+    def read_sweep(project):
+        read_times.append(fake_clock.t)
+        if len(read_times) == 1:
+            raise requests.ConnectionError("wandb unreachable")
+        if len(read_times) == 3:
+            result_path = study.result_path(case_a)
+            result_path.parent.mkdir(parents=True, exist_ok=True)
+            result_path.touch()
+        return []
+
+    monkeypatch.setattr(study_module, "get_completed_runs", read_sweep)
+
+    study.run_unfinished_cases(skip_tuning=False, enable_parallelism=True)
+
+    assert len(read_times) == 3
+    read_gaps = np.diff(read_times)
+    assert (read_gaps >= config.sweep_poll_interval_s).all()
 
 
 def test_scheduler_failure_launches_nothing(make_stub_study, monkeypatch, quiet_scheduler):

@@ -84,6 +84,7 @@ from transport_study.orchestration.topk_results import (
     topk_statistics,
 )
 from transport_study.orchestration.wandb_utils import (
+    WANDB_READ_ERRORS,
     SweepReadError,
     get_best_train_config,
     get_completed_runs,
@@ -1156,6 +1157,7 @@ class Study:
         elapsed = get_running_job_elapsed_s()
         if not elapsed:
             return
+        now = time.monotonic()
         for case in cases:
             if not case.is_hyperparam_case():
                 continue
@@ -1163,7 +1165,15 @@ class Study:
             job_elapsed = elapsed.get(job_name)
             if job_elapsed is None or job_elapsed < WATCHDOG_MIN_AGE_S:
                 continue
-            if has_live_agent_run(self.wandb_project_name(case), AGENT_HEARTBEAT_STALL_S):
+            if now < self._next_agent_check.get(job_name, -math.inf):
+                continue
+            self._next_agent_check[job_name] = now + config.sweep_poll_interval_s
+            try:
+                agent_live = has_live_agent_run(self.wandb_project_name(case), AGENT_HEARTBEAT_STALL_S)
+            except WANDB_READ_ERRORS as e:
+                logger.warning(f"wandb read failed for agent job {job_name}, checking it again at the next poll: {e}")
+                continue
+            if agent_live:
                 continue
             logger.warning(
                 f"Agent job {job_name} has run {job_elapsed}s with no actively heartbeating "
@@ -1236,6 +1246,7 @@ class Study:
         before it can be relaunched: its result file may already be written but
         not yet visible across nodes, and relaunching in that window submits a
         duplicate job for a finished case.
+        With parallelism a case still tuning is held until its sweep may be read again (config.sweep_poll_interval_s).
 
         Borrowed cases (see case_home) are only waited on, their home study trains them.
         The ancestor chain is reloaded every pass, so a reset ancestor stops the loop.
@@ -1261,13 +1272,15 @@ class Study:
 
             runnable = [case for case in local if self.check_prereq_satisfied(case)]
             now = time.monotonic()
-            in_flight, in_grace, to_launch = [], [], []
+            in_flight, in_grace, sweeping, to_launch = [], [], [], []
             for case in runnable:
                 if self.case_in_flight(case, running_job_names):
                     in_flight.append(case)
                     last_in_flight[self.train_job_name(case)] = now
                 elif now - last_in_flight.get(self.train_job_name(case), -math.inf) < RELAUNCH_GRACE_S:
                     in_grace.append(case)
+                elif enable_parallelism and now < self._next_sweep_poll.get(str(case), -math.inf):
+                    sweeping.append(case)
                 else:
                     to_launch.append(case)
             n_blocked = len(local) - len(runnable)
@@ -1275,7 +1288,7 @@ class Study:
             waiting_summary = "".join(f", {n} waiting on {name}" for name, n in waiting.items())
             logger.opt(colors=True).info(
                 f"<bold><green>{len(unfinished)} cases remain</green></bold> "
-                f"({len(in_flight)} in flight, {len(in_grace)} awaiting results, "
+                f"({len(in_flight)} in flight, {len(in_grace)} awaiting results, {len(sweeping)} tuning, "
                 f"{len(to_launch)} ready to launch, {n_blocked} blocked on prereqs{waiting_summary})"
             )
 
@@ -1363,24 +1376,31 @@ class Study:
             logger.info(f"Skipping hyperparameter tuning, writing default config for {case}")
             self._write_tuned_config(case, self.make_train_config(case))
             return True
-        completed_runs = get_completed_runs(self.wandb_project_name(case))
-        finished_runs = [r for r in completed_runs if is_trained_to_completion(r)]
-        min_finished = math.ceil(MIN_FINISHED_FRACTION * config.hyperparam_sweeps)
-        if len(completed_runs) < config.hyperparam_sweeps or len(finished_runs) < min_finished:
-            logger.info(
-                f"Hyperparameter sweeps incomplete "
-                f"({len(completed_runs)}/{config.hyperparam_sweeps} runs, "
-                f"{len(finished_runs)}/{min_finished} finished)"
-            )
-            self.launch_sweep(
-                case,
-                enable_parallelism=enable_parallelism,
-                n_completed_runs=len(completed_runs),
-                n_finished_runs=len(finished_runs),
-                partition=partition,
-            )
+        # run_unfinished_cases holds the case until then, whether this read succeeds or not
+        self._next_sweep_poll[str(case)] = time.monotonic() + config.sweep_poll_interval_s
+        try:
+            completed_runs = get_completed_runs(self.wandb_project_name(case))
+            finished_runs = [r for r in completed_runs if is_trained_to_completion(r)]
+            min_finished = math.ceil(MIN_FINISHED_FRACTION * config.hyperparam_sweeps)
+            if len(completed_runs) < config.hyperparam_sweeps or len(finished_runs) < min_finished:
+                logger.info(
+                    f"Hyperparameter sweeps incomplete "
+                    f"({len(completed_runs)}/{config.hyperparam_sweeps} runs, "
+                    f"{len(finished_runs)}/{min_finished} finished)"
+                )
+                self.launch_sweep(
+                    case,
+                    enable_parallelism=enable_parallelism,
+                    n_completed_runs=len(completed_runs),
+                    n_finished_runs=len(finished_runs),
+                    partition=partition,
+                )
+                return False
+            return self._finalize_sweep(case, enable_parallelism, completed_runs)
+        except WANDB_READ_ERRORS as e:
+            # A wandb outage or an exhausted rate limit holds this sweep, the orchestrator keeps going
+            logger.warning(f"wandb read failed, holding the sweep of case {case} until the next poll: {e}")
             return False
-        return self._finalize_sweep(case, enable_parallelism, completed_runs)
 
     def _finalize_sweep(self, case: Case, enable_parallelism: bool, completed_runs: list) -> bool:
         """Save best config once sweep runs are done. Returns True if ready."""
@@ -1405,6 +1425,8 @@ class Study:
                 "check the project for runs stuck crashing, pruning or diverging."
             )
         self._write_tuned_config(case, best_train_config)
+        # The case reads its sweep no more, so nothing holds its training launch
+        self._next_sweep_poll.pop(str(case), None)
         # Every trial is over, so their resume checkpoints are no longer needed
         shutil.rmtree(self.sweep_checkpoint_dir(case), ignore_errors=True)
         logger.success(f"Saved best hyperparameter config for {case}")
@@ -1876,6 +1898,10 @@ class Study:
         self._steps_per_epoch_cache: dict[str, int] = {}
         # get_loaded_shot_count per (device, study type), read by make_weighted_device_weights
         self._loaded_shot_counts: dict[tuple[str, str], int] = {}
+        # The next time each tuning case's sweep progress (str(case))
+        # and each agent job's liveness (job name) may be read from wandb again
+        self._next_sweep_poll: dict[str, float] = {}
+        self._next_agent_check: dict[str, float] = {}
 
         self.working_dir = Path(config.working_dir_base) / self.name
         self.model_dir = self.working_dir / "models"
