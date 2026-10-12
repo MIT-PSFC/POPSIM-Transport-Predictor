@@ -6,6 +6,9 @@ finish, so a study with hundreds of cases does not flood the scheduler. Cases
 that keep failing must fall through to the serial path rather than loop.
 """
 
+from types import SimpleNamespace
+
+import numpy as np
 import pytest
 
 from transport_study.orchestration import case_analysis
@@ -13,6 +16,7 @@ from transport_study.orchestration.case_analysis import (
     ANALYSIS_MAX_ATTEMPTS,
     run_case_analysis_parallel,
 )
+from transport_study.orchestration.study import RELAUNCH_GRACE_S
 from transport_study.tests.stubs import StubCase, mark_analysis_done
 
 MAX_JOBS = 2
@@ -31,9 +35,28 @@ def study(make_stub_study):
 
 
 @pytest.fixture
+def single_case_study(make_stub_study):
+    """A study of one case with a result file, so it needs analysis."""
+    study = make_stub_study([StubCase(name="case.0")], max_analysis_jobs=MAX_JOBS)
+    result_path = study.result_path(study.cases[0])
+    result_path.parent.mkdir(parents=True, exist_ok=True)
+    result_path.touch()
+    return study
+
+
+@pytest.fixture
 def empty_queue(monkeypatch):
     """squeue reports nothing running, so every pending case is launchable."""
     monkeypatch.setattr(case_analysis, "get_running_job_names", lambda: set())
+
+
+@pytest.fixture
+def fake_clock(monkeypatch):
+    """Virtual clock that only advances on sleep, so grace windows cost no wall time."""
+    clock = SimpleNamespace(t=0.0)
+    monkeypatch.setattr(case_analysis.time, "monotonic", lambda: clock.t)
+    monkeypatch.setattr(case_analysis.time, "sleep", lambda seconds: setattr(clock, "t", clock.t + seconds))
+    return clock
 
 
 def launch_batches_per_pass(monkeypatch, finish_immediately: bool = True) -> list[list[str]]:
@@ -44,6 +67,7 @@ def launch_batches_per_pass(monkeypatch, finish_immediately: bool = True) -> lis
         batches[-1].append(str(case))
         if finish_immediately:
             mark_analysis_done(study, case)
+        return True
 
     monkeypatch.setattr(case_analysis, "launch_case_analysis_parallel", fake_launch)
     monkeypatch.setattr(case_analysis.time, "sleep", lambda seconds: batches.append([]))
@@ -68,6 +92,7 @@ def test_job_finishing_before_the_queue_query_is_not_relaunched(study, monkeypat
     def launch_into_queue(study_arg, case):
         launched.append(str(case))
         queue[study_arg.analysis_job_name(case)] = case
+        return True
 
     def queue_whose_jobs_just_finished():
         """Every queued job finishes right before squeue reports, after the previous pass checked its case."""
@@ -95,13 +120,8 @@ def test_no_pending_cases_submits_nothing(study, monkeypatch, empty_queue):
     assert batches == [[]]
 
 
-def test_scheduler_failure_waits_instead_of_launching(make_stub_study, monkeypatch):
+def test_scheduler_failure_waits_instead_of_launching(single_case_study, monkeypatch):
     """A squeue failure must not look like an empty queue and launch anyway."""
-    study = make_stub_study([StubCase(name="case.0")], max_analysis_jobs=MAX_JOBS)
-    result_path = study.result_path(study.cases[0])
-    result_path.parent.mkdir(parents=True, exist_ok=True)
-    result_path.touch()
-
     snapshots = iter([None])  # first pass: squeue failed, then an empty queue
     monkeypatch.setattr(case_analysis, "get_running_job_names", lambda: next(snapshots, set()))
 
@@ -111,29 +131,51 @@ def test_scheduler_failure_waits_instead_of_launching(make_stub_study, monkeypat
     def fake_launch(study_arg, case):
         launched.append(str(case))
         mark_analysis_done(study_arg, case)
+        return True
 
     monkeypatch.setattr(case_analysis, "launch_case_analysis_parallel", fake_launch)
     monkeypatch.setattr(case_analysis.time, "sleep", sleeps.append)
 
-    run_case_analysis_parallel(study)
+    run_case_analysis_parallel(single_case_study)
 
     assert launched == ["case.0"]
     # One sleep for the failed pass, one for the pass that launched the job
     assert len(sleeps) == 2
 
 
-def test_case_that_never_finishes_stops_after_max_attempts(make_stub_study, monkeypatch, empty_queue):
-    """A case whose analysis job keeps dying falls through to the serial path
-    instead of being resubmitted forever."""
-    study = make_stub_study([StubCase(name="case.0")], max_analysis_jobs=MAX_JOBS)
-    result_path = study.result_path(study.cases[0])
-    result_path.parent.mkdir(parents=True, exist_ok=True)
-    result_path.touch()
+def test_case_that_never_finishes_stops_after_max_attempts(single_case_study, monkeypatch, empty_queue, fake_clock):
+    """A case whose analysis job keeps dying is relaunched only after the grace window,
+    since its outputs may not be visible yet (NFS, 31 of 77 cases relaunched in hs1_transport_primary),
+    and falls through to the serial path instead of being resubmitted forever."""
+    launch_times: list[float] = []
 
+    def launch_and_die(study_arg, case):
+        launch_times.append(fake_clock.t)
+        return True
+
+    monkeypatch.setattr(case_analysis, "launch_case_analysis_parallel", launch_and_die)
+
+    run_case_analysis_parallel(single_case_study)
+
+    assert len(launch_times) == ANALYSIS_MAX_ATTEMPTS
+    relaunch_gaps = np.diff(launch_times)
+    assert (relaunch_gaps >= RELAUNCH_GRACE_S).all()
+
+
+def test_rejected_submission_counts_no_attempt(single_case_study, monkeypatch, empty_queue, fake_clock):
+    """sbatch rejecting the job (SLURM busy) must not use up the case's attempts and push it to the serial path."""
+    submissions_accepted = iter([False] * ANALYSIS_MAX_ATTEMPTS + [True])
     launched: list[str] = []
-    monkeypatch.setattr(case_analysis, "launch_case_analysis_parallel", lambda study_arg, case: launched.append(str(case)))
-    monkeypatch.setattr(case_analysis.time, "sleep", lambda seconds: None)
 
-    run_case_analysis_parallel(study)
+    def flaky_launch(study_arg, case):
+        accepted = next(submissions_accepted)
+        if accepted:
+            launched.append(str(case))
+            mark_analysis_done(study_arg, case)
+        return accepted
 
-    assert launched == ["case.0"] * ANALYSIS_MAX_ATTEMPTS
+    monkeypatch.setattr(case_analysis, "launch_case_analysis_parallel", flaky_launch)
+
+    run_case_analysis_parallel(single_case_study)
+
+    assert launched == ["case.0"]

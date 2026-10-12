@@ -1053,8 +1053,8 @@ Path({str(study_config_path)!r}).unlink()
     return _submit_training_job(job_name, partition, time_limit, log_path, script_path, "\n", "agent")
 
 
-def launch_case_analysis_parallel(study, case) -> None:
-    """Submit a CPU SLURM job computing one case's stage metrics and case report.
+def launch_case_analysis_parallel(study, case) -> bool:
+    """Submit a CPU SLURM job computing one case's stage metrics and case report, returns whether SLURM accepted it.
 
     Analysis (metrics aggregation, PDF pages, GIF frames) is matplotlib and
     numpy bound with no GPU work, so it goes to config.analysis_partition when
@@ -1105,4 +1105,4 @@ echo "=== $(date) job $SLURM_JOB_ID ({job_name}) start on $SLURMD_NODENAME ==="
 export MPLBACKEND=Agg
 {CPU_JOB_ENV}"""
     script = sbatch_script(job_name, partition, config.analysis_time_limit, log_path, script_path, setup, mem=config.analysis_mem)
-    submit_sbatch(script, job_name, "analysis")
+    return submit_sbatch(script, job_name, "analysis")

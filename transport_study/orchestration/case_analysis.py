@@ -8,6 +8,7 @@ through orchestration.case_metrics and orchestration.case_reports.
 run_summary_analysis is the whole analysis of the studies whose collect_results is the per-case scalar summary.
 """
 
+import math
 import time
 
 import xarray as xr
@@ -28,6 +29,7 @@ from transport_study.orchestration.slurm_utils import (
     get_running_job_names,
     launch_case_analysis_parallel,
 )
+from transport_study.orchestration.study import RELAUNCH_GRACE_S
 from transport_study.orchestration.tables import (
     ComparisonTableSpec,
     write_summary_comparison_tables,
@@ -47,6 +49,9 @@ def run_case_analysis_parallel(study) -> None:
     At most config.max_analysis_jobs analysis jobs are queued (running or pending) at once,
     so a study with hundreds of cases does not flood the scheduler.
     More jobs are submitted as earlier ones finish.
+    Only a job SLURM accepted counts as an attempt, a rejected submission is retried on the next pass.
+    A case whose job just left the queue is held for RELAUNCH_GRACE_S, like the training loop,
+    since its outputs may be written but not yet visible on this node (NFS caches the missing file).
     Cases that exhaust their attempts fall back to the study's serial analysis path afterwards.
     """
     partition = config.analysis_partition or config.partition
@@ -58,6 +63,8 @@ def run_case_analysis_parallel(study) -> None:
     )
 
     attempts: dict[str, int] = {}
+    # analysis job name -> monotonic time the job was last submitted or seen in the queue
+    last_in_flight: dict[str, float] = {}
     while pending:
         running_job_names = get_running_job_names()
         if running_job_names is None:
@@ -70,25 +77,34 @@ def run_case_analysis_parallel(study) -> None:
         if not pending:
             break
 
-        in_flight = [case for case in pending if study.analysis_job_name(case) in running_job_names]
-        launchable = [
-            case
-            for case in pending
-            if study.analysis_job_name(case) not in running_job_names and attempts.get(str(case), 0) < ANALYSIS_MAX_ATTEMPTS
-        ]
+        now = time.monotonic()
+        in_flight, in_grace, launchable = [], [], []
+        for case in pending:
+            job_name = study.analysis_job_name(case)
+            if job_name in running_job_names:
+                in_flight.append(case)
+                last_in_flight[job_name] = now
+            elif now - last_in_flight.get(job_name, -math.inf) < RELAUNCH_GRACE_S:
+                in_grace.append(case)
+            elif attempts.get(str(case), 0) < ANALYSIS_MAX_ATTEMPTS:
+                launchable.append(case)
         capacity = max(config.max_analysis_jobs - len(in_flight), 0)
         for case in launchable[:capacity]:
+            accepted = launch_case_analysis_parallel(study, case)
+            # SLURM refused the job, the remaining cases wait for the next pass
+            if not accepted:
+                break
             attempts[str(case)] = attempts.get(str(case), 0) + 1
-            launch_case_analysis_parallel(study, case)
+            last_in_flight[study.analysis_job_name(case)] = now
             in_flight.append(case)
 
-        if not in_flight:
+        if not in_flight and not in_grace and not launchable:
             logger.error(
                 f"{len(pending)} analysis cases did not finish after {ANALYSIS_MAX_ATTEMPTS} attempts each, "
                 "they will be computed serially instead"
             )
             break
-        logger.info(f"{len(pending)} analysis cases remain ({len(in_flight)} jobs in flight)")
+        logger.info(f"{len(pending)} analysis cases remain ({len(in_flight)} jobs in flight, {len(in_grace)} awaiting results)")
 
         time.sleep(ANALYSIS_POLL_INTERVAL_S)
 
