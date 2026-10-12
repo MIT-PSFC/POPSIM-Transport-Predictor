@@ -505,12 +505,7 @@ class DataVisualizationBase:
 
     @classmethod
     def domain_overlap(cls, figure_dir: Path | str):
-        """Show how the input parameter space of every device overlaps, per normalization.
-
-        Unlike hazard extrapolation (where extrapolation is unavoidable in real
-        units), here more overlap is better - normalization should align the devices
-        for transfer learning.
-        """
+        """Show how the input parameter space of every device overlaps, per normalization."""
         save_dir = Path(figure_dir) / "data_visualization" / "domain_overlap"
         colors = _device_colors()
 

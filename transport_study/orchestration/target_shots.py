@@ -198,11 +198,14 @@ def spanning_picks(mmd: np.ndarray, num_target_shots: int) -> np.ndarray:
 
 def training_shot_picks(
     pool_hazard: np.ndarray,
-    pool_footprints: list[np.ndarray],
+    pool_footprints: list[np.ndarray] | None,
     num_target_shots: int,
     target_shot_order: str,
 ) -> np.ndarray:
-    """Pool indices of the num_target_shots training shots, in pick order."""
+    """Pool indices of the num_target_shots training shots, in pick order.
+
+    Only the spanning order reads pool_footprints, the hazard orders take None.
+    """
     if num_target_shots > pool_hazard.size:
         raise ValueError(
             f"num_target_shots={num_target_shots} requested but only {pool_hazard.size} target shots remain outside the test set. "
@@ -229,8 +232,10 @@ def target_shot_split(ds_power_balance: xr.Dataset, target_split: TargetSplit) -
     hazard = ds_power_balance["hazard"].values
     mask_test = held_out_shot_mask(shots, hazard, target_split)
     pool_idx = np.flatnonzero(~mask_test)
-    ds_pool = ds_power_balance.isel({EPISODE_DIM: pool_idx})
-    pool_footprints = shot_footprints(ds_pool)
+    pool_footprints = None
+    if target_split.target_shot_order == "spanning":
+        ds_pool = ds_power_balance.isel({EPISODE_DIM: pool_idx})
+        pool_footprints = shot_footprints(ds_pool)
     pool_hazard = hazard[pool_idx]
     picks = training_shot_picks(pool_hazard, pool_footprints, target_split.num_target_shots, target_split.target_shot_order)
     train_shots = shots[pool_idx[picks]]
