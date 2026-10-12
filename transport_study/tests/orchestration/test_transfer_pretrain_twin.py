@@ -99,7 +99,7 @@ def test_case_grid_holds_one_stateless_twin_per_combination(study):
         ("weighted", "physics-coral", True),
         # Stateless normalizers work with zero target shots
         ("weighted", "physics", False),
-        ("addition", "raw"),
+        ("addition", "raw", False),
         # A da None case never sees the target
         (None, "zscore", False),
     ],

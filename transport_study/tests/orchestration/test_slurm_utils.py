@@ -48,11 +48,19 @@ def test_resources_available(loaded_config):
 
 FAKE_PARTITION_TABLE = """\
 PartitionName=fake_psfc_gpu PriorityTier=50 PreemptMode=OFF
+PartitionName=fake_psfc_cpu PriorityTier=50 PreemptMode=OFF
 PartitionName=fake_shared_gpu PriorityTier=50 PreemptMode=OFF
 PartitionName=fake_normal_gpu PriorityTier=25 PreemptMode=OFF
+PartitionName=fake_normal_cpu PriorityTier=25 PreemptMode=OFF
 PartitionName=fake_quicktest PriorityTier=100 PreemptMode=REQUEUE
 PartitionName=fake_preemptable PriorityTier=1 PreemptMode=REQUEUE
 """
+
+# The preempt/partition_prio scheduler config and its partition table, by command
+FAKE_PREEMPTION_STDOUT = {
+    ("scontrol", "show", "config"): "PreemptMode             = REQUEUE\nPreemptType             = preempt/partition_prio\n",
+    ("scontrol", "show", "partition", "-o"): FAKE_PARTITION_TABLE,
+}
 
 FAKE_NODE_STATES = {"node01": "mix-", "node02": "alloc", "node03": "alloc", "node04": "mix", "node05": "drain"}
 
@@ -74,10 +82,8 @@ FAKE_HOSTNAMES = {"node[01,99]": "node01\nnode99\n", "node[02-03]": "node02\nnod
 
 def _fake_slurm_stdout(cmd: list[str]) -> str:
     """A scheduler holding FAKE_RUNNING_JOBS on the FAKE_NODE_STATES nodes, 4 a100s each."""
-    if cmd == ["scontrol", "show", "config"]:
-        return "PreemptMode             = REQUEUE\nPreemptType             = preempt/partition_prio\n"
-    if cmd == ["scontrol", "show", "partition", "-o"]:
-        return FAKE_PARTITION_TABLE
+    if tuple(cmd) in FAKE_PREEMPTION_STDOUT:
+        return FAKE_PREEMPTION_STDOUT[tuple(cmd)]
     if cmd[:3] == ["scontrol", "show", "hostnames"]:
         return FAKE_HOSTNAMES[cmd[3]]
     if cmd[0] == "sinfo":
@@ -91,15 +97,17 @@ def _fake_slurm_stdout(cmd: list[str]) -> str:
         queried_nodes = cmd[cmd.index("-w") + 1].split(",") if "-w" in cmd else []
         queried_partitions = cmd[cmd.index("-p") + 1].split(",")
         lines = []
-        for job_id, partition, _, nodes, gpus in FAKE_RUNNING_JOBS:
+        for job_id, partition, hostlist, nodes, gpus in FAKE_RUNNING_JOBS:
             if partition not in queried_partitions or not set(nodes) & set(queried_nodes):
                 continue
             gpu_tres = f",gres/gpu={gpus * len(nodes)},gres/gpu:a100={gpus * len(nodes)}" if gpus else ""
-            lines.append(f"{job_id}  2026-10-01T00:00:00  cpu=4,mem=16G,node={len(nodes)},billing=4{gpu_tres}")
+            job_tres = f"cpu={4 * len(nodes)},mem={16 * len(nodes)}G,node={len(nodes)},billing=4{gpu_tres}"
+            lines.append(f"{job_id}|2026-10-01T00:00:00|{job_tres}|{hostlist}")
         return "\n".join(lines) + "\n"
     if cmd[:5] == ["scontrol", "-d", "-o", "show", "job"]:
         job_id, partition, hostlist, nodes, gpus = next(job for job in FAKE_RUNNING_JOBS if job[0] == cmd[5])
-        return f"JobId={job_id} Partition={partition} NodeList={hostlist} NumNodes={len(nodes)} Nodes={hostlist} CPU_IDs=0-3 Mem=16384 GRES=gpu:a100:{gpus}(IDX:0)\n"
+        gres = f"gpu:a100:{gpus}(IDX:0)" if gpus else ""
+        return f"JobId={job_id} Partition={partition} NodeList={hostlist} NumNodes={len(nodes)} Nodes={hostlist} CPU_IDs=0-3 Mem=16384 GRES={gres}\n"
     raise AssertionError(f"unexpected SLURM command {cmd}")
 
 
@@ -152,9 +160,14 @@ FAKE_USER_CPU_TRES = ["cpu=4,mem=48G,node=1,billing=4"] * 3
 
 
 def _fake_cpu_slurm_stdout(qos_caps: str | None):
-    """qos_caps is the MaxTRESPU of the partition's QOS, None for a partition without a QOS."""
+    """qos_caps is the MaxTRESPU of the partition's QOS, None for a partition without a QOS.
+
+    The scheduler preempts nothing (see test_open_cpu_slots_counts_preemptable_jobs_as_free).
+    """
 
     def fake_stdout(cmd: list[str]) -> str:
+        if cmd == ["scontrol", "show", "config"]:
+            return "PreemptType             = preempt/none\n"
         if cmd[:3] == ["scontrol", "show", "partition"]:
             qos = "N/A" if qos_caps is None else "fake_qos"
             return f"PartitionName={cmd[3]} QoS={qos} MaxTime=12:00:00\n"
@@ -162,13 +175,12 @@ def _fake_cpu_slurm_stdout(qos_caps: str | None):
             return f"fake_qos|{qos_caps}\n"
         if cmd[0] == "sinfo":
             return "".join(f"{node}  {cpus}  {memory}  {alloc}  {state}\n" for node, cpus, memory, alloc, state in FAKE_CPU_NODES)
-        if cmd[0] == "squeue" and "--state=PENDING" in cmd:
-            return "1001\n"
         if cmd[0] == "squeue" and "tres-alloc:200" in cmd:
             return "\n".join(FAKE_USER_CPU_TRES) + "\n"
         if cmd[0] == "squeue":
-            # Every job of this user anywhere, for the user-wide job budget
-            return "".join(f"{job_id}\n" for job_id in range(7))
+            # This user's 1 pending job on the partition, or every job of this user anywhere for the user-wide job budget
+            job_count = 1 if "--state=PENDING" in cmd else 7
+            return "".join(f"{job_id}\n" for job_id in range(job_count))
         raise AssertionError(f"unexpected SLURM command {cmd}")
 
     return fake_stdout
@@ -190,6 +202,73 @@ def test_open_cpu_slots_fits_jobs_by_cpus_memory_and_qos(monkeypatch, partition,
     _fake_config(cpu_partition=partition, cpu_train_cpus=4, train_mem="48G")
     _serve_fake_slurm(monkeypatch, _fake_cpu_slurm_stdout(qos_caps))
     assert open_cpu_slots(partition) == slots
+
+
+# (node, allocated/idle/other/total CPUs, memory MB, allocated memory MB, state) of fake_psfc_cpu
+FAKE_EVICTION_CPU_NODES = [
+    ("cpu21", "64/0/0/64", 262144, 262144, "alloc"),
+    ("cpu22", "24/40/0/64", 1048576, 163840, "mix"),
+    ("cpu23", "64/0/0/64", 262144, 262144, "alloc"),
+    ("cpu24", "64/0/0/64", 262144, 262144, "drain"),
+]
+
+# (job id, partition, hostlist, tres-alloc CPUs, (node, CPU IDs, memory MB) per node), cpu99 lies outside the partition
+FAKE_CPU_RUNNING_JOBS = [
+    ("201", "fake_preemptable", "cpu21", 16, (("cpu21", "0-15", 98304),)),
+    ("202", "fake_normal_cpu", "cpu21", 48, (("cpu21", "16-63", 163840),)),
+    ("203", "fake_preemptable", "cpu[22,99]", 40, (("cpu22", "0-47", 163840), ("cpu99", "0-31", 65536))),
+    ("204", "fake_quicktest", "cpu23", 64, (("cpu23", "0-63", 262144),)),
+    ("205", "fake_preemptable", "cpu24", 64, (("cpu24", "0-63", 262144),)),
+]
+
+
+def _fake_cpu_eviction_slurm_stdout(job_detail_queries: list[str]):
+    """A scheduler holding FAKE_CPU_RUNNING_JOBS on the FAKE_EVICTION_CPU_NODES, each job detail query appended to job_detail_queries."""
+
+    def fake_stdout(cmd: list[str]) -> str:
+        if tuple(cmd) in FAKE_PREEMPTION_STDOUT:
+            return FAKE_PREEMPTION_STDOUT[tuple(cmd)]
+        if cmd[:3] == ["scontrol", "show", "partition"]:
+            return f"PartitionName={cmd[3]} QoS=N/A MaxTime=12:00:00\n"
+        if cmd[0] == "sinfo":
+            return "".join(f"{node}  {cpus}  {memory}  {alloc}  {state}\n" for node, cpus, memory, alloc, state in FAKE_EVICTION_CPU_NODES)
+        if cmd[0] == "squeue" and "--state=PENDING" in cmd:
+            return ""
+        if cmd[0] == "squeue":
+            queried_nodes = set(cmd[cmd.index("-w") + 1].split(","))
+            queried_partitions = cmd[cmd.index("-p") + 1].split(",")
+            lines = []
+            for job_id, partition, hostlist, job_cpus, node_details in FAKE_CPU_RUNNING_JOBS:
+                job_nodes = {node for node, _, _ in node_details}
+                if partition not in queried_partitions or not job_nodes & queried_nodes:
+                    continue
+                job_mem_MB = sum(mem_MB for _, _, mem_MB in node_details)
+                job_tres = f"cpu={job_cpus},mem={job_mem_MB}M,node={len(node_details)},billing={job_cpus}"
+                lines.append(f"{job_id}|2026-10-01T00:00:00|{job_tres}|{hostlist}")
+            return "\n".join(lines) + "\n"
+        if cmd[:5] == ["scontrol", "-d", "-o", "show", "job"]:
+            job_detail_queries.append(cmd[5])
+            node_details = next(job[4] for job in FAKE_CPU_RUNNING_JOBS if job[0] == cmd[5])
+            groups = "".join(f" Nodes={node} CPU_IDs={cpu_ids} Mem={mem_MB} GRES=" for node, cpu_ids, mem_MB in node_details)
+            return f"JobId={cmd[5]} NumNodes={len(node_details)}{groups}\n"
+        raise AssertionError(f"unexpected SLURM command {cmd}")
+
+    return fake_stdout
+
+
+def test_open_cpu_slots_counts_preemptable_jobs_as_free(monkeypatch):
+    """CPUs and memory held by lower-tier preemptable jobs on nodes taking jobs count as free.
+
+    cpu21: job 201's 16 CPUs and 96G fit 2 jobs of 4 CPUs and 48G, the tier 25 job 202 is not preemptable.
+    cpu22: job 203's 40 CPUs split 24 / 16 by its 48 and 32 CPU IDs, so 40 idle + 24 CPUs fit 16 jobs, memory 21.
+    cpu23: the tier 100 job 204 is not preemptable, and drained cpu24 counts nothing.
+    Only the two-node job 203 needs its scontrol detail, a one-node job's squeue tres-alloc is its node's share.
+    """
+    _fake_config(cpu_partition="fake_psfc_cpu", cpu_train_cpus=4, train_mem="48G")
+    job_detail_queries: list[str] = []
+    _serve_fake_slurm(monkeypatch, _fake_cpu_eviction_slurm_stdout(job_detail_queries))
+    assert open_cpu_slots("fake_psfc_cpu") == 18
+    assert job_detail_queries == ["203"]
 
 
 def test_cpu_partitions_keep_the_user_job_budget_without_spillover(monkeypatch):

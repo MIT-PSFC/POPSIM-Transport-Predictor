@@ -356,8 +356,12 @@ GPU_GRES_ENTRY_PATTERN = r"gpu(?::([\w.]+))?:(\d+)"
 # A trailing "-" (planned by backfill for a pending job) is stripped first, any other flag such as "*" excludes the node.
 SCHEDULABLE_NODE_STATES = ("idle", "mix", "alloc", "comp")
 
-# One per-node group of scontrol -d -o show job, the groups are the hostlist and the GPU type and count held on each of its nodes
-JOB_NODE_GPUS_PATTERN = rf" Nodes=(\S+) CPU_IDs=\S+ Mem=\S+ GRES={GPU_GRES_ENTRY_PATTERN}"
+# One per-node group of scontrol -d -o show job.
+# The groups are the hostlist, and the CPU IDs, memory in MB and GRES (empty without any) held on each of its nodes.
+JOB_NODE_DETAIL_PATTERN = r" Nodes=(\S+) CPU_IDs=(\S+) Mem=(\d+) GRES=(\S*)"
+
+# What preempting a running job frees on each of its nodes, memory in MB
+EVICTABLE_TRES = ("cpu", "mem", "gres/gpu")
 
 
 def _gres_gpu_count(gres: str) -> int:
@@ -396,51 +400,89 @@ def _expand_hostlist(hostlist: str) -> list[str] | None:
     return stdout.split()
 
 
-@_cache_resolved
-def _job_node_gpus(job_id: str, start_time: str) -> tuple[tuple[str, int], ...] | None:
-    """(node, GPUs held there) of every node of one run of a job, from its scontrol detail groups, None if a query fails.
+def _cpu_id_count(cpu_ids: str) -> int:
+    """IDs in an scontrol CPU ID list like 0-15,18-19,64."""
+    id_count = 0
+    for id_range in cpu_ids.split(","):
+        first_id, _, last_id = id_range.partition("-")
+        id_count += int(last_id or first_id) - int(first_id) + 1
+    return id_count
 
+
+@_cache_resolved
+def _job_node_tres(job_id: str, start_time: str, job_cpus: int) -> tuple[tuple[str, dict[str, int]], ...] | None:
+    """(node, EVICTABLE_TRES held there) of every node of one run of a multi-node job, None if a query fails.
+
+    The split comes from the job's scontrol detail groups.
     A run's allocation never changes, so each is queried once.
     A requeued job keeps its id but starts a new run, so the start time is part of the key.
+    A node's CPU ID count is not its allocated CPUs on every node type (64 IDs against 48 CPUs on one),
+    so job_cpus, the job's tres-alloc cpu total, is split in proportion to the counts.
     """
     job_stdout = _slurm_stdout(["scontrol", "-d", "-o", "show", "job", job_id], level="WARNING")
     if job_stdout is None:
         return None
-    node_gpus: list[tuple[str, int]] = []
-    for group_hostlist, _, gpus_per_node in re.findall(JOB_NODE_GPUS_PATTERN, job_stdout):
+    node_details: list[tuple[str, int, int, int]] = []
+    for group_hostlist, cpu_ids, mem_MB, gres in re.findall(JOB_NODE_DETAIL_PATTERN, job_stdout):
         group_nodes = _expand_hostlist(group_hostlist)
         if group_nodes is None:
             return None
-        node_gpus.extend((node, int(gpus_per_node)) for node in group_nodes)
-    return tuple(node_gpus)
+        cpu_id_count = _cpu_id_count(cpu_ids)
+        gpus = _gres_gpu_count(gres)
+        node_details.extend((node, cpu_id_count, int(mem_MB), gpus) for node in group_nodes)
+    total_cpu_ids = sum(cpu_id_count for _, cpu_id_count, _, _ in node_details)
+    return tuple(
+        (node, {"cpu": job_cpus * cpu_id_count // total_cpu_ids, "mem": mem_MB, "gres/gpu": gpus})
+        for node, cpu_id_count, mem_MB, gpus in node_details
+    )
 
 
-def _evictable_node_gpus(nodes: list[str], partitions: tuple[str, ...]) -> dict[str, int] | None:
-    """GPUs held on each of these nodes by running jobs of these partitions, None if a query fails.
+def _evictable_node_tres(nodes: list[str], partitions: tuple[str, ...]) -> dict[str, dict[str, int]] | None:
+    """EVICTABLE_TRES held on each of these nodes by running jobs of these partitions, None if a query fails.
 
-    squeue tres-alloc is the job total over all its nodes,
-    so the per-node split comes from the job's scontrol detail groups.
+    A one-node job's squeue tres-alloc is what it holds on its node.
+    A multi-node job's is its total over every node, so its split comes from scontrol (_job_node_tres).
     """
     if not nodes or not partitions:
         return {}
     node_list = ",".join(nodes)
     partition_list = ",".join(partitions)
+    # The | suffixes leave every field unpadded, so a long hostlist cannot run into its neighbor
     squeue_stdout = _slurm_stdout(
-        ["squeue", "-w", node_list, "-p", partition_list, "--states=RUNNING", "--noheader", "-O", "JobID:20,StartTime:25,tres-alloc:200"]
+        [
+            "squeue",
+            "-w",
+            node_list,
+            "-p",
+            partition_list,
+            "--states=RUNNING",
+            "--noheader",
+            "-O",
+            "JobID:|,StartTime:|,tres-alloc:|,NodeList:",
+        ]
     )
     if squeue_stdout is None:
         return None
-    gpu_job_runs = [line.split()[:2] for line in squeue_stdout.splitlines() if "gres/gpu=" in line]
-    node_gpus: dict[str, int] = {}
-    for job_id, start_time in gpu_job_runs:
-        job_node_gpus = _job_node_gpus(job_id, start_time)
-        if job_node_gpus is None:
-            return None
-        for node, gpus in job_node_gpus:
-            node_gpus[node] = node_gpus.get(node, 0) + gpus
-    # A multi-node job may also hold GPUs outside these nodes
+    node_tres: dict[str, dict[str, int]] = {}
+    for line in squeue_stdout.splitlines():
+        fields = line.strip().split("|")
+        if len(fields) != 4:
+            continue
+        job_id, start_time, tres_alloc, hostlist = fields
+        job_tres = _tres_amounts(tres_alloc)
+        if job_tres["node"] == 1:
+            job_node_tres = ((hostlist, job_tres),)
+        else:
+            job_node_tres = _job_node_tres(job_id, start_time, job_tres["cpu"])
+            if job_node_tres is None:
+                return None
+        for node, held_tres in job_node_tres:
+            node_totals = node_tres.setdefault(node, dict.fromkeys(EVICTABLE_TRES, 0))
+            for key in EVICTABLE_TRES:
+                node_totals[key] += held_tres.get(key, 0)
+    # A multi-node job may also hold resources outside these nodes
     queried_nodes = set(nodes)
-    return {node: gpus for node, gpus in node_gpus.items() if node in queried_nodes}
+    return {node: held_tres for node, held_tres in node_tres.items() if node in queried_nodes}
 
 
 def count_idle_gpus(partition: str | None = None, buffer_gpus: int | None = None) -> int:
@@ -460,11 +502,11 @@ def count_idle_gpus(partition: str | None = None, buffer_gpus: int | None = None
     if node_free_gpus is None or evictable_partitions is None:
         return 0
     schedulable_nodes = list(node_free_gpus)
-    node_evictable_gpus = _evictable_node_gpus(schedulable_nodes, evictable_partitions)
-    if node_evictable_gpus is None:
+    node_evictable_tres = _evictable_node_tres(schedulable_nodes, evictable_partitions)
+    if node_evictable_tres is None:
         return 0
     free_gpus = sum(node_free_gpus.values())
-    evictable_gpus = sum(node_evictable_gpus.values())
+    evictable_gpus = sum(held_tres["gres/gpu"] for held_tres in node_evictable_tres.values())
     return max(free_gpus + evictable_gpus - buffer_gpus, 0)
 
 
@@ -710,17 +752,27 @@ def _schedulable_node_free_cpus_mem(partition: str) -> dict[str, tuple[int, int]
 def open_cpu_slots(partition: str) -> int:
     """CPU training or agent jobs worth submitting to this partition now, 0 if a query fails.
 
-    Each node fits as many cpu_train_cpus x train_mem jobs as its idle CPUs and unallocated memory allow.
+    Each node fits as many cpu_train_cpus x train_mem jobs as its idle CPUs and unallocated memory allow,
+    counting what running jobs of a partition this one preempts hold there as free.
     This user's pending jobs there claim slots already,
     and the partition's per-user QOS cpu and mem caps bound the rest.
     """
     node_free = _schedulable_node_free_cpus_mem(partition)
+    evictable_partitions = _preemptable_partitions(partition)
     caps = partition_user_tres_caps(partition)
     pending_jobs = count_pending_jobs(partition)
-    if node_free is None or caps is None or pending_jobs is None:
+    if node_free is None or evictable_partitions is None or caps is None or pending_jobs is None:
+        return 0
+    node_evictable_tres = _evictable_node_tres(list(node_free), evictable_partitions)
+    if node_evictable_tres is None:
         return 0
     job_mem_MB = slurm_mem_MB(config.train_mem)
-    node_slots = [min(idle_cpus // config.cpu_train_cpus, free_mem_MB // job_mem_MB) for idle_cpus, free_mem_MB in node_free.values()]
+    node_slots = []
+    for node, (idle_cpus, free_mem_MB) in node_free.items():
+        evictable_tres = node_evictable_tres.get(node, dict.fromkeys(EVICTABLE_TRES, 0))
+        node_cpus = idle_cpus + evictable_tres["cpu"]
+        node_mem_MB = free_mem_MB + evictable_tres["mem"]
+        node_slots.append(min(node_cpus // config.cpu_train_cpus, node_mem_MB // job_mem_MB))
     slots = sum(node_slots) - pending_jobs
     job_tres = {"cpu": config.cpu_train_cpus, "mem": job_mem_MB}
     capped_tres = [key for key in job_tres if key in caps]
