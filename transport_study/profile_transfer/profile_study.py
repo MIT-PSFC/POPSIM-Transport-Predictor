@@ -66,6 +66,19 @@ STUDY_MODEL_TYPES = (*MODEL_TYPES_WITH_SHAPES, *MODEL_TYPES_WITHOUT_SHAPES)
 # The physical inputs every profile-predictor model consumes
 PROFILE_INPUT_VARS = list(NN_INPUT_SOURCE_VARS)
 
+# What collect_results reads of a result file
+PROFILE_SUMMARY_RESULT_VARS = [
+    "error_abs_shot",
+    "error_rel_shot",
+    "ne_error_abs_shot",
+    "te_error_abs_shot",
+    "ne_error_rel_shot",
+    "te_error_rel_shot",
+    "error_abs_ts",
+    "error_rel_ts",
+    "ds_source",
+]
+
 
 class ProfileStudy(Study):
     SWEEP_CONFIG_DIR = Path(PACKAGE_ROOT) / "profile_transfer" / "sweep_configs"
@@ -381,7 +394,9 @@ class ProfileStudy(Study):
             if not result_path.exists():
                 continue
 
-            ds = xr.load_dataset(result_path)
+            # The error variables alone, never the predicted and target profiles that make up most of the file
+            with xr.open_dataset(result_path) as ds_result:
+                ds = ds_result[PROFILE_SUMMARY_RESULT_VARS].load()
 
             # Reduce per-timeslice errors to per-shot summaries (worst and mean timeslice) of each checkpoint,
             # then take their top-K mean

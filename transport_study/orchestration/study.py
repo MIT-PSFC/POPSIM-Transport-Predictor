@@ -120,6 +120,9 @@ ORCHESTRATION_POLL_INTERVAL_S = 20
 # Result files can lag job exit by ~1 min on NFS, so wait this long after a case leaves the queue before relaunching it
 RELAUNCH_GRACE_S = 180
 
+# What the base collect_results reads of a result file, never the predicted and target profiles that make up most of it
+SUMMARY_RESULT_VARS = ["error_abs_shot", "error_rel_shot", "error_abs_ts", "error_rel_ts", "time"]
+
 # Measured steps per epoch of each loader config, kept between runs in the study's working dir.
 # A fresh config lock starts it over (see Study.steps_per_epoch)
 STEPS_PER_EPOCH_FILENAME = "steps_per_epoch.toml"
@@ -1726,7 +1729,8 @@ class Study:
             if not result_path.exists():
                 continue
 
-            ds = xr.load_dataset(result_path)
+            with xr.open_dataset(result_path) as ds_result:
+                ds = ds_result[SUMMARY_RESULT_VARS].load()
 
             result = self._summarize_case_errors(ds).assign_coords(self.case_coords(case_idx, case))
             results.append(result)
