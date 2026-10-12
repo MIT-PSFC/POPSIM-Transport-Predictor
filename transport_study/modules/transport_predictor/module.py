@@ -750,6 +750,8 @@ class TransportPredictorToraxBase(TransportPredictor):
         """The stored energy and the ohmic power TORAX infers from a state, Output fields in MJ and MW.
 
         The thermal stored energy counts ions and impurities at T_i (T_e in the rebuild), no fast ions.
+        A multiobjective case anchors it to the measured energy_mhd, which counts the fast ions too,
+        so on beam-heated shots the anchor pulls the thermal energy up by the fast-ion share, a known bias.
         The ohmic power is j_ohm E over the TORAX resistivity at the state's T_e and Z_eff.
         """
         return {
