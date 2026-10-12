@@ -567,6 +567,9 @@ class CaseTrainDataLoader(DataLoader):
 
     def __init__(self, train_dl: DataLoader, steps_per_epoch: int | None, normalizer_fit_ds: xr.Dataset | None = None):
         n_batches_natural = len(train_dl)
+        # Without a batch an epoch never ends, __iter__ would loop until the watchdog kills the job
+        if n_batches_natural == 0:
+            raise ValueError("The training set holds no samples (every target NaN, e.g. no fresh timeslice of fresh_var, or no shots)")
         if steps_per_epoch is not None and n_batches_natural > steps_per_epoch:
             raise ValueError(
                 f"One pass over this training set is {n_batches_natural} batches, more than the study's {steps_per_epoch} steps per epoch, "
