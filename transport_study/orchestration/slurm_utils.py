@@ -892,27 +892,37 @@ def _submit_training_job(
     return _sbatch_gpu_job(build_script, job_name, partition, kind)
 
 
-def clamp_time_for_partition(partition: str, train_config: TrainConfig) -> tuple[str, TrainConfig]:
-    """sbatch --time and in-job wall budget fitted to the partition's MaxTime.
+def clamp_time_limit(partition: str, time_limit: str) -> str:
+    """sbatch --time of a job, cut to the partition's MaxTime when that is shorter.
 
-    Some spillover partitions cap walltime below train_time_limit
-    and reject over-limit requests outright.
-    The in-job budget shrinks by the same amount, preserving the
-    margin the trainer needs to checkpoint and exit before SLURM kills the job.
+    Some partitions cap walltime below the configured limits and reject over-limit requests outright.
     """
-    requested_s = parse_slurm_time_s(config.train_time_limit)
+    requested_s = parse_slurm_time_s(time_limit)
     limit_s = partition_time_limit_s(partition)
     if requested_s is None or limit_s is None or limit_s >= requested_s:
-        return config.train_time_limit, train_config
+        return time_limit
+    clamped_time_limit = format_slurm_time(limit_s)
+    logger.info(f"Partition {partition} MaxTime {clamped_time_limit} is below the requested {time_limit}, clamping the job time")
+    return clamped_time_limit
+
+
+def clamp_time_for_partition(partition: str, train_config: TrainConfig) -> tuple[str, TrainConfig]:
+    """sbatch --time and in-job wall budget of a training or agent job, fitted to the partition's MaxTime.
+
+    The in-job budget shrinks by the same amount as the job time,
+    preserving the margin the trainer needs to checkpoint and exit before SLURM kills the job.
+    """
+    time_limit = clamp_time_limit(partition, config.train_time_limit)
+    requested_s = parse_slurm_time_s(config.train_time_limit)
+    clamped_s = parse_slurm_time_s(time_limit)
+    if requested_s is None or clamped_s is None or clamped_s == requested_s:
+        return time_limit, train_config
     checkpoint_margin_s = max(requested_s - config.train_wall_budget_s, 0)
-    clamped_budget_s = float(max(limit_s - checkpoint_margin_s, 600))
+    clamped_budget_s = float(max(clamped_s - checkpoint_margin_s, 600))
     if train_config.max_wall_seconds is not None:
         clamped_budget_s = min(clamped_budget_s, train_config.max_wall_seconds)
-    logger.info(
-        f"Partition {partition} MaxTime {format_slurm_time(limit_s)} is below the requested "
-        f"{config.train_time_limit}, clamping job time and wall budget ({clamped_budget_s:.0f} s)"
-    )
-    return format_slurm_time(limit_s), train_config.model_copy(update={"max_wall_seconds": clamped_budget_s})
+    logger.info(f"Clamping the in-job wall budget to {clamped_budget_s:.0f} s")
+    return time_limit, train_config.model_copy(update={"max_wall_seconds": clamped_budget_s})
 
 
 def launch_train_parallel(
@@ -1104,5 +1114,6 @@ Path({study_config_path!r}).unlink()
 echo "=== $(date) job $SLURM_JOB_ID ({job_name}) start on $SLURMD_NODENAME ==="
 export MPLBACKEND=Agg
 {CPU_JOB_ENV}"""
-    script = sbatch_script(job_name, partition, config.analysis_time_limit, log_path, script_path, setup, mem=config.analysis_mem)
+    time_limit = clamp_time_limit(partition, config.analysis_time_limit)
+    script = sbatch_script(job_name, partition, time_limit, log_path, script_path, setup, mem=config.analysis_mem)
     return submit_sbatch(script, job_name, "analysis")
