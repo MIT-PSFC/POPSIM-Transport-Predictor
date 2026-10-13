@@ -147,10 +147,6 @@ SUMMARY_RESULT_VARS = ["error_abs_shot", "error_rel_shot", "error_abs_ts", "erro
 # A fresh config lock starts it over (see Study.steps_per_epoch)
 STEPS_PER_EPOCH_FILENAME = "steps_per_epoch.toml"
 
-# Tuned learning rates were swept for from-scratch training.
-# Fine-tuning scales lr0 by max_epochs / total_steps, clipped below at this floor. See _scale_transfer_lr
-TRANSFER_LR_FLOOR = 0.01
-
 # A training job is considered stuck once it has run at least this long with no progress (e.g. OpenBLAS or XLA compile-pool deadlocks)
 WATCHDOG_MIN_AGE_S = 80 * 60
 
@@ -195,12 +191,6 @@ def recorded_steps_per_epoch(working_dir: Path) -> dict[str, dict]:
         return {}
     with open(path, "rb") as f:
         return tomllib.load(f)
-
-
-def transfer_lr_scale(steps_per_epoch: int, max_epochs: int) -> float:
-    """lr0 scale of a finetune, max_epochs / total_steps clipped to [TRANSFER_LR_FLOOR, 1] (see Study._scale_transfer_lr)."""
-    total_steps = steps_per_epoch * max_epochs
-    return min(1.0, max(TRANSFER_LR_FLOOR, max_epochs / total_steps))
 
 
 def model_size_updates(model_size: str, sweep_model_init_parameters: dict, model_init_config: dict) -> dict:
@@ -1029,45 +1019,28 @@ class Study:
         recorded[config_hash] = {"data_train_run_builder": data_train_run_builder_name, "steps_per_epoch": steps_per_epoch}
         write_toml_atomic(self.working_dir / STEPS_PER_EPOCH_FILENAME, recorded)
 
-    def _scale_transfer_lr(self, train_config: TrainConfig) -> TrainConfig:
-        """Step-budget the learning-rate schedule for fine-tuning from a pretrained checkpoint.
+    def _scale_target_only_lr(self, train_config: TrainConfig) -> TrainConfig:
+        """lr0 of a case that trains on the target device alone, a transfer finetune or an exnihilo case.
 
-        Tuned learning rates were swept for from-scratch training.
-        The scale keeps lr x total_steps near lr0 x max_epochs,
-        scale = max_epochs / total_steps clipped to [TRANSFER_LR_FLOOR, 1].
-        Every case trains the study's steps_per_epoch, so the scale is 1 / steps_per_epoch clipped the same way.
-
-        The schedule is also flattened (lrf_frac = 1, a constant under optax exponential_decay),
-        so the whole step budget is spent at working LR.
-        Best-checkpoint selection and early stopping guard against overshoot.
-        A live finetune could not stop on the test set, but every compared case does the same.
+        Tuned learning rates were swept on the source devices.
+        A target-only case cycles its few target shots through all of the study's steps per epoch (CaseTrainDataLoader),
+        so it trains at lr0 / (2 x steps_per_epoch), each epoch moving the weights about half a step at the tuned lr0.
+        The tuned schedule is kept, only its scale changes.
 
         Applied after the tuned-config merge so the swept optimizer_config cannot overwrite it.
         """
         steps_per_epoch = train_config.dataloader_config["steps_per_epoch"]
-        total_steps = steps_per_epoch * train_config.max_epochs
-        scale = transfer_lr_scale(steps_per_epoch, train_config.max_epochs)
-        logger.info(
-            f"Transfer LR scale {scale:.3g} from step budget "
-            f"({steps_per_epoch} steps/epoch x {train_config.max_epochs} epochs = {total_steps} steps)"
-        )
-        lr0_finetune = train_config.optimizer_config["lr0"] * scale
-        return train_config.model_copy(
-            update={
-                "optimizer_config": {
-                    **train_config.optimizer_config,
-                    "lr0": lr0_finetune,
-                    "lrf_frac": 1.0,
-                }
-            }
-        )
+        lr0_target_only = train_config.optimizer_config["lr0"] / (2 * steps_per_epoch)
+        logger.info(f"Target-only lr0 {lr0_target_only:.3g}, the tuned lr0 / (2 x {steps_per_epoch} steps per epoch)")
+        optimizer_config = {**train_config.optimizer_config, "lr0": lr0_target_only}
+        return train_config.model_copy(update={"optimizer_config": optimizer_config})
 
     def make_train_config(self, case: Case) -> TrainConfig:
         """Make the TrainConfig for a given case.
 
         Builds the shared scaffold (dataloader/loss/optimizer bases, weighted
         device weights, transfer checkpoint wiring, tuned-config merge,
-        the study's training steps per epoch, transfer LR scaling)
+        the study's training steps per epoch, target-only LR scaling)
         around the per-model-type pieces supplied by the model_train_spec hook.
         """
         dataloader_config_base = self.base_dataloader_config(case)
@@ -1122,12 +1095,10 @@ class Study:
         dataloader_config = {**train_config.dataloader_config, "steps_per_epoch": steps_per_epoch}
         train_config = train_config.model_copy(update={"dataloader_config": dataloader_config})
 
-        # Fine-tuning from a pretrained checkpoint gets a step-budgeted flat
-        # learning rate instead of the swept schedule (see _scale_transfer_lr).
-        # Applied after the tuned-config merge so the swept optimizer_config
-        # cannot overwrite it
-        if case.domain_adaptation == "transfer":
-            train_config = self._scale_transfer_lr(train_config)
+        # A case that trains on the target alone gets a reduced lr0 (see _scale_target_only_lr).
+        # Applied after the tuned-config merge so the swept optimizer_config cannot overwrite it
+        if case.domain_adaptation == "transfer" or case.training_data.exnihilo:
+            train_config = self._scale_target_only_lr(train_config)
 
         return train_config
 

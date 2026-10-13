@@ -267,7 +267,7 @@ class PowerBalanceStudy(Study):
             # The p_oh/p_rad submodules train at a reduced rate relative to
             # the taue network so joint training does not pull them far from
             # their pretrained behavior. In transfer finetunes this stacks
-            # with the step-budgeted transfer LR on purpose: the submodules
+            # with the target-only lr0 scale on purpose: the submodules
             # already ran their own pretrain + finetune prereq chain, so the
             # joint finetune lets their last layers drift only at 0.1x the
             # transfer LR.

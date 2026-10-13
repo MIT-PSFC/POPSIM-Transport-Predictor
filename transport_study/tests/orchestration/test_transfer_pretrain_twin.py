@@ -125,9 +125,12 @@ def test_exnihilo_coral_impossibility(study, data_normalization, impossible):
     assert case.is_impossible() == impossible
 
 
-def test_finetune_restores_the_twin_and_twin_trains_from_scratch(synthetic_device_stores, tmp_path, monkeypatch):
-    """The transfer case starts from its twin's checkpoint, the twin itself from scratch on the untouched schedule."""
-    # The transfer lr budget builds the dataloaders, and popsim rejects a single-shot whole-episode test set
+def test_finetune_restores_the_twin_and_target_only_cases_scale_lr0(synthetic_device_stores, tmp_path, monkeypatch):
+    """The transfer case starts from its twin's checkpoint, the twin itself from scratch on the untouched schedule.
+
+    The finetune and the exnihilo case train on the target alone, at lr0 / (2 x steps_per_epoch) on the tuned schedule.
+    """
+    # The steps per epoch build the dataloaders, and popsim rejects a single-shot whole-episode test set
     study = _study(synthetic_device_stores, tmp_path, target_test_set_size=2, num_target_shots_options=(1,))
     # The synthetic shots are shorter than the study's training segments
     base_dataloader_config = study.base_dataloader_config
@@ -138,13 +141,22 @@ def test_finetune_restores_the_twin_and_twin_trains_from_scratch(synthetic_devic
     )
     case = _case()
     twin = case.transfer_pretrain_case()
+    exnihilo_case = _case(training_data="exnihilo", domain_adaptation=None)
 
     finetune_config = study.make_train_config(case)
     twin_config = study.make_train_config(twin)
+    exnihilo_config = study.make_train_config(exnihilo_case)
 
     assert finetune_config.model_init_config["transfer_checkpoint"] == str(study.trained_model_dir(twin))
     assert not twin_config.model_init_config.get("transfer_checkpoint")
-    assert twin_config.optimizer_config == study.base_optimizer_config()
+    base_optimizer_config = study.base_optimizer_config()
+    assert twin_config.optimizer_config == base_optimizer_config
+    base_lr0 = base_optimizer_config["lr0"]
+    for target_only_config in (finetune_config, exnihilo_config):
+        steps_per_epoch = target_only_config.dataloader_config["steps_per_epoch"]
+        assert target_only_config.optimizer_config["lr0"] == pytest.approx(base_lr0 / (2 * steps_per_epoch))
+        # Every other optimizer setting, the schedule's among them, stays tuned
+        assert {**target_only_config.optimizer_config, "lr0": base_lr0} == base_optimizer_config
 
 
 def test_zero_shot_pretrain_datasets(study):

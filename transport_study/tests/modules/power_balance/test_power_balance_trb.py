@@ -383,8 +383,8 @@ def test_base_optimizer_config_carries_lr_factors(tmp_path):
 
 @requires_sample_data
 def test_transfer_config_stacks_submodule_lr_factors(tmp_path):
-    # The submodule LR reduction deliberately stacks with the step-budgeted
-    # transfer LR: the submodules already ran their own pretrain + finetune
+    # The submodule LR reduction deliberately stacks with the target-only
+    # lr0 scale: the submodules already ran their own pretrain + finetune
     # prereq chain, so the joint finetune moves their last layers only at
     # 0.1x the transfer LR. The factors must survive make_train_config for
     # transfer cases exactly as for da=None cases
@@ -417,7 +417,7 @@ def test_transfer_config_stacks_submodule_lr_factors(tmp_path):
     assert hyperparam_config.optimizer_config["submodule_lr_factors"] == expected
 
     # The surviving factors keep the optimizer grouped, so the stacked
-    # schedule actually applies on top of the step-budgeted transfer lr0
+    # schedule actually applies on top of the target-only lr0
     trainable, _ = make_partition_by_members(lambda m: m)(_make_fake_module())
     grouped_state = make_grouped_exponential_adamw(transfer_config.optimizer_config).init(trainable)
     assert hasattr(grouped_state, "inner_states")
