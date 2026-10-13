@@ -5,9 +5,11 @@ import re
 import subprocess
 import sys
 import tempfile
-from collections.abc import Callable
-from datetime import timedelta
+import time
+from collections.abc import Callable, Collection
+from datetime import datetime, timedelta
 from pathlib import Path
+from typing import NamedTuple
 
 import yaml
 from loguru import logger
@@ -159,16 +161,29 @@ exit $exit_code
 """
 
 
-def submit_sbatch(script: str, job_name: str, kind: str) -> bool:
-    """Submit an sbatch script, returns whether SLURM accepted it."""
+# What sbatch prints for an accepted job
+SUBMITTED_JOB_PATTERN = re.compile(r"Submitted batch job (\d+)")
+
+
+def _submitted_job_id(sbatch_stdout: str, job_name: str) -> int | None:
+    """The job id an accepted sbatch printed, None (logged) when its output has none."""
+    match = SUBMITTED_JOB_PATTERN.search(sbatch_stdout)
+    if match is None:
+        logger.error(f"sbatch accepted {job_name} but printed no job id: {sbatch_stdout!r}")
+        return None
+    return int(match.group(1))
+
+
+def submit_sbatch(script: str, job_name: str, kind: str) -> int | None:
+    """Submit an sbatch script, returns the job id SLURM accepted it under, None when it did not."""
     result = _run_slurm(["sbatch"], stdin=script)
     if result is None:
-        return False
+        return None
     if result.returncode != 0:
         logger.error(f"sbatch failed for {kind} job {job_name}: {result.stderr}")
-        return False
+        return None
     logger.info(f"Submitted {kind} job {job_name}: {result.stdout.strip()}")
-    return True
+    return _submitted_job_id(result.stdout, job_name)
 
 
 def importable_module(cls: type) -> str:
@@ -237,22 +252,27 @@ def query_partitions() -> str:
     return ",".join(dict.fromkeys(p for p in partitions if p))
 
 
+# squeue states of a job that has not left the queue yet.
+# A COMPLETING job has finished training but still holds its name, a REQUEUED one runs again
+IN_FLIGHT_JOB_STATES = "PENDING,RUNNING,CONFIGURING,COMPLETING,SUSPENDED,REQUEUED"
+
+
 def count_running_jobs(job_name: str, partition: str | None = None) -> int | None:
-    """Running and pending jobs with this name on the partition(s), None if squeue fails.
+    """Jobs with this name still in the queue on the partition(s) (IN_FLIGHT_JOB_STATES), None if squeue fails.
 
     Defaults to the primary plus spillover partitions so a case whose job
     spilled over still counts as in flight.
     """
     if partition is None:
         partition = query_partitions()
-    stdout = _slurm_stdout(["squeue", "-p", partition, "-n", job_name, "--state=RUNNING,PENDING", "--noheader"])
+    stdout = _slurm_stdout(["squeue", "-p", partition, "-n", job_name, f"--state={IN_FLIGHT_JOB_STATES}", "--noheader"])
     if stdout is None:
         return None
     return _count_lines(stdout)
 
 
 def get_running_job_names() -> set[str] | None:
-    """Names of this user's running and pending jobs on every partition, in one squeue call.
+    """Names of this user's jobs still in the queue (IN_FLIGHT_JOB_STATES) on every partition, in one squeue call.
 
     Orchestration loops poll job state for every case each pass. One squeue
     call returning all names (checked by set membership) replaces hundreds of
@@ -262,10 +282,67 @@ def get_running_job_names() -> set[str] | None:
     and a job on a partition the config no longer names still counts.
     """
     # Default %j truncates long names, and case names run long
-    stdout = _slurm_stdout(["squeue", "-u", getpass.getuser(), "--state=RUNNING,PENDING", "--noheader", "--format=%512j"])
+    stdout = _slurm_stdout(["squeue", "-u", getpass.getuser(), f"--state={IN_FLIGHT_JOB_STATES}", "--noheader", "--format=%512j"])
     if stdout is None:
         return None
     return {line.strip() for line in stdout.splitlines() if line.strip()}
+
+
+# sacct states of a job that will not run again (CANCELLED prints as "CANCELLED by <uid>")
+TERMINAL_JOB_STATES = ("BOOT_FAIL", "CANCELLED", "COMPLETED", "DEADLINE", "FAILED", "NODE_FAIL", "OUT_OF_MEMORY", "PREEMPTED", "TIMEOUT")
+
+
+class JobEnd(NamedTuple):
+    """A job's sacct state and wall-clock end time, the end None while the job can still run."""
+
+    state: str
+    end_time: float | None
+
+
+def job_end_states(job_ids: Collection[int]) -> dict[int, JobEnd] | None:
+    """sacct's state and end of each of job_ids, in one call, None when sacct fails.
+
+    A job sacct has no record of yet is missing from the dict.
+    The end is None until the state is one of TERMINAL_JOB_STATES.
+    A terminal job without an end time reads as having ended at once (end 0).
+    """
+    job_id_list = ",".join(str(job_id) for job_id in job_ids)
+    stdout = _slurm_stdout(["sacct", "-X", "-n", "-P", "-j", job_id_list, "-o", "JobID,State,End"], level="WARNING")
+    if stdout is None:
+        return None
+    end_states = {}
+    for line in stdout.splitlines():
+        fields = line.strip().split("|")
+        if len(fields) != 3 or not fields[0].isdigit():
+            continue
+        job_id_field, state_field, end_field = fields
+        state = state_field.split(" ")[0]
+        end_time = None
+        if state in TERMINAL_JOB_STATES:
+            # sacct prints local times without a zone, the same clock as time.time()
+            end_time = datetime.fromisoformat(end_field).timestamp() if end_field[:1].isdigit() else 0.0
+        end_states[int(job_id_field)] = JobEnd(state, end_time)
+    return end_states
+
+
+def recent_job_ids(name_suffix: str, since_s: float) -> dict[str, int] | None:
+    """Job id of each of this user's jobs whose name ends with name_suffix, queued or run in the last since_s seconds.
+
+    The newest job wins when a name repeats.
+    None when sacct fails.
+    """
+    start_time = datetime.fromtimestamp(time.time() - since_s).strftime("%Y-%m-%dT%H:%M:%S")
+    stdout = _slurm_stdout(
+        ["sacct", "-u", getpass.getuser(), "-X", "-n", "-P", "-S", start_time, "-o", "JobID,JobName%512"], level="WARNING"
+    )
+    if stdout is None:
+        return None
+    job_ids = {}
+    for line in stdout.splitlines():
+        job_id_field, _, job_name = line.strip().partition("|")
+        if job_id_field.isdigit() and job_name.endswith(name_suffix):
+            job_ids[job_name] = max(int(job_id_field), job_ids.get(job_name, 0))
+    return job_ids
 
 
 def get_running_job_elapsed_s(partition: str | None = None) -> dict[str, int] | None:
@@ -897,8 +974,8 @@ def _gres_requests(partition: str) -> list[tuple[str, str | None]]:
     return requests
 
 
-def _sbatch_gpu_job(build_script: Callable[[str, str | None], str], job_name: str, partition: str, kind: str) -> bool:
-    """Submit build_script(gres, exclude) via sbatch, falling back to typed gres, returns whether SLURM accepted it.
+def _sbatch_gpu_job(build_script: Callable[[str, str | None], str], job_name: str, partition: str, kind: str) -> int | None:
+    """Submit build_script(gres, exclude) via sbatch, falling back to typed gres, returns the accepted job id or None.
 
     Only the "Requested node configuration is not available" rejection moves
     on to the next gres request, any other sbatch failure is final.
@@ -908,22 +985,22 @@ def _sbatch_gpu_job(build_script: Callable[[str, str | None], str], job_name: st
         script = build_script(gres, exclude)
         result = _run_slurm(["sbatch"], stdin=script)
         if result is None:
-            return False
+            return None
         if result.returncode == 0:
             logger.info(f"Submitted {kind} job {job_name}: {result.stdout.strip()}")
-            return True
+            return _submitted_job_id(result.stdout, job_name)
         if GRES_UNAVAILABLE_ERROR not in result.stderr:
             break
         logger.info(f"{partition} rejected gres request {gres!r} for {job_name}, trying next GPU type")
     if result is not None:
         logger.error(f"sbatch failed for {kind} job {job_name}: {result.stderr}")
-    return False
+    return None
 
 
 def _submit_training_job(
     job_name: str, partition: str, time_limit: str, log_path: Path | str, script_path: Path | str, job_setup: str, kind: str
-) -> bool:
-    """Submit a training or agent job, returns whether SLURM accepted it.
+) -> int | None:
+    """Submit a training or agent job, returns the job id SLURM accepted it under, None when it did not.
 
     On a CPU partition it is a CPU job of cpu_train_cpus CPUs, anywhere else a one-GPU job.
     job_setup holds the job's own shell lines, the device banner goes in front and the device environment after.
@@ -983,8 +1060,10 @@ def launch_train_parallel(
     result_path: Path | str,
     log_path: Path | str,
     partition: str | None = None,
-) -> bool:
-    """Submit a SLURM job that runs training serially and saves results to result_path, returns whether SLURM accepted it.
+) -> int | None:
+    """Submit a SLURM job that runs training serially and saves results to result_path.
+
+    Returns the job id SLURM accepted it under, None when it did not.
 
     Args:
         train_config: The training configuration.
@@ -1060,8 +1139,8 @@ def launch_agent_parallel(
     job_name: str,
     log_dir: Path | str,
     partition: str | None = None,
-) -> bool:
-    """Submit a SLURM job that launches a W&B agent for an existing sweep, returns whether SLURM accepted it.
+) -> int | None:
+    """Submit a SLURM job that launches a W&B agent for an existing sweep, returns the accepted job id or None.
 
     Args:
         train_config: The training configuration.
@@ -1115,8 +1194,8 @@ Path({str(study_config_path)!r}).unlink()
     return _submit_training_job(job_name, partition, time_limit, log_path, script_path, "\n", "agent")
 
 
-def launch_case_analysis_parallel(study, case) -> bool:
-    """Submit a CPU SLURM job computing one case's stage metrics and case report, returns whether SLURM accepted it.
+def launch_case_analysis_parallel(study, case) -> int | None:
+    """Submit a CPU SLURM job computing one case's stage metrics and case report, returns the accepted job id or None.
 
     Analysis (metrics aggregation, PDF pages, GIF frames) is matplotlib and
     numpy bound with no GPU work, so it goes to config.analysis_partition when

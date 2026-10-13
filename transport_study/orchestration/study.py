@@ -12,7 +12,7 @@ from collections import Counter
 from dataclasses import dataclass, fields, replace
 from itertools import product
 from pathlib import Path
-from typing import Annotated, ClassVar
+from typing import Annotated, ClassVar, NamedTuple
 
 import wandb
 import xarray as xr
@@ -83,11 +83,13 @@ from transport_study.orchestration.slurm_utils import (
     get_pending_job_pending_s,
     get_running_job_elapsed_s,
     get_running_job_names,
+    job_end_states,
     launch_agent_parallel,
     launch_train_parallel,
     open_slots,
     partition_exists,
     pick_partition,
+    recent_job_ids,
 )
 from transport_study.orchestration.target_shots import (
     BASE_TARGET_SHOT_ORDER,
@@ -140,8 +142,19 @@ MIN_RUNNING_AGENTS = 6
 # How long the orchestration loop sleeps between passes over the unfinished cases
 ORCHESTRATION_POLL_INTERVAL_S = 20
 
-# Result files can lag job exit by ~1 min on NFS, so wait this long after a seed's job leaves the queue before relaunching it
+# Result files can lag job exit by ~1 min on NFS, so wait this long after a seed's job ended before relaunching it
 RELAUNCH_GRACE_S = 180
+
+# sacct records a job seconds after its submission, a submitted job it still has no record of this long after counts as gone
+SUBMIT_ACCOUNTING_LAG_S = 300
+
+
+class SubmittedJob(NamedTuple):
+    """A training job SLURM accepted, its id and the wall-clock time of the submission."""
+
+    job_id: int
+    submitted_at: float
+
 
 # The training shuffle of every config before launch_train seeds it, the one sweep trials train with
 BASE_SHUFFLE_SEED = 0
@@ -1379,6 +1392,54 @@ class Study:
         """Whether the case's training and sweep agents may also run on the CPU partitions (cpu_model_types)."""
         return bool(config.cpu_partition) and case.model_type in config.cpu_model_types
 
+    def _recall_recent_train_jobs(self) -> None:
+        """Record this study's training jobs queued or run in the last RELAUNCH_GRACE_S, so a restarted orchestrator holds them too.
+
+        A previous orchestrator submitted them, so they are missing from submitted_train_jobs.
+        A failed sacct leaves them unrecorded, as before the hold existed.
+        """
+        recent_train_jobs = recent_job_ids(f".{self.name}", RELAUNCH_GRACE_S)
+        if recent_train_jobs is None:
+            logger.warning("sacct failed, the training jobs of a previous orchestrator are not held")
+            return
+        now = time.time()
+        for job_name, job_id in recent_train_jobs.items():
+            if job_name.startswith("train_"):
+                self.submitted_train_jobs[job_name] = SubmittedJob(job_id, now)
+
+    def _held_train_job_names(self, running_job_names: set[str]) -> set[str]:
+        """The submitted training jobs that left the queue too recently for their seed to be relaunched.
+
+        A job is held while sacct has no record of it yet (accounting lags submission by seconds),
+        while sacct still shows it in a non-terminal state (squeue and sacct can disagree for a moment),
+        until RELAUNCH_GRACE_S past its end, and through any pass whose sacct call fails.
+        A job sacct never records is released SUBMIT_ACCOUNTING_LAG_S after its submission.
+        A released job leaves submitted_train_jobs, so each is looked up only until it is resolved.
+        """
+        gone_jobs = {job_name: job for job_name, job in self.submitted_train_jobs.items() if job_name not in running_job_names}
+        if not gone_jobs:
+            return set()
+        gone_job_ids = [job.job_id for job in gone_jobs.values()]
+        end_states = job_end_states(gone_job_ids)
+        if end_states is None:
+            logger.warning("sacct failed, holding every training job that left the queue until the next pass")
+            return set(gone_jobs)
+        now = time.time()
+        held_job_names = set()
+        for job_name, job in gone_jobs.items():
+            end_state = end_states.get(job.job_id)
+            if end_state is None:
+                still_held = now - job.submitted_at < SUBMIT_ACCOUNTING_LAG_S
+            elif end_state.end_time is None:
+                still_held = True
+            else:
+                still_held = now - end_state.end_time < RELAUNCH_GRACE_S
+            if still_held:
+                held_job_names.add(job_name)
+            else:
+                del self.submitted_train_jobs[job_name]
+        return held_job_names
+
     def run_unfinished_cases(self, skip_tuning: bool, enable_parallelism: bool):
         """Loop until every runnable case has a result file.
 
@@ -1392,17 +1453,20 @@ class Study:
         self.cases, so a blocked case becomes runnable once its prereq case finishes.
         Nothing needs to recurse into prereq chains here.
 
-        A seed whose job just left the queue is held for RELAUNCH_GRACE_S before it can be relaunched.
+        Every training job the study submits is recorded with its job id (submitted_train_jobs).
+        A seed whose job has left the queue stays held until sacct shows that job ended RELAUNCH_GRACE_S ago (_held_train_job_names).
         Its seed result may already be written but not yet visible across nodes,
         and relaunching in that window submits a duplicate job for a finished seed.
+        The hold needs no snapshot to have seen the job, so a seed submitted and finished between two passes is held too.
+        A restarted orchestrator recalls the jobs its predecessor had in the queue (_recall_recent_train_jobs).
         With parallelism a case still tuning is held until its sweep may be read again (config.sweep_poll_interval_s).
 
         Borrowed cases (see case_home) are only waited on, their home study trains them.
         The ancestor chain is reloaded every pass, so a reset ancestor stops the loop.
         """
         unfinished = self.get_unfinished_cases()
-        # train job name -> monotonic time the job was last seen in the queue
-        last_in_flight: dict[str, float] = {}
+        if enable_parallelism:
+            self._recall_recent_train_jobs()
         while unfinished:
             self.refresh_lineage()
             borrowed = [case for case in unfinished if self.is_borrowed(case)]
@@ -1416,8 +1480,10 @@ class Study:
                 self.kill_stuck_jobs(local)
                 self._kill_stuck_agents(local)
                 self._kill_long_pending_jobs(local)
+                held_job_names = self._held_train_job_names(running_job_names)
             else:
                 running_job_names = set()
+                held_job_names = set()
 
             runnable = [case for case in local if self.check_prereq_satisfied(case)]
             now = time.monotonic()
@@ -1437,8 +1503,7 @@ class Study:
                     job_name = self.train_job_name(case, seed)
                     if job_name in running_job_names:
                         n_in_flight += 1
-                        last_in_flight[job_name] = now
-                    elif now - last_in_flight.get(job_name, -math.inf) < RELAUNCH_GRACE_S:
+                    elif job_name in held_job_names:
                         n_in_grace += 1
                     else:
                         launch_seeds.append(seed)
@@ -1783,16 +1848,18 @@ class Study:
         seed_result_path = self.seed_result_path(case, seed)
         if enable_parallelism:
             logger.info(f"Launching training job {train_job_name} for case\n{case}")
-            submitted = launch_train_parallel(
+            job_id = launch_train_parallel(
                 train_config,
                 train_job_name,
                 seed_result_path,
                 self.train_log_path(case, seed),
                 partition=partition,
             )
-            # Nothing ran, so a rejected submission does not count toward MAX_TRAIN_ATTEMPTS
-            if not submitted:
+            if job_id is None:
+                # Nothing ran, so a rejected submission does not count toward MAX_TRAIN_ATTEMPTS
                 self.train_attempts[train_job_name] = attempts
+            else:
+                self.submitted_train_jobs[train_job_name] = SubmittedJob(job_id, time.time())
         else:
             logger.info("Launching training serially")
             trainer, _, _, _, result_dict = launch_train(train_config)
@@ -2127,6 +2194,8 @@ class Study:
         # and each agent job's liveness (job name) may be read from wandb again
         self._next_sweep_poll: dict[str, float] = {}
         self._next_agent_check: dict[str, float] = {}
+        # Every training job this orchestrator submitted (or recalled) by job name, until it is resolved (see _held_train_job_names)
+        self.submitted_train_jobs: dict[str, SubmittedJob] = {}
 
         self.working_dir = Path(config.working_dir_base) / self.name
         self.model_dir = self.working_dir / "models"

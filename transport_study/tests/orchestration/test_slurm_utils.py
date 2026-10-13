@@ -1,6 +1,7 @@
 import os
 import shutil
 import sys
+from datetime import datetime
 from types import SimpleNamespace
 
 import pytest
@@ -312,3 +313,29 @@ def test_importable_module_main_recovers_dotted_path(monkeypatch):
 def test_parse_slurm_time_s_reads_every_sbatch_form(time_str, expected_s):
     """A lone field is minutes, but after a day prefix it is hours (sbatch --time grammar)."""
     assert parse_slurm_time_s(time_str) == expected_s
+
+
+def test_submit_sbatch_returns_accepted_job_id(monkeypatch):
+    _serve_fake_slurm(monkeypatch, lambda cmd: "Submitted batch job 25741062\n")
+
+    assert slurm_utils.submit_sbatch("#!/bin/bash\n", "train_case.a.seed_0.study", "training") == 25741062
+
+
+def test_job_end_states_reads_terminal_ends_and_skips_unrecorded_jobs(monkeypatch):
+    """A terminal state carries its end as wall-clock seconds, a running job none, CANCELLED keeps only its state word."""
+    sacct_stdout = "7|COMPLETED|2026-10-13T19:20:31\n8|RUNNING|Unknown\n9|CANCELLED by 1234|2026-10-13T19:21:00\n"
+    _serve_fake_slurm(monkeypatch, lambda cmd: sacct_stdout)
+
+    end_states = slurm_utils.job_end_states([7, 8, 9, 10])
+
+    assert end_states[7] == slurm_utils.JobEnd("COMPLETED", datetime(2026, 10, 13, 19, 20, 31).timestamp())
+    assert end_states[8] == slurm_utils.JobEnd("RUNNING", None)
+    assert end_states[9] == slurm_utils.JobEnd("CANCELLED", datetime(2026, 10, 13, 19, 21, 0).timestamp())
+    assert 10 not in end_states
+
+
+def test_recent_job_ids_keeps_newest_job_of_each_name_of_study(monkeypatch):
+    sacct_stdout = "7|train_case.a.seed_0.study\n9|train_case.a.seed_0.study\n8|agent_case.a.study\n10|train_case.b.seed_0.other\n"
+    _serve_fake_slurm(monkeypatch, lambda cmd: sacct_stdout)
+
+    assert slurm_utils.recent_job_ids(".study", 180) == {"train_case.a.seed_0.study": 9, "agent_case.a.study": 8}
