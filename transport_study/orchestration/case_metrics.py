@@ -8,8 +8,8 @@ Everything else lives here:
 the per-timeslice records read off a result file (staged_result_records),
 the nearest-time join back to the device datasets, the shot-stage labels, the per-stage aggregation,
 the per-case cache and the collected metrics of a whole study.
-Every metric keeps one value per retained checkpoint (orchestration.topk_results),
-and the per-stage aggregation reduces each case score to its best, top-K mean and top-K std.
+Every metric keeps one value per seed (orchestration.seed_results),
+and the per-stage aggregation reduces each case score to its best seed's, the seed mean and the seed std.
 """
 
 from collections.abc import Callable
@@ -23,16 +23,16 @@ import xarray as xr
 from loguru import logger
 
 from transport_study import EPISODE_DIM, TIME_COORD, TIME_DIM
+from transport_study.orchestration.seed_results import (
+    BEST_SEED_ATTR,
+    SEED_DIM,
+    seed_statistics,
+)
 from transport_study.orchestration.stages import STAGE_AGG_NAMES, segment_stages
 from transport_study.orchestration.study import (
     Study,
     real_timeslice_mask,
     write_netcdf_atomic,
-)
-from transport_study.orchestration.topk_results import (
-    BEST_EPOCH_ATTR,
-    CKPT_DIM,
-    topk_statistics,
 )
 from transport_study.signals import POWER_ADDITIONAL_MW
 
@@ -46,15 +46,15 @@ CASE_METRICS_FILENAME = "case_metrics.nc"
 DIVERGED_VAR = "error_diverged_ts"
 
 # The StagedTimesliceMetrics fields every staged_result_records call fills
-RECORD_FIELDS = ("shot", "ds_source", "time", "stage", "aux_heated", "ckpt_epochs", "best_epoch")
+RECORD_FIELDS = ("shot", "ds_source", "time", "stage", "aux_heated", "seeds", "best_seed")
 
 
 @dataclass
 class StagedTimesliceMetrics:
     """Long-form per-timeslice metrics of one case, one record per valid test timeslice.
 
-    Subclasses add one (records, checkpoints) array per metric, named METRIC_PREFIX + metric name,
-    one column per retained checkpoint epoch in ckpt_epochs.
+    Subclasses add one (records, seeds) array per metric, named METRIC_PREFIX + metric name,
+    one column per seed in seeds.
     """
 
     METRIC_PREFIX: ClassVar[str]
@@ -64,8 +64,8 @@ class StagedTimesliceMetrics:
     time: np.ndarray
     stage: np.ndarray
     aux_heated: np.ndarray
-    ckpt_epochs: np.ndarray
-    best_epoch: int
+    seeds: np.ndarray
+    best_seed: int
 
     @classmethod
     def from_records(cls, records: dict, metric_names: tuple[str, ...], **extra_fields):
@@ -87,12 +87,12 @@ class StagedTimesliceMetrics:
         return self.stage == stage
 
     def metric(self, name: str) -> np.ndarray:
-        """One metric of every record at every retained checkpoint, (records, checkpoints)."""
+        """One metric of every record of every seed, (records, seeds)."""
         return getattr(self, f"{self.METRIC_PREFIX}{name}")
 
     def best(self, name: str) -> np.ndarray:
-        """One metric of every record at the best checkpoint, the one whose predictions the case reports plot."""
-        best_column = int(np.flatnonzero(self.ckpt_epochs == self.best_epoch)[0])
+        """One metric of every record of the best seed, the one whose predictions the case reports plot."""
+        best_column = int(np.flatnonzero(self.seeds == self.best_seed)[0])
         return self.metric(name)[:, best_column]
 
 
@@ -142,14 +142,14 @@ def staged_result_records(result_ds: xr.Dataset, device_dataset: Callable[[str],
     each result timeslice is joined to it by (shot, nearest time) for its stage label.
     metric_vars maps each metric name to the result variable it reads, NaN when a result file lacks it.
     A record is a timeslice that advances its shot's clock (the padded rollout tail would weight the shot end
-    hundreds of times) and has a target, read off the best checkpoint's DIVERGED_VAR.
+    hundreds of times) and has a target, read off the best seed's DIVERGED_VAR.
     A diverged timeslice therefore stays a record, NaN in the errors and 1 in the diverged flag.
 
     Returns the RECORD_FIELDS, result_time_idx / device_time_idx (positions in the result file and the device dataset)
-    and one (records, checkpoints) array per metric name.
+    and one (records, seeds) array per metric name.
     """
-    ckpt_epochs = result_ds[CKPT_DIM].values
-    best_epoch = int(result_ds.attrs[BEST_EPOCH_ATTR])
+    seeds = result_ds[SEED_DIM].values
+    best_seed = int(result_ds.attrs[BEST_SEED_ATTR])
     record_names = ("shot", "ds_source", "time", "stage", "aux_heated", "result_time_idx", "device_time_idx")
     chunks: dict[str, list] = {name: [] for name in (*record_names, *metric_vars)}
 
@@ -163,7 +163,7 @@ def staged_result_records(result_ds: xr.Dataset, device_dataset: Callable[[str],
         shot_device = device_ds.sel({EPISODE_DIM: shot})
 
         res_time = shot_res[TIME_COORD].values
-        diverged_best = shot_res[DIVERGED_VAR].sel({CKPT_DIM: best_epoch}).values
+        diverged_best = shot_res[DIVERGED_VAR].sel({SEED_DIM: best_seed}).values
         mask_valid = real_timeslice_mask(shot_res[TIME_COORD]).values & np.isfinite(diverged_best)
         result_idxs = np.flatnonzero(mask_valid)
         if len(result_idxs) == 0:
@@ -187,9 +187,9 @@ def staged_result_records(result_ds: xr.Dataset, device_dataset: Callable[[str],
         chunks["device_time_idx"].append(device_idxs)
         for name, var in metric_vars.items():
             if var in shot_res:
-                values = shot_res[var].transpose(TIME_DIM, CKPT_DIM).values[result_idxs]
+                values = shot_res[var].transpose(TIME_DIM, SEED_DIM).values[result_idxs]
             else:
-                values = np.full((n, len(ckpt_epochs)), np.nan)
+                values = np.full((n, len(seeds)), np.nan)
             chunks[name].append(values)
 
     records = {
@@ -200,43 +200,43 @@ def staged_result_records(result_ds: xr.Dataset, device_dataset: Callable[[str],
         "aux_heated": concat_records(chunks["aux_heated"], dtype=bool),
         "result_time_idx": concat_records(chunks["result_time_idx"], dtype=int),
         "device_time_idx": concat_records(chunks["device_time_idx"], dtype=int),
-        "ckpt_epochs": ckpt_epochs,
-        "best_epoch": best_epoch,
+        "seeds": seeds,
+        "best_seed": best_seed,
     }
     for name in metric_vars:
-        records[name] = np.concatenate(chunks[name]) if chunks[name] else np.full((0, len(ckpt_epochs)), np.nan)
+        records[name] = np.concatenate(chunks[name]) if chunks[name] else np.full((0, len(seeds)), np.nan)
     return records
 
 
 def aggregate_case_metrics(ts_metrics: StagedTimesliceMetrics, metric_names: tuple[str, ...]) -> xr.Dataset:
     """Reduce one case's per-timeslice metrics to per-stage statistics.
 
-    Each stat (mean / std / med / count over the finite values of a stage's records) is computed per checkpoint,
-    one case score per retained checkpoint,
-    then reduced by topk_statistics to <metric>_<stat> (the top-K mean), <metric>_<stat>_best and <metric>_<stat>_ckpt_std.
+    Each stat (mean / std / med / count over the finite values of a stage's records) is computed per seed,
+    one case score per seed,
+    then reduced by seed_statistics to <metric>_<stat> (the seed mean), <metric>_<stat>_best and <metric>_<stat>_seed_std.
     Dims: stage (STAGE_AGG_NAMES).
     collect_metrics attaches the case-identifying coords, it knows the case_idx.
     """
-    n_ckpt = len(ts_metrics.ckpt_epochs)
-    per_ckpt_vars = {}
+    n_seeds = len(ts_metrics.seeds)
+    per_seed_vars = {}
     for metric in metric_names:
         values = ts_metrics.metric(metric)
-        stats = {stat: np.full((len(STAGE_AGG_NAMES), n_ckpt), np.nan) for stat in ("mean", "std", "med", "count")}
+        stats = {stat: np.full((len(STAGE_AGG_NAMES), n_seeds), np.nan) for stat in ("mean", "std", "med", "count")}
         for stage_pos, stage in enumerate(STAGE_AGG_NAMES):
             stage_values = values[ts_metrics.stage_mask(stage)]
-            for ckpt_pos in range(n_ckpt):
-                ckpt_values = stage_values[:, ckpt_pos]
-                ckpt_values = ckpt_values[np.isfinite(ckpt_values)]
-                stats["count"][stage_pos, ckpt_pos] = len(ckpt_values)
-                if len(ckpt_values):
-                    stats["mean"][stage_pos, ckpt_pos] = np.mean(ckpt_values)
-                    stats["std"][stage_pos, ckpt_pos] = np.std(ckpt_values)
-                    stats["med"][stage_pos, ckpt_pos] = np.median(ckpt_values)
-        for stat, per_ckpt_values in stats.items():
-            per_ckpt_vars[f"{metric}_{stat}"] = (("stage", CKPT_DIM), per_ckpt_values)
+            for seed_pos in range(n_seeds):
+                seed_values = stage_values[:, seed_pos]
+                seed_values = seed_values[np.isfinite(seed_values)]
+                stats["count"][stage_pos, seed_pos] = len(seed_values)
+                if len(seed_values):
+                    stats["mean"][stage_pos, seed_pos] = np.mean(seed_values)
+                    stats["std"][stage_pos, seed_pos] = np.std(seed_values)
+                    stats["med"][stage_pos, seed_pos] = np.median(seed_values)
+        for stat, per_seed_values in stats.items():
+            per_seed_vars[f"{metric}_{stat}"] = (("stage", SEED_DIM), per_seed_values)
 
-    per_ckpt = xr.Dataset(per_ckpt_vars, coords={"stage": list(STAGE_AGG_NAMES), CKPT_DIM: ts_metrics.ckpt_epochs})
-    return topk_statistics(per_ckpt, ts_metrics.best_epoch)
+    per_seed = xr.Dataset(per_seed_vars, coords={"stage": list(STAGE_AGG_NAMES), SEED_DIM: ts_metrics.seeds})
+    return seed_statistics(per_seed, ts_metrics.best_seed)
 
 
 def case_timeslice_metrics(study: Study, case, result_ds: xr.Dataset) -> StagedTimesliceMetrics:

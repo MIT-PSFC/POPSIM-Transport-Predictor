@@ -3,7 +3,7 @@
 For every finished case: a PDF of the best and worst holdout shots by TIME-AVERAGED relative error.
 The per-shot errors in the result files are raw time integrals, which penalize long shots,
 the time-averaged form removes that duration confound.
-Every page shows the best checkpoint, whose predictions the result file holds.
+Every page shows the best seed, whose predictions the result file holds.
 Each page shows the predicted vs measured trajectory with the discharge stages shaded,
 plus the per-timeslice error traces with the aux-heated spans marked.
 """
@@ -61,7 +61,7 @@ def shot_title(
     unit: str = "",
     title_metrics: tuple[tuple[str, str], ...] = (("rel", "rel err"), ("abs", "abs err")),
 ) -> str:
-    """Page title with the best checkpoint's time-averaged title_metrics (name, label) and the span of one shot's records.
+    """Page title with the best seed's time-averaged title_metrics (name, label) and the span of one shot's records.
 
     unit labels the abs metric.
     """
@@ -133,7 +133,7 @@ def _shot_page(
 
 
 def shot_pdf(result_ds: xr.Dataset, ts_metrics: CaseTimesliceMetrics, pdf_path: Path, page_fn=_shot_page, rank_metric: str = "rel"):
-    """Best and worst holdout shot pages by the best checkpoint's time-averaged rank_metric.
+    """Best and worst holdout shot pages by the best seed's time-averaged rank_metric.
 
     page_fn(result_ds, ts_metrics, shot, title_prefix=...) renders one shot,
     the transport study passes its profile-evolution page ranked by chi.

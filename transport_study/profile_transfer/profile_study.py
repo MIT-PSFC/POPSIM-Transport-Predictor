@@ -35,6 +35,7 @@ from transport_study.orchestration.case_metrics import collect_metrics
 from transport_study.orchestration.case_reports import generate_case_reports
 from transport_study.orchestration.comparison_figures import comparison_figures
 from transport_study.orchestration.organize_data import PROFILE_TARGET_VARS
+from transport_study.orchestration.seed_results import BEST_SEED_ATTR, SEED_DIM
 from transport_study.orchestration.study import (
     BASE_MODEL_SIZE,
     CaseGridConfig,
@@ -42,7 +43,6 @@ from transport_study.orchestration.study import (
     Study,
 )
 from transport_study.orchestration.target_shots import BASE_TARGET_SHOT_ORDER
-from transport_study.orchestration.topk_results import BEST_EPOCH_ATTR, CKPT_DIM
 from transport_study.profile_transfer.case_reports import torax_relaxation_report
 from transport_study.profile_transfer.data_visualization import DataVisualization
 from transport_study.profile_transfer.plotting import (
@@ -369,14 +369,14 @@ class ProfileStudy(Study):
           domain_adaptation, freeze_shapes, geometry_builder,
           num_target_shots (identify the case)
         - shot (device shot id), ds_source (which dataset the shot came from)
-        Data variables (along record), top-K means over the retained checkpoints:
+        Data variables (along record), means over the seeds:
         - err_abs_shot / err_rel_shot: time-integrated combined (ne+Te) error for the shot
           (duration-weighted, longer shots score larger at equal instantaneous error)
         - ne_err_abs_shot / te_err_abs_shot / ne_err_rel_shot / te_err_rel_shot: per-channel
           time-integrated errors (see which channel drives a bad shot)
         - err_abs_ts_max / err_rel_ts_max: worst single timeslice in the shot
         - err_abs_ts_mean / err_rel_ts_mean: mean over the shot's timeslices
-        - n_valid_ts: number of non-NaN timeslices contributing to the shot, at the best checkpoint
+        - n_valid_ts: number of non-NaN timeslices contributing to the shot, of the best seed
         """
         data_var_names = [
             "err_abs_shot",
@@ -402,11 +402,11 @@ class ProfileStudy(Study):
             with xr.open_dataset(result_path) as ds_result:
                 ds = ds_result[PROFILE_SUMMARY_RESULT_VARS].load()
 
-            # Reduce per-timeslice errors to per-shot summaries (worst and mean timeslice) of each checkpoint,
-            # then take their top-K mean
+            # Reduce per-timeslice errors to per-shot summaries (worst and mean timeslice) of each seed,
+            # then take their seed mean
             err_abs_ts = ds["error_abs_ts"]
             err_rel_ts = ds["error_rel_ts"]
-            per_shot_per_ckpt = {
+            per_shot_per_seed = {
                 "err_abs_shot": ds["error_abs_shot"],
                 "err_rel_shot": ds["error_rel_shot"],
                 "ne_err_abs_shot": ds["ne_error_abs_shot"],
@@ -418,8 +418,8 @@ class ProfileStudy(Study):
                 "err_abs_ts_mean": err_abs_ts.mean(TIME_DIM, skipna=True),
                 "err_rel_ts_mean": err_rel_ts.mean(TIME_DIM, skipna=True),
             }
-            per_shot = {name: per_ckpt.mean(CKPT_DIM).values for name, per_ckpt in per_shot_per_ckpt.items()}
-            best_err_abs_ts = err_abs_ts.sel({CKPT_DIM: int(ds.attrs[BEST_EPOCH_ATTR])})
+            per_shot = {name: per_seed.mean(SEED_DIM).values for name, per_seed in per_shot_per_seed.items()}
+            best_err_abs_ts = err_abs_ts.sel({SEED_DIM: int(ds.attrs[BEST_SEED_ATTR])})
             per_shot["n_valid_ts"] = best_err_abs_ts.notnull().sum(TIME_DIM).values
 
             shot_ids = ds["shot"].values

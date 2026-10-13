@@ -1,7 +1,7 @@
 """Per-case reports of transport transfer study results (its ANALYSIS_REPORTS_MODULE, see orchestration.case_reports).
 
 The power balance study's shot PDF with a transport-specific page:
-the best and worst holdout shots by the best checkpoint's TIME-AVERAGED chi (the validation loss),
+the best and worst holdout shots by the best seed's TIME-AVERAGED chi (the validation loss),
 each page the per-timeslice chi over the shot with the discharge stages shaded,
 aux-heated spans and diverged timeslices marked.
 The predicted profiles are left out: their (time, rho) maps took most of a report's rendering time.
@@ -49,7 +49,7 @@ def _shot_page(
     shot,
     title_prefix: str = "",
 ) -> plt.Figure:
-    """Chi page for one holdout shot, the best checkpoint's.
+    """Chi page for one holdout shot, the best seed's.
 
     The combined chi and its value and gradient parts over time on a log scale
     (chi spans orders of magnitude across a discharge), each a line through the fresh timeslices,

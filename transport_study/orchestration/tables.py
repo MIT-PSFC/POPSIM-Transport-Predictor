@@ -43,19 +43,19 @@ class ComparisonTableSpec:
     excluded_model_types: tuple[str, ...] = ()
 
 
-# The three top-K values of a per-stage mean (orchestration.topk_results.topk_statistics)
-TOPK_SUFFIXES = ("", "_best", "_ckpt_std")
+# The three seed values of a per-stage mean (orchestration.seed_results.seed_statistics)
+SEED_SUFFIXES = ("", "_best", "_seed_std")
 
 
 def merge_stage_metrics(df: pd.DataFrame, metrics_ds: xr.Dataset, metric_names: tuple[str, ...]) -> pd.DataFrame:
     """Merge the per-stage means from a collected metrics dataset (dims case_idx x stage)
-    into a per-case frame as <metric>_mean<suffix>_<stage> columns, one per TOPK_SUFFIXES entry:
-    the top-K mean, the best checkpoint's and the top-K std.
+    into a per-case frame as <metric>_mean<suffix>_<stage> columns, one per SEED_SUFFIXES entry:
+    the seed mean, the best seed's and the seed std.
     NaN for cases without valid metrics."""
     column_sources = [
         (f"{metric}_mean{suffix}_{stage}", f"{metric}_mean{suffix}", stage)
         for metric in metric_names
-        for suffix in TOPK_SUFFIXES
+        for suffix in SEED_SUFFIXES
         for stage in STAGE_AGG_NAMES
     ]
     if metrics_ds.data_vars and "case_idx" in metrics_ds.dims:

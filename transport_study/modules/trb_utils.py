@@ -670,12 +670,13 @@ class CaseTrainDataLoader(DataLoader):
     An epoch chains reshuffled passes over the samples until steps_per_epoch batches are out,
     and the rest of its last pass is dropped.
     A steps_per_epoch of None keeps one natural pass per epoch, as Study.steps_per_epoch builds it to measure that length.
+    shuffle_seed keys the reshuffles, each seed of a case draws its own (Study.launch_train).
 
     It also carries normalizer_fit_ds, the dataset model_init fits its normalizer statistics on (see normalizer_fit_dataset),
     its own samples unless resolve_case_datasets returned a separate fit set.
     """
 
-    def __init__(self, train_dl: DataLoader, steps_per_epoch: int | None, normalizer_fit_ds: xr.Dataset | None = None):
+    def __init__(self, train_dl: DataLoader, steps_per_epoch: int | None, shuffle_seed: int, normalizer_fit_ds: xr.Dataset | None = None):
         n_batches_natural = len(train_dl)
         # Without a batch an epoch never ends, __iter__ would loop until the watchdog kills the job
         if n_batches_natural == 0:
@@ -691,7 +692,7 @@ class CaseTrainDataLoader(DataLoader):
             shuffle=train_dl.shuffle,
             drop_last=train_dl.drop_last,
             pad_last=train_dl.pad_last,
-            key=train_dl.key,
+            key=jax.random.key(shuffle_seed),
             generate_prng=train_dl.generate_prng,
         )
         self.steps_per_epoch = steps_per_epoch
@@ -820,7 +821,7 @@ def get_time_dep_dataloaders(
             drop_last=[True, False, False],
             pad_last=[False, True, True],
         )
-    train_dl = CaseTrainDataLoader(train_dl, dataloader_config["steps_per_epoch"], normalizer_fit_ds)
+    train_dl = CaseTrainDataLoader(train_dl, dataloader_config["steps_per_epoch"], dataloader_config["shuffle_seed"], normalizer_fit_ds)
     return ds_val, train_dl, val_dl, test_dl
 
 

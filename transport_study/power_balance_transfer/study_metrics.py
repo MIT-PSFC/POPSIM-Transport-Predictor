@@ -1,7 +1,7 @@
 """Stage-resolved metrics of power balance transfer study results (its ANALYSIS_METRICS_MODULE, see orchestration.case_metrics).
 
 The result files carry per-timeslice absolute and relative errors (error_abs_ts / error_rel_ts)
-and the diverged flag (error_diverged_ts) of every retained checkpoint,
+and the diverged flag (error_diverged_ts) of every seed,
 not where in the discharge each timeslice sits.
 Each result timeslice is joined back to its device dataset by (shot, nearest time)
 to pick up ip_MA and the auxiliary power for the shot-stage labels.
@@ -74,7 +74,7 @@ def case_timeslice_metrics(study: Study, case, result_ds: xr.Dataset) -> CaseTim
 
 
 def shot_time_averaged(ts_metrics: StagedTimesliceMetrics, name: str) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Per-shot time average of one metric at the best checkpoint, the duration-free shot ranking metric.
+    """Per-shot time average of one metric of the best seed, the duration-free shot ranking metric.
 
     Returns:
         (shots, averages, n_ts): unique shots with the mean of the metric over each shot's finite timeslices,

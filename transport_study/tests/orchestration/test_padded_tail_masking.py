@@ -11,21 +11,21 @@ import xarray as xr
 from transport_study import EPISODE_DIM, TIME_COORD, TIME_DIM
 from transport_study.config import StudyConfig, load_config
 from transport_study.modules.trb_utils import integrate_error_over_time
+from transport_study.orchestration.seed_results import aggregate_seed_results
 from transport_study.orchestration.study import real_timeslice_mask, write_netcdf_atomic
-from transport_study.orchestration.topk_results import aggregate_topk_results
 from transport_study.power_balance_transfer.study_metrics import (
     compute_case_timeslice_metrics,
     load_stage_dataset,
     shot_time_averaged,
 )
 from transport_study.tests.datasets.synthetic_store import DT, SHOT_LENGTHS, T_START
-from transport_study.tests.stubs import StubCase
+from transport_study.tests.stubs import StubCase, with_seed_attrs
 
 N_PAD_REPEATS = 20
 
 
 def padded_result(errors_real: np.ndarray, time_real: np.ndarray, shot: int) -> xr.Dataset:
-    """One-shot, one-checkpoint result file whose final timeslice repeats N_PAD_REPEATS times at a clamped time,
+    """One-shot, one-seed result file whose final timeslice repeats N_PAD_REPEATS times at a clamped time,
     as the rollout batches pad."""
     errors = np.concatenate([errors_real, np.full(N_PAD_REPEATS, errors_real[-1])])
     time = np.concatenate([time_real, np.full(N_PAD_REPEATS, time_real[-1])])
@@ -41,7 +41,8 @@ def padded_result(errors_real: np.ndarray, time_real: np.ndarray, shot: int) -> 
         },
         coords={EPISODE_DIM: [shot]},
     ).assign_coords(ds_source=(EPISODE_DIM, ["mast"]))
-    return aggregate_topk_results({1: step_ds}, best_step=1)
+    seed_ds = with_seed_attrs(step_ds, val_loss=0.1)
+    return aggregate_seed_results({0: seed_ds})
 
 
 def test_real_timeslice_mask_drops_padded_tails():
@@ -75,8 +76,8 @@ def test_shot_time_integral_unchanged_by_padding():
     ds_padded = padded_result(errors_real, time_real, shot=101)
     ds_unpadded = padded_result(errors_real, time_real, shot=101).isel({TIME_DIM: slice(0, errors_real.size)})
 
-    integral_padded = integrate_error_over_time(ds_padded["error_abs_ts"].squeeze("ckpt"), ds_padded[TIME_COORD])
-    integral_unpadded = integrate_error_over_time(ds_unpadded["error_abs_ts"].squeeze("ckpt"), ds_unpadded[TIME_COORD])
+    integral_padded = integrate_error_over_time(ds_padded["error_abs_ts"].squeeze("seed"), ds_padded[TIME_COORD])
+    integral_unpadded = integrate_error_over_time(ds_unpadded["error_abs_ts"].squeeze("seed"), ds_unpadded[TIME_COORD])
 
     np.testing.assert_allclose(integral_padded.values, integral_unpadded.values)
 

@@ -2,7 +2,7 @@
 
 A grid with one row per chi metric (value / gradient / combined, see study_metrics)
 and one column per shot stage (all, rampup, flattop, flattop ohmic, flattop aux, rampdown),
-each line the top-K mean with the top-K std as its error bar.
+each line the seed mean with the seed std as its error bar.
 Consumes the stage-resolved collected metrics (collected_metrics.nc, dims case_idx x stage).
 freeze_shapes_comparison plots the frozen - unfrozen difference on the same grid.
 """

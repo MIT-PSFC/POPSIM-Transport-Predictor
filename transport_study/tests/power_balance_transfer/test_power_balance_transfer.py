@@ -44,6 +44,8 @@ def _make_config(study_name: str, **overrides) -> PowerBalanceStudy.Config:
         max_epochs=2,
         epochs_per_val=1,
         patience=2,
+        # One seed, so every case trains once as before seeds
+        num_seeds=1,
         model_types=("sciml-taue-nn", "mlp"),
         training_datasets=("cmod-low1", "cmod-low1_cmod-low2"),
         data_normalization_methods=("coral",),
@@ -68,6 +70,15 @@ def _clean_case(study: PowerBalanceStudy, case: PowerBalanceStudy.Case):
     shutil.rmtree(study.trained_model_dir(case), ignore_errors=True)
     if study.result_path(case).exists():
         os.remove(study.result_path(case))
+    for seed in range(config.num_seeds):
+        study.seed_result_path(case, seed).unlink(missing_ok=True)
+
+
+def _train_case(study: PowerBalanceStudy, case: PowerBalanceStudy.Case):
+    """Train every seed of the case serially, then merge them into its result file and best checkpoint."""
+    for seed in range(config.num_seeds):
+        study.launch_train(case, seed)
+    study.merge_seed_results(case)
 
 
 def _hyperparam_case(study: PowerBalanceStudy, model_type: str) -> PowerBalanceStudy.Case:
@@ -203,7 +214,7 @@ def test_weighted_device_weight():
     # Target gets the largest per-sample weight (few shots, half the budget)
     assert weights["cmod-high"] > weights["cmod-low1"]
 
-    study.launch_train(case_p_oh)
+    _train_case(study, case_p_oh)
     assert study.result_path(case_p_oh).exists()
 
 
@@ -296,7 +307,7 @@ def test_transformer_training():
 
     _clean_case(study, case)
 
-    study.launch_train(case)
+    _train_case(study, case)
     assert study.result_path(case).exists()
 
     trainer_init, _ = study.restore_trainer(case, restore_best_checkpoint=False)
@@ -342,7 +353,7 @@ def test_submodule_freezing():
 
     for case in [case_p_oh, case_p_rad, case_frozen, case_unfrozen]:
         if not study.result_path(case).exists():
-            study.launch_train(case)
+            _train_case(study, case)
 
     # Load the trained models for each case,
     # Ensure the weights for p_oh and p_rad are the same for the frozen case,
@@ -406,9 +417,9 @@ def test_transfer_weights():
 
     _clean_case(study, case_pretrain)
     _clean_case(study, case_transfer)
-    study.launch_train(case_pretrain)
+    _train_case(study, case_pretrain)
     assert study.result_path(case_pretrain).exists()
-    study.launch_train(case_transfer)
+    _train_case(study, case_transfer)
     assert study.result_path(case_transfer).exists()
 
     pretrain_final = study.restore_trainer(case_pretrain)[0].train_state.model.module
@@ -491,7 +502,7 @@ def test_transfer_weights_submodules(freeze_submodules):
     for case in ordered_cases:
         _clean_case(study, case)
     for case in ordered_cases:
-        study.launch_train(case)
+        _train_case(study, case)
         assert study.result_path(case).exists()
 
     # Get initial and final modules for each case

@@ -29,6 +29,8 @@ def make_config(tmp_path, study_name, parent_study=None, **overrides):
         data_normalization_methods=("physics",),
         num_target_shots_options=(0, 1),
         target_test_set_size=10,
+        # One seed, so each case the child trains is one launch
+        num_seeds=1,
     )
     defaults.update(overrides)
     return PowerBalanceStudy.Config(**defaults)
@@ -74,7 +76,7 @@ def test_child_waits_for_borrowed_cases_and_launches_only_its_own(tmp_path, monk
 
     launched = []
 
-    def fake_run_case(case, skip_tuning, enable_parallelism, partition=None):
+    def fake_run_case(case, seed, skip_tuning, enable_parallelism, partition=None):
         launched.append(str(case))
         finish(child, case)
 
@@ -89,7 +91,7 @@ def test_child_waits_for_borrowed_cases_and_launches_only_its_own(tmp_path, monk
     assert sorted(launched) == sorted(str(case) for case in child.cases if case.model_type == "transformer")
     assert child.get_unfinished_cases() == []
     with pytest.raises(RuntimeError, match="must not write it"):
-        child.launch_train(parent_cases[0])
+        child.launch_train(parent_cases[0], 0)
 
 
 def test_tertiary_resolves_each_case_to_the_root_most_claimant(tmp_path):

@@ -58,7 +58,7 @@ def results_ds() -> xr.Dataset:
     for err in ("err_abs", "err_rel"):
         for domain in ("shot", "ts"):
             for stat in ("mean", "std", "med", "p25", "p75", "min", "max"):
-                for suffix in ("", "_best", "_ckpt_std"):
+                for suffix in ("", "_best", "_seed_std"):
                     ds[f"{err}_{domain}_{stat}{suffix}"] = ("case_idx", rng.uniform(0.01, 1.0, n))
 
     # One diverged case to exercise the divergence masking

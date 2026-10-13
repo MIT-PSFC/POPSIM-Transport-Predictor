@@ -52,22 +52,22 @@ def killed(monkeypatch) -> list[str]:
 
 
 def set_job_elapsed(monkeypatch, study, case, elapsed_s: float | None):
-    """Report the case's train job as running for elapsed_s (None: not running)."""
-    elapsed = {} if elapsed_s is None else {study.train_job_name(case): elapsed_s}
+    """Report the case's one seed job as running for elapsed_s (None: not running)."""
+    elapsed = {} if elapsed_s is None else {study.train_job_name(case, 0): elapsed_s}
     monkeypatch.setattr(study_module, "get_running_job_elapsed_s", lambda partition=None: elapsed)
 
 
 def write_checkpoint(study: Study, case, epoch: int, age_s: float):
-    """Create a checkpoint epoch dir, backdated by age_s seconds."""
-    epoch_dir = study.trained_model_dir(case) / str(epoch)
+    """Create a checkpoint epoch dir of the case's one seed, backdated by age_s seconds."""
+    epoch_dir = study.seed_model_dir(case, 0) / str(epoch)
     epoch_dir.mkdir(parents=True, exist_ok=True)
     mtime = time.time() - age_s
     os.utime(epoch_dir, (mtime, mtime))
 
 
 def write_train_log(study: Study, case, age_s: float):
-    """Create the case's train log, last written age_s seconds ago."""
-    train_log_path = study.train_log_path(case)
+    """Create the train log of the case's one seed, last written age_s seconds ago."""
+    train_log_path = study.train_log_path(case, 0)
     train_log_path.parent.mkdir(parents=True, exist_ok=True)
     train_log_path.touch()
     mtime = time.time() - age_s
@@ -103,7 +103,7 @@ def test_old_job_with_stale_checkpoint_killed(study, case, killed, monkeypatch):
 
     study.kill_stuck_jobs([case])
 
-    assert killed == [study.train_job_name(case)]
+    assert killed == [study.train_job_name(case, 0)]
 
 
 def test_old_job_with_no_checkpoint_killed(study, case, killed, monkeypatch):
@@ -112,7 +112,7 @@ def test_old_job_with_no_checkpoint_killed(study, case, killed, monkeypatch):
 
     study.kill_stuck_jobs([case])
 
-    assert killed == [study.train_job_name(case)]
+    assert killed == [study.train_job_name(case, 0)]
 
 
 @pytest.mark.parametrize(("log_age_s", "is_killed"), [(WATCHDOG_STALL_S - 1, False), (WATCHDOG_STALL_S + 1, True)])
@@ -127,7 +127,7 @@ def test_train_log_progress_spares_a_job_between_checkpoints(study, case, killed
 
     study.kill_stuck_jobs([case])
 
-    assert killed == ([study.train_job_name(case)] if is_killed else [])
+    assert killed == ([study.train_job_name(case, 0)] if is_killed else [])
 
 
 def test_job_absent_from_elapsed_map_not_killed(study, case, killed, monkeypatch):
@@ -150,12 +150,12 @@ def test_latest_checkpoint_epoch_reads_real_checkpoint_layout(study, case):
     so a layout mismatch kills every healthy job and never resets the counter.
     With max_to_keep 1 and the best loss at epoch 1, the newest dir left is the unvalidated latest one.
     """
-    manager = create_default_checkpoint_manager(study.trained_model_dir(case), max_to_keep=1)
+    manager = create_default_checkpoint_manager(study.seed_model_dir(case, 0), max_to_keep=1)
     for epoch, loss in {1: 0.2, 2: 0.9, 3: None}.items():
         state = TrainState(step=epoch, epoch=epoch, model={"w": jnp.zeros(2)}, opt_state={"dummy": jnp.zeros(1)})
         save_train_state(state, manager, loss=loss)
 
-    assert study.latest_checkpoint_epoch(case) == 3
+    assert study.latest_checkpoint_epoch(case, 0) == 3
 
 
 # ----------------------------------------------------------------------
@@ -189,10 +189,11 @@ def run_one_pass(monkeypatch, study: Study, pending: dict[str, int] | None) -> S
     def cancel_job(job_name, partition=None, state="RUNNING"):
         calls.cancels.append((job_name, partition, state))
 
-    def finish_case(case, skip_tuning, enable_parallelism, partition=None):
+    def finish_case(case, seed, skip_tuning, enable_parallelism, partition=None):
         result_path = study.result_path(case)
         result_path.parent.mkdir(parents=True, exist_ok=True)
         result_path.touch()
+        return True
 
     monkeypatch.setattr(study_module, "get_pending_job_pending_s", pending_job_pending_s)
     monkeypatch.setattr(study_module, "cancel_job", cancel_job)
@@ -208,7 +209,7 @@ def run_one_pass(monkeypatch, study: Study, pending: dict[str, int] | None) -> S
 @pytest.mark.parametrize(("pending_s", "cancelled"), [(WATCHDOG_PENDING_S, True), (WATCHDOG_PENDING_S - 1, False)])
 def test_spillover_train_job_cancelled_past_threshold(spillover_study, monkeypatch, pending_s, cancelled):
     """Only the spillover partitions are queried and cancelled on, so a primary-partition job keeps its queue position."""
-    train_job_name = spillover_study.train_job_name(spillover_study.cases[0])
+    train_job_name = spillover_study.train_job_name(spillover_study.cases[0], 0)
 
     calls = run_one_pass(monkeypatch, spillover_study, {train_job_name: pending_s})
 
@@ -219,7 +220,7 @@ def test_spillover_train_job_cancelled_past_threshold(spillover_study, monkeypat
 
 def test_no_spillover_partitions_disables_watchdog(make_stub_study, monkeypatch):
     study = make_stub_study([StubCase(name="case.a")], partition="primary", spillover_partitions=())
-    train_job_name = study.train_job_name(study.cases[0])
+    train_job_name = study.train_job_name(study.cases[0], 0)
 
     calls = run_one_pass(monkeypatch, study, {train_job_name: 10 * WATCHDOG_PENDING_S})
 
@@ -233,25 +234,26 @@ def test_pending_cancel_refunds_train_attempt(spillover_study, monkeypatch, atte
 
     None is an orchestrator restart, an empty counter facing a job the previous process submitted.
     """
-    case = spillover_study.cases[0]
+    train_job_name = spillover_study.train_job_name(spillover_study.cases[0], 0)
     if attempts_before is not None:
-        spillover_study.train_attempts[str(case)] = attempts_before
+        spillover_study.train_attempts[train_job_name] = attempts_before
 
-    run_one_pass(monkeypatch, spillover_study, {spillover_study.train_job_name(case): WATCHDOG_PENDING_S})
+    run_one_pass(monkeypatch, spillover_study, {train_job_name: WATCHDOG_PENDING_S})
 
-    assert spillover_study.train_attempts[str(case)] == attempts_after
+    assert spillover_study.train_attempts[train_job_name] == attempts_after
 
 
 def test_agent_pending_cancel_skips_refund(spillover_study, monkeypatch):
     """launch_sweep tops agents back up on its own, so cancelling a pending agent refunds nothing."""
     case = spillover_study.cases[0]
-    spillover_study.train_attempts[str(case)] = 2
+    train_job_name = spillover_study.train_job_name(case, 0)
+    spillover_study.train_attempts[train_job_name] = 2
     agent_job_name = spillover_study.agent_job_name(case)
 
     calls = run_one_pass(monkeypatch, spillover_study, {agent_job_name: WATCHDOG_PENDING_S})
 
     assert calls.cancels == [(agent_job_name, ",".join(SPILLOVER_PARTITIONS), "PENDING")]
-    assert spillover_study.train_attempts[str(case)] == 2
+    assert spillover_study.train_attempts[train_job_name] == 2
 
 
 def test_squeue_failure_skips_pending_watchdog(spillover_study, monkeypatch):
@@ -302,9 +304,9 @@ def test_cpu_capable_job_pending_for_a_gpu_is_cancelled(make_stub_study, monkeyp
     cpu_capable = StubCase(name="case.cpu", model_type="cpu_type")
     gpu_only = StubCase(name="case.gpu", model_type="gpu_type")
     study = make_stub_study([cpu_capable, gpu_only], partition="primary", cpu_partition="cpu_primary", cpu_model_types=("cpu_type",))
-    pending = {study.train_job_name(case): WATCHDOG_PENDING_S for case in (cpu_capable, gpu_only)}
+    pending = {study.train_job_name(case, 0): WATCHDOG_PENDING_S for case in (cpu_capable, gpu_only)}
 
     calls = run_one_pass(monkeypatch, study, pending)
 
     assert calls.pending_queries == ["primary"]
-    assert calls.cancels == [(study.train_job_name(cpu_capable), "primary", "PENDING")]
+    assert calls.cancels == [(study.train_job_name(cpu_capable, 0), "primary", "PENDING")]

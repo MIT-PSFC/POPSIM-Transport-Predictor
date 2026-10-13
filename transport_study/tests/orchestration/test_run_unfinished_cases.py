@@ -10,12 +10,14 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 import requests
+import xarray as xr
 from popsim.ml import TrainConfig
 
 from transport_study.config import config
 from transport_study.orchestration import study as study_module
-from transport_study.orchestration.study import Study
-from transport_study.tests.stubs import StubCase
+from transport_study.orchestration.seed_results import BEST_SEED_ATTR
+from transport_study.orchestration.study import Study, write_netcdf_atomic
+from transport_study.tests.stubs import StubCase, with_seed_attrs
 
 
 @pytest.fixture
@@ -43,11 +45,12 @@ def set_queue_snapshots(monkeypatch, snapshots):
 def record_and_finish_cases(monkeypatch, study: Study, order: list[str]):
     """Replace run_case with a stand-in that records pickup order and finishes the case."""
 
-    def run_case(case, skip_tuning, enable_parallelism, partition=None):
+    def run_case(case, seed, skip_tuning, enable_parallelism, partition=None):
         order.append(str(case))
         result_path = study.result_path(case)
         result_path.parent.mkdir(parents=True, exist_ok=True)
         result_path.touch()
+        return True
 
     monkeypatch.setattr(study, "run_case", run_case)
 
@@ -75,7 +78,7 @@ def test_in_flight_case_not_picked_up(make_stub_study, monkeypatch, fake_clock, 
     case_a = StubCase(name="case.a")
     case_b = StubCase(name="case.b")
     study = make_stub_study([case_a, case_b])
-    set_queue_snapshots(monkeypatch, [{study.train_job_name(case_a)}])
+    set_queue_snapshots(monkeypatch, [{study.train_job_name(case_a, 0)}])
 
     order: list[str] = []
     record_and_finish_cases(monkeypatch, study, order)
@@ -93,7 +96,7 @@ def test_result_lag_does_not_relaunch(make_stub_study, monkeypatch, fake_clock, 
     study = make_stub_study([case_a])
 
     def snapshots():
-        yield {study.train_job_name(case_a)}  # pass 1: job in flight
+        yield {study.train_job_name(case_a, 0)}  # pass 1: job in flight
         yield set()  # pass 2: job gone, result not yet visible (filesystem lag)
         result_path = study.result_path(case_a)
         result_path.parent.mkdir(parents=True, exist_ok=True)
@@ -117,16 +120,16 @@ def test_relaunch_after_grace_when_no_result(make_stub_study, monkeypatch, fake_
     stop) is relaunched, but only after the grace window."""
     case_a = StubCase(name="case.a")
     study = make_stub_study([case_a])
-    set_queue_snapshots(monkeypatch, [{study.train_job_name(case_a)}])
+    set_queue_snapshots(monkeypatch, [{study.train_job_name(case_a, 0)}])
 
     launch_times: list[float] = []
     order: list[str] = []
     record_and_finish_cases(monkeypatch, study, order)
     finish_case = study.run_case
 
-    def run_case(case, skip_tuning, enable_parallelism, partition=None):
+    def run_case(case, seed, skip_tuning, enable_parallelism, partition=None):
         launch_times.append(fake_clock.t)
-        finish_case(case, skip_tuning=skip_tuning, enable_parallelism=enable_parallelism)
+        return finish_case(case, seed, skip_tuning=skip_tuning, enable_parallelism=enable_parallelism)
 
     monkeypatch.setattr(study, "run_case", run_case)
 
@@ -185,16 +188,6 @@ def test_scheduler_failure_launches_nothing(make_stub_study, monkeypatch, quiet_
     assert len(sleeps) == 2
 
 
-def test_case_in_flight_ignores_agent_jobs(make_stub_study):
-    """Sweep agent jobs must not make a case look in flight: a tuning case with
-    agents running may still need more agents launched."""
-    case_a = StubCase(name="case.a")
-    study = make_stub_study([case_a])
-
-    assert not study.case_in_flight(case_a, {study.agent_job_name(case_a)})
-    assert study.case_in_flight(case_a, {study.train_job_name(case_a)})
-
-
 @pytest.mark.parametrize(("submitted", "expected_attempts"), [(False, 0), (True, 1)])
 def test_rejected_submission_refunds_train_attempt(make_stub_study, monkeypatch, submitted, expected_attempts):
     """A training job SLURM never accepted must not count toward MAX_TRAIN_ATTEMPTS."""
@@ -213,9 +206,9 @@ def test_rejected_submission_refunds_train_attempt(make_stub_study, monkeypatch,
     monkeypatch.setattr(study, "make_train_config", lambda _case: train_config)
     monkeypatch.setattr(study_module, "launch_train_parallel", lambda *args, **kwargs: submitted)
 
-    study.launch_train(case, enable_parallelism=True, partition="test_partition")
+    study.launch_train(case, 0, enable_parallelism=True, partition="test_partition")
 
-    assert study.train_attempts.get(str(case), 0) == expected_attempts
+    assert study.train_attempts.get(study.train_job_name(case, 0), 0) == expected_attempts
 
 
 def test_gpu_only_cases_take_the_gpu_before_cpu_capable_ones(make_stub_study, monkeypatch):
@@ -237,11 +230,12 @@ def test_gpu_only_cases_take_the_gpu_before_cpu_capable_ones(make_stub_study, mo
 
     launches: list[tuple[str, str]] = []
 
-    def run_case(case, skip_tuning, enable_parallelism, partition=None):
+    def run_case(case, seed, skip_tuning, enable_parallelism, partition=None):
         launches.append((str(case), partition))
         result_path = study.result_path(case)
         result_path.parent.mkdir(parents=True, exist_ok=True)
         result_path.touch()
+        return True
 
     monkeypatch.setattr(study_module, "pick_partition", pick_partition)
     monkeypatch.setattr(study_module, "get_running_job_names", lambda: set())
@@ -252,3 +246,36 @@ def test_gpu_only_cases_take_the_gpu_before_cpu_capable_ones(make_stub_study, mo
     study.run_unfinished_cases(skip_tuning=True, enable_parallelism=True)
 
     assert launches == [("case.b", "gpu"), ("case.a", "cpu"), ("case.c", "gpu")]
+
+
+def test_every_seed_trains_and_their_merge_finishes_the_case(make_stub_study, monkeypatch):
+    """Each seed of a case is its own launch.
+
+    Once every seed has its result the loop merges them into the case result,
+    keeping only the best seed's best checkpoint, and only then does a dependent case start.
+    """
+    prereq = StubCase(name="case.prereq")
+    dependent = StubCase(name="case.dependent", prereqs=[prereq])
+    study = make_stub_study([dependent, prereq], num_seeds=2)
+    monkeypatch.setattr(study_module.time, "sleep", lambda s: None)
+    launches: list[tuple[str, int]] = []
+
+    def train_seed(case, seed, skip_tuning, enable_parallelism, partition=None):
+        launches.append((str(case), seed))
+        checkpoint_dir = study.seed_model_dir(case, seed) / "3"
+        checkpoint_dir.mkdir(parents=True)
+        # Seed 1 validates best
+        seed_ds = with_seed_attrs(xr.Dataset({"error_abs_ts": ("shot", [float(seed)])}), val_loss=1.0 - seed, best_epoch=3)
+        write_netcdf_atomic(seed_ds, study.seed_result_path(case, seed))
+        return True
+
+    monkeypatch.setattr(study, "run_case", train_seed)
+    study.run_unfinished_cases(skip_tuning=True, enable_parallelism=False)
+
+    assert launches == [("case.prereq", 0), ("case.prereq", 1), ("case.dependent", 0), ("case.dependent", 1)]
+    prereq_result = xr.load_dataset(study.result_path(prereq))
+    assert prereq_result["error_abs_ts"].sel(seed=1).item() == 1.0
+    assert prereq_result.attrs[BEST_SEED_ATTR] == 1
+    # Only the best seed's best checkpoint is left, where every restore of the case reads
+    assert [path.name for path in study.trained_model_dir(prereq).iterdir()] == ["3"]
+    assert not study.seed_result_path(prereq, 0).exists()

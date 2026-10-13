@@ -126,7 +126,7 @@ def test_fixed_steps_epochs_chain_reshuffled_passes():
     """Every epoch is exactly steps_per_epoch full batches, and each complete pass inside it covers every sample once in a new order."""
     natural_dl = _timeslice_loader(n_shots=3, n_times=4, batch_size=4)
     assert len(natural_dl) == 3
-    fixed_dl = CaseTrainDataLoader(natural_dl, steps_per_epoch=7)
+    fixed_dl = CaseTrainDataLoader(natural_dl, steps_per_epoch=7, shuffle_seed=0)
 
     assert len(fixed_dl) == 7
     for _ in range(2):
@@ -142,7 +142,7 @@ def test_fixed_steps_epochs_chain_reshuffled_passes():
 def test_fixed_steps_refuse_a_training_set_above_the_study_steps():
     natural_dl = _timeslice_loader(n_shots=3, n_times=4, batch_size=4)
     with pytest.raises(ValueError, match="more than the study's 2 steps per epoch"):
-        CaseTrainDataLoader(natural_dl, steps_per_epoch=2)
+        CaseTrainDataLoader(natural_dl, steps_per_epoch=2, shuffle_seed=0)
 
 
 def _fresh_abs_error(pred, targ):

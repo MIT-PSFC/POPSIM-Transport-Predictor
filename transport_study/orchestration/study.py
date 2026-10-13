@@ -31,7 +31,7 @@ from pydantic import Field, field_serializer, field_validator, model_validator
 
 from transport_study import EPISODE_DIM, PACKAGE_ROOT, TIME_DIM
 from transport_study.config import (
-    DEBUG_NUM_RESULT_CHECKPOINTS,
+    DEBUG_NUM_SEEDS,
     ROLE_TABLES,
     CaseAxis,
     FieldRole,
@@ -68,6 +68,14 @@ from transport_study.orchestration.organize_data import (
     get_loaded_shot_count,
     parse_training_data,
 )
+from transport_study.orchestration.seed_results import (
+    BEST_SEED_ATTR,
+    SEED_BEST_EPOCH_ATTR,
+    SEED_DIM,
+    aggregate_seed_results,
+    seed_result,
+    seed_statistics,
+)
 from transport_study.orchestration.slurm_utils import (
     cancel_job,
     count_running_jobs,
@@ -87,12 +95,6 @@ from transport_study.orchestration.target_shots import (
     TargetSplit,
     configured_target_split,
     held_out_shot_mask,
-)
-from transport_study.orchestration.topk_results import (
-    BEST_EPOCH_ATTR,
-    CKPT_DIM,
-    compute_topk_study_results,
-    topk_statistics,
 )
 from transport_study.orchestration.wandb_utils import (
     WANDB_READ_ERRORS,
@@ -123,7 +125,8 @@ SIZE_HYPERPARAMETERS = ("nn_width", "nn_depth", "d_model", "reservoir_size")
 # The ones half halves, depth stays tuned
 WIDTH_HYPERPARAMETERS = ("nn_width", "d_model", "reservoir_size")
 
-# Abort the run once a single case has been launched this many times without a result file, guards against deterministically failing jobs being resubmitted forever
+# Abort the run once a single seed of a case has been launched this many times without a result file,
+# guards against deterministically failing jobs being resubmitted forever
 MAX_TRAIN_ATTEMPTS = 3
 
 # A sweep is done once the trial target is met AND this fraction of it trained to completion,
@@ -137,8 +140,11 @@ MIN_RUNNING_AGENTS = 6
 # How long the orchestration loop sleeps between passes over the unfinished cases
 ORCHESTRATION_POLL_INTERVAL_S = 20
 
-# Result files can lag job exit by ~1 min on NFS, so wait this long after a case leaves the queue before relaunching it
+# Result files can lag job exit by ~1 min on NFS, so wait this long after a seed's job leaves the queue before relaunching it
 RELAUNCH_GRACE_S = 180
+
+# The training shuffle of every config before launch_train seeds it, the one sweep trials train with
+BASE_SHUFFLE_SEED = 0
 
 # What the base collect_results reads of a result file, never the predicted and target profiles that make up most of it
 SUMMARY_RESULT_VARS = ["error_abs_shot", "error_rel_shot", "error_abs_ts", "error_rel_ts", "time"]
@@ -275,12 +281,9 @@ class CaseGridConfig(StudyConfig):
     hyperparam_num_target_shots: int = HYPERPARAM_TARGET_SHOTS
     # Optional dict of dataset fractions to use during domain adaptation, only used if domain_adaptation includes "weighted"
     dataset_fractions: dict[str, float] = Field(default_factory=dict)
-    # How many best-by-val-loss checkpoints each production training run keeps.
-    # Final results average the test metrics over all of them, so the report
-    # is robust to the val-loss argmin flipping between near-tied epochs under
-    # GPU float noise, and the per-checkpoint spread quantifies that noise.
-    # Sweeps always keep 1. Must be >= 1 (1 only computes best-checkpoint test metrics)
-    num_result_checkpoints: int = Field(default=10, ge=1)
+    # How many independently seeded training runs every production case trains, each its own job (orchestration/seed_results.py).
+    # Every case score is the mean over them, with their std as the run-to-run spread, and the best seed's checkpoint is the one kept
+    num_seeds: int = Field(default=5, ge=1)
 
     # Field name -> its valid values, set per subclass.
     # A tuple field must hold valid values only, a scalar field must be one.
@@ -297,10 +300,10 @@ class CaseGridConfig(StudyConfig):
         return self
 
     @model_validator(mode="after")
-    def _apply_debug_checkpoint_limit(self):
-        """Cap the averaged checkpoints of a debug run, see DEBUG_NUM_RESULT_CHECKPOINTS."""
+    def _apply_debug_seed_limit(self):
+        """Cap the seeds of a debug run, see DEBUG_NUM_SEEDS."""
         if self.debug:
-            object.__setattr__(self, "num_result_checkpoints", min(self.num_result_checkpoints, DEBUG_NUM_RESULT_CHECKPOINTS))
+            object.__setattr__(self, "num_seeds", min(self.num_seeds, DEBUG_NUM_SEEDS))
         return self
 
     @model_validator(mode="after")
@@ -627,24 +630,39 @@ class Study:
     # The three paths every read of a case's artifacts goes through, routed to the study the case lives in (case_home)
 
     def trained_model_dir(self, case: Case) -> Path:
-        """The case's checkpoint dir, in the working dir of the study it lives in."""
+        """The case's checkpoint dir, in the working dir of the study it lives in.
+
+        Once its seeds are merged it holds the best seed's best checkpoint, the one every restore of the case reads.
+        """
         return self.case_home(case).model_dir / str(case)
 
     def result_path(self, case: Case) -> Path:
-        """The case's result file, in the working dir of the study it lives in."""
+        """The case's result file, in the working dir of the study it lives in, written once its seeds are merged."""
         return self.case_home(case).result_path(str(case))
 
-    def _latest_checkpoint_dir_info(self, case: Case) -> tuple[int, float] | None:
-        """(epoch, mtime) of the newest checkpoint of the case,
+    def seed_model_dir(self, case: Case, seed: int) -> Path:
+        """Where one seed of the case trains, its best checkpoint and the latest one it resumes from."""
+        return self.trained_model_dir(case) / f"seed_{seed}"
+
+    def seed_result_path(self, case: Case, seed: int) -> Path:
+        """The test results of one seed's best checkpoint, until merge_seed_results folds them into the case result."""
+        return self.result_path(case).with_name(f"seed_{seed}.nc")
+
+    def pending_seeds(self, case: Case) -> list[int]:
+        """The seeds of the case without a seed result yet."""
+        return [seed for seed in range(config.num_seeds) if not self.seed_result_path(case, seed).exists()]
+
+    def _latest_checkpoint_dir_info(self, case: Case, seed: int) -> tuple[int, float] | None:
+        """(epoch, mtime) of the newest checkpoint of one seed of the case,
         or None if there is none yet.
 
-        The case's checkpoint dir keeps the best checkpoints plus the latest one, which training resumes from.
+        A seed's checkpoint dir keeps its best checkpoint plus the latest one, which training resumes from.
         Orbax names each checkpoint directory after its step (here the epoch)
         and renames it into place atomically once fully written,
         so the newest dir's mtime marks the moment that epoch's checkpoint became visible.
         In-progress saves get a non-numeric tmp suffix and are skipped.
         """
-        checkpoint_dir = self.trained_model_dir(case)
+        checkpoint_dir = self.seed_model_dir(case, seed)
         if not checkpoint_dir.exists():
             return None
         epoch_dirs = [p for p in checkpoint_dir.iterdir() if p.is_dir() and p.name.isdigit()]
@@ -653,13 +671,13 @@ class Study:
         newest = max(epoch_dirs, key=lambda p: int(p.name))
         return int(newest.name), newest.stat().st_mtime
 
-    def train_log_path(self, case: Case) -> Path:
-        """The SLURM log of the case's training jobs, every launch attempt appends to it."""
-        return self.log_dir / "logs_train" / f"{self.train_job_name(case)}.log"
+    def train_log_path(self, case: Case, seed: int) -> Path:
+        """The SLURM log of one seed's training jobs, every launch attempt appends to it."""
+        return self.log_dir / "logs_train" / f"{self.train_job_name(case, seed)}.log"
 
-    def latest_checkpoint_epoch(self, case: Case) -> int | None:
-        """Epoch of the newest resume checkpoint, or None if empty."""
-        info = self._latest_checkpoint_dir_info(case)
+    def latest_checkpoint_epoch(self, case: Case, seed: int) -> int | None:
+        """Epoch of one seed's newest resume checkpoint, or None if empty."""
+        info = self._latest_checkpoint_dir_info(case, seed)
         return info[0] if info else None
 
     def collected_results_path(self) -> Path:
@@ -696,8 +714,8 @@ class Study:
     def agent_job_name(self, case: Case) -> str:
         return f"agent_{case}.{self.name}"
 
-    def train_job_name(self, case: Case) -> str:
-        return f"train_{case}.{self.name}"
+    def train_job_name(self, case: Case, seed: int) -> str:
+        return f"train_{case}.seed_{seed}.{self.name}"
 
     def analysis_job_name(self, case: Case) -> str:
         return f"analysis_{case}.{self.name}"
@@ -1043,7 +1061,9 @@ class Study:
         the study's training steps per epoch, target-only LR scaling)
         around the per-model-type pieces supplied by the model_train_spec hook.
         """
-        dataloader_config_base = self.base_dataloader_config(case)
+        dataloader_config_case = self.base_dataloader_config(case)
+        # launch_train swaps in each seed's own training shuffle
+        dataloader_config_base = {**dataloader_config_case, "shuffle_seed": BASE_SHUFFLE_SEED}
         loss_config = self.base_loss_config(case)
         optimizer_config = self.base_optimizer_config()
         spec = self.model_train_spec(case, dataloader_config_base)
@@ -1070,7 +1090,8 @@ class Study:
             max_epochs=config.max_epochs,
             epochs_per_val=config.epochs_per_val,
             patience=config.patience,
-            # When doing hyperparameter tuning, this gets overwritten by the wandb agent
+            # Where the case's merged best checkpoint is restored from.
+            # launch_train points each seed at its own dir, and the wandb agent each sweep trial
             checkpoint_dir=str(self.trained_model_dir(case)),
             dataloader_config=spec.dataloader_config,
             model_init_config=spec.model_init_config,
@@ -1223,15 +1244,6 @@ class Study:
                 unfinished.append(case)
         return unfinished
 
-    def case_in_flight(self, case: Case, running_job_names: set[str]) -> bool:
-        """Whether a training job for this case is running or pending.
-
-        Deliberately ignores sweep agent jobs: a hyperparam case with agents
-        running may still need more agents launched (launch_sweep tops up to
-        the remaining trial count), so it must stay eligible for pickup.
-        """
-        return self.train_job_name(case) in running_job_names
-
     def kill_stuck_jobs(self, cases: list[Case]):
         """Kill training jobs that are running but making no progress.
 
@@ -1239,7 +1251,7 @@ class Study:
         with neither a checkpoint nor a train log write in the last WATCHDOG_STALL_S.
         The log advances every epoch, so a slow model whose validation interval outlasts the stall window survives.
         Both thresholds are CPU_WATCHDOG_SCALE times longer for a job on a CPU partition.
-        Killing it frees the case to be relaunched as a fresh process by the normal orchestration loop.
+        Killing it frees the seed to be relaunched as a fresh process by the normal orchestration loop.
         launch_train's attempt counter only resets on checkpoint progress,
         so a job that keeps deadlocking still hits MAX_TRAIN_ATTEMPTS and aborts the study rather than looping forever.
         """
@@ -1255,8 +1267,8 @@ class Study:
                 return
             cpu_job_names = set(cpu_elapsed)
         now = time.time()
-        for case in cases:
-            job_name = self.train_job_name(case)
+        for case, seed in product(cases, range(config.num_seeds)):
+            job_name = self.train_job_name(case, seed)
             job_elapsed = elapsed.get(job_name)
             watchdog_scale = CPU_WATCHDOG_SCALE if job_name in cpu_job_names else 1
             min_age_s = WATCHDOG_MIN_AGE_S * watchdog_scale
@@ -1264,10 +1276,10 @@ class Study:
             if job_elapsed is None or job_elapsed < min_age_s:
                 continue
             progress_mtimes = []
-            checkpoint_info = self._latest_checkpoint_dir_info(case)
+            checkpoint_info = self._latest_checkpoint_dir_info(case, seed)
             if checkpoint_info is not None:
                 progress_mtimes.append(checkpoint_info[1])
-            train_log_path = self.train_log_path(case)
+            train_log_path = self.train_log_path(case, seed)
             if train_log_path.exists():
                 progress_mtimes.append(train_log_path.stat().st_mtime)
             last_progress = max(progress_mtimes, default=-math.inf)
@@ -1276,7 +1288,7 @@ class Study:
             logger.warning(
                 f"Job {job_name} has run {job_elapsed}s with no checkpoint or train log progress in "
                 f"the last {stall_s}s, likely deadlocked. Killing so it can be resubmitted.\n"
-                f"Case:\t{case}"
+                f"Case:\t{case}, seed {seed}"
             )
             cancel_job(job_name)
 
@@ -1342,7 +1354,8 @@ class Study:
             if not pending:
                 continue
             for case in partition_cases:
-                job_names = [self.train_job_name(case)]
+                train_job_names = [self.train_job_name(case, seed) for seed in range(config.num_seeds)]
+                job_names = list(train_job_names)
                 if case.is_hyperparam_case():
                     job_names.append(self.agent_job_name(case))
                 for job_name in job_names:
@@ -1358,9 +1371,9 @@ class Study:
                     # scancel --state=PENDING is a no-op if the job started since
                     # the squeue snapshot, so at worst this refund is one attempt
                     # too generous and the case gets one extra retry
-                    if job_name == self.train_job_name(case):
-                        attempts = self.train_attempts.get(str(case), 0)
-                        self.train_attempts[str(case)] = max(attempts - 1, 0)
+                    if job_name in train_job_names:
+                        attempts = self.train_attempts.get(job_name, 0)
+                        self.train_attempts[job_name] = max(attempts - 1, 0)
 
     def trains_on_cpu(self, case: Case) -> bool:
         """Whether the case's training and sweep agents may also run on the CPU partitions (cpu_model_types)."""
@@ -1369,18 +1382,19 @@ class Study:
     def run_unfinished_cases(self, skip_tuning: bool, enable_parallelism: bool):
         """Loop until every runnable case has a result file.
 
-        Each pass takes one squeue snapshot of this user's job names, then only
-        picks up cases that are actually able to run: prereq results on disk
-        and no job for the case already in flight. Blocked and in-flight cases
-        are counted in a single per-pass summary line instead of being visited
+        Every case trains config.num_seeds seeds, each its own job and seed result (orchestration/seed_results.py).
+        Each pass takes one squeue snapshot of this user's job names,
+        merges the seeds of every case whose seeds have all finished (merge_seed_results),
+        then only picks up the seeds that are actually able to run:
+        prereq results on disk and no job for the seed already in flight.
+        Blocked and in-flight cases are counted in a single per-pass summary line instead of being visited
         (and logged about) individually. Prereqs are themselves cases in
         self.cases, so a blocked case becomes runnable once its prereq case finishes.
         Nothing needs to recurse into prereq chains here.
 
-        A case whose job just left the queue is held for RELAUNCH_GRACE_S
-        before it can be relaunched: its result file may already be written but
-        not yet visible across nodes, and relaunching in that window submits a
-        duplicate job for a finished case.
+        A seed whose job just left the queue is held for RELAUNCH_GRACE_S before it can be relaunched.
+        Its seed result may already be written but not yet visible across nodes,
+        and relaunching in that window submits a duplicate job for a finished seed.
         With parallelism a case still tuning is held until its sweep may be read again (config.sweep_poll_interval_s).
 
         Borrowed cases (see case_home) are only waited on, their home study trains them.
@@ -1407,24 +1421,37 @@ class Study:
 
             runnable = [case for case in local if self.check_prereq_satisfied(case)]
             now = time.monotonic()
-            in_flight, in_grace, sweeping, to_launch = [], [], [], []
+            n_in_flight, n_in_grace = 0, 0
+            # Each ready case with the seeds of it to launch
+            sweeping, to_launch = [], []
             for case in runnable:
-                if self.case_in_flight(case, running_job_names):
-                    in_flight.append(case)
-                    last_in_flight[self.train_job_name(case)] = now
-                elif now - last_in_flight.get(self.train_job_name(case), -math.inf) < RELAUNCH_GRACE_S:
-                    in_grace.append(case)
-                elif enable_parallelism and now < self._next_sweep_poll.get(str(case), -math.inf):
+                pending_seeds = self.pending_seeds(case)
+                if not pending_seeds:
+                    self.merge_seed_results(case)
+                    continue
+                if enable_parallelism and now < self._next_sweep_poll.get(str(case), -math.inf):
                     sweeping.append(case)
-                else:
-                    to_launch.append(case)
+                    continue
+                launch_seeds = []
+                for seed in pending_seeds:
+                    job_name = self.train_job_name(case, seed)
+                    if job_name in running_job_names:
+                        n_in_flight += 1
+                        last_in_flight[job_name] = now
+                    elif now - last_in_flight.get(job_name, -math.inf) < RELAUNCH_GRACE_S:
+                        n_in_grace += 1
+                    else:
+                        launch_seeds.append(seed)
+                if launch_seeds:
+                    to_launch.append((case, launch_seeds))
             n_blocked = len(local) - len(runnable)
+            n_ready = sum(len(launch_seeds) for _, launch_seeds in to_launch)
             waiting = Counter(self.case_home(case).name for case in borrowed)
             waiting_summary = "".join(f", {n} waiting on {name}" for name, n in waiting.items())
             logger.opt(colors=True).info(
                 f"<bold><green>{len(unfinished)} cases remain</green></bold> "
-                f"({len(in_flight)} in flight, {len(in_grace)} awaiting results, {len(sweeping)} tuning, "
-                f"{len(to_launch)} ready to launch, {n_blocked} blocked on prereqs{waiting_summary})"
+                f"({n_in_flight} seeds in flight, {n_in_grace} awaiting results, {len(sweeping)} cases tuning, "
+                f"{n_ready} seeds of {len(to_launch)} cases ready to launch, {n_blocked} cases blocked on prereqs{waiting_summary})"
             )
 
             if enable_parallelism:
@@ -1432,77 +1459,92 @@ class Study:
                 # Sleep for a bit before checking again to avoid spamming slurm
                 time.sleep(ORCHESTRATION_POLL_INTERVAL_S)
             else:
-                for case in to_launch:
-                    self.run_case(case, skip_tuning=skip_tuning, enable_parallelism=False)
+                for case, launch_seeds in to_launch:
+                    for seed in launch_seeds:
+                        self.run_case(case, seed, skip_tuning=skip_tuning, enable_parallelism=False)
                 # Nothing runs in the background of a serial run,
-                # so only a pass that finished no case waits (on an ancestor, or between sweep passes)
-                finished_this_pass = [case for case in to_launch if self.result_path(case).exists()]
+                # so only a pass that finished no seed waits (on an ancestor, or between sweep passes)
+                finished_this_pass = [
+                    case
+                    for case, launch_seeds in to_launch
+                    if self.result_path(case).exists() or any(self.seed_result_path(case, seed).exists() for seed in launch_seeds)
+                ]
                 if not finished_this_pass:
                     time.sleep(ORCHESTRATION_POLL_INTERVAL_S)
             unfinished = [case for case in unfinished if not self.result_path(case).exists()]
 
-    def _launch_ready_cases(self, to_launch: list[Case], skip_tuning: bool):
-        """Give each ready case a partition and launch it, GPU-only cases first.
+    def _launch_ready_cases(self, to_launch: list[tuple[Case, list[int]]], skip_tuning: bool):
+        """Give each ready seed a partition and launch it, the GPU-only cases' seeds first.
 
         A case that can also train on CPU only takes the primary GPUs the GPU-only cases of this pass leave,
         beyond cpu_capable_buffer_gpus, and the CPU partitions otherwise.
         So it still tries the primary after a GPU-only case found it full, since its GPU buffer may be the smaller one.
-        A GPU-only case finding no partition holds the remaining GPU-only cases until the next pass,
+        A GPU-only seed finding no partition holds the remaining GPU-only cases until the next pass,
         a CPU-capable one finding none holds every case left.
+        A case that cannot train yet (still tuning, or a job of it in the way) holds its other seeds.
         """
-        launch_order = sorted(to_launch, key=self.trains_on_cpu)
+        launch_order = sorted(to_launch, key=lambda case_seeds: self.trains_on_cpu(case_seeds[0]))
         gpu_only_held = False
-        for case in launch_order:
+        for case, seeds in launch_order:
             cpu_capable = self.trains_on_cpu(case)
             if gpu_only_held and not cpu_capable:
                 continue
-            partition = pick_partition(cpu_capable)
-            if partition is None and not cpu_capable:
-                logger.info("No open GPU slots or spillover budget, holding the ready GPU-only cases until the next pass")
-                gpu_only_held = True
-                continue
-            if partition is None:
-                logger.info("No open GPU or CPU slots, holding the remaining ready cases until the next pass")
-                break
-            self.run_case(case, skip_tuning=skip_tuning, enable_parallelism=True, partition=partition)
+            for seed in seeds:
+                partition = pick_partition(cpu_capable)
+                if partition is None and not cpu_capable:
+                    logger.info("No open GPU slots or spillover budget, holding the ready GPU-only cases until the next pass")
+                    gpu_only_held = True
+                    break
+                if partition is None:
+                    logger.info("No open GPU or CPU slots, holding the remaining ready cases until the next pass")
+                    return
+                if not self.run_case(case, seed, skip_tuning=skip_tuning, enable_parallelism=True, partition=partition):
+                    break
 
     def run_case(
         self,
         case: Case,
+        seed: int,
         skip_tuning: bool,
         enable_parallelism: bool,
         partition: str | None = None,
-    ):
-        """Run a single case of the study, including hyperparameter tuning, training, and evaluation as needed.
+    ) -> bool:
+        """Run one seed of a case of the study, tuning the case's hyperparameters first as needed.
 
-        If case or a prereq is in progress, simply return and let orchestration loop try again later.
-        With parallelism the case's jobs go to partition, picked here when None.
+        Returns whether the case is ready to train, so its other seeds may launch too.
+        It is not while the case or a prereq is in progress, the orchestration loop tries again later.
+        With parallelism the seed's job goes to partition, picked here when None.
         """
         if not self.check_data_requirements(case):
             raise ValueError(f"Case {case} does not have the required data to run. This should have been caught earlier!")
         self._require_local(case)
+        # A merged case has no seed results left, its result file is the one to check
         if self.result_path(case).exists():
             logger.warning(f"Case {case} already has results, skipping.")
-            return
-        if self.check_prereq_satisfied(case):
-            self._run_ready_case(case, skip_tuning, enable_parallelism, partition)
-        else:
+            return False
+        if self.seed_result_path(case, seed).exists():
+            logger.warning(f"Seed {seed} of case {case} already has results, skipping.")
+            return True
+        if not self.check_prereq_satisfied(case):
             logger.debug(f"Case blocked on unmet prereqs, skipping until they finish.\nCase:\t{case}")
+            return False
+        return self._run_ready_case(case, seed, skip_tuning, enable_parallelism, partition)
 
-    def _run_ready_case(self, case: Case, skip_tuning: bool, enable_parallelism: bool, partition: str | None):
-        """Execute a case whose prereqs are satisfied."""
+    def _run_ready_case(self, case: Case, seed: int, skip_tuning: bool, enable_parallelism: bool, partition: str | None) -> bool:
+        """Launch one seed of a case whose prereqs are satisfied, returns whether the case was ready to train."""
         if enable_parallelism and partition is None:
             partition = pick_partition(self.trains_on_cpu(case))
             if partition is None:
                 logger.debug("No resources currently available, waiting before trying again...")
-                return
+                return False
         if case.is_hyperparam_case() and not self._ensure_hyperparams_ready(case, skip_tuning, enable_parallelism, partition):
-            return
-        if not self._no_blocking_jobs(case, enable_parallelism):
-            logger.debug(f"Jobs already in flight for case {case}, waiting before trying again...")
-            return
-        logger.opt(colors=True).info(f"<bold><cyan>RUNNING CASE:</cyan></bold>\n{case}")
-        self.launch_train(case, enable_parallelism=enable_parallelism, partition=partition)
+            return False
+        if not self._no_blocking_jobs(case, seed, enable_parallelism):
+            logger.debug(f"Jobs already in flight for seed {seed} of case {case}, waiting before trying again...")
+            return False
+        logger.opt(colors=True).info(f"<bold><cyan>RUNNING CASE, seed {seed}:</cyan></bold>\n{case}")
+        self.launch_train(case, seed, enable_parallelism=enable_parallelism, partition=partition)
+        return True
 
     def _ensure_hyperparams_ready(self, case: Case, skip_tuning: bool, enable_parallelism: bool, partition: str | None) -> bool:
         """Ensure tuned config exists. Returns True if ready to proceed to training."""
@@ -1581,13 +1623,13 @@ class Study:
         with open(tuned_config_path, "w") as f:
             yaml.dump(train_config.model_dump(), f, indent=4)
 
-    def _no_blocking_jobs(self, case: Case, enable_parallelism: bool) -> bool:
-        """Returns True if no in-flight SLURM jobs are blocking training."""
+    def _no_blocking_jobs(self, case: Case, seed: int, enable_parallelism: bool) -> bool:
+        """Returns True if no in-flight SLURM jobs are blocking the seed's training."""
         if not enable_parallelism:
             return True
         for job_name, label in [
             (self.agent_job_name(case), "agent"),
-            (self.train_job_name(case), "training"),
+            (self.train_job_name(case, seed), "training"),
         ]:
             running = count_running_jobs(job_name)
             if running is None:
@@ -1638,8 +1680,7 @@ class Study:
                 "resume": True,
                 "checkpoint_dir": str(self.sweep_checkpoint_dir(case)),
                 "max_wall_seconds": float(config.train_wall_budget_s),
-                # Sweep trials are compared on val loss only, no need to keep
-                # the top-K checkpoints production runs retain for results
+                # Sweep trials are compared on val loss only, one checkpoint like every production seed
                 "checkpoint_max_to_keep": 1,
             }
         )
@@ -1700,76 +1741,113 @@ class Study:
             logger.info("Launching agent serially")
             launch_agent(train_config, sweep_id, kwargs_agent=kwargs_agent)
 
-    def launch_train(self, case: Case, enable_parallelism: bool = False, partition: str | None = None):
-        """Launch a training job for the given case."""
+    def launch_train(self, case: Case, seed: int, enable_parallelism: bool = False, partition: str | None = None):
+        """Launch the training job of one seed of the given case."""
         if case.is_impossible():
             raise ValueError(
                 f"Case {case} is not a possible case to run, check the logic in the Case dataclass to see why this is. This should have been caught earlier!"
             )
         self._require_local(case)
 
-        # Only reached when no result file exists and no job for this case is
+        # Only reached when no seed result exists and no job for this seed is
         # running (see _no_blocking_jobs), so every call is a fresh (re)launch.
-        # More than MAX_TRAIN_ATTEMPTS launches means the case fails every time.
+        # More than MAX_TRAIN_ATTEMPTS launches means the seed fails every time.
         # Exception: a relaunch whose latest checkpoint advanced since the last
         # launch is a resume of a wall-clock-limited job making real progress,
         # so the attempt counter resets rather than counting toward the cap
-        attempts = self.train_attempts.get(str(case), 0)
-        latest_epoch = self.latest_checkpoint_epoch(case)
-        prev_epoch = self.train_attempt_epochs.get(str(case))
+        train_job_name = self.train_job_name(case, seed)
+        attempts = self.train_attempts.get(train_job_name, 0)
+        latest_epoch = self.latest_checkpoint_epoch(case, seed)
+        prev_epoch = self.train_attempt_epochs.get(train_job_name)
         if latest_epoch is not None and (prev_epoch is None or latest_epoch > prev_epoch):
             attempts = 0
-        self.train_attempt_epochs[str(case)] = latest_epoch
+        self.train_attempt_epochs[train_job_name] = latest_epoch
         if attempts >= MAX_TRAIN_ATTEMPTS:
-            train_log_path = self.train_log_path(case)
+            train_log_path = self.train_log_path(case, seed)
             summary = (
-                f"ABORTING STUDY: case failed training {attempts} times without producing a result.\n"
+                f"ABORTING STUDY: seed {seed} of a case failed training {attempts} times without producing a result.\n"
                 f"Case:      {case}\n"
-                f"Job name:  {self.train_job_name(case)}\n"
+                f"Job name:  {train_job_name}\n"
                 f"Train log: {train_log_path}\n"
                 f"(attempts append to the same log, separated by '=== ... job <id> start ===' lines)\n"
                 f"Other unfinished cases were not attempted further. Fix the case or remove it, then rerun."
             )
             logger.critical(summary)
             raise RuntimeError(summary)
-        self.train_attempts[str(case)] = attempts + 1
+        self.train_attempts[train_job_name] = attempts + 1
 
-        logger.opt(colors=True).info(f"<bold><red>LAUNCHING TRAINING for case\n{case}</red></bold>")
+        logger.opt(colors=True).info(f"<bold><red>LAUNCHING TRAINING for seed {seed} of case\n{case}</red></bold>")
 
         train_config = self.make_train_config(case)
-        # Real training runs resume from the latest checkpoint if one exists and
-        # stop cleanly at the wall-clock budget so the next launch can continue.
-        # They keep the top num_result_checkpoints checkpoints, whose test
-        # metrics the final result averages (see orchestration/topk_results.py)
-        train_config = train_config.model_copy(
-            update={
-                "resume": True,
-                "max_wall_seconds": float(config.train_wall_budget_s),
-                "checkpoint_max_to_keep": config.num_result_checkpoints,
-            }
-        )
-        result_path = self.result_path(case)
+        train_config = self._seeded_train_config(train_config, case, seed)
+        seed_result_path = self.seed_result_path(case, seed)
         if enable_parallelism:
-            train_job_name = self.train_job_name(case)
             logger.info(f"Launching training job {train_job_name} for case\n{case}")
             submitted = launch_train_parallel(
                 train_config,
                 train_job_name,
-                result_path,
-                self.train_log_path(case),
+                seed_result_path,
+                self.train_log_path(case, seed),
                 partition=partition,
             )
             # Nothing ran, so a rejected submission does not count toward MAX_TRAIN_ATTEMPTS
             if not submitted:
-                self.train_attempts[str(case)] = attempts
+                self.train_attempts[train_job_name] = attempts
         else:
             logger.info("Launching training serially")
-            trainer, _, _, test_dl, result_dict = launch_train(train_config)
+            trainer, _, _, _, result_dict = launch_train(train_config)
             if result_dict is None:
                 logger.info("Training stopped at the wall-clock budget before finishing, relaunch to resume from the latest checkpoint.")
                 return
-            ds = compute_topk_study_results(trainer, test_dl, train_config, result_dict)
-            write_netcdf_atomic(ds, result_path)
+            seed_ds = seed_result(trainer, result_dict)
+            write_netcdf_atomic(seed_ds, seed_result_path)
+
+    def _seeded_train_config(self, train_config: TrainConfig, case: Case, seed: int) -> TrainConfig:
+        """train_config as one seed of the case trains it.
+
+        The seed sets the model initialization and the training shuffle.
+        Each seed trains into its own checkpoint dir, keeping only its best checkpoint beside the latest one it resumes from.
+        It stops cleanly at the wall-clock budget, so the next launch can continue.
+        """
+        model_init_config = {**train_config.model_init_config, "prng_seed": seed}
+        dataloader_config = {**train_config.dataloader_config, "shuffle_seed": seed}
+        return train_config.model_copy(
+            update={
+                "model_init_config": model_init_config,
+                "dataloader_config": dataloader_config,
+                "checkpoint_dir": str(self.seed_model_dir(case, seed)),
+                "checkpoint_max_to_keep": 1,
+                "resume": True,
+                "max_wall_seconds": float(config.train_wall_budget_s),
+            }
+        )
+
+    def merge_seed_results(self, case: Case) -> None:
+        """Fold a case's finished seeds into its result file and keep only the best seed's best checkpoint.
+
+        That checkpoint moves up into trained_model_dir(case), the dir every restore of the case reads
+        (transfer finetunes, submodule prereqs, restore_trainer), and the seed dirs are deleted.
+        Every step is skipped once done, so a merge short circuits reruns cleanly at the next pass.
+        The result file is written last, it marks the case finished.
+        """
+        self._require_local(case)
+        per_seed = {}
+        for seed in range(config.num_seeds):
+            seed_result_path = self.seed_result_path(case, seed)
+            per_seed[seed] = xr.load_dataset(seed_result_path)
+        case_ds = aggregate_seed_results(per_seed)
+        best_seed = int(case_ds.attrs[BEST_SEED_ATTR])
+        best_epoch = int(per_seed[best_seed].attrs[SEED_BEST_EPOCH_ATTR])
+        best_checkpoint_dir = self.trained_model_dir(case) / str(best_epoch)
+        if not best_checkpoint_dir.exists():
+            seed_checkpoint_dir = self.seed_model_dir(case, best_seed) / str(best_epoch)
+            os.rename(seed_checkpoint_dir, best_checkpoint_dir)
+        for seed in per_seed:
+            shutil.rmtree(self.seed_model_dir(case, seed), ignore_errors=True)
+        write_netcdf_atomic(case_ds, self.result_path(case))
+        for seed in per_seed:
+            self.seed_result_path(case, seed).unlink(missing_ok=True)
+        logger.info(f"Merged the {len(per_seed)} seeds of case {case}, seed {best_seed} has the lowest validation loss")
 
     ##############
     # COLLECTION #
@@ -1778,12 +1856,13 @@ class Study:
     def _summarize_case_errors(ds: xr.Dataset) -> xr.Dataset:
         """Reduce a case's result dataset to scalar error statistics.
 
-        Reads the four error variables every study's test eval suite writes
-        (error_{abs,rel}_{shot,ts}) and emits err_E_D_S scalars where E is
-        'abs' or 'rel', D is 'shot' or 'ts', and S is one of mean, std, med,
-        p25, p75, min, max.
-        Each statistic is computed per retained checkpoint, one case score per checkpoint,
-        then reduced by topk_statistics to err_E_D_S (the top-K mean), err_E_D_S_best and err_E_D_S_ckpt_std.
+        Reads the four error variables every study's test eval suite writes (error_{abs,rel}_{shot,ts})
+        and emits err_E_D_S scalars where
+        E is 'abs' or 'rel',
+        D is 'shot' or 'ts',
+        S is one of mean, std, med, p25, p75, min, max.
+        Each statistic is computed per seed, one case score per seed,
+        then reduced by seed_statistics to err_E_D_S (the seed mean), err_E_D_S_best and err_E_D_S_seed_std.
 
         The per-timeslice stats only count timeslices that advance the shot
         clock: the padded rollout tail repeats each shot's final timeslice
@@ -1799,20 +1878,20 @@ class Study:
             "abs_ts": ds["error_abs_ts"].where(real),
             "rel_ts": ds["error_rel_ts"].where(real),
         }
-        per_ckpt = {}
+        per_seed = {}
         for error_name, error in errors.items():
-            # Every dim but the checkpoints is reduced, each checkpoint keeps its own statistics
-            error_flat = error.stack(point=[dim for dim in error.dims if dim != CKPT_DIM])
-            per_ckpt[f"err_{error_name}_mean"] = error_flat.mean("point")
-            per_ckpt[f"err_{error_name}_std"] = error_flat.std("point")
-            per_ckpt[f"err_{error_name}_med"] = error_flat.median("point")
-            per_ckpt[f"err_{error_name}_p25"] = error_flat.quantile(0.25, dim="point").drop_vars("quantile")
-            per_ckpt[f"err_{error_name}_p75"] = error_flat.quantile(0.75, dim="point").drop_vars("quantile")
-            per_ckpt[f"err_{error_name}_min"] = error_flat.min("point")
-            per_ckpt[f"err_{error_name}_max"] = error_flat.max("point")
-        # Only the checkpoint index survives as a coordinate
-        per_ckpt_ds = xr.Dataset(per_ckpt).reset_coords(drop=True)
-        return topk_statistics(per_ckpt_ds, int(ds.attrs[BEST_EPOCH_ATTR]))
+            # Every dim but the seeds is reduced, each seed keeps its own statistics
+            error_flat = error.stack(point=[dim for dim in error.dims if dim != SEED_DIM])
+            per_seed[f"err_{error_name}_mean"] = error_flat.mean("point")
+            per_seed[f"err_{error_name}_std"] = error_flat.std("point")
+            per_seed[f"err_{error_name}_med"] = error_flat.median("point")
+            per_seed[f"err_{error_name}_p25"] = error_flat.quantile(0.25, dim="point").drop_vars("quantile")
+            per_seed[f"err_{error_name}_p75"] = error_flat.quantile(0.75, dim="point").drop_vars("quantile")
+            per_seed[f"err_{error_name}_min"] = error_flat.min("point")
+            per_seed[f"err_{error_name}_max"] = error_flat.max("point")
+        # Only the seed index survives as a coordinate
+        per_seed_ds = xr.Dataset(per_seed).reset_coords(drop=True)
+        return seed_statistics(per_seed_ds, int(ds.attrs[BEST_SEED_ATTR]))
 
     def restore_trainer(self, case: Case, restore_best_checkpoint: bool = True) -> tuple[Trainer, DataLoader]:
         """Restore a given case's trainer and the test dataloader"""
@@ -2032,9 +2111,9 @@ class Study:
         _load_study_config(cfg)
 
         self.name = config.study_name
-        # Launch counter per case (str(case) -> count) backing MAX_TRAIN_ATTEMPTS
+        # Launch counter per seed (train job name -> count) backing MAX_TRAIN_ATTEMPTS
         self.train_attempts: dict[str, int] = {}
-        # Latest-checkpoint epoch per case as of its last launch.
+        # Latest-checkpoint epoch per seed (train job name) as of its last launch.
         # A relaunch whose checkpoint advanced past this is a resume making progress, not a failure
         self.train_attempt_epochs: dict[str, int | None] = {}
         # Measured steps per epoch per largest-training-set loader config,

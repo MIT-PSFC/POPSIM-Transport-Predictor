@@ -989,7 +989,7 @@ def launch_train_parallel(
     Args:
         train_config: The training configuration.
         job_name: The SLURM job name.
-        result_path: Path where the result xarray Dataset will be saved as NetCDF.
+        result_path: Path where the seed result (seed_results.seed_result) will be saved as NetCDF.
         log_path: The job's SLURM stdout/stderr log, its directory also holds the job's script and configs.
         partition: The SLURM partition to submit to.
     """
@@ -1027,19 +1027,19 @@ from loguru import logger
 from popsim.ml import TrainConfig
 from popsim.ml.launch import launch_train
 from transport_study.orchestration.study import write_netcdf_atomic
-from transport_study.orchestration.topk_results import compute_topk_study_results
+from transport_study.orchestration.seed_results import seed_result
 {_config_reload_script(study_config_path)}
 with open({config_path!r}) as f:
     train_config = TrainConfig(**yaml.safe_load(f))
 
-trainer, _, _, test_dl, result_dict = launch_train(train_config)
+trainer, _, _, _, result_dict = launch_train(train_config)
 if result_dict is None:
     # Trainer hit its wall-clock budget and saved the latest checkpoint. Exit
     # cleanly with no result file, the orchestrator resubmits and the next job
     # resumes from that checkpoint.
     logger.info("Training stopped at the wall-clock budget before finishing, resubmitted job will resume.")
 else:
-    ds = compute_topk_study_results(trainer, test_dl, train_config, result_dict)
+    ds = seed_result(trainer, result_dict)
     write_netcdf_atomic(ds, {str(result_path)!r})
 Path({str(config_path)!r}).unlink()
 Path({str(study_config_path)!r}).unlink()

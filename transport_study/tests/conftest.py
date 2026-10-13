@@ -26,7 +26,10 @@ def fresh_global_config():
 
 @pytest.fixture
 def make_stub_study(tmp_path):
-    """Factory building a StubStudy rooted at tmp_path from a list of StubCases."""
+    """Factory building a StubStudy rooted at tmp_path from a list of StubCases.
+
+    Every case trains one seed unless a test asks for more, so each case is one job.
+    """
 
     def _make(cases: list[StubCase], study_name: str = "stub_study", **config_overrides) -> StubStudy:
         cfg = StubConfig(
@@ -34,7 +37,7 @@ def make_stub_study(tmp_path):
             working_dir_base=Path(tmp_path),
             dataset_paths={},
             target_device="cmod",
-            **config_overrides,
+            **{"num_seeds": 1, **config_overrides},
         )
         return StubStudy(cfg, cases)
 

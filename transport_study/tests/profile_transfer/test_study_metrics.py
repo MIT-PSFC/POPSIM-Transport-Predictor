@@ -2,7 +2,7 @@
 on synthetic data with no training involved.
 
 The chi itself is computed by the test suite (tests/transport_transfer/test_study_results.py),
-these tests cover reading it back per retained checkpoint, the stage join and the per-case cache.
+these tests cover reading it back per seed, the stage join and the per-case cache.
 The stage segmentation these join against is shared machinery covered by
 tests/orchestration/test_stages.py.
 """
@@ -20,30 +20,31 @@ from transport_study.orchestration.case_metrics import (
     compute_and_save_case_metrics,
 )
 from transport_study.orchestration.case_reports import analysis_case_done
+from transport_study.orchestration.seed_results import aggregate_seed_results
 from transport_study.orchestration.stages import STAGE_AGG_NAMES
-from transport_study.orchestration.topk_results import aggregate_topk_results
 from transport_study.profile_transfer import study_metrics
 from transport_study.profile_transfer.profile_study import ProfileStudy
 from transport_study.profile_transfer.study_metrics import (
     compute_case_timeslice_metrics,
 )
+from transport_study.tests.stubs import with_seed_attrs
 
 GRADIENT_WEIGHT = 0.1
-BEST_EPOCH = 4
-OTHER_EPOCH = 8
+BEST_SEED = 0
+OTHER_SEED = 1
 
 RESULT_TIMES = np.array([0.1, 0.2, 0.3, 0.4])
 EVAL_TIMES = np.array([0.0, 0.1, 0.2, 0.3, 0.4, 0.5])
 # Flattop threshold 0.9 * p95: eval indices 2..4 are flattop, 0..1 rampup, 5 rampdown
 EVAL_IP = np.array([0.2, 0.5, 1.0, 1.0, 1.0, 0.3])
 EVAL_P_NBI = np.array([0.0, 0.0, 0.05, 0.5, 0.0, 0.0])
-# Per-timeslice chi of the best checkpoint, the other retained checkpoint scores twice as much
+# Per-timeslice chi of the best seed, the other seed scores twice as much
 CHI_VALUE = np.array([1.0, 2.0, 3.0, 4.0])
 CHI_GRAD = np.array([10.0, 0.0, 10.0, 0.0])
 
 
 def _step_result(times: np.ndarray, chi_scale: float) -> xr.Dataset:
-    """One checkpoint's study_results of one shot, shaped like the test suite output."""
+    """One seed's study_results of one shot, shaped like the test suite output."""
     n_ts = len(times)
     profile = np.broadcast_to(1.0 - 0.5 * RHO_GRID, (1, n_ts, len(RHO_GRID))).copy()
     dims_profile = ("shot", "time_idx", RADIAL_DIM)
@@ -72,8 +73,10 @@ def _step_result(times: np.ndarray, chi_scale: float) -> xr.Dataset:
 
 
 def _make_result_ds(times: np.ndarray = RESULT_TIMES) -> xr.Dataset:
-    """A case result of two retained checkpoints."""
-    return aggregate_topk_results({BEST_EPOCH: _step_result(times, 1.0), OTHER_EPOCH: _step_result(times, 2.0)}, BEST_EPOCH)
+    """A case result of two seeds, the best one with the lower validation loss."""
+    best_seed_ds = with_seed_attrs(_step_result(times, 1.0), val_loss=0.1)
+    other_seed_ds = with_seed_attrs(_step_result(times, 2.0), val_loss=0.2)
+    return aggregate_seed_results({BEST_SEED: best_seed_ds, OTHER_SEED: other_seed_ds})
 
 
 def _make_eval_ds() -> xr.Dataset:
@@ -93,7 +96,7 @@ def patched_eval(monkeypatch):
 
 
 class TestComputeCaseTimesliceMetrics:
-    def test_reads_the_suite_chi_of_every_checkpoint(self, patched_eval):
+    def test_reads_the_suite_chi_of_every_seed(self, patched_eval):
         ts = compute_case_timeslice_metrics(_make_result_ds())
         assert len(ts) == 4
         np.testing.assert_allclose(ts.best("value"), CHI_VALUE)
@@ -161,10 +164,10 @@ class TestCaseMetricsCache:
         assert len(ts_metrics) == 4
         assert list(case_ds["stage"].values) == list(STAGE_AGG_NAMES)
         best_mean = CHI_VALUE.mean()
-        # The best checkpoint, the top-K mean and std of the two checkpoints' case scores
+        # The best seed's, the mean and the sample std of the two seeds' case scores
         np.testing.assert_allclose(case_ds["value_mean_best"].sel(stage="all").item(), best_mean)
         np.testing.assert_allclose(case_ds["value_mean"].sel(stage="all").item(), 1.5 * best_mean)
-        np.testing.assert_allclose(case_ds["value_mean_ckpt_std"].sel(stage="all").item(), 0.5 * best_mean)
+        np.testing.assert_allclose(case_ds["value_mean_seed_std"].sel(stage="all").item(), best_mean / np.sqrt(2.0))
         assert case_ds["value_count"].sel(stage="all").item() == 4
         # From EVAL_IP / EVAL_P_NBI: rampup at 0.1s, flattop at 0.2-0.4s with one aux slice
         assert case_ds["value_count"].sel(stage="rampup").item() == 1

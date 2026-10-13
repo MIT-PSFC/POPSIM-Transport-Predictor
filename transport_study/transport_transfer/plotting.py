@@ -2,7 +2,7 @@
 
 A grid with one row per metric (combined chi, relative error, diverged fraction, see study_metrics)
 and one column per shot stage (all, rampup, flattop, flattop ohmic, flattop aux, rampdown),
-each line the top-K mean with the top-K std as its error bar.
+each line the seed mean with the seed std as its error bar.
 Consumes the stage-resolved collected metrics (collected_metrics.nc, dims case_idx x stage),
 over the transport case-grid fields (no data_normalization, plus geometry_builder, torax_state and multiobjective).
 """

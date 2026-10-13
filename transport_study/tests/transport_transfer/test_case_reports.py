@@ -8,8 +8,9 @@ import xarray as xr
 from transport_study import RADIAL_DIM
 from transport_study.orchestration.case_metrics import aggregate_case_metrics
 from transport_study.orchestration.case_reports import generate_case_report
-from transport_study.orchestration.topk_results import aggregate_topk_results
+from transport_study.orchestration.seed_results import aggregate_seed_results
 from transport_study.power_balance_transfer import study_metrics
+from transport_study.tests.stubs import with_seed_attrs
 from transport_study.transport_transfer.study_metrics import (
     METRIC_NAMES,
     compute_case_timeslice_metrics,
@@ -47,7 +48,8 @@ def _scalar_result_ds() -> xr.Dataset:
         },
         coords={"shot": SHOTS, "time": (dims, np.stack([time, time], axis=1)), "ds_source": ("shot", ["testdev", "testdev"])},
     )
-    return aggregate_topk_results({1: step_ds}, best_step=1)
+    seed_ds = with_seed_attrs(step_ds, val_loss=0.1)
+    return aggregate_seed_results({0: seed_ds})
 
 
 def _profile_result_ds() -> xr.Dataset:
@@ -77,7 +79,8 @@ def _profile_result_ds() -> xr.Dataset:
             "ds_source": ("shot", ["testdev", "testdev"]),
         },
     )
-    return aggregate_topk_results({1: step_ds}, best_step=1)
+    seed_ds = with_seed_attrs(step_ds, val_loss=0.1)
+    return aggregate_seed_results({0: seed_ds})
 
 
 def _report_study(result_path) -> SimpleNamespace:

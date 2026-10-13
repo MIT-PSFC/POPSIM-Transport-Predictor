@@ -17,6 +17,10 @@ import xarray as xr
 
 from transport_study.config import CaseAxis, StudyConfig
 from transport_study.orchestration.case_metrics import case_metrics_path
+from transport_study.orchestration.seed_results import (
+    SEED_BEST_EPOCH_ATTR,
+    SEED_VAL_LOSS_ATTR,
+)
 from transport_study.orchestration.study import (
     BASE_MODEL_SIZE,
     CaseGridConfig,
@@ -81,6 +85,14 @@ class StubStudy(Study):
 
     def make_cases(self, cfg: StudyConfig) -> list[StubCase]:
         return self.injected_cases
+
+
+def with_seed_attrs(seed_ds: xr.Dataset, val_loss: float, best_epoch: int = 1) -> xr.Dataset:
+    """seed_ds as seed_results.seed_result writes it, with its best epoch and that epoch's validation loss."""
+    seed_ds = seed_ds.copy()
+    seed_ds.attrs[SEED_BEST_EPOCH_ATTR] = best_epoch
+    seed_ds.attrs[SEED_VAL_LOSS_ATTR] = val_loss
+    return seed_ds
 
 
 def mark_analysis_done(study: Study, case) -> None:

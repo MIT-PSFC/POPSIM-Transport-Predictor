@@ -125,9 +125,9 @@ STAGE_LABELS = {
 
 
 def stage_series_stats(ds: xr.Dataset, metric: str, stage: str) -> tuple[np.ndarray, np.ndarray]:
-    """Per-case top-K mean and top-K std of one metric's per-timeslice mean in one stage of a collected metrics dataset."""
+    """Per-case seed mean and seed std of one metric's per-timeslice mean in one stage of a collected metrics dataset."""
     stage_ds = ds.sel(stage=stage)
-    return stage_ds[f"{metric}_mean"].values, stage_ds[f"{metric}_mean_ckpt_std"].values
+    return stage_ds[f"{metric}_mean"].values, stage_ds[f"{metric}_mean_seed_std"].values
 
 
 @dataclass(frozen=True)
@@ -136,7 +136,7 @@ class ComparisonLayout:
 
     row_labels / col_labels: panel rows and columns, name -> axis label
     cell_size: (width, height) of one panel in inches
-    series_stats(ds, row, col): per-case (top-K means, top-K stds) of one panel, the std drawn as the error bar
+    series_stats(ds, row, col): per-case (seed means, seed stds) of one panel, the std drawn as the error bar
     grid_fields: every case-grid field a figure compares along or holds fixed
     field_tokens: per-field filename token template (e.g. "td_{}"), mirroring the case-string vocabulary
     value_labels: per-field value -> display label, in titles and legends

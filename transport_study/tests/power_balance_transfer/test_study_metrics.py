@@ -10,12 +10,12 @@ import pytest
 import xarray as xr
 
 from transport_study.orchestration.case_metrics import aggregate_case_metrics
+from transport_study.orchestration.seed_results import aggregate_seed_results
 from transport_study.orchestration.stages import STAGE_AGG_NAMES
 from transport_study.orchestration.tables import (
-    TOPK_SUFFIXES,
+    SEED_SUFFIXES,
     write_summary_comparison_tables,
 )
-from transport_study.orchestration.topk_results import aggregate_topk_results
 from transport_study.power_balance_transfer import study_metrics
 from transport_study.power_balance_transfer.case_reports import shot_pdf
 from transport_study.power_balance_transfer.study_metrics import (
@@ -24,12 +24,13 @@ from transport_study.power_balance_transfer.study_metrics import (
     shot_time_averaged,
 )
 from transport_study.power_balance_transfer.tables import SPEC
+from transport_study.tests.stubs import with_seed_attrs
 
 N_TS = 100
 SHOTS = [101, 102]
-# The best checkpoint's errors are the constants below, the other retained checkpoint's are twice them
-BEST_EPOCH = 7
-OTHER_EPOCH = 3
+# The best seed's errors are the constants below, the other seed's are twice them
+BEST_SEED = 1
+OTHER_SEED = 0
 
 
 @pytest.fixture()
@@ -51,7 +52,7 @@ def device_ds() -> xr.Dataset:
 
 
 def _step_result(error_scale: float, n_diverged_101: int = 0) -> xr.Dataset:
-    """One checkpoint's study_results: constant abs error 0.1 on shot 101 and 0.3 on shot 102 times error_scale,
+    """One seed's study_results: constant abs error 0.1 on shot 101 and 0.3 on shot 102 times error_scale,
     the last 20 timeslices of shot 102 NaN-padded, and the last n_diverged_101 of shot 101 diverged."""
     time = np.arange(N_TS) * 1e-3
     targ = np.full((N_TS, 2), 1.0)
@@ -81,10 +82,17 @@ def _step_result(error_scale: float, n_diverged_101: int = 0) -> xr.Dataset:
     )
 
 
+def _two_seed_result(best_seed_ds: xr.Dataset) -> xr.Dataset:
+    """A case result of best_seed_ds and another seed at twice the constant errors with a higher validation loss."""
+    best_seed_ds = with_seed_attrs(best_seed_ds, val_loss=0.1)
+    other_seed_ds = with_seed_attrs(_step_result(2.0), val_loss=0.2)
+    return aggregate_seed_results({BEST_SEED: best_seed_ds, OTHER_SEED: other_seed_ds})
+
+
 @pytest.fixture()
 def result_ds() -> xr.Dataset:
-    """Synthetic case result file of two retained checkpoints, the best one with the constant errors."""
-    return aggregate_topk_results({BEST_EPOCH: _step_result(1.0), OTHER_EPOCH: _step_result(2.0)}, BEST_EPOCH)
+    """Synthetic case result file of two seeds, the best one (lower validation loss) with the constant errors."""
+    return _two_seed_result(_step_result(1.0))
 
 
 @pytest.fixture()
@@ -104,7 +112,7 @@ def test_compute_case_timeslice_metrics(ts_metrics):
     assert ts_metrics.aux_heated[shot_101][40:60].all()
     assert not ts_metrics.aux_heated[shot_101][:40].any()
 
-    # Errors ride along unchanged, one column per retained checkpoint
+    # Errors ride along unchanged, one column per seed
     assert np.allclose(ts_metrics.best("abs")[shot_101], 0.1)
     assert np.allclose(ts_metrics.best("abs")[~shot_101], 0.3)
     assert np.allclose(ts_metrics.metric("abs")[shot_101], [0.2, 0.1])
@@ -142,10 +150,10 @@ def test_aggregate_case_metrics(ts_metrics):
     best_mean = float(case_ds["abs_mean_best"].sel(stage="all"))
     assert 0.1 < best_mean < 0.3
 
-    # Each checkpoint scores the case on its own, the other checkpoint's errors are twice the best one's
+    # Each seed scores the case on its own, the other seed's errors are twice the best one's
     other_mean = 2.0 * best_mean
     assert np.isclose(case_ds["abs_mean"].sel(stage="all"), 0.5 * (best_mean + other_mean))
-    assert np.isclose(case_ds["abs_mean_ckpt_std"].sel(stage="all"), 0.5 * (other_mean - best_mean))
+    assert np.isclose(case_ds["abs_mean_seed_std"].sel(stage="all"), (other_mean - best_mean) / np.sqrt(2.0))
     assert np.isclose(case_ds["diverged_mean"].sel(stage="all"), 0.0)
 
 
@@ -154,7 +162,7 @@ def test_diverged_timeslices_stay_records_and_count_as_the_fraction(monkeypatch,
     NaN in the errors, which the error means skip, and 1 in the diverged flag, whose stage mean is the fraction."""
     monkeypatch.setattr(study_metrics, "load_stage_dataset", lambda device: device_ds)
     n_diverged = 15
-    result_ds = aggregate_topk_results({BEST_EPOCH: _step_result(1.0, n_diverged), OTHER_EPOCH: _step_result(2.0)}, BEST_EPOCH)
+    result_ds = _two_seed_result(_step_result(1.0, n_diverged))
 
     ts_metrics = compute_case_timeslice_metrics(result_ds)
     case_ds = aggregate_case_metrics(ts_metrics, METRIC_NAMES)
@@ -170,7 +178,7 @@ def test_shot_time_averaged(ts_metrics):
     _, avg_rel, _ = shot_time_averaged(ts_metrics, "rel")
 
     assert list(shots) == SHOTS
-    # Time-averaged errors are duration-free: the best checkpoint's constants come back exactly
+    # Time-averaged errors are duration-free: the best seed's constants come back exactly
     assert np.allclose(avg_abs, [0.1, 0.3])
     assert np.allclose(avg_rel, np.array([0.1, 0.3]) / 1.1)
     assert list(n_ts) == [N_TS, 80]
@@ -213,7 +221,7 @@ def collected_datasets() -> tuple[xr.Dataset, xr.Dataset]:
     n_metrics = n - 1
     metrics = xr.Dataset(coords={"case_idx": np.arange(n_metrics), "stage": list(STAGE_AGG_NAMES)})
     for metric in METRIC_NAMES:
-        for suffix in TOPK_SUFFIXES:
+        for suffix in SEED_SUFFIXES:
             metrics[f"{metric}_mean{suffix}"] = (
                 ("case_idx", "stage"),
                 rng.uniform(0.01, 1.0, (n_metrics, len(STAGE_AGG_NAMES))),
@@ -245,7 +253,7 @@ def test_write_comparison_tables(tmp_path, collected_datasets):
     assert "transformer" in model_table
     assert "rel err (time avg)" in model_table
     assert "flattop ohmic" in model_table
-    assert "| ckpt std |" in model_table
+    assert "| seed std |" in model_table
     assert "| diverged |" in model_table
 
     # Axes with a single value (training_data, domain_adaptation) produce no tables

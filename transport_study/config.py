@@ -52,13 +52,13 @@ RHO_GRID = np.linspace(0.0, 1.0, N_RHO_POINTS)
 # the target device keeps every shot, each source device keeps only its DEBUG_MAX_SOURCE_SHOTS most recent ones,
 # training and sweep trials stop by DEBUG_MAX_EPOCHS and validate at least every DEBUG_EPOCHS_PER_VAL epochs,
 # each sweep runs DEBUG_HYPERPARAM_SWEEPS trials and is read from wandb every DEBUG_SWEEP_POLL_INTERVAL_S,
-# and result files average at most the top DEBUG_NUM_RESULT_CHECKPOINTS checkpoints (CaseGridConfig)
+# and every case trains at most DEBUG_NUM_SEEDS seeds (CaseGridConfig)
 DEBUG_MAX_SOURCE_SHOTS = 100
 DEBUG_MAX_EPOCHS = 12
 DEBUG_EPOCHS_PER_VAL = 3
 DEBUG_HYPERPARAM_SWEEPS = 1
 DEBUG_SWEEP_POLL_INTERVAL_S = 1.0
-DEBUG_NUM_RESULT_CHECKPOINTS = 3
+DEBUG_NUM_SEEDS = 2
 
 
 class FieldRole(StrEnum):

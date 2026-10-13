@@ -1,7 +1,7 @@
 """Stage-resolved metrics of profile transfer study results (its ANALYSIS_METRICS_MODULE, see orchestration.case_metrics).
 
 Reads the chi validation loss (ProfilePredictorTRB.get_val_loss_fn, trb_utils.chi_value / chi_gradient)
-that the test suite writes per test timeslice and retained checkpoint,
+that the test suite writes per test timeslice and seed,
 joined back to the device datasets for ip_MA and the heating powers of the stage labels.
 Each test timeslice gets four metrics:
 

@@ -124,7 +124,7 @@ class ProfilePredictorTRB(TrainRunBuilder):
             drop_last=[True, False],
             pad_last=[False, True],
         )
-        train_dl = CaseTrainDataLoader(train_dl, dataloader_config["steps_per_epoch"], normalizer_fit_ds)
+        train_dl = CaseTrainDataLoader(train_dl, dataloader_config["steps_per_epoch"], dataloader_config["shuffle_seed"], normalizer_fit_ds)
         # The validation set doubles as the test set (see resolve_case_datasets)
         return ds_val, train_dl, val_dl, val_dl
 

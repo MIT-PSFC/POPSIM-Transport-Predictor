@@ -210,7 +210,7 @@ def _fig_to_image(fig: plt.Figure) -> Image.Image:
 
 
 def _select_gif_shots(ts_metrics: CaseTimesliceMetrics) -> list:
-    """Best, median, and worst test shots by the best checkpoint's shot-mean combined metric."""
+    """Best, median, and worst test shots by the best seed's shot-mean combined metric."""
     shots = np.unique(ts_metrics.shot)
     combined = ts_metrics.best("combined")
 
@@ -267,7 +267,7 @@ def case_report_done(case_dir: Path) -> bool:
 def render_case_report(result_ds: xr.Dataset, ts_metrics: CaseTimesliceMetrics, case_dir: Path):
     """The profile evolution GIFs, then the best and worst test timeslices by the combined metric.
 
-    Both score the best checkpoint, whose predictions the result file holds.
+    Both score the best seed, whose predictions the result file holds.
     The PDF comes last, since case_report_done reads it alone.
     """
     evolution_gifs(result_ds, ts_metrics, case_dir)
@@ -280,8 +280,8 @@ def torax_relaxation_report(study, metrics_ds: xr.Dataset, figure_dir: Path):
     """Relaxation figure for the best torax case at its best timeslice.
 
     Picks the torax-* case with the lowest combined-metric mean over all test
-    timeslices (top-K mean), restores its trained module, reruns the TORAX solve step by
-    step on the timeslice where the best checkpoint fits best, and plots the profile
+    timeslices (seed mean), restores its trained module, reruns the TORAX solve step by
+    step on the timeslice where the best seed fits best, and plots the profile
     relaxation into the measured target shape.
     """
     if not metrics_ds.data_vars or "case_idx" not in metrics_ds.dims:
