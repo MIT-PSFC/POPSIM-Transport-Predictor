@@ -334,8 +334,37 @@ def test_job_end_states_reads_terminal_ends_and_skips_unrecorded_jobs(monkeypatc
     assert 10 not in end_states
 
 
-def test_recent_job_ids_keeps_newest_job_of_each_name_of_study(monkeypatch):
+def test_recent_submitted_jobs_keeps_the_newest_job_of_each_name(monkeypatch):
+    """Only names of the given prefix and suffix, the training jobs of one study."""
     sacct_stdout = "7|train_case.a.seed_0.study\n9|train_case.a.seed_0.study\n8|agent_case.a.study\n10|train_case.b.seed_0.other\n"
     _serve_fake_slurm(monkeypatch, lambda cmd: sacct_stdout)
 
-    assert slurm_utils.recent_job_ids(".study", 180) == {"train_case.a.seed_0.study": 9, "agent_case.a.study": 8}
+    recent_jobs = slurm_utils.recent_submitted_jobs("train_", ".study")
+
+    assert {job_name: job.job_id for job_name, job in recent_jobs.items()} == {"train_case.a.seed_0.study": 9}
+
+
+@pytest.mark.parametrize(
+    ("end_states", "now", "is_held"),
+    [
+        ({}, 100.0, True),
+        ({}, 400.0, False),
+        ({7: slurm_utils.JobEnd("RUNNING", None)}, 1000.0, True),
+        ({7: slurm_utils.JobEnd("COMPLETED", 50.0)}, 200.0, True),
+        ({7: slurm_utils.JobEnd("COMPLETED", 50.0)}, 240.0, False),
+        (None, 1000.0, True),
+    ],
+    ids=["unrecorded_within_lag", "unrecorded_past_lag", "sacct_still_running", "inside_grace", "past_grace", "sacct_failed"],
+)
+def test_held_job_names_holds_a_gone_job_until_it_is_resolved(monkeypatch, end_states, now, is_held):
+    """A job submitted at t = 0 and gone from the queue, beside one still queued."""
+    submitted_jobs = {"job.gone": slurm_utils.SubmittedJob(7, 0.0), "job.queued": slurm_utils.SubmittedJob(8, 0.0)}
+    monkeypatch.setattr(slurm_utils, "job_end_states", lambda job_ids: end_states)
+    monkeypatch.setattr(slurm_utils.time, "time", lambda: now)
+
+    held = slurm_utils.held_job_names(submitted_jobs, running_job_names={"job.queued"})
+
+    assert held == ({"job.gone"} if is_held else set())
+    # A released job is no longer tracked, a queued one always is
+    assert ("job.gone" in submitted_jobs) == is_held
+    assert "job.queued" in submitted_jobs

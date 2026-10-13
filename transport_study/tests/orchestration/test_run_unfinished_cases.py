@@ -14,9 +14,14 @@ import xarray as xr
 from popsim.ml import TrainConfig
 
 from transport_study.config import config
+from transport_study.orchestration import slurm_utils
 from transport_study.orchestration import study as study_module
 from transport_study.orchestration.seed_results import BEST_SEED_ATTR
-from transport_study.orchestration.slurm_utils import JobEnd
+from transport_study.orchestration.slurm_utils import (
+    RELAUNCH_GRACE_S,
+    JobEnd,
+    SubmittedJob,
+)
 from transport_study.orchestration.study import Study, write_netcdf_atomic
 from transport_study.tests.stubs import StubCase, with_seed_attrs
 
@@ -39,8 +44,8 @@ def quiet_scheduler(monkeypatch):
     """Neutral SLURM stand-ins: no elapsed jobs, a partition always available, no job sacct knows of."""
     monkeypatch.setattr(study_module, "get_running_job_elapsed_s", lambda partition=None: {})
     monkeypatch.setattr(study_module, "pick_partition", lambda *args, **kwargs: "test_partition")
-    monkeypatch.setattr(study_module, "recent_job_ids", lambda name_suffix, since_s: {})
-    monkeypatch.setattr(study_module, "job_end_states", lambda job_ids: {})
+    monkeypatch.setattr(study_module, "recent_submitted_jobs", lambda name_prefix, name_suffix: {})
+    monkeypatch.setattr(slurm_utils, "job_end_states", lambda job_ids: {})
 
 
 # The train config every stubbed make_train_config returns
@@ -117,8 +122,8 @@ def test_result_lag_does_not_relaunch(make_stub_study, monkeypatch, fake_clock, 
     case_a = StubCase(name="case.a")
     study = make_stub_study([case_a])
     job_name = study.train_job_name(case_a, 0)
-    monkeypatch.setattr(study_module, "recent_job_ids", lambda name_suffix, since_s: {job_name: 7})
-    monkeypatch.setattr(study_module, "job_end_states", lambda job_ids: {7: JobEnd("COMPLETED", 0.0)})
+    monkeypatch.setattr(study_module, "recent_submitted_jobs", lambda name_prefix, name_suffix: {job_name: SubmittedJob(7, 0.0)})
+    monkeypatch.setattr(slurm_utils, "job_end_states", lambda job_ids: {7: JobEnd("COMPLETED", 0.0)})
 
     def snapshots():
         yield {job_name}  # pass 1: job in flight
@@ -146,8 +151,8 @@ def test_relaunch_after_grace_when_no_result(make_stub_study, monkeypatch, fake_
     case_a = StubCase(name="case.a")
     study = make_stub_study([case_a])
     job_name = study.train_job_name(case_a, 0)
-    monkeypatch.setattr(study_module, "recent_job_ids", lambda name_suffix, since_s: {job_name: 7})
-    monkeypatch.setattr(study_module, "job_end_states", lambda job_ids: {7: JobEnd("FAILED", 0.0)})
+    monkeypatch.setattr(study_module, "recent_submitted_jobs", lambda name_prefix, name_suffix: {job_name: SubmittedJob(7, 0.0)})
+    monkeypatch.setattr(slurm_utils, "job_end_states", lambda job_ids: {7: JobEnd("FAILED", 0.0)})
     set_queue_snapshots(monkeypatch, [{job_name}])
 
     launch_times: list[float] = []
@@ -164,7 +169,7 @@ def test_relaunch_after_grace_when_no_result(make_stub_study, monkeypatch, fake_
     study.run_unfinished_cases(skip_tuning=True, enable_parallelism=True)
 
     assert len(launch_times) == 1
-    assert launch_times[0] >= study_module.RELAUNCH_GRACE_S
+    assert launch_times[0] >= RELAUNCH_GRACE_S
 
 
 def test_tuning_case_reads_its_sweep_once_per_poll_interval(make_stub_study, monkeypatch, fake_clock, quiet_scheduler):
@@ -232,22 +237,18 @@ def test_rejected_submission_refunds_train_attempt(make_stub_study, monkeypatch,
     assert (recorded_job.job_id if recorded_job else None) == job_id
 
 
-@pytest.mark.parametrize(
-    "end_states",
-    [{7: JobEnd("COMPLETED", 15.0)}, {}, None],
-    ids=["ended_just_before", "no_sacct_record_yet", "sacct_failed"],
-)
-def test_seed_finished_between_two_passes_is_not_relaunched(make_stub_study, monkeypatch, fake_clock, quiet_scheduler, end_states):
+def test_seed_finished_between_two_passes_is_not_relaunched(make_stub_study, monkeypatch, fake_clock, quiet_scheduler):
     """The gap of the first apsdpp launch: a seed submitted and finished between two squeue snapshots, never seen in flight.
 
     Its accepted submission holds it, and its result landing during the hold finishes the case.
+    The other ways a gone job stays held are tested on slurm_utils.held_job_names itself.
     """
     case_a = StubCase(name="case.a")
     study = make_stub_study([case_a])
     monkeypatch.setattr(study, "check_data_requirements", lambda case: True)
     monkeypatch.setattr(study, "make_train_config", lambda _case: STUB_TRAIN_CONFIG)
     monkeypatch.setattr(study_module, "count_running_jobs", lambda job_name: 0)
-    monkeypatch.setattr(study_module, "job_end_states", lambda job_ids: end_states)
+    monkeypatch.setattr(slurm_utils, "job_end_states", lambda job_ids: {7: JobEnd("COMPLETED", 15.0)})
     launches: list[str] = []
 
     def accept_job(train_config, job_name, *args, **kwargs):
@@ -302,7 +303,7 @@ def test_gpu_only_cases_take_the_gpu_before_cpu_capable_ones(make_stub_study, mo
     monkeypatch.setattr(study_module, "pick_partition", pick_partition)
     monkeypatch.setattr(study_module, "get_running_job_names", lambda: set())
     monkeypatch.setattr(study_module, "get_running_job_elapsed_s", lambda partition=None: {})
-    monkeypatch.setattr(study_module, "recent_job_ids", lambda name_suffix, since_s: {})
+    monkeypatch.setattr(study_module, "recent_submitted_jobs", lambda name_prefix, name_suffix: {})
     monkeypatch.setattr(study_module.time, "sleep", lambda s: setattr(gpu_slots, "open", 1))
     monkeypatch.setattr(study, "run_case", run_case)
 

@@ -11,16 +11,30 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
-from transport_study.orchestration import case_analysis
+from transport_study.orchestration import case_analysis, slurm_utils
 from transport_study.orchestration.case_analysis import (
     ANALYSIS_MAX_ATTEMPTS,
     run_case_analysis_parallel,
 )
-from transport_study.orchestration.study import RELAUNCH_GRACE_S
+from transport_study.orchestration.slurm_utils import RELAUNCH_GRACE_S, JobEnd
 from transport_study.tests.stubs import StubCase, mark_analysis_done
 
 MAX_JOBS = 2
 N_CASES = 5
+
+
+@pytest.fixture(autouse=True)
+def sacct_ends(monkeypatch) -> dict[int, JobEnd]:
+    """sacct stand-in: no analysis job of a previous orchestrator, and the ends of the jobs a test records here.
+
+    A job a test records no end for reads as one sacct has no record of yet.
+    """
+    end_states: dict[int, JobEnd] = {}
+    monkeypatch.setattr(case_analysis, "recent_submitted_jobs", lambda name_prefix, name_suffix: {})
+    monkeypatch.setattr(
+        slurm_utils, "job_end_states", lambda job_ids: {job_id: end_states[job_id] for job_id in job_ids if job_id in end_states}
+    )
+    return end_states
 
 
 @pytest.fixture
@@ -52,9 +66,12 @@ def empty_queue(monkeypatch):
 
 @pytest.fixture
 def fake_clock(monkeypatch):
-    """Virtual clock that only advances on sleep, so grace windows cost no wall time."""
+    """Virtual clock that only advances on sleep, so grace windows cost no wall time.
+
+    It stands in for the wall clock too, which sacct job ends are compared against.
+    """
     clock = SimpleNamespace(t=0.0)
-    monkeypatch.setattr(case_analysis.time, "monotonic", lambda: clock.t)
+    monkeypatch.setattr(case_analysis.time, "time", lambda: clock.t)
     monkeypatch.setattr(case_analysis.time, "sleep", lambda seconds: setattr(clock, "t", clock.t + seconds))
     return clock
 
@@ -67,7 +84,7 @@ def launch_batches_per_pass(monkeypatch, finish_immediately: bool = True) -> lis
         batches[-1].append(str(case))
         if finish_immediately:
             mark_analysis_done(study, case)
-        return True
+        return len(batches[-1])
 
     monkeypatch.setattr(case_analysis, "launch_case_analysis_parallel", fake_launch)
     monkeypatch.setattr(case_analysis.time, "sleep", lambda seconds: batches.append([]))
@@ -92,7 +109,7 @@ def test_job_finishing_before_the_queue_query_is_not_relaunched(study, monkeypat
     def launch_into_queue(study_arg, case):
         launched.append(str(case))
         queue[study_arg.analysis_job_name(case)] = case
-        return True
+        return len(launched)
 
     def queue_whose_jobs_just_finished():
         """Every queued job finishes right before squeue reports, after the previous pass checked its case."""
@@ -131,7 +148,7 @@ def test_scheduler_failure_waits_instead_of_launching(single_case_study, monkeyp
     def fake_launch(study_arg, case):
         launched.append(str(case))
         mark_analysis_done(study_arg, case)
-        return True
+        return 7
 
     monkeypatch.setattr(case_analysis, "launch_case_analysis_parallel", fake_launch)
     monkeypatch.setattr(case_analysis.time, "sleep", sleeps.append)
@@ -143,15 +160,17 @@ def test_scheduler_failure_waits_instead_of_launching(single_case_study, monkeyp
     assert len(sleeps) == 2
 
 
-def test_case_that_never_finishes_stops_after_max_attempts(single_case_study, monkeypatch, empty_queue, fake_clock):
-    """A case whose analysis job keeps dying is relaunched only after the grace window,
+def test_case_that_never_finishes_stops_after_max_attempts(single_case_study, monkeypatch, empty_queue, fake_clock, sacct_ends):
+    """A case whose analysis job keeps dying is relaunched only RELAUNCH_GRACE_S after the job's end,
     since its outputs may not be visible yet (NFS, 31 of 77 cases relaunched in hs1_transport_primary),
     and falls through to the serial path instead of being resubmitted forever."""
     launch_times: list[float] = []
 
     def launch_and_die(study_arg, case):
         launch_times.append(fake_clock.t)
-        return True
+        job_id = len(launch_times)
+        sacct_ends[job_id] = JobEnd("FAILED", fake_clock.t)
+        return job_id
 
     monkeypatch.setattr(case_analysis, "launch_case_analysis_parallel", launch_and_die)
 
@@ -164,17 +183,48 @@ def test_case_that_never_finishes_stops_after_max_attempts(single_case_study, mo
 
 def test_rejected_submission_counts_no_attempt(single_case_study, monkeypatch, empty_queue, fake_clock):
     """sbatch rejecting the job (SLURM busy) must not use up the case's attempts and push it to the serial path."""
-    submissions_accepted = iter([False] * ANALYSIS_MAX_ATTEMPTS + [True])
+    submitted_job_ids = iter([None] * ANALYSIS_MAX_ATTEMPTS + [7])
     launched: list[str] = []
 
     def flaky_launch(study_arg, case):
-        accepted = next(submissions_accepted)
-        if accepted:
+        job_id = next(submitted_job_ids)
+        if job_id is not None:
             launched.append(str(case))
             mark_analysis_done(study_arg, case)
-        return accepted
+        return job_id
 
     monkeypatch.setattr(case_analysis, "launch_case_analysis_parallel", flaky_launch)
+
+    run_case_analysis_parallel(single_case_study)
+
+    assert launched == ["case.0"]
+
+
+def test_job_ending_late_in_a_long_pass_is_held_from_its_end(single_case_study, monkeypatch, fake_clock, sacct_ends):
+    """The hold runs from the job's sacct end, not from the pass that last saw the job in the queue.
+
+    The done check loads every pending case, so a pass can outlast RELAUNCH_GRACE_S.
+    Timed from the pass that saw it, a job ending late in such a pass was relaunched before its outputs were visible.
+    """
+    case = single_case_study.cases[0]
+    # Pass 1 (t = 0) launches, pass 2 (t = 400) sees the job running, it ends at t = 750 and is gone at pass 3 (t = 800)
+    snapshots = iter([set(), {single_case_study.analysis_job_name(case)}])
+    monkeypatch.setattr(case_analysis, "get_running_job_names", lambda: next(snapshots, set()))
+    sacct_ends[7] = JobEnd("COMPLETED", 750.0)
+    launched: list[str] = []
+
+    def launch(study_arg, case_arg):
+        launched.append(str(case_arg))
+        return 7
+
+    def long_pass(seconds):
+        fake_clock.t += 400.0
+        # The outputs become visible on this node only after pass 3
+        if fake_clock.t >= 1200.0:
+            mark_analysis_done(single_case_study, case)
+
+    monkeypatch.setattr(case_analysis, "launch_case_analysis_parallel", launch)
+    monkeypatch.setattr(case_analysis.time, "sleep", long_pass)
 
     run_case_analysis_parallel(single_case_study)
 

@@ -325,24 +325,77 @@ def job_end_states(job_ids: Collection[int]) -> dict[int, JobEnd] | None:
     return end_states
 
 
-def recent_job_ids(name_suffix: str, since_s: float) -> dict[str, int] | None:
-    """Job id of each of this user's jobs whose name ends with name_suffix, queued or run in the last since_s seconds.
+# Result files can lag job exit by ~1 min on NFS, so the work of a job waits this long after the job ended before it is relaunched
+RELAUNCH_GRACE_S = 180
 
-    The newest job wins when a name repeats.
-    None when sacct fails.
+# sacct records a job seconds after its submission, a submitted job it still has no record of this long after counts as gone
+SUBMIT_ACCOUNTING_LAG_S = 300
+
+
+class SubmittedJob(NamedTuple):
+    """A job SLURM accepted, its id and the wall-clock time of the submission."""
+
+    job_id: int
+    submitted_at: float
+
+
+def held_job_names(submitted_jobs: dict[str, SubmittedJob], running_job_names: set[str]) -> set[str]:
+    """The submitted jobs that left the queue too recently for their work to be relaunched.
+
+    submitted_jobs maps each job name to the job, running_job_names is the pass's squeue snapshot.
+    A job is held while sacct has no record of it yet (accounting lags submission by seconds),
+    while sacct still shows it in a non-terminal state (squeue and sacct can disagree for a moment),
+    until RELAUNCH_GRACE_S past its end, and through any call whose sacct query fails.
+    A job sacct never records is released SUBMIT_ACCOUNTING_LAG_S after its submission.
+    A released job is removed from submitted_jobs, so each is looked up only until it is resolved.
+    The hold needs no snapshot to have seen the job, so a job submitted and finished between two snapshots is held too.
     """
-    start_time = datetime.fromtimestamp(time.time() - since_s).strftime("%Y-%m-%dT%H:%M:%S")
+    gone_jobs = {job_name: job for job_name, job in submitted_jobs.items() if job_name not in running_job_names}
+    if not gone_jobs:
+        return set()
+    gone_job_ids = [job.job_id for job in gone_jobs.values()]
+    end_states = job_end_states(gone_job_ids)
+    if end_states is None:
+        logger.warning("sacct failed, holding every submitted job that left the queue until the next pass")
+        return set(gone_jobs)
+    now = time.time()
+    held = set()
+    for job_name, job in gone_jobs.items():
+        end_state = end_states.get(job.job_id)
+        if end_state is None:
+            still_held = now - job.submitted_at < SUBMIT_ACCOUNTING_LAG_S
+        elif end_state.end_time is None:
+            still_held = True
+        else:
+            still_held = now - end_state.end_time < RELAUNCH_GRACE_S
+        if still_held:
+            held.add(job_name)
+        else:
+            del submitted_jobs[job_name]
+    return held
+
+
+def recent_submitted_jobs(name_prefix: str, name_suffix: str) -> dict[str, SubmittedJob]:
+    """This user's jobs named name_prefix...name_suffix that were queued or ran in the last RELAUNCH_GRACE_S.
+
+    A restarted orchestrator tracks them in held_job_names, since its predecessor submitted them.
+    The newest job wins when a name repeats.
+    A failed sacct leaves them untracked (logged), as before the hold existed.
+    """
+    start_time = datetime.fromtimestamp(time.time() - RELAUNCH_GRACE_S).strftime("%Y-%m-%dT%H:%M:%S")
     stdout = _slurm_stdout(
         ["sacct", "-u", getpass.getuser(), "-X", "-n", "-P", "-S", start_time, "-o", "JobID,JobName%512"], level="WARNING"
     )
     if stdout is None:
-        return None
-    job_ids = {}
+        logger.warning(f"sacct failed, the {name_prefix}*{name_suffix} jobs of a previous orchestrator are not held")
+        return {}
+    job_ids: dict[str, int] = {}
     for line in stdout.splitlines():
         job_id_field, _, job_name = line.strip().partition("|")
-        if job_id_field.isdigit() and job_name.endswith(name_suffix):
+        if job_id_field.isdigit() and job_name.startswith(name_prefix) and job_name.endswith(name_suffix):
             job_ids[job_name] = max(int(job_id_field), job_ids.get(job_name, 0))
-    return job_ids
+    now = time.time()
+    return {job_name: SubmittedJob(job_id, now) for job_name, job_id in job_ids.items()}
 
 
 def get_running_job_elapsed_s(partition: str | None = None) -> dict[str, int] | None:
