@@ -40,8 +40,10 @@ from transport_study.orchestration.study import (
 )
 from transport_study.orchestration.target_shots import BASE_TARGET_SHOT_ORDER
 from transport_study.power_balance_transfer.power_balance_study import (
+    POWER_BALANCE_BATCH_SIZE,
     POWER_BALANCE_INPUT_VARS,
     POWER_BALANCE_LOSS_DEFAULTS,
+    SCALAR_SUBMODULE_BATCH_SIZE,
     SCALAR_SUBMODULE_SETTINGS,
 )
 from transport_study.profile_transfer.profile_study import PROFILE_INPUT_VARS
@@ -333,11 +335,11 @@ class TransportStudy(Study):
             # Hyperparameters
             "segment_length_train": 100,
             "segment_overlap_train": 50,
-            # Below the power balance study's 4096:
-            # every torax sample runs a 100-step differentiated TORAX rollout (jax.checkpoint remat, see TransportPredictorToraxBase).
-            # Measured on an A100-80GB with gyrobohm, VRAM is not the limit (~5 MB/sample, 8192 fits in 38 GB).
-            # Epoch time stops falling past 512, so a larger batch only gives up optimizer steps.
-            "batch_size": 512,
+            # Every torax sample runs a 100-step differentiated TORAX rollout (jax.checkpoint remat, see TransportPredictorToraxBase).
+            # Measured 2026-10-12 on the production stores at sweep-max sizes (scratch/batch_bench), on an A100-80GB:
+            # 1024 gives 65 steps per epoch, torax-gyrobohm 259 s and torax-qlknn 331 s per epoch (474 and 548 s at 512),
+            # peaking at 7.5 GB (TORAX) and 23 GB (transformer), and every training process holds ~62 GB of host memory.
+            "batch_size": 1024,
             # Part of validation, should be left alone during hyperparameter tuning
             "segment_length_val": None,
             "segment_overlap_val": 0,
@@ -427,8 +429,8 @@ class TransportStudy(Study):
                     "input_vars": POWER_BALANCE_INPUT_VARS,
                     "data_train_run_builder": pb_trb,  # Needed for submodules
                     **dataloader_config_base,
-                    # Scalar-signal training is cheap, match the power balance study
-                    "batch_size": 4096,
+                    # Match the power balance study
+                    "batch_size": SCALAR_SUBMODULE_BATCH_SIZE,
                 },
                 model_init_config={
                     "nn_depth": 2,
@@ -452,8 +454,8 @@ class TransportStudy(Study):
                     "target_vars": ["energy_mhd_MJ", "fresh_equilibrium", "power_ohm_MW", "power_radiated_MW", "ds_source_idx"],
                     "state_vars": ["energy_mhd_MJ"],
                     **dataloader_config_base,
-                    # Scalar-signal training is cheap, match the power balance study
-                    "batch_size": 4096,
+                    # Match the power balance study
+                    "batch_size": POWER_BALANCE_BATCH_SIZE,
                 },
                 model_init_config={
                     "model_type": config.power_balance_model_type,

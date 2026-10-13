@@ -4,15 +4,15 @@ metric:
   goal: "minimize"
 early_terminate:
   type: hyperband
-  min_iter: 2
-  eta: 3
+  min_iter: 10
+  eta: 2
 parameters:
   model_init_config:
     parameters:
       nn_width:
-        values: [32, 64, 128]
+        values: [8, 12, 18, 26, 38, 54]
       nn_depth:
-        values: [2, 3, 4, 5, 6]
+        values: [2, 3, 4]
   optimizer_config:
     parameters:
       lr0:

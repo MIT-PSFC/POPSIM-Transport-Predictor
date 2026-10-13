@@ -4,8 +4,8 @@ metric:
   goal: "minimize"
 early_terminate:
   type: hyperband
-  min_iter: 2
-  eta: 3
+  min_iter: 10
+  eta: 2
 # The transport sciml model has no NN of its own, its power_balance and
 # profile submodules are restored from their own tuned cases. Sweep only
 # training dynamics.

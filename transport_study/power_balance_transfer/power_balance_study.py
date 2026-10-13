@@ -60,6 +60,14 @@ SCALAR_SUBMODULE_SETTINGS = {
     },
 }
 
+# Training batches, shared with the transport study's power balance pseudo-types.
+# Measured 2026-10-12 on the production stores at sweep-max sizes (scratch/batch_bench):
+# Wtot segment batches of 1024 give 67 steps per epoch, the transformer peaking at 11 GB on a GPU and 14 GB on a 16G CPU job,
+# where 2048 is OOM-killed.
+POWER_BALANCE_BATCH_SIZE = 1024
+# p_oh / p_rad timeslice batches of 16384 give about 190 steps per epoch at 0.2 GB on a GPU
+SCALAR_SUBMODULE_BATCH_SIZE = 16384
+
 # Fallback loss hyperparameters of every power balance case run without a tuned config,
 # also those of the transport study's power balance pseudo-types (p_oh, p_rad, power_balance)
 POWER_BALANCE_LOSS_DEFAULTS = {
@@ -242,10 +250,8 @@ class PowerBalanceStudy(Study):
             # Hyperparameters
             "segment_length_train": 100,
             "segment_overlap_train": 50,
-            # 4096 measured 42 GB on the worst case
-            # (transformer at sweep max, d_model 64, history_len 50, these 100-step segments)
-            # Memory scales linearly with batch and segment_length_train so revisit this cap if segment_length_train grows.
-            "batch_size": 4096,
+            # Memory scales linearly with batch and segment_length_train, see POWER_BALANCE_BATCH_SIZE
+            "batch_size": POWER_BALANCE_BATCH_SIZE,
             # Part of validation, should be left alone during hyperparameter tuning
             "segment_length_val": None,
             "segment_overlap_val": 0,
@@ -285,6 +291,7 @@ class PowerBalanceStudy(Study):
                     "input_vars": POWER_BALANCE_INPUT_VARS,
                     "data_train_run_builder": trb,  # Needed for submodules
                     **dataloader_config_base,
+                    "batch_size": SCALAR_SUBMODULE_BATCH_SIZE,
                 },
                 model_init_config={
                     "nn_depth": 2,

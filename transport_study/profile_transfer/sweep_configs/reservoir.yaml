@@ -4,13 +4,13 @@ metric:
   goal: "minimize"
 early_terminate:
   type: hyperband
-  min_iter: 2
-  eta: 3
+  min_iter: 10
+  eta: 2
 parameters:
   model_init_config:
     parameters:
       reservoir_size:
-        values: [64, 128, 256, 512]
+        values: [16, 32, 64, 128, 256, 512, 1024, 1920]
       spectral_radius:
         distribution: uniform
         min: 0.5

@@ -230,9 +230,9 @@ class ProfileStudy(Study):
             "target_vars": [*PROFILE_TARGET_VARS, "ds_source_idx"],
             **self.target_split_config(case),
             # Hyperparameters
-            # 2048 measured 34.7 GB on the worst torax case
-            # (qlknn, nn 64x4, 8 solver steps),
-            # Throughput saturates here, 4096 gains nothing (1.8 ms/sample at both).
+            # Measured 2026-10-12 on the production stores at sweep-max sizes (scratch/batch_bench), on an A100-80GB:
+            # 2048 gives 126 steps per epoch, torax-qlknn (nn 64x4, 8 solver steps) 37 s per epoch at 1.8 GB.
+            # 4096 and 8192 fit too (7.1 GB) and cut the epoch only to 28 and 23 s while halving the steps.
             "batch_size": 2048,
         }
 

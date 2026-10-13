@@ -22,6 +22,8 @@ def test_config_load():
     cfg = StudyConfig(
         study_name="test_study",
         debug=True,
+        # Above the debug cap, which the default validation interval already sits under
+        epochs_per_val=20,
         dataset_paths={
             "cmod-low": "path/to/cmod_low.nc",
             "cmod-high": "path/to/cmod_high.nc",

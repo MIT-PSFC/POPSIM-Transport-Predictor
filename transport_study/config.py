@@ -126,16 +126,20 @@ class StudyConfig(BaseModel):
     debug: bool = False
     # Keep only the most recent shots of each device, every shot when None (get_ds logs a truncation)
     max_ds_size: int | None = None
-    hyperparam_sweeps: int = 200
-    max_epochs: int = 1000
-    epochs_per_val: int = 20
-    patience: int = 6  # epochs_per_val * patience = max epochs without improvement before stopping
+    # 80 trials per sweep, about 10 per swept dimension (Loeppky, Sacks and Welch 2009, Technometrics 51).
+    # The sweeps vary 5 to 11 hyperparameters, at most 9 continuous, the rest discrete with 3 to 7 levels.
+    # Random search with far fewer trials than a grid matches or beats it (Bergstra and Bengio 2012, JMLR 13),
+    # and these sweeps are Bayesian.
+    hyperparam_sweeps: int = 80
+    max_epochs: int = 120
+    epochs_per_val: int = 1
+    patience: int = 10  # epochs_per_val * patience = max epochs without improvement before stopping
     # Epoch cap for hyperparameter sweep trials and agent jobs
     # Trials are wall-clock limited to train_wall_budget_s and stop early via patience
     # Capped below max_epochs so sweep trials stay cheap.
     # The swept transition_frac is a fraction of each run's own step budget,
     # so a tuned schedule stretches to the production horizon, validated only over this shorter one
-    hyperparam_max_epochs: int = 240
+    hyperparam_max_epochs: int = 100
 
     # Environment-specific orchestration settings
     partition: Orchestration[str | None] = Field(default_factory=lambda: os.environ.get("PTPS_PARTITION"))

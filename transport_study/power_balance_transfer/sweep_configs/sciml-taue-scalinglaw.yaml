@@ -4,8 +4,8 @@ metric:
   goal: "minimize"
 early_terminate:
   type: hyperband
-  min_iter: 2
-  eta: 3
+  min_iter: 10
+  eta: 2
 # The scaling law itself has no NN hyperparameters, its p_oh/p_rad submodules
 # are restored from their own tuned cases. Sweep only training dynamics.
 parameters:

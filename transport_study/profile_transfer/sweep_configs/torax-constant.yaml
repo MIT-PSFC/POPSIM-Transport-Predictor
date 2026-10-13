@@ -4,14 +4,14 @@ metric:
   goal: "minimize"
 early_terminate:
   type: hyperband
-  min_iter: 2
-  eta: 3
+  min_iter: 10
+  eta: 2
 parameters:
   model_init_config:
     parameters:
       # Width and depth are shared by the three coefficient MLPs (transport, sources, edge)
       nn_width:
-        values: [8, 16, 32, 64]
+        values: [24, 40, 64, 96, 144]
       nn_depth:
         values: [1, 2, 3, 4]
       # Relaxation length in fixed 25 ms steps (trb.RELAXATION_DT_S), the window has no other knob
