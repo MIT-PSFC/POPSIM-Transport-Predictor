@@ -21,6 +21,8 @@ from transport_study.orchestration.comparison_figures import (
     DA_COLORS,
     DA_LABELS,
     DIVERGED_THRESHOLD,
+    MODEL_SIZE_COLORS,
+    MODEL_SIZE_LABELS,
     NORM_COLORS,
     NORM_LABELS,
     ORDER_COLORS,
@@ -90,6 +92,7 @@ LAYOUT = ComparisonLayout(
         "freeze_shapes",
         "geometry_builder",
         "target_shot_order",
+        "model_size",
     ),
     field_tokens={
         "model_type": "{}",
@@ -99,6 +102,7 @@ LAYOUT = ComparisonLayout(
         "freeze_shapes": "freeze_{}",
         "geometry_builder": "geom_{}",
         "target_shot_order": "order_{}",
+        "model_size": "size_{}",
     },
     value_labels={
         "model_type": MODEL_LABELS,
@@ -107,6 +111,7 @@ LAYOUT = ComparisonLayout(
         "domain_adaptation": DA_LABELS,
         "geometry_builder": GEOM_LABELS,
         "target_shot_order": ORDER_LABELS,
+        "model_size": MODEL_SIZE_LABELS,
     },
 )
 
@@ -123,6 +128,8 @@ COMPARISON_FAMILIES = (
     ),
     # Without target shots every case takes the base order, so the other orders start at 1 target shot
     ComparisonFamily("target_shot_order_comparison", "target_shot_order", "Target shot order comparison", ORDER_COLORS, min_series=2),
+    # Only renders in a study that varies the model size, borrowing the tuned-size cases from its primary
+    ComparisonFamily("model_size_comparison", "model_size", "Model size comparison", MODEL_SIZE_COLORS, min_series=2),
 )
 
 

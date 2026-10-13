@@ -21,6 +21,7 @@ from transport_study.modules.power_balance.module import (
 )
 from transport_study.orchestration.case_analysis import run_summary_analysis
 from transport_study.orchestration.study import (
+    BASE_MODEL_SIZE,
     CaseGridConfig,
     ModelTrainSpec,
     Study,
@@ -61,12 +62,13 @@ SCALAR_SUBMODULE_SETTINGS = {
 }
 
 # Training batches, shared with the transport study's power balance pseudo-types.
-# Measured 2026-10-12 on the production stores at sweep-max sizes (scratch/batch_bench):
-# Wtot segment batches of 1024 give 67 steps per epoch, the transformer peaking at 11 GB on a GPU and 14 GB on a 16G CPU job,
-# where 2048 is OOM-killed.
-POWER_BALANCE_BATCH_SIZE = 1024
-# p_oh / p_rad timeslice batches of 16384 give about 190 steps per epoch at 0.2 GB on a GPU
-SCALAR_SUBMODULE_BATCH_SIZE = 16384
+# Every loader family's batch is set so its steps per epoch match the transport study's 32 (TRANSPORT_BATCH_SIZE),
+# one step clock across the project.
+# Measured 2026-10-13 on the production stores at the sweep maxima (scratch/batch_bench_uniform), on an A100-80GB:
+# Wtot segment batches of 2048 give 33 steps per epoch, the transformer 7.6 s per epoch at 18 GB.
+POWER_BALANCE_BATCH_SIZE = 2048
+# p_oh / p_rad timeslice batches of 98304 give 31 / 34 steps per epoch, under 1 s per epoch at 0.3 GB
+SCALAR_SUBMODULE_BATCH_SIZE = 98304
 
 # Fallback loss hyperparameters of every power balance case run without a tuned config,
 # also those of the transport study's power balance pseudo-types (p_oh, p_rad, power_balance)
@@ -195,11 +197,12 @@ class PowerBalanceStudy(Study):
             num_target_shots: int,
             target_shot_order: str = BASE_TARGET_SHOT_ORDER,
             multiobjective: bool = False,
+            model_size: str = BASE_MODEL_SIZE,
         ):
             self.data_normalization = data_normalization
             self.freeze_submodules = freeze_submodules
             self.multiobjective = multiobjective
-            self.init_common(model_type, training_data, domain_adaptation, num_target_shots, target_shot_order)
+            self.init_common(model_type, training_data, domain_adaptation, num_target_shots, target_shot_order, model_size)
 
         def normalization_method(self) -> str | None:
             return self.data_normalization
@@ -229,7 +232,8 @@ class PowerBalanceStudy(Study):
             return pinned
 
         def model_type_prereqs(self) -> list[Study.Case]:
-            # The structured models restore pre-trained p_oh/p_rad submodules
+            # The structured models restore pre-trained p_oh/p_rad submodules at the case's own model size,
+            # so a sized case sizes the whole model
             if self.model_type in MODEL_TYPES_WITH_SUBMODULES:
                 return [
                     self.replace(model_type=submodule_type, freeze_submodules=config.hyperparam_freeze_submodules)

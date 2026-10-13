@@ -18,6 +18,7 @@ import xarray as xr
 from transport_study.config import CaseAxis, StudyConfig
 from transport_study.orchestration.case_metrics import case_metrics_path
 from transport_study.orchestration.study import (
+    BASE_MODEL_SIZE,
     CaseGridConfig,
     Study,
     write_netcdf_atomic,
@@ -51,6 +52,7 @@ class StubCase:
     training_data: SimpleNamespace = field(default_factory=lambda: SimpleNamespace(sources=[], exnihilo=False))
     domain_adaptation: str | None = None
     target_shot_order: str = BASE_TARGET_SHOT_ORDER
+    model_size: str = BASE_MODEL_SIZE
     # A hyperparam case also owns sweep agent jobs
     hyperparam: bool = False
 

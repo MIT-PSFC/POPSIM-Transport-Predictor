@@ -28,6 +28,7 @@ def _results_ds() -> xr.Dataset:
         "freeze_submodules": "none",
         "multiobjective": False,
         "target_shot_order": "ascending",
+        "model_size": "sweep",
     }
     return xr.Dataset(
         data_vars={
@@ -71,7 +72,9 @@ def test_write_comparison_tables(tmp_path):
     assert len(df) == 2
     assert "p_oh" not in set(df["model_type"])
 
-    table_path = tmp_path / "tables" / "model_type" / "td_cmod.norm_physics.da_none.freeze_none.mo_False.targ_0.order_ascending.md"
+    table_path = (
+        tmp_path / "tables" / "model_type" / "td_cmod.norm_physics.da_none.freeze_none.mo_False.targ_0.order_ascending.size_sweep.md"
+    )
     content = table_path.read_text()
     assert "| sciml-taue-nn |" in content
     assert "| sciml-taue-scalinglaw |" in content
@@ -79,7 +82,9 @@ def test_write_comparison_tables(tmp_path):
 
 def test_missing_metrics_render_as_dash(tmp_path):
     write_summary_comparison_tables(_results_ds(), xr.Dataset(), SPEC, tmp_path)
-    table_path = tmp_path / "tables" / "model_type" / "td_cmod.norm_physics.da_none.freeze_none.mo_False.targ_0.order_ascending.md"
+    table_path = (
+        tmp_path / "tables" / "model_type" / "td_cmod.norm_physics.da_none.freeze_none.mo_False.targ_0.order_ascending.size_sweep.md"
+    )
     content = table_path.read_text()
     assert "| sciml-taue-nn | - |" in content
 

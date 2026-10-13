@@ -36,6 +36,7 @@ from transport_study.orchestration.case_reports import generate_case_reports
 from transport_study.orchestration.comparison_figures import comparison_figures
 from transport_study.orchestration.organize_data import PROFILE_TARGET_VARS
 from transport_study.orchestration.study import (
+    BASE_MODEL_SIZE,
     CaseGridConfig,
     ModelTrainSpec,
     Study,
@@ -65,6 +66,12 @@ STUDY_MODEL_TYPES = (*MODEL_TYPES_WITH_SHAPES, *MODEL_TYPES_WITHOUT_SHAPES)
 
 # The physical inputs every profile-predictor model consumes
 PROFILE_INPUT_VARS = list(NN_INPUT_SOURCE_VARS)
+
+# Timeslice batch, shared with the transport study's profile pseudo-type,
+# set so the profile loaders train the transport study's 32 steps per epoch (TRANSPORT_BATCH_SIZE).
+# Measured 2026-10-13 on the production stores at the sweep maxima (scratch/batch_bench_uniform), on an A100-80GB:
+# 8192 gives 31 steps per epoch, torax-qlknn 24 s and torax-gyrobohm 8.7 s per epoch at 7.2 GB (39 and 21 s at 2048).
+PROFILE_BATCH_SIZE = 8192
 
 # What collect_results reads of a result file
 PROFILE_SUMMARY_RESULT_VARS = [
@@ -214,11 +221,12 @@ class ProfileStudy(Study):
             geometry_builder: str = "circular",
             data_normalization: str = "physics",
             target_shot_order: str = BASE_TARGET_SHOT_ORDER,
+            model_size: str = BASE_MODEL_SIZE,
         ):
             self.data_normalization = data_normalization
             self.freeze_shapes = freeze_shapes
             self.geometry_builder = geometry_builder
-            self.init_common(model_type, training_data, domain_adaptation, num_target_shots, target_shot_order)
+            self.init_common(model_type, training_data, domain_adaptation, num_target_shots, target_shot_order, model_size)
 
     #############
     # EXECUTION #
@@ -230,10 +238,7 @@ class ProfileStudy(Study):
             "target_vars": [*PROFILE_TARGET_VARS, "ds_source_idx"],
             **self.target_split_config(case),
             # Hyperparameters
-            # Measured 2026-10-12 on the production stores at sweep-max sizes (scratch/batch_bench), on an A100-80GB:
-            # 2048 gives 126 steps per epoch, torax-qlknn (nn 64x4, 8 solver steps) 37 s per epoch at 1.8 GB.
-            # 4096 and 8192 fit too (7.1 GB) and cut the epoch only to 28 and 23 s while halving the steps.
-            "batch_size": 2048,
+            "batch_size": PROFILE_BATCH_SIZE,
         }
 
     def base_loss_config(self, case: Case) -> dict:

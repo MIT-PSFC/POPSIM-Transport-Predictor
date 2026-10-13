@@ -82,3 +82,25 @@ def test_sciml_rejects_multiobjective(loaded_config):
     # The sciml types anchor their submodules regardless, the axis does not apply to them
     with pytest.raises(ValueError, match="multiobjective should be a dummy value"):
         _case(multiobjective=True)
+
+
+def test_model_size_case_name_shared_sweep_and_prereq_sizes(loaded_config):
+    """A max-size case carries size_max and tunes on the plain case's sweep.
+    Its p_oh / p_rad prereqs and its pretrain twin take its size, so the whole model is sized.
+    """
+    case = _case(freeze_submodules=False, domain_adaptation="transfer", num_target_shots=3, model_size="max")
+    assert str(case) == "case.sciml-taue-nn.td_cmod-low1.norm_coral.size_max.targ_3.da_transfer"
+    plain_case = case.replace(model_size="sweep")
+    assert case.get_hyperparam_prereq() == plain_case.get_hyperparam_prereq()
+    submodule_prereqs = [prereq for prereq in case.prereqs if prereq.model_type in ("p_oh", "p_rad")]
+    assert [str(prereq) for prereq in submodule_prereqs] == [
+        "case.p_oh.td_cmod-low1.norm_coral.size_max.targ_3.da_transfer",
+        "case.p_rad.td_cmod-low1.norm_coral.size_max.targ_3.da_transfer",
+    ]
+    assert case.transfer_pretrain_case().model_size == "max"
+
+
+def test_scalinglaw_sizes_through_its_submodules(loaded_config):
+    # The scaling law's own coefficients are not a swept net, its p_oh / p_rad nets are
+    case = _case(model_type="sciml-taue-scalinglaw", freeze_submodules=False, model_size="half")
+    assert [prereq.model_size for prereq in case.prereqs if prereq.model_type in ("p_oh", "p_rad")] == ["half", "half"]

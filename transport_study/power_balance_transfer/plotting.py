@@ -16,6 +16,8 @@ from transport_study.orchestration.comparison_figures import (
     DA_LABELS,
     FREEZE_COLORS,
     FREEZE_LABELS,
+    MODEL_SIZE_COLORS,
+    MODEL_SIZE_LABELS,
     MULTIOBJECTIVE_COLORS,
     MULTIOBJECTIVE_LABELS,
     NORM_COLORS,
@@ -73,6 +75,7 @@ LAYOUT = ComparisonLayout(
         "freeze_submodules",
         "multiobjective",
         "target_shot_order",
+        "model_size",
     ),
     field_tokens={
         "model_type": "{}",
@@ -82,6 +85,7 @@ LAYOUT = ComparisonLayout(
         "freeze_submodules": "freeze_{}",
         "multiobjective": "mo_{}",
         "target_shot_order": "order_{}",
+        "model_size": "size_{}",
     },
     value_labels={
         "model_type": MODEL_LABELS,
@@ -91,6 +95,7 @@ LAYOUT = ComparisonLayout(
         "freeze_submodules": FREEZE_LABELS,
         "multiobjective": MULTIOBJECTIVE_LABELS,
         "target_shot_order": ORDER_LABELS,
+        "model_size": MODEL_SIZE_LABELS,
     },
     excluded_model_types=SUBMODULE_MODEL_TYPES,
 )
@@ -107,4 +112,6 @@ COMPARISON_FAMILIES = (
     # Both only render in the child studies that vary them (hs1_pb_freeze, hs1_pb_multiobjective)
     ComparisonFamily("freeze_submodules_comparison", "freeze_submodules", "Frozen vs unfrozen submodules", FREEZE_COLORS, min_series=2),
     ComparisonFamily("multiobjective_comparison", "multiobjective", "Multiobjective comparison", MULTIOBJECTIVE_COLORS, min_series=2),
+    # Only renders in a study that varies the model size, borrowing the tuned-size cases from its primary
+    ComparisonFamily("model_size_comparison", "model_size", "Model size comparison", MODEL_SIZE_COLORS, min_series=2),
 )

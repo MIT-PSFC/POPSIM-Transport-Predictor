@@ -11,6 +11,8 @@ from transport_study.modules.transport_predictor.module import SUBMODULE_MODEL_T
 from transport_study.orchestration.comparison_figures import (
     DA_COLORS,
     DA_LABELS,
+    MODEL_SIZE_COLORS,
+    MODEL_SIZE_LABELS,
     MULTIOBJECTIVE_COLORS,
     MULTIOBJECTIVE_LABELS,
     ORDER_COLORS,
@@ -61,6 +63,7 @@ LAYOUT = ComparisonLayout(
         "torax_state",
         "multiobjective",
         "target_shot_order",
+        "model_size",
     ),
     field_tokens={
         "model_type": "{}",
@@ -71,6 +74,7 @@ LAYOUT = ComparisonLayout(
         "torax_state": "tstate_{}",
         "multiobjective": "mo_{}",
         "target_shot_order": "order_{}",
+        "model_size": "size_{}",
     },
     value_labels={
         "model_type": MODEL_LABELS,
@@ -78,6 +82,7 @@ LAYOUT = ComparisonLayout(
         "domain_adaptation": DA_LABELS,
         "multiobjective": MULTIOBJECTIVE_LABELS,
         "target_shot_order": ORDER_LABELS,
+        "model_size": MODEL_SIZE_LABELS,
     },
     excluded_model_types=SUBMODULE_MODEL_TYPES,
 )
@@ -90,4 +95,6 @@ COMPARISON_FAMILIES = (
     ComparisonFamily("target_shot_order_comparison", "target_shot_order", "Target shot order comparison", ORDER_COLORS, min_series=2),
     # Only renders in a study that varies it (hs1_transport_multiobjective)
     ComparisonFamily("multiobjective_comparison", "multiobjective", "Multiobjective comparison", MULTIOBJECTIVE_COLORS, min_series=2),
+    # Only renders in a study that varies the model size, borrowing the tuned-size cases from its primary
+    ComparisonFamily("model_size_comparison", "model_size", "Model size comparison", MODEL_SIZE_COLORS, min_series=2),
 )

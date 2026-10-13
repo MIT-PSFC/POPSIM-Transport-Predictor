@@ -60,6 +60,12 @@ def test_weighted_case_name(loaded_config):
     assert str(case) == "case.shape-init-pca.td_cmod-low1.norm_physics-coral.freeze_True.geom_circular.targ_3.da_weighted"
 
 
+def test_model_size_case_name(loaded_config):
+    # The base size leaves no token, every other size follows the geom_ token
+    case = _case(domain_adaptation="weighted", num_target_shots=3, model_size="min")
+    assert str(case) == "case.shape-init-pca.td_cmod-low1.norm_physics.freeze_True.geom_circular.size_min.targ_3.da_weighted"
+
+
 def test_target_shot_order_case_name(loaded_config):
     case = _case(model_type="mlp", training_data="exnihilo", num_target_shots=7, target_shot_order="descending")
     assert str(case) == "case.mlp.td_exnihilo.norm_physics.freeze_True.geom_circular.targ_7.order_descending"
@@ -78,6 +84,14 @@ def test_target_shot_order_case_name(loaded_config):
         {"freeze_shapes": False, "domain_adaptation": "transfer", "num_target_shots": 3},
         {"domain_adaptation": "weighted", "num_target_shots": 3, "target_shot_order": "spanning"},
         {"model_type": "mlp", "training_data": "exnihilo", "num_target_shots": 7, "target_shot_order": "descending"},
+        {"model_size": "max"},
+        {
+            "model_type": "reservoir",
+            "domain_adaptation": "weighted",
+            "num_target_shots": 3,
+            "target_shot_order": "spanning",
+            "model_size": "half",
+        },
     ],
 )
 def test_checkpoint_parser_round_trip(loaded_config, overrides):

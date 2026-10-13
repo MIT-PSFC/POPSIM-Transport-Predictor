@@ -7,7 +7,7 @@ from transport_study.modules.profile_predictor.module import ProfilePredictor
 from transport_study.modules.profile_predictor.trb import (
     ProfilePredictorTRB,
 )
-from transport_study.orchestration.study import HYPERPARAM_TARGET_SHOTS
+from transport_study.orchestration.study import BASE_MODEL_SIZE, HYPERPARAM_TARGET_SHOTS
 from transport_study.orchestration.target_shots import BASE_TARGET_SHOT_ORDER
 from transport_study.profile_transfer.profile_study import ProfileStudy
 
@@ -16,11 +16,12 @@ def checkpoint_to_profile_case(checkpoint_dir: Path | str) -> ProfileStudy.Case:
     """Parse a case directory name back into a ProfileStudy.Case.
 
     Mirrors ProfileStudy.Case.__str__:
-    case.{model_type}.td_{td}.norm_{n}[.freeze_True].geom_{g}                                 source-trained, no adaptation
-    case.{model_type}.td_{td}.norm_{n}[.freeze_True].geom_{g}.targ_{n}[.order_{o}]            exnihilo
-    case.{model_type}.td_{td}.norm_{n}[.freeze_True].geom_{g}.targ_{n}[.order_{o}].da_{da}    domain adaptation
+    case.{model_type}.td_{td}.norm_{n}[.freeze_True].geom_{g}[.size_{s}]                                 source-trained, no adaptation
+    case.{model_type}.td_{td}.norm_{n}[.freeze_True].geom_{g}[.size_{s}].targ_{n}[.order_{o}]            exnihilo
+    case.{model_type}.td_{td}.norm_{n}[.freeze_True].geom_{g}[.size_{s}].targ_{n}[.order_{o}].da_{da}    domain adaptation
 
     The freeze_ token is suppressed for unfrozen shapes (see Study.Case.STR_TOKEN_FIELDS),
+    the size_ token for the base model size,
     the order_ token for the base target shot order,
     norm_ and geom_ are mandatory and fixed in position.
     """
@@ -45,6 +46,11 @@ def checkpoint_to_profile_case(checkpoint_dir: Path | str) -> ProfileStudy.Case:
         raise ValueError(f"Unexpected case name format: {case_name}")
     geometry_builder = pieces[idx].removeprefix("geom_")
     idx += 1
+
+    model_size = BASE_MODEL_SIZE
+    if idx < len(pieces) and pieces[idx].startswith("size_"):
+        model_size = pieces[idx].removeprefix("size_")
+        idx += 1
 
     num_target_shots = HYPERPARAM_TARGET_SHOTS
     target_shot_order = BASE_TARGET_SHOT_ORDER
@@ -71,6 +77,7 @@ def checkpoint_to_profile_case(checkpoint_dir: Path | str) -> ProfileStudy.Case:
         num_target_shots=num_target_shots,
         geometry_builder=geometry_builder,
         target_shot_order=target_shot_order,
+        model_size=model_size,
     )
 
 

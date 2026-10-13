@@ -115,3 +115,14 @@ def test_sciml_rejects_multiobjective(loaded_config):
     # sciml always anchors its submodules, the axis does not apply to it
     with pytest.raises(ValueError, match="multiobjective should be a dummy value"):
         _case(multiobjective=True)
+
+
+def test_model_size_case_name_and_sized_sciml_prereqs(loaded_config):
+    case = _case(model_type="transformer", domain_adaptation="weighted", num_target_shots=3, model_size="half")
+    assert str(case) == "case.transformer.td_cmod-low1.freeze_True.size_half.targ_3.da_weighted"
+    # sciml composes its prereqs' nets, so they and the power balance's p_oh / p_rad take its size
+    sciml_case = _case(freeze_submodules=False, model_size="max")
+    prereq_sizes = {prereq.model_type: prereq.model_size for prereq in sciml_case.prereqs if not prereq.is_hyperparam_case()}
+    assert prereq_sizes == {"power_balance": "max", "profile": "max"}
+    power_balance_prereq = next(prereq for prereq in sciml_case.prereqs if prereq.model_type == "power_balance")
+    assert [prereq.model_size for prereq in power_balance_prereq.prereqs if prereq.model_type in ("p_oh", "p_rad")] == ["max", "max"]

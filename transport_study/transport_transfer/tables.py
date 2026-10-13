@@ -1,7 +1,7 @@
 """Per-axis comparison tables for transport transfer study results.
 
 For every case axis (model type, training dataset, domain adaptation,
-geometry builder, torax state, multiobjective, number of target shots, target shot order) and every combination
+geometry builder, torax state, multiobjective, number of target shots, target shot order, model size) and every combination
 of the remaining axes, one markdown table comparing the cases that differ only
 along that axis. Columns combine the stage-resolved TIME-AVERAGED errors from
 collected_metrics.nc (per-timeslice means, free of the shot-duration confound
@@ -27,6 +27,7 @@ CASE_FIELD_ORDER = (
     "multiobjective",
     "num_target_shots",
     "target_shot_order",
+    "model_size",
 )
 
 SPEC = ComparisonTableSpec(
@@ -41,6 +42,7 @@ SPEC = ComparisonTableSpec(
         "multiobjective",
         "num_target_shots",
         "target_shot_order",
+        "model_size",
     ),
     case_field_order=CASE_FIELD_ORDER,
     # Filename tokens per grouping field, mirroring the case-string vocabulary
@@ -54,6 +56,7 @@ SPEC = ComparisonTableSpec(
         "multiobjective": "mo_{}",
         "num_target_shots": "targ_{}",
         "target_shot_order": "order_{}",
+        "model_size": "size_{}",
     },
     columns=(
         ("combined chi (time avg)", "combined_mean_all"),

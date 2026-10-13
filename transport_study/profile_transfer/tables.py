@@ -41,6 +41,7 @@ CASE_FIELD_ORDER = (
     "geometry_builder",
     "num_target_shots",
     "target_shot_order",
+    "model_size",
 )
 
 SPEC = ComparisonTableSpec(
@@ -56,6 +57,7 @@ SPEC = ComparisonTableSpec(
         "geometry_builder": "geom_{}",
         "num_target_shots": "targ_{}",
         "target_shot_order": "order_{}",
+        "model_size": "size_{}",
     },
     columns=(
         ("combined (time avg)", "combined_mean_all"),

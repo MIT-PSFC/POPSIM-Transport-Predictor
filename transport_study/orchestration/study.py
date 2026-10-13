@@ -113,6 +113,15 @@ HYPERPARAM_TARGET_SHOTS = 0
 # A case can also be a transfer_pretrain twin, which no grid lists (see Study.Case.transfer_pretrain_case)
 DOMAIN_ADAPTATION_METHODS = (None, "weighted", "addition", "transfer")
 
+# The architecture sizes of the model_size case axis (see model_size_updates).
+# BASE_MODEL_SIZE trains the tuned config, every other size swaps only its architecture size.
+MODEL_SIZES = ("sweep", "min", "max", "half")
+BASE_MODEL_SIZE = "sweep"
+# The hyperparameters min / max move to the ends of their sweep grids
+SIZE_HYPERPARAMETERS = ("nn_width", "nn_depth", "d_model", "reservoir_size")
+# The ones half halves, depth stays tuned
+WIDTH_HYPERPARAMETERS = ("nn_width", "d_model", "reservoir_size")
+
 # Abort the run once a single case has been launched this many times without a result file, guards against deterministically failing jobs being resubmitted forever
 MAX_TRAIN_ATTEMPTS = 3
 
@@ -193,6 +202,31 @@ def transfer_lr_scale(steps_per_epoch: int, max_epochs: int) -> float:
     return min(1.0, max(TRANSFER_LR_FLOOR, max_epochs / total_steps))
 
 
+def model_size_updates(model_size: str, sweep_model_init_parameters: dict, model_init_config: dict) -> dict:
+    """The model_init_config entries a model size overrides, only among the size hyperparameters the model type's sweep lists.
+
+    min / max take the smallest / largest value of each SIZE_HYPERPARAMETERS grid.
+    half halves each tuned WIDTH_HYPERPARAMETERS value and keeps the depth.
+    A halved d_model stays a multiple of num_heads and at least num_heads, so every attention head keeps a dimension.
+    Everything else keeps its tuned value.
+    """
+    size_grids = {name: spec["values"] for name, spec in sweep_model_init_parameters.items() if name in SIZE_HYPERPARAMETERS}
+    if model_size == BASE_MODEL_SIZE:
+        return {}
+    if model_size == "min":
+        return {name: min(values) for name, values in size_grids.items()}
+    if model_size == "max":
+        return {name: max(values) for name, values in size_grids.items()}
+    if model_size == "half":
+        updates = {name: model_init_config[name] // 2 for name in size_grids if name in WIDTH_HYPERPARAMETERS}
+        if "d_model" in updates:
+            num_heads = model_init_config["num_heads"]
+            d_model_head_multiple = updates["d_model"] // num_heads * num_heads
+            updates["d_model"] = max(num_heads, d_model_head_multiple)
+        return updates
+    raise ValueError(f"Unknown model size {model_size!r}, must be one of {MODEL_SIZES}")
+
+
 def write_netcdf_atomic(ds: xr.Dataset, path: Path | str) -> None:
     """Write ds to path through a temporary file, so a partial file is never visible at path.
 
@@ -238,6 +272,8 @@ class CaseGridConfig(StudyConfig):
     domain_adaptation_methods: Annotated[tuple[str | None, ...], CaseAxis("domain_adaptation")] = DOMAIN_ADAPTATION_METHODS
     # The orders a case adds its target training shots in, see orchestration/target_shots.py
     target_shot_orders: Annotated[tuple[str, ...], CaseAxis("target_shot_order")] = (BASE_TARGET_SHOT_ORDER,)
+    # The architecture sizes each case trains at, see model_size_updates
+    model_sizes: Annotated[tuple[str, ...], CaseAxis("model_size")] = (BASE_MODEL_SIZE,)
     # The held-out target test set, never trained on, defined by exactly one of the two:
     # the target_test_set_size highest-hazard target shots,
     # or every target shot at or above the hazard of the lowest named target_test_shots shot
@@ -290,6 +326,14 @@ class CaseGridConfig(StudyConfig):
         invalid = [order for order in v if order not in TARGET_SHOT_ORDERS]
         if invalid:
             raise ValueError(f"Invalid target shot orders: {invalid}. Must be among {TARGET_SHOT_ORDERS}.")
+        return v
+
+    @field_validator("model_sizes")
+    @classmethod
+    def _validate_model_sizes(cls, v: tuple[str, ...]) -> tuple[str, ...]:
+        invalid = [model_size for model_size in v if model_size not in MODEL_SIZES]
+        if invalid:
+            raise ValueError(f"Invalid model sizes: {invalid}. Must be among {MODEL_SIZES}.")
         return v
 
     @field_validator("domain_adaptation_methods", "hyperparam_domain_adaptation")
@@ -403,6 +447,8 @@ class Study:
         # The order the target training shots are added in (see orchestration/target_shots.py),
         # always the base order without target shots in training
         target_shot_order: str
+        # The architecture size, BASE_MODEL_SIZE trains the tuned config (see model_size_updates)
+        model_size: str
         # Cases this one depends on, run first (None when independent)
         prereqs: list[Study.Case] | None
 
@@ -417,7 +463,7 @@ class Study:
         # Per-case fields with a config.hyperparam_<name> counterpart
         HYPERPARAM_FIELDS: ClassVar[tuple[str, ...]] = ()
 
-        def init_common(self, model_type, training_data, domain_adaptation, num_target_shots, target_shot_order):
+        def init_common(self, model_type, training_data, domain_adaptation, num_target_shots, target_shot_order, model_size):
             """Shared between every subclass __init__: parse, validate, build prereqs."""
             if isinstance(training_data, str):
                 training_data = parse_training_data(training_data, dict(config.dataset_paths), config.target_device)
@@ -426,6 +472,7 @@ class Study:
             self.domain_adaptation = domain_adaptation
             self.num_target_shots = num_target_shots
             self.target_shot_order = target_shot_order
+            self.model_size = model_size
             self.validate()
             prereqs = self._build_prereqs()
             self.prereqs = prereqs if prereqs else None
@@ -439,6 +486,8 @@ class Study:
                 raise ValueError(f"Unknown target shot order: {self.target_shot_order}")
             if self.domain_adaptation not in (*DOMAIN_ADAPTATION_METHODS, "transfer_pretrain"):
                 raise ValueError(f"Unknown domain adaptation: {self.domain_adaptation!r}")
+            if self.model_size not in MODEL_SIZES:
+                raise ValueError(f"Unknown model size: {self.model_size!r}")
             if self.num_target_shots == 0 and self.target_shot_order != BASE_TARGET_SHOT_ORDER:
                 raise ValueError(f"target_shot_order {self.target_shot_order} needs target shots in training, this case has none")
             if self.domain_adaptation is None:
@@ -496,8 +545,13 @@ class Study:
 
         @classmethod
         def _hyperparam_field_values(cls) -> dict:
-            # Every target shot order shares the base order's hyperparam case and sweep
-            values = {"training_data": Study._hyperparam_training_data(), "target_shot_order": BASE_TARGET_SHOT_ORDER}
+            # Every target shot order shares the base order's hyperparam case and sweep,
+            # and every model size the tuned config of the plain case
+            values = {
+                "training_data": Study._hyperparam_training_data(),
+                "target_shot_order": BASE_TARGET_SHOT_ORDER,
+                "model_size": BASE_MODEL_SIZE,
+            }
             for name in cls.HYPERPARAM_FIELDS:
                 values[name] = getattr(config, f"hyperparam_{name}")
             return values
@@ -562,6 +616,9 @@ class Study:
                 if len(token) == 3 and value == token[2]:
                     continue
                 parts.append(f"{prefix}{value}")
+            # Omitted at the base size, so the names from before the axis existed stay unchanged
+            if self.model_size != BASE_MODEL_SIZE:
+                parts.append(f"size_{self.model_size}")
             if self.domain_adaptation or self.training_data.exnihilo:
                 parts.append(f"targ_{self.num_target_shots}")
                 if self.target_shot_order != BASE_TARGET_SHOT_ORDER:
@@ -1055,6 +1112,9 @@ class Study:
             train_config_base = self._set_transfer_checkpoint(train_config_base, case.transfer_pretrain_case())
 
         train_config = self._apply_tuned_config(case, train_config_base)
+        # Outside _apply_tuned_config, which returns early without a tuned config
+        if case.model_size != BASE_MODEL_SIZE:
+            train_config = self._apply_model_size(case, train_config)
 
         # Every case trains the same steps per epoch, measured on the final loader config (see steps_per_epoch)
         steps_per_epoch = self.steps_per_epoch(train_config)
@@ -1100,6 +1160,29 @@ class Study:
                 }
             }
         )
+
+    def _apply_model_size(self, case: Case, train_config: TrainConfig) -> TrainConfig:
+        """Swap the tuned architecture size for the case's model size, every other hyperparameter stays tuned (see model_size_updates)."""
+        sweep_model_init_parameters = self.sweep_model_init_parameters(case.model_type)
+        size_updates = model_size_updates(case.model_size, sweep_model_init_parameters, train_config.model_init_config)
+        logger.info(f"Model size {case.model_size} of case {case}: {size_updates}")
+        return train_config.model_copy(update={"model_init_config": {**train_config.model_init_config, **size_updates}})
+
+    @classmethod
+    def sweep_config(cls, model_type: str) -> dict:
+        """The wandb sweep config of a model type, its yaml in SWEEP_CONFIG_DIR."""
+        sweep_config_path = Path(cls.SWEEP_CONFIG_DIR) / f"{model_type}.yaml"
+        return load_dict(str(sweep_config_path))
+
+    @classmethod
+    def sweep_model_init_parameters(cls, model_type: str) -> dict:
+        """The model_init_config parameters a model type's sweep varies, none for a model type without a swept net of its own.
+
+        sciml-taue-scalinglaw and the transport sciml sweep their optimizer alone, their nets are their prereqs'.
+        """
+        sweep_config = cls.sweep_config(model_type)
+        model_init_sweep = sweep_config["parameters"].get("model_init_config", {})
+        return model_init_sweep.get("parameters", {})
 
     def base_optimizer_config(self) -> dict:
         """Fallback optimizer hyperparameters for cases run without a tuned config."""
@@ -1594,8 +1677,7 @@ class Study:
 
         if not sweep_id:
             logger.info(f"No existing sweep found for case {case}, creating a new sweep")
-            sweep_config_path = Path(self.SWEEP_CONFIG_DIR) / f"{case.model_type}.yaml"
-            sweep_config = load_dict(str(sweep_config_path))
+            sweep_config = self.sweep_config(case.model_type)
             sweep_id = wandb.sweep(sweep_config, entity=config.wandb_entity, project=wandb_project_name)
 
         if enable_parallelism:

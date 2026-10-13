@@ -34,6 +34,7 @@ from transport_study.modules.transport_predictor.train_configs import (
 from transport_study.orchestration.case_analysis import run_summary_analysis
 from transport_study.orchestration.organize_data import PROFILE_TARGET_VARS
 from transport_study.orchestration.study import (
+    BASE_MODEL_SIZE,
     CaseGridConfig,
     ModelTrainSpec,
     Study,
@@ -46,7 +47,10 @@ from transport_study.power_balance_transfer.power_balance_study import (
     SCALAR_SUBMODULE_BATCH_SIZE,
     SCALAR_SUBMODULE_SETTINGS,
 )
-from transport_study.profile_transfer.profile_study import PROFILE_INPUT_VARS
+from transport_study.profile_transfer.profile_study import (
+    PROFILE_BATCH_SIZE,
+    PROFILE_INPUT_VARS,
+)
 from transport_study.transport_transfer.data_visualization import DataVisualization
 from transport_study.transport_transfer.plotting import COMPARISON_FAMILIES, LAYOUT
 from transport_study.transport_transfer.tables import SPEC as TABLE_SPEC
@@ -82,6 +86,16 @@ TRANSPORT_TARGET_VARS = [*PROFILE_TARGET_VARS, "fresh_profile", "fresh_equilibri
 MEASURED_POWER_VARS = ["power_ohm_MW", "power_radiated_MW"]
 # The signals a multiobjective case anchors, the ones TORAX infers from its state (no P_rad, see TransportPredictorToraxBase)
 MULTIOBJECTIVE_TARGET_VARS = ["energy_mhd_MJ", "power_ohm_MW"]
+
+# Segment batch of the top-level cases, the largest that every transport model type fits at its sweep maximum.
+# Its 32 steps per epoch are the project's step clock, every other loader family's batch matches them.
+# Every torax sample runs a 100-step differentiated TORAX rollout (jax.checkpoint remat, see TransportPredictorToraxBase).
+# Measured 2026-10-13 on the production stores at the sweep maxima (scratch/batch_bench_uniform), on an A100-80GB:
+# - torax-gyrobohm 155 s and torax-qlknn 221 s per epoch at 15 and 17 GB, against 268 and 347 s at 1024.
+# - The transformer peaks at 72 GB, inside the 90 percent XLA pool of slurm_utils.GPU_JOB_ENV,
+#   and runs out of memory at 3072 (one 100 GB buffer).
+# - Every training process holds ~62 GB of host memory.
+TRANSPORT_BATCH_SIZE = 2048
 
 # Everything the env may need to seed a state at the segment start: the
 # measured profiles (transformer buffer / torax initial condition), the stored
@@ -260,12 +274,13 @@ class TransportStudy(Study):
             torax_state: str = "rebuild",
             target_shot_order: str = BASE_TARGET_SHOT_ORDER,
             multiobjective: bool = False,
+            model_size: str = BASE_MODEL_SIZE,
         ):
             self.freeze_submodules = freeze_submodules
             self.geometry_builder = geometry_builder
             self.torax_state = torax_state
             self.multiobjective = multiobjective
-            self.init_common(model_type, training_data, domain_adaptation, num_target_shots, target_shot_order)
+            self.init_common(model_type, training_data, domain_adaptation, num_target_shots, target_shot_order, model_size)
 
         def normalization_method(self) -> str | None:
             # Study-wide settings, not case axes
@@ -311,6 +326,7 @@ class TransportStudy(Study):
         def model_type_prereqs(self) -> list[Study.Case]:
             # sciml restores a pre-trained power balance and profile predictor.
             # The power balance itself restores pre-trained p_oh/p_rad.
+            # Every prereq is built at the case's own model size, so a sized case sizes the whole model.
             if self.model_type == "sciml":
                 submodule_types = ("power_balance", "profile")
             elif self.model_type == "power_balance":
@@ -335,11 +351,7 @@ class TransportStudy(Study):
             # Hyperparameters
             "segment_length_train": 100,
             "segment_overlap_train": 50,
-            # Every torax sample runs a 100-step differentiated TORAX rollout (jax.checkpoint remat, see TransportPredictorToraxBase).
-            # Measured 2026-10-12 on the production stores at sweep-max sizes (scratch/batch_bench), on an A100-80GB:
-            # 1024 gives 65 steps per epoch, torax-gyrobohm 259 s and torax-qlknn 331 s per epoch (474 and 548 s at 512),
-            # peaking at 7.5 GB (TORAX) and 23 GB (transformer), and every training process holds ~62 GB of host memory.
-            "batch_size": 1024,
+            "batch_size": TRANSPORT_BATCH_SIZE,
             # Part of validation, should be left alone during hyperparameter tuning
             "segment_length_val": None,
             "segment_overlap_val": 0,
@@ -482,8 +494,8 @@ class TransportStudy(Study):
                     "target_vars": [*PROFILE_TARGET_VARS, "ds_source_idx"],
                     "extra_vars": ["t_e_shape", "n_e_shape"],
                     **dataloader_config_base,
-                    # Timeslice samples are cheap, match the profile study
-                    "batch_size": 2048,
+                    # Match the profile study
+                    "batch_size": PROFILE_BATCH_SIZE,
                 },
                 model_init_config={
                     "model_type": config.profile_model_type,
