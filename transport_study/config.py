@@ -204,6 +204,9 @@ class StudyConfig(BaseModel):
     sweep_poll_interval_s: Orchestration[float] = Field(
         default_factory=lambda: float(os.environ.get("PTPS_SWEEP_POLL_INTERVAL_S", "300")), gt=0
     )
+    # Ceiling on one sweep's running + pending agent jobs,
+    # so the bayes search takes in finished trials before it suggests the next ones
+    max_running_agents: Orchestration[int] = Field(default_factory=lambda: int(os.environ.get("PTPS_MAX_RUNNING_AGENTS", "20")), ge=1)
     # Scratch directory for trajectory-optimization intermediate results
     scratch_dir: Orchestration[Path | None] = None
 

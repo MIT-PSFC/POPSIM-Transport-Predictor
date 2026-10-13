@@ -1622,6 +1622,8 @@ class Study:
         On any other partition the cap is that partition's open slots (open_slots):
         the remaining per-user GPU allowance of a spillover partition,
         or the CPU jobs that fit on a CPU partition, bounded by the user-wide job ceiling.
+        On every partition the sweep keeps at most config.max_running_agents agents running or pending,
+        so the bayes search takes in finished trials before it suggests the next ones.
         """
         self._require_local(case)
         train_config = self.make_train_config(case)
@@ -1677,7 +1679,8 @@ class Study:
             # one agent at a time may get pruned.
             # A sweep smaller than that (debug) never runs more agents than it has trials
             min_running_agents = min(MIN_RUNNING_AGENTS, config.hyperparam_sweeps)
-            sweep_jobs = min(capacity, max(outstanding_trials, min_running_agents - running_agents))
+            agent_room = config.max_running_agents - running_agents
+            sweep_jobs = min(capacity, agent_room, max(outstanding_trials, min_running_agents - running_agents))
             if sweep_jobs <= 0:
                 logger.debug(f"No agent jobs needed for case {case} ({running_agents} agents already running)")
                 return
