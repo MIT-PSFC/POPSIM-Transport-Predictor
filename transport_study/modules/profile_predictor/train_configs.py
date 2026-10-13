@@ -9,6 +9,7 @@ from transport_study.modules.profile_predictor.trb import (
     ProfilePredictorTRB,
     relaxation_numerics,
 )
+from transport_study.modules.trb_utils import ADAMW_DEFAULTS
 from transport_study.orchestration.organize_data import PROFILE_TARGET_VARS
 
 # Solver steps of the profile relaxation without a tuned config
@@ -45,6 +46,7 @@ PROFILE_PREDICTOR_SHAPE_INIT_CONFIG = {
         "decay_rate": 0.1,
         "lrf_frac": 0.17,
         "weight_decay": 2e-4,
+        **ADAMW_DEFAULTS,
     },
     "trainable_getter_config": {
         "freeze_shapes": True,
@@ -260,6 +262,7 @@ _PROFILE_PREDICTOR_TORAX_CONFIG_BASE: dict[str, Any] = {
         "decay_rate": 0.1,
         "lrf_frac": 0.1,
         "weight_decay": 1e-4,
+        **ADAMW_DEFAULTS,
     },
 }
 

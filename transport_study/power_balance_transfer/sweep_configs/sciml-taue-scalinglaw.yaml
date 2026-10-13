@@ -11,10 +11,11 @@ early_terminate:
 parameters:
   optimizer_config:
     parameters:
+      # No tuned lr0 of the first apsdpp launch sat below 1.3e-3, and most sat in the top third of [1e-5, 1e-2]
       lr0:
         distribution: log_uniform_values
-        min: 1.0e-5
-        max: 1.0e-2
+        min: 1.0e-4
+        max: 1.0e-1
       # Final learning rate as a fraction of lr0, never above it
       lrf_frac:
         distribution: log_uniform_values
@@ -24,6 +25,21 @@ parameters:
         distribution: log_uniform_values
         min: 1.0e-6
         max: 0.1
+      # The AdamW moments as 1 - b (trb_utils.make_exponential_adamw), b1 in [0.7, 0.99] and b2 in [0.9, 0.9999]
+      one_minus_b1:
+        distribution: log_uniform_values
+        min: 0.01
+        max: 0.3
+      one_minus_b2:
+        distribution: log_uniform_values
+        min: 1.0e-4
+        max: 0.1
+      eps:
+        distribution: log_uniform_values
+        min: 1.0e-10
+        max: 1.0e-4
+      nesterov:
+        values: [false, true]
       # Fraction of the run's optimizer steps per 10x learning-rate decay,
       # resolved to transition_steps from the run's own steps_per_epoch * max_epochs at train time.
       # Horizon-invariant, a tuned schedule carries over to other epoch budgets and batch sizes
@@ -38,7 +54,9 @@ parameters:
     parameters:
       # Safe to sweep, the sweep metric val/loss.mean is the delta-free
       # validation loss (PowerBalanceTRB.get_val_loss_fn)
+      # A fraction of the device's typical value, at 1 nearly every residual is in the quadratic part already.
+      # The floor was 0.01 until the best sciml-taue-scalinglaw trials of the first apsdpp launch sat against it
       huber_delta:
         distribution: log_uniform_values
-        min: 0.01
+        min: 1.0e-3
         max: 1.0

@@ -418,12 +418,22 @@ def path_names(path: tuple) -> set:
     return {getattr(key, "name", None) for key in path} | {getattr(key, "key", None) for key in path}
 
 
+# The optax AdamW defaults of every optimizer_config.
+# b1 and b2 are stored as 1 - b, so a log-uniform sweep spreads its trials evenly over the moment horizons 1 / (1 - b)
+ADAMW_DEFAULTS = {"one_minus_b1": 0.1, "one_minus_b2": 1e-3, "eps": 1e-8, "nesterov": False}
+
+# Every optimizer_config key make_exponential_adamw and make_grouped_exponential_adamw read
+OPTIMIZER_CONFIG_KEYS = ("lr0", "lrf_frac", "transition_steps", "decay_rate", "weight_decay", *ADAMW_DEFAULTS, "submodule_lr_factors")
+
+
 def make_exponential_adamw(optimizer_config: dict, no_decay_names: tuple[str, ...] = ()) -> optax.GradientTransformation:
     """AdamW on an exponentially decaying learning rate schedule.
 
     The rate falls from lr0 by decay_rate every transition_steps and holds at lr0 * lrf_frac.
     lrf_frac <= 1 keeps the final rate at or below lr0
     (optax treats end_value as a floor, an end_value above lr0 would run the whole schedule there).
+    The moment decays are b1 = 1 - one_minus_b1 and b2 = 1 - one_minus_b2,
+    eps is added to the root of the second moment and nesterov switches on the Nesterov first moment.
     Leaves whose pytree path holds one of no_decay_names skip the weight decay.
     """
     lr0 = optimizer_config["lr0"]
@@ -434,14 +444,20 @@ def make_exponential_adamw(optimizer_config: dict, no_decay_names: tuple[str, ..
         decay_rate=optimizer_config["decay_rate"],
         end_value=lrf,
     )
+    b1 = 1 - optimizer_config["one_minus_b1"]
+    b2 = 1 - optimizer_config["one_minus_b2"]
 
     def decay_mask(params):
         return jax.tree_util.tree_map_with_path(lambda path, _leaf: not (path_names(path) & set(no_decay_names)), params)
 
     return optax.adamw(
         learning_rate=schedule,
+        b1=b1,
+        b2=b2,
+        eps=optimizer_config["eps"],
         weight_decay=optimizer_config["weight_decay"],
         mask=decay_mask if no_decay_names else None,
+        nesterov=optimizer_config["nesterov"],
     )
 
 

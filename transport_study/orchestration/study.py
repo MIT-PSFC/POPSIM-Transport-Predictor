@@ -47,6 +47,7 @@ from transport_study.modules.normalization import (
     STAT_NORMALIZATIONS,
 )
 from transport_study.modules.trb_utils import (
+    ADAMW_DEFAULTS,
     chi_sigma_floors,
     residual_scales,
     resolve_case_datasets,
@@ -1192,6 +1193,7 @@ class Study:
             "decay_rate": 0.1,
             "lrf_frac": 0.2,
             "weight_decay": 2e-4,
+            **ADAMW_DEFAULTS,
         }
 
     def base_dataloader_config(self, case: Case) -> dict:

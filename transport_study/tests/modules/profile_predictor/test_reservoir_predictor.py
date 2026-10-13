@@ -20,6 +20,7 @@ from transport_study.modules.profile_predictor.module import (
     ProfilePredictorReservoir,
 )
 from transport_study.modules.profile_predictor.trb import ProfilePredictorTRB
+from transport_study.modules.trb_utils import ADAMW_DEFAULTS
 from transport_study.orchestration.organize_data import PROFILE_TARGET_VARS
 from transport_study.profile_transfer.profile_study import PROFILE_INPUT_VARS
 from transport_study.tests.sample_data import SAMPLE_DIR, requires_sample_data
@@ -143,6 +144,7 @@ def test_reservoir_training_smoke():
             "decay_rate": 0.1,
             "lrf_frac": 0.17,
             "weight_decay": 2e-4,
+            **ADAMW_DEFAULTS,
         },
     )
 

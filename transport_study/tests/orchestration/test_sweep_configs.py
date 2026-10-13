@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 from popsim.ml.train_config import load_dict
 
+from transport_study.modules.trb_utils import OPTIMIZER_CONFIG_KEYS
 from transport_study.power_balance_transfer.power_balance_study import PowerBalanceStudy
 from transport_study.profile_transfer.profile_study import ProfileStudy
 from transport_study.transport_transfer.transport_transfer_study import TransportStudy
@@ -19,6 +20,10 @@ SWEEP_METRIC_NAME = "val/loss.mean"
 
 # A distribution spec must carry its bounds alongside the distribution name
 DISTRIBUTION_KEYS = {"distribution", "min", "max"}
+
+# The optimizer_config keys a trial's optimizer reads.
+# popsim turns transition_frac into transition_steps before the optimizer is built (launch.resolve_transition_frac)
+SWEEPABLE_OPTIMIZER_KEYS = {*OPTIMIZER_CONFIG_KEYS, "transition_frac"}
 
 SWEEP_CONFIG_PATHS = [(study, path) for study in STUDIES for path in sorted(Path(study.SWEEP_CONFIG_DIR).glob("*.yaml"))]
 
@@ -68,3 +73,12 @@ def test_sweep_config_is_valid(study, path):
     assert "dataloader_config" not in cfg["parameters"], f"{path.name}: sweeps must not change the training loader"
     for name, spec in cfg["parameters"].items():
         check_parameter(name, spec, path)
+
+
+@pytest.mark.parametrize(("study", "path"), SWEEP_CONFIG_PATHS, ids=[f"{s.STUDY_TYPE}-{p.stem}" for s, p in SWEEP_CONFIG_PATHS])
+def test_swept_optimizer_keys_reach_the_optimizer(study, path):
+    """wandb merges any swept key into the trial config, so a key the optimizer never reads would be silently ignored."""
+    cfg = load_dict(str(path))
+    optimizer_parameters = cfg["parameters"].get("optimizer_config", {}).get("parameters", {})
+    unread_keys = set(optimizer_parameters) - SWEEPABLE_OPTIMIZER_KEYS
+    assert not unread_keys, f"{path.name}: the optimizer never reads {sorted(unread_keys)}"
