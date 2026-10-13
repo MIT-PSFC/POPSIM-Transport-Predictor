@@ -14,7 +14,7 @@ from transport_study.transport_transfer.transport_transfer_study import Transpor
 
 STUDIES = (ProfileStudy, PowerBalanceStudy, TransportStudy)
 
-# The orchestration picks the best sweep run by this exact summary key
+# The orchestration ranks sweep runs by the logged history of this exact key
 SWEEP_METRIC_NAME = "val/loss.mean"
 
 # A distribution spec must carry its bounds alongside the distribution name

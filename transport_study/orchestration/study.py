@@ -1582,7 +1582,9 @@ class Study:
             if running_jobs > 0:
                 logger.info(f"Found {running_jobs} running agent jobs, waiting for them to complete before proceeding")
                 return False
-        best_train_config = get_best_train_config(self.wandb_project_name(case))
+        # Read again now that no agent runs, an agent that exited since the first read would be missing from it
+        final_runs = get_completed_runs(self.wandb_project_name(case))
+        best_train_config = get_best_train_config(final_runs)
         if best_train_config is None:
             raise RuntimeError(
                 f"Hyperparameter sweep for case {case} reports {len(completed_runs)} completed runs "

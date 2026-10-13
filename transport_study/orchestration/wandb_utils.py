@@ -117,34 +117,44 @@ def get_completed_runs(project: str) -> list[Any]:
 def is_trained_to_completion(run) -> bool:
     """Whether a trial ran until training itself ended it.
 
-    That is max_epochs, early stopping, divergence or the wall-clock budget.
+    That is max_epochs, early stopping or divergence.
+    A trial cut by the wall-clock budget ends preempted (popsim launch.finish_sweep_run),
+    and counts once the agent that resumes it finishes it.
     A trial the sweep stopped (hyperband pruning) still ends "finished" on the server,
     so popsim marks it in the run summary.
     """
     return run.state == "finished" and not run.summary.get(STOP_REQUESTED_SUMMARY_KEY, False)
 
 
-def _sweep_metric(run) -> float:
-    """A run's sweep metric, NaN when it is missing or not a number."""
-    value = run.summary.get(SWEEP_METRIC)
-    return float(value) if isinstance(value, int | float) else math.nan
+def _history_min(run) -> float:
+    """The lowest finite sweep metric a run logged, NaN when it logged none.
+
+    The run summary holds the last logged value instead,
+    which for an early-stopped trial is patience validations past its best.
+    """
+    history_rows = run.scan_history(keys=[SWEEP_METRIC])
+    history_values = [row[SWEEP_METRIC] for row in history_rows]
+    # wandb returns a logged NaN or infinity as a float or as a string, depending on the client
+    finite_values = [float(value) for value in history_values if isinstance(value, int | float) and math.isfinite(value)]
+    return min(finite_values, default=math.nan)
 
 
 @retry_rate_limited
-def get_best_train_config(project: str) -> TrainConfig | None:
-    """Train config of the sweep's best trial, None when no trial is eligible.
+def get_best_train_config(completed_runs: list) -> TrainConfig | None:
+    """Train config of the best trial of completed_runs (get_completed_runs), None when no trial is eligible.
 
     Only trials trained to completion with a finite sweep metric are eligible.
-    A crashed or hyperband-pruned trial's summary keeps its val/loss.mean from when it died or was pruned,
-    so ranking those runs would pick a config that never completed a full training run.
-    A NaN metric would scramble the ranking.
+    A crashed or hyperband-pruned trial never completed a full training run.
+    Each trial ranks by the lowest val/loss.mean it logged,
+    the value the bayes search fits and the checkpoint a production run is tested at.
     """
-    completed_runs = get_completed_runs(project)
-    ranked_runs = [run for run in completed_runs if is_trained_to_completion(run) and math.isfinite(_sweep_metric(run))]
+    trained_runs = [run for run in completed_runs if is_trained_to_completion(run)]
+    run_minima = {run.id: _history_min(run) for run in trained_runs}
+    ranked_runs = [run for run in trained_runs if math.isfinite(run_minima[run.id])]
     if len(ranked_runs) == 0:
         return None
-    best_run = min(ranked_runs, key=_sweep_metric)
-    logger.info(f"Best run is {best_run.name} with val loss {_sweep_metric(best_run)}")
+    best_run = min(ranked_runs, key=lambda run: run_minima[run.id])
+    logger.info(f"Best run is {best_run.name} with minimum val loss {run_minima[best_run.id]}")
     return TrainConfig.load(best_run.config)
 
 
