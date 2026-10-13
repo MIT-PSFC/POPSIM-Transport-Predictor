@@ -139,7 +139,7 @@ STEPS_PER_EPOCH_FILENAME = "steps_per_epoch.toml"
 
 # Tuned learning rates were swept for from-scratch training.
 # Fine-tuning scales lr0 by max_epochs / total_steps, clipped below at this floor. See _scale_transfer_lr
-TRANSFER_LR_FLOOR = 0.1
+TRANSFER_LR_FLOOR = 0.01
 
 # A training job is considered stuck once it has run at least this long with no progress (e.g. OpenBLAS or XLA compile-pool deadlocks)
 WATCHDOG_MIN_AGE_S = 80 * 60

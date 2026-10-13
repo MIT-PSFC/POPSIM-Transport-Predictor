@@ -13,9 +13,9 @@ from transport_study.orchestration.study import TRANSFER_LR_FLOOR, transfer_lr_s
         (1, 1.0),
         # Between the clips the scale is 1 / steps_per_epoch, max_epochs cancels
         (4, 0.25),
+        (50, 0.02),
         # Step-rich finetunes cool to the floor
-        (10, TRANSFER_LR_FLOOR),
-        (50, TRANSFER_LR_FLOOR),
+        (500, TRANSFER_LR_FLOOR),
     ],
 )
 def test_transfer_lr_scale(steps_per_epoch, max_epochs, expected_scale):
