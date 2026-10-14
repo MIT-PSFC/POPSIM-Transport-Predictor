@@ -18,10 +18,11 @@ parameters:
         values: [1, 2, 3, 4]
   optimizer_config:
     parameters:
+      # Range from the first apsdpp launch, whose tuned lr0 sat in the top third of [1e-5, 1e-2]
       lr0:
         distribution: log_uniform_values
-        min: 1.0e-5
-        max: 1.0e-2
+        min: 1.0e-4
+        max: 1.0e-1
       # Final learning rate as a fraction of lr0, never above it
       lrf_frac:
         distribution: log_uniform_values
@@ -31,9 +32,22 @@ parameters:
         distribution: log_uniform_values
         min: 1.0e-6
         max: 0.1
-      # Fraction of the run's optimizer steps per 10x learning-rate decay,
-      # resolved to transition_steps from the run's own steps_per_epoch * max_epochs at train time.
-      # Horizon-invariant, a tuned schedule carries over to other epoch budgets and batch sizes
+      # The AdamW moments as 1 - b (trb_utils.make_exponential_adamw), b1 in [0.7, 0.99] and b2 in [0.9, 0.9999]
+      one_minus_b1:
+        distribution: log_uniform_values
+        min: 0.01
+        max: 0.3
+      one_minus_b2:
+        distribution: log_uniform_values
+        min: 1.0e-4
+        max: 0.1
+      eps:
+        distribution: log_uniform_values
+        min: 1.0e-10
+        max: 1.0e-4
+      nesterov:
+        values: [false, true]
+      # Optimizer steps per 10x learning-rate decay as a fraction of the run's own steps (popsim resolve_transition_frac), horizon-invariant
       transition_frac:
         distribution: log_uniform_values
         min: 0.03

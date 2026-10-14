@@ -46,10 +46,12 @@ from transport_study.power_balance_transfer.power_balance_study import (
     POWER_BALANCE_LOSS_DEFAULTS,
     SCALAR_SUBMODULE_BATCH_SIZE,
     SCALAR_SUBMODULE_SETTINGS,
+    PowerBalanceStudy,
 )
 from transport_study.profile_transfer.profile_study import (
     PROFILE_BATCH_SIZE,
     PROFILE_INPUT_VARS,
+    ProfileStudy,
 )
 from transport_study.transport_transfer.data_visualization import DataVisualization
 from transport_study.transport_transfer.plotting import COMPARISON_FAMILIES, LAYOUT
@@ -342,6 +344,20 @@ class TransportStudy(Study):
     #############
     # EXECUTION #
     #############
+
+    @classmethod
+    def sweep_config(cls, model_type: str) -> dict:
+        """A pseudo-type sweeps with the owning study's yaml of its configured variant, so it tunes as that study's case would.
+
+        p_oh, p_rad and power_balance (as config.power_balance_model_type) take the power balance study's,
+        profile (as config.profile_model_type) the profile study's, every top-level type this study's own.
+        """
+        if model_type in POWER_BALANCE_SUBMODULE_TYPES:
+            variant = config.power_balance_model_type if model_type == "power_balance" else model_type
+            return PowerBalanceStudy.sweep_config(variant)
+        if model_type == "profile":
+            return ProfileStudy.sweep_config(config.profile_model_type)
+        return super().sweep_config(model_type)
 
     def base_dataloader_config(self, case: Case) -> dict:
         return {
