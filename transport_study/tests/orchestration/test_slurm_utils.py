@@ -10,6 +10,7 @@ from transport_study.config import StudyConfig, load_config
 from transport_study.orchestration import slurm_utils
 from transport_study.orchestration.slurm_utils import (
     LaunchSlots,
+    TrainingDevices,
     count_idle_gpus,
     importable_module,
     open_cpu_slots,
@@ -152,15 +153,15 @@ def test_gpu_buffers_share_one_primary_count_read_once_per_pass(monkeypatch):
 
     _serve_fake_slurm(monkeypatch, recorded_stdout)
     slots = LaunchSlots()
-    assert slots.available("fake_psfc_gpu") == 4
+    assert slots.available("fake_psfc_gpu", TrainingDevices.GPU_ONLY) == 4
     n_commands_first_read = len(slurm_commands)
 
-    assert slots.available("fake_psfc_gpu", cpu_capable=True) == 2
+    assert slots.available("fake_psfc_gpu", TrainingDevices.CPU_CAPABLE) == 2
     slots.take("fake_psfc_gpu")
     slots.take("fake_psfc_gpu")
-    assert slots.available("fake_psfc_gpu") == 2
-    assert slots.available("fake_psfc_gpu", cpu_capable=True) == 0
-    assert slots.pick() == "fake_psfc_gpu"
+    assert slots.available("fake_psfc_gpu", TrainingDevices.GPU_ONLY) == 2
+    assert slots.available("fake_psfc_gpu", TrainingDevices.CPU_CAPABLE) == 0
+    assert slots.pick(TrainingDevices.GPU_ONLY) == "fake_psfc_gpu"
     assert len(slurm_commands) == n_commands_first_read
 
 
@@ -172,7 +173,32 @@ def test_gpu_only_slots_are_the_gpus_past_the_buffer_plus_the_queue_allowance(mo
     """Of 3 available GPUs the buffer leaves some idle, never fewer than none, and gpu_pending_jobs more jobs may wait in the queue."""
     _fake_config(partition="fake_psfc_gpu", buffer_gpus=buffer_gpus, gpu_pending_jobs=gpu_pending_jobs)
     _serve_fake_slurm(monkeypatch, _fake_slurm_stdout)
-    assert LaunchSlots().available("fake_psfc_gpu") == gpu_only_slots
+    assert LaunchSlots().available("fake_psfc_gpu", TrainingDevices.GPU_ONLY) == gpu_only_slots
+
+
+@pytest.mark.parametrize(
+    ("devices", "cpu_capable_buffer_gpus", "cpu_slots", "partition"),
+    [
+        (TrainingDevices.GPU_ONLY, 1, 5, "fake_gpu"),
+        # More GPUs idle than its buffer
+        (TrainingDevices.CPU_CAPABLE, 1, 5, "fake_gpu"),
+        # No more idle GPUs than its buffer, so the CPU partition
+        (TrainingDevices.CPU_CAPABLE, 3, 5, "fake_cpu"),
+        # Never an idle GPU
+        (TrainingDevices.CPU_ONLY, 1, 5, "fake_cpu"),
+        # Held while the CPU partition is full
+        (TrainingDevices.CPU_ONLY, 1, 0, None),
+    ],
+)
+def test_each_device_kind_is_placed_on_its_own_partitions(monkeypatch, devices, cpu_capable_buffer_gpus, cpu_slots, partition):
+    """3 GPUs idle on the primary partition, cpu_slots jobs fitting on the CPU partition."""
+    _fake_config(partition="fake_gpu", cpu_partition="fake_cpu", buffer_gpus=0, cpu_capable_buffer_gpus=cpu_capable_buffer_gpus)
+    monkeypatch.setattr(slurm_utils, "count_available_gpus", lambda partition_name: 3)
+    monkeypatch.setattr(slurm_utils, "count_pending_jobs", lambda partition_name=None: 0)
+    monkeypatch.setattr(slurm_utils, "open_cpu_slots", lambda partition_name: cpu_slots)
+    monkeypatch.setattr(slurm_utils, "user_job_budget", lambda: 100)
+
+    assert LaunchSlots().pick(devices) == partition
 
 
 # (node, allocated/idle/other/total CPUs, memory MB, allocated memory MB, state) of a CPU partition
@@ -310,9 +336,9 @@ def test_cpu_partitions_keep_the_user_job_budget_without_spillover(monkeypatch):
     _fake_config(cpu_partition="fake_cpu_budget", max_user_jobs=10, spillover_job_headroom=2, spillover_partitions=(), train_mem="48G")
     _serve_fake_slurm(monkeypatch, _fake_cpu_slurm_stdout(""))
     slots = LaunchSlots()
-    assert slots.available("fake_cpu_budget") == 1
+    assert slots.available("fake_cpu_budget", TrainingDevices.CPU_ONLY) == 1
     slots.take("fake_cpu_budget")
-    assert slots.available("fake_cpu_budget") == 0
+    assert slots.available("fake_cpu_budget", TrainingDevices.CPU_ONLY) == 0
 
 
 def test_importable_module_normal():

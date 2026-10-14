@@ -304,7 +304,7 @@ def test_cpu_capable_job_pending_for_a_gpu_is_cancelled(make_stub_study, monkeyp
     """
     cpu_capable = StubCase(name="case.cpu", model_type="cpu_type")
     gpu_only = StubCase(name="case.gpu", model_type="gpu_type")
-    study = make_stub_study([cpu_capable, gpu_only], partition="primary", cpu_partition="cpu_primary", cpu_model_types=("cpu_type",))
+    study = make_stub_study([cpu_capable, gpu_only], partition="primary", cpu_partition="cpu_primary", gpu_only_model_types=("gpu_type",))
     pending = {study.train_job_name(case, 0): WATCHDOG_PENDING_S for case in (cpu_capable, gpu_only)}
 
     calls = run_one_pass(monkeypatch, study, pending)

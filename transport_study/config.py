@@ -178,13 +178,15 @@ class StudyConfig(BaseModel):
     # Submissions per partition are capped at its per-user GPU allowance (QOS MaxTRESPU gres/gpu).
     # Empty disables spillover.
     spillover_partitions: Orchestration[tuple[str, ...]] = Field(default_factory=lambda: _env_list("PTPS_SPILLOVER_PARTITIONS"))
-    # Model types whose training and sweep agent jobs may also run on the CPU partitions.
+    # Model types whose training and sweep agent jobs run on GPU partitions only, and those that run on the CPU partitions only.
+    # Every other model type is CPU-capable: it takes a primary GPU only after the GPU-only cases
+    # and while more than cpu_capable_buffer_gpus are idle, else the first CPU partition with room.
+    # Without a cpu_partition every model type trains on GPU, so a slow type must be listed GPU-only once there is one.
     # Prereq pseudo types count by their own name (p_oh, power_balance, profile).
-    # A listed type takes a primary GPU only after the study's GPU-only cases and while
-    # more than cpu_capable_buffer_gpus are idle, else the first CPU partition with room.
     # No env var, the valid names differ per study.
-    cpu_model_types: Orchestration[tuple[str, ...]] = ()
-    # Primary CPU partition for cpu_model_types, then the fallbacks in order
+    gpu_only_model_types: Orchestration[tuple[str, ...]] = ()
+    cpu_only_model_types: Orchestration[tuple[str, ...]] = ()
+    # Primary CPU partition of the CPU-capable and CPU-only model types, then the fallbacks in order
     cpu_partition: Orchestration[str | None] = Field(default_factory=lambda: os.environ.get("PTPS_CPU_PARTITION"))
     cpu_fallback_partitions: Orchestration[tuple[str, ...]] = Field(default_factory=lambda: _env_list("PTPS_CPU_FALLBACK_PARTITIONS"))
     # CPUs per CPU training or agent job.
@@ -235,9 +237,15 @@ class StudyConfig(BaseModel):
 
     @model_validator(mode="after")
     def _check_cpu_partitions(self):
-        """CPU training needs a CPU partition, and no partition may serve both devices, since submission picks the device by partition."""
-        if (self.cpu_model_types or self.cpu_fallback_partitions) and not self.cpu_partition:
-            raise ValueError("cpu_model_types and cpu_fallback_partitions need a cpu_partition")
+        """CPU training needs a CPU partition, and no partition may serve both devices, since submission picks the device by partition.
+
+        A model type is GPU-only, CPU-only or neither (CPU-capable), never both.
+        """
+        if (self.cpu_only_model_types or self.cpu_fallback_partitions) and not self.cpu_partition:
+            raise ValueError("cpu_only_model_types and cpu_fallback_partitions need a cpu_partition")
+        both_devices_only = sorted(set(self.gpu_only_model_types) & set(self.cpu_only_model_types))
+        if both_devices_only:
+            raise ValueError(f"Model types {both_devices_only} are in both gpu_only_model_types and cpu_only_model_types")
         # Unset partitions are None, a config rebuilt from its lock carries no orchestration fields at all
         gpu_partitions = {p for p in (self.partition, *self.spillover_partitions) if p}
         shared = sorted(p for p in (self.cpu_partition, *self.cpu_fallback_partitions) if p and p in gpu_partitions)

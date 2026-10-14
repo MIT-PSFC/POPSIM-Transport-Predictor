@@ -21,6 +21,7 @@ from transport_study.orchestration.slurm_utils import (
     RELAUNCH_GRACE_S,
     JobEnd,
     SubmittedJob,
+    TrainingDevices,
 )
 from transport_study.orchestration.study import Study, write_netcdf_atomic
 from transport_study.tests.stubs import StubCase, open_launch_slots, with_seed_attrs
@@ -273,25 +274,32 @@ def test_seed_finished_between_two_passes_is_not_relaunched(make_stub_study, mon
     assert launches == [study.train_job_name(case_a, 0)]
 
 
-def test_gpu_only_cases_take_the_gpu_before_cpu_capable_ones(make_stub_study, monkeypatch):
+def test_cases_launch_gpu_only_then_cpu_only_then_cpu_capable(make_stub_study, monkeypatch):
     """One GPU slot opens per pass.
 
-    The GPU-only case.b takes it ahead of the alphabetically earlier CPU-capable case.a,
-    which goes to the CPU partition instead of waiting, and GPU-only case.c holds for the next pass.
+    The GPU-only case.b takes it ahead of the alphabetically earlier cases, GPU-only case.c holds for the next pass,
+    the CPU-only case.d goes to the CPU partition next, and the CPU-capable case.a goes there too instead of waiting.
     """
-    cpu_capable = StubCase(name="case.a", model_type="cpu_type")
+    cpu_capable = StubCase(name="case.a", model_type="flexible_type")
     gpu_only = [StubCase(name="case.b", model_type="gpu_type"), StubCase(name="case.c", model_type="gpu_type")]
-    study = make_stub_study([cpu_capable, *gpu_only], partition="gpu", cpu_partition="cpu", cpu_model_types=("cpu_type",))
+    cpu_only = StubCase(name="case.d", model_type="cpu_type")
+    study = make_stub_study(
+        [cpu_capable, *gpu_only, cpu_only],
+        partition="gpu",
+        cpu_partition="cpu",
+        gpu_only_model_types=("gpu_type",),
+        cpu_only_model_types=("cpu_type",),
+    )
     gpu_slots = SimpleNamespace(open=1)
 
     class OneGpuPerPass:
-        """LaunchSlots stand-in, the one GPU of a pass taken by the first pick."""
+        """LaunchSlots stand-in, the one GPU of a pass taken by the first pick that may take a GPU."""
 
-        def pick(self, cpu_capable=False):
-            if gpu_slots.open > 0:
+        def pick(self, devices):
+            if devices is not TrainingDevices.CPU_ONLY and gpu_slots.open > 0:
                 gpu_slots.open -= 1
                 return "gpu"
-            return "cpu" if cpu_capable else None
+            return None if devices is TrainingDevices.GPU_ONLY else "cpu"
 
     launches: list[tuple[str, str]] = []
 
@@ -311,7 +319,7 @@ def test_gpu_only_cases_take_the_gpu_before_cpu_capable_ones(make_stub_study, mo
 
     study.run_unfinished_cases(skip_tuning=True, enable_parallelism=True)
 
-    assert launches == [("case.b", "gpu"), ("case.a", "cpu"), ("case.c", "gpu")]
+    assert launches == [("case.b", "gpu"), ("case.d", "cpu"), ("case.a", "cpu"), ("case.c", "gpu")]
 
 
 def test_every_seed_trains_and_their_merge_finishes_the_case(make_stub_study, monkeypatch):

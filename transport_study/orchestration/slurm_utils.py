@@ -9,6 +9,7 @@ import time
 from collections import Counter
 from collections.abc import Callable, Collection
 from datetime import datetime, timedelta
+from enum import Enum
 from pathlib import Path
 from typing import NamedTuple
 
@@ -236,7 +237,7 @@ def _config_reload_script(study_config_path: Path) -> str:
 
 
 def cpu_partitions() -> list[str]:
-    """The CPU partitions for the cpu_model_types, the primary first, empty without a cpu_partition."""
+    """The CPU partitions of the CPU-capable and CPU-only model types, the primary first, empty without a cpu_partition."""
     if not config.cpu_partition:
         return []
     return [config.cpu_partition, *config.cpu_fallback_partitions]
@@ -616,7 +617,7 @@ def _evictable_node_tres(nodes: list[str], partitions: tuple[str, ...]) -> dict[
     return {node: held_tres for node, held_tres in node_tres.items() if node in queried_nodes}
 
 
-def _available_gpus(partition: str) -> int | None:
+def count_available_gpus(partition: str) -> int | None:
     """GPUs a job submitted to this partition could take now, None when a query fails.
 
     A GPU counts when it sits on a node of the partition that takes new jobs,
@@ -637,7 +638,7 @@ def _available_gpus(partition: str) -> int | None:
 
 
 def count_idle_gpus(partition: str | None = None, buffer_gpus: int | None = None) -> int:
-    """GPUs a job submitted to this partition could take now (_available_gpus), minus buffer_gpus.
+    """GPUs a job submitted to this partition could take now (count_available_gpus), minus buffer_gpus.
 
     Any failed query counts as no idle GPUs, so nothing launches.
     """
@@ -645,7 +646,7 @@ def count_idle_gpus(partition: str | None = None, buffer_gpus: int | None = None
         partition = config.partition
     if buffer_gpus is None:
         buffer_gpus = config.buffer_gpus
-    available_gpus = _available_gpus(partition)
+    available_gpus = count_available_gpus(partition)
     if available_gpus is None:
         return 0
     return max(available_gpus - buffer_gpus, 0)
@@ -919,15 +920,24 @@ def open_cpu_slots(partition: str) -> int:
     return max(slots, 0)
 
 
+class TrainingDevices(Enum):
+    """Where the training and sweep agent jobs of a model type may run (gpu_only_model_types, cpu_only_model_types)."""
+
+    GPU_ONLY = "gpu_only"
+    CPU_ONLY = "cpu_only"
+    CPU_CAPABLE = "cpu_capable"
+
+
 class LaunchSlots:
     """The open slots of one orchestration pass, each partition queried at most once and debited per accepted job.
 
     Querying every partition again for every job cost about 2 s per launch in the first apsdpp launch,
     most of its 7-10 min passes.
     The primary GPU partition is read once (the GPUs a job could take now and this user's pending jobs there),
-    and both kinds of job draw on that one count:
+    and the jobs that may go there draw on that one count:
     a GPU-only job leaves buffer_gpus GPUs idle and may wait in the queue up to gpu_pending_jobs,
-    a CPU-capable one leaves cpu_capable_buffer_gpus idle and never waits there.
+    a CPU-capable one leaves cpu_capable_buffer_gpus idle and never waits there,
+    and a CPU-only one never goes there.
     Every other partition is read the first time a job may go there,
     and the user-wide job budget, read once, bounds them all.
     A failed query gives no slots, so nothing launches there this pass.
@@ -946,20 +956,22 @@ class LaunchSlots:
     def _primary_gpu_counts(self) -> tuple[int, int] | None:
         if not self._primary_read:
             self._primary_read = True
-            available_gpus = _available_gpus(config.partition)
+            available_gpus = count_available_gpus(config.partition)
             pending_jobs = count_pending_jobs(config.partition)
             if available_gpus is not None and pending_jobs is not None:
                 self._primary_counts = (available_gpus, pending_jobs)
         return self._primary_counts
 
-    def available(self, partition: str, cpu_capable: bool = False) -> int:
-        """Training or agent jobs worth submitting to this partition now."""
+    def available(self, partition: str, devices: TrainingDevices) -> int:
+        """Training or agent jobs of a model type running on devices worth submitting to this partition now."""
         if partition == config.partition:
+            if devices is TrainingDevices.CPU_ONLY:
+                return 0
             primary_counts = self._primary_gpu_counts()
             if primary_counts is None:
                 return 0
             available_gpus, pending_jobs = primary_counts
-            if cpu_capable:
+            if devices is TrainingDevices.CPU_CAPABLE:
                 slots = max(available_gpus - config.cpu_capable_buffer_gpus, 0) - pending_jobs
             else:
                 slots = max(available_gpus - config.buffer_gpus, 0) + config.gpu_pending_jobs - pending_jobs
@@ -973,16 +985,22 @@ class LaunchSlots:
         budget_left = self._user_job_budget - taken_off_primary
         return max(min(partition_left, budget_left), 0)
 
-    def pick(self, cpu_capable: bool = False) -> str | None:
-        """Partition the next training or agent job should go to, or None to hold off launching.
+    def pick(self, devices: TrainingDevices) -> str | None:
+        """Partition the next training or agent job of a model type running on devices should go to, or None to hold off launching.
 
         The first candidate with open slots wins:
-        the primary GPU partition, then the GPU spillover partitions for a GPU-only case,
-        or the CPU partitions in order for a case that can also train on CPU.
+        the primary GPU partition then the GPU spillover partitions for a GPU-only case,
+        the primary GPU partition then the CPU partitions in order for a CPU-capable one,
+        and the CPU partitions in order alone for a CPU-only one.
         """
-        fallbacks = cpu_partitions() if cpu_capable else list(config.spillover_partitions)
-        for partition in [config.partition, *fallbacks]:
-            if self.available(partition, cpu_capable) > 0:
+        if devices is TrainingDevices.CPU_ONLY:
+            candidates = cpu_partitions()
+        elif devices is TrainingDevices.CPU_CAPABLE:
+            candidates = [config.partition, *cpu_partitions()]
+        else:
+            candidates = [config.partition, *config.spillover_partitions]
+        for partition in candidates:
+            if self.available(partition, devices) > 0:
                 return partition
         return None
 

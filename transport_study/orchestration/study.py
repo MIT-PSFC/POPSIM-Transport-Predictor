@@ -79,6 +79,7 @@ from transport_study.orchestration.seed_results import (
 from transport_study.orchestration.slurm_utils import (
     LaunchSlots,
     SubmittedJob,
+    TrainingDevices,
     cancel_job,
     count_running_jobs,
     cpu_partitions,
@@ -141,6 +142,10 @@ MIN_RUNNING_AGENTS = 6
 
 # How long the orchestration loop sleeps between passes over the unfinished cases
 ORCHESTRATION_POLL_INTERVAL_S = 20
+
+# The order a pass places the device kinds in: the GPU-only cases first, then the CPU-only ones, which never take a GPU,
+# then the CPU-capable ones, which take the GPUs and CPU slots the others leave
+DEVICE_LAUNCH_ORDER = (TrainingDevices.GPU_ONLY, TrainingDevices.CPU_ONLY, TrainingDevices.CPU_CAPABLE)
 
 # The training shuffle of every config before launch_train seeds it, the one sweep trials train with
 BASE_SHUFFLE_SEED = 0
@@ -1345,7 +1350,7 @@ class Study:
         """
         fallback = ",".join(p for p in (*config.spillover_partitions, *config.cpu_fallback_partitions) if p and p != config.partition)
         watched = [(fallback, cases)] if fallback else []
-        cpu_capable_cases = [case for case in cases if self.trains_on_cpu(case)]
+        cpu_capable_cases = [case for case in cases if self.training_devices(case) is TrainingDevices.CPU_CAPABLE]
         if cpu_capable_cases and config.partition:
             watched.append((config.partition, cpu_capable_cases))
         for partition, partition_cases in watched:
@@ -1374,9 +1379,13 @@ class Study:
                         attempts = self.train_attempts.get(job_name, 0)
                         self.train_attempts[job_name] = max(attempts - 1, 0)
 
-    def trains_on_cpu(self, case: Case) -> bool:
-        """Whether the case's training and sweep agents may also run on the CPU partitions (cpu_model_types)."""
-        return bool(config.cpu_partition) and case.model_type in config.cpu_model_types
+    def training_devices(self, case: Case) -> TrainingDevices:
+        """Where the case's training and sweep agents may run (gpu_only_model_types, cpu_only_model_types), GPU only without a cpu_partition."""
+        if not config.cpu_partition or case.model_type in config.gpu_only_model_types:
+            return TrainingDevices.GPU_ONLY
+        if case.model_type in config.cpu_only_model_types:
+            return TrainingDevices.CPU_ONLY
+        return TrainingDevices.CPU_CAPABLE
 
     def run_unfinished_cases(self, skip_tuning: bool, enable_parallelism: bool):
         """Loop until every runnable case has a result file.
@@ -1480,33 +1489,37 @@ class Study:
             unfinished = [case for case in unfinished if not self.result_path(case).exists()]
 
     def _launch_ready_cases(self, to_launch: list[tuple[Case, list[int]]], skip_tuning: bool):
-        """Give each ready seed a partition from the pass's launch_slots and launch it, the GPU-only cases' seeds first.
+        """Give each ready seed a partition from the pass's launch_slots and launch it, in DEVICE_LAUNCH_ORDER.
 
-        A case that can also train on CPU only takes the primary GPUs the GPU-only cases of this pass leave,
-        beyond cpu_capable_buffer_gpus, and the CPU partitions otherwise.
+        A CPU-capable case only takes the primary GPUs the GPU-only cases of this pass leave beyond cpu_capable_buffer_gpus,
+        and the CPU slots the CPU-only cases leave.
         So it still tries the primary after a GPU-only case found it full, since its GPU buffer may be the smaller one.
-        A GPU-only seed finding no partition holds the remaining GPU-only cases until the next pass,
-        a CPU-capable one finding none holds every case left.
+        A seed finding no partition holds the remaining cases of its kind until the next pass,
+        and a CPU-capable one finding none holds the CPU-only cases too, since the CPU partitions are full.
         A case that cannot train yet (still tuning, or its prereqs unmet) holds its other seeds.
         The cases still tuning go last, each reads its wandb project (about 20 s) before any training launch could wait on it.
         """
-        launch_order = sorted(to_launch, key=lambda case_seeds: (self._reads_sweep(case_seeds[0]), self.trains_on_cpu(case_seeds[0])))
-        gpu_only_held = False
+        launch_order = sorted(to_launch, key=lambda case_seeds: self._launch_rank(case_seeds[0]))
+        held_devices: set[TrainingDevices] = set()
         for case, seeds in launch_order:
-            cpu_capable = self.trains_on_cpu(case)
-            if gpu_only_held and not cpu_capable:
+            devices = self.training_devices(case)
+            if devices in held_devices:
                 continue
             for seed in seeds:
-                partition = self.launch_slots.pick(cpu_capable)
-                if partition is None and not cpu_capable:
-                    logger.info("No open GPU slots or spillover budget, holding the ready GPU-only cases until the next pass")
-                    gpu_only_held = True
-                    break
+                partition = self.launch_slots.pick(devices)
                 if partition is None:
-                    logger.info("No open GPU or CPU slots, holding the remaining ready cases until the next pass")
-                    return
+                    logger.info(f"No open slots for the ready {devices.value} cases, holding them until the next pass")
+                    held_devices.add(devices)
+                    if devices is TrainingDevices.CPU_CAPABLE:
+                        held_devices.add(TrainingDevices.CPU_ONLY)
+                    break
                 if not self.run_case(case, seed, skip_tuning=skip_tuning, enable_parallelism=True, partition=partition):
                     break
+
+    def _launch_rank(self, case: Case) -> tuple[bool, int]:
+        """Where a ready case goes in a pass's launch order, the cases still tuning last, each kind in DEVICE_LAUNCH_ORDER."""
+        devices = self.training_devices(case)
+        return self._reads_sweep(case), DEVICE_LAUNCH_ORDER.index(devices)
 
     def _reads_sweep(self, case: Case) -> bool:
         """Whether launching the case reads its wandb sweep first, a hyperparam case without its tuned config yet."""
@@ -1544,7 +1557,7 @@ class Study:
     def _run_ready_case(self, case: Case, seed: int, skip_tuning: bool, enable_parallelism: bool, partition: str | None) -> bool:
         """Launch one seed of a case whose prereqs are satisfied, returns whether the case was ready to train."""
         if enable_parallelism and partition is None:
-            partition = self.launch_slots.pick(self.trains_on_cpu(case))
+            partition = self.launch_slots.pick(self.training_devices(case))
             if partition is None:
                 logger.debug("No resources currently available, waiting before trying again...")
                 return False
@@ -1706,7 +1719,7 @@ class Study:
             outstanding_for_count = config.hyperparam_sweeps - n_completed_runs - running_agents
             outstanding_for_finished = min_finished - n_finished_runs - running_agents
             outstanding_trials = max(outstanding_for_count, outstanding_for_finished)
-            capacity = self.launch_slots.available(partition, self.trains_on_cpu(case))
+            capacity = self.launch_slots.available(partition, self.training_devices(case))
             # Keep MIN_RUNNING_AGENTS going (up to capacity) to finish out the sweep,
             # one agent at a time may get pruned.
             # A sweep smaller than that (debug) never runs more agents than it has trials

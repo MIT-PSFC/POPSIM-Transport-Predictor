@@ -119,7 +119,8 @@ class ProfileStudy(Study):
 
         FIELD_CHOICES: ClassVar[dict[str, tuple]] = {
             "model_types": STUDY_MODEL_TYPES,
-            "cpu_model_types": STUDY_MODEL_TYPES,
+            "gpu_only_model_types": STUDY_MODEL_TYPES,
+            "cpu_only_model_types": STUDY_MODEL_TYPES,
             "geometry_builders": VALID_GEOMETRY_BUILDERS,
             "data_normalization_methods": FEATURE_NORMALIZATIONS,
             "hyperparam_data_normalization": FEATURE_NORMALIZATIONS,
