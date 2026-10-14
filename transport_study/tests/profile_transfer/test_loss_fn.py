@@ -43,12 +43,12 @@ def study_config(tmp_path) -> ProfileStudy.Config:
         study_name="test_loss_fn",
         working_dir_base=tmp_path,
         dataset_paths={
-            "cmod-low": SAMPLE_DIR / "cmod-low1.nc",
+            "cmod-low1": SAMPLE_DIR / "cmod-low1.nc",
             "cmod-high": SAMPLE_DIR / "cmod-high.nc",
         },
         target_device="cmod-high",
         model_types=("mlp",),
-        training_datasets=("cmod-low",),
+        training_datasets=("cmod-low1",),
         target_test_set_size=60,
     )
     load_config(cfg)
@@ -263,19 +263,19 @@ def test_weighted_case_weights_reach_loss_config(study_config):
     # Weights mirror the actual training set: all loaded source shots plus
     # num_target_shots target shots. Without configured dataset_fractions the
     # target's share of the loss is sqrt-scaled in its share of the shots
-    n_source = get_loaded_shot_count("cmod-low", study_type=ProfileStudy.STUDY_TYPE)
+    n_source = get_loaded_shot_count("cmod-low1", study_type=ProfileStudy.STUDY_TYPE)
     n_target = 10
     n_total = n_source + n_target
     target_fraction = min(0.5, np.sqrt(n_target / n_total))
-    assert set(weights) == {"cmod-high", "cmod-low"}
+    assert set(weights) == {"cmod-high", "cmod-low1"}
     assert weights["cmod-high"] == pytest.approx(target_fraction * n_total / n_target)
-    assert weights["cmod-low"] == pytest.approx((1 - target_fraction) * n_total / n_source)
+    assert weights["cmod-low1"] == pytest.approx((1 - target_fraction) * n_total / n_source)
     # Effective contributions split in the configured proportion and the mean
     # per-sample weight over the training set is exactly 1
     assert weights["cmod-high"] * n_target == pytest.approx(target_fraction * n_total)
-    assert weights["cmod-high"] * n_target + weights["cmod-low"] * n_source == pytest.approx(n_total)
+    assert weights["cmod-high"] * n_target + weights["cmod-low1"] * n_source == pytest.approx(n_total)
     # Scarce target data must be weighted more heavily than plentiful source data
-    assert weights["cmod-high"] > weights["cmod-low"]
+    assert weights["cmod-high"] > weights["cmod-low1"]
     # Validation eval must see the same weighting as training
     assert train_config.val_eval_suite_config["loss_config"]["device_weights"] == weights
 
@@ -396,7 +396,7 @@ def test_loss_on_prepared_sample_dataset():
     Pulls one fully-finite timeslice of the prepared cmod-high sample dataset
     (real GP-fit profiles, gradients and error bars on the uniform 51-point
     rho grid) with the device's real chi_sigma_floors:
-    perfect predictions cost nothing, a two-sigma miss costs more than a half-sigma miss,
+    perfect predictions cost no value chi, a two-sigma miss costs more than a half-sigma miss,
     and both losses stay finite on real signals.
     """
     ds = get_ds("cmod-high", "profile_transfer")
@@ -415,17 +415,21 @@ def test_loss_on_prepared_sample_dataset():
     extras = {var: ts[var].values for var in PROFILE_TARGET_VARS if var not in ("n_e_1e20", "t_e_keV")}
 
     floors = {device: chi_sigma_floors(device) for device in config.dataset_paths}
-    val_loss = ProfilePredictorTRB.get_val_loss_fn({"gradient_weight": 0.1, "chi_sigma_floors": floors})
+    val_loss_config = {"gradient_weight": 0.1, "chi_sigma_floors": floors}
+    val_loss = ProfilePredictorTRB.get_val_loss_fn(val_loss_config)
+    # The GP-fit gradient is not the finite difference of the GP-fit values,
+    # so a perfect prediction scores a small gradient chi and only the value chi vanishes
+    val_loss_values = ProfilePredictorTRB.get_val_loss_fn({**val_loss_config, "gradient_weight": 0.0})
     train_loss = ProfilePredictorTRB.get_loss_fn(
         {"huber_delta": 1.0, "huber_delta_grad": 3.0, "gradient_weight": 0.1, "train_chi_sigma_floors": floors}
     )
 
     pred_perfect, targ = _pred_and_targ(ne, te, ne, te, **extras)
-    assert float(val_loss(pred_perfect, targ)) == pytest.approx(0.0, abs=1e-9)
+    assert float(val_loss_values(pred_perfect, targ)) == pytest.approx(0.0, abs=1e-9)
 
     pred_inside, _ = _pred_and_targ(ne + 0.5 * ne_sigma, te - 0.5 * te_sigma, ne, te, **extras)
     pred_outside, _ = _pred_and_targ(ne + 2.0 * ne_sigma, te - 2.0 * te_sigma, ne, te, **extras)
-    assert float(val_loss(pred_outside, targ)) > float(val_loss(pred_inside, targ)) > 0.0
+    assert float(val_loss(pred_outside, targ)) > float(val_loss(pred_inside, targ)) > float(val_loss(pred_perfect, targ))
 
     for pred in (pred_perfect, pred_inside, pred_outside):
         assert np.isfinite(float(train_loss(pred, targ)))

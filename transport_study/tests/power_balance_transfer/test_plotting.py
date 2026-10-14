@@ -26,15 +26,18 @@ def results_ds() -> xr.Dataset:
             continue
         if (da == "transfer" or td == "exnihilo") and shots == 0:
             continue
-        rows.append((mt, td, dn, da, False, shots, "ascending", False))
+        rows.append((mt, td, dn, da, False, shots, "ascending", False, "sweep"))
         # Without target shots every case takes the base order
         if shots > 0:
-            rows.append((mt, td, dn, da, False, shots, "spanning", False))
+            rows.append((mt, td, dn, da, False, shots, "spanning", False, "sweep"))
         # The child-study axes: frozen sciml submodules and multiobjective transformers
         if mt.startswith("sciml"):
-            rows.append((mt, td, dn, da, True, shots, "ascending", False))
+            rows.append((mt, td, dn, da, True, shots, "ascending", False, "sweep"))
         if mt == "transformer":
-            rows.append((mt, td, dn, da, False, shots, "ascending", True))
+            rows.append((mt, td, dn, da, False, shots, "ascending", True, "sweep"))
+        # The model_size child axis, a halved mlp beside the tuned size
+        if mt == "mlp":
+            rows.append((mt, td, dn, da, False, shots, "ascending", False, "half"))
 
     rng = np.random.default_rng(0)
     n = len(rows)
@@ -49,8 +52,9 @@ def results_ds() -> xr.Dataset:
             "num_target_shots",
             "target_shot_order",
             "multiobjective",
+            "model_size",
         ),
-        range(8),
+        range(9),
         strict=True,
     ):
         ds = ds.assign_coords({coord_name: ("case_idx", [row[idx] for row in rows])})

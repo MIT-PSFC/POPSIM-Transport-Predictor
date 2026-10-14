@@ -9,10 +9,9 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from popsim.ml import TrainConfig
 from popsim.ml.launch import launch_train
 
-from transport_study.config import RHO_GRID, StudyConfig, load_config
+from transport_study.config import RHO_GRID, StudyConfig, load_config, reset_config
 from transport_study.modules.normalization import CoralFeatureNormalizer
 from transport_study.modules.profile_predictor.module import (
     N_NN_INPUTS,
@@ -20,9 +19,7 @@ from transport_study.modules.profile_predictor.module import (
     ProfilePredictorReservoir,
 )
 from transport_study.modules.profile_predictor.trb import ProfilePredictorTRB
-from transport_study.modules.trb_utils import ADAMW_DEFAULTS
-from transport_study.orchestration.organize_data import PROFILE_TARGET_VARS
-from transport_study.profile_transfer.profile_study import PROFILE_INPUT_VARS
+from transport_study.profile_transfer.profile_study import ProfileStudy
 from transport_study.tests.sample_data import SAMPLE_DIR, requires_sample_data
 
 RESERVOIR_SIZE = 32
@@ -34,7 +31,7 @@ def loaded_config():
         StudyConfig(
             study_name="test_reservoir_predictor",
             dataset_paths={
-                "cmod-low": SAMPLE_DIR / "cmod-low1.nc",
+                "cmod-low1": SAMPLE_DIR / "cmod-low1.nc",
                 "cmod-high": SAMPLE_DIR / "cmod-high.nc",
             },
             target_device="cmod-high",
@@ -108,44 +105,27 @@ def test_reservoir_trainable_getter_only_readout(make_module):
 
 @pytest.mark.slow
 @requires_sample_data
-def test_reservoir_training_smoke():
-    """End-to-end launch_train on the sample dataset."""
-    train_config = TrainConfig(
-        project="test_reservoir_training_smoke",
-        train_run_builder="transport_study.modules.profile_predictor.trb.ProfilePredictorTRB",
+def test_reservoir_training_smoke(tmp_path):
+    """End-to-end launch_train of the production reservoir config on the sample dataset."""
+    # The study loads its own config in place of the module fixture's
+    reset_config()
+    cfg = ProfileStudy.Config(
+        study_name="test_reservoir_training_smoke",
+        working_dir_base=tmp_path,
+        dataset_paths={
+            "cmod-low1": SAMPLE_DIR / "cmod-low1.nc",
+            "cmod-high": SAMPLE_DIR / "cmod-high.nc",
+        },
+        target_device="cmod-high",
+        max_ds_size=10,
         max_epochs=2,
         epochs_per_val=1,
-        checkpoint_dir=None,
-        dataloader_config={
-            "input_vars": PROFILE_INPUT_VARS,
-            "target_vars": [*PROFILE_TARGET_VARS, "ds_source_idx"],
-            "training_data": {"sources": ["cmod-low"], "exnihilo": False},
-            "batch_size": None,
-        },
-        model_init_config={
-            "model_type": "reservoir",
-            # model_init indexes this strictly, the study normally supplies it
-            "data_normalization": "physics-coral",
-            "reservoir_size": RESERVOIR_SIZE,
-            "spectral_radius": 0.9,
-            "input_scaling": 0.5,
-            "leak_rate": 1.0,
-            "n_steps": 10,
-            "prng_seed": 42,
-        },
-        loss_config={
-            "huber_delta": 0.5,
-            "gradient_weight": 0.1,
-            "huber_delta_grad": 5.0,
-        },
-        optimizer_config={
-            "lr0": 3e-3,
-            "transition_steps": 1661,
-            "decay_rate": 0.1,
-            "lrf_frac": 0.17,
-            "weight_decay": 2e-4,
-            **ADAMW_DEFAULTS,
-        },
+        model_types=("reservoir",),
+        training_datasets=("cmod-low1",),
+        domain_adaptation_methods=(None,),
+        num_target_shots_options=(0,),
+        target_test_set_size=4,
     )
-
-    launch_train(train_config)
+    study = ProfileStudy(cfg)
+    (case,) = study.cases
+    launch_train(study.make_train_config(case))

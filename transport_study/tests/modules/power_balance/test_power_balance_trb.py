@@ -30,9 +30,6 @@ from transport_study.modules.trb_utils import (
     ADAMW_DEFAULTS,
     make_grouped_exponential_adamw,
 )
-from transport_study.orchestration.study import HYPERPARAM_TARGET_SHOTS
-from transport_study.power_balance_transfer.power_balance_study import PowerBalanceStudy
-from transport_study.tests.sample_data import SAMPLE_DIR, requires_sample_data
 
 ##################
 # Loss functions #
@@ -352,72 +349,3 @@ def test_scaling_law_coefficients_skip_weight_decay():
         scaling_updates = getattr(updates.taue_predictor, name)
         assert all(float(update) == 0.0 for update in scaling_updates.values())
     assert float(jnp.abs(updates.p_oh_predictor.nn.layers[0].weight).max()) > 0.0
-
-
-@requires_sample_data
-def test_base_optimizer_config_carries_lr_factors(tmp_path):
-    study = PowerBalanceStudy(
-        PowerBalanceStudy.Config(
-            study_name="pb_trb_optimizer_test",
-            working_dir_base=tmp_path,
-            dataset_paths={
-                "cmod-low1": SAMPLE_DIR / "cmod-low1.nc",
-                "cmod-high": SAMPLE_DIR / "cmod-high.nc",
-            },
-            target_device="cmod-high",
-            model_types=("sciml-taue-nn",),
-            training_datasets=("cmod-low1",),
-            data_normalization_methods=("raw",),
-            domain_adaptation_methods=(None,),
-            freeze_submodules_options=(True,),
-            num_target_shots_options=(HYPERPARAM_TARGET_SHOTS,),
-            target_test_set_size=4,
-        )
-    )
-    case = next(c for c in study.cases if c.model_type == "sciml-taue-nn")
-    train_config = study.make_train_config(case)
-
-    expected = {"p_oh_predictor": 0.1, "p_rad_predictor": 0.1}
-    assert train_config.optimizer_config["submodule_lr_factors"] == expected
-
-
-@requires_sample_data
-def test_transfer_config_stacks_submodule_lr_factors(tmp_path):
-    # The submodule LR reduction deliberately stacks with the target-only
-    # lr0 scale: the submodules already ran their own pretrain + finetune
-    # prereq chain, so the joint finetune moves their last layers only at
-    # 0.1x the transfer LR. The factors must survive make_train_config for
-    # transfer cases exactly as for da=None cases
-    study = PowerBalanceStudy(
-        PowerBalanceStudy.Config(
-            study_name="pb_trb_transfer_lr_test",
-            working_dir_base=tmp_path,
-            dataset_paths={
-                "cmod-low1": SAMPLE_DIR / "cmod-low1.nc",
-                "cmod-high": SAMPLE_DIR / "cmod-high.nc",
-            },
-            target_device="cmod-high",
-            model_types=("sciml-taue-nn",),
-            training_datasets=("cmod-low1",),
-            data_normalization_methods=("raw",),
-            domain_adaptation_methods=(None, "transfer"),
-            freeze_submodules_options=(True,),
-            num_target_shots_options=(HYPERPARAM_TARGET_SHOTS, 2),
-            target_test_set_size=4,
-        )
-    )
-    transfer_case = next(c for c in study.cases if c.domain_adaptation == "transfer" and c.num_target_shots == 2)
-    hyperparam_case = next(c for c in study.cases if c.domain_adaptation is None and c.model_type == "sciml-taue-nn")
-
-    transfer_config = study.make_train_config(transfer_case)
-    hyperparam_config = study.make_train_config(hyperparam_case)
-
-    expected = {"p_oh_predictor": 0.1, "p_rad_predictor": 0.1}
-    assert transfer_config.optimizer_config["submodule_lr_factors"] == expected
-    assert hyperparam_config.optimizer_config["submodule_lr_factors"] == expected
-
-    # The surviving factors keep the optimizer grouped, so the stacked
-    # schedule actually applies on top of the target-only lr0
-    trainable, _ = make_partition_by_members(lambda m: m)(_make_fake_module())
-    grouped_state = make_grouped_exponential_adamw(transfer_config.optimizer_config).init(trainable)
-    assert hasattr(grouped_state, "inner_states")

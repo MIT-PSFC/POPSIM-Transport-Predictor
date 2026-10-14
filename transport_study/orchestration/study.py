@@ -11,6 +11,7 @@ import time
 import tomllib
 from collections import Counter
 from concurrent.futures import ProcessPoolExecutor
+from contextlib import contextmanager
 from dataclasses import dataclass, fields, replace
 from itertools import product
 from pathlib import Path
@@ -245,11 +246,29 @@ def model_size_updates(model_size: str, sweep_model_init_parameters: dict, model
     raise ValueError(f"Unknown model size {model_size!r}, must be one of {MODEL_SIZES}")
 
 
+@contextmanager
+def _cpu_only_jax_environment():
+    """JAX_PLATFORMS=cpu for the processes spawned inside, which copy this process's environment.
+
+    The result readers only need xarray, and a GPU client per reader would preallocate the device over again.
+    """
+    previous = os.environ.get("JAX_PLATFORMS")
+    os.environ["JAX_PLATFORMS"] = "cpu"
+    try:
+        yield
+    finally:
+        if previous is None:
+            del os.environ["JAX_PLATFORMS"]
+        else:
+            os.environ["JAX_PLATFORMS"] = previous
+
+
 def map_result_files[CaseRead](read_case: Callable[[Path], CaseRead], result_paths: list[Path]) -> list[CaseRead]:
     """read_case of every result file, in order, on up to COLLECT_PROCESSES processes.
 
     read_case must be a module-level function of the result path alone, so a fresh process can import it.
-    The processes are spawned, never forked, since forking a process that imported JAX can deadlock.
+    The processes are spawned, never forked, since forking a process that imported JAX can deadlock,
+    and on the CPU, since importing study.py initializes JAX.
     A single file is read in this process.
     Logs a progress line every COLLECT_PROGRESS_EVERY cases.
     """
@@ -258,7 +277,7 @@ def map_result_files[CaseRead](read_case: Callable[[Path], CaseRead], result_pat
         return [read_case(result_path) for result_path in result_paths]
     spawn_context = multiprocessing.get_context("spawn")
     case_reads = []
-    with ProcessPoolExecutor(n_processes, mp_context=spawn_context) as pool:
+    with _cpu_only_jax_environment(), ProcessPoolExecutor(n_processes, mp_context=spawn_context) as pool:
         for n_read, case_read in enumerate(pool.map(read_case, result_paths), start=1):
             case_reads.append(case_read)
             if n_read % COLLECT_PROGRESS_EVERY == 0 or n_read == len(result_paths):

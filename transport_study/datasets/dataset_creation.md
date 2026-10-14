@@ -36,3 +36,15 @@ into `dataset_N`, and `--clean` deletes an earlier build first.
 The build needs neither popsim nor JAX.
 It writes `<data_assembly_dir>/<ds_name>/dataset_full/ds.zarr` (through `ds.partial.zarr` while incomplete, so a crashed run leaves no half store)
 and diagnostic plots next to it: per-shot time traces, profile heatmaps, and a summary PDF.
+
+## Test samples
+
+The tests that need real data read three samples per device, `<device>-low1.nc`, `<device>-low2.nc` and `<device>-high.nc`
+(`datasets/samples.py`): the first, second and last `SAMPLE_N_SHOTS` (80) shots of a study store in ascending hazard,
+written as netCDF in the store schema so `organize_data.get_ds` reads each as a device of its own.
+They live outside the repo in the directory `PTPS_TEST_SAMPLE_DIR` names (`tests/sample_data.py`), rebuilt from the current stores with
+
+```bash
+python -m transport_study.datasets.cli sample --device cmod --store <data_assembly_dir>/cmod/dataset_full/ds.zarr --sample_dir $PTPS_TEST_SAMPLE_DIR
+python -m transport_study.datasets.cli sample --device mast --store <data_assembly_dir>/mast/dataset_full/ds.zarr --sample_dir $PTPS_TEST_SAMPLE_DIR
+```

@@ -12,9 +12,10 @@ DEVICES = ("cmod", "mast", "tcv", "d3d")
 
 
 class DatasetCLI:
-    """Build one device's study store from its transport-validation-datasets store.
+    """Build one device's study store from its transport-validation-datasets store, or the test samples of a study store.
 
         python -m transport_study.datasets.cli build --device cmod --store <cmod_published.zarr> --data_assembly_dir <dir>
+        python -m transport_study.datasets.cli sample --device cmod --store <dataset_full/ds.zarr> --sample_dir $PTPS_TEST_SAMPLE_DIR
 
     transport-validation-datasets builds every device:
     C-Mod and MAST up to a published store (<ds>_published.zarr),
@@ -52,6 +53,25 @@ class DatasetCLI:
         log_path = workflow.final_ds_dir / f"processed_data_{os.getpid()}.log"
         logger.add(log_path)
         workflow.run_processed_data_workflow()
+
+    def sample(self, device: str, store: Path | str, sample_dir: Path | str):
+        """Write the test samples of one device's study store (see samples.py).
+
+        device: one of DEVICES, the prefix of the sample file names
+        store: the study store (dataset_full/ds.zarr) to split by hazard
+        sample_dir: where the <device>-<block>.nc files go, the tests read PTPS_TEST_SAMPLE_DIR
+        """
+        # samples imports organize_data and with it JAX, which the store build never needs
+        from transport_study.datasets.samples import (
+            SAMPLE_BLOCKS,
+            SAMPLE_N_SHOTS,
+            make_samples,
+        )
+
+        if device not in DEVICES:
+            raise ValueError(f"Unknown device {device!r}, the study stores are {DEVICES}")
+        logger.info(f"Writing the {SAMPLE_BLOCKS} samples of {SAMPLE_N_SHOTS} shots of {store} to {sample_dir}")
+        make_samples(device, store, sample_dir)
 
 
 if __name__ == "__main__":

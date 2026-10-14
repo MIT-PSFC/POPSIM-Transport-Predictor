@@ -11,7 +11,7 @@ from torax import ToraxConfig
 from torax import experimental as torax_experimental
 
 from transport_study import RADIAL_DIM
-from transport_study.config import RHO_GRID, StudyConfig, load_config
+from transport_study.config import RHO_GRID
 from transport_study.modules.profile_predictor.module import Inputs
 from transport_study.modules.profile_predictor.torax_module import (
     TRANSPORT_COEFFICIENT_NAMES,
@@ -21,12 +21,11 @@ from transport_study.modules.profile_predictor.torax_module import (
     validate_transport_model_name,
 )
 from transport_study.modules.profile_predictor.train_configs import (
-    PROFILE_PREDICTOR_TORAX_CONFIGS,
     TORAX_CONFIG_BASE,
     TORAX_TRANSPORT_BLOCKS,
 )
 from transport_study.modules.profile_predictor.trb import relaxation_numerics
-from transport_study.orchestration.organize_data import PROFILE_TARGET_VARS
+from transport_study.profile_transfer.profile_study import ProfileStudy
 from transport_study.tests.sample_data import SAMPLE_DIR, requires_sample_data
 
 TRANSPORT_MODELS = ("constant", "gyrobohm", "qlknn")
@@ -141,48 +140,45 @@ def test_validate_transport_model_name_rejects_mismatch(transport, transport_mod
         validate_transport_model_name(torax_config, transport_model)
 
 
+def _smoke_study(tmp_path, model_type: str, device: str, geometry_builder: str = "circular") -> ProfileStudy:
+    """A one-case profile study on a device's samples, so the smoke trains exactly the production config."""
+    cfg = ProfileStudy.Config(
+        study_name=f"test_{model_type}_{device}_{geometry_builder}",
+        working_dir_base=tmp_path,
+        dataset_paths={
+            f"{device}-low1": SAMPLE_DIR / f"{device}-low1.nc",
+            f"{device}-high": SAMPLE_DIR / f"{device}-high.nc",
+        },
+        target_device=f"{device}-high",
+        # Ten shots keep the smoke cheap, the production batch over the whole sample OOMs the GPU
+        max_ds_size=10,
+        max_epochs=4,
+        epochs_per_val=2,
+        model_types=(model_type,),
+        geometry_builders=(geometry_builder,),
+        data_normalization_methods=("physics-coral",),
+        hyperparam_data_normalization="physics-coral",
+        training_datasets=(f"{device}-low1",),
+        domain_adaptation_methods=(None,),
+        num_target_shots_options=(0,),
+        target_test_set_size=4,
+    )
+    return ProfileStudy(cfg)
+
+
+def _smoke_train_config(study: ProfileStudy) -> TrainConfig:
+    """The hyperparam case's production train config at a batch the smoke sample fits."""
+    (case,) = study.cases
+    train_config = study.make_train_config(case)
+    return train_config.model_copy(update={"dataloader_config": {**train_config.dataloader_config, "batch_size": 512}})
+
+
 @pytest.mark.slow
 @requires_sample_data
 @pytest.mark.parametrize("transport_model", ["constant", "gyrobohm", "qlknn"])
-def test_torax_predictor(transport_model):
-    config = StudyConfig(
-        study_name=f"test_torax_predictor_{transport_model}",
-        dataset_paths={
-            "cmod-low": SAMPLE_DIR / "cmod-low1.nc",
-            "cmod-high": SAMPLE_DIR / "cmod-high.nc",
-        },
-        target_device="cmod-high",
-        # large batch with the the full ~100 shot sample dataset OOMs the GPU
-        # 10 shots keeps this a cheap smoke test
-        max_ds_size=10,
-    )
-    load_config(config)
-
-    train_config = TrainConfig(**PROFILE_PREDICTOR_TORAX_CONFIGS[transport_model])
-    training_data = {
-        "sources": ["cmod-low"],
-        "exnihilo": False,
-    }
-    train_config = train_config.model_copy(
-        update={
-            "project": config.study_name,
-            "max_epochs": 4,
-            "epochs_per_val": 2,
-            "dataloader_config": {
-                **train_config.dataloader_config,
-                "training_data": training_data,
-                "target_vars": [*PROFILE_TARGET_VARS, "ds_source_idx"],
-                "batch_size": 512,
-            },
-            "model_init_config": {
-                **train_config.model_init_config,
-                # model_init indexes this strictly, the study normally supplies it
-                "data_normalization": "physics-coral",
-            },
-        }
-    )
-
-    _trainer, _train_dl, _val_dl, _test_dl, _ = launch_train(train_config)
+def test_torax_predictor(tmp_path, transport_model):
+    study = _smoke_study(tmp_path, f"torax-{transport_model}", "cmod")
+    launch_train(_smoke_train_config(study))
 
 
 # qlknn training blew up on MAST samples with the circular geometry,
@@ -190,44 +186,9 @@ def test_torax_predictor(transport_model):
 @pytest.mark.slow
 @requires_sample_data
 @pytest.mark.parametrize("transport_model", ["gyrobohm", "qlknn"])
-def test_torax_predictor_mast_miller(transport_model):
-    config = StudyConfig(
-        study_name=f"test_torax_predictor_mast_miller_{transport_model}",
-        dataset_paths={
-            "mast-low": SAMPLE_DIR / "mast-low1.nc",
-            "mast-high": SAMPLE_DIR / "mast-high.nc",
-        },
-        target_device="mast-high",
-        max_ds_size=10,
-    )
-    load_config(config)
-
-    train_config = TrainConfig(**PROFILE_PREDICTOR_TORAX_CONFIGS[transport_model])
-    training_data = {
-        "sources": ["mast-low"],
-        "exnihilo": False,
-    }
-    train_config = train_config.model_copy(
-        update={
-            "project": config.study_name,
-            "max_epochs": 4,
-            "epochs_per_val": 2,
-            "dataloader_config": {
-                **train_config.dataloader_config,
-                "training_data": training_data,
-                "target_vars": [*PROFILE_TARGET_VARS, "ds_source_idx"],
-                "batch_size": 512,
-            },
-            "model_init_config": {
-                **train_config.model_init_config,
-                "geometry_builder": "miller",
-                # model_init indexes this strictly, the study normally supplies it
-                "data_normalization": "physics-coral",
-            },
-        }
-    )
-
-    _trainer, _train_dl, _val_dl, _test_dl, _ = launch_train(train_config)
+def test_torax_predictor_mast_miller(tmp_path, transport_model):
+    study = _smoke_study(tmp_path, f"torax-{transport_model}", "mast", geometry_builder="miller")
+    launch_train(_smoke_train_config(study))
 
 
 @pytest.mark.slow

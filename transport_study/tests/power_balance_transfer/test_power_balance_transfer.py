@@ -75,9 +75,17 @@ def _clean_case(study: PowerBalanceStudy, case: PowerBalanceStudy.Case):
 
 
 def _train_case(study: PowerBalanceStudy, case: PowerBalanceStudy.Case):
-    """Train every seed of the case serially, then merge them into its result file and best checkpoint."""
+    """Train the case as the serial orchestrator would.
+
+    Its unfinished prereqs go first, then every seed through run_case,
+    which writes a hyperparam case's tuned config before training (the anchor terms read the submodules' ones),
+    then the seed merge into the result file and best checkpoint.
+    """
+    for prereq in case.prereqs or []:
+        if not study.result_path(prereq).exists():
+            _train_case(study, prereq)
     for seed in range(config.num_seeds):
-        study.launch_train(case, seed)
+        study.run_case(case, seed, skip_tuning=True, enable_parallelism=False)
     study.merge_seed_results(case)
 
 
@@ -204,7 +212,7 @@ def test_weighted_device_weight():
         training_data="cmod-low1_cmod-low2",
         data_normalization="coral",
         domain_adaptation="weighted",
-        freeze_submodules=True,
+        freeze_submodules=config.hyperparam_freeze_submodules,
         num_target_shots=3,
     )
 
@@ -246,7 +254,7 @@ def test_addition_no_device_weights(tmp_path):
             training_data="cmod-low1_cmod-low2",
             data_normalization="coral",
             domain_adaptation=domain_adaptation,
-            freeze_submodules=True,
+            freeze_submodules=config.hyperparam_freeze_submodules,
             num_target_shots=3,
         )
 
@@ -301,7 +309,7 @@ def test_transformer_training():
         training_data="cmod-low1",
         data_normalization="coral",
         domain_adaptation=None,
-        freeze_submodules=True,
+        freeze_submodules=config.hyperparam_freeze_submodules,
         num_target_shots=0,
     )
 
@@ -346,8 +354,8 @@ def test_submodule_freezing():
             num_target_shots=HYPERPARAM_TARGET_SHOTS,
         )
 
-    case_p_oh = _case("p_oh", True)
-    case_p_rad = _case("p_rad", True)
+    case_p_oh = _case("p_oh", config.hyperparam_freeze_submodules)
+    case_p_rad = _case("p_rad", config.hyperparam_freeze_submodules)
     case_frozen = _case("sciml-taue-nn", True)
     case_unfrozen = _case("sciml-taue-nn", False)
 
@@ -405,7 +413,7 @@ def test_transfer_weights():
         training_data="cmod-low1_cmod-low2",
         data_normalization="coral",
         domain_adaptation="transfer",
-        freeze_submodules=True,
+        freeze_submodules=config.hyperparam_freeze_submodules,
         num_target_shots=3,
     )
     # The pretrain twin keeps this case's num_target_shots, the old shared
@@ -428,13 +436,15 @@ def test_transfer_weights():
     transfer_init = study.restore_trainer(case_transfer, restore_best_checkpoint=False)[0].train_state.model.module
     transfer_final = study.restore_trainer(case_transfer)[0].train_state.model.module
 
-    # Important! The TARGET device's per-device stats are fitted by the pretrain twin
-    # (identity before this change, the shared pretrain never saw the target device)
+    # CORAL aligns every source device to the target, which keeps the identity transform as the reference,
+    # so the pretrain twin's fit on historic + the case's target shots shows on the sources
     target_idx = config.ds_source_to_idx[config.target_device]
-    n = np.asarray(pretrain_final.normalizer.transforms[target_idx]).shape[0]
-    assert not np.allclose(np.asarray(pretrain_final.normalizer.transforms[target_idx]), np.eye(n)), (
-        "Target device CORAL transform is identity, the combined fit did not happen"
-    )
+    transforms = pretrain_final.normalizer.transforms
+    n = np.asarray(transforms[target_idx]).shape[0]
+    assert np.allclose(np.asarray(transforms[target_idx]), np.eye(n)), "The target device is the CORAL reference"
+    for source in case_transfer.training_data.sources:
+        source_idx = config.ds_source_to_idx[source]
+        assert not np.allclose(np.asarray(transforms[source_idx]), np.eye(n)), f"{source} was not aligned to the target"
     # The transfer case inherits the pretrain normalizer through the
     # checkpoint restore and never refits or trains it
     chex.assert_trees_all_equal(pretrain_final.normalizer, transfer_init.normalizer)
@@ -479,8 +489,8 @@ def test_transfer_weights_submodules(freeze_submodules):
             num_target_shots=HYPERPARAM_TARGET_SHOTS if domain_adaptation is None else 3,
         )
 
-    case_p_oh_transfer = _case("p_oh", "transfer", True)
-    case_p_rad_transfer = _case("p_rad", "transfer", True)
+    case_p_oh_transfer = _case("p_oh", "transfer", config.hyperparam_freeze_submodules)
+    case_p_rad_transfer = _case("p_rad", "transfer", config.hyperparam_freeze_submodules)
     case_sciml_transfer = _case("sciml-taue-nn", "transfer", freeze_submodules)
     case_p_oh_pretrain = case_p_oh_transfer.replace(domain_adaptation="transfer_pretrain")
     case_p_rad_pretrain = case_p_rad_transfer.replace(domain_adaptation="transfer_pretrain")
@@ -571,11 +581,7 @@ def test_collect_results():
     shutil.rmtree(study.result_dir, ignore_errors=True)
     study.working_dir.mkdir(parents=True, exist_ok=True)
 
-    unfinished_cases = [case for case in study.cases if not study.result_path(case).exists() and study.check_data_requirements(case)]
-    while len(unfinished_cases) > 0:
-        for case in unfinished_cases:
-            study.run_case(case, skip_tuning=True, enable_parallelism=False)
-        unfinished_cases = [case for case in unfinished_cases if not study.result_path(case).exists()]
+    study.run_unfinished_cases(skip_tuning=True, enable_parallelism=False)
 
     ds_merged = study.collect_results()
 
