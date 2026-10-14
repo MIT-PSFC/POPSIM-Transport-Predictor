@@ -5,6 +5,7 @@ from transport_study.config import reset_config
 from transport_study.modules.power_balance.trb import PowerBalanceTRB
 from transport_study.orchestration.study import BATCHES_PER_EPOCH_FILENAME
 from transport_study.power_balance_transfer.power_balance_study import PowerBalanceStudy
+from transport_study.tests.tuned_configs import write_hyperparam_tuned_configs
 
 # Small batches and short segments, so the synthetic historic set spans more than one batch
 SHORT_LOADERS = {"batch_size": 2, "segment_length_train": 20, "segment_overlap_train": 10}
@@ -34,6 +35,7 @@ def _study(study_config: PowerBalanceStudy.Config, monkeypatch) -> PowerBalanceS
     study = PowerBalanceStudy(study_config)
     base_dataloader_config = study.base_dataloader_config
     monkeypatch.setattr(study, "base_dataloader_config", lambda case: {**base_dataloader_config(case), **SHORT_LOADERS})
+    write_hyperparam_tuned_configs(study)
     return study
 
 

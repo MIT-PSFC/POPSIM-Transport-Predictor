@@ -486,9 +486,8 @@ class Study:
     # whose hyperparam case's tuned huber_delta the anchor term uses (see anchor_huber_deltas)
     ANCHOR_DELTA_MODEL_TYPES: ClassVar[dict[str, str]] = {}
 
-    # Tuned-config dataloader and loss keys, merged by strict indexing (KeyError when a tuned config lacks one).
-    # A loss key merges only into a case whose own base loss config holds it (a transport power balance pseudo-type has no huber_delta_grad)
-    TUNED_DATALOADER_KEYS: ClassVar[tuple[str, ...]] = ()
+    # The swept loss keys a tuned config contributes, indexed strictly (KeyError when a tuned config lacks one),
+    # each only into a case whose own base loss config holds it (a transport power balance pseudo-type has no huber_delta_grad)
     TUNED_LOSS_KEYS: ClassVar[tuple[str, ...]] = ()
 
     @dataclass
@@ -1203,23 +1202,26 @@ class Study:
         return train_config
 
     def _apply_tuned_config(self, case: Case, train_config_base: TrainConfig) -> TrainConfig:
-        """Merge swept hyperparameters from the case's tuned config, when one exists.
+        """Merge the swept hyperparameters of the case's tuned config into its base train config.
 
-        Only the TUNED_* keys come from the tuned dataloader/loss configs, so
-        case-specific entries (e.g. weighted device_weights) stay intact. The
-        optimizer_config is replaced entirely.
+        The tuned config contributes the optimizer config wholesale, the TUNED_LOSS_KEYS the base loss config holds
+        and the swept model_init entries (tuned_model_init_updates), so the case-specific entries
+        (device_weights, the loss statistics, the submodule configs) stay intact.
+        The dataloader config is always the base one, no sweep may change it (test_sweep_configs).
+        Only the hyperparam case itself may lack its tuned config, while its sweep runs or when skip_tuning writes it from this base.
+        Every other case trains after its hyperparam prereq finished, so a missing file is a routing error and raises.
         """
         tuned_config_path = self.tuned_config_path(case)
         if not tuned_config_path.exists():
-            return train_config_base
+            if case.is_hyperparam_case():
+                return train_config_base
+            raise FileNotFoundError(f"No tuned config of {case.get_hyperparam_prereq()} at {tuned_config_path}, which {case} trains with")
         tuned_config = TrainConfig.load(str(tuned_config_path))
         logger.info(f"Found tuned hyperparameter config for case {case}, using hyperparameters from that config")
 
-        tuned_dataloader = {key: tuned_config.dataloader_config[key] for key in self.TUNED_DATALOADER_KEYS}
         tuned_loss = {key: tuned_config.loss_config[key] for key in self.TUNED_LOSS_KEYS if key in train_config_base.loss_config}
         train_config = train_config_base.model_copy(
             update={
-                "dataloader_config": {**train_config_base.dataloader_config, **tuned_dataloader},
                 "optimizer_config": tuned_config.optimizer_config,
                 "loss_config": {**train_config_base.loss_config, **tuned_loss},
             }
@@ -1653,7 +1655,7 @@ class Study:
             return True
         if skip_tuning:
             logger.info(f"Skipping hyperparameter tuning, writing default config for {case}")
-            self._write_tuned_config(case, self.make_train_config(case))
+            self.write_tuned_config(case, self.make_train_config(case))
             return True
         # run_unfinished_cases holds the case until then, whether this read succeeds or not
         self._next_sweep_poll[str(case)] = time.monotonic() + config.sweep_poll_interval_s
@@ -1705,7 +1707,7 @@ class Study:
                 "Only runs trained to completion with a finite val/loss.mean are eligible, "
                 "check the project for runs stuck crashing, pruning or diverging."
             )
-        self._write_tuned_config(case, best_train_config)
+        self.write_tuned_config(case, best_train_config)
         # The case reads its sweep no more, so nothing holds its training launch
         self._next_sweep_poll.pop(str(case), None)
         # Every trial is over, so their resume checkpoints are no longer needed
@@ -1713,8 +1715,8 @@ class Study:
         logger.success(f"Saved best hyperparameter config for {case}")
         return True
 
-    def _write_tuned_config(self, case: Case, train_config: TrainConfig):
-        """Write a train config to the tuned config path for the given case."""
+    def write_tuned_config(self, case: Case, train_config: TrainConfig):
+        """Write train_config as the tuned config of the case, the one every case of its model type merges (_apply_tuned_config)."""
         self._require_local(case)
         tuned_config_path = self.tuned_config_path(case)
         tuned_config_path.parent.mkdir(parents=True, exist_ok=True)

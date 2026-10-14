@@ -19,6 +19,7 @@ from transport_study.orchestration.target_shots import (
 )
 from transport_study.power_balance_transfer.power_balance_study import PowerBalanceStudy
 from transport_study.tests.sample_data import SAMPLE_DIR, requires_sample_data
+from transport_study.tests.tuned_configs import write_hyperparam_tuned_configs
 
 
 def _working_dir_base() -> Path:
@@ -261,6 +262,7 @@ def test_addition_no_device_weights(tmp_path):
     case_weighted = _case("weighted")
     case_addition = _case("addition")
 
+    write_hyperparam_tuned_configs(study)
     train_config_weighted = study.make_train_config(case_weighted)
     train_config_addition = study.make_train_config(case_addition)
 

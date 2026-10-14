@@ -19,6 +19,7 @@ from transport_study.modules.power_balance.p_rad.trb import RadiatedPowerTRB
 from transport_study.modules.power_balance.trb import PowerBalanceTRB
 from transport_study.modules.trb_utils import submodule_config_dict
 from transport_study.power_balance_transfer.power_balance_study import PowerBalanceStudy
+from transport_study.tests.tuned_configs import write_hyperparam_tuned_configs
 
 SUBMODULE_TRBS = {"p_oh_predictor": OhmicPowerTRB, "p_rad_predictor": RadiatedPowerTRB}
 
@@ -37,7 +38,7 @@ def _float_leaves(model) -> list[np.ndarray]:
     return [np.asarray(leaf) for leaf in jax.tree.leaves(eqx.filter(model, eqx.is_inexact_array))]
 
 
-def test_transfer_restores_the_pretrain_then_its_own_submodules(synthetic_device_stores, tmp_path, monkeypatch):
+def test_transfer_restores_pretrain_then_its_own_submodules(synthetic_device_stores, tmp_path, monkeypatch):
     # Two target test shots, popsim rejects a single-shot whole-episode test set
     study = PowerBalanceStudy(
         PowerBalanceStudy.Config(
@@ -60,8 +61,7 @@ def test_transfer_restores_the_pretrain_then_its_own_submodules(synthetic_device
         "base_dataloader_config",
         lambda case: {**base_dataloader_config(case), "segment_length_train": 20, "segment_overlap_train": 10},
     )
-    # No hyperparam p_oh / p_rad case has trained here, so no tuned config holds the anchor deltas
-    monkeypatch.setattr(study, "anchor_huber_deltas", lambda case, train_run_builder, target_vars: {})
+    write_hyperparam_tuned_configs(study)
     case = next(case for case in study.cases if case.domain_adaptation == "transfer" and case.model_type == "sciml-taue-nn")
     train_config = study.make_train_config(case)
     _, train_dl, _, _ = PowerBalanceTRB.get_dataloaders(train_config.dataloader_config)

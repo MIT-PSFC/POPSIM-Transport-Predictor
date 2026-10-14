@@ -22,6 +22,7 @@ from transport_study.orchestration.organize_data import (
 from transport_study.orchestration.study import HYPERPARAM_TARGET_SHOTS
 from transport_study.orchestration.target_shots import TargetSplit
 from transport_study.power_balance_transfer.power_balance_study import PowerBalanceStudy
+from transport_study.tests.tuned_configs import write_hyperparam_tuned_configs
 
 STATELESS_NORMALIZATIONS = ("raw", "physics")
 
@@ -130,7 +131,7 @@ def test_exnihilo_coral_impossibility(study, data_normalization, impossible):
     assert case.is_impossible() == impossible
 
 
-def test_finetune_restores_twin_and_scales_lr0_by_the_historic_batches(synthetic_device_stores, tmp_path, monkeypatch):
+def test_finetune_restores_twin_and_scales_lr0_by_historic_batches(synthetic_device_stores, tmp_path, monkeypatch):
     """The transfer case starts from its twin's checkpoint, the twin itself from scratch on the untouched schedule.
 
     The finetune trains at lr0 / sqrt(the batches per epoch of the historic training set, its twin's) on the tuned schedule,
@@ -145,6 +146,7 @@ def test_finetune_restores_twin_and_scales_lr0_by_the_historic_batches(synthetic
         "base_dataloader_config",
         lambda case: {**base_dataloader_config(case), "segment_length_train": 20, "segment_overlap_train": 10, "batch_size": 2},
     )
+    write_hyperparam_tuned_configs(study)
     case = _case()
     twin = case.transfer_pretrain_case()
     exnihilo_case = _case(training_data="exnihilo", domain_adaptation=None)
@@ -167,7 +169,7 @@ def test_finetune_restores_twin_and_scales_lr0_by_the_historic_batches(synthetic
     assert {**finetune_config.optimizer_config, "lr0": base_lr0} == base_optimizer_config
 
 
-def test_finetune_stage_trains_longer_on_the_production_decay(synthetic_device_stores, tmp_path, monkeypatch):
+def test_finetune_stage_trains_longer_on_production_decay(synthetic_device_stores, tmp_path):
     """An exnihilo case trains finetune_max_epochs with finetune_patience, its learning rate decaying as a max_epochs run does.
 
     The transfer pretrain twin trains max_epochs with patience on the tuned transition_frac, like every case outside the finetune stage.
@@ -182,14 +184,13 @@ def test_finetune_stage_trains_longer_on_the_production_decay(synthetic_device_s
         finetune_max_epochs=480,
         finetune_patience=160,
     )
-    # A tuned schedule, its decay a fraction of the run, in place of the base config's absolute transition_steps
+    # A tuned schedule, its decay a fraction of the run, in place of the base config's absolute transition_steps,
+    # as the mlp hyperparam case's tuned config, the one every mlp case merges
     optimizer_config_tuned = {key: value for key, value in study.base_optimizer_config().items() if key != "transition_steps"}
     optimizer_config_tuned["transition_frac"] = 0.5
-    monkeypatch.setattr(
-        study,
-        "_apply_tuned_config",
-        lambda case, train_config_base: train_config_base.model_copy(update={"optimizer_config": optimizer_config_tuned}),
-    )
+    hyperparam_case = _case().get_hyperparam_prereq()
+    tuned_config = study.make_train_config(hyperparam_case).model_copy(update={"optimizer_config": optimizer_config_tuned})
+    study.write_tuned_config(hyperparam_case, tuned_config)
 
     exnihilo_config = study.make_train_config(_case(training_data="exnihilo", domain_adaptation=None))
     twin_config = study.make_train_config(_case().transfer_pretrain_case())

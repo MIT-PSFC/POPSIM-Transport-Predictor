@@ -94,7 +94,6 @@ class PowerBalanceStudy(Study):
     DATA_VISUALIZATION = DataVisualization
     ANALYSIS_METRICS_MODULE = "transport_study.power_balance_transfer.study_metrics"
     ANALYSIS_REPORTS_MODULE = "transport_study.power_balance_transfer.case_reports"
-    TUNED_DATALOADER_KEYS = ("segment_length_train", "segment_overlap_train", "batch_size")
     TUNED_LOSS_KEYS = ("huber_delta",)
 
     ##################
@@ -253,12 +252,12 @@ class PowerBalanceStudy(Study):
     def base_dataloader_config(self, case: Case) -> dict:
         return {
             **self.target_split_config(case),
-            # Hyperparameters
+            # Fixed loader settings, no sweep changes them (test_sweep_configs)
             "segment_length_train": 100,
             "segment_overlap_train": 50,
             # Memory scales linearly with batch and segment_length_train, see POWER_BALANCE_BATCH_SIZE
             "batch_size": POWER_BALANCE_BATCH_SIZE,
-            # Part of validation, should be left alone during hyperparameter tuning
+            # Validation scores whole episodes
             "segment_length_val": None,
             "segment_overlap_val": 0,
         }

@@ -28,6 +28,7 @@ from transport_study.orchestration.organize_data import (
 )
 from transport_study.profile_transfer.profile_study import ProfileStudy
 from transport_study.tests.sample_data import SAMPLE_DIR, requires_sample_data
+from transport_study.tests.tuned_configs import write_hyperparam_tuned_configs
 
 RHO = RHO_GRID
 RHO_MID = 0.5 * (RHO[:-1] + RHO[1:])
@@ -257,6 +258,7 @@ def test_weighted_case_weights_reach_loss_config(study_config):
     weighted case trained unweighted.
     """
     study = ProfileStudy(study_config)
+    write_hyperparam_tuned_configs(study)
     train_config = study.make_train_config(weighted_case(study, num_target_shots=10))
 
     weights = train_config.loss_config["device_weights"]

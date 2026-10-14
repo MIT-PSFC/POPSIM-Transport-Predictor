@@ -38,7 +38,7 @@ def _stale_working_dir(cfg):
 
 
 @pytest.mark.parametrize("queued", ["train_case.x.seed_0.test_reset", orchestrator_job_name("test_reset")])
-def test_reset_refuses_a_queued_job_of_study(tmp_path, monkeypatch, queued):
+def test_reset_refuses_queued_job_of_study(tmp_path, monkeypatch, queued):
     cfg = _config(tmp_path)
     working_dir = _stale_working_dir(cfg)
     monkeypatch.setattr(study_module, "get_running_job_names", lambda: {queued, "train_case.x.seed_0.other_study"})
@@ -58,7 +58,7 @@ def test_reset_replaces_working_dir_and_writes_fresh_lock(tmp_path, monkeypatch)
     assert not working_dir.with_name(f"{cfg.study_name}{study_module.PREVIOUS_WORKING_DIR_SUFFIX}").exists()
 
 
-def test_reset_keeps_working_dir_when_parent_is_missing(tmp_path, monkeypatch):
+def test_reset_keeps_working_dir_when_parent_missing(tmp_path, monkeypatch):
     """A child reset before its parent would otherwise wipe itself and then fail the parent check."""
     cfg = _config(tmp_path, parent_study="never_run_parent")
     working_dir = _stale_working_dir(cfg)

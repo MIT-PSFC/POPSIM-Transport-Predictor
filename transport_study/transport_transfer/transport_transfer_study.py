@@ -130,7 +130,6 @@ class TransportStudy(Study):
         "power_ohm_MW": "p_oh",
         "power_radiated_MW": "p_rad",
     }
-    TUNED_DATALOADER_KEYS = ("segment_length_train", "segment_overlap_train", "batch_size")
     # huber_delta_grad belongs to the profile chi-huber losses, a power balance pseudo-type's config has none
     TUNED_LOSS_KEYS = ("huber_delta", "huber_delta_grad")
 
@@ -347,11 +346,11 @@ class TransportStudy(Study):
     def base_dataloader_config(self, case: Case) -> dict:
         return {
             **self.target_split_config(case),
-            # Hyperparameters
+            # Fixed loader settings, no sweep changes them (test_sweep_configs)
             "segment_length_train": 100,
             "segment_overlap_train": 50,
             "batch_size": TRANSPORT_BATCH_SIZE,
-            # Part of validation, should be left alone during hyperparameter tuning
+            # Validation scores whole episodes
             "segment_length_val": None,
             "segment_overlap_val": 0,
         }

@@ -127,7 +127,6 @@ class ProfileStudy(Study):
     ANALYSIS_METRICS_MODULE = "transport_study.profile_transfer.study_metrics"
     ANALYSIS_REPORTS_MODULE = "transport_study.profile_transfer.case_reports"
     CHI_VALIDATION_LOSS = True
-    TUNED_DATALOADER_KEYS = ("batch_size",)
     TUNED_LOSS_KEYS = ("huber_delta", "huber_delta_grad")
 
     ##################
@@ -271,7 +270,7 @@ class ProfileStudy(Study):
             # Profiles plus their gradient and error-bar companions, the chi validation loss divides by the error bars
             "target_vars": [*PROFILE_TARGET_VARS, "ds_source_idx"],
             **self.target_split_config(case),
-            # Hyperparameters
+            # A fixed loader setting, no sweep changes it (test_sweep_configs)
             "batch_size": PROFILE_BATCH_SIZE,
         }
 
