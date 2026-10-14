@@ -141,11 +141,8 @@ MAX_TRAIN_ATTEMPTS = 3
 
 # A sweep is done once the trial target is met AND this fraction of it trained to completion,
 # since the tuned config is picked from those runs only (see wandb_utils.is_trained_to_completion)
-# Hyperband with eta 3 lets only a few percent of trials run to completion, so demanding much more than that forces extra trials far past the count target
+# Hyperband (eta 2) lets only a few percent of trials run to completion, so demanding much more than that forces extra trials far past the count target
 MIN_FINISHED_FRACTION = 0.05
-
-# Agents kept running per sweep while it is unfinished, even when fewer trials are outstanding
-MIN_RUNNING_AGENTS = 6
 
 # How long the orchestration loop sleeps between passes over the unfinished cases
 ORCHESTRATION_POLL_INTERVAL_S = 20
@@ -173,6 +170,9 @@ SUMMARY_RESULT_VARS = ["error_abs_shot", "error_rel_shot", "error_abs_ts", "erro
 # A fresh config lock starts it over (see Study.batches_per_epoch)
 BATCHES_PER_EPOCH_FILENAME = "batches_per_epoch.toml"
 
+# Where reset_study sets the old working dir aside while the fresh study checks its lineage
+PREVIOUS_WORKING_DIR_SUFFIX = ".previous"
+
 # A training job is considered stuck once it has run at least this long with no progress (e.g. OpenBLAS or XLA compile-pool deadlocks)
 WATCHDOG_MIN_AGE_S = 80 * 60
 
@@ -198,6 +198,11 @@ CPU_WATCHDOG_SCALE = 4
 # shot clock by the 1 kHz sample period, a padded repeat by at most float jitter
 # (~1e-13 s observed), so anything below this threshold is padding
 PAD_TIME_STEP_S = 1e-6
+
+
+def orchestrator_job_name(study_name: str) -> str:
+    """The SLURM job name of a study's orchestrator wrapper (studies/*/*.sh), which reset_study refuses to run under."""
+    return f"{study_name}_orchestrator"
 
 
 def real_timeslice_mask(time_2d: xr.DataArray, time_dim: str = TIME_DIM) -> xr.DataArray:
@@ -1546,7 +1551,9 @@ class Study:
             else:
                 for case, launch_seeds in to_launch:
                     for seed in launch_seeds:
-                        self.run_case(case, seed, skip_tuning=skip_tuning, enable_parallelism=False)
+                        # A case still tuning or blocked holds its other seeds, as in _launch_ready_cases
+                        if not self.run_case(case, seed, skip_tuning=skip_tuning, enable_parallelism=False):
+                            break
                 # Nothing runs in the background of a serial run,
                 # so only a pass that finished no seed waits (on an ancestor, or between sweep passes)
                 finished_this_pass = [
@@ -1724,21 +1731,13 @@ class Study:
     ):
         """Launch a wandb hyperparameter sweep for the given case.
 
-        With parallelism, launches at most as many agent jobs as sweep trials
-        still outstanding, capped by the open GPU slots (idle GPUs beyond
-        buffer_gpus less this user's pending jobs). Outstanding is the larger of the
-        two remaining targets (both net of agents already running): trials to
-        reach the completed-count target (hyperparam_sweeps - completed) and
-        trials to reach the finished-run quota (min_finished - finished). Once
-        the count target is met but too many trials have crashed to satisfy the
-        finished quota, the second term keeps agents flowing. Without the
-        outstanding cap the orchestration loop would submit another batch of
-        agents every pass until the queue filled, far past what is needed.
-
-        On any other partition the cap is that partition's open slots in the pass's launch_slots (LaunchSlots.available):
-        the remaining per-user GPU allowance of a spillover partition,
-        or the CPU jobs that fit on a CPU partition, bounded by the user-wide job ceiling.
-        On every partition the sweep keeps at most config.max_running_agents agents running or pending,
+        With parallelism, launches at most as many agent jobs as sweep trials still outstanding,
+        each agent running one trial (count=1), so no trial past the targets is ever started.
+        Outstanding is the larger of the two remaining targets, both net of the agents already running:
+        trials to reach hyperparam_sweeps completed runs,
+        and trials to reach the finished-run quota (min_finished) once crashes left it short.
+        The cap is the partition's open slots in the pass's launch_slots (LaunchSlots.available),
+        and config.max_running_agents agents running or pending per sweep,
         so the bayes search takes in finished trials before it suggests the next ones.
         """
         self._require_local(case)
@@ -1780,22 +1779,13 @@ class Study:
             if running_agents is None:
                 logger.info(f"Could not query the agent jobs, holding the agent launches for case {case} until the next pass")
                 return
-            # Each agent runs exactly one trial (count=1), so outstanding trials
-            # bound how many more agents are worth submitting. Take the larger of
-            # the count target and the finished-quota target so a sweep whose
-            # count target is met but whose trials keep crashing keeps launching
-            # until enough runs finish (each in-flight agent may yet finish).
             min_finished = math.ceil(MIN_FINISHED_FRACTION * config.hyperparam_sweeps)
             outstanding_for_count = config.hyperparam_sweeps - n_completed_runs - running_agents
             outstanding_for_finished = min_finished - n_finished_runs - running_agents
             outstanding_trials = max(outstanding_for_count, outstanding_for_finished)
             capacity = self.launch_slots.available(partition, self.training_devices(case))
-            # Keep MIN_RUNNING_AGENTS going (up to capacity) to finish out the sweep,
-            # one agent at a time may get pruned.
-            # A sweep smaller than that (debug) never runs more agents than it has trials
-            min_running_agents = min(MIN_RUNNING_AGENTS, config.hyperparam_sweeps)
             agent_room = config.max_running_agents - running_agents
-            sweep_jobs = min(capacity, agent_room, max(outstanding_trials, min_running_agents - running_agents))
+            sweep_jobs = min(capacity, agent_room, outstanding_trials)
             if sweep_jobs <= 0:
                 logger.debug(f"No agent jobs needed for case {case} ({running_agents} agents already running)")
                 return
@@ -2199,16 +2189,29 @@ class Study:
             job_names = get_running_job_names()
             if job_names is None:
                 raise RuntimeError(f"squeue failed, so whether a job of study {config.study_name} is still queued or running is unknown")
-            # Every job name of a study ends with the study name (see train_job_name)
-            study_job_names = sorted(name for name in job_names if name.endswith(f".{config.study_name}"))
+            # Every job name of a study ends with the study name (see train_job_name), its orchestrator wrapper's is the study's
+            study_job_names = sorted(
+                name for name in job_names if name.endswith(f".{config.study_name}") or name == orchestrator_job_name(config.study_name)
+            )
             if study_job_names:
                 raise RuntimeError(
                     f"Study {config.study_name} has jobs queued or running, cancel them before resetting it:\n" + "\n".join(study_job_names)
                 )
+        # The old working dir is set aside while the fresh study checks its lineage,
+        # so a parent that was not reset first, or a locked field that differs, leaves it in place
         working_dir = Path(config.working_dir_base) / config.study_name
+        previous_dir = working_dir.with_name(f"{config.study_name}{PREVIOUS_WORKING_DIR_SUFFIX}")
+        shutil.rmtree(previous_dir, ignore_errors=True)
         if working_dir.exists():
-            shutil.rmtree(working_dir)
-        study = cls(config)
+            working_dir.rename(previous_dir)
+        try:
+            study = cls(config)
+        except Exception:
+            shutil.rmtree(working_dir, ignore_errors=True)
+            if previous_dir.exists():
+                previous_dir.rename(working_dir)
+            raise
+        shutil.rmtree(previous_dir, ignore_errors=True)
         study.setup_directories(clean_sweeps=True)
 
     def __init__(self, cfg: str | Path | CaseGridConfig):
