@@ -80,7 +80,7 @@ def test_multiobjective_case_name_and_shared_sweep(loaded_config):
 
 def test_sciml_rejects_multiobjective(loaded_config):
     # The sciml types anchor their submodules regardless, the axis does not apply to them
-    with pytest.raises(ValueError, match="multiobjective should be a dummy value"):
+    with pytest.raises(ValueError, match=r"sciml-taue-nn ignores .*multiobjective"):
         _case(multiobjective=True)
 
 

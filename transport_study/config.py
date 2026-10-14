@@ -106,6 +106,11 @@ def _env_list(var_name: str, default: str = "") -> tuple[str, ...]:
 SLURM_MEM_UNITS_MB = {"K": 1 / 1024, "M": 1, "G": 1024, "T": 1024 * 1024}
 
 
+def source_devices(dataset_paths: dict, target_device: str | None) -> list[str]:
+    """The non-target devices with a store, sorted: the historic sources of every study."""
+    return sorted(set(dataset_paths) - {target_device})
+
+
 def slurm_mem_MB(mem: str) -> int:
     """MB of a SLURM memory size like "48G", "64000M" or "386G", raising on anything else."""
     unit = mem[-1].upper() if mem and mem[-1].isalpha() else "M"

@@ -60,7 +60,8 @@ def _case(**overrides) -> PowerBalanceStudy.Case:
         "training_data": "cmod",
         "data_normalization": "physics",
         "domain_adaptation": "transfer",
-        "freeze_submodules": True,
+        # The mlp has no submodules, its freeze axis is pinned to the hyperparam value
+        "freeze_submodules": False,
         "num_target_shots": 1,
     }
     kwargs.update(overrides)

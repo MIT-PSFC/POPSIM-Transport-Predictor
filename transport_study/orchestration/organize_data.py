@@ -16,6 +16,7 @@ from transport_study.config import (
     RHO_GRID,
     TRAIN_VAL_SPLIT,
     config,
+    source_devices,
 )
 from transport_study.modules import plasma_parameters
 from transport_study.modules.normalization import (
@@ -75,8 +76,7 @@ class TrainingData:
 def parse_training_data(s: str, dataset_paths: dict, target_device: str | None) -> TrainingData:
     """Convert a string like 'cmod_tcv' or 'exnihilo' to a TrainingData object."""
     if s == "exnihilo":
-        non_target = set(dataset_paths.keys()) - ({target_device} if target_device else set())
-        return TrainingData(sources=sorted(non_target), exnihilo=True)
+        return TrainingData(sources=source_devices(dataset_paths, target_device), exnihilo=True)
     sources = s.split("_")
     if target_device in sources:
         raise ValueError(

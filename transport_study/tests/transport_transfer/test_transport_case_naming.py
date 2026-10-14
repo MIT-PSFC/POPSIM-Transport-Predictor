@@ -43,8 +43,9 @@ def test_source_trained_case_name(loaded_config):
 
 
 def test_exnihilo_case_name(loaded_config):
-    case = _case(model_type="transformer", training_data="exnihilo", num_target_shots=5)
-    assert str(case) == "case.transformer.td_exnihilo.freeze_True.targ_5"
+    # Only sciml has submodules to freeze, every other type sits at the unfrozen hyperparam value with no token
+    case = _case(model_type="transformer", training_data="exnihilo", freeze_submodules=False, num_target_shots=5)
+    assert str(case) == "case.transformer.td_exnihilo.targ_5"
 
 
 def test_domain_adaptation_case_name(loaded_config):
@@ -62,8 +63,8 @@ def test_domain_adaptation_case_name(loaded_config):
 )
 def test_torax_axis_tokens(loaded_config, geometry_builder, torax_state, suffix):
     """A non-default torax axis gets its token in STR_TOKEN_FIELDS order, a default one stays suppressed."""
-    case = _case(model_type="torax-gyrobohm", geometry_builder=geometry_builder, torax_state=torax_state)
-    assert str(case) == f"case.torax-gyrobohm.td_cmod-low1.freeze_True{suffix}"
+    case = _case(model_type="torax-gyrobohm", freeze_submodules=False, geometry_builder=geometry_builder, torax_state=torax_state)
+    assert str(case) == f"case.torax-gyrobohm.td_cmod-low1{suffix}"
 
 
 def test_submodule_prereq_case_names(loaded_config):
@@ -92,10 +93,12 @@ def test_target_shot_order_reaches_every_prereq(loaded_config):
     assert "case.p_oh.td_cmod-low1.targ_3.order_spanning.da_weighted" in power_balance_prereq_names
 
 
-@pytest.mark.parametrize("torax_axis", [{"geometry_builder": "miller"}, {"torax_state": "carry"}])
+@pytest.mark.parametrize("torax_axis", ["geometry_builder", "torax_state"])
 def test_non_torax_rejects_torax_axes(loaded_config, torax_axis):
-    with pytest.raises(ValueError, match="only applies to torax model types"):
-        _case(model_type="transformer", **torax_axis)
+    """An axis a model type ignores must hold its pinned value, a case spelled otherwise names no grid case."""
+    off_pin = {"geometry_builder": "miller", "torax_state": "carry"}[torax_axis]
+    with pytest.raises(ValueError, match=f"transformer ignores .*{torax_axis}"):
+        _case(model_type="transformer", freeze_submodules=False, **{torax_axis: off_pin})
 
 
 def test_cases_are_hashable_and_set_stable(loaded_config):
@@ -113,13 +116,13 @@ def test_multiobjective_case_name_and_shared_sweep(loaded_config, model_type):
 
 def test_sciml_rejects_multiobjective(loaded_config):
     # sciml always anchors its submodules, the axis does not apply to it
-    with pytest.raises(ValueError, match="multiobjective should be a dummy value"):
+    with pytest.raises(ValueError, match=r"sciml ignores .*multiobjective"):
         _case(multiobjective=True)
 
 
 def test_model_size_case_name_and_sized_sciml_prereqs(loaded_config):
-    case = _case(model_type="transformer", domain_adaptation="weighted", num_target_shots=3, model_size="half")
-    assert str(case) == "case.transformer.td_cmod-low1.freeze_True.size_half.targ_3.da_weighted"
+    case = _case(model_type="transformer", freeze_submodules=False, domain_adaptation="weighted", num_target_shots=3, model_size="half")
+    assert str(case) == "case.transformer.td_cmod-low1.size_half.targ_3.da_weighted"
     # sciml composes its prereqs' nets, so they and the power balance's p_oh / p_rad take its size
     sciml_case = _case(freeze_submodules=False, model_size="max")
     prereq_sizes = {prereq.model_type: prereq.model_size for prereq in sciml_case.prereqs if not prereq.is_hyperparam_case()}

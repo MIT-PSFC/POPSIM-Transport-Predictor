@@ -15,6 +15,7 @@ from transport_study.config import CaseAxis, config
 from transport_study.modules.normalization import FEATURE_NORMALIZATIONS
 from transport_study.modules.profile_predictor.module import (
     MODEL_TYPES_WITH_SHAPES,
+    N_NN_INPUTS,
     NN_INPUT_SOURCE_VARS,
 )
 from transport_study.modules.profile_predictor.torax_module import (
@@ -31,14 +32,19 @@ from transport_study.orchestration.case_analysis import (
 from transport_study.orchestration.case_metrics import collect_metrics
 from transport_study.orchestration.case_reports import generate_case_reports
 from transport_study.orchestration.comparison_figures import comparison_figures
-from transport_study.orchestration.organize_data import PROFILE_TARGET_VARS
+from transport_study.orchestration.organize_data import (
+    PROFILE_SHAPE_VARS,
+    PROFILE_TARGET_VARS,
+)
 from transport_study.orchestration.seed_results import BEST_SEED_ATTR, SEED_DIM
 from transport_study.orchestration.study import (
     BASE_MODEL_SIZE,
+    NN_INIT_DEFAULTS,
     CaseGridConfig,
     ModelTrainSpec,
     Study,
     map_result_files,
+    model_type_field_choices,
 )
 from transport_study.orchestration.target_shots import BASE_TARGET_SHOT_ORDER
 from transport_study.profile_transfer.case_reports import torax_relaxation_report
@@ -117,6 +123,67 @@ def profile_shot_summaries(result_path: Path) -> dict[str, np.ndarray]:
     return per_shot
 
 
+PROFILE_TRB = "transport_study.modules.profile_predictor.trb.ProfilePredictorTRB"
+
+
+def profile_train_spec(
+    model_type: str,
+    dataloader_config_base: dict,
+    data_normalization: str,
+    domain_adaptation: str | None,
+    freeze_shapes: bool,
+    geometry_builder: str,
+) -> ModelTrainSpec:
+    """The spec of a profile predictor of model_type, the profile study's cases and the transport study's profile pseudo-type alike."""
+    dataloader_config = {
+        "input_vars": PROFILE_INPUT_VARS,
+        # Profiles plus their gradient and error-bar companions, the chi validation loss divides by the error bars
+        "target_vars": [*PROFILE_TARGET_VARS, "ds_source_idx"],
+        **dataloader_config_base,
+        "batch_size": PROFILE_BATCH_SIZE,
+    }
+    model_init_config = {
+        "model_type": model_type,
+        "data_normalization": data_normalization,
+        "domain_adaptation": domain_adaptation,
+        # The dimensionless nn_inputs derived from the raw input_vars, log(nu_star) among them
+        "in_size": N_NN_INPUTS,
+        "prng_seed": NN_INIT_DEFAULTS["prng_seed"],
+    }
+    if model_type in MODEL_TYPES_WITH_SHAPES:
+        dataloader_config["extra_vars"] = list(PROFILE_SHAPE_VARS)
+        model_init_config |= {
+            **NN_INIT_DEFAULTS,
+            "freeze_shapes": freeze_shapes,
+            "te_shape_var": "t_e_shape",
+            "ne_shape_var": "n_e_shape",
+            "n_shapes": 3,
+        }
+    elif model_type == "mlp":
+        model_init_config |= NN_INIT_DEFAULTS
+    elif model_type == "reservoir":
+        model_init_config |= {
+            "reservoir_size": 128,  # Fixed random reservoir state dimension
+            "spectral_radius": 0.9,  # Contraction factor of the recurrent weights
+            "input_scaling": 0.5,  # Scale of the random input weights and bias
+            "leak_rate": 1.0,  # Leaky integration rate of the state update
+            "n_steps": 20,  # Reservoir iterations before readout
+        }
+    elif model_type.startswith("torax-"):
+        transport_model = model_type.removeprefix("torax-")
+        torax_defaults = PROFILE_PREDICTOR_TORAX_CONFIGS[transport_model]["model_init_config"]
+        model_init_config |= {
+            **NN_INIT_DEFAULTS,
+            "torax_config": torax_defaults["torax_config"],
+            "geometry_builder": geometry_builder,
+            "delta_exponent": torax_defaults["delta_exponent"],
+            "n_solver_steps": torax_defaults["n_solver_steps"],
+        }
+    else:
+        raise ValueError(f"Unknown model type: {model_type}")
+    return ModelTrainSpec(train_run_builder=PROFILE_TRB, dataloader_config=dataloader_config, model_init_config=model_init_config)
+
+
 class ProfileStudy(Study):
     SWEEP_CONFIG_DIR = Path(PACKAGE_ROOT) / "profile_transfer" / "sweep_configs"
     STUDY_TYPE = "profile_transfer"
@@ -147,9 +214,8 @@ class ProfileStudy(Study):
         hyperparam_freeze_shapes: bool = True
 
         FIELD_CHOICES: ClassVar[dict[str, tuple]] = {
-            "model_types": STUDY_MODEL_TYPES,
-            "gpu_only_model_types": STUDY_MODEL_TYPES,
-            "cpu_only_model_types": STUDY_MODEL_TYPES,
+            **CaseGridConfig.FIELD_CHOICES,
+            **model_type_field_choices(STUDY_MODEL_TYPES),
             "geometry_builders": VALID_GEOMETRY_BUILDERS,
             "data_normalization_methods": FEATURE_NORMALIZATIONS,
             "hyperparam_data_normalization": FEATURE_NORMALIZATIONS,
@@ -157,48 +223,26 @@ class ProfileStudy(Study):
 
     @dataclass
     class Case(Study.Case):
-        """
-        model_type: The type of profile_predictor model to use
-        - shape-init-pca / shape-init-kmeans: B-spline shape bases (PCA or k-means initialized) weighted by an NN
-        - mlp: a single neural network directly predicts profiles at certain points
-        - torax-constant / torax-gyrobohm / torax-qlknn: TORAX simulation with
-          NN-predicted parameters for the constant, Bohm-GyroBohm,
-          or QLKNN surrogate transport model
+        """The profile case, see Study.Case for the shared axes.
 
-        training_data: The dataset(s) used for training
-        - cmod: C-Mod only
-        - tcv: TCV only
-        - cmod_tcv: C-Mod + TCV
-        - exnihilo: No historic training data
+        model_type:
+        - shape-init-pca / shape-init-kmeans: point shapes from a PCA or k-means of the training profiles, weighted by an NN
+        - mlp: one network predicts the profile points directly
+        - reservoir: a fixed random reservoir with a trained readout
+        - torax-constant / torax-gyrobohm / torax-qlknn: a TORAX relaxation with NN-predicted transport, edge and source parameters
 
-        data_normalization: The stat stage applied to the 10 dimensionless nn_inputs,
-        implemented as a frozen POPSIM module fitted from training data only
-        (transport_study/modules/normalization.py, see FEATURE_NORMALIZATIONS).
+        data_normalization: the stat stage over the 10 dimensionless nn_inputs, a frozen POPSIM module fitted on the training
+        data only (transport_study/modules/normalization.py, FEATURE_NORMALIZATIONS)
         - physics: the dimensionless parameters as-is
         - physics-coral: per-device CORAL alignment fitted on them
         - physics-zscore: per-device z-score fitted on them
 
-        domain_adaptation: The method for domain adaptation between source and target devices.
-        - none: No domain adaptation, train and test on the same device(s). This is used for hyperparameter tuning and as a baseline for comparison, answering the question "what is the best possible performance we could expect if we had a bunch of data?"
-        - weighted: Add a small amount of highly-weighted target data during training
-        - addition: Add target shots to the training set as normal samples, no weighting
-        - transfer: Train on source data, freeze all but the last layer of every network, and fine-tune on a small amount of target data (ProfilePredictorTRB.get_trainable_getter)
-        - transfer_pretrain: The pretrain half of a transfer case, never a case-grid axis value (see Study.Case.transfer_pretrain_case). Trains on historic data only with checkpoint selection on the target test set. Stat normalizations (physics-coral / physics-zscore) fit the stat stage on historic + the transfer case's target shots, stateless ones share one twin at 0 target shots
+        freeze_shapes: whether the shape-init types keep their initial shape basis fixed in training,
+        pinned to the hyperparam value for the types without shapes
 
-        freeze_shapes:
-        - some profile predictors first use PCA to identify dominant shapes. these shapes may be frozen or modified during module training
-
-        geometry_builder: Per-sample TORAX geometry construction, only meaningful for torax-* model
-        types (every other model type is pinned to "circular").
-        - circular: large-aspect-ratio analytic geometry (delta = 0 everywhere)
-        - miller: shaped Miller geometry driven by triangularity_upper/triangularity_lower
-
-        num_target_shots: The number of shots included in the training data from the target dataset, never any of the held-out test shots.
-
-        target_shot_order: The order the target training shots are added in as num_target_shots grows, see orchestration/target_shots.py
-        - ascending: the base extrapolation, lowest hazard first, suppressed from the case name
-        - descending: the highest-hazard non-test shots first, the ones closest to the test regime
-        - spanning: the shots whose timeslice footprints span the power balance input and output space
+        geometry_builder: the per-sample TORAX geometry of the torax-* types, pinned to circular for the rest
+        - circular: TORAX's large-aspect-ratio analytic geometry
+        - miller: the shaped Miller geometry driven by the triangularities
         """
 
         data_normalization: str
@@ -285,82 +329,14 @@ class ProfileStudy(Study):
         }
 
     def model_train_spec(self, case: Case, dataloader_config_base: dict) -> ModelTrainSpec:
-        trb = "transport_study.modules.profile_predictor.trb.ProfilePredictorTRB"
-        if case.model_type in MODEL_TYPES_WITH_SHAPES:
-            return ModelTrainSpec(
-                train_run_builder=trb,
-                dataloader_config={
-                    "input_vars": PROFILE_INPUT_VARS,
-                    "extra_vars": ["t_e_shape", "n_e_shape"],
-                    **dataloader_config_base,
-                },
-                model_init_config={
-                    "model_type": case.model_type,
-                    "data_normalization": case.data_normalization,
-                    "domain_adaptation": case.domain_adaptation,
-                    "freeze_shapes": case.freeze_shapes,
-                    "te_shape_var": "t_e_shape",
-                    "ne_shape_var": "n_e_shape",
-                    "n_shapes": 3,
-                    "nn_depth": 2,
-                    "nn_width": 16,
-                    "in_size": 10,  # Dimensionless nn_inputs derived from the raw input_vars, includes log(nu_star)
-                    "prng_seed": 42,
-                },
-            )
-        elif case.model_type == "mlp":
-            return ModelTrainSpec(
-                train_run_builder=trb,
-                dataloader_config={"input_vars": PROFILE_INPUT_VARS, **dataloader_config_base},
-                model_init_config={
-                    "model_type": case.model_type,
-                    "data_normalization": case.data_normalization,
-                    "domain_adaptation": case.domain_adaptation,
-                    "nn_depth": 2,
-                    "nn_width": 16,
-                    "in_size": 10,  # Dimensionless nn_inputs derived from the raw input_vars, includes log(nu_star)
-                    "prng_seed": 42,
-                },
-            )
-        elif case.model_type == "reservoir":
-            return ModelTrainSpec(
-                train_run_builder=trb,
-                dataloader_config={"input_vars": PROFILE_INPUT_VARS, **dataloader_config_base},
-                model_init_config={
-                    "model_type": case.model_type,
-                    "data_normalization": case.data_normalization,
-                    "domain_adaptation": case.domain_adaptation,
-                    "reservoir_size": 128,  # Fixed random reservoir state dimension
-                    "spectral_radius": 0.9,  # Contraction factor of the recurrent weights
-                    "input_scaling": 0.5,  # Scale of the random input weights and bias
-                    "leak_rate": 1.0,  # Leaky integration rate of the state update
-                    "n_steps": 20,  # Reservoir iterations before readout
-                    "in_size": 10,  # Dimensionless nn_inputs derived from the raw input_vars, includes log(nu_star)
-                    "prng_seed": 42,
-                },
-            )
-        elif case.model_type.startswith("torax-"):
-            transport_model = case.model_type.removeprefix("torax-")
-            torax_defaults = PROFILE_PREDICTOR_TORAX_CONFIGS[transport_model]["model_init_config"]
-            return ModelTrainSpec(
-                train_run_builder=trb,
-                dataloader_config={"input_vars": PROFILE_INPUT_VARS, **dataloader_config_base},
-                model_init_config={
-                    "model_type": case.model_type,
-                    "data_normalization": case.data_normalization,
-                    "domain_adaptation": case.domain_adaptation,
-                    "nn_depth": 2,
-                    "nn_width": 16,
-                    "in_size": 10,  # Dimensionless nn_inputs derived from the raw input_vars, includes log(nu_star)
-                    "torax_config": torax_defaults["torax_config"],
-                    "geometry_builder": case.geometry_builder,
-                    "delta_exponent": torax_defaults["delta_exponent"],
-                    "n_solver_steps": torax_defaults["n_solver_steps"],
-                    "prng_seed": 42,
-                },
-            )
-        else:
-            raise ValueError(f"Unknown model type: {case.model_type}")
+        return profile_train_spec(
+            case.model_type,
+            dataloader_config_base,
+            case.data_normalization,
+            case.domain_adaptation,
+            case.freeze_shapes,
+            case.geometry_builder,
+        )
 
     ##############
     # COLLECTION #

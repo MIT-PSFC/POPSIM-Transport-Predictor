@@ -2,10 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Annotated, ClassVar
-
-if TYPE_CHECKING:
-    from popsim.ml import TrainConfig
+from typing import Annotated, ClassVar
 
 import fire
 import netCDF4  # noqa: F401
@@ -35,23 +32,23 @@ from transport_study.orchestration.case_analysis import run_summary_analysis
 from transport_study.orchestration.organize_data import PROFILE_TARGET_VARS
 from transport_study.orchestration.study import (
     BASE_MODEL_SIZE,
+    NN_INIT_DEFAULTS,
     CaseGridConfig,
     ModelTrainSpec,
     Study,
+    model_type_field_choices,
 )
 from transport_study.orchestration.target_shots import BASE_TARGET_SHOT_ORDER
 from transport_study.power_balance_transfer.power_balance_study import (
-    POWER_BALANCE_BATCH_SIZE,
-    POWER_BALANCE_INPUT_VARS,
     POWER_BALANCE_LOSS_DEFAULTS,
-    SCALAR_SUBMODULE_BATCH_SIZE,
     SCALAR_SUBMODULE_SETTINGS,
     PowerBalanceStudy,
+    scalar_submodule_train_spec,
+    structured_power_balance_train_spec,
 )
 from transport_study.profile_transfer.profile_study import (
-    PROFILE_BATCH_SIZE,
-    PROFILE_INPUT_VARS,
     ProfileStudy,
+    profile_train_spec,
 )
 from transport_study.transport_transfer.data_visualization import DataVisualization
 from transport_study.transport_transfer.plotting import COMPARISON_FAMILIES, LAYOUT
@@ -116,6 +113,8 @@ POWER_BALANCE_SUBMODULE_TYPES = ("power_balance", "p_oh", "p_rad")
 VALID_POWER_BALANCE_MODEL_TYPES = ("sciml-taue-nn", "sciml-taue-scalinglaw")
 # Profile predictor variants allowed as the sciml profile submodule
 VALID_PROFILE_MODEL_TYPES = (*MODEL_TYPES_WITH_SHAPES, "mlp")
+# The shapes of a shape-init profile submodule are an initial-guess basis, not physics the sciml fine-tunes, so they stay frozen
+PROFILE_SUBMODULE_FREEZE_SHAPES = True
 
 
 class TransportStudy(Study):
@@ -176,9 +175,8 @@ class TransportStudy(Study):
         profile_model_type: str = "shape-init-pca"
 
         FIELD_CHOICES: ClassVar[dict[str, tuple]] = {
-            "model_types": STUDY_MODEL_TYPES,
-            "gpu_only_model_types": STUDY_MODEL_TYPES,
-            "cpu_only_model_types": STUDY_MODEL_TYPES,
+            **CaseGridConfig.FIELD_CHOICES,
+            **model_type_field_choices(STUDY_MODEL_TYPES),
             "geometry_builders": VALID_GEOMETRY_BUILDERS,
             "torax_state_options": VALID_TORAX_STATES,
             "data_normalization": FEATURE_NORMALIZATIONS,
@@ -189,55 +187,32 @@ class TransportStudy(Study):
 
     @dataclass
     class Case(Study.Case):
-        """
-        model_type: The type of transport predictor model to use.
-        - transformer: recurrent causal attention over a rolling buffer of past profiles
-        - sciml: a time-dependent power balance evolves the stored energy, a
-          time-independent profile predictor maps the state-implied beta_tor_norm to profiles
-        - torax-constant / torax-gyrobohm / torax-qlknn: one-step
-          differentiable TORAX simulation with NN-predicted transport, source
-          shape, and edge parameters
-        - power_balance / profile / p_oh / p_rad: submodule predictors, appear
-          only as prereq cases of sciml (power_balance itself chains p_oh and p_rad)
+        """The transport case, see Study.Case for the shared axes. Normalization is study-wide, never an axis.
 
-        training_data: The historic dataset(s) used for training
-        - a device name from config.dataset_paths, e.g. cmod
-        - device names joined by _ for a combination, e.g. cmod_tcv
-        - exnihilo: No historic training data
+        model_type:
+        - transformer: recurrent causal attention over a rolling buffer of past predicted profiles
+        - sciml: a time-dependent power balance evolves the stored energy,
+          a time-independent profile predictor maps the state-implied beta_tor_norm to profiles
+        - torax-constant / torax-gyrobohm / torax-qlknn: one differentiable TORAX step per call
+          with NN-predicted transport, source shape and edge parameters
+        - power_balance / profile / p_oh / p_rad: the submodule predictors, prereq cases of sciml alone
+          (power_balance itself chains p_oh and p_rad)
 
-        domain_adaptation: The method for domain adaptation between source and target devices.
-        - none: No domain adaptation, train and test on the same device(s). This is used for hyperparameter tuning and as a baseline for comparison, answering the question "what is the best possible performance we could expect if we had a bunch of data?"
-        - weighted: Add a small amount of highly-weighted target data during training
-        - addition: Add target shots to the training set as normal samples, no weighting
-        - transfer: Train on source data, freeze all but the last layers of the model, and fine-tune on a small amount of target data
-        - transfer_pretrain: The pretrain half of a transfer case, never a case-grid axis value (see Study.Case.transfer_pretrain_case). Trains on historic data only with checkpoint selection on the target test set. Stat normalizations (physics-coral / physics-zscore) fit the stat stage on historic + the transfer case's target shots, stateless ones share one twin at 0 target shots
+        freeze_submodules: whether the sciml keeps the p_oh / p_rad predictors of its power balance fixed,
+        as the power balance study's freeze does, its tau_E network and the profile predictor always train.
+        Pinned to the hyperparam value for every other model type
 
-        freeze_submodules: Whether the sciml model keeps the p_oh / p_rad predictors of its power balance submodule frozen,
-        as the power balance study's freeze does. Its tau_E network and the profile predictor always train.
-        Only meaningful for sciml, every other model type is pinned to the hyperparam default.
+        geometry_builder: the per-sample TORAX geometry of the torax-* types, pinned to circular for the rest
+        - circular: TORAX's large-aspect-ratio analytic geometry
+        - miller: the shaped Miller geometry driven by the triangularities
 
-        geometry_builder: Per-sample TORAX geometry construction, only meaningful for torax-* model
-        types (every other model type is pinned to "circular").
-        - circular: large-aspect-ratio analytic geometry (delta = 0 everywhere)
-        - miller: shaped Miller geometry driven by triangularity_upper/triangularity_lower
-
-        torax_state: How the torax-* model types carry state between steps,
-        only meaningful for torax-* (every other model type is pinned to "rebuild").
-        - rebuild: carry only ne/te and rebuild a TORAX initial state each step (T_i := T_e, psi from Ip)
+        torax_state: how the torax-* types carry state between steps, pinned to rebuild for the rest
+        - rebuild: carry ne / te only and rebuild the TORAX state each step (T_i := T_e, psi from Ip)
         - carry: also carry T_i and psi, so the ion channel and the current evolve over the rollout
 
-        multiobjective: Whether the training loss also anchors the stored energy and the ohmic power to the measured signals,
-        only meaningful for MULTIOBJECTIVE_MODEL_TYPES (every other model type is pinned to the hyperparam default,
-        sciml always anchors its submodules).
-        The transformer predicts them with two more head outputs, TORAX infers them from its own state.
-        Shares the plain case's sweep, only multiobjective cases show it in the name
-
-        num_target_shots: The number of shots included in the training data from the target dataset, never any of the held-out test shots.
-
-        target_shot_order: The order the target training shots are added in as num_target_shots grows, see orchestration/target_shots.py
-        - ascending: the base extrapolation, lowest hazard first, suppressed from the case name
-        - descending: the highest-hazard non-test shots first, the ones closest to the test regime
-        - spanning: the shots whose timeslice footprints span the power balance input and output space
+        multiobjective: whether the training loss also anchors the stored energy and the ohmic power to the measured
+        signals (MULTIOBJECTIVE_MODEL_TYPES alone, sciml always anchors its submodules). The transformer predicts them with
+        two more head outputs, TORAX infers them from its own state. Shares the plain case's sweep, named mo_True
         """
 
         freeze_submodules: bool
@@ -294,20 +269,6 @@ class TransportStudy(Study):
                 raise ValueError(f"Unknown geometry builder: {self.geometry_builder}")
             if self.torax_state not in VALID_TORAX_STATES:
                 raise ValueError(f"Unknown torax state: {self.torax_state}")
-            if not self.model_type.startswith("torax-"):
-                if self.geometry_builder != "circular":
-                    raise ValueError(f"geometry_builder only applies to torax model types, not {self.model_type}")
-                if self.torax_state != "rebuild":
-                    raise ValueError(f"torax_state only applies to torax model types, not {self.model_type}")
-            if self.model_type in SUBMODULE_MODEL_TYPES and self.freeze_submodules != config.hyperparam_freeze_submodules:
-                raise ValueError(
-                    f"freeze_submodules should be a dummy value ({config.hyperparam_freeze_submodules}) for submodule {self.model_type}"
-                )
-            if self.model_type not in MULTIOBJECTIVE_MODEL_TYPES and self.multiobjective != config.hyperparam_multiobjective:
-                raise ValueError(
-                    f"multiobjective should be a dummy value ({config.hyperparam_multiobjective}) for {self.model_type}, "
-                    f"only {MULTIOBJECTIVE_MODEL_TYPES} take it"
-                )
 
         @classmethod
         def pin_inapplicable_axes(cls, fields: dict) -> dict:
@@ -331,15 +292,13 @@ class TransportStudy(Study):
                 submodule_types = ("power_balance", "profile")
             elif self.model_type == "power_balance":
                 submodule_types = ("p_oh", "p_rad")
-            elif self.multiobjective:
-                # The Wtot and P_oh anchors take the huber deltas the hyperparam power_balance and p_oh cases were tuned with
+            elif self.model_type in MULTIOBJECTIVE_MODEL_TYPES and self.multiobjective:
+                # The Wtot and P_oh anchors take the huber deltas the hyperparam power_balance and p_oh cases were tuned with.
+                # The model type guard matters when the hyperparam value is True, which pins the prereqs' own flag True
                 return [self.hyperparam_case_of(model_type) for model_type in ("power_balance", "p_oh")]
             else:
                 return []
-            return [
-                self.replace(model_type=submodule_type, freeze_submodules=config.hyperparam_freeze_submodules)
-                for submodule_type in submodule_types
-            ]
+            return [self.replace_pinned(model_type=submodule_type) for submodule_type in submodule_types]
 
     #############
     # EXECUTION #
@@ -420,11 +379,6 @@ class TransportStudy(Study):
             },
         }
 
-    def _make_submodule_config(self, case: Case, submodule_type: str) -> TrainConfig:
-        """Full TrainConfig for a submodule prereq case, recursing through make_train_config
-        so submodule cases get their own tuned merge and transfer wiring."""
-        return self.make_train_config(case.replace(model_type=submodule_type, freeze_submodules=config.hyperparam_freeze_submodules))
-
     def _transport_dataloader_config(self, case: Case, dataloader_config_base: dict) -> dict:
         """Dataloader config shared by every top-level transport model type.
 
@@ -442,92 +396,34 @@ class TransportStudy(Study):
 
     def model_train_spec(self, case: Case, dataloader_config_base: dict) -> ModelTrainSpec:
         trb = "transport_study.modules.transport_predictor.trb.TransportPredictorTRB"
-        pb_trb = "transport_study.modules.power_balance.trb.PowerBalanceTRB"
-        if case.model_type in ("p_oh", "p_rad"):
-            # Identical to the power balance study's scalar submodule cases
-            # (they load power-balance-prepped data through PowerBalanceTRB)
-            submodule_settings = SCALAR_SUBMODULE_SETTINGS[case.model_type]
-            return ModelTrainSpec(
-                train_run_builder=submodule_settings["train_run_builder"],
-                dataloader_config={
-                    "target_vars": submodule_settings["target_vars"],
-                    "fresh_var": submodule_settings["fresh_var"],
-                    "input_vars": POWER_BALANCE_INPUT_VARS,
-                    "data_train_run_builder": pb_trb,  # Needed for submodules
-                    **dataloader_config_base,
-                    # Match the power balance study
-                    "batch_size": SCALAR_SUBMODULE_BATCH_SIZE,
-                },
-                model_init_config={
-                    "nn_depth": 2,
-                    "nn_width": 16,
-                    "prng_seed": 42,
-                    "data_normalization": config.power_balance_data_normalization,
-                    "domain_adaptation": case.domain_adaptation,
-                },
+        # The pseudo-types are built by the owning studies' builders, so they train exactly as those studies' cases do
+        if case.model_type in SCALAR_SUBMODULE_SETTINGS:
+            return scalar_submodule_train_spec(
+                case.model_type, dataloader_config_base, config.power_balance_data_normalization, case.domain_adaptation
             )
-        elif case.model_type == "power_balance":
-            # The stored-energy submodule of sciml, trained exactly like the
-            # power balance study's structured cases
-            return ModelTrainSpec(
-                train_run_builder=pb_trb,
-                dataloader_config={
-                    "input_vars": POWER_BALANCE_INPUT_VARS,
-                    # The measured powers are targets so the training loss can
-                    # anchor the p_oh/p_rad submodule predictions to them
-                    # (anchor_weight_* in the loss config), matching the power
-                    # balance study's structured cases
-                    "target_vars": ["energy_mhd_MJ", "fresh_equilibrium", "power_ohm_MW", "power_radiated_MW", "ds_source_idx"],
-                    "state_vars": ["energy_mhd_MJ"],
-                    **dataloader_config_base,
-                    # Match the power balance study
-                    "batch_size": POWER_BALANCE_BATCH_SIZE,
-                },
-                model_init_config={
-                    "model_type": config.power_balance_model_type,
-                    "data_normalization": config.power_balance_data_normalization,
-                    "domain_adaptation": case.domain_adaptation,
-                    "freeze_submodules": config.power_balance_freeze_submodules,
-                    "nn_depth": 2,
-                    "nn_width": 16,
-                    "prng_seed": 42,
-                    "submodules": {
-                        "p_oh_predictor": self._make_submodule_config(case, "p_oh"),
-                        "p_rad_predictor": self._make_submodule_config(case, "p_rad"),
-                    },
-                },
+        if case.model_type == "power_balance":
+            submodule_configs = {
+                "p_oh_predictor": self._make_submodule_config(case, "p_oh"),
+                "p_rad_predictor": self._make_submodule_config(case, "p_rad"),
+            }
+            return structured_power_balance_train_spec(
+                config.power_balance_model_type,
+                dataloader_config_base,
+                config.power_balance_data_normalization,
+                case.domain_adaptation,
+                config.power_balance_freeze_submodules,
+                submodule_configs,
             )
-        elif case.model_type == "profile":
-            # The profile submodule of sciml, trained exactly like the profile
-            # study's time-independent cases (profile-prepped data has beta_tor_norm)
-            return ModelTrainSpec(
-                train_run_builder="transport_study.modules.profile_predictor.trb.ProfilePredictorTRB",
-                dataloader_config={
-                    "input_vars": PROFILE_INPUT_VARS,
-                    # Profiles plus their gradient and error-bar companions, the chi validation loss divides by the error bars
-                    "target_vars": [*PROFILE_TARGET_VARS, "ds_source_idx"],
-                    "extra_vars": ["t_e_shape", "n_e_shape"],
-                    **dataloader_config_base,
-                    # Match the profile study
-                    "batch_size": PROFILE_BATCH_SIZE,
-                },
-                model_init_config={
-                    "model_type": config.profile_model_type,
-                    "data_normalization": config.data_normalization,
-                    "domain_adaptation": case.domain_adaptation,
-                    # Profile study hyperparam default.
-                    # The shapes are an initial-guess basis, not physics to fine-tune here.
-                    "freeze_shapes": True,
-                    "te_shape_var": "t_e_shape",
-                    "ne_shape_var": "n_e_shape",
-                    "n_shapes": 3,
-                    "nn_depth": 2,
-                    "nn_width": 16,
-                    "in_size": 10,  # Dimensionless nn_inputs derived from the raw input_vars, includes log(nu_star)
-                    "prng_seed": 42,
-                },
+        if case.model_type == "profile":
+            return profile_train_spec(
+                config.profile_model_type,
+                dataloader_config_base,
+                config.data_normalization,
+                case.domain_adaptation,
+                freeze_shapes=PROFILE_SUBMODULE_FREEZE_SHAPES,
+                geometry_builder="circular",
             )
-        elif case.model_type == "sciml":
+        if case.model_type == "sciml":
             return ModelTrainSpec(
                 train_run_builder=trb,
                 dataloader_config={
@@ -543,14 +439,14 @@ class TransportStudy(Study):
                     "data_normalization": config.data_normalization,
                     "domain_adaptation": case.domain_adaptation,
                     "freeze_submodules": case.freeze_submodules,
-                    "prng_seed": 42,
+                    "prng_seed": NN_INIT_DEFAULTS["prng_seed"],
                     "submodules": {
                         "power_balance": self._make_submodule_config(case, "power_balance"),
                         "profile_predictor": self._make_submodule_config(case, "profile"),
                     },
                 },
             )
-        elif case.model_type == "transformer":
+        if case.model_type == "transformer":
             return ModelTrainSpec(
                 train_run_builder=trb,
                 dataloader_config=self._transport_dataloader_config(case, dataloader_config_base),
@@ -561,13 +457,11 @@ class TransportStudy(Study):
                     "d_model": 16,  # Token embedding width
                     "num_heads": 2,
                     "history_len": 20,  # Attention window over past profiles
-                    "nn_depth": 2,  # MLP head after attention
-                    "nn_width": 16,
+                    **NN_INIT_DEFAULTS,
                     "multiobjective": case.multiobjective,
-                    "prng_seed": 42,
                 },
             )
-        elif case.model_type.startswith("torax-"):
+        if case.model_type.startswith("torax-"):
             transport_model = case.model_type.removeprefix("torax-")
             return ModelTrainSpec(
                 train_run_builder=trb,
@@ -576,19 +470,16 @@ class TransportStudy(Study):
                     "model_type": case.model_type,
                     "data_normalization": config.data_normalization,
                     "domain_adaptation": case.domain_adaptation,
-                    "nn_depth": 2,
-                    "nn_width": 16,
+                    **NN_INIT_DEFAULTS,
                     "torax_config": make_transport_torax_config(transport_model, case.torax_state),
                     "torax_state": case.torax_state,
                     "geometry_builder": case.geometry_builder,
                     "delta_exponent": 2.0,
                     # One TORAX solver step per dataset timestep
                     "sim_dt": UNIFORM_TIMEBASE_DT,
-                    "prng_seed": 42,
                 },
             )
-        else:
-            raise ValueError(f"Unknown model type: {case.model_type}")
+        raise ValueError(f"Unknown model type: {case.model_type}")
 
     ############
     # ANALYSIS #

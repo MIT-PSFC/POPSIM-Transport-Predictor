@@ -44,6 +44,7 @@ from transport_study.config import (
     config,
     env_dataset_paths,
     load_config,
+    source_devices,
 )
 from transport_study.modules.normalization import (
     CORAL_NORMALIZATIONS,
@@ -224,6 +225,11 @@ def recorded_batches_per_epoch(working_dir: Path) -> dict[str, dict]:
         return tomllib.load(f)
 
 
+def model_type_field_choices(model_types: tuple[str, ...]) -> dict[str, tuple]:
+    """The FIELD_CHOICES entries of the config fields that name a study's model types."""
+    return {"model_types": model_types, "gpu_only_model_types": model_types, "cpu_only_model_types": model_types}
+
+
 def model_size_updates(model_size: str, sweep_model_init_parameters: dict, model_init_config: dict) -> dict:
     """The model_init_config entries a model size overrides, only among the size hyperparameters the model type's sweep lists.
 
@@ -358,9 +364,9 @@ class CaseGridConfig(StudyConfig):
     # Every case score is the mean over them, with their std as the run-to-run spread, and the best seed's checkpoint is the one kept
     num_seeds: int = Field(default=5, ge=1)
 
-    # Field name -> its valid values, set per subclass.
-    # A tuple field must hold valid values only, a scalar field must be one.
-    FIELD_CHOICES: ClassVar[dict[str, tuple]] = {}
+    # Field name -> its valid values. A tuple field must hold valid values only, a scalar field must be one.
+    # A subclass spreads this base and model_type_field_choices into its own
+    FIELD_CHOICES: ClassVar[dict[str, tuple]] = {"target_shot_orders": TARGET_SHOT_ORDERS, "model_sizes": MODEL_SIZES}
 
     @model_validator(mode="after")
     def _validate_field_choices(self):
@@ -386,22 +392,6 @@ class CaseGridConfig(StudyConfig):
                 "Set exactly one of target_test_set_size and target_test_shots, the two ways to define the held-out target test set"
             )
         return self
-
-    @field_validator("target_shot_orders")
-    @classmethod
-    def _validate_target_shot_orders(cls, v: tuple[str, ...]) -> tuple[str, ...]:
-        invalid = [order for order in v if order not in TARGET_SHOT_ORDERS]
-        if invalid:
-            raise ValueError(f"Invalid target shot orders: {invalid}. Must be among {TARGET_SHOT_ORDERS}.")
-        return v
-
-    @field_validator("model_sizes")
-    @classmethod
-    def _validate_model_sizes(cls, v: tuple[str, ...]) -> tuple[str, ...]:
-        invalid = [model_size for model_size in v if model_size not in MODEL_SIZES]
-        if invalid:
-            raise ValueError(f"Invalid model sizes: {invalid}. Must be among {MODEL_SIZES}.")
-        return v
 
     @field_validator("domain_adaptation_methods", "hyperparam_domain_adaptation")
     @classmethod
@@ -436,6 +426,11 @@ class CaseGridConfig(StudyConfig):
     @field_serializer("domain_adaptation_methods")
     def _serialize_domain_adaptation_methods(self, v):
         return ["none" if da is None else da for da in v]
+
+
+# The untuned network size and init seed every model_train_spec starts from.
+# The tuned merge replaces the swept sizes and launch_train the seed, a sweep trial and a skip_tuning config keep them
+NN_INIT_DEFAULTS = {"nn_depth": 2, "nn_width": 16, "prng_seed": 42}
 
 
 @dataclass
@@ -500,6 +495,29 @@ class Study:
         then calls init_common, and alias __hash__ = Study.Case.__hash__
         (a dataclass body without its own __init__ or __hash__ would have them
         regenerated or nulled by the dataclass decorator).
+
+        The axes every study shares:
+
+        training_data: the historic devices trained on
+        - device names from config.dataset_paths joined by _, e.g. cmod_tcv, never the target
+        - exnihilo: no historic data, the target's training shots alone
+
+        domain_adaptation: how the target device enters training
+        - none: train and test on the source devices alone, the hyperparam and baseline cases
+        - weighted: the target training shots added with the device weights of make_weighted_device_weights
+        - addition: the target training shots added as plain samples
+        - transfer: pretrain on the historic data (the transfer_pretrain twin, see transfer_pretrain_case),
+          restore it and fine-tune the last layers on the target shots
+        - transfer_pretrain: the twin itself, never a case-grid value
+
+        num_target_shots: target shots in training, never a held-out test shot (orchestration/target_shots.py)
+
+        target_shot_order: the order those shots are added in as num_target_shots grows
+        - ascending: the base extrapolation, lowest hazard first, no name token
+        - descending: the highest-hazard non-test shots first, closest to the test regime
+        - spanning: the shots whose timeslice footprints span the power balance input and output space
+
+        model_size: the architecture size, sweep (the tuned one), min, max, half, quarter or eighth (model_size_updates)
         """
 
         model_type: str
@@ -542,6 +560,10 @@ class Study:
             prereqs = self._build_prereqs()
             self.prereqs = prereqs if prereqs else None
 
+        def case_fields(self) -> dict:
+            """Every field of the case but its prereqs, the constructor arguments of another case like it."""
+            return {field.name: getattr(self, field.name) for field in fields(self) if field.name != "prereqs"}
+
         def validate(self):
             if self.model_type not in self.VALID_MODEL_TYPES:
                 raise ValueError(f"Unknown model type: {self.model_type}")
@@ -560,12 +582,20 @@ class Study:
                     raise ValueError(
                         "If domain_adaptation is None and training data is not 'exnihilo', num_target_shots must be HYPERPARAM_TARGET_SHOTS since this means we're training and testing on the same dataset"
                     )
+            # An axis the model type ignores holds its one pinned value, so every spelling of a case is the grid's
+            case_fields = self.case_fields()
+            pinned_fields = type(self).pin_inapplicable_axes(case_fields)
+            unpinned = {name: value for name, value in case_fields.items() if pinned_fields[name] != value}
+            if unpinned:
+                raise ValueError(
+                    f"{self.model_type} ignores {sorted(unpinned)}, pinned to {[pinned_fields[name] for name in sorted(unpinned)]}"
+                )
 
         def _build_prereqs(self) -> list[Study.Case]:
             """[hyperparam case, model-type prereqs, transfer pretrain case], deduped in order."""
             prereqs = []
             if not self.is_hyperparam_case():
-                prereqs.append(self.replace(**self._hyperparam_field_values()))
+                prereqs.append(self.get_hyperparam_prereq())
             prereqs.extend(self.model_type_prereqs())
             if self.domain_adaptation == "transfer":
                 prereqs.append(self.transfer_pretrain_case())
@@ -609,9 +639,16 @@ class Study:
 
         def replace(self, **changes) -> Study.Case:
             """Rebuild through the real constructor with some fields changed, so validation and prereqs stay consistent."""
-            kwargs = {f.name: getattr(self, f.name) for f in fields(self) if f.name != "prereqs"}
-            kwargs.update(changes)
-            return type(self)(**kwargs)
+            return type(self)(**{**self.case_fields(), **changes})
+
+        def replace_pinned(self, **changes) -> Study.Case:
+            """replace, with every axis the resulting model type ignores pinned (pin_inapplicable_axes).
+
+            The way to another model type's case, a submodule prereq or a hyperparam case of it,
+            whose freeze, geometry or objective axes need not apply.
+            """
+            case_fields = {**self.case_fields(), **changes}
+            return type(self)(**type(self).pin_inapplicable_axes(case_fields))
 
         @classmethod
         def _hyperparam_field_values(cls) -> dict:
@@ -636,9 +673,7 @@ class Study:
 
         def hyperparam_case_of(self, model_type: str) -> Study.Case:
             """The study's hyperparam case of another model type, whose tuned config every case of that model type trains with."""
-            case_fields = {field.name: getattr(self, field.name) for field in fields(self) if field.name != "prereqs"}
-            case_fields.update(model_type=model_type, **self._hyperparam_field_values())
-            return type(self)(**type(self).pin_inapplicable_axes(case_fields))
+            return self.replace_pinned(model_type=model_type, **self._hyperparam_field_values())
 
         @classmethod
         def pin_inapplicable_axes(cls, fields: dict) -> dict:
@@ -647,10 +682,12 @@ class Study:
             The pinned duplicates of a grid point collapse into one case in finalize_cases.
             Subclass overrides pin their own axes on top of this.
             """
+            # A copy, the subclasses pin into it and validate compares it against the fields passed in
+            pinned = dict(fields)
             # Without target shots in training there is nothing to order
             if fields["num_target_shots"] == 0:
-                return fields | {"target_shot_order": BASE_TARGET_SHOT_ORDER}
-            return fields
+                pinned["target_shot_order"] = BASE_TARGET_SHOT_ORDER
+            return pinned
 
         def is_impossible(self) -> bool:
             """Some cases don't make sense to run. Mark those cases as impossible and raise an error if we try to run them."""
@@ -888,10 +925,8 @@ class Study:
     #################
     @classmethod
     def _hyperparam_training_data(cls) -> TrainingData:
-        """All configured non-target source devices, the canonical hyperparam case."""
-        target = config.target_device
-        sources = sorted(set(config.dataset_paths.keys()) - ({target} if target else set()))
-        return TrainingData(sources=sources)
+        """Every configured source device, the training data of the hyperparam cases."""
+        return TrainingData(sources=source_devices(config.dataset_paths, config.target_device))
 
     def make_cases(self, cfg: StudyConfig) -> list[Case]:
         """Every case of the grid spanned by cfg's case axes, plus their prereqs.
@@ -903,12 +938,10 @@ class Study:
         cases = []
         for axis_values in product(*(getattr(cfg, name) for name in case_axes.values())):
             fields = dict(zip(case_axes, axis_values, strict=True))
-            if fields["domain_adaptation"] is None:
-                if fields["training_data"].exnihilo:
-                    if fields["num_target_shots"] == 0:
-                        continue  # Can't train from nothing with 0 target shots
-                elif fields["num_target_shots"] != HYPERPARAM_TARGET_SHOTS:
-                    continue  # Without adaptation a source-trained case sees no target shots
+            # Without adaptation a source-trained case sees no target shots, Case.validate rejects any other count
+            source_only = fields["domain_adaptation"] is None and not fields["training_data"].exnihilo
+            if source_only and fields["num_target_shots"] != HYPERPARAM_TARGET_SHOTS:
+                continue
             cases.append(self.Case(**self.Case.pin_inapplicable_axes(fields)))
         return self.finalize_cases(cases)
 
@@ -1050,6 +1083,10 @@ class Study:
                 statistics["train_chi_sigma_floors"] = training_chi_sigma_floors(profile_parts)
             self._training_statistics_cache[selection] = statistics
         return self._training_statistics_cache[selection]
+
+    def _make_submodule_config(self, case: Case, submodule_type: str) -> TrainConfig:
+        """The TrainConfig of a submodule prereq of the case, through make_train_config so it gets its own tuned merge and transfer wiring."""
+        return self.make_train_config(case.replace_pinned(model_type=submodule_type))
 
     def _set_transfer_checkpoint(self, train_config: TrainConfig, transfer_case: Case) -> TrainConfig:
         """Point model_init at the pretrained checkpoint the transfer case fine-tunes from."""

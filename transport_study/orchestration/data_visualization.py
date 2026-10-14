@@ -10,7 +10,7 @@ from matplotlib import patches
 from scipy.spatial import ConvexHull
 
 from transport_study import EPISODE_DIM, RADIAL_DIM, TIME_DIM
-from transport_study.config import config
+from transport_study.config import config, source_devices
 from transport_study.orchestration.organize_data import (
     TrainingData,
     concat_with_nan_padding,
@@ -45,15 +45,9 @@ DATASET_SHAPES = {
 }
 
 
-def _source_devices() -> list[str]:
-    """All non-target devices that have a dataset path, in deterministic order."""
-    target = config.target_device
-    return [d for d in sorted(config.dataset_paths) if d != target]
-
-
 def _all_devices() -> list[str]:
     """Source devices followed by the target device (if it has a dataset path)."""
-    devices = list(_source_devices())
+    devices = source_devices(config.dataset_paths, config.target_device)
     target = config.target_device
     if target and config.dataset_paths.get(target):
         devices.append(target)
@@ -377,7 +371,7 @@ class DataVisualizationBase:
         """
         save_dir = Path(figure_dir) / "data_visualization" / "hazard_extrapolation"
         colors = _device_colors()
-        sources = _source_devices()
+        sources = source_devices(config.dataset_paths, config.target_device)
         target = config.target_device
 
         # 1. Each source device on its own.
