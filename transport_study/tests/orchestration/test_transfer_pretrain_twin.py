@@ -126,15 +126,15 @@ def test_exnihilo_coral_impossibility(study, data_normalization, impossible):
     assert case.is_impossible() == impossible
 
 
-def test_finetune_restores_twin_and_only_transfer_scales_lr0(synthetic_device_stores, tmp_path, monkeypatch):
+def test_finetune_restores_twin_and_scales_lr0_by_the_historic_batches(synthetic_device_stores, tmp_path, monkeypatch):
     """The transfer case starts from its twin's checkpoint, the twin itself from scratch on the untouched schedule.
 
-    The finetune trains at lr0 / sqrt(its own batches per epoch) on the tuned schedule,
+    The finetune trains at lr0 / sqrt(the batches per epoch of the historic training set, its twin's) on the tuned schedule,
     the twin and the exnihilo case at the tuned lr0.
     """
     # The batch count builds the dataloaders, and popsim rejects a single-shot whole-episode test set
     study = _study(synthetic_device_stores, tmp_path, target_test_set_size=2, num_target_shots_options=(1,))
-    # The synthetic shots are shorter than the study's training segments, and a batch of 2 gives the finetune more than one batch
+    # The synthetic shots are shorter than the study's training segments, and a batch of 2 gives the historic set more than one batch
     base_dataloader_config = study.base_dataloader_config
     monkeypatch.setattr(
         study,
@@ -154,8 +154,8 @@ def test_finetune_restores_twin_and_only_transfer_scales_lr0(synthetic_device_st
     base_optimizer_config = study.base_optimizer_config()
     assert twin_config.optimizer_config == base_optimizer_config
     assert exnihilo_config.optimizer_config == base_optimizer_config
-    _, finetune_train_dl, _, _ = PowerBalanceTRB.get_dataloaders(finetune_config.dataloader_config)
-    batches_per_epoch = len(finetune_train_dl)
+    _, historic_train_dl, _, _ = PowerBalanceTRB.get_dataloaders(twin_config.dataloader_config)
+    batches_per_epoch = len(historic_train_dl)
     assert batches_per_epoch > 1
     base_lr0 = base_optimizer_config["lr0"]
     assert finetune_config.optimizer_config["lr0"] == pytest.approx(base_lr0 / np.sqrt(batches_per_epoch))

@@ -1038,7 +1038,7 @@ class Study:
     def batches_per_epoch(self, train_config: TrainConfig) -> int:
         """The batches in one pass over the training set of this loader config, the case's optimizer steps per epoch.
 
-        Only the transfer learning rate reads it (_scale_transfer_lr), and a transfer case loads the target device alone.
+        Only the transfer learning rate reads it (_scale_transfer_lr), on the historic training set, which loads every source device.
         A measurement builds the training loader, so it is recorded in the working dir (BATCHES_PER_EPOCH_FILENAME) for later runs.
         The root-most study of the lineage that recorded it wins, like case_home,
         so a child trains its own cases with the value its borrowed cases trained with.
@@ -1063,18 +1063,29 @@ class Study:
         recorded[config_hash] = {"data_train_run_builder": data_train_run_builder_name, "batches_per_epoch": batches_per_epoch}
         write_toml_atomic(self.working_dir / BATCHES_PER_EPOCH_FILENAME, recorded)
 
-    def _scale_transfer_lr(self, train_config: TrainConfig) -> TrainConfig:
-        """lr0 of a transfer finetune, the tuned lr0 / sqrt(its own batches per epoch).
+    def _scale_transfer_lr(self, case: Case, train_config: TrainConfig) -> TrainConfig:
+        """lr0 of a transfer finetune, the tuned lr0 / sqrt(the batches per epoch of the historic training set), whatever the finetune's size.
 
-        Tuned learning rates were swept on the source devices, a finetune trains the last layers of a pretrained model.
-        Every set under one batch trains only one step per epoch, so it keeps the tuned lr0.
+        The historic training set is the one the case's transfer_pretrain twin trains on,
+        every source device's training and validation shots, so the scale is one value per loader family and training data.
+        That set does not depend on the target split, so it is measured on the 0-shot split, one measurement for every rung.
         The tuned schedule is kept, only its scale changes.
 
         Applied after the tuned-config merge so the swept optimizer_config cannot overwrite it.
         """
-        batches_per_epoch = self.batches_per_epoch(train_config)
+        historic_split = configured_target_split(HYPERPARAM_TARGET_SHOTS, BASE_TARGET_SHOT_ORDER)
+        historic_dataloader_config = {
+            **train_config.dataloader_config,
+            "training_data": case.training_data,
+            "domain_adaptation": "transfer_pretrain",
+            **historic_split.dataloader_config(),
+        }
+        historic_train_config = train_config.model_copy(update={"dataloader_config": historic_dataloader_config})
+        batches_per_epoch = self.batches_per_epoch(historic_train_config)
         lr0_transfer = train_config.optimizer_config["lr0"] / math.sqrt(batches_per_epoch)
-        logger.info(f"Transfer lr0 {lr0_transfer:.3g}, the tuned lr0 / sqrt({batches_per_epoch} batches per epoch)")
+        logger.info(
+            f"Transfer lr0 {lr0_transfer:.3g}, the tuned lr0 / sqrt({batches_per_epoch} batches per epoch of the historic training set)"
+        )
         optimizer_config = {**train_config.optimizer_config, "lr0": lr0_transfer}
         return train_config.model_copy(update={"optimizer_config": optimizer_config})
 
@@ -1139,7 +1150,7 @@ class Study:
         # A transfer finetune gets a reduced lr0 (see _scale_transfer_lr), exnihilo keeps the tuned one.
         # Applied after the tuned-config merge so the swept optimizer_config cannot overwrite it
         if case.domain_adaptation == "transfer":
-            train_config = self._scale_transfer_lr(train_config)
+            train_config = self._scale_transfer_lr(case, train_config)
 
         return train_config
 

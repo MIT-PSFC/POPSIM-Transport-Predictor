@@ -1,4 +1,4 @@
-"""A transfer case's batches per epoch (Study.batches_per_epoch), which set its learning rate,
+"""The historic training set's batches per epoch (Study.batches_per_epoch), which set the transfer learning rate,
 are measured once and recorded in the working dir for later runs and child studies, until a reset."""
 
 from transport_study.config import reset_config
@@ -6,7 +6,7 @@ from transport_study.modules.power_balance.trb import PowerBalanceTRB
 from transport_study.orchestration.study import BATCHES_PER_EPOCH_FILENAME
 from transport_study.power_balance_transfer.power_balance_study import PowerBalanceStudy
 
-# Small batches and short segments, so the synthetic transfer set spans more than one batch
+# Small batches and short segments, so the synthetic historic set spans more than one batch
 SHORT_LOADERS = {"batch_size": 2, "segment_length_train": 20, "segment_overlap_train": 10}
 
 
