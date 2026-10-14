@@ -2,10 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Annotated, ClassVar
-
-if TYPE_CHECKING:
-    from popsim.ml import TrainConfig
+from typing import Annotated, ClassVar
 
 import fire
 import netCDF4  # noqa: F401
@@ -364,24 +361,6 @@ class ProfileStudy(Study):
             )
         else:
             raise ValueError(f"Unknown model type: {case.model_type}")
-
-    def tuned_model_init_updates(self, case: Case, tuned_config: TrainConfig) -> dict:
-        # The reservoir has no MLP depth/width, everything else sweeps them
-        updates = {}
-        if case.model_type != "reservoir":
-            updates["nn_depth"] = tuned_config.model_init_config["nn_depth"]
-            updates["nn_width"] = tuned_config.model_init_config["nn_width"]
-        if case.model_type in MODEL_TYPES_WITH_SHAPES:
-            updates["n_shapes"] = tuned_config.model_init_config["n_shapes"]
-        elif case.model_type == "reservoir":
-            updates["reservoir_size"] = tuned_config.model_init_config["reservoir_size"]
-            updates["spectral_radius"] = tuned_config.model_init_config["spectral_radius"]
-            updates["input_scaling"] = tuned_config.model_init_config["input_scaling"]
-            updates["leak_rate"] = tuned_config.model_init_config["leak_rate"]
-            updates["n_steps"] = tuned_config.model_init_config["n_steps"]
-        elif case.model_type.startswith("torax"):
-            updates["n_solver_steps"] = tuned_config.model_init_config["n_solver_steps"]
-        return updates
 
     ##############
     # COLLECTION #

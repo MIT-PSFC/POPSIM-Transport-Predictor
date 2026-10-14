@@ -384,18 +384,6 @@ class PowerBalanceStudy(Study):
         else:
             raise ValueError(f"Unknown model type: {case.model_type}")
 
-    def tuned_model_init_updates(self, case: Case, tuned_config: TrainConfig) -> dict:
-        # sciml-taue-scalinglaw has no NN of its own (its submodules carry their own tuned configs)
-        updates = {}
-        if case.model_type in [*SUBMODULE_MODEL_TYPES, "mlp", "sciml-taue-nn", "transformer"]:
-            updates["nn_depth"] = tuned_config.model_init_config["nn_depth"]
-            updates["nn_width"] = tuned_config.model_init_config["nn_width"]
-        if case.model_type == "transformer":
-            updates["d_model"] = tuned_config.model_init_config["d_model"]
-            updates["num_heads"] = tuned_config.model_init_config["num_heads"]
-            updates["history_len"] = tuned_config.model_init_config["history_len"]
-        return updates
-
     ############
     # ANALYSIS #
     ############

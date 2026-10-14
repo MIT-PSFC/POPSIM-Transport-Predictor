@@ -456,8 +456,7 @@ class Study:
 
     Subclasses define a nested Config (CaseGridConfig subclass) and Case
     (Study.Case subclass), the make_train_config hooks
-    (base_dataloader_config / base_loss_config / model_train_spec /
-    tuned_model_init_updates), collect_results, and run_analysis.
+    (base_dataloader_config / base_loss_config / model_train_spec), collect_results, and run_analysis.
     The case grid comes from the Config's case axes (make_cases).
     """
 
@@ -1291,8 +1290,14 @@ class Study:
         raise NotImplementedError
 
     def tuned_model_init_updates(self, case: Case, tuned_config: TrainConfig) -> dict:
-        """model_init_config entries swept only for certain model types."""
-        raise NotImplementedError
+        """The model_init_config entries the case's sweep varied, at their tuned values.
+
+        The names come from the model type's sweep yaml (sweep_model_init_parameters), the values from the tuned config,
+        indexed strictly since a tuned config holds every swept key.
+        A model type without a swept net of its own (the scaling law, the transport sciml) copies nothing.
+        """
+        swept_names = self.sweep_model_init_parameters(case.model_type)
+        return {name: tuned_config.model_init_config[name] for name in swept_names}
 
     def check_data_requirements(self, case: Case) -> bool:
         """Given a case, check if the required data for that case is available."""
