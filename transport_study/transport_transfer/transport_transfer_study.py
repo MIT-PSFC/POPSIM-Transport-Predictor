@@ -224,6 +224,8 @@ class TransportStudy(Study):
         multiobjective: bool
 
         VALID_MODEL_TYPES = STUDY_MODEL_TYPES
+        # The power balance and profile predictors sciml restores, and the p_oh / p_rad predictors the power balance restores
+        RESTORED_MODEL_TYPES = SUBMODULE_MODEL_TYPES
         # Unfrozen submodules and the geometry_builder and torax_state defaults are suppressed from the case name,
         # so the default grid keeps clean case names and new axes never rename pre-existing cases
         STR_TOKEN_FIELDS = (

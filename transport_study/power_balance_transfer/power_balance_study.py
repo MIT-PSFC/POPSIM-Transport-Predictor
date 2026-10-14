@@ -219,6 +219,8 @@ class PowerBalanceStudy(Study):
         multiobjective: bool
 
         VALID_MODEL_TYPES = STUDY_MODEL_TYPES
+        # The p_oh / p_rad predictors the sciml types restore
+        RESTORED_MODEL_TYPES = SUBMODULE_MODEL_TYPES
         # Unfrozen submodules and single-objective training are the defaults, so only the others show in the name
         STR_TOKEN_FIELDS = (
             ("norm_", "data_normalization"),

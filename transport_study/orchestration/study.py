@@ -315,6 +315,22 @@ def write_netcdf_atomic(ds: xr.Dataset, path: Path | str) -> None:
     tmp_path.replace(path)
 
 
+def _copy_dir_atomic(source_dir: Path, path: Path) -> None:
+    """Copy source_dir to path through a temporary dir, so a partial copy is never visible at path.
+
+    The merge skips a checkpoint copy once path exists, a copy cut short must not pass for done.
+    """
+    tmp_path = path.with_name(path.name + ".tmp")
+    shutil.rmtree(tmp_path, ignore_errors=True)
+    shutil.copytree(source_dir, tmp_path)
+    tmp_path.rename(path)
+
+
+def _seed_checkpoint_dir(model_dir: Path | str, seed: int) -> Path:
+    """Where seed s of the case whose checkpoint dir is model_dir trains and keeps its best checkpoint."""
+    return Path(model_dir) / f"seed_{seed}"
+
+
 def _load_study_config(study_config: CaseGridConfig) -> None:
     """Load study_config as the global config, which a process loads once.
 
@@ -361,7 +377,8 @@ class CaseGridConfig(StudyConfig):
     # Optional dict of dataset fractions to use during domain adaptation, only used if domain_adaptation includes "weighted"
     dataset_fractions: dict[str, float] = Field(default_factory=dict)
     # How many independently seeded training runs every production case trains, each its own job (orchestration/seed_results.py).
-    # Every case score is the mean over them, with their std as the run-to-run spread, and the best seed's checkpoint is the one kept
+    # Every case score is the mean over them, with their std as the run-to-run spread, and the best seed's checkpoint is the one restores read.
+    # Seed s of a case restores seed s of every case it restores from (Study._seeded_train_config)
     num_seeds: int = Field(default=5, ge=1)
 
     # Field name -> its valid values. A tuple field must hold valid values only, a scalar field must be one.
@@ -548,6 +565,8 @@ class Study:
         STR_TOKEN_FIELDS: ClassVar[tuple[tuple[str, str] | tuple[str, str, object], ...]] = ()
         # Per-case fields with a config.hyperparam_<name> counterpart
         HYPERPARAM_FIELDS: ClassVar[tuple[str, ...]] = ()
+        # Model types other cases restore as submodules, seed by seed (see keeps_seed_checkpoints)
+        RESTORED_MODEL_TYPES: ClassVar[tuple[str, ...]] = ()
 
         def init_common(self, model_type, training_data, domain_adaptation, num_target_shots, target_shot_order, model_size):
             """Shared between every subclass __init__: parse, validate, build prereqs."""
@@ -616,6 +635,15 @@ class Study:
         def trains_on_target_only(self) -> bool:
             """A transfer finetune or an exnihilo case, the finetune stage, which trains on the target shots alone."""
             return self.domain_adaptation == "transfer" or self.training_data.exnihilo
+
+        @property
+        def keeps_seed_checkpoints(self) -> bool:
+            """A transfer_pretrain twin or a submodule, which other cases restore seed by seed (Study._seeded_train_config).
+
+            Its merge keeps every seed's best checkpoint (Study.merge_seed_results).
+            Read off the case alone, so a borrowed case is merged the same way by the study it lives in.
+            """
+            return self.domain_adaptation == "transfer_pretrain" or self.model_type in self.RESTORED_MODEL_TYPES
 
         def transfer_pretrain_case(self) -> Study.Case:
             """The pretrain prereq case this transfer case fine-tunes from.
@@ -748,7 +776,8 @@ class Study:
     def trained_model_dir(self, case: Case) -> Path:
         """The case's checkpoint dir, in the working dir of the study it lives in.
 
-        Once its seeds are merged it holds the best seed's best checkpoint, the one every restore of the case reads.
+        Once its seeds are merged it holds the best seed's best checkpoint, the one every restore of the case reads,
+        except a seeded training run, which reads its own seed's (see seed_model_dir).
         """
         return self.case_home(case).model_dir / str(case)
 
@@ -757,8 +786,11 @@ class Study:
         return self.case_home(case).result_path(str(case))
 
     def seed_model_dir(self, case: Case, seed: int) -> Path:
-        """Where one seed of the case trains, its best checkpoint and the latest one it resumes from."""
-        return self.trained_model_dir(case) / f"seed_{seed}"
+        """Where one seed of the case trains, its best checkpoint and the latest one it resumes from.
+
+        A case with keeps_seed_checkpoints keeps the best one here once merged, for the seed s runs restoring it.
+        """
+        return _seed_checkpoint_dir(self.trained_model_dir(case), seed)
 
     def seed_result_path(self, case: Case, seed: int) -> Path:
         """The test results of one seed's best checkpoint, until merge_seed_results folds them into the case result."""
@@ -1092,7 +1124,10 @@ class Study:
         return self.make_train_config(case.replace_pinned(model_type=submodule_type))
 
     def _set_transfer_checkpoint(self, train_config: TrainConfig, transfer_case: Case) -> TrainConfig:
-        """Point model_init at the pretrained checkpoint the transfer case fine-tunes from."""
+        """Point model_init at the pretrained checkpoint the transfer case fine-tunes from, the twin's merged best.
+
+        launch_train repoints each seed s at the twin's seed s (_seeded_train_config).
+        """
         return train_config.model_copy(
             update={
                 "model_init_config": {
@@ -1211,7 +1246,8 @@ class Study:
             epochs_per_val=config.epochs_per_val,
             patience=config.patience,
             # Where the case's merged best checkpoint is restored from.
-            # launch_train points each seed at its own dir, and the wandb agent each sweep trial
+            # launch_train points each seed at its own dir, and the wandb agent each sweep trial.
+            # A seed s run restores seed s of this dir, a sweep trial and restore_trainer the merged best
             checkpoint_dir=str(self.trained_model_dir(case)),
             dataloader_config=spec.dataloader_config,
             model_init_config=spec.model_init_config,
@@ -1925,10 +1961,24 @@ class Study:
         """train_config as one seed of the case trains it.
 
         The seed sets the model initialization and the training shuffle.
+        It also restores seed s of every case the run restores from,
+        the transfer_pretrain twin (transfer_checkpoint) and each submodule prereq (submodules),
+        so the seed spread holds theirs too.
+        Only the direct submodules are repointed, a seed s submodule checkpoint already holds its own seed s submodules.
         Each seed trains into its own checkpoint dir, keeping only its best checkpoint beside the latest one it resumes from.
         It stops cleanly at the wall-clock budget, so the next launch can continue.
         """
         model_init_config = {**train_config.model_init_config, "prng_seed": seed}
+        transfer_checkpoint = model_init_config.get("transfer_checkpoint")
+        if transfer_checkpoint:
+            seed_transfer_dir = _seed_checkpoint_dir(transfer_checkpoint, seed)
+            model_init_config["transfer_checkpoint"] = str(seed_transfer_dir)
+        if "submodules" in model_init_config:
+            seeded_submodules = {}
+            for name, submodule_config in model_init_config["submodules"].items():
+                seed_submodule_dir = _seed_checkpoint_dir(submodule_config.checkpoint_dir, seed)
+                seeded_submodules[name] = submodule_config.model_copy(update={"checkpoint_dir": str(seed_submodule_dir)})
+            model_init_config["submodules"] = seeded_submodules
         dataloader_config = {**train_config.dataloader_config, "shuffle_seed": seed}
         return train_config.model_copy(
             update={
@@ -1944,8 +1994,11 @@ class Study:
     def merge_seed_results(self, case: Case) -> None:
         """Fold a case's finished seeds into its result file and keep only the best seed's best checkpoint.
 
-        That checkpoint moves up into trained_model_dir(case), the dir every restore of the case reads
-        (transfer finetunes, submodule prereqs, restore_trainer), and the seed dirs are deleted.
+        That checkpoint moves up into trained_model_dir(case), the dir every unseeded restore of the case reads
+        (sweep trials, restore_trainer), and the seed dirs are deleted.
+        A case with keeps_seed_checkpoints (a transfer_pretrain twin or a submodule) copies it up instead
+        and keeps each seed's best checkpoint in its seed dir, the one seed s of its dependents restores (_seeded_train_config).
+        Only the resume checkpoints go.
         Every step is skipped once done, so a merge short circuits reruns cleanly at the next pass.
         The result file is written last, it marks the case finished.
         """
@@ -1960,9 +2013,19 @@ class Study:
         best_checkpoint_dir = self.trained_model_dir(case) / str(best_epoch)
         if not best_checkpoint_dir.exists():
             seed_checkpoint_dir = self.seed_model_dir(case, best_seed) / str(best_epoch)
-            os.rename(seed_checkpoint_dir, best_checkpoint_dir)
-        for seed in per_seed:
-            shutil.rmtree(self.seed_model_dir(case, seed), ignore_errors=True)
+            if case.keeps_seed_checkpoints:
+                _copy_dir_atomic(seed_checkpoint_dir, best_checkpoint_dir)
+            else:
+                os.rename(seed_checkpoint_dir, best_checkpoint_dir)
+        for seed, seed_ds in per_seed.items():
+            seed_model_dir = self.seed_model_dir(case, seed)
+            if not case.keeps_seed_checkpoints:
+                shutil.rmtree(seed_model_dir, ignore_errors=True)
+                continue
+            seed_best_epoch_name = str(int(seed_ds.attrs[SEED_BEST_EPOCH_ATTR]))
+            for checkpoint_path in seed_model_dir.iterdir():
+                if checkpoint_path.name != seed_best_epoch_name:
+                    shutil.rmtree(checkpoint_path)
         write_netcdf_atomic(case_ds, self.result_path(case))
         for seed in per_seed:
             self.seed_result_path(case, seed).unlink(missing_ok=True)

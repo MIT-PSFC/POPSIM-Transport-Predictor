@@ -2,9 +2,11 @@
 
 Every production case trains config.num_seeds times.
 Seed s sets the model initialization and the training shuffle (Study.launch_train),
+restores seed s of every case it restores from (its transfer_pretrain twin, its submodule prereqs),
 keeps only its best-by-val-loss checkpoint and writes the test results of it (seed_result).
 Once every seed has finished, Study.merge_seed_results combines them into the case result (aggregate_seed_results),
 which keeps every test error variable of each seed on a seed dim.
+A case other cases restore keeps every seed's best checkpoint for them (Study.Case.keeps_seed_checkpoints).
 Every case score then comes in three values (seed_statistics):
 the best seed's (lowest validation loss), the mean over the seeds and the std over them,
 the run-to-run spread a difference between cases has to beat.

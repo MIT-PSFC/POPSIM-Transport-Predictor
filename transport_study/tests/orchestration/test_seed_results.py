@@ -23,6 +23,7 @@ from popsim.ml.checkpointing import (
 )
 
 import transport_study.orchestration.study as study_module
+from transport_study.modules.trb_utils import restore_from_checkpoint
 from transport_study.orchestration.seed_results import (
     BEST_SEED_ATTR,
     SEED_BEST_EPOCH_VAR,
@@ -110,22 +111,23 @@ def test_seed_result_reads_the_best_checkpoint():
     np.testing.assert_allclose(aggregated["error_abs_ts"].sel({SEED_DIM: 4}).values, best_ds["error_abs_ts"].values)
 
 
-def test_launch_train_seeds_its_init_shuffle_and_checkpoint_dir(make_stub_study, monkeypatch):
-    """Each seed trains its own initialization and shuffle into its own checkpoint dir, keeping one checkpoint,
-    and sweep trials keep one checkpoint too."""
-    case = StubCase("case.stub")
-    study = make_stub_study([case], num_seeds=4)
-    base_config = TrainConfig(
-        project="stub_project",
-        train_run_builder="stub.module.StubTRB",
-        max_epochs=3,
-        epochs_per_val=1,
-        dataloader_config={"shuffle_seed": 0},
-        model_init_config={"prng_seed": 42},
-        loss_config={},
-        optimizer_config={},
-    )
-    monkeypatch.setattr(study, "make_train_config", lambda _case: base_config)
+def _stub_train_config(**updates) -> TrainConfig:
+    """A TrainConfig carrying only what launch_train reads, with updates on top."""
+    config_fields = {
+        "project": "stub_project",
+        "train_run_builder": "stub.module.StubTRB",
+        "max_epochs": 3,
+        "epochs_per_val": 1,
+        "dataloader_config": {"shuffle_seed": 0},
+        "model_init_config": {"prng_seed": 42},
+        "loss_config": {},
+        "optimizer_config": {},
+    }
+    return TrainConfig(**{**config_fields, **updates})
+
+
+def _capture_launch_train(monkeypatch) -> dict[str, TrainConfig]:
+    """Swap the serial launch_train for one recording its train config under "train"."""
     captured: dict[str, TrainConfig] = {}
 
     def fake_launch_train(train_config):
@@ -133,6 +135,17 @@ def test_launch_train_seeds_its_init_shuffle_and_checkpoint_dir(make_stub_study,
         return None, None, None, None, None
 
     monkeypatch.setattr(study_module, "launch_train", fake_launch_train)
+    return captured
+
+
+def test_launch_train_seeds_its_init_shuffle_and_checkpoint_dir(make_stub_study, monkeypatch):
+    """Each seed trains its own initialization and shuffle into its own checkpoint dir, keeping one checkpoint,
+    and sweep trials keep one checkpoint too."""
+    case = StubCase("case.stub")
+    study = make_stub_study([case], num_seeds=4)
+    base_config = _stub_train_config()
+    monkeypatch.setattr(study, "make_train_config", lambda _case: base_config)
+    captured = _capture_launch_train(monkeypatch)
     study.launch_train(case, 3, enable_parallelism=False)
     seeded_config = captured["train"]
     assert seeded_config.model_init_config["prng_seed"] == 3
@@ -194,3 +207,85 @@ def test_interrupted_merge_reruns_cleanly(make_stub_study):
 
     assert study.result_path(case).exists()
     assert [path.name for path in study.trained_model_dir(case).iterdir()] == [str(best_epoch)]
+
+
+def test_restored_case_merge_keeps_each_seeds_best_checkpoint(make_stub_study):
+    """The merge of a case other cases restore seed by seed (keeps_seed_checkpoints).
+
+    Before the merge:
+    - each seed dir holds its best checkpoint (epoch 2) and its resume checkpoint (epoch 3)
+    - seed 1 has the lower validation loss, so it is the best seed
+
+    The merge then:
+    1. copies seed 1's epoch 2 checkpoint up into the case dir, where unseeded restores read
+    2. deletes epoch 3 from each seed dir, so each keeps only its own best checkpoint
+
+    After it the case dir holds 2/, seed_0/2/ and seed_1/2/,
+    and a restore of the case dir reads 2/ and skips the seed dirs.
+    """
+    case = StubCase("case.restored", keeps_seed_checkpoints=True)
+    study = make_stub_study([case], num_seeds=2)
+    seed_best_epochs = {
+        0: _train_seed(study, case, 0, {1: 0.9, 2: 0.4, 3: 0.6}),
+        1: _train_seed(study, case, 1, {1: 0.8, 2: 0.3, 3: 0.5}),
+    }
+
+    study.merge_seed_results(case)
+
+    # 1. The best seed's best checkpoint sits in the case dir beside the seed dirs
+    model_dir = study.trained_model_dir(case)
+    assert sorted(path.name for path in model_dir.iterdir()) == [str(seed_best_epochs[1]), "seed_0", "seed_1"]
+    # 2. Each seed dir keeps only its own best checkpoint
+    for seed, best_epoch in seed_best_epochs.items():
+        assert [path.name for path in study.seed_model_dir(case, seed).iterdir()] == [str(best_epoch)]
+    # The restore reads the copied-up checkpoint, seed 1's weights
+    restored = restore_model(create_default_checkpoint_manager(model_dir), _TinyModel(w=jnp.zeros(2)))
+    assert float(restored.w[0]) == 10.0 * 1 + seed_best_epochs[1]
+
+
+def test_seed_restores_same_seed_of_twin_and_submodules(make_stub_study, monkeypatch):
+    """Seed s of a case restores seed s of its transfer_pretrain twin and of each submodule prereq, not their best seed.
+
+    Before the launch:
+    - the twin and the submodule each train 2 seeds, with weights 10 x seed + epoch
+    - seed 0's best checkpoint is epoch 2 (weights 2), seed 1's is epoch 1 (weights 11)
+    - seed 1 has the lower validation loss, so each merge copies seed 1's checkpoint up into the case dir
+    - so each case dir holds 1/ (weights 11), seed_0/2/ (weights 2) and seed_1/1/ (weights 11)
+    - the consumer's train config points transfer_checkpoint and the submodule checkpoint_dir at the two case dirs,
+      as make_train_config builds them
+
+    The launch of the consumer's seed 0 then:
+    1. repoints transfer_checkpoint at the twin's seed_0/
+    2. repoints the submodule checkpoint_dir at the submodule's seed_0/
+
+    Restoring from both repointed dirs gives weights 2, seed 0's, never 11, the merged best.
+    """
+    twin = StubCase("case.twin", keeps_seed_checkpoints=True)
+    submodule = StubCase("case.submodule", keeps_seed_checkpoints=True)
+    case = StubCase("case.finetune")
+    study = make_stub_study([twin, submodule, case], num_seeds=2)
+    for prereq in (twin, submodule):
+        seed_0_best_epoch = _train_seed(study, prereq, 0, {1: 0.9, 2: 0.4})
+        _train_seed(study, prereq, 1, {1: 0.3, 2: 0.5})
+        study.merge_seed_results(prereq)
+    submodule_config = _stub_train_config(checkpoint_dir=str(study.trained_model_dir(submodule)))
+    model_init_config = {
+        "prng_seed": 42,
+        "transfer_checkpoint": str(study.trained_model_dir(twin)),
+        "submodules": {"p_oh_predictor": submodule_config},
+    }
+    base_config = _stub_train_config(model_init_config=model_init_config)
+    monkeypatch.setattr(study, "make_train_config", lambda _case: base_config)
+    captured = _capture_launch_train(monkeypatch)
+
+    study.launch_train(case, 0, enable_parallelism=False)
+
+    seeded_init_config = captured["train"].model_init_config
+    template = _TinyModel(w=jnp.zeros(2))
+    # 1. The twin restore reads seed 0's checkpoint
+    restored_twin = restore_from_checkpoint(template, seeded_init_config["transfer_checkpoint"])
+    # 2. The submodule restore reads seed 0's checkpoint
+    seeded_submodule_dir = seeded_init_config["submodules"]["p_oh_predictor"].checkpoint_dir
+    restored_submodule = restore_from_checkpoint(template, seeded_submodule_dir)
+    assert float(restored_twin.w[0]) == seed_0_best_epoch
+    assert float(restored_submodule.w[0]) == seed_0_best_epoch

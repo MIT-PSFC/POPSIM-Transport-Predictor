@@ -59,6 +59,8 @@ class StubCase:
     model_size: str = BASE_MODEL_SIZE
     # A hyperparam case also owns sweep agent jobs
     hyperparam: bool = False
+    # A twin or submodule stand-in, whose merge keeps every seed's best checkpoint
+    keeps_seed_checkpoints: bool = False
 
     def is_hyperparam_case(self) -> bool:
         return self.hyperparam
