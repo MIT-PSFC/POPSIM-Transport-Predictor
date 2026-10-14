@@ -344,11 +344,10 @@ class TransportStudy(Study):
             "huber_delta": 1.0,
             "gradient_weight": 0.1,
             "huber_delta_grad": 3.0,
-            # Charged per diverged (non-finite) timeslice, sized to swamp ordinary loss differences
+            # Charged per diverged (non-finite) fresh timeslice in validation, sized to swamp ordinary loss differences
             # so a diverged trial cannot win the sweep.
-            # One per loss: the training penalty carries no gradient and only marks the logged loss,
-            # the validation chi is ~1 per fresh timeslice, so one diverged timeslice in a thousand adds ~10 to it
-            "divergence_penalty": 10.0,
+            # The validation chi is ~1 per fresh timeslice, so one diverged timeslice in a thousand adds ~10 to it.
+            # Training has no penalty, popsim masks a diverged sample out of its step
             "divergence_penalty_val": 1e4,
             # Anchor terms keeping the sciml submodule predictions close to
             # the measured signals while the whole module trains on the

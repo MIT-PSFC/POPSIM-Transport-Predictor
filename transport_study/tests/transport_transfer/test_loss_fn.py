@@ -34,7 +34,6 @@ LOSS_CONFIG = {
     "huber_delta": 1.0,
     "huber_delta_grad": 3.0,
     "gradient_weight": 0.1,
-    "divergence_penalty": 10.0,
     "divergence_penalty_val": 1e4,
     "anchor_weight_energy_mhd": 0.0,
     "anchor_weight_power_ohm": 0.0,

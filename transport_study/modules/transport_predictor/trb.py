@@ -177,6 +177,10 @@ class TransportPredictorTRB(TrainRunBuilder):
         Training integrates over the equal-length segments,
         validation averages over each episode's fresh profile time (TimeAveragedLoss), so a long shot weighs no more than a short one.
 
+        A diverged (non-finite) rollout leaves its training loss non-finite, stale slices included,
+        so popsim's train step masks that sample and steps on the rest of the batch.
+        Validation replaces the non-finite values by the target and charges divergence_penalty_val at the fresh slices instead.
+
         The anchor terms pull the sciml submodule predictions (the power balance Wtot and its own p_oh / p_rad)
         and a multiobjective case's stored energy and ohmic power toward the measured signals,
         weighted by the anchor_weight_* loss_config keys.
@@ -190,12 +194,11 @@ class TransportPredictorTRB(TrainRunBuilder):
         gradient_weight = loss_config["gradient_weight"]
         if training:
             sigma_floors = loss_config["train_chi_sigma_floors"]
-            divergence_penalty = loss_config["divergence_penalty"]
             residual_scales = loss_config["residual_scales"]
             anchor_signals = TransportPredictorTRB.ANCHOR_SIGNALS
         else:
             sigma_floors = loss_config["chi_sigma_floors"]
-            divergence_penalty = loss_config["divergence_penalty_val"]
+            divergence_penalty_val = loss_config["divergence_penalty_val"]
             residual_scales = {}
             anchor_signals = {}
         anchor_weights = {signal: loss_config[weight_key] for signal, (_, weight_key) in anchor_signals.items()}
@@ -206,15 +209,20 @@ class TransportPredictorTRB(TrainRunBuilder):
             ds_source_idx = targ["ds_source_idx"].data
             sample_weights = per_sample_device_values(ds_source_idx, device_weights, 1.0)
 
-            # A diverged rollout is a failure of the model, not a missing measurement,
-            # so it is charged by the divergence penalty below instead of passing through as NaN.
-            # The non-finite values are replaced by the target BEFORE the arithmetic,
-            # because reverse mode also differentiates the discarded branch of a later jnp.where
-            ne_finite = jnp.isfinite(pred.ne)
-            te_finite = jnp.isfinite(pred.te)
-            ne_pred = jnp.where(ne_finite, pred.ne, ne_targ)
-            te_pred = jnp.where(te_finite, pred.te, te_targ)
-            diverged = ~(jnp.all(ne_finite, axis=-1) & jnp.all(te_finite, axis=-1))
+            if training:
+                # A diverged rollout passes through as non-finite, so popsim can find its sample and mask it.
+                # Replacing it here would leave the loss finite but the gradient NaN,
+                # since the rollout's own backward pass multiplies its non-finite intermediates,
+                # and popsim would skip the whole step
+                ne_pred, te_pred = pred.ne, pred.te
+            else:
+                # A diverged rollout is a failure of the model, not a missing measurement,
+                # so validation charges it the divergence penalty below instead of passing it through as NaN
+                ne_finite = jnp.isfinite(pred.ne)
+                te_finite = jnp.isfinite(pred.te)
+                ne_pred = jnp.where(ne_finite, pred.ne, ne_targ)
+                te_pred = jnp.where(te_finite, pred.te, te_targ)
+                diverged = ~(jnp.all(ne_finite, axis=-1) & jnp.all(te_finite, axis=-1))
 
             # Only timeslices with a fresh profile measurement count for the profile terms, values and gradients alike
             profile_weights = sample_weights * targ["fresh_profile"].data
@@ -238,30 +246,25 @@ class TransportPredictorTRB(TrainRunBuilder):
                 else:
                     channel_loss = chi_profile_loss(*profile_terms, gradient_weight)
                 channel_losses.append(channel_loss)
-            # Training averages the two channels, chi sums them, the scales the divergence penalties are sized to
+            # Training averages the two channels, chi sums them, the scale divergence_penalty_val is sized to
             channel_sum = channel_losses[0] + channel_losses[1]
             loss = jnp.mean(profile_weights * (0.5 * channel_sum if training else channel_sum))
 
             for signal, anchor_weight in anchor_weights.items():
                 if anchor_weight <= 0.0 or signal not in targ:
                     continue
-                anchor_pred = getattr(pred, anchor_signals[signal][0])
-                anchor_finite = jnp.isfinite(anchor_pred)
-                anchor_targ = targ[signal].data
-                # Same sanitize-then-charge treatment as the profiles
-                anchor_residual = jnp.where(anchor_finite, anchor_pred, anchor_targ) - anchor_targ
+                # Training only, so a diverged anchor prediction passes through as non-finite like the profiles
+                anchor_residual = getattr(pred, anchor_signals[signal][0]) - targ[signal].data
                 anchor_scale = per_sample_residual_scale(ds_source_idx, residual_scales, signal)
                 anchor_errors = optax.huber_loss(anchor_residual / anchor_scale, delta=loss_config["anchor_huber_deltas"][signal])
                 anchor_sample_weights = sample_weights * freshness_weight(signal, targ)
                 loss = loss + anchor_weight * jnp.mean(anchor_sample_weights * anchor_errors)
-                diverged = diverged | ~anchor_finite
 
-            # Training charges the divergence penalty outside the freshness mask:
-            # a rollout that went non-finite is broken whether or not those slices carry a fresh measurement.
-            # Validation charges it at the fresh slices, so the whole validation loss is one fresh-time average,
+            if training:
+                return loss
+            # Charged at the fresh slices, so the whole validation loss is one fresh-time average,
             # a fully diverged episode scoring the penalty itself, and a diverged trial cannot win the sweep
-            diverged_weights = sample_weights if training else profile_weights
-            return loss + divergence_penalty * jnp.mean(diverged_weights * diverged.astype(loss.dtype))
+            return loss + divergence_penalty_val * jnp.mean(profile_weights * diverged.astype(loss.dtype))
 
         # Validation scores whole episodes, where an integral would weigh each shot by its length,
         # so it divides by the fresh profile time and every shot counts once.
@@ -291,7 +294,8 @@ class TransportPredictorTRB(TrainRunBuilder):
         # submodule_lr_factors runs the sciml power_balance subtree at a reduced learning rate,
         # and its scaling-law coefficients skip the weight decay,
         # both no-ops for model types without a matching pytree path.
-        # A non-finite gradient reaches popsim's NaN skip count and TrainingDivergedError abort unmasked
+        # popsim masks a diverged sample out of its step (its training loss is non-finite),
+        # a non-finite gradient of an all-finite batch still reaches its NaN skip count and TrainingDivergedError abort
         return make_grouped_exponential_adamw(optimizer_config, no_decay_names=SCALING_LAW_FIELDS)
 
     @staticmethod
