@@ -64,14 +64,21 @@ SCALAR_SUBMODULE_SETTINGS = {
 }
 
 # Training batches, shared with the transport study's power balance pseudo-types.
-# Each loader family's batch sits near the throughput knee of its most expensive model at its sweep maximum,
-# the batch past which the time per sample stops falling.
-# On an A100-80GB: the transformer's time per sample falls 25 percent from 2048 to 4096 and 11 percent more to 8192,
-# where it peaks at 72.6 GB of the 77 GB XLA pool. 4096 keeps the headroom, 16 batches per epoch on the largest set at 36 GB.
-POWER_BALANCE_BATCH_SIZE = 4096
-# p_oh / p_rad: 18 and 15 percent per doubling from 98304, then 6 / 9 percent past 393216, 7 / 8 batches per epoch at 1.3 GB.
-# They should train on CPU, where an epoch takes about as long at any batch, so this only sets their steps per epoch
-SCALAR_SUBMODULE_BATCH_SIZE = 393216
+# Each sits at or below its family's critical batch size (McCandlish et al. 2018),
+# past which a larger batch reaches a given loss in about the same steps and wastes the extra samples.
+# Gradient noise scale at the best-validation epoch, plain / Adam: mlp 341 / 534, sciml-taue-nn 284 / 304, transformer 2,017 / 4,121.
+# The mlp's fitted critical batch grows from about 330 to 930 as the loss falls,
+# and every batch from 4096 to the full set needed about the same steps to reach the same loss.
+# 512 gives 93 batches per epoch on the hyperparam case.
+# For reference, the largest batches on an A100-80GB at the sweep maxima:
+# the transformer 8192 (72.6 GB of the 77 GB XLA pool, 12288 runs out of memory),
+# mlp / sciml-taue-nn / sciml-taue-scalinglaw 65536 at 4-13 GB, the largest tried, their time per sample flat past 32768.
+POWER_BALANCE_BATCH_SIZE = 512
+# p_oh / p_rad train on CPU only, on about 2.1 and 2.3M timeslices, so 2048 is about 1,100 steps per epoch.
+# p_rad's noise scale at its best epoch is 2,070 / 2,619 (plain / Adam), p_oh's is unusable, its gradient vanishing at convergence.
+# For reference, on GPU their time per sample stops falling near 393216 (1.3 GB),
+# and a CPU epoch took 24 s at 4096, nearly flat to 16384
+SCALAR_SUBMODULE_BATCH_SIZE = 2048
 
 POWER_BALANCE_TRB = "transport_study.modules.power_balance.trb.PowerBalanceTRB"
 # The stored energy and its freshness flag the Wtot loss reads, with the device label

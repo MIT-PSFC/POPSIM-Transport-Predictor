@@ -45,8 +45,8 @@ export XLA_FLAGS="${XLA_FLAGS:+$XLA_FLAGS }--xla_gpu_force_compilation_paralleli
 export JAX_PLATFORMS=cuda,cpu
 
 # One preallocated XLA pool at 90% of VRAM, growth-mode allocation fragments the pool.
-# The transport transformer at its sweep maximum peaks at 72 GB at TRANSPORT_BATCH_SIZE (2026-10-13),
-# over the 64 GiB of an 80% pool on an A100-80GB.
+# The transport transformer at its sweep maximum peaks at 72 GB at batch 2048,
+# over the 64 GiB of an 80% pool on an A100-80GB, so the pool holds the largest batches any study has benchmarked.
 # The other 10% holds the CUDA context and kernel images (~0.7 GB measured).
 export XLA_PYTHON_CLIENT_PREALLOCATE=true
 export XLA_PYTHON_CLIENT_MEM_FRACTION=0.90

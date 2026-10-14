@@ -88,13 +88,13 @@ MEASURED_POWER_VARS = ["power_ohm_MW", "power_radiated_MW"]
 # The signals a multiobjective case anchors, the ones TORAX infers from its state (no P_rad, see TransportPredictorToraxBase)
 MULTIOBJECTIVE_TARGET_VARS = ["energy_mhd_MJ", "power_ohm_MW"]
 
-# Segment batch of the top-level cases, the largest that every transport model type fits at its sweep maximum,
-# 32 batches per epoch on the largest set. Transformer's memory caps it (TORAX could go faster at larger batch size).
-# On an A100-80GB:
-# - torax-gyrobohm 155 s and torax-qlknn 221 s per epoch at 15 and 17 GB, against 268 and 347 s at 1024.
-# - The transformer peaks at 72 GB, inside the 90 percent XLA pool of slurm_utils.GPU_JOB_ENV,
-#   and runs out of memory at 3072 (one 100 GB buffer).
-TRANSPORT_BATCH_SIZE = 2048
+# Segment batch of the top-level cases, 47 batches per epoch on the hyperparam case.
+# No transport model's critical batch size was measured,
+# 1024 sits below the gradient noise scale of the power balance transformer, 2,017 / 4,121 plain / Adam at its best epoch.
+# On an A100-80GB, torax-gyrobohm takes 268 s and torax-qlknn 347 s per epoch at 1024, against 155 and 221 s at 2048.
+# For reference, the largest batches at the sweep maxima in the 90 percent XLA pool of slurm_utils.GPU_JOB_ENV:
+# the transformer 2048 (72 GB, 3072 runs out of memory), torax-gyrobohm 10240 (73.6 GB), torax-qlknn 8192 (66.2 GB), sciml 32768 (43.6 GB).
+TRANSPORT_BATCH_SIZE = 1024
 
 # Everything the env may need to seed a state at the segment start: the
 # measured profiles (transformer buffer / torax initial condition), the stored

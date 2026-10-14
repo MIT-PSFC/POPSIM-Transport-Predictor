@@ -71,11 +71,15 @@ STUDY_MODEL_TYPES = (*MODEL_TYPES_WITH_SHAPES, *MODEL_TYPES_WITHOUT_SHAPES)
 # The physical inputs every profile-predictor model consumes
 PROFILE_INPUT_VARS = list(NN_INPUT_SOURCE_VARS)
 
-# Timeslice batch, shared with the transport study's profile pseudo-type,
-# at the throughput knee of torax-qlknn, the most expensive profile model, at its sweep maximum.
-# On an A100-80GB: past 8192 its time per sample falls only 7, 4 and 3 percent per doubling.
-# 8192 gives 31 batches per epoch on the largest set, torax-qlknn 23.5 s and torax-gyrobohm 8.6 s per epoch at 7.2 GB.
-PROFILE_BATCH_SIZE = 8192
+# Timeslice batch, shared with the transport study's profile pseudo-type.
+# At or below the critical batch size of every profile model measured (McCandlish et al. 2018).
+# Gradient noise scale at the best-validation epoch, plain / Adam: mlp 1,235 / 1,577, reservoir 3,064 / 2,195,
+# shape-init-kmeans 5,974 / 6,935, shape-init-pca 6,380 / 8,374. The TORAX models were not measured.
+# 1024 gives 194 batches per epoch on the hyperparam case.
+# For reference, the largest batches on an A100-80GB at the sweep maxima:
+# torax-qlknn 81920 (68.5 GB), every other model 262144, the largest tried.
+# The time per sample stops falling near 8192 for torax-qlknn, 16384 for torax-gyrobohm and 65536 for mlp and shape-init.
+PROFILE_BATCH_SIZE = 1024
 
 # What collect_results reads of a result file
 PROFILE_SUMMARY_RESULT_VARS = [
