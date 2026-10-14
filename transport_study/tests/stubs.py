@@ -63,6 +63,10 @@ class StubCase:
     def is_hyperparam_case(self) -> bool:
         return self.hyperparam
 
+    def get_hyperparam_prereq(self) -> StubCase:
+        """A stub case has no hyperparam axes, so it is its own hyperparam case."""
+        return self
+
     def is_impossible(self) -> bool:
         return False
 
@@ -85,6 +89,22 @@ class StubStudy(Study):
 
     def make_cases(self, cfg: StudyConfig) -> list[StubCase]:
         return self.injected_cases
+
+
+def open_launch_slots(partition: str) -> type:
+    """A slurm_utils.LaunchSlots stand-in class, every job going to partition and never out of room."""
+
+    class OpenLaunchSlots:
+        def pick(self, cpu_capable: bool = False) -> str:
+            return partition
+
+        def available(self, partition_name: str, cpu_capable: bool = False) -> int:
+            return 1000
+
+        def take(self, partition_name: str) -> None:
+            pass
+
+    return OpenLaunchSlots
 
 
 def with_seed_attrs(seed_ds: xr.Dataset, val_loss: float, best_epoch: int = 1) -> xr.Dataset:

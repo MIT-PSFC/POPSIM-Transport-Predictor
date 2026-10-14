@@ -6,6 +6,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from collections import Counter
 from collections.abc import Callable, Collection
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -615,29 +616,39 @@ def _evictable_node_tres(nodes: list[str], partitions: tuple[str, ...]) -> dict[
     return {node: held_tres for node, held_tres in node_tres.items() if node in queried_nodes}
 
 
-def count_idle_gpus(partition: str | None = None, buffer_gpus: int | None = None) -> int:
-    """GPUs a job submitted to this partition could take now, minus buffer_gpus.
+def _available_gpus(partition: str) -> int | None:
+    """GPUs a job submitted to this partition could take now, None when a query fails.
 
     A GPU counts when it sits on a node of the partition that takes new jobs,
     and either no job holds it or a job of a partition this one preempts holds it.
     sinfo gresused covers every job on a node, whatever its partition, GPU request style or node count.
+    """
+    node_free_gpus = _schedulable_node_free_gpus(partition)
+    evictable_partitions = _preemptable_partitions(partition)
+    if node_free_gpus is None or evictable_partitions is None:
+        return None
+    schedulable_nodes = list(node_free_gpus)
+    node_evictable_tres = _evictable_node_tres(schedulable_nodes, evictable_partitions)
+    if node_evictable_tres is None:
+        return None
+    free_gpus = sum(node_free_gpus.values())
+    evictable_gpus = sum(held_tres["gres/gpu"] for held_tres in node_evictable_tres.values())
+    return free_gpus + evictable_gpus
+
+
+def count_idle_gpus(partition: str | None = None, buffer_gpus: int | None = None) -> int:
+    """GPUs a job submitted to this partition could take now (_available_gpus), minus buffer_gpus.
+
     Any failed query counts as no idle GPUs, so nothing launches.
     """
     if partition is None:
         partition = config.partition
     if buffer_gpus is None:
         buffer_gpus = config.buffer_gpus
-    node_free_gpus = _schedulable_node_free_gpus(partition)
-    evictable_partitions = _preemptable_partitions(partition)
-    if node_free_gpus is None or evictable_partitions is None:
+    available_gpus = _available_gpus(partition)
+    if available_gpus is None:
         return 0
-    schedulable_nodes = list(node_free_gpus)
-    node_evictable_tres = _evictable_node_tres(schedulable_nodes, evictable_partitions)
-    if node_evictable_tres is None:
-        return 0
-    free_gpus = sum(node_free_gpus.values())
-    evictable_gpus = sum(held_tres["gres/gpu"] for held_tres in node_evictable_tres.values())
-    return max(free_gpus + evictable_gpus - buffer_gpus, 0)
+    return max(available_gpus - buffer_gpus, 0)
 
 
 def count_pending_jobs(partition: str | None = None) -> int | None:
@@ -654,7 +665,6 @@ def open_gpu_slots(partition: str | None = None, buffer_gpus: int | None = None)
     """GPU jobs worth submitting to this partition now: idle GPUs beyond buffer_gpus less this user's pending jobs.
 
     Pending jobs will take idle GPUs once scheduled, so they claim slots already.
-    A negative buffer_gpus keeps that many jobs pending on a full partition.
     Any failed query gives no slots, so nothing launches.
     """
     idle_gpus = count_idle_gpus(partition, buffer_gpus)
@@ -830,13 +840,6 @@ def user_job_budget() -> int:
     return max(config.max_user_jobs - config.spillover_job_headroom - user_jobs, 0)
 
 
-def spillover_budget() -> int:
-    """The user-wide job budget for GPU spillover, none without spillover partitions."""
-    if not config.spillover_partitions:
-        return 0
-    return user_job_budget()
-
-
 def spillover_slots(partition: str) -> int:
     """Jobs still worth submitting to this spillover partition right now.
 
@@ -884,8 +887,9 @@ def open_cpu_slots(partition: str) -> int:
 
     Each node fits as many cpu_train_cpus x train_mem jobs as its idle CPUs and unallocated memory allow,
     counting what running jobs of a partition this one preempts hold there as free.
-    This user's pending jobs there claim slots already,
-    and the partition's per-user QOS cpu and mem caps bound the rest.
+    This user's pending jobs there claim slots already, beyond the cpu_pending_jobs allowed to pend,
+    so a freed slot is refilled without waiting for the next orchestration pass.
+    The partition's per-user QOS cpu and mem caps bound the rest.
     """
     node_free = _schedulable_node_free_cpus_mem(partition)
     evictable_partitions = _preemptable_partitions(partition)
@@ -903,7 +907,7 @@ def open_cpu_slots(partition: str) -> int:
         node_cpus = idle_cpus + evictable_tres["cpu"]
         node_mem_MB = free_mem_MB + evictable_tres["mem"]
         node_slots.append(min(node_cpus // config.cpu_train_cpus, node_mem_MB // job_mem_MB))
-    slots = sum(node_slots) - pending_jobs
+    slots = sum(node_slots) + config.cpu_pending_jobs - pending_jobs
     job_tres = {"cpu": config.cpu_train_cpus, "mem": job_mem_MB}
     capped_tres = [key for key in job_tres if key in caps]
     if capped_tres:
@@ -915,33 +919,76 @@ def open_cpu_slots(partition: str) -> int:
     return max(slots, 0)
 
 
-def open_slots(partition: str, cpu_capable: bool = False) -> int:
-    """Training or agent jobs worth submitting to this partition now.
+class LaunchSlots:
+    """The open slots of one orchestration pass, each partition queried at most once and debited per accepted job.
 
-    The primary GPU partition holds buffer_gpus idle GPUs back from GPU-only cases,
-    and cpu_capable_buffer_gpus from cases that can also train on CPU.
-    Every partition but the primary is bounded by the user-wide job budget too.
+    Querying every partition again for every job cost about 2 s per launch in the first apsdpp launch,
+    most of its 7-10 min passes.
+    The primary GPU partition is read once (the GPUs a job could take now and this user's pending jobs there),
+    and both kinds of job draw on that one count:
+    a GPU-only job leaves buffer_gpus GPUs idle and may wait in the queue up to gpu_pending_jobs,
+    a CPU-capable one leaves cpu_capable_buffer_gpus idle and never waits there.
+    Every other partition is read the first time a job may go there,
+    and the user-wide job budget, read once, bounds them all.
+    A failed query gives no slots, so nothing launches there this pass.
     """
-    if partition == config.partition:
-        buffer_gpus = config.cpu_capable_buffer_gpus if cpu_capable else config.buffer_gpus
-        return open_gpu_slots(partition, buffer_gpus)
-    if partition in cpu_partitions():
-        return min(open_cpu_slots(partition), user_job_budget())
-    return min(spillover_budget(), spillover_slots(partition))
 
+    def __init__(self):
+        self._primary_read = False
+        # (GPUs a job could take, this user's pending jobs) of the primary partition, None when a query failed
+        self._primary_counts: tuple[int, int] | None = None
+        # Open slots of every other partition read so far, before this pass's debits and the user-wide budget
+        self._partition_slots: dict[str, int] = {}
+        self._user_job_budget: int | None = None
+        # Jobs SLURM accepted this pass, per partition
+        self._taken: Counter[str] = Counter()
 
-def pick_partition(cpu_capable: bool = False) -> str | None:
-    """Partition the next training or agent job should go to, or None to hold off launching.
+    def _primary_gpu_counts(self) -> tuple[int, int] | None:
+        if not self._primary_read:
+            self._primary_read = True
+            available_gpus = _available_gpus(config.partition)
+            pending_jobs = count_pending_jobs(config.partition)
+            if available_gpus is not None and pending_jobs is not None:
+                self._primary_counts = (available_gpus, pending_jobs)
+        return self._primary_counts
 
-    The first candidate with open slots wins:
-    the primary GPU partition, then the GPU spillover partitions for a GPU-only case,
-    or the CPU partitions in order for a case that can also train on CPU.
-    """
-    fallbacks = cpu_partitions() if cpu_capable else list(config.spillover_partitions)
-    for partition in [config.partition, *fallbacks]:
-        if open_slots(partition, cpu_capable) > 0:
-            return partition
-    return None
+    def available(self, partition: str, cpu_capable: bool = False) -> int:
+        """Training or agent jobs worth submitting to this partition now."""
+        if partition == config.partition:
+            primary_counts = self._primary_gpu_counts()
+            if primary_counts is None:
+                return 0
+            available_gpus, pending_jobs = primary_counts
+            if cpu_capable:
+                slots = max(available_gpus - config.cpu_capable_buffer_gpus, 0) - pending_jobs
+            else:
+                slots = max(available_gpus - config.buffer_gpus, 0) + config.gpu_pending_jobs - pending_jobs
+            return max(slots - self._taken[partition], 0)
+        if partition not in self._partition_slots:
+            self._partition_slots[partition] = open_cpu_slots(partition) if partition in cpu_partitions() else spillover_slots(partition)
+        if self._user_job_budget is None:
+            self._user_job_budget = user_job_budget()
+        taken_off_primary = sum(count for taken_partition, count in self._taken.items() if taken_partition != config.partition)
+        partition_left = self._partition_slots[partition] - self._taken[partition]
+        budget_left = self._user_job_budget - taken_off_primary
+        return max(min(partition_left, budget_left), 0)
+
+    def pick(self, cpu_capable: bool = False) -> str | None:
+        """Partition the next training or agent job should go to, or None to hold off launching.
+
+        The first candidate with open slots wins:
+        the primary GPU partition, then the GPU spillover partitions for a GPU-only case,
+        or the CPU partitions in order for a case that can also train on CPU.
+        """
+        fallbacks = cpu_partitions() if cpu_capable else list(config.spillover_partitions)
+        for partition in [config.partition, *fallbacks]:
+            if self.available(partition, cpu_capable) > 0:
+                return partition
+        return None
+
+    def take(self, partition: str) -> None:
+        """Debit one job SLURM accepted on partition."""
+        self._taken[partition] += 1
 
 
 @_cache_resolved

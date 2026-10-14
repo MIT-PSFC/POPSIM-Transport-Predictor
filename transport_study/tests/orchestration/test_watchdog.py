@@ -7,7 +7,7 @@ Both exist so a case can never be stranded by a job that will not finish:
   queue forever without checkpointing or writing its train log.
 - The pending watchdog (Study._kill_long_pending_jobs) cancels a job stuck
   PENDING on a spillover partition, handing the case back to the launch path
-  so pick_partition can re-decide placement. The primary partition is exempt.
+  so the next pass's LaunchSlots can re-decide placement. The primary partition is exempt.
 """
 
 import os
@@ -30,7 +30,7 @@ from transport_study.orchestration.study import (
     WATCHDOG_STALL_S,
     Study,
 )
-from transport_study.tests.stubs import StubCase
+from transport_study.tests.stubs import StubCase, open_launch_slots
 
 
 @pytest.fixture
@@ -200,7 +200,7 @@ def run_one_pass(monkeypatch, study: Study, pending: dict[str, int] | None) -> S
     monkeypatch.setattr(study_module, "get_running_job_names", lambda: set())
     monkeypatch.setattr(study_module, "get_running_job_elapsed_s", lambda partition=None: {})
     monkeypatch.setattr(study_module, "recent_submitted_jobs", lambda name_prefix, name_suffix: {})
-    monkeypatch.setattr(study_module, "pick_partition", lambda *args, **kwargs: "primary")
+    monkeypatch.setattr(study_module, "LaunchSlots", open_launch_slots("primary"))
     monkeypatch.setattr(study_module.time, "sleep", lambda s: None)
     monkeypatch.setattr(study, "run_case", finish_case)
     study.run_unfinished_cases(skip_tuning=True, enable_parallelism=True)

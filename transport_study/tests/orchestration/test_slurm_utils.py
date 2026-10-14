@@ -9,10 +9,10 @@ import pytest
 from transport_study.config import StudyConfig, load_config
 from transport_study.orchestration import slurm_utils
 from transport_study.orchestration.slurm_utils import (
+    LaunchSlots,
     count_idle_gpus,
     importable_module,
     open_cpu_slots,
-    open_slots,
     parse_slurm_time_s,
     resources_available,
 )
@@ -137,13 +137,42 @@ def test_count_idle_gpus_counts_free_and_preemptable_gpus_on_schedulable_nodes(m
     assert count_idle_gpus("fake_psfc_gpu", 1) == idle_gpus
 
 
-def test_cpu_capable_cases_keep_their_own_gpu_buffer(monkeypatch):
-    """A negative buffer_gpus queues GPU-only jobs past the 3 idle GPUs,
-    while cpu_capable_buffer_gpus keeps the last 3 for them."""
-    _fake_config(partition="fake_psfc_gpu", buffer_gpus=-1, cpu_partition="fake_cpu", cpu_capable_buffer_gpus=3)
+def test_gpu_buffers_share_one_primary_count_read_once_per_pass(monkeypatch):
+    """gpu_pending_jobs queues one GPU-only job past the 3 idle GPUs,
+    while cpu_capable_buffer_gpus keeps the last one for them.
+
+    Both read one count, read once, and every accepted job debits it.
+    """
+    _fake_config(partition="fake_psfc_gpu", buffer_gpus=0, gpu_pending_jobs=1, cpu_partition="fake_cpu", cpu_capable_buffer_gpus=1)
+    slurm_commands: list[list[str]] = []
+
+    def recorded_stdout(cmd):
+        slurm_commands.append(cmd)
+        return _fake_slurm_stdout(cmd)
+
+    _serve_fake_slurm(monkeypatch, recorded_stdout)
+    slots = LaunchSlots()
+    assert slots.available("fake_psfc_gpu") == 4
+    n_commands_first_read = len(slurm_commands)
+
+    assert slots.available("fake_psfc_gpu", cpu_capable=True) == 2
+    slots.take("fake_psfc_gpu")
+    slots.take("fake_psfc_gpu")
+    assert slots.available("fake_psfc_gpu") == 2
+    assert slots.available("fake_psfc_gpu", cpu_capable=True) == 0
+    assert slots.pick() == "fake_psfc_gpu"
+    assert len(slurm_commands) == n_commands_first_read
+
+
+@pytest.mark.parametrize(
+    ("buffer_gpus", "gpu_pending_jobs", "gpu_only_slots"),
+    [(0, 0, 3), (1, 0, 2), (0, 2, 5), (5, 2, 2)],
+)
+def test_gpu_only_slots_are_the_gpus_past_the_buffer_plus_the_queue_allowance(monkeypatch, buffer_gpus, gpu_pending_jobs, gpu_only_slots):
+    """Of 3 available GPUs the buffer leaves some idle, never fewer than none, and gpu_pending_jobs more jobs may wait in the queue."""
+    _fake_config(partition="fake_psfc_gpu", buffer_gpus=buffer_gpus, gpu_pending_jobs=gpu_pending_jobs)
     _serve_fake_slurm(monkeypatch, _fake_slurm_stdout)
-    assert open_slots("fake_psfc_gpu") == 4
-    assert open_slots("fake_psfc_gpu", cpu_capable=True) == 0
+    assert LaunchSlots().available("fake_psfc_gpu") == gpu_only_slots
 
 
 # (node, allocated/idle/other/total CPUs, memory MB, allocated memory MB, state) of a CPU partition
@@ -189,18 +218,22 @@ def _fake_cpu_slurm_stdout(qos_caps: str | None):
 
 # The partition QOS lookups are cached per partition name, so every scenario gets its own partition
 @pytest.mark.parametrize(
-    ("partition", "qos_caps", "slots"),
+    ("partition", "qos_caps", "cpu_pending_jobs", "slots"),
     [
         # 2 + 8 + 1 node slots, less the 1 pending job
-        ("fake_cpu_no_qos", None, 10),
+        ("fake_cpu_no_qos", None, 0, 10),
         # A QOS without MaxTRESPU caps nothing either
-        ("fake_cpu_uncapped", "", 10),
+        ("fake_cpu_uncapped", "", 0, 10),
         # (386G - 3 x 48G) // 48G = 5 jobs of memory left under the QOS cap, CPUs would allow 21
-        ("fake_cpu_capped", "cpu=96,mem=386G", 5),
+        ("fake_cpu_capped", "cpu=96,mem=386G", 0, 5),
+        # 2 more jobs may pend beyond what fits
+        ("fake_cpu_pending_allowance", None, 2, 12),
+        # but never past the QOS cap
+        ("fake_cpu_capped_allowance", "cpu=96,mem=386G", 2, 5),
     ],
 )
-def test_open_cpu_slots_fits_jobs_by_cpus_memory_and_qos(monkeypatch, partition, qos_caps, slots):
-    _fake_config(cpu_partition=partition, cpu_train_cpus=4, train_mem="48G")
+def test_open_cpu_slots_fits_jobs_by_cpus_memory_and_qos(monkeypatch, partition, qos_caps, cpu_pending_jobs, slots):
+    _fake_config(cpu_partition=partition, cpu_train_cpus=4, train_mem="48G", cpu_pending_jobs=cpu_pending_jobs)
     _serve_fake_slurm(monkeypatch, _fake_cpu_slurm_stdout(qos_caps))
     assert open_cpu_slots(partition) == slots
 
@@ -276,7 +309,10 @@ def test_cpu_partitions_keep_the_user_job_budget_without_spillover(monkeypatch):
     """With no GPU spillover configured the user-wide job ceiling still bounds a CPU partition: 10 - 2 - 7 jobs leaves 1."""
     _fake_config(cpu_partition="fake_cpu_budget", max_user_jobs=10, spillover_job_headroom=2, spillover_partitions=(), train_mem="48G")
     _serve_fake_slurm(monkeypatch, _fake_cpu_slurm_stdout(""))
-    assert open_slots("fake_cpu_budget") == 1
+    slots = LaunchSlots()
+    assert slots.available("fake_cpu_budget") == 1
+    slots.take("fake_cpu_budget")
+    assert slots.available("fake_cpu_budget") == 0
 
 
 def test_importable_module_normal():

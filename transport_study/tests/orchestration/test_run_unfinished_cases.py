@@ -23,7 +23,7 @@ from transport_study.orchestration.slurm_utils import (
     SubmittedJob,
 )
 from transport_study.orchestration.study import Study, write_netcdf_atomic
-from transport_study.tests.stubs import StubCase, with_seed_attrs
+from transport_study.tests.stubs import StubCase, open_launch_slots, with_seed_attrs
 
 
 @pytest.fixture
@@ -43,7 +43,7 @@ def fake_clock(monkeypatch):
 def quiet_scheduler(monkeypatch):
     """Neutral SLURM stand-ins: no elapsed jobs, a partition always available, no job sacct knows of."""
     monkeypatch.setattr(study_module, "get_running_job_elapsed_s", lambda partition=None: {})
-    monkeypatch.setattr(study_module, "pick_partition", lambda *args, **kwargs: "test_partition")
+    monkeypatch.setattr(study_module, "LaunchSlots", open_launch_slots("test_partition"))
     monkeypatch.setattr(study_module, "recent_submitted_jobs", lambda name_prefix, name_suffix: {})
     monkeypatch.setattr(slurm_utils, "job_end_states", lambda job_ids: {})
 
@@ -247,7 +247,6 @@ def test_seed_finished_between_two_passes_is_not_relaunched(make_stub_study, mon
     study = make_stub_study([case_a])
     monkeypatch.setattr(study, "check_data_requirements", lambda case: True)
     monkeypatch.setattr(study, "make_train_config", lambda _case: STUB_TRAIN_CONFIG)
-    monkeypatch.setattr(study_module, "count_running_jobs", lambda job_name: 0)
     monkeypatch.setattr(slurm_utils, "job_end_states", lambda job_ids: {7: JobEnd("COMPLETED", 15.0)})
     launches: list[str] = []
 
@@ -285,11 +284,14 @@ def test_gpu_only_cases_take_the_gpu_before_cpu_capable_ones(make_stub_study, mo
     study = make_stub_study([cpu_capable, *gpu_only], partition="gpu", cpu_partition="cpu", cpu_model_types=("cpu_type",))
     gpu_slots = SimpleNamespace(open=1)
 
-    def pick_partition(cpu_capable=False):
-        if gpu_slots.open > 0:
-            gpu_slots.open -= 1
-            return "gpu"
-        return "cpu" if cpu_capable else None
+    class OneGpuPerPass:
+        """LaunchSlots stand-in, the one GPU of a pass taken by the first pick."""
+
+        def pick(self, cpu_capable=False):
+            if gpu_slots.open > 0:
+                gpu_slots.open -= 1
+                return "gpu"
+            return "cpu" if cpu_capable else None
 
     launches: list[tuple[str, str]] = []
 
@@ -300,7 +302,7 @@ def test_gpu_only_cases_take_the_gpu_before_cpu_capable_ones(make_stub_study, mo
         result_path.touch()
         return True
 
-    monkeypatch.setattr(study_module, "pick_partition", pick_partition)
+    monkeypatch.setattr(study_module, "LaunchSlots", OneGpuPerPass)
     monkeypatch.setattr(study_module, "get_running_job_names", lambda: set())
     monkeypatch.setattr(study_module, "get_running_job_elapsed_s", lambda partition=None: {})
     monkeypatch.setattr(study_module, "recent_submitted_jobs", lambda name_prefix, name_suffix: {})

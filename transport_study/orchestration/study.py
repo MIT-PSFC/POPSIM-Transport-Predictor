@@ -77,6 +77,7 @@ from transport_study.orchestration.seed_results import (
     seed_statistics,
 )
 from transport_study.orchestration.slurm_utils import (
+    LaunchSlots,
     SubmittedJob,
     cancel_job,
     count_running_jobs,
@@ -87,9 +88,7 @@ from transport_study.orchestration.slurm_utils import (
     held_job_names,
     launch_agent_parallel,
     launch_train_parallel,
-    open_slots,
     partition_exists,
-    pick_partition,
     recent_submitted_jobs,
 )
 from transport_study.orchestration.target_shots import (
@@ -164,7 +163,7 @@ WATCHDOG_STALL_S = 60 * 60
 AGENT_HEARTBEAT_STALL_S = 10 * 60
 
 # A job parked PENDING on a busy spillover or CPU fallback partition can sit in the queue indefinitely.
-# After this long, cancel it so the orchestration loop re-queues it (pick_partition then re-decides placement).
+# After this long, cancel it so the orchestration loop re-queues it (the next pass's LaunchSlots re-decide placement).
 # Jobs pending on a primary partition keep their queue position,
 # except the jobs of a case that can also train on CPU pending for a GPU
 WATCHDOG_PENDING_S = 30 * 60
@@ -1335,7 +1334,7 @@ class Study:
         That is a GPU spillover or CPU fallback partition, any case's job can pend there
         indefinitely once other users grab the capacity it was placed on,
         and the primary GPU partition for a case that can also train on CPU.
-        Cancelling hands the case back to the normal launch path, where pick_partition re-decides placement.
+        Cancelling hands the case back to the normal launch path, where the next pass's LaunchSlots re-decide placement.
         The primary partitions are otherwise exempt:
         jobs there keep their queue position (and accrued age priority)
         instead of cycling to the back every 30 min. A cancelled pending job
@@ -1409,6 +1408,7 @@ class Study:
             self.submitted_train_jobs.update(previous_train_jobs)
         while unfinished:
             self.refresh_lineage()
+            self._pass_train_configs = {}
             borrowed = [case for case in unfinished if self.is_borrowed(case)]
             local = [case for case in unfinished if not self.is_borrowed(case)]
             if enable_parallelism:
@@ -1460,6 +1460,7 @@ class Study:
             )
 
             if enable_parallelism:
+                self.launch_slots = LaunchSlots()
                 self._launch_ready_cases(to_launch, skip_tuning)
                 # Sleep for a bit before checking again to avoid spamming slurm
                 time.sleep(ORCHESTRATION_POLL_INTERVAL_S)
@@ -1479,23 +1480,24 @@ class Study:
             unfinished = [case for case in unfinished if not self.result_path(case).exists()]
 
     def _launch_ready_cases(self, to_launch: list[tuple[Case, list[int]]], skip_tuning: bool):
-        """Give each ready seed a partition and launch it, the GPU-only cases' seeds first.
+        """Give each ready seed a partition from the pass's launch_slots and launch it, the GPU-only cases' seeds first.
 
         A case that can also train on CPU only takes the primary GPUs the GPU-only cases of this pass leave,
         beyond cpu_capable_buffer_gpus, and the CPU partitions otherwise.
         So it still tries the primary after a GPU-only case found it full, since its GPU buffer may be the smaller one.
         A GPU-only seed finding no partition holds the remaining GPU-only cases until the next pass,
         a CPU-capable one finding none holds every case left.
-        A case that cannot train yet (still tuning, or a job of it in the way) holds its other seeds.
+        A case that cannot train yet (still tuning, or its prereqs unmet) holds its other seeds.
+        The cases still tuning go last, each reads its wandb project (about 20 s) before any training launch could wait on it.
         """
-        launch_order = sorted(to_launch, key=lambda case_seeds: self.trains_on_cpu(case_seeds[0]))
+        launch_order = sorted(to_launch, key=lambda case_seeds: (self._reads_sweep(case_seeds[0]), self.trains_on_cpu(case_seeds[0])))
         gpu_only_held = False
         for case, seeds in launch_order:
             cpu_capable = self.trains_on_cpu(case)
             if gpu_only_held and not cpu_capable:
                 continue
             for seed in seeds:
-                partition = pick_partition(cpu_capable)
+                partition = self.launch_slots.pick(cpu_capable)
                 if partition is None and not cpu_capable:
                     logger.info("No open GPU slots or spillover budget, holding the ready GPU-only cases until the next pass")
                     gpu_only_held = True
@@ -1505,6 +1507,10 @@ class Study:
                     return
                 if not self.run_case(case, seed, skip_tuning=skip_tuning, enable_parallelism=True, partition=partition):
                     break
+
+    def _reads_sweep(self, case: Case) -> bool:
+        """Whether launching the case reads its wandb sweep first, a hyperparam case without its tuned config yet."""
+        return case.is_hyperparam_case() and not self.tuned_config_path(case).exists()
 
     def run_case(
         self,
@@ -1538,14 +1544,11 @@ class Study:
     def _run_ready_case(self, case: Case, seed: int, skip_tuning: bool, enable_parallelism: bool, partition: str | None) -> bool:
         """Launch one seed of a case whose prereqs are satisfied, returns whether the case was ready to train."""
         if enable_parallelism and partition is None:
-            partition = pick_partition(self.trains_on_cpu(case))
+            partition = self.launch_slots.pick(self.trains_on_cpu(case))
             if partition is None:
                 logger.debug("No resources currently available, waiting before trying again...")
                 return False
         if case.is_hyperparam_case() and not self._ensure_hyperparams_ready(case, skip_tuning, enable_parallelism, partition):
-            return False
-        if not self._no_blocking_jobs(case, seed, enable_parallelism):
-            logger.debug(f"Jobs already in flight for seed {seed} of case {case}, waiting before trying again...")
             return False
         logger.opt(colors=True).info(f"<bold><cyan>RUNNING CASE, seed {seed}:</cyan></bold>\n{case}")
         self.launch_train(case, seed, enable_parallelism=enable_parallelism, partition=partition)
@@ -1628,23 +1631,6 @@ class Study:
         with open(tuned_config_path, "w") as f:
             yaml.dump(train_config.model_dump(), f, indent=4)
 
-    def _no_blocking_jobs(self, case: Case, seed: int, enable_parallelism: bool) -> bool:
-        """Returns True if no in-flight SLURM jobs are blocking the seed's training."""
-        if not enable_parallelism:
-            return True
-        for job_name, label in [
-            (self.agent_job_name(case), "agent"),
-            (self.train_job_name(case, seed), "training"),
-        ]:
-            running = count_running_jobs(job_name)
-            if running is None:
-                logger.info(f"Could not query the {label} jobs, holding the launch until the next pass")
-                return False
-            if running > 0:
-                logger.info(f"Found {running} running {label} jobs, waiting for them to complete before proceeding")
-                return False
-        return True
-
     def launch_sweep(
         self,
         case: Case,
@@ -1666,7 +1652,7 @@ class Study:
         outstanding cap the orchestration loop would submit another batch of
         agents every pass until the queue filled, far past what is needed.
 
-        On any other partition the cap is that partition's open slots (open_slots):
+        On any other partition the cap is that partition's open slots in the pass's launch_slots (LaunchSlots.available):
         the remaining per-user GPU allowance of a spillover partition,
         or the CPU jobs that fit on a CPU partition, bounded by the user-wide job ceiling.
         On every partition the sweep keeps at most config.max_running_agents agents running or pending,
@@ -1720,7 +1706,7 @@ class Study:
             outstanding_for_count = config.hyperparam_sweeps - n_completed_runs - running_agents
             outstanding_for_finished = min_finished - n_finished_runs - running_agents
             outstanding_trials = max(outstanding_for_count, outstanding_for_finished)
-            capacity = open_slots(partition, self.trains_on_cpu(case))
+            capacity = self.launch_slots.available(partition, self.trains_on_cpu(case))
             # Keep MIN_RUNNING_AGENTS going (up to capacity) to finish out the sweep,
             # one agent at a time may get pruned.
             # A sweep smaller than that (debug) never runs more agents than it has trials
@@ -1732,7 +1718,7 @@ class Study:
                 return
             logger.info(f"Launching {sweep_jobs} agent job(s) {agent_job_name} on {partition} for case\n{case}")
             for _ in range(sweep_jobs):
-                submitted = launch_agent_parallel(
+                job_id = launch_agent_parallel(
                     train_config,
                     sweep_id,
                     kwargs_agent,
@@ -1740,8 +1726,9 @@ class Study:
                     Path(self.log_dir) / "logs_sweep",
                     partition=partition,
                 )
-                if not submitted:
+                if job_id is None:
                     break
+                self.launch_slots.take(partition)
         else:
             logger.info("Launching agent serially")
             launch_agent(train_config, sweep_id, kwargs_agent=kwargs_agent)
@@ -1755,7 +1742,7 @@ class Study:
         self._require_local(case)
 
         # Only reached when no seed result exists and no job for this seed is
-        # running (see _no_blocking_jobs), so every call is a fresh (re)launch.
+        # in flight or held (see run_unfinished_cases), so every call is a fresh (re)launch.
         # More than MAX_TRAIN_ATTEMPTS launches means the seed fails every time.
         # Exception: a relaunch whose latest checkpoint advanced since the last
         # launch is a resume of a wall-clock-limited job making real progress,
@@ -1783,8 +1770,12 @@ class Study:
 
         logger.opt(colors=True).info(f"<bold><red>LAUNCHING TRAINING for seed {seed} of case\n{case}</red></bold>")
 
-        train_config = self.make_train_config(case)
-        train_config = self._seeded_train_config(train_config, case, seed)
+        # Every seed of a case launched in one pass shares its train config
+        case_train_config = self._pass_train_configs.get(str(case))
+        if case_train_config is None:
+            case_train_config = self.make_train_config(case)
+            self._pass_train_configs[str(case)] = case_train_config
+        train_config = self._seeded_train_config(case_train_config, case, seed)
         seed_result_path = self.seed_result_path(case, seed)
         if enable_parallelism:
             logger.info(f"Launching training job {train_job_name} for case\n{case}")
@@ -1800,6 +1791,7 @@ class Study:
                 self.train_attempts[train_job_name] = attempts
             else:
                 self.submitted_train_jobs[train_job_name] = SubmittedJob(job_id, time.time())
+                self.launch_slots.take(partition)
         else:
             logger.info("Launching training serially")
             trainer, _, _, _, result_dict = launch_train(train_config)
@@ -2136,6 +2128,11 @@ class Study:
         self._next_agent_check: dict[str, float] = {}
         # Every training job this orchestrator submitted (or recalled) by job name, until it is resolved (slurm_utils.held_job_names)
         self.submitted_train_jobs: dict[str, SubmittedJob] = {}
+        # The open slots of the current orchestration pass, debited per accepted job (see _launch_ready_cases).
+        # It queries nothing until a job needs a partition, and every parallel pass starts a fresh one
+        self.launch_slots = LaunchSlots()
+        # make_train_config of every case launched in the current pass, which all its seeds share
+        self._pass_train_configs: dict[str, TrainConfig] = {}
 
         self.working_dir = Path(config.working_dir_base) / self.name
         self.model_dir = self.working_dir / "models"

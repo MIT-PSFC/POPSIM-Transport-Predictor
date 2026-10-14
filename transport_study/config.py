@@ -159,7 +159,11 @@ class StudyConfig(BaseModel):
     # trainer can save the latest checkpoint and exit cleanly, then a resubmitted job
     # resumes from that checkpoint. 27000 s = 7.5 h
     train_wall_budget_s: Orchestration[int] = Field(default_factory=lambda: int(os.environ.get("PTPS_TRAIN_WALL_BUDGET_S", "27000")))
-    buffer_gpus: Orchestration[int | None] = Field(default_factory=lambda: int(os.environ.get("PTPS_BUFFER_GPUS", "12")))
+    # Idle GPUs of the primary partition a GPU-only job leaves for other users and studies
+    buffer_gpus: Orchestration[int] = Field(default_factory=lambda: int(os.environ.get("PTPS_BUFFER_GPUS", "12")), ge=0)
+    # GPU-only jobs allowed to pend on the primary partition beyond its GPUs past buffer_gpus (slurm_utils.LaunchSlots),
+    # so SLURM starts the next one the moment a GPU frees, without waiting for the next orchestration pass
+    gpu_pending_jobs: Orchestration[int] = Field(default_factory=lambda: int(os.environ.get("PTPS_GPU_PENDING_JOBS", "0")), ge=0)
     # SLURM gres GPU type names training and agent jobs may land on.
     # The default keeps float64 TORAX training off cards with slow fp64 pipelines (l40s, a40, l4, rtx_pro_6000).
     # Empty disables the exclusion.
@@ -186,10 +190,14 @@ class StudyConfig(BaseModel):
     # CPUs per CPU training or agent job.
     # XLA's CPU thread pool follows the job's cgroup, and the sequential rollouts barely speed up past 4.
     cpu_train_cpus: Orchestration[int] = Field(default_factory=lambda: int(os.environ.get("PTPS_CPU_TRAIN_CPUS", "4")), ge=1)
-    # Idle primary GPUs a CPU-capable case leaves for GPU-only cases, for this running study or another running in parallel
+    # Idle primary GPUs a CPU-capable case leaves for GPU-only cases, for this running study or another running in parallel.
+    # A CPU-capable job never pends on the primary partition, the CPU partitions take it instead
     cpu_capable_buffer_gpus: Orchestration[int] = Field(
         default_factory=lambda: int(os.environ.get("PTPS_CPU_CAPABLE_BUFFER_GPUS", "0")), ge=0
     )
+    # Jobs allowed to pend on each CPU partition beyond what fits on it now (slurm_utils.open_cpu_slots),
+    # so SLURM refills a freed slot without waiting for the next orchestration pass
+    cpu_pending_jobs: Orchestration[int] = Field(default_factory=lambda: int(os.environ.get("PTPS_CPU_PENDING_JOBS", "0")), ge=0)
     # sbatch --mem of every training and agent job, GPU or CPU.
     # A CPU job also holds the device arrays in host RAM, so size it from the CPU peak.
     train_mem: Orchestration[str] = Field(default_factory=lambda: os.environ.get("PTPS_TRAIN_MEM", "120G"))
