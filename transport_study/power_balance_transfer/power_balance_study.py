@@ -62,13 +62,14 @@ SCALAR_SUBMODULE_SETTINGS = {
 }
 
 # Training batches, shared with the transport study's power balance pseudo-types.
-# Every loader family's batch is set so its steps per epoch match the transport study's 32 (TRANSPORT_BATCH_SIZE),
-# one step clock across the project.
-# Measured 2026-10-13 on the production stores at the sweep maxima (scratch/batch_bench_uniform), on an A100-80GB:
-# Wtot segment batches of 2048 give 33 steps per epoch, the transformer 7.6 s per epoch at 18 GB.
-POWER_BALANCE_BATCH_SIZE = 2048
-# p_oh / p_rad timeslice batches of 98304 give 31 / 34 steps per epoch, under 1 s per epoch at 0.3 GB
-SCALAR_SUBMODULE_BATCH_SIZE = 98304
+# Each loader family's batch sits near the throughput knee of its most expensive model at its sweep maximum,
+# the batch past which the time per sample stops falling.
+# On an A100-80GB: the transformer's time per sample falls 25 percent from 2048 to 4096 and 11 percent more to 8192,
+# where it peaks at 72.6 GB of the 77 GB XLA pool. 4096 keeps the headroom, 16 batches per epoch on the largest set at 36 GB.
+POWER_BALANCE_BATCH_SIZE = 4096
+# p_oh / p_rad: 18 and 15 percent per doubling from 98304, then 6 / 9 percent past 393216, 7 / 8 batches per epoch at 1.3 GB.
+# They should train on CPU, where an epoch takes about as long at any batch, so this only sets their steps per epoch
+SCALAR_SUBMODULE_BATCH_SIZE = 393216
 
 # Fallback loss hyperparameters of every power balance case run without a tuned config,
 # also those of the transport study's power balance pseudo-types (p_oh, p_rad, power_balance)

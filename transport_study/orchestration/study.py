@@ -31,7 +31,7 @@ from popsim.ml.launch import (
 from popsim.ml.train_config import load_dict
 from pydantic import Field, field_serializer, field_validator, model_validator
 
-from transport_study import EPISODE_DIM, PACKAGE_ROOT, TIME_DIM
+from transport_study import PACKAGE_ROOT, TIME_DIM
 from transport_study.config import (
     DEBUG_NUM_SEEDS,
     ROLE_TABLES,
@@ -66,7 +66,6 @@ from transport_study.orchestration.config_lock import (
 from transport_study.orchestration.lineage import StudyArchive
 from transport_study.orchestration.organize_data import (
     TrainingData,
-    get_ds,
     get_loaded_shot_count,
     parse_training_data,
 )
@@ -100,7 +99,6 @@ from transport_study.orchestration.target_shots import (
     TARGET_SHOT_ORDERS,
     TargetSplit,
     configured_target_split,
-    held_out_shot_mask,
 )
 from transport_study.orchestration.wandb_utils import (
     WANDB_READ_ERRORS,
@@ -170,9 +168,9 @@ COLLECT_POLL_INTERVAL_S = 30
 # What the base collect_results reads of a result file, never the predicted and target profiles that make up most of it
 SUMMARY_RESULT_VARS = ["error_abs_shot", "error_rel_shot", "error_abs_ts", "error_rel_ts", "time"]
 
-# Measured steps per epoch of each loader config, kept between runs in the study's working dir.
-# A fresh config lock starts it over (see Study.steps_per_epoch)
-STEPS_PER_EPOCH_FILENAME = "steps_per_epoch.toml"
+# Measured batches per epoch of each loader config, kept between runs in the study's working dir.
+# A fresh config lock starts it over (see Study.batches_per_epoch)
+BATCHES_PER_EPOCH_FILENAME = "batches_per_epoch.toml"
 
 # A training job is considered stuck once it has run at least this long with no progress (e.g. OpenBLAS or XLA compile-pool deadlocks)
 WATCHDOG_MIN_AGE_S = 80 * 60
@@ -211,9 +209,9 @@ def real_timeslice_mask(time_2d: xr.DataArray, time_dim: str = TIME_DIM) -> xr.D
     return time_2d.notnull() & (prev.isnull() | ((time_2d - prev) > PAD_TIME_STEP_S))
 
 
-def recorded_steps_per_epoch(working_dir: Path) -> dict[str, dict]:
-    """The steps per epoch a study recorded in its working dir, by loader config hash (see Study.steps_per_epoch)."""
-    path = working_dir / STEPS_PER_EPOCH_FILENAME
+def recorded_batches_per_epoch(working_dir: Path) -> dict[str, dict]:
+    """The batches per epoch a study recorded in its working dir, by loader config hash (see Study.batches_per_epoch)."""
+    path = working_dir / BATCHES_PER_EPOCH_FILENAME
     if not path.exists():
         return {}
     with open(path, "rb") as f:
@@ -1037,82 +1035,55 @@ class Study:
             }
         )
 
-    @functools.cached_property
-    def target_pool_size(self) -> int:
-        """Target shots outside the test set, the most any case trains on.
+    def batches_per_epoch(self, train_config: TrainConfig) -> int:
+        """The batches in one pass over the training set of this loader config, the case's optimizer steps per epoch.
 
-        Counted on the power balance view of the target, which every study splits on (see target_shots.py).
-        """
-        ds_power_balance = get_ds(config.target_device, "power_balance_transfer")
-        shots = ds_power_balance[EPISODE_DIM].values
-        hazard = ds_power_balance["hazard"].values
-        mask_test = held_out_shot_mask(shots, hazard, configured_target_split(0))
-        return int((~mask_test).sum())
-
-    def steps_per_epoch(self, train_config: TrainConfig) -> int:
-        """The optimizer steps per epoch of every case trained with this loader config.
-
-        It is the natural steps per epoch of the largest training set the locked fields allow:
-        every non-target device's training and validation shots plus the whole target pool.
-        Every case's training set is a subset of it, repeated in reshuffled passes up to steps_per_epoch (trb_utils.CaseTrainDataLoader),
-        so the LR schedule, the validation cadence and the patience count the same steps in every case.
-        Only locked fields enter, so it follows neither the case grid nor the study of a lineage.
-        Measured on the case's final loader config (batch size, segments, variables), so each loader family gets its own.
-
-        A measurement loads every device, so it is recorded in the working dir (STEPS_PER_EPOCH_FILENAME) for later runs.
+        Only the transfer learning rate reads it (_scale_transfer_lr), and a transfer case loads the target device alone.
+        A measurement builds the training loader, so it is recorded in the working dir (BATCHES_PER_EPOCH_FILENAME) for later runs.
         The root-most study of the lineage that recorded it wins, like case_home,
-        so a child trains its own cases with the steps its borrowed cases trained with.
+        so a child trains its own cases with the value its borrowed cases trained with.
         A fresh config lock deletes the record (_open_config_lock), so a reset study measures again.
         """
-        target_split = configured_target_split(self.target_pool_size)
-        dataloader_config_largest = {
-            **train_config.dataloader_config,
-            "training_data": self._hyperparam_training_data(),
-            "domain_adaptation": "addition",
-            **target_split.dataloader_config(),
-            "steps_per_epoch": None,
-        }
         data_trb = get_data_train_run_builder_class(train_config.train_run_builder, train_config.dataloader_config)
-        config_json = json.dumps([str(data_trb), dataloader_config_largest], sort_keys=True, default=str)
+        config_json = json.dumps([str(data_trb), train_config.dataloader_config], sort_keys=True, default=str)
         config_hash = hashlib.sha256(config_json.encode()).hexdigest()
-        if config_hash not in self._steps_per_epoch_cache:
-            recorded = [recorded_steps_per_epoch(archive.working_dir) for archive in reversed(self.archive.chain())]
-            steps_per_epoch = next((record[config_hash]["steps_per_epoch"] for record in recorded if config_hash in record), None)
-            if steps_per_epoch is None:
-                _, train_dl, _, _ = data_trb.get_dataloaders(dataloader_config_largest)
-                steps_per_epoch = len(train_dl)
-                self._record_steps_per_epoch(config_hash, data_trb.__name__, steps_per_epoch)
-                logger.info(f"{steps_per_epoch} training steps per epoch for every case on {data_trb.__name__} loaders of this config")
-            self._steps_per_epoch_cache[config_hash] = steps_per_epoch
-        return self._steps_per_epoch_cache[config_hash]
+        if config_hash not in self._batches_per_epoch_cache:
+            recorded = [recorded_batches_per_epoch(archive.working_dir) for archive in reversed(self.archive.chain())]
+            batches_per_epoch = next((record[config_hash]["batches_per_epoch"] for record in recorded if config_hash in record), None)
+            if batches_per_epoch is None:
+                _, train_dl, _, _ = data_trb.get_dataloaders(train_config.dataloader_config)
+                batches_per_epoch = len(train_dl)
+                self._record_batches_per_epoch(config_hash, data_trb.__name__, batches_per_epoch)
+                logger.info(f"{batches_per_epoch} batches per epoch on {data_trb.__name__} loaders of this config")
+            self._batches_per_epoch_cache[config_hash] = batches_per_epoch
+        return self._batches_per_epoch_cache[config_hash]
 
-    def _record_steps_per_epoch(self, config_hash: str, data_train_run_builder_name: str, steps_per_epoch: int) -> None:
-        recorded = recorded_steps_per_epoch(self.working_dir)
-        recorded[config_hash] = {"data_train_run_builder": data_train_run_builder_name, "steps_per_epoch": steps_per_epoch}
-        write_toml_atomic(self.working_dir / STEPS_PER_EPOCH_FILENAME, recorded)
+    def _record_batches_per_epoch(self, config_hash: str, data_train_run_builder_name: str, batches_per_epoch: int) -> None:
+        recorded = recorded_batches_per_epoch(self.working_dir)
+        recorded[config_hash] = {"data_train_run_builder": data_train_run_builder_name, "batches_per_epoch": batches_per_epoch}
+        write_toml_atomic(self.working_dir / BATCHES_PER_EPOCH_FILENAME, recorded)
 
-    def _scale_target_only_lr(self, train_config: TrainConfig) -> TrainConfig:
-        """lr0 of a case that trains on the target device alone, a transfer finetune or an exnihilo case.
+    def _scale_transfer_lr(self, train_config: TrainConfig) -> TrainConfig:
+        """lr0 of a transfer finetune, the tuned lr0 / sqrt(its own batches per epoch).
 
-        Tuned learning rates were swept on the source devices.
-        A target-only case cycles its few target shots through all of the study's steps per epoch (CaseTrainDataLoader),
-        so it trains at lr0 / (2 x steps_per_epoch), each epoch moving the weights about half a step at the tuned lr0.
+        Tuned learning rates were swept on the source devices, a finetune trains the last layers of a pretrained model.
+        Every set under one batch trains only one step per epoch, so it keeps the tuned lr0.
         The tuned schedule is kept, only its scale changes.
 
         Applied after the tuned-config merge so the swept optimizer_config cannot overwrite it.
         """
-        steps_per_epoch = train_config.dataloader_config["steps_per_epoch"]
-        lr0_target_only = train_config.optimizer_config["lr0"] / (2 * steps_per_epoch)
-        logger.info(f"Target-only lr0 {lr0_target_only:.3g}, the tuned lr0 / (2 x {steps_per_epoch} steps per epoch)")
-        optimizer_config = {**train_config.optimizer_config, "lr0": lr0_target_only}
+        batches_per_epoch = self.batches_per_epoch(train_config)
+        lr0_transfer = train_config.optimizer_config["lr0"] / math.sqrt(batches_per_epoch)
+        logger.info(f"Transfer lr0 {lr0_transfer:.3g}, the tuned lr0 / sqrt({batches_per_epoch} batches per epoch)")
+        optimizer_config = {**train_config.optimizer_config, "lr0": lr0_transfer}
         return train_config.model_copy(update={"optimizer_config": optimizer_config})
 
     def make_train_config(self, case: Case) -> TrainConfig:
         """Make the TrainConfig for a given case.
 
-        Builds the shared scaffold (dataloader/loss/optimizer bases, weighted
-        device weights, transfer checkpoint wiring, tuned-config merge,
-        the study's training steps per epoch, target-only LR scaling)
+        Builds the shared scaffold
+        (dataloader/loss/optimizer bases, weighted device weights,
+        transfer checkpoint wiring, tuned-config merge, transfer LR scaling)
         around the per-model-type pieces supplied by the model_train_spec hook.
         """
         dataloader_config_case = self.base_dataloader_config(case)
@@ -1165,15 +1136,10 @@ class Study:
         if case.model_size != BASE_MODEL_SIZE:
             train_config = self._apply_model_size(case, train_config)
 
-        # Every case trains the same steps per epoch, measured on the final loader config (see steps_per_epoch)
-        steps_per_epoch = self.steps_per_epoch(train_config)
-        dataloader_config = {**train_config.dataloader_config, "steps_per_epoch": steps_per_epoch}
-        train_config = train_config.model_copy(update={"dataloader_config": dataloader_config})
-
-        # A case that trains on the target alone gets a reduced lr0 (see _scale_target_only_lr).
+        # A transfer finetune gets a reduced lr0 (see _scale_transfer_lr), exnihilo keeps the tuned one.
         # Applied after the tuned-config merge so the swept optimizer_config cannot overwrite it
-        if case.domain_adaptation == "transfer" or case.training_data.exnihilo:
-            train_config = self._scale_target_only_lr(train_config)
+        if case.domain_adaptation == "transfer":
+            train_config = self._scale_transfer_lr(train_config)
 
         return train_config
 
@@ -2209,9 +2175,9 @@ class Study:
         # Latest-checkpoint epoch per seed (train job name) as of its last launch.
         # A relaunch whose checkpoint advanced past this is a resume making progress, not a failure
         self.train_attempt_epochs: dict[str, int | None] = {}
-        # Measured steps per epoch per largest-training-set loader config,
-        # so repeated make_train_config calls do not reread the records (see steps_per_epoch)
-        self._steps_per_epoch_cache: dict[str, int] = {}
+        # Measured batches per epoch per loader config,
+        # so repeated make_train_config calls do not reread the records (see batches_per_epoch)
+        self._batches_per_epoch_cache: dict[str, int] = {}
         # get_loaded_shot_count per (device, study type), read by make_weighted_device_weights
         self._loaded_shot_counts: dict[tuple[str, str], int] = {}
         # training_loss_statistics per training-data selection
@@ -2286,8 +2252,8 @@ class Study:
                 parent_stamp=parent.stamp if parent is not None else None,
             )
             write_config_lock(lock_path, lock)
-            # Steps per epoch recorded under an earlier setup or dataset do not carry over to a fresh lock
-            (self.working_dir / STEPS_PER_EPOCH_FILENAME).unlink(missing_ok=True)
+            # Batch counts recorded under an earlier setup or dataset do not carry over to a fresh lock
+            (self.working_dir / BATCHES_PER_EPOCH_FILENAME).unlink(missing_ok=True)
             return lock
 
         lock = read_config_lock(lock_path, config.get_instance(), self.STUDY_TYPE)

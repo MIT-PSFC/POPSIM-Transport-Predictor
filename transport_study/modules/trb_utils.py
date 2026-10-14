@@ -662,58 +662,28 @@ def prepared_for_dataloader(ds: xr.Dataset) -> xr.Dataset:
 
 
 class CaseTrainDataLoader(DataLoader):
-    """Every case's training DataLoader, each epoch exactly steps_per_epoch batches of the natural loader's batch size.
+    """Every case's training DataLoader, one epoch one pass over the case's own training set.
 
-    Every case of a study trains the same steps per epoch (Study.steps_per_epoch),
-    so the LR schedule, the validation cadence and the patience count the same optimizer steps
-    whatever the size of the case's training set.
-    An epoch chains reshuffled passes over the samples until steps_per_epoch batches are out,
-    and the rest of its last pass is dropped.
-    A steps_per_epoch of None keeps one natural pass per epoch, as Study.steps_per_epoch builds it to measure that length.
-    shuffle_seed keys the reshuffles, each seed of a case draws its own (Study.launch_train).
-
+    shuffle_seed keys the shuffle of every pass, each seed of a case draws its own (Study.launch_train).
     It also carries normalizer_fit_ds, the dataset model_init fits its normalizer statistics on (see normalizer_fit_dataset),
     its own samples unless resolve_case_datasets returned a separate fit set.
     """
 
-    def __init__(self, train_dl: DataLoader, steps_per_epoch: int | None, shuffle_seed: int, normalizer_fit_ds: xr.Dataset | None = None):
-        n_batches_natural = len(train_dl)
-        # Without a batch an epoch never ends, __iter__ would loop until the watchdog kills the job
-        if n_batches_natural == 0:
+    def __init__(self, train_dl: DataLoader, shuffle_seed: int, normalizer_fit_ds: xr.Dataset | None = None):
+        # Without a batch an epoch trains nothing
+        if len(train_dl) == 0:
             raise ValueError("The training set holds no samples (every target NaN, e.g. no fresh timeslice of fresh_var, or no shots)")
-        if steps_per_epoch is not None and n_batches_natural > steps_per_epoch:
-            raise ValueError(
-                f"One pass over this training set is {n_batches_natural} batches, more than the study's {steps_per_epoch} steps per epoch, "
-                "which come from the largest training set its locked fields allow"
-            )
         super().__init__(
             train_dl.dataset,
             batch_size=train_dl.batch_size,
             shuffle=train_dl.shuffle,
             drop_last=train_dl.drop_last,
             pad_last=train_dl.pad_last,
+            fill_last=train_dl.fill_last,
             key=jax.random.key(shuffle_seed),
             generate_prng=train_dl.generate_prng,
         )
-        self.steps_per_epoch = steps_per_epoch
         self.normalizer_fit_ds = self.ds if normalizer_fit_ds is None else normalizer_fit_ds
-
-    def __len__(self) -> int:
-        if self.steps_per_epoch is None:
-            return super().__len__()
-        return self.steps_per_epoch
-
-    def __iter__(self):
-        if self.steps_per_epoch is None:
-            yield from super().__iter__()
-            return
-        n_batches = 0
-        while True:
-            for batch in super().__iter__():
-                yield batch
-                n_batches += 1
-                if n_batches == self.steps_per_epoch:
-                    return
 
 
 def module_build_config(model_init_config: dict) -> dict:
@@ -818,10 +788,13 @@ def get_time_dep_dataloaders(
             **common,
             batch_size=dataloader_config["batch_size"],
             shuffle=[True, False, False],
-            drop_last=[True, False, False],
+            # Every loader keeps one compiled shape.
+            # Training fills its ragged final batch with samples drawn from the rest of the epoch,
+            # evaluation pads it and trims the duplicates
             pad_last=[False, True, True],
+            fill_last=[True, False, False],
         )
-    train_dl = CaseTrainDataLoader(train_dl, dataloader_config["steps_per_epoch"], dataloader_config["shuffle_seed"], normalizer_fit_ds)
+    train_dl = CaseTrainDataLoader(train_dl, dataloader_config["shuffle_seed"], normalizer_fit_ds)
     return ds_val, train_dl, val_dl, test_dl
 
 
@@ -851,11 +824,10 @@ def time_dep_train_loader_kwargs(dataloader_config: dict, input_vars: list[str])
         # while the partial segments at a shot's end are forward-filled with epsilon-padded times and kept
         "nan_handling": "drop_segment",
         # Keep every batch the same shape so the jitted train step never
-        # retraces on a ragged final batch (whose static xr metadata is not
-        # comparable across calls). The ragged tail is dropped,
-        # reshuffled every epoch, so no data is permanently lost
-        "drop_last": True,
-        "pad_last": False,
+        # retraces on a ragged final batch (whose static xr metadata is not comparable across calls).
+        # The ragged final batch is filled with segments drawn from the rest of the epoch,
+        # so every epoch trains on every segment once
+        "fill_last": True,
     }
 
 
@@ -928,8 +900,7 @@ def segmented_train_dataloader(train_parts: list[xr.Dataset | None], loader_kwar
         XarrayPreppedDataset(merged_samples, training_metadata),
         batch_size=loader_kwargs["batch_size"],
         shuffle=loader_kwargs["shuffle"],
-        drop_last=loader_kwargs["drop_last"],
-        pad_last=loader_kwargs["pad_last"],
+        fill_last=loader_kwargs["fill_last"],
     )
 
 

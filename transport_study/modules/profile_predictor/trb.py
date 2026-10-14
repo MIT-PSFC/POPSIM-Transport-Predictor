@@ -119,12 +119,12 @@ class ProfilePredictorTRB(TrainRunBuilder):
             convert_xr_to_jnp=False,  # Needed to keep the coords for calculating loss
             # Keep every batch the same shape to avoid an extra XLA compilation
             # for the final partial batch, which is expensive for TORAX models.
-            # Train drops the ragged tail (reshuffled every epoch, so no data is
-            # permanently lost), val pads it and consumers trim the duplicates.
-            drop_last=[True, False],
+            # Training fills its ragged final batch with samples drawn from the rest of the epoch,
+            # validation pads it and its consumers trim the duplicates.
             pad_last=[False, True],
+            fill_last=[True, False],
         )
-        train_dl = CaseTrainDataLoader(train_dl, dataloader_config["steps_per_epoch"], dataloader_config["shuffle_seed"], normalizer_fit_ds)
+        train_dl = CaseTrainDataLoader(train_dl, dataloader_config["shuffle_seed"], normalizer_fit_ds)
         # The validation set doubles as the test set (see resolve_case_datasets)
         return ds_val, train_dl, val_dl, val_dl
 

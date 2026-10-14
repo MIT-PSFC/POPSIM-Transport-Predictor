@@ -69,9 +69,9 @@ STUDY_MODEL_TYPES = (*MODEL_TYPES_WITH_SHAPES, *MODEL_TYPES_WITHOUT_SHAPES)
 PROFILE_INPUT_VARS = list(NN_INPUT_SOURCE_VARS)
 
 # Timeslice batch, shared with the transport study's profile pseudo-type,
-# set so the profile loaders train the transport study's 32 steps per epoch (TRANSPORT_BATCH_SIZE).
-# Measured 2026-10-13 on the production stores at the sweep maxima (scratch/batch_bench_uniform), on an A100-80GB:
-# 8192 gives 31 steps per epoch, torax-qlknn 24 s and torax-gyrobohm 8.7 s per epoch at 7.2 GB (39 and 21 s at 2048).
+# at the throughput knee of torax-qlknn, the most expensive profile model, at its sweep maximum.
+# On an A100-80GB: past 8192 its time per sample falls only 7, 4 and 3 percent per doubling.
+# 8192 gives 31 batches per epoch on the largest set, torax-qlknn 23.5 s and torax-gyrobohm 8.6 s per epoch at 7.2 GB.
 PROFILE_BATCH_SIZE = 8192
 
 # What collect_results reads of a result file
