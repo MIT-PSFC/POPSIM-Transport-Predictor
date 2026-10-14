@@ -51,9 +51,9 @@ def study(request):
 
 def test_locked_field_change_is_refused(study, tmp_path):
     """max_epochs changes what every case produces under an unchanged name, so a rerun with a new value must stop."""
-    build_study(study, make_config(study, tmp_path, max_epochs=500))
+    build_study(study, make_config(study, tmp_path, max_epochs=500, finetune_max_epochs=500))
     with pytest.raises(RuntimeError, match="max_epochs"):
-        build_study(study, make_config(study, tmp_path, max_epochs=400))
+        build_study(study, make_config(study, tmp_path, max_epochs=400, finetune_max_epochs=500))
 
 
 def test_case_axis_change_is_accepted_and_recorded(study, tmp_path):

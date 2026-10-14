@@ -9,6 +9,7 @@ from typing import Any
 
 import numpy as np
 import pytest
+from popsim.ml.launch import resolve_transition_frac
 
 from transport_study import EPISODE_DIM
 from transport_study.config import config
@@ -25,7 +26,9 @@ from transport_study.power_balance_transfer.power_balance_study import PowerBala
 STATELESS_NORMALIZATIONS = ("raw", "physics")
 
 
-def _study(store_paths: dict, working_dir_base, target_test_set_size: int, num_target_shots_options: tuple[int, ...]) -> PowerBalanceStudy:
+def _study(
+    store_paths: dict, working_dir_base, target_test_set_size: int, num_target_shots_options: tuple[int, ...], **config_overrides
+) -> PowerBalanceStudy:
     """cmod the source and mast the target, of the 3 synthetic target shots target_test_set_size held out for testing."""
     return PowerBalanceStudy(
         PowerBalanceStudy.Config(
@@ -39,6 +42,7 @@ def _study(store_paths: dict, working_dir_base, target_test_set_size: int, num_t
             model_types=("mlp", "sciml-taue-nn"),
             data_normalization_methods=("physics", "coral"),
             num_target_shots_options=num_target_shots_options,
+            **config_overrides,
         )
     )
 
@@ -161,6 +165,42 @@ def test_finetune_restores_twin_and_scales_lr0_by_the_historic_batches(synthetic
     assert finetune_config.optimizer_config["lr0"] == pytest.approx(base_lr0 / np.sqrt(batches_per_epoch))
     # Every other optimizer setting, the schedule's among them, stays tuned
     assert {**finetune_config.optimizer_config, "lr0": base_lr0} == base_optimizer_config
+
+
+def test_finetune_stage_trains_longer_on_the_production_decay(synthetic_device_stores, tmp_path, monkeypatch):
+    """An exnihilo case trains finetune_max_epochs with finetune_patience, its learning rate decaying as a max_epochs run does.
+
+    The transfer pretrain twin trains max_epochs with patience on the tuned transition_frac, like every case outside the finetune stage.
+    """
+    study = _study(
+        synthetic_device_stores,
+        tmp_path,
+        target_test_set_size=1,
+        num_target_shots_options=(1,),
+        max_epochs=120,
+        patience=10,
+        finetune_max_epochs=480,
+        finetune_patience=160,
+    )
+    # A tuned schedule, its decay a fraction of the run, in place of the base config's absolute transition_steps
+    optimizer_config_tuned = {key: value for key, value in study.base_optimizer_config().items() if key != "transition_steps"}
+    optimizer_config_tuned["transition_frac"] = 0.5
+    monkeypatch.setattr(
+        study,
+        "_apply_tuned_config",
+        lambda case, train_config_base: train_config_base.model_copy(update={"optimizer_config": optimizer_config_tuned}),
+    )
+
+    exnihilo_config = study.make_train_config(_case(training_data="exnihilo", domain_adaptation=None))
+    twin_config = study.make_train_config(_case().transfer_pretrain_case())
+
+    assert (exnihilo_config.max_epochs, exnihilo_config.patience) == (480, 160)
+    assert (twin_config.max_epochs, twin_config.patience) == (120, 10)
+    assert twin_config.optimizer_config == optimizer_config_tuned
+    steps_per_epoch = 3
+    exnihilo_schedule = resolve_transition_frac(exnihilo_config.optimizer_config, steps_per_epoch, exnihilo_config.max_epochs)
+    twin_schedule = resolve_transition_frac(twin_config.optimizer_config, steps_per_epoch, twin_config.max_epochs)
+    assert exnihilo_schedule == twin_schedule
 
 
 def test_zero_shot_pretrain_datasets(study):

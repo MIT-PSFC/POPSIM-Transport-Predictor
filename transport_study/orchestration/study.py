@@ -557,6 +557,11 @@ class Study:
             """The input normalization method this case trains with, None when the study has none."""
             return None
 
+        @property
+        def trains_on_target_only(self) -> bool:
+            """A transfer finetune or an exnihilo case, the finetune stage, which trains on the target shots alone."""
+            return self.domain_adaptation == "transfer" or self.training_data.exnihilo
+
         def transfer_pretrain_case(self) -> Study.Case:
             """The pretrain prereq case this transfer case fine-tunes from.
 
@@ -628,7 +633,7 @@ class Study:
         def is_impossible(self) -> bool:
             """Some cases don't make sense to run. Mark those cases as impossible and raise an error if we try to run them."""
             # Can't do transfer learning or training from nothing with 0 target shots.
-            if (self.domain_adaptation == "transfer" or self.training_data.exnihilo) and self.num_target_shots == 0:
+            if self.trains_on_target_only and self.num_target_shots == 0:
                 return True
 
             # exnihilo means training from nothing - no source domain to adapt from
@@ -1089,12 +1094,29 @@ class Study:
         optimizer_config = {**train_config.optimizer_config, "lr0": lr0_transfer}
         return train_config.model_copy(update={"optimizer_config": optimizer_config})
 
+    @staticmethod
+    def _extend_finetune_budget(train_config: TrainConfig) -> TrainConfig:
+        """The finetune stage's epochs and patience, on the learning-rate decay of a max_epochs run.
+
+        popsim resolves transition_frac against the run's own epochs (resolve_transition_frac),
+        so scaling it by max_epochs / finetune_max_epochs keeps the decay of every other production run,
+        and the epochs past max_epochs train on its decayed tail.
+        An absolute transition_steps (the untuned base config) keeps it already.
+        """
+        optimizer_config = dict(train_config.optimizer_config)
+        if "transition_frac" in optimizer_config:
+            horizon_ratio = config.max_epochs / config.finetune_max_epochs
+            optimizer_config["transition_frac"] = optimizer_config["transition_frac"] * horizon_ratio
+        return train_config.model_copy(
+            update={"max_epochs": config.finetune_max_epochs, "patience": config.finetune_patience, "optimizer_config": optimizer_config}
+        )
+
     def make_train_config(self, case: Case) -> TrainConfig:
         """Make the TrainConfig for a given case.
 
         Builds the shared scaffold
         (dataloader/loss/optimizer bases, weighted device weights,
-        transfer checkpoint wiring, tuned-config merge, transfer LR scaling)
+        transfer checkpoint wiring, tuned-config merge, transfer LR scaling, the finetune stage's epochs)
         around the per-model-type pieces supplied by the model_train_spec hook.
         """
         dataloader_config_case = self.base_dataloader_config(case)
@@ -1151,6 +1173,8 @@ class Study:
         # Applied after the tuned-config merge so the swept optimizer_config cannot overwrite it
         if case.domain_adaptation == "transfer":
             train_config = self._scale_transfer_lr(case, train_config)
+        if case.trains_on_target_only:
+            train_config = self._extend_finetune_budget(train_config)
 
         return train_config
 

@@ -134,6 +134,12 @@ class StudyConfig(BaseModel):
     max_epochs: int = 120
     epochs_per_val: int = 1
     patience: int = 10  # epochs_per_val * patience = max epochs without improvement before stopping
+    # Epochs and patience of the finetune stage, the transfer finetunes and exnihilo cases that train on the target shots alone.
+    # An epoch of a target-only set is one or a few optimizer steps, so these run longer than every other case.
+    # Their learning-rate decay stays that of a max_epochs run (Study._extend_finetune_budget),
+    # so the epochs past max_epochs train on its decayed tail
+    finetune_max_epochs: int = 240
+    finetune_patience: int = 20
     # Epoch cap for hyperparameter sweep trials and agent jobs
     # Trials are wall-clock limited to train_wall_budget_s and stop early via patience
     # Capped below max_epochs so sweep trials stay cheap.
@@ -236,6 +242,13 @@ class StudyConfig(BaseModel):
         return tuple(gpu_type.lower() for gpu_type in gpu_types)
 
     @model_validator(mode="after")
+    def _check_finetune_max_epochs(self):
+        """The finetune stage trains at least max_epochs, so a TOML raising max_epochs has to set finetune_max_epochs too."""
+        if self.finetune_max_epochs < self.max_epochs:
+            raise ValueError(f"finetune_max_epochs {self.finetune_max_epochs} is below max_epochs {self.max_epochs}")
+        return self
+
+    @model_validator(mode="after")
     def _check_cpu_partitions(self):
         """CPU training needs a CPU partition, and no partition may serve both devices, since submission picks the device by partition.
 
@@ -265,6 +278,7 @@ class StudyConfig(BaseModel):
         """Cap the epochs, the validation interval, the sweep size and the sweep poll interval of a debug run (get_ds caps the source shots)."""
         if self.debug:
             object.__setattr__(self, "max_epochs", min(self.max_epochs, DEBUG_MAX_EPOCHS))
+            object.__setattr__(self, "finetune_max_epochs", min(self.finetune_max_epochs, DEBUG_MAX_EPOCHS))
             object.__setattr__(self, "hyperparam_max_epochs", min(self.hyperparam_max_epochs, DEBUG_MAX_EPOCHS))
             object.__setattr__(self, "epochs_per_val", min(self.epochs_per_val, DEBUG_EPOCHS_PER_VAL))
             object.__setattr__(self, "hyperparam_sweeps", min(self.hyperparam_sweeps, DEBUG_HYPERPARAM_SWEEPS))

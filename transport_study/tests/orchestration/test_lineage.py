@@ -134,9 +134,9 @@ def test_reset_ancestor_stops_every_descendant(tmp_path):
 
 
 def test_locked_field_mismatch_with_parent_is_refused(tmp_path):
-    build(make_config(tmp_path, "primary", max_epochs=500))
+    build(make_config(tmp_path, "primary", max_epochs=500, finetune_max_epochs=500))
     with pytest.raises(RuntimeError, match="max_epochs"):
-        build(make_config(tmp_path, "secondary", parent_study="primary", max_epochs=400))
+        build(make_config(tmp_path, "secondary", parent_study="primary", max_epochs=400, finetune_max_epochs=500))
 
 
 def test_ancestor_grid_growing_over_a_trained_case_is_a_conflict(tmp_path):
