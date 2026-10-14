@@ -268,7 +268,7 @@ class PowerBalance(TimeDepModule):
         at the Wtot floor so the raw state cannot run away to large negative values.
         The clamp is the same physical prior for all model types:
         the structured models can otherwise emit unbounded dW/dt
-        (P_cond at the tau_e floor, the unbounded softplus P_oh/P_rad submodules).
+        (P_cond at the tau_e floor, the unbounded leaky softplus P_oh/P_rad submodules).
         """
         width = BOUND_CLAMP_WIDTH_FRAC * (MAX_POWER - MIN_POWER)
         bounded = smooth_clamp(wtot_mj_dot, MIN_POWER, MAX_POWER, width, width)
