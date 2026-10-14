@@ -13,6 +13,7 @@ from popsim.ml import TrainConfig
 
 from transport_study.config import StudyConfig, load_config
 from transport_study.orchestration import slurm_utils
+from transport_study.tests.stubs import StubCase
 
 
 @pytest.fixture
@@ -111,3 +112,17 @@ def test_cpu_partition_job_requests_cpus_and_no_gpu(tmp_path, train_config, subm
     assert "export JAX_PLATFORMS=cpu" in script
     assert "#SBATCH --cpus-per-task=8" in script
     assert "#SBATCH --mem=48G" in script
+
+
+def test_collect_results_job_script_compiles_and_asks_for_its_cpus(make_stub_study, submitted_scripts):
+    """The collection job reads on one process per CPU, so it asks for that many."""
+    study = make_stub_study([StubCase(name="case.a")], partition="fake_partition")
+
+    slurm_utils.launch_collect_results_job(study, cpus=16)
+
+    (script,) = submitted_scripts
+    assert "#SBATCH --cpus-per-task=16" in script
+    assert "export JAX_PLATFORMS=cpu" in script
+    collect_scripts = list((study.working_dir / "logs" / "logs_collect").glob(f"{study.collect_job_name()}_*.py"))
+    assert len(collect_scripts) == 1
+    assert_script_valid(collect_scripts[0])

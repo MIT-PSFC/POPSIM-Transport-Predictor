@@ -1312,6 +1312,48 @@ Path({str(study_config_path)!r}).unlink()
     return _submit_training_job(job_name, partition, time_limit, log_path, script_path, "\n", "agent")
 
 
+def launch_collect_results_job(study, cpus: int) -> int | None:
+    """Submit a CPU SLURM job writing the study's collected_results.nc (Study.collect_results), returns the accepted job id or None.
+
+    It reads the result files on one process per CPU (study.map_result_files), the reads are I/O bound.
+    It goes to config.analysis_partition when set (config.partition otherwise) and writes nothing when no case has a result.
+    """
+    partition = config.analysis_partition or config.partition
+    log_dir = study.working_dir / "logs" / "logs_collect"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    job_name = study.collect_job_name()
+
+    # This runs in a fresh process, so the global transport_study.config singleton isn't loaded there.
+    # The study class reloads it from this TOML
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".toml", delete=False, prefix=f"{job_name}_study_config_", dir=log_dir) as f:
+        study_config_path = f.name
+    config.save(Path(study_config_path))
+
+    study_cls = type(study)
+    py_script = f"""\
+from pathlib import Path
+from {importable_module(study_cls)} import {study_cls.__name__}
+from transport_study.orchestration.study import write_netcdf_atomic
+
+study = {study_cls.__name__}(Path({study_config_path!r}))
+collected_results = study.collect_results()
+if collected_results.data_vars:
+    write_netcdf_atomic(collected_results, study.collected_results_path())
+Path({study_config_path!r}).unlink()
+"""
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False, prefix=f"{job_name}_", dir=log_dir) as f:
+        f.write(py_script)
+        script_path = f.name
+    log_path = log_dir / f"{job_name}.log"
+
+    setup = f"""\
+echo "=== $(date) job $SLURM_JOB_ID ({job_name}) start on $SLURMD_NODENAME ==="
+{CPU_JOB_ENV}"""
+    time_limit = clamp_time_limit(partition, config.analysis_time_limit)
+    script = sbatch_script(job_name, partition, time_limit, log_path, script_path, setup, mem=config.analysis_mem, cpus=cpus)
+    return submit_sbatch(script, job_name, "collection")
+
+
 def launch_case_analysis_parallel(study, case) -> int | None:
     """Submit a CPU SLURM job computing one case's stage metrics and case report, returns the accepted job id or None.
 

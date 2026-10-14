@@ -41,6 +41,7 @@ from transport_study.orchestration.study import (
     CaseGridConfig,
     ModelTrainSpec,
     Study,
+    map_result_files,
 )
 from transport_study.orchestration.target_shots import BASE_TARGET_SHOT_ORDER
 from transport_study.profile_transfer.case_reports import torax_relaxation_report
@@ -85,6 +86,38 @@ PROFILE_SUMMARY_RESULT_VARS = [
     "error_rel_ts",
     "ds_source",
 ]
+
+
+def profile_shot_summaries(result_path: Path) -> dict[str, np.ndarray]:
+    """The per-shot error summaries of one profile case result file, each a seed mean (ProfileStudy.collect_results).
+
+    A map_result_files reader, with the shot ids and ds_source beside the summaries.
+    It reads the error variables alone, never the predicted and target profiles that make up most of the file.
+    """
+    with xr.open_dataset(result_path) as ds_result:
+        ds = ds_result[PROFILE_SUMMARY_RESULT_VARS].load()
+    # Reduce per-timeslice errors to per-shot summaries (worst and mean timeslice) of each seed,
+    # then take their seed mean
+    err_abs_ts = ds["error_abs_ts"]
+    err_rel_ts = ds["error_rel_ts"]
+    per_shot_per_seed = {
+        "err_abs_shot": ds["error_abs_shot"],
+        "err_rel_shot": ds["error_rel_shot"],
+        "ne_err_abs_shot": ds["ne_error_abs_shot"],
+        "te_err_abs_shot": ds["te_error_abs_shot"],
+        "ne_err_rel_shot": ds["ne_error_rel_shot"],
+        "te_err_rel_shot": ds["te_error_rel_shot"],
+        "err_abs_ts_max": err_abs_ts.max(TIME_DIM, skipna=True),
+        "err_rel_ts_max": err_rel_ts.max(TIME_DIM, skipna=True),
+        "err_abs_ts_mean": err_abs_ts.mean(TIME_DIM, skipna=True),
+        "err_rel_ts_mean": err_rel_ts.mean(TIME_DIM, skipna=True),
+    }
+    per_shot = {name: per_seed.mean(SEED_DIM).values for name, per_seed in per_shot_per_seed.items()}
+    best_err_abs_ts = err_abs_ts.sel({SEED_DIM: int(ds.attrs[BEST_SEED_ATTR])})
+    per_shot["n_valid_ts"] = best_err_abs_ts.notnull().sum(TIME_DIM).values
+    per_shot["shot"] = ds["shot"].values
+    per_shot["ds_source"] = ds["ds_source"].values
+    return per_shot
 
 
 class ProfileStudy(Study):
@@ -393,46 +426,17 @@ class ProfileStudy(Study):
             "n_valid_ts",
         ]
 
+        finished_cases = [(case_idx, case) for case_idx, case in enumerate(self.cases) if self.result_path(case).exists()]
+        result_paths = [self.result_path(case) for _, case in finished_cases]
+        shot_summaries = map_result_files(profile_shot_summaries, result_paths)
         records: list[dict] = []
-        for case_idx, case in enumerate(self.cases):
-            result_path = self.result_path(case)
-            if not result_path.exists():
-                continue
-
-            # The error variables alone, never the predicted and target profiles that make up most of the file
-            with xr.open_dataset(result_path) as ds_result:
-                ds = ds_result[PROFILE_SUMMARY_RESULT_VARS].load()
-
-            # Reduce per-timeslice errors to per-shot summaries (worst and mean timeslice) of each seed,
-            # then take their seed mean
-            err_abs_ts = ds["error_abs_ts"]
-            err_rel_ts = ds["error_rel_ts"]
-            per_shot_per_seed = {
-                "err_abs_shot": ds["error_abs_shot"],
-                "err_rel_shot": ds["error_rel_shot"],
-                "ne_err_abs_shot": ds["ne_error_abs_shot"],
-                "te_err_abs_shot": ds["te_error_abs_shot"],
-                "ne_err_rel_shot": ds["ne_error_rel_shot"],
-                "te_err_rel_shot": ds["te_error_rel_shot"],
-                "err_abs_ts_max": err_abs_ts.max(TIME_DIM, skipna=True),
-                "err_rel_ts_max": err_rel_ts.max(TIME_DIM, skipna=True),
-                "err_abs_ts_mean": err_abs_ts.mean(TIME_DIM, skipna=True),
-                "err_rel_ts_mean": err_rel_ts.mean(TIME_DIM, skipna=True),
-            }
-            per_shot = {name: per_seed.mean(SEED_DIM).values for name, per_seed in per_shot_per_seed.items()}
-            best_err_abs_ts = err_abs_ts.sel({SEED_DIM: int(ds.attrs[BEST_SEED_ATTR])})
-            per_shot["n_valid_ts"] = best_err_abs_ts.notnull().sum(TIME_DIM).values
-
-            shot_ids = ds["shot"].values
-            n_shots = len(shot_ids)
-            ds_source = ds["ds_source"].values
+        for (case_idx, case), per_shot in zip(finished_cases, shot_summaries, strict=True):
             case_coords = self.case_coords(case_idx, case)
-
-            for i in range(n_shots):
+            for i in range(len(per_shot["shot"])):
                 record = {name: per_shot[name][i] for name in data_var_names}
                 record.update(case_coords)
-                record["shot"] = shot_ids[i]
-                record["ds_source"] = ds_source[i]
+                record["shot"] = per_shot["shot"][i]
+                record["ds_source"] = per_shot["ds_source"][i]
                 records.append(record)
 
         if not records:

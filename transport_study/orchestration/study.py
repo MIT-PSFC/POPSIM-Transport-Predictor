@@ -4,15 +4,17 @@ import functools
 import hashlib
 import json
 import math
+import multiprocessing
 import os
 import shutil
 import time
 import tomllib
 from collections import Counter
+from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass, fields, replace
 from itertools import product
 from pathlib import Path
-from typing import Annotated, ClassVar
+from typing import TYPE_CHECKING, Annotated, ClassVar
 
 import wandb
 import xarray as xr
@@ -88,6 +90,7 @@ from transport_study.orchestration.slurm_utils import (
     get_running_job_names,
     held_job_names,
     launch_agent_parallel,
+    launch_collect_results_job,
     launch_train_parallel,
     partition_exists,
     recent_submitted_jobs,
@@ -109,6 +112,9 @@ from transport_study.orchestration.wandb_utils import (
     is_trained_to_completion,
     run_clean_sweeps,
 )
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 # Target-shot count for hyperparameter tuning cases. When domain adaptation is
 # None no target data is used during training, and during domain adaptation no
@@ -149,6 +155,15 @@ DEVICE_LAUNCH_ORDER = (TrainingDevices.GPU_ONLY, TrainingDevices.CPU_ONLY, Train
 
 # The training shuffle of every config before launch_train seeds it, the one sweep trials train with
 BASE_SHUFFLE_SEED = 0
+
+# Processes reading the result files of collect_results (map_result_files).
+# A cold result read over NFS takes about 3 s and is I/O bound, 16 processes cut it about 14x (2026-10-13 benchmark).
+# Threads cannot: netCDF4 is not thread-safe (it segfaults), and h5netcdf serializes its reads under one lock
+COLLECT_PROCESSES = 16
+# collect_results logs its progress every this many cases
+COLLECT_PROGRESS_EVERY = 20
+# How often the orchestrator checks on the collection job
+COLLECT_POLL_INTERVAL_S = 30
 
 # What the base collect_results reads of a result file, never the predicted and target profiles that make up most of it
 SUMMARY_RESULT_VARS = ["error_abs_shot", "error_rel_shot", "error_abs_ts", "error_rel_ts", "time"]
@@ -226,6 +241,34 @@ def model_size_updates(model_size: str, sweep_model_init_parameters: dict, model
             updates["d_model"] = max(num_heads, d_model_head_multiple)
         return updates
     raise ValueError(f"Unknown model size {model_size!r}, must be one of {MODEL_SIZES}")
+
+
+def map_result_files[CaseRead](read_case: Callable[[Path], CaseRead], result_paths: list[Path]) -> list[CaseRead]:
+    """read_case of every result file, in order, on up to COLLECT_PROCESSES processes.
+
+    read_case must be a module-level function of the result path alone, so a fresh process can import it.
+    The processes are spawned, never forked, since forking a process that imported JAX can deadlock.
+    A single file is read in this process.
+    Logs a progress line every COLLECT_PROGRESS_EVERY cases.
+    """
+    n_processes = min(COLLECT_PROCESSES, len(result_paths))
+    if n_processes <= 1:
+        return [read_case(result_path) for result_path in result_paths]
+    spawn_context = multiprocessing.get_context("spawn")
+    case_reads = []
+    with ProcessPoolExecutor(n_processes, mp_context=spawn_context) as pool:
+        for n_read, case_read in enumerate(pool.map(read_case, result_paths), start=1):
+            case_reads.append(case_read)
+            if n_read % COLLECT_PROGRESS_EVERY == 0 or n_read == len(result_paths):
+                logger.info(f"Collected {n_read} of {len(result_paths)} case results")
+    return case_reads
+
+
+def summarize_result_file(result_path: Path) -> xr.Dataset:
+    """The scalar error statistics of one case result file (Study._summarize_case_errors), a map_result_files reader."""
+    with xr.open_dataset(result_path) as ds_result:
+        ds = ds_result[SUMMARY_RESULT_VARS].load()
+    return Study._summarize_case_errors(ds)
 
 
 def write_netcdf_atomic(ds: xr.Dataset, path: Path | str) -> None:
@@ -723,6 +766,9 @@ class Study:
 
     def analysis_job_name(self, case: Case) -> str:
         return f"analysis_{case}.{self.name}"
+
+    def collect_job_name(self) -> str:
+        return f"collect_results.{self.name}"
 
     def check_prereq_satisfied(self, case: Case) -> bool:
         """Check if the prerequisites for this case have been satisfied by looking for the existence of the result path"""
@@ -1905,6 +1951,44 @@ class Study:
         per_seed_ds = xr.Dataset(per_seed).reset_coords(drop=True)
         return seed_statistics(per_seed_ds, int(ds.attrs[BEST_SEED_ATTR]))
 
+    def write_collected_results(self, enable_parallelism: bool) -> None:
+        """Collect the results of every finished case into collected_results.nc.
+
+        With parallelism the collection runs as a CPU job of its own (slurm_utils.launch_collect_results_job),
+        its COLLECT_PROCESSES processes reading the result files while the orchestrator waits for the file.
+        A job SLURM refuses, or one that ends without writing the file, falls back to collecting here.
+        """
+        if enable_parallelism and self._collect_results_in_job():
+            return
+        ds_final = self.collect_results()
+        if not ds_final.data_vars:
+            raise RuntimeError(f"Study {self.name} has no case result to collect, check its [datasets] table and the logs above")
+        write_netcdf_atomic(ds_final, self.collected_results_path())
+
+    def _collect_results_in_job(self) -> bool:
+        """Run collect_results in a job of its own and wait for collected_results.nc, returns whether the job wrote it.
+
+        The job counts as failed once it has left the queue and sacct shows it ended RELAUNCH_GRACE_S ago (slurm_utils.held_job_names).
+        """
+        collected_results_path = self.collected_results_path()
+        job_id = launch_collect_results_job(self, COLLECT_PROCESSES)
+        if job_id is None:
+            logger.warning("SLURM refused the collection job, collecting the results here instead")
+            return False
+        job_name = self.collect_job_name()
+        submitted_jobs = {job_name: SubmittedJob(job_id, time.time())}
+        logger.info(f"Collecting the case results in job {job_id}, waiting for {collected_results_path}")
+        while not collected_results_path.exists():
+            time.sleep(COLLECT_POLL_INTERVAL_S)
+            running_job_names = get_running_job_names()
+            if running_job_names is None or job_name in running_job_names:
+                continue
+            held_names = held_job_names(submitted_jobs, running_job_names)
+            if job_name not in held_names and not collected_results_path.exists():
+                logger.error(f"Collection job {job_id} ended without writing {collected_results_path}, collecting the results here instead")
+                return False
+        return True
+
     def restore_trainer(self, case: Case, restore_best_checkpoint: bool = True) -> tuple[Trainer, DataLoader]:
         """Restore a given case's trainer and the test dataloader"""
         if not self.trained_model_dir(case).exists():
@@ -1950,17 +2034,13 @@ class Study:
         'shot' (time-integrated per shot) or 'ts' (per timeslice), and S is one of
         mean, std, med, p25, p75, min, max. E.g. err_abs_shot_mean, err_rel_ts_p75.
         """
+        finished_cases = [(case_idx, case) for case_idx, case in enumerate(self.cases) if self.result_path(case).exists()]
+        result_paths = [self.result_path(case) for _, case in finished_cases]
+        summaries = map_result_files(summarize_result_file, result_paths)
         results = []
-        for case_idx, case in enumerate(self.cases):
-            result_path = self.result_path(case)
-            if not result_path.exists():
-                continue
-
-            with xr.open_dataset(result_path) as ds_result:
-                ds = ds_result[SUMMARY_RESULT_VARS].load()
-
-            result = self._summarize_case_errors(ds).assign_coords(self.case_coords(case_idx, case))
-            results.append(result)
+        for (case_idx, case), summary in zip(finished_cases, summaries, strict=True):
+            case_coords = self.case_coords(case_idx, case)
+            results.append(summary.assign_coords(case_coords))
 
         if not results:
             logger.warning("No case results found to collect!")
@@ -2068,10 +2148,7 @@ class Study:
         # Returns at once when every case already has a result
         logger.opt(colors=True).info("<bold><magenta>ORCHESTRATION</magenta></bold>")
         study.run_unfinished_cases(skip_tuning=bool(skip_tuning), enable_parallelism=bool(enable_parallelism))
-        ds_final = study.collect_results()
-        if not ds_final.data_vars:
-            raise RuntimeError(f"Study {study.name} has no case result to collect, check its [datasets] table and the logs above")
-        write_netcdf_atomic(ds_final, study.collected_results_path())
+        study.write_collected_results(enable_parallelism=bool(enable_parallelism))
 
         study.run_analysis(enable_parallelism=bool(enable_parallelism))
         study.study_complete_path().touch()
