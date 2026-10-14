@@ -40,6 +40,7 @@ from transport_study.orchestration.study import (
 )
 from transport_study.orchestration.target_shots import BASE_TARGET_SHOT_ORDER
 from transport_study.power_balance_transfer.power_balance_study import (
+    POWER_BALANCE_BATCH_SIZE,
     POWER_BALANCE_LOSS_DEFAULTS,
     SCALAR_SUBMODULE_SETTINGS,
     PowerBalanceStudy,
@@ -47,6 +48,7 @@ from transport_study.power_balance_transfer.power_balance_study import (
     structured_power_balance_train_spec,
 )
 from transport_study.profile_transfer.profile_study import (
+    PROFILE_BATCH_SIZE,
     ProfileStudy,
     profile_train_spec,
 )
@@ -175,7 +177,6 @@ class TransportStudy(Study):
         profile_model_type: str = "shape-init-pca"
 
         FIELD_CHOICES: ClassVar[dict[str, tuple]] = {
-            **CaseGridConfig.FIELD_CHOICES,
             **model_type_field_choices(STUDY_MODEL_TYPES),
             "geometry_builders": VALID_GEOMETRY_BUILDERS,
             "torax_state_options": VALID_TORAX_STATES,
@@ -199,7 +200,8 @@ class TransportStudy(Study):
           (power_balance itself chains p_oh and p_rad)
 
         freeze_submodules: whether the sciml keeps the p_oh / p_rad predictors of its power balance fixed,
-        as the power balance study's freeze does, its tau_E network and the profile predictor always train.
+        as the power balance study's freeze does.
+        Its tau_E network and the profile predictor always train.
         Pinned to the hyperparam value for every other model type
 
         geometry_builder: the per-sample TORAX geometry of the torax-* types, pinned to circular for the rest
@@ -210,9 +212,10 @@ class TransportStudy(Study):
         - rebuild: carry ne / te only and rebuild the TORAX state each step (T_i := T_e, psi from Ip)
         - carry: also carry T_i and psi, so the ion channel and the current evolve over the rollout
 
-        multiobjective: whether the training loss also anchors the stored energy and the ohmic power to the measured
-        signals (MULTIOBJECTIVE_MODEL_TYPES alone, sciml always anchors its submodules). The transformer predicts them with
-        two more head outputs, TORAX infers them from its own state. Shares the plain case's sweep, named mo_True
+        multiobjective: whether the training loss also anchors the stored energy and the ohmic power
+        to the measured signals (MULTIOBJECTIVE_MODEL_TYPES alone, sciml always anchors its submodules).
+        The transformer predicts them with two more head outputs, TORAX infers them from its own state.
+        Shares the plain case's sweep, named mo_True
         """
 
         freeze_submodules: bool
@@ -403,12 +406,12 @@ class TransportStudy(Study):
             )
         if case.model_type == "power_balance":
             submodule_configs = {
-                "p_oh_predictor": self._make_submodule_config(case, "p_oh"),
-                "p_rad_predictor": self._make_submodule_config(case, "p_rad"),
+                "p_oh_predictor": self.make_submodule_config(case, "p_oh"),
+                "p_rad_predictor": self.make_submodule_config(case, "p_rad"),
             }
             return structured_power_balance_train_spec(
                 config.power_balance_model_type,
-                dataloader_config_base,
+                {**dataloader_config_base, "batch_size": POWER_BALANCE_BATCH_SIZE},
                 config.power_balance_data_normalization,
                 case.domain_adaptation,
                 config.power_balance_freeze_submodules,
@@ -417,7 +420,7 @@ class TransportStudy(Study):
         if case.model_type == "profile":
             return profile_train_spec(
                 config.profile_model_type,
-                dataloader_config_base,
+                {**dataloader_config_base, "batch_size": PROFILE_BATCH_SIZE},
                 config.data_normalization,
                 case.domain_adaptation,
                 freeze_shapes=PROFILE_SUBMODULE_FREEZE_SHAPES,
@@ -441,8 +444,8 @@ class TransportStudy(Study):
                     "freeze_submodules": case.freeze_submodules,
                     "prng_seed": NN_INIT_DEFAULTS["prng_seed"],
                     "submodules": {
-                        "power_balance": self._make_submodule_config(case, "power_balance"),
-                        "profile_predictor": self._make_submodule_config(case, "profile"),
+                        "power_balance": self.make_submodule_config(case, "power_balance"),
+                        "profile_predictor": self.make_submodule_config(case, "profile"),
                     },
                 },
             )

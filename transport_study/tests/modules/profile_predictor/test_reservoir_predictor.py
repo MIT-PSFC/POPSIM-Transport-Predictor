@@ -121,6 +121,8 @@ def test_reservoir_training_smoke(tmp_path):
         max_epochs=2,
         epochs_per_val=1,
         model_types=("reservoir",),
+        data_normalization_methods=("physics-coral",),
+        hyperparam_data_normalization="physics-coral",
         training_datasets=("cmod-low1",),
         domain_adaptation_methods=(None,),
         num_target_shots_options=(0,),

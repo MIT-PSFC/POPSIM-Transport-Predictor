@@ -202,7 +202,7 @@ PAD_TIME_STEP_S = 1e-6
 
 
 def orchestrator_job_name(study_name: str) -> str:
-    """The SLURM job name of a study's orchestrator wrapper (studies/*/*.sh), which reset_study refuses to run under."""
+    """The SLURM job name of a study's orchestrator wrapper (studies/*/*.sh), reset_study refuses while it is queued or running."""
     return f"{study_name}_orchestrator"
 
 
@@ -365,12 +365,15 @@ class CaseGridConfig(StudyConfig):
     num_seeds: int = Field(default=5, ge=1)
 
     # Field name -> its valid values. A tuple field must hold valid values only, a scalar field must be one.
-    # A subclass spreads this base and model_type_field_choices into its own
+    # The choices of every class in the hierarchy apply, a subclass adds its own (model_type_field_choices among them)
     FIELD_CHOICES: ClassVar[dict[str, tuple]] = {"target_shot_orders": TARGET_SHOT_ORDERS, "model_sizes": MODEL_SIZES}
 
     @model_validator(mode="after")
     def _validate_field_choices(self):
-        for field_name, valid in self.FIELD_CHOICES.items():
+        field_choices: dict[str, tuple] = {}
+        for klass in reversed(type(self).__mro__):
+            field_choices.update(vars(klass).get("FIELD_CHOICES", {}))
+        for field_name, valid in field_choices.items():
             value = getattr(self, field_name)
             values = value if isinstance(value, tuple) else (value,)
             invalid = [item for item in values if item not in valid]
@@ -1084,7 +1087,7 @@ class Study:
             self._training_statistics_cache[selection] = statistics
         return self._training_statistics_cache[selection]
 
-    def _make_submodule_config(self, case: Case, submodule_type: str) -> TrainConfig:
+    def make_submodule_config(self, case: Case, submodule_type: str) -> TrainConfig:
         """The TrainConfig of a submodule prereq of the case, through make_train_config so it gets its own tuned merge and transfer wiring."""
         return self.make_train_config(case.replace_pinned(model_type=submodule_type))
 
@@ -2242,21 +2245,28 @@ class Study:
                     f"Study {config.study_name} has jobs queued or running, cancel them before resetting it:\n" + "\n".join(study_job_names)
                 )
         # The old working dir is set aside while the fresh study checks its lineage,
-        # so a parent that was not reset first, or a locked field that differs, leaves it in place
+        # so a parent that was not reset first, or a locked field that differs, leaves it in place.
+        # A set-aside dir without a working dir is a reset that was interrupted, still the study
         working_dir = Path(config.working_dir_base) / config.study_name
         previous_dir = working_dir.with_name(f"{config.study_name}{PREVIOUS_WORKING_DIR_SUFFIX}")
+        if previous_dir.exists() and not working_dir.exists():
+            previous_dir.rename(working_dir)
         shutil.rmtree(previous_dir, ignore_errors=True)
         if working_dir.exists():
             working_dir.rename(previous_dir)
         try:
             study = cls(config)
-        except Exception:
+        except BaseException:
             shutil.rmtree(working_dir, ignore_errors=True)
+            if working_dir.exists():
+                # An open file (NFS keeps a stub) blocks the removal, the fresh dir moves out of the way instead
+                working_dir.rename(working_dir.with_name(f"{config.study_name}.failed_{new_stamp()}"))
             if previous_dir.exists():
                 previous_dir.rename(working_dir)
             raise
-        shutil.rmtree(previous_dir, ignore_errors=True)
+        # The old sweeps go before the old dir, so a failed wandb cleanup leaves the study intact to reset again
         study.setup_directories(clean_sweeps=True)
+        shutil.rmtree(previous_dir, ignore_errors=True)
 
     def __init__(self, cfg: str | Path | CaseGridConfig):
         """

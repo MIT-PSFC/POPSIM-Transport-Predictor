@@ -69,3 +69,15 @@ def test_reset_keeps_working_dir_when_parent_missing(tmp_path, monkeypatch):
     assert (working_dir / "results" / "stale.nc").exists()
     assert not (working_dir / CONFIG_LOCK_FILENAME).exists()
     assert not working_dir.with_name(f"{cfg.study_name}{study_module.PREVIOUS_WORKING_DIR_SUFFIX}").exists()
+
+
+def test_reset_restores_an_interrupted_reset_before_checking_the_lineage(tmp_path, monkeypatch):
+    """A set-aside dir without a working dir is a reset that was interrupted, it is the study again before anything is deleted."""
+    cfg = _config(tmp_path, parent_study="never_run_parent")
+    working_dir = _stale_working_dir(cfg)
+    working_dir.rename(working_dir.with_name(f"{cfg.study_name}{study_module.PREVIOUS_WORKING_DIR_SUFFIX}"))
+    monkeypatch.setattr(study_module, "get_running_job_names", lambda: set())
+    reset_config()
+    with pytest.raises(RuntimeError, match="no config lock"):
+        PowerBalanceStudy.reset_study(cfg)
+    assert (working_dir / "results" / "stale.nc").exists()

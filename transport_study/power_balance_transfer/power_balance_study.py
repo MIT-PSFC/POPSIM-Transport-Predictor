@@ -130,7 +130,6 @@ def structured_power_balance_train_spec(
             "target_vars": STRUCTURED_TARGET_VARS,
             "state_vars": ["energy_mhd_MJ"],
             **dataloader_config_base,
-            "batch_size": POWER_BALANCE_BATCH_SIZE,
         },
         model_init_config={
             "model_type": model_type,
@@ -176,7 +175,6 @@ class PowerBalanceStudy(Study):
         hyperparam_multiobjective: bool = False
 
         FIELD_CHOICES: ClassVar[dict[str, tuple]] = {
-            **CaseGridConfig.FIELD_CHOICES,
             **model_type_field_choices(STUDY_MODEL_TYPES),
             "data_normalization_methods": INPUT_NORMALIZATIONS,
             "hyperparam_data_normalization": INPUT_NORMALIZATIONS,
@@ -193,8 +191,8 @@ class PowerBalanceStudy(Study):
         - transformer: the current inputs attend over a buffer of past predicted stored energies
         - p_oh / p_rad: the submodule predictors, prereq cases of the sciml types alone
 
-        data_normalization: the input normalization of the model's NN, a POPSIM module fitted on the training data only
-        (transport_study/modules/normalization.py)
+        data_normalization: the input normalization of the model's NN,
+        a POPSIM module fitted on the training data only (transport_study/modules/normalization.py)
         - raw: Ip, Wtot and the rest in their working units
         - physics: dimensionless parameters like q_star and f_G
         - zscore: per-device zero mean and unit variance
@@ -204,8 +202,9 @@ class PowerBalanceStudy(Study):
         freeze_submodules: whether the sciml types keep their p_oh / p_rad submodules fixed in joint training,
         the alternative letting them drift from the measured powers toward a better Wtot
 
-        multiobjective: whether the transformer's head also predicts P_oh and P_rad, anchored to the measured powers
-        like the sciml submodules (MULTIOBJECTIVE_MODEL_TYPES alone). Shares the plain case's sweep, named mo_True
+        multiobjective: whether the transformer's head also predicts P_oh and P_rad,
+        anchored to the measured powers like the sciml submodules (MULTIOBJECTIVE_MODEL_TYPES alone).
+        Shares the plain case's sweep, named mo_True
         """
 
         data_normalization: str
@@ -309,8 +308,8 @@ class PowerBalanceStudy(Study):
             return scalar_submodule_train_spec(case.model_type, dataloader_config_base, case.data_normalization, case.domain_adaptation)
         if case.model_type in MODEL_TYPES_WITH_SUBMODULES:
             submodule_configs = {
-                "p_oh_predictor": self._make_submodule_config(case, "p_oh"),
-                "p_rad_predictor": self._make_submodule_config(case, "p_rad"),
+                "p_oh_predictor": self.make_submodule_config(case, "p_oh"),
+                "p_rad_predictor": self.make_submodule_config(case, "p_rad"),
             }
             return structured_power_balance_train_spec(
                 case.model_type,

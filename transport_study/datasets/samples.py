@@ -25,22 +25,23 @@ SAMPLE_BLOCKS = ("low1", "low2", "high")
 SAMPLE_ENCODING = {"zlib": True, "shuffle": True, "complevel": 4}
 
 
-def sample_path(sample_dir: Path | str, device: str, block: str) -> Path:
+def _sample_path(sample_dir: Path | str, device: str, block: str) -> Path:
     """The sample file of one hazard block of a device."""
     return Path(sample_dir) / f"{device}-{block}.nc"
 
 
-def shots_by_hazard(ds_store: xr.Dataset) -> np.ndarray:
-    """Shots of a device store in ascending order of the hazard metric the study ranks shots by."""
+def _shots_by_hazard(ds_store: xr.Dataset) -> np.ndarray:
+    """Shots of a device store in ascending order of the hazard metric the study ranks shots by, those without one left out."""
     ds_scalars = ds_store[["energy_mhd", "ip"]].load()
     ds_working = convert_to_working_units(ds_scalars)
     ds_hazard = add_hazard(ds_working)
-    hazard = ds_hazard["hazard"]
+    # A shot without a valid energy or current timeslice has no hazard and belongs to no sample
+    hazard = ds_hazard["hazard"].dropna(EPISODE_DIM)
     hazard_sorted = hazard.sortby(hazard)
     return hazard_sorted[EPISODE_DIM].values
 
 
-def write_sample(ds_store: xr.Dataset, shots: np.ndarray, path: Path) -> None:
+def _write_sample(ds_store: xr.Dataset, shots: np.ndarray, path: Path) -> None:
     """Write the given shots of a device store as one netCDF sample.
 
     The time_idx columns none of the shots uses (time NaN for every shot) are dropped.
@@ -74,7 +75,7 @@ def make_samples(device: str, store_path: Path | str, sample_dir: Path | str) ->
     if n_shots < n_needed:
         raise ValueError(f"{store_path} has {n_shots} shots, {len(SAMPLE_BLOCKS)} disjoint samples need {n_needed}")
 
-    shots_sorted = shots_by_hazard(ds_store)
+    shots_sorted = _shots_by_hazard(ds_store)
     block_shots = {
         "low1": shots_sorted[:SAMPLE_N_SHOTS],
         "low2": shots_sorted[SAMPLE_N_SHOTS : 2 * SAMPLE_N_SHOTS],
@@ -82,7 +83,7 @@ def make_samples(device: str, store_path: Path | str, sample_dir: Path | str) ->
     }
     paths = []
     for block in SAMPLE_BLOCKS:
-        path = sample_path(sample_dir, device, block)
-        write_sample(ds_store, block_shots[block], path)
+        path = _sample_path(sample_dir, device, block)
+        _write_sample(ds_store, block_shots[block], path)
         paths.append(path)
     return paths

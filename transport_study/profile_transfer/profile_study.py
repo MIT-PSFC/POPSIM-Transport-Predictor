@@ -140,7 +140,6 @@ def profile_train_spec(
         # Profiles plus their gradient and error-bar companions, the chi validation loss divides by the error bars
         "target_vars": [*PROFILE_TARGET_VARS, "ds_source_idx"],
         **dataloader_config_base,
-        "batch_size": PROFILE_BATCH_SIZE,
     }
     model_init_config = {
         "model_type": model_type,
@@ -148,7 +147,6 @@ def profile_train_spec(
         "domain_adaptation": domain_adaptation,
         # The dimensionless nn_inputs derived from the raw input_vars, log(nu_star) among them
         "in_size": N_NN_INPUTS,
-        "prng_seed": NN_INIT_DEFAULTS["prng_seed"],
     }
     if model_type in MODEL_TYPES_WITH_SHAPES:
         dataloader_config["extra_vars"] = list(PROFILE_SHAPE_VARS)
@@ -163,6 +161,7 @@ def profile_train_spec(
         model_init_config |= NN_INIT_DEFAULTS
     elif model_type == "reservoir":
         model_init_config |= {
+            "prng_seed": NN_INIT_DEFAULTS["prng_seed"],
             "reservoir_size": 128,  # Fixed random reservoir state dimension
             "spectral_radius": 0.9,  # Contraction factor of the recurrent weights
             "input_scaling": 0.5,  # Scale of the random input weights and bias
@@ -214,7 +213,6 @@ class ProfileStudy(Study):
         hyperparam_freeze_shapes: bool = True
 
         FIELD_CHOICES: ClassVar[dict[str, tuple]] = {
-            **CaseGridConfig.FIELD_CHOICES,
             **model_type_field_choices(STUDY_MODEL_TYPES),
             "geometry_builders": VALID_GEOMETRY_BUILDERS,
             "data_normalization_methods": FEATURE_NORMALIZATIONS,
@@ -226,13 +224,15 @@ class ProfileStudy(Study):
         """The profile case, see Study.Case for the shared axes.
 
         model_type:
-        - shape-init-pca / shape-init-kmeans: point shapes from a PCA or k-means of the training profiles, weighted by an NN
+        - shape-init-pca / shape-init-kmeans: point shapes from a PCA or k-means of the training profiles,
+          weighted by an NN
         - mlp: one network predicts the profile points directly
         - reservoir: a fixed random reservoir with a trained readout
-        - torax-constant / torax-gyrobohm / torax-qlknn: a TORAX relaxation with NN-predicted transport, edge and source parameters
+        - torax-constant / torax-gyrobohm / torax-qlknn: a TORAX relaxation
+          with NN-predicted transport, edge and source parameters
 
-        data_normalization: the stat stage over the 10 dimensionless nn_inputs, a frozen POPSIM module fitted on the training
-        data only (transport_study/modules/normalization.py, FEATURE_NORMALIZATIONS)
+        data_normalization: the stat stage over the 10 dimensionless nn_inputs,
+        a frozen POPSIM module fitted on the training data only (transport_study/modules/normalization.py, FEATURE_NORMALIZATIONS)
         - physics: the dimensionless parameters as-is
         - physics-coral: per-device CORAL alignment fitted on them
         - physics-zscore: per-device z-score fitted on them

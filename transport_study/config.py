@@ -131,8 +131,8 @@ class StudyConfig(BaseModel):
     debug: bool = False
     # Keep only the most recent shots of each device, every shot when None (get_ds logs a truncation)
     max_ds_size: int | None = None
-    # About 10 trials per swept dimension (Loeppky, Sacks and Welch 2009, Technometrics 51).
-    # Every study's sweeps vary 9 to 15 hyperparameters, 8 or 9 of them continuous, the rest discrete with 2 to 7 levels.
+    # Loeppky, Sacks and Welch (2009, Technometrics 51) suggest about 10 trials per swept dimension.
+    # The sweeps vary 9 to 15 hyperparameters, 8 to 12 of them continuous, the rest discrete with 2 to 8 levels.
     # Random search with far fewer trials than a grid matches or beats it (Bergstra and Bengio 2012, JMLR 13),
     # and these sweeps are Bayesian.
     hyperparam_sweeps: int = 80

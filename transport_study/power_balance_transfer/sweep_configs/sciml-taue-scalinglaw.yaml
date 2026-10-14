@@ -11,7 +11,7 @@ early_terminate:
 parameters:
   optimizer_config:
     parameters:
-      # Range from the first apsdpp launch, whose tuned lr0 sat in the top third of [1e-5, 1e-2]
+      # Two decades up to 1e-1, the first apsdpp power balance launch tuned lr0 into the top third of [1e-5, 1e-2]
       lr0:
         distribution: log_uniform_values
         min: 1.0e-4
