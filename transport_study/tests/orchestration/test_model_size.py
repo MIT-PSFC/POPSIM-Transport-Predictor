@@ -1,5 +1,7 @@
 """model_size_updates on the real sweep grids: the architecture each model size trains."""
 
+import pytest
+
 from transport_study.orchestration.study import model_size_updates
 from transport_study.power_balance_transfer.power_balance_study import PowerBalanceStudy
 from transport_study.profile_transfer.profile_study import ProfileStudy
@@ -17,12 +19,21 @@ def test_min_and_max_move_only_width_and_depth_to_the_grid_ends():
             assert value == grid_end(parameters[name]["values"])
 
 
-def test_half_halves_the_tuned_widths_and_keeps_depth():
+@pytest.mark.parametrize(("model_size", "d_model", "nn_width"), [("half", 16, 12), ("quarter", 8, 6), ("eighth", 4, 3)])
+def test_width_sizes_divide_the_tuned_widths_and_keep_depth(model_size, d_model, nn_width):
     parameters = PowerBalanceStudy.sweep_model_init_parameters("transformer")
-    assert model_size_updates("half", parameters, TUNED_TRANSFORMER) == {"d_model": 16, "nn_width": 12}
-    # d_model 4 would halve to 2, below one dimension per head for 4 heads, so it stays 4
-    tuned_smallest_d_model = {**TUNED_TRANSFORMER, "d_model": 4}
-    assert model_size_updates("half", parameters, tuned_smallest_d_model)["d_model"] == 4
+    assert model_size_updates(model_size, parameters, TUNED_TRANSFORMER) == {"d_model": d_model, "nn_width": nn_width}
+
+
+def test_divided_widths_keep_one_unit_and_a_dimension_per_head():
+    """The smallest tuned widths of the transformer grid divided by 8.
+
+    nn_width 4 // 8 is 0, so it keeps 1.
+    d_model 4 // 8 is 0, below one dimension per head for 4 heads, so it stays 4.
+    """
+    parameters = PowerBalanceStudy.sweep_model_init_parameters("transformer")
+    tuned_smallest_widths = {**TUNED_TRANSFORMER, "d_model": 4, "nn_width": 4}
+    assert model_size_updates("eighth", parameters, tuned_smallest_widths) == {"d_model": 4, "nn_width": 1}
 
 
 def test_half_reservoir_halves_only_its_size():

@@ -127,12 +127,14 @@ DOMAIN_ADAPTATION_METHODS = (None, "weighted", "addition", "transfer")
 
 # The architecture sizes of the model_size case axis (see model_size_updates).
 # BASE_MODEL_SIZE trains the tuned config, every other size swaps only its architecture size.
-MODEL_SIZES = ("sweep", "min", "max", "half")
+MODEL_SIZES = ("sweep", "min", "max", "half", "quarter", "eighth")
 BASE_MODEL_SIZE = "sweep"
 # The hyperparameters min / max move to the ends of their sweep grids
 SIZE_HYPERPARAMETERS = ("nn_width", "nn_depth", "d_model", "reservoir_size")
-# The ones half halves, depth stays tuned
+# The ones the width sizes divide, depth stays tuned
 WIDTH_HYPERPARAMETERS = ("nn_width", "d_model", "reservoir_size")
+# What each width size divides the tuned widths by
+WIDTH_DIVISORS = {"half": 2, "quarter": 4, "eighth": 8}
 
 # Abort the run once a single seed of a case has been launched this many times without a result file,
 # guards against deterministically failing jobs being resubmitted forever
@@ -222,8 +224,9 @@ def model_size_updates(model_size: str, sweep_model_init_parameters: dict, model
     """The model_init_config entries a model size overrides, only among the size hyperparameters the model type's sweep lists.
 
     min / max take the smallest / largest value of each SIZE_HYPERPARAMETERS grid.
-    half halves each tuned WIDTH_HYPERPARAMETERS value and keeps the depth.
-    A halved d_model stays a multiple of num_heads and at least num_heads, so every attention head keeps a dimension.
+    half / quarter / eighth divide each tuned WIDTH_HYPERPARAMETERS value by 2 / 4 / 8 (WIDTH_DIVISORS) and keep the depth.
+    A divided width keeps at least one unit (4 // 8 is 0 on the transformer nn_width grid),
+    and a divided d_model stays a multiple of num_heads and at least num_heads, so every attention head keeps a dimension.
     Everything else keeps its tuned value.
     """
     size_grids = {name: spec["values"] for name, spec in sweep_model_init_parameters.items() if name in SIZE_HYPERPARAMETERS}
@@ -233,8 +236,9 @@ def model_size_updates(model_size: str, sweep_model_init_parameters: dict, model
         return {name: min(values) for name, values in size_grids.items()}
     if model_size == "max":
         return {name: max(values) for name, values in size_grids.items()}
-    if model_size == "half":
-        updates = {name: model_init_config[name] // 2 for name in size_grids if name in WIDTH_HYPERPARAMETERS}
+    if model_size in WIDTH_DIVISORS:
+        divisor = WIDTH_DIVISORS[model_size]
+        updates = {name: max(model_init_config[name] // divisor, 1) for name in size_grids if name in WIDTH_HYPERPARAMETERS}
         if "d_model" in updates:
             num_heads = model_init_config["num_heads"]
             d_model_head_multiple = updates["d_model"] // num_heads * num_heads

@@ -110,8 +110,22 @@ FREEZE_LABELS = {False: "Unfrozen submodules", True: "Frozen submodules"}
 MULTIOBJECTIVE_COLORS = {False: "#c0c0c0", True: "#c77dff"}
 MULTIOBJECTIVE_LABELS = {False: "Single objective", True: "Multiobjective"}
 # The model_size axis: the tuned architecture against the ends of its sweep grid and its halved width
-MODEL_SIZE_COLORS = {"sweep": "#c0c0c0", "min": "#0095ff", "half": "#2ec4b6", "max": "#ff8c1a"}
-MODEL_SIZE_LABELS = {"sweep": "Tuned size", "min": "Sweep minimum", "half": "Half width", "max": "Sweep maximum"}
+MODEL_SIZE_COLORS = {
+    "sweep": "#c0c0c0",
+    "min": "#0095ff",
+    "eighth": "#c77dff",
+    "quarter": "#8ac926",
+    "half": "#2ec4b6",
+    "max": "#ff8c1a",
+}
+MODEL_SIZE_LABELS = {
+    "sweep": "Tuned size",
+    "min": "Sweep minimum",
+    "eighth": "Eighth width",
+    "quarter": "Quarter width",
+    "half": "Half width",
+    "max": "Sweep maximum",
+}
 
 # Columns of the stage-resolved grids (collected_metrics.nc, see orchestration.case_metrics)
 STAGE_LABELS = {
