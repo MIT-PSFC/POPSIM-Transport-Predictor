@@ -5,6 +5,7 @@ embedded path must be a str at interpolation time. These capture the generated
 scripts without touching SLURM and check they compile.
 """
 
+import runpy
 from pathlib import Path
 
 import pytest
@@ -126,3 +127,22 @@ def test_collect_results_job_script_compiles_and_asks_for_its_cpus(make_stub_stu
     collect_scripts = list((study.working_dir / "logs" / "logs_collect").glob(f"{study.collect_job_name()}_*.py"))
     assert len(collect_scripts) == 1
     assert_script_valid(collect_scripts[0])
+
+
+def test_collect_results_job_script_inert_when_rerun_as_mp_main(make_stub_study, submitted_scripts):
+    """Each spawned reader process re-runs the job's script as __mp_main__.
+
+    Without the main guard every reader built the study and spawned readers of its own,
+    and multiprocessing aborted the job.
+    """
+    study = make_stub_study([StubCase(name="case.a")], partition="fake_partition")
+    slurm_utils.launch_collect_results_job(study, cpus=16)
+    log_dir = study.working_dir / "logs" / "logs_collect"
+    (collect_script,) = log_dir.glob(f"{study.collect_job_name()}_*.py")
+    (study_config,) = log_dir.glob(f"{study.collect_job_name()}_study_config_*.toml")
+
+    runpy.run_path(str(collect_script), run_name="__mp_main__")
+
+    # Only the main process deletes the config it reloads
+    assert study_config.exists()
+    assert not study.collected_results_path().exists()

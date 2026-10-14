@@ -1335,11 +1335,13 @@ from pathlib import Path
 from {importable_module(study_cls)} import {study_cls.__name__}
 from transport_study.orchestration.study import write_netcdf_atomic
 
-study = {study_cls.__name__}(Path({study_config_path!r}))
-collected_results = study.collect_results()
-if collected_results.data_vars:
-    write_netcdf_atomic(collected_results, study.collected_results_path())
-Path({study_config_path!r}).unlink()
+# The spawned reader processes re-run this script as __mp_main__, so only the main process collects
+if __name__ == "__main__":
+    study = {study_cls.__name__}(Path({study_config_path!r}))
+    collected_results = study.collect_results()
+    if collected_results.data_vars:
+        write_netcdf_atomic(collected_results, study.collected_results_path())
+    Path({study_config_path!r}).unlink()
 """
     with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False, prefix=f"{job_name}_", dir=log_dir) as f:
         f.write(py_script)
