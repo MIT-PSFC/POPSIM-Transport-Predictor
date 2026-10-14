@@ -326,6 +326,11 @@ class ProfileStudy(Study):
             "gradient_weight": 0.1,
             # Trained models sat near 1 error bar on the values and 3-4 on the gradients, so the gradients get their own delta
             "huber_delta_grad": 3.0,
+            # Charged per diverged (non-finite) validation sample, sized to swamp ordinary loss differences
+            # so a diverged trial cannot win the sweep.
+            # The chi is ~1 per sample, so one diverged sample in a thousand adds ~10 to it, the transport study's scale.
+            # Training has no penalty, popsim masks a diverged sample out of its step
+            "divergence_penalty_val": 1e4,
         }
 
     def model_train_spec(self, case: Case, dataloader_config_base: dict) -> ModelTrainSpec:

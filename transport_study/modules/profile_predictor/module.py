@@ -355,8 +355,9 @@ def kmeans_initial_guess(
     te_data: xr.DataArray,
     ne_data: xr.DataArray,
     sample_dim: str,
-    seed: int = 0,
+    seed: int,
 ):
+    """k-means centers of the unit-integral training shapes, seeded so every training seed of a case clusters on its own."""
     from sklearn.cluster import KMeans
 
     te_data = te_data.transpose(sample_dim, ...)

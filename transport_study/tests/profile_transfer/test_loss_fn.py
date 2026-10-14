@@ -71,7 +71,12 @@ def _device_floors(floor: float) -> dict:
 
 def _val_config(gradient_weight: float = 0.1, floor: float = SIGMA_FLOOR, **overrides) -> dict:
     """Chi validation loss config."""
-    return {"gradient_weight": gradient_weight, "chi_sigma_floors": _device_floors(floor), **overrides}
+    return {
+        "gradient_weight": gradient_weight,
+        "chi_sigma_floors": _device_floors(floor),
+        "divergence_penalty_val": 1e4,
+        **overrides,
+    }
 
 
 def _train_config(gradient_weight: float = 0.1, floor: float = SIGMA_FLOOR, **overrides) -> dict:
@@ -311,6 +316,27 @@ def test_chi_counts_the_residual_in_error_bars():
     loss_tight_bars = float(train_loss(pred, targ))
     loss_wide_bars = float(train_loss(pred, targ_wide_bars))
     assert 0.0 < loss_wide_bars < loss_tight_bars
+
+
+def test_diverged_sample_pays_validation_penalty_and_stays_nonfinite_in_training():
+    """A prediction with one non-finite point scores the chi of its finite points plus divergence_penalty_val,
+    so one diverged sample cannot turn val/loss.mean NaN.
+
+    Its training loss stays non-finite, so popsim masks the sample out of its step.
+    """
+    k = 2.0
+    ne = 1.5 * (1 - RHO**2)
+    te = 3.0 * (1 - RHO**2)
+    ne_pred = ne + k * SIGMA_FRAC * 1.5
+    ne_pred[3] = np.nan
+    pred, targ = _pred_and_targ(ne_pred, te - k * SIGMA_FRAC * 3.0, ne, te)
+    val_config = _val_config()
+
+    val_loss = float(ProfilePredictorTRB.get_val_loss_fn(val_config)(pred, targ))
+    train_loss = float(ProfilePredictorTRB.get_loss_fn(_train_config())(pred, targ))
+
+    assert val_loss == pytest.approx(2.0 * k + val_config["divergence_penalty_val"], rel=1e-3)
+    assert not np.isfinite(train_loss)
 
 
 def test_chi_floor_caps_tight_error_bars():

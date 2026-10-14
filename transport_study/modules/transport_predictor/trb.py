@@ -39,6 +39,7 @@ from transport_study.modules.trb_utils import (
     per_sample_device_values,
     per_sample_residual_scale,
     per_sample_sigma_floor,
+    replace_diverged_profiles,
     restore_from_checkpoint,
     submodule_config_dict,
     target_device_idx,
@@ -218,11 +219,7 @@ class TransportPredictorTRB(TrainRunBuilder):
             else:
                 # A diverged rollout is a failure of the model, not a missing measurement,
                 # so validation charges it the divergence penalty below instead of passing it through as NaN
-                ne_finite = jnp.isfinite(pred.ne)
-                te_finite = jnp.isfinite(pred.te)
-                ne_pred = jnp.where(ne_finite, pred.ne, ne_targ)
-                te_pred = jnp.where(te_finite, pred.te, te_targ)
-                diverged = ~(jnp.all(ne_finite, axis=-1) & jnp.all(te_finite, axis=-1))
+                ne_pred, te_pred, diverged = replace_diverged_profiles(pred.ne, pred.te, ne_targ, te_targ)
 
             # Only timeslices with a fresh profile measurement count for the profile terms, values and gradients alike
             profile_weights = sample_weights * targ["fresh_profile"].data

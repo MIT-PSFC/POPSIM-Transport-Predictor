@@ -41,6 +41,7 @@ from transport_study.modules.trb_utils import (
     normalizer_fit_dataset,
     per_sample_device_values,
     per_sample_sigma_floor,
+    replace_diverged_profiles,
     resolve_case_datasets,
     restore_from_checkpoint,
     target_device_idx,
@@ -175,7 +176,9 @@ class ProfilePredictorTRB(TrainRunBuilder):
                 if shape_type == ShapeType.PCA_LIKE:
                     te_shapes, ne_shapes = pca_initial_guess(n_shapes, ds[te_shape_var], ds[ne_shape_var], sample_dim)
                 elif shape_type == ShapeType.CONVEX_COMBINATION:
-                    te_shapes, ne_shapes = kmeans_initial_guess(n_shapes, ds[te_shape_var], ds[ne_shape_var], sample_dim)
+                    te_shapes, ne_shapes = kmeans_initial_guess(
+                        n_shapes, ds[te_shape_var], ds[ne_shape_var], sample_dim, seed=model_init_config["prng_seed"]
+                    )
                 else:
                     raise ValueError(f"Invalid shape type: {shape_type}")
 
@@ -276,17 +279,21 @@ class ProfilePredictorTRB(TrainRunBuilder):
         Summed over ne and Te, value chi plus gradient_weight times gradient chi, device-weighted.
         The error bars are floored per device at chi_sigma_floors from the loss config.
         Chi reads no huber delta, so the sweep metric val/loss.mean cannot be gamed by shrinking one.
+        A diverged (non-finite) prediction scores the chi of its finite points plus divergence_penalty_val,
+        so one diverged sample cannot turn val/loss.mean NaN (trb_utils.replace_diverged_profiles).
         """
         device_weights = loss_config.get("device_weights", {})
         gradient_weight = loss_config["gradient_weight"]
         sigma_floors = loss_config["chi_sigma_floors"]
+        divergence_penalty_val = loss_config["divergence_penalty_val"]
 
         def loss_fn(pred, targ):
             rho = pred.ne[RADIAL_DIM].data
             ds_source_idx = targ["ds_source_idx"].data
             sample_weights = per_sample_device_values(ds_source_idx, device_weights, 1.0)
-            loss = 0.0
-            for channel, pred_channel in (("n_e_1e20", pred.ne.data), ("t_e_keV", pred.te.data)):
+            ne_pred, te_pred, diverged = replace_diverged_profiles(pred.ne.data, pred.te.data, targ["n_e_1e20"].data, targ["t_e_keV"].data)
+            loss = divergence_penalty_val * diverged
+            for channel, pred_channel in (("n_e_1e20", ne_pred), ("t_e_keV", te_pred)):
                 targ_channel = targ[channel].data
                 value_error_var, grad_error_var = CHI_ERROR_VARS[channel]
                 value_floor = per_sample_sigma_floor(ds_source_idx, sigma_floors, value_error_var)

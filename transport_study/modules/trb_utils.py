@@ -203,6 +203,22 @@ def chi_profile_loss(
     return value_chi + gradient_weight * grad_chi
 
 
+def replace_diverged_profiles(
+    ne_pred: jnp.ndarray, te_pred: jnp.ndarray, ne_targ: jnp.ndarray, te_targ: jnp.ndarray
+) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+    """The predicted (..., rho) profiles with every non-finite value replaced by its target, and whether each timeslice diverged.
+
+    For the validation losses, which charge a diverged timeslice divergence_penalty_val instead of passing it through as NaN,
+    so one diverged sample cannot turn val/loss.mean NaN.
+    Training never replaces them: a non-finite loss lets popsim mask the sample,
+    where a finite stand-in leaves the gradient NaN and popsim skips the whole step.
+    """
+    ne_finite = jnp.isfinite(ne_pred)
+    te_finite = jnp.isfinite(te_pred)
+    diverged = ~(jnp.all(ne_finite, axis=-1) & jnp.all(te_finite, axis=-1))
+    return jnp.where(ne_finite, ne_pred, ne_targ), jnp.where(te_finite, te_pred, te_targ), diverged
+
+
 def chi_sigma_floors_of(datasets: list[xr.Dataset], label: str) -> dict[str, float]:
     """The peak-normalized error-bar floor of every CHI_ERROR_VARS variable over one device's fresh profiles in datasets.
 
