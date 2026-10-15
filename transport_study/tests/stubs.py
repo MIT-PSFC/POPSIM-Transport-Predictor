@@ -97,13 +97,13 @@ def open_launch_slots(partition: str) -> type:
     """A slurm_utils.LaunchSlots stand-in class, every job going to partition and never out of room."""
 
     class OpenLaunchSlots:
-        def pick(self, devices) -> str:
+        def pick(self, devices, mem: str) -> str:
             return partition
 
-        def available(self, partition_name: str, devices) -> int:
+        def available(self, partition_name: str, devices, mem: str) -> int:
             return 1000
 
-        def take(self, partition_name: str) -> None:
+        def take(self, partition_name: str, mem: str) -> None:
             pass
 
     return OpenLaunchSlots

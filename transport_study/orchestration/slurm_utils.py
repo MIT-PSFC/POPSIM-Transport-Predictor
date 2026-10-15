@@ -8,6 +8,7 @@ import tempfile
 import time
 from collections import Counter
 from collections.abc import Callable, Collection
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from enum import Enum
 from pathlib import Path
@@ -883,41 +884,74 @@ def _schedulable_node_free_cpus_mem(partition: str) -> dict[str, tuple[int, int]
     return node_free
 
 
-def open_cpu_slots(partition: str) -> int:
-    """CPU training or agent jobs worth submitting to this partition now, 0 if a query fails.
+@dataclass
+class CpuPartitionRoom:
+    """What one CPU partition can take in an orchestration pass, debited per accepted job of whatever size.
 
-    Each node fits as many cpu_train_cpus x train_mem jobs as its idle CPUs and unallocated memory allow,
-    counting what running jobs of a partition this one preempts hold there as free.
-    This user's pending jobs there claim slots already, beyond the cpu_pending_jobs allowed to pend,
+    node_free holds each node's free [CPUs, memory MB], what running jobs of a partition this one preempts hold there included.
+    pending_left is how many more jobs may pend beyond what fits now, cpu_pending_jobs less this user's pending jobs there.
+    It goes negative when more are pending, since those claim the first slots that free.
+    qos_room is the room under each per-user QOS cap of the partition, CPUs and memory MB.
+    """
+
+    node_free: list[list[int]]
+    pending_left: int
+    qos_room: dict[str, int]
+
+    def slots(self, job_cpus: int, job_mem_MB: int) -> int:
+        """Jobs of job_cpus CPUs and job_mem_MB worth submitting now.
+
+        Each node fits as many as its free CPUs and memory allow, the pending allowance adds to that, the QOS room bounds it.
+        """
+        fitting = sum(min(cpus // job_cpus, mem_MB // job_mem_MB) for cpus, mem_MB in self.node_free)
+        slots = fitting + self.pending_left
+        job_tres = {"cpu": job_cpus, "mem": job_mem_MB}
+        for key, room in self.qos_room.items():
+            slots = min(slots, room // job_tres[key])
+        return max(slots, 0)
+
+    def take(self, job_cpus: int, job_mem_MB: int) -> None:
+        """Debit one accepted job from the first node it fits on, else from the pending allowance, and from the QOS room."""
+        for node_free in self.node_free:
+            if node_free[0] >= job_cpus and node_free[1] >= job_mem_MB:
+                node_free[0] -= job_cpus
+                node_free[1] -= job_mem_MB
+                break
+        else:
+            self.pending_left -= 1
+        job_tres = {"cpu": job_cpus, "mem": job_mem_MB}
+        for key in self.qos_room:
+            self.qos_room[key] -= job_tres[key]
+
+
+def cpu_partition_room(partition: str) -> CpuPartitionRoom | None:
+    """The free CPUs and memory of the CPU partition, its pending allowance and its QOS room, None if a query fails.
+
+    Each node's idle CPUs and unallocated memory count what running jobs of a partition this one preempts hold there as free.
+    This user's pending jobs there claim room already, beyond the cpu_pending_jobs allowed to pend,
     so a freed slot is refilled without waiting for the next orchestration pass.
-    The partition's per-user QOS cpu and mem caps bound the rest.
     """
     node_free = _schedulable_node_free_cpus_mem(partition)
     evictable_partitions = _preemptable_partitions(partition)
     caps = partition_user_tres_caps(partition)
     pending_jobs = count_pending_jobs(partition)
     if node_free is None or evictable_partitions is None or caps is None or pending_jobs is None:
-        return 0
+        return None
     node_evictable_tres = _evictable_node_tres(list(node_free), evictable_partitions)
     if node_evictable_tres is None:
-        return 0
-    job_mem_MB = slurm_mem_MB(config.train_mem)
-    node_slots = []
+        return None
+    room_free = []
     for node, (idle_cpus, free_mem_MB) in node_free.items():
         evictable_tres = node_evictable_tres.get(node, dict.fromkeys(EVICTABLE_TRES, 0))
-        node_cpus = idle_cpus + evictable_tres["cpu"]
-        node_mem_MB = free_mem_MB + evictable_tres["mem"]
-        node_slots.append(min(node_cpus // config.cpu_train_cpus, node_mem_MB // job_mem_MB))
-    slots = sum(node_slots) + config.cpu_pending_jobs - pending_jobs
-    job_tres = {"cpu": config.cpu_train_cpus, "mem": job_mem_MB}
-    capped_tres = [key for key in job_tres if key in caps]
+        room_free.append([idle_cpus + evictable_tres["cpu"], free_mem_MB + evictable_tres["mem"]])
+    capped_tres = [key for key in ("cpu", "mem") if key in caps]
+    qos_room = {}
     if capped_tres:
         used = count_user_tres(partition)
         if used is None:
-            return 0
-        for key in capped_tres:
-            slots = min(slots, (caps[key] - used.get(key, 0)) // job_tres[key])
-    return max(slots, 0)
+            return None
+        qos_room = {key: caps[key] - used.get(key, 0) for key in capped_tres}
+    return CpuPartitionRoom(room_free, config.cpu_pending_jobs - pending_jobs, qos_room)
 
 
 class TrainingDevices(Enum):
@@ -940,6 +974,8 @@ class LaunchSlots:
     and a CPU-only one never goes there.
     Every other partition is read the first time a job may go there,
     and the user-wide job budget, read once, bounds them all.
+    A CPU partition is packed by each job's own memory (Study.training_mem) on its nodes (CpuPartitionRoom),
+    the GPU partitions count GPUs alone, since their memory does not bind.
     A failed query gives no slots, so nothing launches there this pass.
     """
 
@@ -947,7 +983,9 @@ class LaunchSlots:
         self._primary_read = False
         # (GPUs a job could take, this user's pending jobs) of the primary partition, None when a query failed
         self._primary_counts: tuple[int, int] | None = None
-        # Open slots of every other partition read so far, before this pass's debits and the user-wide budget
+        # The room of every CPU partition read so far, debited per accepted job, None when a query failed
+        self._cpu_rooms: dict[str, CpuPartitionRoom | None] = {}
+        # Open slots of every spillover partition read so far, before this pass's debits and the user-wide budget
         self._partition_slots: dict[str, int] = {}
         self._user_job_budget: int | None = None
         # Jobs SLURM accepted this pass, per partition
@@ -962,8 +1000,13 @@ class LaunchSlots:
                 self._primary_counts = (available_gpus, pending_jobs)
         return self._primary_counts
 
-    def available(self, partition: str, devices: TrainingDevices) -> int:
-        """Training or agent jobs of a model type running on devices worth submitting to this partition now."""
+    def _cpu_room(self, partition: str) -> CpuPartitionRoom | None:
+        if partition not in self._cpu_rooms:
+            self._cpu_rooms[partition] = cpu_partition_room(partition)
+        return self._cpu_rooms[partition]
+
+    def available(self, partition: str, devices: TrainingDevices, mem: str) -> int:
+        """Training or agent jobs of a model type running on devices, each asking mem, worth submitting to this partition now."""
         if partition == config.partition:
             if devices is TrainingDevices.CPU_ONLY:
                 return 0
@@ -976,17 +1019,22 @@ class LaunchSlots:
             else:
                 slots = max(available_gpus - config.buffer_gpus, 0) + config.gpu_pending_jobs - pending_jobs
             return max(slots - self._taken[partition], 0)
-        if partition not in self._partition_slots:
-            self._partition_slots[partition] = open_cpu_slots(partition) if partition in cpu_partitions() else spillover_slots(partition)
+        if partition in cpu_partitions():
+            cpu_room = self._cpu_room(partition)
+            # The room is debited per accepted job already
+            partition_left = cpu_room.slots(config.cpu_train_cpus, slurm_mem_MB(mem)) if cpu_room is not None else 0
+        else:
+            if partition not in self._partition_slots:
+                self._partition_slots[partition] = spillover_slots(partition)
+            partition_left = self._partition_slots[partition] - self._taken[partition]
         if self._user_job_budget is None:
             self._user_job_budget = user_job_budget()
         taken_off_primary = sum(count for taken_partition, count in self._taken.items() if taken_partition != config.partition)
-        partition_left = self._partition_slots[partition] - self._taken[partition]
         budget_left = self._user_job_budget - taken_off_primary
         return max(min(partition_left, budget_left), 0)
 
-    def pick(self, devices: TrainingDevices) -> str | None:
-        """Partition the next training or agent job of a model type running on devices should go to, or None to hold off launching.
+    def pick(self, devices: TrainingDevices, mem: str) -> str | None:
+        """Partition the next training or agent job of a model type running on devices, asking mem, should go to, or None to hold off launching.
 
         The first candidate with open slots wins:
         the primary GPU partition then the GPU spillover partitions for a GPU-only case,
@@ -1000,13 +1048,16 @@ class LaunchSlots:
         else:
             candidates = [config.partition, *config.spillover_partitions]
         for partition in candidates:
-            if self.available(partition, devices) > 0:
+            if self.available(partition, devices, mem) > 0:
                 return partition
         return None
 
-    def take(self, partition: str) -> None:
-        """Debit one job SLURM accepted on partition."""
+    def take(self, partition: str, mem: str) -> None:
+        """Debit one job asking mem that SLURM accepted on partition."""
         self._taken[partition] += 1
+        cpu_room = self._cpu_rooms.get(partition)
+        if cpu_room is not None:
+            cpu_room.take(config.cpu_train_cpus, slurm_mem_MB(mem))
 
 
 @_cache_resolved
@@ -1116,9 +1167,9 @@ def _sbatch_gpu_job(build_script: Callable[[str, str | None], str], job_name: st
 
 
 def _submit_training_job(
-    job_name: str, partition: str, time_limit: str, log_path: Path | str, script_path: Path | str, job_setup: str, kind: str
+    job_name: str, partition: str, time_limit: str, log_path: Path | str, script_path: Path | str, job_setup: str, kind: str, mem: str
 ) -> int | None:
-    """Submit a training or agent job, returns the job id SLURM accepted it under, None when it did not.
+    """Submit a training or agent job asking mem, returns the job id SLURM accepted it under, None when it did not.
 
     On a CPU partition it is a CPU job of cpu_train_cpus CPUs, anywhere else a one-GPU job.
     job_setup holds the job's own shell lines, the device banner goes in front and the device environment after.
@@ -1126,14 +1177,14 @@ def _submit_training_job(
     if partition in cpu_partitions():
         setup = CPU_JOB_BANNER.format(job_name=job_name) + job_setup + CPU_JOB_ENV
         script = sbatch_script(
-            job_name, partition, time_limit, log_path, script_path, setup, mem=config.train_mem, requeue=True, cpus=config.cpu_train_cpus
+            job_name, partition, time_limit, log_path, script_path, setup, mem=mem, requeue=True, cpus=config.cpu_train_cpus
         )
         return submit_sbatch(script, job_name, kind)
     setup = GPU_JOB_BANNER.format(job_name=job_name) + job_setup + GPU_JOB_ENV
 
     def build_script(gres: str, exclude: str | None) -> str:
         return sbatch_script(
-            job_name, partition, time_limit, log_path, script_path, setup, mem=config.train_mem, gres=gres, exclude=exclude, requeue=True
+            job_name, partition, time_limit, log_path, script_path, setup, mem=mem, gres=gres, exclude=exclude, requeue=True
         )
 
     return _sbatch_gpu_job(build_script, job_name, partition, kind)
@@ -1177,6 +1228,7 @@ def launch_train_parallel(
     job_name: str,
     result_path: Path | str,
     log_path: Path | str,
+    mem: str,
     partition: str | None = None,
 ) -> int | None:
     """Submit a SLURM job that runs training serially and saves results to result_path.
@@ -1188,6 +1240,7 @@ def launch_train_parallel(
         job_name: The SLURM job name.
         result_path: Path where the seed result (seed_results.seed_result) will be saved as NetCDF.
         log_path: The job's SLURM stdout/stderr log, its directory also holds the job's script and configs.
+        mem: The job's sbatch --mem (Study.training_mem).
         partition: The SLURM partition to submit to.
     """
     if partition is None:
@@ -1247,7 +1300,7 @@ Path({str(study_config_path)!r}).unlink()
         script_path = f.name
 
     # Save results to netcdf only, no need to sync wandb runs online from batch jobs
-    return _submit_training_job(job_name, partition, time_limit, log_path, script_path, "\nexport WANDB_MODE=offline\n\n", "training")
+    return _submit_training_job(job_name, partition, time_limit, log_path, script_path, "\nexport WANDB_MODE=offline\n\n", "training", mem)
 
 
 def launch_agent_parallel(
@@ -1256,6 +1309,7 @@ def launch_agent_parallel(
     kwargs_agent: dict,
     job_name: str,
     log_dir: Path | str,
+    mem: str,
     partition: str | None = None,
 ) -> int | None:
     """Submit a SLURM job that launches a W&B agent for an existing sweep, returns the accepted job id or None.
@@ -1266,6 +1320,7 @@ def launch_agent_parallel(
         kwargs_agent: Keyword arguments for ``wandb.agent``.
         job_name: The SLURM job name.
         log_dir: Directory for SLURM stdout/stderr logs.
+        mem: The job's sbatch --mem (Study.training_mem).
         partition: The SLURM partition to submit to.
     """
     if partition is None:
@@ -1309,7 +1364,7 @@ Path({str(study_config_path)!r}).unlink()
     with open(script_path, "w") as f:
         f.write(py_script)
 
-    return _submit_training_job(job_name, partition, time_limit, log_path, script_path, "\n", "agent")
+    return _submit_training_job(job_name, partition, time_limit, log_path, script_path, "\n", "agent", mem)
 
 
 def launch_collect_results_job(study, cpus: int) -> int | None:

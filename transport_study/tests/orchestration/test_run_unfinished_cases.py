@@ -14,7 +14,7 @@ import xarray as xr
 from popsim.ml import TrainConfig
 from popsim.ml.checkpointing import checkpoint_step_path
 
-from transport_study.config import config
+from transport_study.config import config, slurm_mem_MB
 from transport_study.modules.trb_utils import CHECKPOINT_FORMAT
 from transport_study.orchestration import slurm_utils
 from transport_study.orchestration import study as study_module
@@ -297,7 +297,7 @@ def test_cases_launch_gpu_only_then_cpu_only_then_cpu_capable(make_stub_study, m
     class OneGpuPerPass:
         """LaunchSlots stand-in, the one GPU of a pass taken by the first pick that may take a GPU."""
 
-        def pick(self, devices):
+        def pick(self, devices, mem):
             if devices is not TrainingDevices.CPU_ONLY and gpu_slots.open > 0:
                 gpu_slots.open -= 1
                 return "gpu"
@@ -322,6 +322,49 @@ def test_cases_launch_gpu_only_then_cpu_only_then_cpu_capable(make_stub_study, m
     study.run_unfinished_cases(skip_tuning=True, enable_parallelism=True)
 
     assert launches == [("case.b", "gpu"), ("case.d", "cpu"), ("case.a", "cpu"), ("case.c", "gpu")]
+
+
+def test_case_finding_no_room_holds_only_cases_asking_as_much_memory(make_stub_study, monkeypatch):
+    """The CPU partition has room for 12G jobs but not 80G ones in the first pass, for both in the next.
+
+    The 80G case.a finds no slot, but the 12G case.b after it launches in the same pass instead of waiting behind it.
+    """
+    big = StubCase(name="case.a", model_type="big_type")
+    small = StubCase(name="case.b", model_type="small_type")
+    study = make_stub_study(
+        [big, small],
+        partition="gpu",
+        cpu_partition="cpu",
+        cpu_only_model_types=("big_type", "small_type"),
+        train_mem_by_model_type={"big_type": "80G", "small_type": "12G"},
+    )
+    room = SimpleNamespace(largest_mem_MB=slurm_mem_MB("40G"))
+
+    class SmallJobsFirstPass:
+        """LaunchSlots stand-in, the CPU partition taking jobs up to room.largest_mem_MB."""
+
+        def pick(self, devices, mem):
+            return "cpu" if slurm_mem_MB(mem) <= room.largest_mem_MB else None
+
+    launches: list[str] = []
+
+    def run_case(case, seed, skip_tuning, enable_parallelism, partition=None):
+        launches.append(str(case))
+        result_path = study.result_path(case)
+        result_path.parent.mkdir(parents=True, exist_ok=True)
+        result_path.touch()
+        return True
+
+    monkeypatch.setattr(study_module, "LaunchSlots", SmallJobsFirstPass)
+    monkeypatch.setattr(study_module, "get_running_job_names", lambda: set())
+    monkeypatch.setattr(study_module, "get_running_job_elapsed_s", lambda partition=None: {})
+    monkeypatch.setattr(study_module, "recent_submitted_jobs", lambda name_prefix, name_suffix: {})
+    monkeypatch.setattr(study_module.time, "sleep", lambda s: setattr(room, "largest_mem_MB", slurm_mem_MB("100G")))
+    monkeypatch.setattr(study, "run_case", run_case)
+
+    study.run_unfinished_cases(skip_tuning=True, enable_parallelism=True)
+
+    assert launches == ["case.b", "case.a"]
 
 
 def test_every_seed_trains_and_their_merge_finishes_the_case(make_stub_study, monkeypatch):

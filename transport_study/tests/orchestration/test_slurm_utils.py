@@ -6,14 +6,15 @@ from types import SimpleNamespace
 
 import pytest
 
-from transport_study.config import StudyConfig, load_config
+from transport_study.config import StudyConfig, load_config, slurm_mem_MB
 from transport_study.orchestration import slurm_utils
 from transport_study.orchestration.slurm_utils import (
+    CpuPartitionRoom,
     LaunchSlots,
     TrainingDevices,
     count_idle_gpus,
+    cpu_partition_room,
     importable_module,
-    open_cpu_slots,
     parse_slurm_time_s,
     resources_available,
 )
@@ -153,15 +154,15 @@ def test_gpu_buffers_share_one_primary_count_read_once_per_pass(monkeypatch):
 
     _serve_fake_slurm(monkeypatch, recorded_stdout)
     slots = LaunchSlots()
-    assert slots.available("fake_psfc_gpu", TrainingDevices.GPU_ONLY) == 4
+    assert slots.available("fake_psfc_gpu", TrainingDevices.GPU_ONLY, "48G") == 4
     n_commands_first_read = len(slurm_commands)
 
-    assert slots.available("fake_psfc_gpu", TrainingDevices.CPU_CAPABLE) == 2
-    slots.take("fake_psfc_gpu")
-    slots.take("fake_psfc_gpu")
-    assert slots.available("fake_psfc_gpu", TrainingDevices.GPU_ONLY) == 2
-    assert slots.available("fake_psfc_gpu", TrainingDevices.CPU_CAPABLE) == 0
-    assert slots.pick(TrainingDevices.GPU_ONLY) == "fake_psfc_gpu"
+    assert slots.available("fake_psfc_gpu", TrainingDevices.CPU_CAPABLE, "48G") == 2
+    slots.take("fake_psfc_gpu", "48G")
+    slots.take("fake_psfc_gpu", "48G")
+    assert slots.available("fake_psfc_gpu", TrainingDevices.GPU_ONLY, "48G") == 2
+    assert slots.available("fake_psfc_gpu", TrainingDevices.CPU_CAPABLE, "48G") == 0
+    assert slots.pick(TrainingDevices.GPU_ONLY, "48G") == "fake_psfc_gpu"
     assert len(slurm_commands) == n_commands_first_read
 
 
@@ -173,7 +174,7 @@ def test_gpu_only_slots_are_the_gpus_past_the_buffer_plus_the_queue_allowance(mo
     """Of 3 available GPUs the buffer leaves some idle, never fewer than none, and gpu_pending_jobs more jobs may wait in the queue."""
     _fake_config(partition="fake_psfc_gpu", buffer_gpus=buffer_gpus, gpu_pending_jobs=gpu_pending_jobs)
     _serve_fake_slurm(monkeypatch, _fake_slurm_stdout)
-    assert LaunchSlots().available("fake_psfc_gpu", TrainingDevices.GPU_ONLY) == gpu_only_slots
+    assert LaunchSlots().available("fake_psfc_gpu", TrainingDevices.GPU_ONLY, "48G") == gpu_only_slots
 
 
 @pytest.mark.parametrize(
@@ -192,13 +193,16 @@ def test_gpu_only_slots_are_the_gpus_past_the_buffer_plus_the_queue_allowance(mo
 )
 def test_each_device_kind_is_placed_on_its_own_partitions(monkeypatch, devices, cpu_capable_buffer_gpus, cpu_slots, partition):
     """3 GPUs idle on the primary partition, cpu_slots jobs fitting on the CPU partition."""
-    _fake_config(partition="fake_gpu", cpu_partition="fake_cpu", buffer_gpus=0, cpu_capable_buffer_gpus=cpu_capable_buffer_gpus)
+    _fake_config(
+        partition="fake_gpu", cpu_partition="fake_cpu", cpu_train_cpus=4, buffer_gpus=0, cpu_capable_buffer_gpus=cpu_capable_buffer_gpus
+    )
     monkeypatch.setattr(slurm_utils, "count_available_gpus", lambda partition_name: 3)
     monkeypatch.setattr(slurm_utils, "count_pending_jobs", lambda partition_name=None: 0)
-    monkeypatch.setattr(slurm_utils, "open_cpu_slots", lambda partition_name: cpu_slots)
+    # cpu_slots nodes with room for one job of 4 CPUs and 48G each
+    monkeypatch.setattr(slurm_utils, "cpu_partition_room", lambda partition_name: CpuPartitionRoom([[4, 49152]] * cpu_slots, 0, {}))
     monkeypatch.setattr(slurm_utils, "user_job_budget", lambda: 100)
 
-    assert LaunchSlots().pick(devices) == partition
+    assert LaunchSlots().pick(devices, "48G") == partition
 
 
 # (node, allocated/idle/other/total CPUs, memory MB, allocated memory MB, state) of a CPU partition
@@ -218,7 +222,7 @@ FAKE_USER_CPU_TRES = ["cpu=4,mem=48G,node=1,billing=4"] * 3
 def _fake_cpu_slurm_stdout(qos_caps: str | None):
     """qos_caps is the MaxTRESPU of the partition's QOS, None for a partition without a QOS.
 
-    The scheduler preempts nothing (see test_open_cpu_slots_counts_preemptable_jobs_as_free).
+    The scheduler preempts nothing (see test_cpu_partition_room_counts_preemptable_jobs_as_free).
     """
 
     def fake_stdout(cmd: list[str]) -> str:
@@ -258,10 +262,27 @@ def _fake_cpu_slurm_stdout(qos_caps: str | None):
         ("fake_cpu_capped_allowance", "cpu=96,mem=386G", 2, 5),
     ],
 )
-def test_open_cpu_slots_fits_jobs_by_cpus_memory_and_qos(monkeypatch, partition, qos_caps, cpu_pending_jobs, slots):
-    _fake_config(cpu_partition=partition, cpu_train_cpus=4, train_mem="48G", cpu_pending_jobs=cpu_pending_jobs)
+def test_cpu_partition_room_fits_jobs_by_cpus_memory_and_qos(monkeypatch, partition, qos_caps, cpu_pending_jobs, slots):
+    _fake_config(cpu_partition=partition, cpu_pending_jobs=cpu_pending_jobs)
     _serve_fake_slurm(monkeypatch, _fake_cpu_slurm_stdout(qos_caps))
-    assert open_cpu_slots(partition) == slots
+    assert cpu_partition_room(partition).slots(4, slurm_mem_MB("48G")) == slots
+
+
+def test_cpu_partition_room_packs_jobs_by_their_own_memory(monkeypatch):
+    """Jobs of 4 CPUs on FAKE_CPU_NODES, where cpu_pending_jobs 2 less the 1 pending job lets 1 more pend.
+
+    12G fits 8 + 10 + 1 on cpu01 / cpu02 / cpu04 and 80G 1 + 4 + 0, the pending one more each.
+    A 48G job goes to cpu01, the first node it fits on, which then has room for 4 of 12G.
+    A 500G job fits no node and takes the last of the pending allowance.
+    """
+    _fake_config(cpu_partition="fake_cpu_mixed", cpu_pending_jobs=2)
+    _serve_fake_slurm(monkeypatch, _fake_cpu_slurm_stdout(None))
+    room = cpu_partition_room("fake_cpu_mixed")
+    assert (room.slots(4, slurm_mem_MB("12G")), room.slots(4, slurm_mem_MB("80G"))) == (20, 6)
+    room.take(4, slurm_mem_MB("48G"))
+    assert room.slots(4, slurm_mem_MB("12G")) == 16
+    room.take(4, slurm_mem_MB("500G"))
+    assert (room.slots(4, slurm_mem_MB("12G")), room.slots(4, slurm_mem_MB("500G"))) == (15, 0)
 
 
 # (node, allocated/idle/other/total CPUs, memory MB, allocated memory MB, state) of fake_psfc_cpu
@@ -316,7 +337,7 @@ def _fake_cpu_eviction_slurm_stdout(job_detail_queries: list[str]):
     return fake_stdout
 
 
-def test_open_cpu_slots_counts_preemptable_jobs_as_free(monkeypatch):
+def test_cpu_partition_room_counts_preemptable_jobs_as_free(monkeypatch):
     """CPUs and memory held by lower-tier preemptable jobs on nodes taking jobs count as free.
 
     cpu21: job 201's 16 CPUs and 96G fit 2 jobs of 4 CPUs and 48G, the tier 25 job 202 is not preemptable.
@@ -324,21 +345,21 @@ def test_open_cpu_slots_counts_preemptable_jobs_as_free(monkeypatch):
     cpu23: the tier 100 job 204 is not preemptable, and drained cpu24 counts nothing.
     Only the two-node job 203 needs its scontrol detail, a one-node job's squeue tres-alloc is its node's share.
     """
-    _fake_config(cpu_partition="fake_psfc_cpu", cpu_train_cpus=4, train_mem="48G")
+    _fake_config(cpu_partition="fake_psfc_cpu")
     job_detail_queries: list[str] = []
     _serve_fake_slurm(monkeypatch, _fake_cpu_eviction_slurm_stdout(job_detail_queries))
-    assert open_cpu_slots("fake_psfc_cpu") == 18
+    assert cpu_partition_room("fake_psfc_cpu").slots(4, slurm_mem_MB("48G")) == 18
     assert job_detail_queries == ["203"]
 
 
 def test_cpu_partitions_keep_the_user_job_budget_without_spillover(monkeypatch):
     """With no GPU spillover configured the user-wide job ceiling still bounds a CPU partition: 10 - 2 - 7 jobs leaves 1."""
-    _fake_config(cpu_partition="fake_cpu_budget", max_user_jobs=10, spillover_job_headroom=2, spillover_partitions=(), train_mem="48G")
+    _fake_config(cpu_partition="fake_cpu_budget", cpu_train_cpus=4, max_user_jobs=10, spillover_job_headroom=2, spillover_partitions=())
     _serve_fake_slurm(monkeypatch, _fake_cpu_slurm_stdout(""))
     slots = LaunchSlots()
-    assert slots.available("fake_cpu_budget", TrainingDevices.CPU_ONLY) == 1
-    slots.take("fake_cpu_budget")
-    assert slots.available("fake_cpu_budget", TrainingDevices.CPU_ONLY) == 0
+    assert slots.available("fake_cpu_budget", TrainingDevices.CPU_ONLY, "48G") == 1
+    slots.take("fake_cpu_budget", "48G")
+    assert slots.available("fake_cpu_budget", TrainingDevices.CPU_ONLY, "48G") == 0
 
 
 def test_importable_module_normal():

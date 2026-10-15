@@ -216,12 +216,16 @@ class StudyConfig(BaseModel):
     cpu_capable_buffer_gpus: Orchestration[int] = Field(
         default_factory=lambda: int(os.environ.get("PTPS_CPU_CAPABLE_BUFFER_GPUS", "0")), ge=0
     )
-    # Jobs allowed to pend on each CPU partition beyond what fits on it now (slurm_utils.open_cpu_slots),
+    # Jobs allowed to pend on each CPU partition beyond what fits on it now (slurm_utils.cpu_partition_room),
     # so SLURM refills a freed slot without waiting for the next orchestration pass
     cpu_pending_jobs: Orchestration[int] = Field(default_factory=lambda: int(os.environ.get("PTPS_CPU_PENDING_JOBS", "0")), ge=0)
-    # sbatch --mem of every training and agent job, GPU or CPU.
+    # sbatch --mem of the training and agent jobs of every model type train_mem_by_model_type does not list, GPU or CPU.
     # A CPU job also holds the device arrays in host RAM, so size it from the CPU peak.
     train_mem: Orchestration[str] = Field(default_factory=lambda: os.environ.get("PTPS_TRAIN_MEM", "120G"))
+    # sbatch --mem of the training and agent jobs of each listed model type, on either device.
+    # Prereq pseudo types count by their own name (p_oh, power_balance, profile).
+    # No env var, the valid names differ per study.
+    train_mem_by_model_type: Orchestration[dict[str, str]] = Field(default_factory=dict)
     # Ceiling on this user's running + pending jobs across all partitions.
     # The default is the mit_preemptable QOS MaxSubmitPU (448), the tightest limit that applies.
     max_user_jobs: Orchestration[int] = Field(default_factory=lambda: int(os.environ.get("PTPS_MAX_USER_JOBS", "448")))
@@ -285,6 +289,14 @@ class StudyConfig(BaseModel):
         """A SLURM memory size, so a typo fails when the config loads instead of at sbatch."""
         slurm_mem_MB(mem)
         return mem
+
+    @field_validator("train_mem_by_model_type")
+    @classmethod
+    def _check_slurm_mems(cls, mems: dict[str, str]) -> dict[str, str]:
+        """Every listed memory a SLURM memory size, as _check_slurm_mem checks one."""
+        for mem in mems.values():
+            slurm_mem_MB(mem)
+        return mems
 
     @model_validator(mode="after")
     def _apply_debug_limits(self):

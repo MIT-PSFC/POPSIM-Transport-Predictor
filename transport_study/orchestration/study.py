@@ -45,6 +45,7 @@ from transport_study.config import (
     config,
     env_dataset_paths,
     load_config,
+    slurm_mem_MB,
     source_devices,
 )
 from transport_study.modules.normalization import (
@@ -229,7 +230,12 @@ def recorded_batches_per_epoch(working_dir: Path) -> dict[str, dict]:
 
 def model_type_field_choices(model_types: tuple[str, ...]) -> dict[str, tuple]:
     """The FIELD_CHOICES entries of the config fields that name a study's model types."""
-    return {"model_types": model_types, "gpu_only_model_types": model_types, "cpu_only_model_types": model_types}
+    return {
+        "model_types": model_types,
+        "gpu_only_model_types": model_types,
+        "cpu_only_model_types": model_types,
+        "train_mem_by_model_type": model_types,
+    }
 
 
 def model_size_updates(model_size: str, sweep_model_init_parameters: dict, model_init_config: dict) -> dict:
@@ -395,7 +401,8 @@ class CaseGridConfig(StudyConfig):
     # Seed s of a case restores seed s of every case it restores from (Study._seeded_train_config)
     num_seeds: int = Field(default=5, ge=1)
 
-    # Field name -> its valid values. A tuple field must hold valid values only, a scalar field must be one.
+    # Field name -> its valid values.
+    # A tuple field must hold valid values only, a dict field valid keys only, a scalar field must be one.
     # The choices of every class in the hierarchy apply, a subclass adds its own (model_type_field_choices among them)
     FIELD_CHOICES: ClassVar[dict[str, tuple]] = {"target_shot_orders": TARGET_SHOT_ORDERS, "model_sizes": MODEL_SIZES}
 
@@ -406,7 +413,7 @@ class CaseGridConfig(StudyConfig):
             field_choices.update(vars(klass).get("FIELD_CHOICES", {}))
         for field_name, valid in field_choices.items():
             value = getattr(self, field_name)
-            values = value if isinstance(value, tuple) else (value,)
+            values = tuple(value) if isinstance(value, (tuple, dict)) else (value,)
             invalid = [item for item in values if item not in valid]
             if invalid:
                 raise ValueError(f"Invalid {field_name}: {invalid}. Must be among {valid}.")
@@ -1566,6 +1573,10 @@ class Study:
             return TrainingDevices.CPU_ONLY
         return TrainingDevices.CPU_CAPABLE
 
+    def training_mem(self, case: Case) -> str:
+        """The sbatch --mem of the case's training and sweep agent jobs, its model type's in train_mem_by_model_type, else train_mem."""
+        return config.train_mem_by_model_type.get(case.model_type, config.train_mem)
+
     def run_unfinished_cases(self, skip_tuning: bool, enable_parallelism: bool):
         """Loop until every runnable case has a result file.
 
@@ -1675,24 +1686,28 @@ class Study:
         A CPU-capable case only takes the primary GPUs the GPU-only cases of this pass leave beyond cpu_capable_buffer_gpus,
         and the CPU slots the CPU-only cases leave.
         So it still tries the primary after a GPU-only case found it full, since its GPU buffer may be the smaller one.
-        A seed finding no partition holds the remaining cases of its kind until the next pass,
-        and a CPU-capable one finding none holds the CPU-only cases too, since the CPU partitions are full.
+        A seed finding no partition holds the remaining cases of its kind asking at least its memory until the next pass,
+        and a CPU-capable one finding none holds those CPU-only cases too, since the CPU partitions have no room that size.
+        A smaller job of the kind may still fit, so it keeps trying.
         A case that cannot train yet (still tuning, or its prereqs unmet) holds its other seeds.
         The cases still tuning go last, each reads its wandb project (about 20 s) before any training launch could wait on it.
         """
         launch_order = sorted(to_launch, key=lambda case_seeds: self._launch_rank(case_seeds[0]))
-        held_devices: set[TrainingDevices] = set()
+        # The smallest memory request of each kind that found no partition this pass
+        held_mem_MB: dict[TrainingDevices, int] = {}
         for case, seeds in launch_order:
             devices = self.training_devices(case)
-            if devices in held_devices:
+            mem = self.training_mem(case)
+            mem_MB = slurm_mem_MB(mem)
+            if mem_MB >= held_mem_MB.get(devices, math.inf):
                 continue
             for seed in seeds:
-                partition = self.launch_slots.pick(devices)
+                partition = self.launch_slots.pick(devices, mem)
                 if partition is None:
-                    logger.info(f"No open slots for the ready {devices.value} cases, holding them until the next pass")
-                    held_devices.add(devices)
-                    if devices is TrainingDevices.CPU_CAPABLE:
-                        held_devices.add(TrainingDevices.CPU_ONLY)
+                    logger.info(f"No open slots for the ready {devices.value} cases of {mem} or more, holding them until the next pass")
+                    held_kinds = [devices, TrainingDevices.CPU_ONLY] if devices is TrainingDevices.CPU_CAPABLE else [devices]
+                    for held_kind in held_kinds:
+                        held_mem_MB[held_kind] = min(held_mem_MB.get(held_kind, mem_MB), mem_MB)
                     break
                 if not self.run_case(case, seed, skip_tuning=skip_tuning, enable_parallelism=True, partition=partition):
                     break
@@ -1738,7 +1753,7 @@ class Study:
     def _run_ready_case(self, case: Case, seed: int, skip_tuning: bool, enable_parallelism: bool, partition: str | None) -> bool:
         """Launch one seed of a case whose prereqs are satisfied, returns whether the case was ready to train."""
         if enable_parallelism and partition is None:
-            partition = self.launch_slots.pick(self.training_devices(case))
+            partition = self.launch_slots.pick(self.training_devices(case), self.training_mem(case))
             if partition is None:
                 logger.debug("No resources currently available, waiting before trying again...")
                 return False
@@ -1887,7 +1902,8 @@ class Study:
             outstanding_for_count = config.hyperparam_sweeps - n_completed_runs - running_agents
             outstanding_for_finished = min_finished - n_finished_runs - running_agents
             outstanding_trials = max(outstanding_for_count, outstanding_for_finished)
-            capacity = self.launch_slots.available(partition, self.training_devices(case))
+            mem = self.training_mem(case)
+            capacity = self.launch_slots.available(partition, self.training_devices(case), mem)
             agent_room = config.max_running_agents - running_agents
             sweep_jobs = min(capacity, agent_room, outstanding_trials)
             if sweep_jobs <= 0:
@@ -1902,10 +1918,11 @@ class Study:
                     agent_job_name,
                     Path(self.log_dir) / "logs_sweep",
                     partition=partition,
+                    mem=mem,
                 )
                 if job_id is None:
                     break
-                self.launch_slots.take(partition)
+                self.launch_slots.take(partition, mem)
         else:
             logger.info("Launching agent serially")
             launch_agent(train_config, sweep_id, kwargs_agent=kwargs_agent)
@@ -1956,19 +1973,21 @@ class Study:
         seed_result_path = self.seed_result_path(case, seed)
         if enable_parallelism:
             logger.info(f"Launching training job {train_job_name} for case\n{case}")
+            mem = self.training_mem(case)
             job_id = launch_train_parallel(
                 train_config,
                 train_job_name,
                 seed_result_path,
                 self.train_log_path(case, seed),
                 partition=partition,
+                mem=mem,
             )
             if job_id is None:
                 # Nothing ran, so a rejected submission does not count toward MAX_TRAIN_ATTEMPTS
                 self.train_attempts[train_job_name] = attempts
             else:
                 self.submitted_train_jobs[train_job_name] = SubmittedJob(job_id, time.time())
-                self.launch_slots.take(partition)
+                self.launch_slots.take(partition, mem)
         else:
             logger.info("Launching training serially")
             trainer, _, _, _, result_dict = launch_train(train_config)

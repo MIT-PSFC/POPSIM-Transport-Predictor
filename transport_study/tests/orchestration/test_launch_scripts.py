@@ -71,7 +71,7 @@ def assert_script_valid(script_path: Path):
 
 
 def test_launch_agent_parallel_script_compiles(tmp_path, loaded_config, train_config, submitted_scripts):
-    slurm_utils.launch_agent_parallel(train_config, "sweep123", {"count": 1}, "agent_test_job", tmp_path)
+    slurm_utils.launch_agent_parallel(train_config, "sweep123", {"count": 1}, "agent_test_job", tmp_path, "48G")
 
     assert len(submitted_scripts) == 1
     scripts = list(tmp_path.glob("agent_test_job_*/run_agent.py"))
@@ -83,7 +83,7 @@ def test_launch_agent_parallel_script_compiles(tmp_path, loaded_config, train_co
 
 
 def test_launch_train_parallel_script_compiles(tmp_path, loaded_config, train_config, submitted_scripts):
-    slurm_utils.launch_train_parallel(train_config, "train_test_job", tmp_path / "result.nc", tmp_path / "train_test_job.log")
+    slurm_utils.launch_train_parallel(train_config, "train_test_job", tmp_path / "result.nc", tmp_path / "train_test_job.log", "48G")
 
     assert len(submitted_scripts) == 1
     scripts = list(tmp_path.glob("train_test_job_script_*.py"))
@@ -92,7 +92,7 @@ def test_launch_train_parallel_script_compiles(tmp_path, loaded_config, train_co
 
 
 def test_cpu_partition_job_requests_cpus_and_no_gpu(tmp_path, train_config, submitted_scripts):
-    """A training job on a CPU partition asks for no GPU and pins jax to the CPU, with the configured CPUs and memory."""
+    """A training job on a CPU partition asks for no GPU and pins jax to the CPU, with the configured CPUs and its own memory."""
     load_config(
         StudyConfig(
             study_name="launch_script_test",
@@ -101,11 +101,10 @@ def test_cpu_partition_job_requests_cpus_and_no_gpu(tmp_path, train_config, subm
             partition="fake_gpu_partition",
             cpu_partition="fake_cpu_partition",
             cpu_train_cpus=8,
-            train_mem="48G",
         )
     )
     slurm_utils.launch_train_parallel(
-        train_config, "train_cpu_job", tmp_path / "result.nc", tmp_path / "train_cpu_job.log", partition="fake_cpu_partition"
+        train_config, "train_cpu_job", tmp_path / "result.nc", tmp_path / "train_cpu_job.log", "48G", partition="fake_cpu_partition"
     )
 
     (script,) = submitted_scripts
