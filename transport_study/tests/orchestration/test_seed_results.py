@@ -3,7 +3,7 @@
 Aggregation is driven with small hand-built xr.Datasets shaped like the
 study_results outputs (data vars error_abs_ts / error_rel_shot / energy_mhd_MJ_pred /
 energy_mhd_MJ_targ over dims shot, time_idx), no training needed.
-The merge tests save real orbax checkpoints on tmp_path.
+The merge tests save real checkpoints in the study's CHECKPOINT_FORMAT on tmp_path.
 """
 
 import os
@@ -17,13 +17,13 @@ import xarray as xr
 from popsim.ml import TrainConfig
 from popsim.ml.checkpointing import (
     TrainState,
+    checkpoint_step_path,
     create_default_checkpoint_manager,
-    restore_model,
     save_train_state,
 )
 
 import transport_study.orchestration.study as study_module
-from transport_study.modules.trb_utils import restore_from_checkpoint
+from transport_study.modules.trb_utils import CHECKPOINT_FORMAT, restore_from_checkpoint
 from transport_study.orchestration.seed_results import (
     BEST_SEED_ATTR,
     SEED_BEST_EPOCH_VAR,
@@ -164,7 +164,7 @@ def test_launch_train_seeds_its_init_shuffle_and_checkpoint_dir(make_stub_study,
 
 def _train_seed(study, case, seed: int, epoch_losses: dict[int, float]) -> int:
     """Save one seed's checkpoints as training would, then write its seed result. Returns its best epoch."""
-    manager = create_default_checkpoint_manager(study.seed_model_dir(case, seed), max_to_keep=1)
+    manager = create_default_checkpoint_manager(study.seed_model_dir(case, seed), max_to_keep=1, checkpoint_format=CHECKPOINT_FORMAT)
     for epoch, loss in epoch_losses.items():
         # Each checkpoint's weights tag the seed and the epoch
         weights = jnp.full((2,), 10.0 * seed + epoch)
@@ -189,9 +189,9 @@ def test_merge_keeps_only_the_best_seeds_best_checkpoint(make_stub_study):
     result_ds = xr.load_dataset(study.result_path(case))
     assert result_ds.attrs[BEST_SEED_ATTR] == 1
     model_dir = study.trained_model_dir(case)
-    assert [path.name for path in model_dir.iterdir()] == [str(best_epoch)]
+    assert list(model_dir.iterdir()) == [checkpoint_step_path(model_dir, best_epoch, CHECKPOINT_FORMAT)]
     assert not study.seed_result_path(case, 0).exists()
-    restored = restore_model(create_default_checkpoint_manager(model_dir), _TinyModel(w=jnp.zeros(2)))
+    restored = restore_from_checkpoint(_TinyModel(w=jnp.zeros(2)), model_dir)
     assert float(restored.w[0]) == 10.0 * 1 + best_epoch
 
 
@@ -201,12 +201,14 @@ def test_interrupted_merge_reruns_cleanly(make_stub_study):
     study = make_stub_study([case], num_seeds=2)
     best_epoch = _train_seed(study, case, 0, {1: 0.2, 2: 0.7})
     _train_seed(study, case, 1, {1: 0.9, 2: 0.8})
-    os.rename(study.seed_model_dir(case, 0) / str(best_epoch), study.trained_model_dir(case) / str(best_epoch))
+    seed_checkpoint_path = checkpoint_step_path(study.seed_model_dir(case, 0), best_epoch, CHECKPOINT_FORMAT)
+    best_checkpoint_path = checkpoint_step_path(study.trained_model_dir(case), best_epoch, CHECKPOINT_FORMAT)
+    os.rename(seed_checkpoint_path, best_checkpoint_path)
 
     study.merge_seed_results(case)
 
     assert study.result_path(case).exists()
-    assert [path.name for path in study.trained_model_dir(case).iterdir()] == [str(best_epoch)]
+    assert list(study.trained_model_dir(case).iterdir()) == [best_checkpoint_path]
 
 
 def test_restored_case_merge_keeps_each_seeds_best_checkpoint(make_stub_study):
@@ -220,8 +222,8 @@ def test_restored_case_merge_keeps_each_seeds_best_checkpoint(make_stub_study):
     1. copies seed 1's epoch 2 checkpoint up into the case dir, where unseeded restores read
     2. deletes epoch 3 from each seed dir, so each keeps only its own best checkpoint
 
-    After it the case dir holds 2/, seed_0/2/ and seed_1/2/,
-    and a restore of the case dir reads 2/ and skips the seed dirs.
+    After it the case dir holds checkpoint 2, seed_0/ and seed_1/ each holding their checkpoint 2,
+    and a restore of the case dir reads its checkpoint 2 and skips the seed dirs.
     """
     case = StubCase("case.restored", keeps_seed_checkpoints=True)
     study = make_stub_study([case], num_seeds=2)
@@ -234,12 +236,14 @@ def test_restored_case_merge_keeps_each_seeds_best_checkpoint(make_stub_study):
 
     # 1. The best seed's best checkpoint sits in the case dir beside the seed dirs
     model_dir = study.trained_model_dir(case)
-    assert sorted(path.name for path in model_dir.iterdir()) == [str(seed_best_epochs[1]), "seed_0", "seed_1"]
+    best_checkpoint_name = checkpoint_step_path(model_dir, seed_best_epochs[1], CHECKPOINT_FORMAT).name
+    assert sorted(path.name for path in model_dir.iterdir()) == [best_checkpoint_name, "seed_0", "seed_1"]
     # 2. Each seed dir keeps only its own best checkpoint
     for seed, best_epoch in seed_best_epochs.items():
-        assert [path.name for path in study.seed_model_dir(case, seed).iterdir()] == [str(best_epoch)]
+        seed_model_dir = study.seed_model_dir(case, seed)
+        assert list(seed_model_dir.iterdir()) == [checkpoint_step_path(seed_model_dir, best_epoch, CHECKPOINT_FORMAT)]
     # The restore reads the copied-up checkpoint, seed 1's weights
-    restored = restore_model(create_default_checkpoint_manager(model_dir), _TinyModel(w=jnp.zeros(2)))
+    restored = restore_from_checkpoint(_TinyModel(w=jnp.zeros(2)), model_dir)
     assert float(restored.w[0]) == 10.0 * 1 + seed_best_epochs[1]
 
 

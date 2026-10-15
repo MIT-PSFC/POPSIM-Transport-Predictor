@@ -62,7 +62,7 @@ def _make_config(study_name: str, **overrides) -> PowerBalanceStudy.Config:
 def _clean_case(study: PowerBalanceStudy, case: PowerBalanceStudy.Case):
     """Clear a case's checkpoints and results from previous runs before retraining.
 
-    Without this, orbax keeps the old "best" checkpoint (max_to_keep=1,
+    Without this, the checkpoint manager keeps the old "best" checkpoint (max_to_keep=1,
     best_mode=min), so restore_best_checkpoint=True would load stale weights
     from a broken training run.
     The same dir holds the latest checkpoint, so launch_train would also resume at max_epochs
@@ -322,8 +322,8 @@ def test_transformer_training():
 
     trainer_init, _ = study.restore_trainer(case, restore_best_checkpoint=False)
     trainer_final, _ = study.restore_trainer(case, restore_best_checkpoint=True)
-    module_init = trainer_init.train_state.model.module
-    module_final = trainer_final.train_state.model.module
+    module_init = trainer_init.eval_model.module
+    module_final = trainer_final.eval_model.module
 
     # Normalizer statistics are frozen buffers, training must not touch them
     chex.assert_trees_all_equal(module_init.normalizer, module_final.normalizer)
@@ -373,10 +373,10 @@ def test_submodule_freezing():
     trainer_frozen, _ = study.restore_trainer(case_frozen)
     trainer_unfrozen, _ = study.restore_trainer(case_unfrozen)
 
-    model_p_oh = trainer_p_oh.train_state.model.nn
-    model_p_rad = trainer_p_rad.train_state.model.nn
-    model_frozen = trainer_frozen.train_state.model.module
-    model_unfrozen = trainer_unfrozen.train_state.model.module
+    model_p_oh = trainer_p_oh.eval_model.nn
+    model_p_rad = trainer_p_rad.eval_model.nn
+    model_frozen = trainer_frozen.eval_model.module
+    model_unfrozen = trainer_unfrozen.eval_model.module
 
     chex.assert_trees_all_equal(model_p_oh, model_frozen.p_oh_predictor.nn)
     chex.assert_trees_all_equal(model_p_rad, model_frozen.p_rad_predictor.nn)
@@ -387,7 +387,7 @@ def test_submodule_freezing():
 
     # The frozen submodules' normalizer stats survive unchanged too
     chex.assert_trees_all_equal(
-        trainer_p_oh.train_state.model.normalizer,
+        trainer_p_oh.eval_model.normalizer,
         model_frozen.p_oh_predictor.normalizer,
     )
 
@@ -432,11 +432,11 @@ def test_transfer_weights():
     _train_case(study, case_transfer)
     assert study.result_path(case_transfer).exists()
 
-    pretrain_final = study.restore_trainer(case_pretrain)[0].train_state.model.module
+    pretrain_final = study.restore_trainer(case_pretrain)[0].eval_model.module
     # restore_best_checkpoint=False on the transfer case IS the pretrain best:
     # model_init restores the transfer_checkpoint before fine-tuning starts
-    transfer_init = study.restore_trainer(case_transfer, restore_best_checkpoint=False)[0].train_state.model.module
-    transfer_final = study.restore_trainer(case_transfer)[0].train_state.model.module
+    transfer_init = study.restore_trainer(case_transfer, restore_best_checkpoint=False)[0].eval_model.module
+    transfer_final = study.restore_trainer(case_transfer)[0].eval_model.module
 
     # CORAL aligns every source device to the target, which keeps the identity transform as the reference,
     # so the pretrain twin's fit on historic + the case's target shots shows on the sources
@@ -453,7 +453,7 @@ def test_transfer_weights():
     chex.assert_trees_all_equal(pretrain_final.normalizer, transfer_final.normalizer)
 
     # The pretrain trained the full network from the random init
-    pretrain_random_init = study.restore_trainer(case_pretrain, restore_best_checkpoint=False)[0].train_state.model.module
+    pretrain_random_init = study.restore_trainer(case_pretrain, restore_best_checkpoint=False)[0].eval_model.module
     for i in range(len(pretrain_final.nn.layers)):
         with pytest.raises(AssertionError):
             chex.assert_trees_all_equal(pretrain_random_init.nn.layers[i], pretrain_final.nn.layers[i])
@@ -518,11 +518,11 @@ def test_transfer_weights_submodules(freeze_submodules):
         assert study.result_path(case).exists()
 
     # Get initial and final modules for each case
-    sciml_transfer_init = study.restore_trainer(case_sciml_transfer, restore_best_checkpoint=False)[0].train_state.model.module
-    p_oh_transfer_final = study.restore_trainer(case_p_oh_transfer)[0].train_state.model
-    p_rad_transfer_final = study.restore_trainer(case_p_rad_transfer)[0].train_state.model
-    sciml_transfer_final = study.restore_trainer(case_sciml_transfer)[0].train_state.model.module
-    sciml_pretrain_final = study.restore_trainer(case_sciml_pretrain)[0].train_state.model.module
+    sciml_transfer_init = study.restore_trainer(case_sciml_transfer, restore_best_checkpoint=False)[0].eval_model.module
+    p_oh_transfer_final = study.restore_trainer(case_p_oh_transfer)[0].eval_model
+    p_rad_transfer_final = study.restore_trainer(case_p_rad_transfer)[0].eval_model
+    sciml_transfer_final = study.restore_trainer(case_sciml_transfer)[0].eval_model.module
+    sciml_pretrain_final = study.restore_trainer(case_sciml_pretrain)[0].eval_model.module
 
     # 1. The transfer case fine-tunes only the taue network's last layer on
     # top of the pretrain best

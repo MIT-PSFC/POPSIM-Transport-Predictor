@@ -139,6 +139,12 @@ class StudyConfig(BaseModel):
     max_epochs: int = 120
     epochs_per_val: int = 1
     patience: int = 10  # epochs_per_val * patience = max epochs without improvement before stopping
+    # Horizon in epochs of the weight average every run validates, checkpoints and restores (popsim Trainer.eval_model).
+    # The running mean of every iterate until the horizon, then an EMA over it.
+    # One target-only epoch is 1 to 3 steps, so the same horizon is far fewer steps in the finetune stage, by design
+    ema_horizon_epochs: float = 5.0
+    # Patience counts a validation as an improvement only when it beats the best by more than this fraction of it
+    min_relative_improvement: float = 0.01
     # Epochs and patience of the finetune stage, the transfer finetunes and exnihilo cases that train on the target shots alone.
     # An epoch of a target-only set is one or a few optimizer steps, so these run longer than every other case.
     # Their learning-rate decay stays that of a max_epochs run (Study._extend_finetune_budget),

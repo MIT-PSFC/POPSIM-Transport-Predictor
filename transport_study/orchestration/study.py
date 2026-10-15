@@ -22,6 +22,7 @@ import xarray as xr
 import yaml
 from loguru import logger
 from popsim.ml import DataLoader, TrainConfig, Trainer
+from popsim.ml.checkpointing import checkpoint_step_path, saved_checkpoint_steps
 from popsim.ml.launch import (
     build_train_run,
     get_data_train_run_builder_class,
@@ -52,6 +53,7 @@ from transport_study.modules.normalization import (
 )
 from transport_study.modules.trb_utils import (
     ADAMW_DEFAULTS,
+    CHECKPOINT_FORMAT,
     chi_sigma_floors,
     residual_scales,
     resolve_case_datasets,
@@ -315,14 +317,26 @@ def write_netcdf_atomic(ds: xr.Dataset, path: Path | str) -> None:
     tmp_path.replace(path)
 
 
-def _copy_dir_atomic(source_dir: Path, path: Path) -> None:
-    """Copy source_dir to path through a temporary dir, so a partial copy is never visible at path.
+def _remove_path(path: Path) -> None:
+    """Delete a checkpoint, a dir or a file depending on its format."""
+    if path.is_dir():
+        shutil.rmtree(path)
+    else:
+        path.unlink()
+
+
+def _copy_path_atomic(source_path: Path, path: Path) -> None:
+    """Copy a checkpoint (a dir or a file) to path through a temporary name, so a partial copy is never visible at path.
 
     The merge skips a checkpoint copy once path exists, a copy cut short must not pass for done.
     """
     tmp_path = path.with_name(path.name + ".tmp")
-    shutil.rmtree(tmp_path, ignore_errors=True)
-    shutil.copytree(source_dir, tmp_path)
+    if tmp_path.exists():
+        _remove_path(tmp_path)
+    if source_path.is_dir():
+        shutil.copytree(source_path, tmp_path)
+    else:
+        shutil.copy2(source_path, tmp_path)
     tmp_path.rename(path)
 
 
@@ -800,24 +814,28 @@ class Study:
         """The seeds of the case without a seed result yet."""
         return [seed for seed in range(config.num_seeds) if not self.seed_result_path(case, seed).exists()]
 
-    def _latest_checkpoint_dir_info(self, case: Case, seed: int) -> tuple[int, float] | None:
+    def _latest_checkpoint_info(self, case: Case, seed: int) -> tuple[int, float] | None:
         """(epoch, mtime) of the newest checkpoint of one seed of the case,
         or None if there is none yet.
 
         A seed's checkpoint dir keeps its best checkpoint plus the latest one, which training resumes from.
-        Orbax names each checkpoint directory after its step (here the epoch)
+        popsim names each checkpoint after its step (here the epoch)
         and renames it into place atomically once fully written,
-        so the newest dir's mtime marks the moment that epoch's checkpoint became visible.
-        In-progress saves get a non-numeric tmp suffix and are skipped.
+        so the newest checkpoint's mtime marks the moment that epoch's checkpoint became visible.
+        In-progress saves carry a temporary name and are skipped.
         """
         checkpoint_dir = self.seed_model_dir(case, seed)
-        if not checkpoint_dir.exists():
+        saved_epochs = saved_checkpoint_steps(checkpoint_dir, CHECKPOINT_FORMAT)
+        if not saved_epochs:
             return None
-        epoch_dirs = [p for p in checkpoint_dir.iterdir() if p.is_dir() and p.name.isdigit()]
-        if not epoch_dirs:
-            return None
-        newest = max(epoch_dirs, key=lambda p: int(p.name))
-        return int(newest.name), newest.stat().st_mtime
+        newest_epoch = saved_epochs[-1]
+        newest_path = checkpoint_step_path(checkpoint_dir, newest_epoch, CHECKPOINT_FORMAT)
+        try:
+            newest_mtime = newest_path.stat().st_mtime
+        except FileNotFoundError:
+            # The running job saved a newer checkpoint and pruned this one after the listing
+            return self._latest_checkpoint_info(case, seed)
+        return newest_epoch, newest_mtime
 
     def train_log_path(self, case: Case, seed: int) -> Path:
         """The SLURM log of one seed's training jobs, every launch attempt appends to it."""
@@ -825,7 +843,7 @@ class Study:
 
     def latest_checkpoint_epoch(self, case: Case, seed: int) -> int | None:
         """Epoch of one seed's newest resume checkpoint, or None if empty."""
-        info = self._latest_checkpoint_dir_info(case, seed)
+        info = self._latest_checkpoint_info(case, seed)
         return info[0] if info else None
 
     def collected_results_path(self) -> Path:
@@ -1245,10 +1263,13 @@ class Study:
             max_epochs=config.max_epochs,
             epochs_per_val=config.epochs_per_val,
             patience=config.patience,
+            min_relative_improvement=config.min_relative_improvement,
+            ema_horizon_epochs=config.ema_horizon_epochs,
             # Where the case's merged best checkpoint is restored from.
             # launch_train points each seed at its own dir, and the wandb agent each sweep trial.
             # A seed s run restores seed s of this dir, a sweep trial and restore_trainer the merged best
             checkpoint_dir=str(self.trained_model_dir(case)),
+            checkpoint_format=CHECKPOINT_FORMAT,
             dataloader_config=spec.dataloader_config,
             model_init_config=spec.model_init_config,
             loss_config=loss_config,
@@ -1438,7 +1459,7 @@ class Study:
             if job_elapsed is None or job_elapsed < min_age_s:
                 continue
             progress_mtimes = []
-            checkpoint_info = self._latest_checkpoint_dir_info(case, seed)
+            checkpoint_info = self._latest_checkpoint_info(case, seed)
             if checkpoint_info is not None:
                 progress_mtimes.append(checkpoint_info[1])
             train_log_path = self.train_log_path(case, seed)
@@ -2010,22 +2031,24 @@ class Study:
         case_ds = aggregate_seed_results(per_seed)
         best_seed = int(case_ds.attrs[BEST_SEED_ATTR])
         best_epoch = int(per_seed[best_seed].attrs[SEED_BEST_EPOCH_ATTR])
-        best_checkpoint_dir = self.trained_model_dir(case) / str(best_epoch)
-        if not best_checkpoint_dir.exists():
-            seed_checkpoint_dir = self.seed_model_dir(case, best_seed) / str(best_epoch)
+        best_checkpoint_path = checkpoint_step_path(self.trained_model_dir(case), best_epoch, CHECKPOINT_FORMAT)
+        if not best_checkpoint_path.exists():
+            best_seed_model_dir = self.seed_model_dir(case, best_seed)
+            seed_checkpoint_path = checkpoint_step_path(best_seed_model_dir, best_epoch, CHECKPOINT_FORMAT)
             if case.keeps_seed_checkpoints:
-                _copy_dir_atomic(seed_checkpoint_dir, best_checkpoint_dir)
+                _copy_path_atomic(seed_checkpoint_path, best_checkpoint_path)
             else:
-                os.rename(seed_checkpoint_dir, best_checkpoint_dir)
+                os.rename(seed_checkpoint_path, best_checkpoint_path)
         for seed, seed_ds in per_seed.items():
             seed_model_dir = self.seed_model_dir(case, seed)
             if not case.keeps_seed_checkpoints:
                 shutil.rmtree(seed_model_dir, ignore_errors=True)
                 continue
-            seed_best_epoch_name = str(int(seed_ds.attrs[SEED_BEST_EPOCH_ATTR]))
+            seed_best_epoch = int(seed_ds.attrs[SEED_BEST_EPOCH_ATTR])
+            seed_best_checkpoint_path = checkpoint_step_path(seed_model_dir, seed_best_epoch, CHECKPOINT_FORMAT)
             for checkpoint_path in seed_model_dir.iterdir():
-                if checkpoint_path.name != seed_best_epoch_name:
-                    shutil.rmtree(checkpoint_path)
+                if checkpoint_path != seed_best_checkpoint_path:
+                    _remove_path(checkpoint_path)
         write_netcdf_atomic(case_ds, self.result_path(case))
         for seed in per_seed:
             self.seed_result_path(case, seed).unlink(missing_ok=True)

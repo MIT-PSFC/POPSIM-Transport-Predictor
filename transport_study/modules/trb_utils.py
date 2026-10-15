@@ -11,7 +11,11 @@ import optax
 import xarray as xr
 from loguru import logger
 from popsim.ml import DataLoader, IntegralLoss, TrainConfig
-from popsim.ml.checkpointing import create_default_checkpoint_manager, restore_model
+from popsim.ml.checkpointing import (
+    CheckpointFormat,
+    create_default_checkpoint_manager,
+    restore_model,
+)
 from popsim.ml.dataloading import XarrayPreppedDataset, make_dataloaders
 from popsim.ml.eval import EvalData, EvaluationSuite, batched_model_eval_and_loss
 from popsim.ml.preprocess_utils import mask_to_largest_group_mask
@@ -31,6 +35,9 @@ from transport_study.orchestration.organize_data import (
 )
 from transport_study.orchestration.target_shots import TargetSplit
 
+# The format every checkpoint of the study is written and restored in, one .npz file per checkpoint.
+# orbax's format takes about 40 files per checkpoint, which can be problematic on some filesystems
+CHECKPOINT_FORMAT: CheckpointFormat = "minimal"
 # Floor on the per-timeslice profile peak used for peak normalization.
 # In channel units (1e20 m^-3 for ne, keV for Te) any real profile peaks far above it,
 # it only guards degenerate targets from blowing up the 1/scale division
@@ -307,7 +314,8 @@ def restore_from_checkpoint(module, checkpoint_dir: str):
     """
     if not Path(checkpoint_dir).is_dir():
         raise FileNotFoundError(f"No checkpoint dir to restore from at {checkpoint_dir}")
-    return restore_model(create_default_checkpoint_manager(checkpoint_dir), module)
+    checkpoint_manager = create_default_checkpoint_manager(checkpoint_dir, checkpoint_format=CHECKPOINT_FORMAT)
+    return restore_model(checkpoint_manager, module)
 
 
 def submodule_config_dict(submodule_config: TrainConfig | dict) -> dict:

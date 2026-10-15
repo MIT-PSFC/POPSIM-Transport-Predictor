@@ -7,6 +7,7 @@ from transport_study.modules.profile_predictor.module import ProfilePredictor
 from transport_study.modules.profile_predictor.trb import (
     ProfilePredictorTRB,
 )
+from transport_study.modules.trb_utils import CHECKPOINT_FORMAT
 from transport_study.orchestration.study import BASE_MODEL_SIZE, HYPERPARAM_TARGET_SHOTS
 from transport_study.orchestration.target_shots import BASE_TARGET_SHOT_ORDER
 from transport_study.profile_transfer.profile_study import ProfileStudy
@@ -105,7 +106,9 @@ def restore_profile_predictor(
         profile_predictor_train_dl,
         profile_predictor_config["model_init_config"],
     )
-    profile_predictor_manager = create_default_checkpoint_manager(profile_predictor_config["checkpoint_dir"])
+    profile_predictor_manager = create_default_checkpoint_manager(
+        profile_predictor_config["checkpoint_dir"], checkpoint_format=CHECKPOINT_FORMAT
+    )
     profile_predictor = restore_model(profile_predictor_manager, profile_predictor)
     return profile_predictor
 

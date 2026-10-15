@@ -17,7 +17,7 @@ from popsim.ml.checkpointing import (
 from transport_study.modules.power_balance.p_oh.trb import OhmicPowerTRB
 from transport_study.modules.power_balance.p_rad.trb import RadiatedPowerTRB
 from transport_study.modules.power_balance.trb import PowerBalanceTRB
-from transport_study.modules.trb_utils import submodule_config_dict
+from transport_study.modules.trb_utils import CHECKPOINT_FORMAT, submodule_config_dict
 from transport_study.power_balance_transfer.power_balance_study import PowerBalanceStudy
 from transport_study.tests.tuned_configs import write_hyperparam_tuned_configs
 
@@ -30,7 +30,7 @@ def _shifted(model, offset: float):
 
 
 def _save(model, checkpoint_dir) -> None:
-    manager = create_default_checkpoint_manager(checkpoint_dir)
+    manager = create_default_checkpoint_manager(checkpoint_dir, checkpoint_format=CHECKPOINT_FORMAT)
     save_train_state(TrainState(step=1, epoch=1, model=model, opt_state={"dummy": jnp.zeros(1)}), manager, loss=0.0)
 
 

@@ -18,10 +18,12 @@ import jax.numpy as jnp
 import pytest
 from popsim.ml.checkpointing import (
     TrainState,
+    checkpoint_step_path,
     create_default_checkpoint_manager,
     save_train_state,
 )
 
+from transport_study.modules.trb_utils import CHECKPOINT_FORMAT
 from transport_study.orchestration import slurm_utils
 from transport_study.orchestration import study as study_module
 from transport_study.orchestration.study import (
@@ -58,11 +60,13 @@ def set_job_elapsed(monkeypatch, study, case, elapsed_s: float | None):
 
 
 def write_checkpoint(study: Study, case, epoch: int, age_s: float):
-    """Create a checkpoint epoch dir of the case's one seed, backdated by age_s seconds."""
-    epoch_dir = study.seed_model_dir(case, 0) / str(epoch)
-    epoch_dir.mkdir(parents=True, exist_ok=True)
+    """Create a checkpoint of the case's one seed at epoch, backdated by age_s seconds."""
+    seed_model_dir = study.seed_model_dir(case, 0)
+    seed_model_dir.mkdir(parents=True, exist_ok=True)
+    checkpoint_path = checkpoint_step_path(seed_model_dir, epoch, CHECKPOINT_FORMAT)
+    checkpoint_path.touch()
     mtime = time.time() - age_s
-    os.utime(epoch_dir, (mtime, mtime))
+    os.utime(checkpoint_path, (mtime, mtime))
 
 
 def write_train_log(study: Study, case, age_s: float):
@@ -148,9 +152,9 @@ def test_latest_checkpoint_epoch_reads_real_checkpoint_layout(study, case):
 
     The stall watchdog and the launch_train resume counter both read it,
     so a layout mismatch kills every healthy job and never resets the counter.
-    With max_to_keep 1 and the best loss at epoch 1, the newest dir left is the unvalidated latest one.
+    With max_to_keep 1 and the best loss at epoch 1, the newest checkpoint left is the unvalidated latest one.
     """
-    manager = create_default_checkpoint_manager(study.seed_model_dir(case, 0), max_to_keep=1)
+    manager = create_default_checkpoint_manager(study.seed_model_dir(case, 0), max_to_keep=1, checkpoint_format=CHECKPOINT_FORMAT)
     for epoch, loss in {1: 0.2, 2: 0.9, 3: None}.items():
         state = TrainState(step=epoch, epoch=epoch, model={"w": jnp.zeros(2)}, opt_state={"dummy": jnp.zeros(1)})
         save_train_state(state, manager, loss=loss)

@@ -51,8 +51,14 @@ def test_diverged_segment_masked_not_skipped(synthetic_device_stores, tmp_path, 
     ds_diverged["power_additional_MW"][{sample_dim: 0, time_dim: 10}] = np.inf
     batch_diverged = XarrayPreppedDataset(ds_diverged, batch.training_metadata, n_padded=batch.n_padded)
 
+    # The study's runs average their weights, so train_epoch needs a horizon, any one will do here
     train_state, train_metrics = train_epoch(
-        trainer.train_state, trainer.partition_fn, trainer.loss_fn, trainer.optimizer, [batch_diverged]
+        trainer.train_state,
+        trainer.partition_fn,
+        trainer.loss_fn,
+        trainer.optimizer,
+        [batch_diverged],
+        average_horizon_steps=len(train_dl),
     )
 
     assert train_state.step == 1

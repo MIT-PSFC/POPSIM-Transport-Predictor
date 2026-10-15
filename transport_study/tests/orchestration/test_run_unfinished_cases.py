@@ -12,8 +12,10 @@ import pytest
 import requests
 import xarray as xr
 from popsim.ml import TrainConfig
+from popsim.ml.checkpointing import checkpoint_step_path
 
 from transport_study.config import config
+from transport_study.modules.trb_utils import CHECKPOINT_FORMAT
 from transport_study.orchestration import slurm_utils
 from transport_study.orchestration import study as study_module
 from transport_study.orchestration.seed_results import BEST_SEED_ATTR
@@ -336,8 +338,10 @@ def test_every_seed_trains_and_their_merge_finishes_the_case(make_stub_study, mo
 
     def train_seed(case, seed, skip_tuning, enable_parallelism, partition=None):
         launches.append((str(case), seed))
-        checkpoint_dir = study.seed_model_dir(case, seed) / "3"
-        checkpoint_dir.mkdir(parents=True)
+        seed_model_dir = study.seed_model_dir(case, seed)
+        seed_model_dir.mkdir(parents=True)
+        checkpoint_path = checkpoint_step_path(seed_model_dir, 3, CHECKPOINT_FORMAT)
+        checkpoint_path.touch()
         # Seed 1 validates best
         seed_ds = with_seed_attrs(xr.Dataset({"error_abs_ts": ("shot", [float(seed)])}), val_loss=1.0 - seed, best_epoch=3)
         write_netcdf_atomic(seed_ds, study.seed_result_path(case, seed))
@@ -351,5 +355,6 @@ def test_every_seed_trains_and_their_merge_finishes_the_case(make_stub_study, mo
     assert prereq_result["error_abs_ts"].sel(seed=1).item() == 1.0
     assert prereq_result.attrs[BEST_SEED_ATTR] == 1
     # Only the best seed's best checkpoint is left, where every restore of the case reads
-    assert [path.name for path in study.trained_model_dir(prereq).iterdir()] == ["3"]
+    best_checkpoint_path = checkpoint_step_path(study.trained_model_dir(prereq), 3, CHECKPOINT_FORMAT)
+    assert list(study.trained_model_dir(prereq).iterdir()) == [best_checkpoint_path]
     assert not study.seed_result_path(prereq, 0).exists()
