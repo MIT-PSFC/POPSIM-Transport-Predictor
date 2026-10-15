@@ -349,6 +349,15 @@ class ShapeType(IntEnum):
 # Model types built as ProfilePredictorShapeInit, the only ones with shape bases to freeze
 MODEL_TYPES_WITH_SHAPES = ("shape-init-pca", "shape-init-kmeans")
 
+# The per-sample reservoir states ProfilePredictorTRB.model_init caches on the training and validation loaders,
+# and the fingerprint of the frozen leaves that made them (ProfilePredictorReservoir.frozen_fingerprint)
+RESERVOIR_DIM = "reservoir"
+RESERVOIR_STATE_VAR = "reservoir_state"
+RESERVOIR_FINGERPRINT_VAR = "reservoir_fingerprint"
+# Reduction-order noise moves the fingerprint by ~1e-14 of itself.
+# Another seed, spectral radius, input scaling or normalizer fit moves it by 1e-5 or more
+RESERVOIR_FINGERPRINT_RTOL = 1e-9
+
 
 def kmeans_initial_guess(
     n_shapes: int,
@@ -563,6 +572,9 @@ class ProfilePredictorReservoir(ProfilePredictor):
     and only the linear readout (self.nn, an RtdMLP with depth=0) is trained.
     The reservoir weights (w_in, w_res, res_bias) are drawn once at init
     and kept frozen by the trainable getter, which only exposes self.nn leaves.
+    So a sample's state never changes during training:
+    model_init caches every sample's state on the loaders (RESERVOIR_STATE_VAR),
+    and a batch carrying it skips the reservoir, which dominated the cost of every step.
     """
 
     w_in: Array  # Fixed random input weights (reservoir_size, 10)
@@ -620,14 +632,51 @@ class ProfilePredictorReservoir(ProfilePredictor):
         h0 = jnp.zeros(self.res_bias.shape, dtype=drive.dtype)
         return jax.lax.fori_loop(0, self.n_steps, step, h0)
 
-    def __call__(self, inputs: Inputs | xr.Dataset, debug: bool = False) -> Outputs:
+    def reservoir_state_of(self, inputs: Inputs | xr.Dataset) -> Array:
+        """The washed-out reservoir state of one sample's inputs, normalized like the readout sees them."""
         if isinstance(inputs, xr.Dataset):
             inputs = Inputs.from_dataset(inputs, jnp.array(self.rhogrid))
-
         nn_inputs = self.normalizer(inputs.nn_inputs, inputs.ds_source_idx)
-        state = self.reservoir_state(nn_inputs)
+        return self.reservoir_state(nn_inputs)
+
+    def frozen_fingerprint(self) -> Array:
+        """A positive scalar of the frozen leaves the reservoir state depends on.
+
+        The sum of squares of w_in, res_bias, the diagonal of w_res and the normalizer buffers.
+        Every redraw or rescale of the reservoir changes the diagonal,
+        and leaving out the rest of w_res keeps the check cheap inside every train step.
+        """
+        w_res_diagonal = jnp.diagonal(self.w_res)
+        normalizer_leaves = [leaf for leaf in jax.tree.leaves(self.normalizer) if eqx.is_inexact_array(leaf)]
+        frozen_leaves = [self.w_in, self.res_bias, w_res_diagonal, *normalizer_leaves]
+        return sum(jnp.sum(leaf**2) for leaf in frozen_leaves)
+
+    def cached_readout(self, inputs: xr.Dataset) -> Array:
+        """The readout of the state model_init cached for this sample, raising when this module's frozen leaves did not make it.
+
+        A checkpoint restored after model_init (another seed's, as Study.restore_trainer does) leaves the cache stale.
+        The check rides on the small readout output:
+        on the (reservoir_size,) state it copied every batch's states and cost a quarter of a CPU train step.
+        """
+        cached_state = inputs[RESERVOIR_STATE_VAR].data
+        nn_outputs = self.nn(cached_state)
+        cached_fingerprint = inputs[RESERVOIR_FINGERPRINT_VAR].data
+        own_fingerprint = self.frozen_fingerprint()
+        fingerprint_tolerance = RESERVOIR_FINGERPRINT_RTOL * own_fingerprint
+        mask_fingerprint_mismatch = jnp.abs(cached_fingerprint - own_fingerprint) > fingerprint_tolerance
+        return eqx.error_if(
+            nn_outputs,
+            mask_fingerprint_mismatch,
+            "The cached reservoir states were made by another reservoir, a checkpoint restored after model_init leaves them stale",
+        )
+
+    def __call__(self, inputs: Inputs | xr.Dataset, debug: bool = False) -> Outputs:
         # Profile values directly on the rhogrid
-        nn_outputs = self.nn(state)
+        if isinstance(inputs, xr.Dataset) and RESERVOIR_STATE_VAR in inputs:
+            nn_outputs = self.cached_readout(inputs)
+        else:
+            state = self.reservoir_state_of(inputs)
+            nn_outputs = self.nn(state)
         return self.assemble_profile_outputs(nn_outputs)
 
 

@@ -691,9 +691,17 @@ class CaseTrainDataLoader(DataLoader):
     shuffle_seed keys the shuffle of every pass, each seed of a case draws its own (Study.launch_train).
     It also carries normalizer_fit_ds, the dataset model_init fits its normalizer statistics on (see normalizer_fit_dataset),
     its own samples unless resolve_case_datasets returned a separate fit set.
+    eval_dl is the loader the case validates and tests on, which model_init can attach per-sample caches to,
+    since model_init only receives the train dataloader (the profile reservoir states).
     """
 
-    def __init__(self, train_dl: DataLoader, shuffle_seed: int, normalizer_fit_ds: xr.Dataset | None = None):
+    def __init__(
+        self,
+        train_dl: DataLoader,
+        shuffle_seed: int,
+        normalizer_fit_ds: xr.Dataset | None = None,
+        eval_dl: DataLoader | None = None,
+    ):
         # Without a batch an epoch trains nothing
         if len(train_dl) == 0:
             raise ValueError("The training set holds no samples (every target NaN, e.g. no fresh timeslice of fresh_var, or no shots)")
@@ -708,6 +716,7 @@ class CaseTrainDataLoader(DataLoader):
             generate_prng=train_dl.generate_prng,
         )
         self.normalizer_fit_ds = self.ds if normalizer_fit_ds is None else normalizer_fit_ds
+        self.eval_dl = eval_dl
 
 
 def module_build_config(model_init_config: dict) -> dict:

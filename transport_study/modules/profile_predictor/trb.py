@@ -1,4 +1,5 @@
 import copy
+import time
 from collections.abc import Callable
 from typing import Any, ClassVar
 
@@ -8,14 +9,20 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import xarray as xr
+from jaxtyping import Array
+from loguru import logger
 from popsim.ml import DataLoader, TrainRunBuilder
-from popsim.ml.dataloading import make_dataloaders
+from popsim.ml.dataloading import XarrayPreppedDataset, make_dataloaders
 from popsim.ml.eval import EvalData, EvaluationSuite
+from popsim.xarray_utils import run_function_with_dim_removed
 
 from transport_study import EPISODE_DIM, RADIAL_DIM, TIME_COORD
 from transport_study.config import config
 from transport_study.modules.profile_predictor.module import (
     MODEL_TYPES_WITH_SHAPES,
+    RESERVOIR_DIM,
+    RESERVOIR_FINGERPRINT_VAR,
+    RESERVOIR_STATE_VAR,
     ProfilePredictorReservoir,
     ProfilePredictorShapeInit,
     ProfilePredictorUnstructuredNN,
@@ -87,6 +94,61 @@ def _profile_chi(chi_fn: Callable, profiles: tuple[xr.DataArray, ...], floor: xr
     return xr.apply_ufunc(chi_of_arrays, *profiles, floor, input_core_dims=[*core_dims, []])
 
 
+def _dataset_reservoir_states(module: ProfilePredictorReservoir, dataset: XarrayPreppedDataset, batch_size: int) -> np.ndarray:
+    """The reservoir state of every sample of dataset in sample order, (sample, reservoir_size).
+
+    Fixed-size batches in order, the last one padded, so one compiled shape covers every batch.
+    """
+    sample_dim = dataset.training_metadata.sample_dim
+
+    @eqx.filter_jit
+    def batch_states(module: ProfilePredictorReservoir, inputs: xr.Dataset) -> Array:
+        return run_function_with_dim_removed(ProfilePredictorReservoir.reservoir_state_of, (module, inputs), sample_dim, in_axes=(None, 0))
+
+    sequential_dl = DataLoader(dataset, batch_size=batch_size, shuffle=False, pad_last=True)
+    states = np.empty((len(dataset), module.res_bias.shape[0]), dtype=module.res_bias.dtype)
+    n_filled = 0
+    for batch in sequential_dl:
+        inputs, _ = batch.get_inputs_and_targets()
+        batch_states_device = batch_states(module, inputs)
+        batch_states_host = np.asarray(batch_states_device)
+        n_real = len(batch) - batch.n_padded
+        states[n_filled : n_filled + n_real] = batch_states_host[:n_real]
+        n_filled += n_real
+    return states
+
+
+def _attach_reservoir_states(module: ProfilePredictorReservoir, train_dl: CaseTrainDataLoader) -> None:
+    """Cache every training and validation sample's reservoir state on its loader, so no epoch reruns the frozen reservoir.
+
+    Each loader's dataset gains the input variables RESERVOIR_STATE_VAR (sample, RESERVOIR_DIM) and RESERVOIR_FINGERPRINT_VAR (sample),
+    which every batch carries (the filled final batch and the NaN retry index the same dataset),
+    and ProfilePredictorReservoir reads them in place of the reservoir.
+    The validation loader is also the test loader (get_dataloaders).
+    """
+    if train_dl.eval_dl is None:
+        raise ValueError("The reservoir state cache needs the loader the case validates on (CaseTrainDataLoader.eval_dl)")
+    fingerprint = float(module.frozen_fingerprint())
+    time_start = time.perf_counter()
+    for loader in (train_dl, train_dl.eval_dl):
+        if RESERVOIR_STATE_VAR in loader.ds:
+            raise ValueError("The loader already holds cached reservoir states, model_init ran twice on it")
+        sample_dim = loader.metadata.sample_dim
+        states = _dataset_reservoir_states(module, loader.dataset, train_dl.batch_size)
+        fingerprints = np.full(len(loader.dataset), fingerprint)
+        # A new Dataset object, the positional tuples skip alignment against the sample MultiIndex
+        # and the normalizer_fit_ds that may alias the old one stays untouched
+        loader.dataset.ds = loader.ds.assign(
+            {RESERVOIR_STATE_VAR: ((sample_dim, RESERVOIR_DIM), states), RESERVOIR_FINGERPRINT_VAR: (sample_dim, fingerprints)}
+        )
+        # A new list, the training and validation metadata share the old one
+        loader.metadata.input_vars = [*loader.metadata.input_vars, RESERVOIR_STATE_VAR, RESERVOIR_FINGERPRINT_VAR]
+    n_train = len(train_dl.dataset)
+    n_eval = len(train_dl.eval_dl.dataset)
+    time_elapsed_s = time.perf_counter() - time_start
+    logger.info(f"Cached the reservoir states of {n_train} training and {n_eval} validation samples in {time_elapsed_s:.1f} s")
+
+
 class ProfilePredictorTRB(TrainRunBuilder):
     """Training run builder for the profile predictor module,
     based on `popsim.modules.profile_predictor.training_run_builder.ProfilePredictorTrainRunBuilder`
@@ -125,7 +187,7 @@ class ProfilePredictorTRB(TrainRunBuilder):
             pad_last=[False, True],
             fill_last=[True, False],
         )
-        train_dl = CaseTrainDataLoader(train_dl, dataloader_config["shuffle_seed"], normalizer_fit_ds)
+        train_dl = CaseTrainDataLoader(train_dl, dataloader_config["shuffle_seed"], normalizer_fit_ds, eval_dl=val_dl)
         # The validation set doubles as the test set (see resolve_case_datasets)
         return ds_val, train_dl, val_dl, val_dl
 
@@ -136,6 +198,7 @@ class ProfilePredictorTRB(TrainRunBuilder):
         The data-driven init (normalizer statistics, PCA / k-means shape guess) is skipped when a restore will overwrite it
         (see trb_utils.module_build_config): for a transfer case,
         and for a skip_data_init skeleton, which the transport sciml submodule also needs since its dataset cannot support the init.
+        A reservoir caches every training and validation sample's state on the loaders (_attach_reservoir_states).
         """
         build_config = module_build_config(model_init_config)
         # Stat stage (CORAL or z-score) on the dimensionless nn_inputs
@@ -228,6 +291,10 @@ class ProfilePredictorTRB(TrainRunBuilder):
         transfer_checkpoint = transfer_checkpoint_to_restore(model_init_config)
         if transfer_checkpoint:
             module = restore_from_checkpoint(module, transfer_checkpoint)
+        # After the restore, so the cache holds the states of the reservoir that trains.
+        # A caller-passed skip_data_init skeleton is restored by its caller, whose leaves would leave the cache stale
+        if model_init_config["model_type"] == "reservoir" and not model_init_config.get("skip_data_init", False):
+            _attach_reservoir_states(module, train_dl)
         return module
 
     # Softening fraction for the relative-error denominator in study_results.
