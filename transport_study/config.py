@@ -167,6 +167,8 @@ class StudyConfig(BaseModel):
     analysis_time_limit: Orchestration[str] = Field(default_factory=lambda: os.environ.get("PTPS_ANALYSIS_TIME_LIMIT", "07:59:59"))
     # sbatch --mem of every analysis job
     analysis_mem: Orchestration[str] = Field(default_factory=lambda: os.environ.get("PTPS_ANALYSIS_MEM", "32G"))
+    # sbatch --mem of the collect_results job
+    collect_mem: Orchestration[str] = Field(default_factory=lambda: os.environ.get("PTPS_COLLECT_MEM", "64G"))
     # Cap on this study's concurrent (running + pending) analysis jobs, so a study
     # with hundreds of cases doesn't flood the queue with pending jobs at once
     max_analysis_jobs: Orchestration[int] = Field(default_factory=lambda: int(os.environ.get("PTPS_MAX_ANALYSIS_JOBS", "20")))
@@ -277,7 +279,7 @@ class StudyConfig(BaseModel):
             raise ValueError(f"Partitions {shared} are both CPU and GPU partitions")
         return self
 
-    @field_validator("train_mem", "analysis_mem")
+    @field_validator("train_mem", "analysis_mem", "collect_mem")
     @classmethod
     def _check_slurm_mem(cls, mem: str) -> str:
         """A SLURM memory size, so a typo fails when the config loads instead of at sbatch."""

@@ -1352,7 +1352,7 @@ if __name__ == "__main__":
 echo "=== $(date) job $SLURM_JOB_ID ({job_name}) start on $SLURMD_NODENAME ==="
 {CPU_JOB_ENV}"""
     time_limit = clamp_time_limit(partition, config.analysis_time_limit)
-    script = sbatch_script(job_name, partition, time_limit, log_path, script_path, setup, mem=config.analysis_mem, cpus=cpus)
+    script = sbatch_script(job_name, partition, time_limit, log_path, script_path, setup, mem=config.collect_mem, cpus=cpus)
     return submit_sbatch(script, job_name, "collection")
 
 
