@@ -16,6 +16,7 @@ from scipy.constants import eV
 from torax import ToraxConfig
 from torax import experimental as torax_experimental
 from torax._src.orchestration.step_function import SimulationStepFn
+from transport_validation_datasets.machine.generic import UNIFORM_TIMEBASE_DT
 
 from transport_study.modules import plasma_parameters
 from transport_study.modules.normalization import (
@@ -34,7 +35,6 @@ from transport_study.modules.profile_predictor.module import (
     N_NN_INPUTS,
     NN_INPUT_NAMES,
     ProfilePredictor,
-    scaled_profile_points,
 )
 from transport_study.modules.profile_predictor.torax_module import (
     TAU_REF_S,
@@ -54,7 +54,6 @@ from transport_study.modules.profile_predictor.torax_module import (
     shared_provider_mapping,
 )
 
-# Positivity floor for the profile outputs, ne [1e20 m^-3] and te [keV]
 # Submodule pseudo-model-types of the sciml prereq cases:
 # sciml -> power_balance + profile, power_balance -> p_oh + p_rad
 SUBMODULE_MODEL_TYPES = ("power_balance", "profile", "p_oh", "p_rad")
@@ -62,7 +61,10 @@ SUBMODULE_MODEL_TYPES = ("power_balance", "profile", "p_oh", "p_rad")
 # the transformer from two more head outputs, TORAX from its own post-processing of the state
 MULTIOBJECTIVE_MODEL_TYPES = ("transformer", *TORAX_MODEL_TYPES)
 
+# Positivity floor for the profile outputs, ne [1e20 m^-3] and te [keV]
 MIN_PROFILE = 1e-3
+# Slope of the profiles below MIN_PROFILE (TransportPredictor.positive_profiles)
+PROFILE_LEAK_SLOPE = 0.01
 
 # Floors applied to profiles used to seed a TORAX state.
 # zero-value cells NaN the TORAX solve regardless of the predicted coefficients
@@ -317,9 +319,15 @@ class TransportPredictor(TimeDepModule):
 
     @staticmethod
     def positive_profiles(ne: Array, te: Array):
-        """Enforce positivity of the profiles, and return a debug dict"""
-        ne_pos = jnp.clip(ne, MIN_PROFILE)
-        te_pos = jnp.clip(te, MIN_PROFILE)
+        """The profiles kept above MIN_PROFILE by a leaky floor, and a debug dict.
+
+        Each point is unchanged at or above MIN_PROFILE, and MIN_PROFILE + PROFILE_LEAK_SLOPE (x - MIN_PROFILE) below it.
+        A hard clip kills the gradients, so a network which drifted there could never bring it back.
+        This keeps its the identity when in a reasonable range, so the profiles carried from step to step never drift by its gain.
+        A point dips below 0 only from about MIN_PROFILE - MIN_PROFILE / PROFILE_LEAK_SLOPE (-0.1) down.
+        """
+        ne_pos = jnp.where(ne >= MIN_PROFILE, ne, MIN_PROFILE + PROFILE_LEAK_SLOPE * (ne - MIN_PROFILE))
+        te_pos = jnp.where(te >= MIN_PROFILE, te, MIN_PROFILE + PROFILE_LEAK_SLOPE * (te - MIN_PROFILE))
         debug_info = {
             "ne_orig": ne,
             "te_orig": te,
@@ -357,13 +365,19 @@ class TransportPredictorTransformer(TransportPredictor):
     (only predicted profiles are kept as history, never past input features)
     3: embed each buffered profile, peak-normalized plus its two peaks, and add a learned per-slot position embedding to key/value tokens
     4: attend (causal by construction, the buffer only ever contains current and past profiles)
-    5: then a residual connection and an MLP head produce the next profile points and their te and ne correction factors
-    6: the corrected profile is rolled into the buffer
-    Only the normalized features and the normalized history enter the network,
-    no n_e_line_average or te_approx scale.
+    5: a residual connection and an MLP head produce the change of every profile point,
+    then the log multipliers of TAU_REF_S into the ne and te time scales tau_ne and tau_te
+    6: the next profile is the current one plus UNIFORM_TIMEBASE_DT / tau times its change, kept positive by the leaky floor,
+    and it is rolled into the buffer
+    The change is in profile units, not relative to the current profile, so a profile that got small can still grow back.
+    The time scales let the network learn a confinement-like time per channel, which the features let vary by device and state
+    The head's last layer starts at zero, so an untrained model holds the measured profile at tau = TAU_REF_S.
+    Only the normalized features and the normalized history enter the network, no n_e_line_average or te_approx scale.
+
     With multiobjective the head has two more outputs after those,
     the stored energy as a correction to the profile-implied one and the ohmic power on its W / TAU_REF_S scale.
     They never enter the profile update, they only give the training loss extra targets to anchor.
+
     Without the position embedding attention is permutation-invariant over the history,
     so the model could not tell the most recent profile from the least recent
     (and the t0-seeded buffer holds identical rows, where values alone carry no ordering at all)
@@ -407,12 +421,16 @@ class TransportPredictorTransformer(TransportPredictor):
         latent = query + attn_out
         nn_out = self.head(latent)
 
-        # scaled_profile_points reads the correction factors at the end of its vector, so the aux outputs are cut off first
-        nn_out_profiles = nn_out[: 2 * n_rho + 2]
-        ne_next, te_next = scaled_profile_points(nn_out_profiles, n_rho)
-        # Clipped values enter the buffer so the carried state stays physical
+        # The change of every profile point, then the log multipliers of TAU_REF_S into each channel's time scale
+        ne_change = nn_out[:n_rho]
+        te_change = nn_out[n_rho : 2 * n_rho]
+        tau_ne_s = TAU_REF_S * jnp.exp(nn_out[2 * n_rho])
+        tau_te_s = TAU_REF_S * jnp.exp(nn_out[2 * n_rho + 1])
+        ne_next = ne_now + UNIFORM_TIMEBASE_DT / tau_ne_s * ne_change
+        te_next = te_now + UNIFORM_TIMEBASE_DT / tau_te_s * te_change
+        # Floored values enter the buffer so the carried state stays physical
         ne_next, te_next, debug_info = self.positive_profiles(ne_next, te_next)
-        debug_info.update(energy_mhd_MJ_state=energy_mhd_MJ)
+        debug_info.update(energy_mhd_MJ_state=energy_mhd_MJ, tau_ne_s=tau_ne_s, tau_te_s=tau_te_s)
 
         # Shift the buffer by one and insert the newest profile at the end
         new_row = jnp.concatenate([ne_next, te_next])
@@ -459,12 +477,17 @@ class TransportPredictorTransformer(TransportPredictor):
         attention = eqx.nn.MultiheadAttention(num_heads=num_heads, query_size=d_model, key=key_attn)
         head = eqx.nn.MLP(
             in_size=d_model,
-            # +2 for the te and ne correction factors, +2 more for the multiobjective stored energy and ohmic power
+            # +2 for the ne and te time scales, +2 more for the multiobjective stored energy and ohmic power
             out_size=2 * n_rho + 2 + (2 if multiobjective else 0),
             width_size=nn_width,
             depth=nn_depth,
             key=key_head,
         )
+        # A zero last layer changes no profile point and gives both time scales TAU_REF_S, so training starts from persistence
+        last_layer = head.layers[-1]
+        zero_weight = jnp.zeros_like(last_layer.weight)
+        zero_bias = jnp.zeros_like(last_layer.bias)
+        head = eqx.tree_at(lambda mlp: (mlp.layers[-1].weight, mlp.layers[-1].bias), head, (zero_weight, zero_bias))
         return cls(
             normalizer=normalizer,
             feature_embed=feature_embed,

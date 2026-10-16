@@ -330,7 +330,7 @@ def profile_outputs(rhogrid: tuple, ne: Array, te: Array, debug_info: dict | Non
 def scaled_profile_points(output_vector: Array, n_rho: int) -> tuple[Array, Array]:
     """ne and te from an output vector of ne points, te points, then the te and ne scale corrections.
 
-    The one decode of every data-driven profile model (mlp, reservoir, shape-init, transport transformer).
+    The one decode of every data-driven time-independent profile model (mlp, reservoir, shape-init).
     """
     ne_points = output_vector[:n_rho]
     te_points = output_vector[n_rho : 2 * n_rho]

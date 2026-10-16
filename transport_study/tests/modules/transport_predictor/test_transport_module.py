@@ -18,6 +18,7 @@ import pytest
 import xarray as xr
 from popsim.field_labels import partition_discrete_cont, partition_save_no_save
 from popsim.ml.partition import make_partition_by_members
+from transport_validation_datasets.machine.generic import UNIFORM_TIMEBASE_DT
 
 from transport_study import RADIAL_DIM
 from transport_study.config import RHO_GRID
@@ -49,13 +50,16 @@ from transport_study.modules.profile_predictor.train_configs import (
 )
 from transport_study.modules.transport_predictor.module import (
     ABSORPTION_DEPTH_BIAS,
+    MIN_PROFILE,
     MIN_W_MJ,
     N_TRANSPORT_NN_INPUTS,
     NE_SEED_FLOOR_20,
+    PROFILE_LEAK_SLOPE,
     SOURCE_SHAPE_COEFFICIENT_NAMES,
     TE_SEED_FLOOR_KEV,
     TRANSPORT_NN_INPUT_NAMES,
     Inputs,
+    TransportPredictor,
     TransportPredictorEnv,
     TransportPredictorSciML,
     TransportPredictorTorax,
@@ -132,8 +136,8 @@ def normalizer_leaves(module) -> list:
     return jax.tree_util.tree_leaves(eqx.filter(module.normalizer, eqx.is_array))
 
 
-@pytest.fixture(scope="module")
-def transformer_module() -> TransportPredictorTransformer:
+def fresh_transformer(multiobjective: bool = False) -> TransportPredictorTransformer:
+    """A small transformer as init builds it, its head's last layer zero."""
     return TransportPredictorTransformer.init(
         d_model=D_MODEL,
         num_heads=2,
@@ -142,9 +146,26 @@ def transformer_module() -> TransportPredictorTransformer:
         nn_depth=1,
         rhogrid=RHO,
         normalizer=make_transport_nn_input_normalizer("physics", None, 2, target_idx=0),
-        multiobjective=False,
+        multiobjective=multiobjective,
         prng_seed=0,
     )
+
+
+def with_random_head(module: TransportPredictorTransformer, seed: int = 0) -> TransportPredictorTransformer:
+    """The transformer with a random last head layer in place of its zero init, so its next profile responds to its inputs and history."""
+    key = jax.random.PRNGKey(seed)
+    key_weight, key_bias = jax.random.split(key)
+    last_layer = module.head.layers[-1]
+    weight = 0.1 * jax.random.normal(key_weight, last_layer.weight.shape)
+    bias = 0.1 * jax.random.normal(key_bias, last_layer.bias.shape)
+    return eqx.tree_at(lambda m: (m.head.layers[-1].weight, m.head.layers[-1].bias), module, (weight, bias))
+
+
+@pytest.fixture(scope="module")
+def transformer_module() -> TransportPredictorTransformer:
+    """A transformer as training leaves it, with a non-zero head."""
+    module = fresh_transformer()
+    return with_random_head(module)
 
 
 @pytest.fixture(scope="module")
@@ -368,8 +389,11 @@ def test_transformer_position_embedding_orders_history(transformer_module):
     next_state_perm, output_perm = transformer_module(state_perm, inputs)
     # The reported output (profile at time t) is order-independent by design
     np.testing.assert_array_equal(np.asarray(output.ne), np.asarray(output_perm.ne))
-    # But the predicted next profile must see the history order
-    assert not np.allclose(np.asarray(next_state.profiles[-1]), np.asarray(next_state_perm.profiles[-1]))
+    # But the predicted step must see the history order.
+    # A step is a small change of the profile, so the steps are compared, not the next profiles
+    step = np.asarray(next_state.profiles[-1] - profiles[-1])
+    step_perm = np.asarray(next_state_perm.profiles[-1] - permuted[-1])
+    assert np.max(np.abs(step - step_perm)) > 1e-6 * np.max(np.abs(step))
 
     # Zeroing pos_embed restores permutation invariance, so the position
     # embedding is exactly what breaks it
@@ -412,23 +436,13 @@ def test_transformer_history_holds_profiles_only(transformer_module):
 
 
 def test_transformer_multiobjective_heads_leave_the_profiles_alone(transformer_module):
-    """The two multiobjective head rows come after the profile decode, which reads its corrections at the end.
+    """The two multiobjective head rows come after the profile changes and the two time scales.
 
     A multiobjective twin sharing every plain weight, its extra head rows zeroed,
     steps to the same next profile, reports the profile-implied stored energy and zero ohmic power.
     The plain transformer reports neither.
     """
-    multiobjective_module = TransportPredictorTransformer.init(
-        d_model=D_MODEL,
-        num_heads=2,
-        history_len=HISTORY_LEN,
-        nn_width=8,
-        nn_depth=1,
-        rhogrid=RHO,
-        normalizer=make_transport_nn_input_normalizer("physics", None, 2, target_idx=0),
-        multiobjective=True,
-        prng_seed=0,
-    )
+    multiobjective_module = fresh_transformer(multiobjective=True)
     plain_arrays, _ = eqx.partition(transformer_module, eqx.is_array)
     multiobjective_arrays, multiobjective_static = eqx.partition(multiobjective_module, eqx.is_array)
     plain_leaves = jax.tree_util.tree_leaves(plain_arrays)
@@ -454,11 +468,58 @@ def test_transformer_multiobjective_heads_leave_the_profiles_alone(transformer_m
     assert np.isnan(float(output_plain.energy_mhd_MJ_pred))
     assert np.isnan(float(output_plain.power_ohm_MW_pred))
 
-    # Freshly initialized, the multiobjective heads give finite values that differ from the zeroed twin's
+    # Freshly initialized, the zero head reports the profile-implied stored energy and zero ohmic power
     _, output_multiobjective = multiobjective_module(state, inputs)
-    assert np.isfinite(float(output_multiobjective.energy_mhd_MJ_pred))
-    assert np.isfinite(float(output_multiobjective.power_ohm_MW_pred))
-    assert float(output_multiobjective.power_ohm_MW_pred) != 0.0
+    assert float(output_multiobjective.energy_mhd_MJ_pred) == pytest.approx(float(energy_mhd_MJ_profiles))
+    assert float(output_multiobjective.power_ohm_MW_pred) == 0.0
+
+
+def test_positive_profiles_leak_below_the_floor():
+    """Identity at and above MIN_PROFILE, slope PROFILE_LEAK_SLOPE below it.
+
+    A point under the floor keeps its gradient, where the hard clip it replaced gave it none.
+    """
+    profile = jnp.array([-1.0, 0.0, 0.5 * MIN_PROFILE, MIN_PROFILE, 0.3, 4.0])
+    ne_floored, te_floored, _ = TransportPredictor.positive_profiles(profile, profile)
+    np.testing.assert_array_equal(np.asarray(ne_floored[3:]), np.asarray(profile[3:]))
+    np.testing.assert_array_equal(np.asarray(te_floored), np.asarray(ne_floored))
+    assert np.all(np.asarray(ne_floored[1:3]) > 0.0)
+
+    def floored_sum(values):
+        floored, _, _ = TransportPredictor.positive_profiles(values, values)
+        return jnp.sum(floored)
+
+    gradient = jax.grad(floored_sum)(profile)
+    np.testing.assert_allclose(np.asarray(gradient), [PROFILE_LEAK_SLOPE] * 3 + [1.0] * 3)
+
+
+def test_transformer_starts_at_persistence_and_steps_by_its_time_scales():
+    """A fresh transformer's zero head leaves the profile unchanged, at both time scales TAU_REF_S.
+
+    A head outputting a change c at every point and log multipliers m_ne, m_te of TAU_REF_S
+    moves each point by UNIFORM_TIMEBASE_DT / (TAU_REF_S exp(m)) x c in its channel.
+    """
+    module = fresh_transformer()
+    # Every seeded point above MIN_PROFILE, where the leaky floor is the identity
+    obs = make_observations(n_e_1e20=(RADIAL_DIM, NE0 + 0.1), t_e_keV=(RADIAL_DIM, TE0 + 0.1))
+    state = TransportPredictorEnv(module=module, domain_adaptation=None).create_state(obs, obs)
+    next_state, output = module(state, make_inputs())
+    np.testing.assert_array_equal(np.asarray(next_state.profiles[-1]), np.asarray(state.profiles[-1]))
+    assert float(output.debug_info["tau_ne_s"]) == pytest.approx(TAU_REF_S)
+    assert float(output.debug_info["tau_te_s"]) == pytest.approx(TAU_REF_S)
+
+    change, log_tau_ne, log_tau_te = 2.0, 0.5, -0.5
+    change_points = jnp.full(2 * N_RHO, change)
+    log_taus = jnp.array([log_tau_ne, log_tau_te])
+    bias = jnp.concatenate([change_points, log_taus])
+    stepping = eqx.tree_at(lambda m: m.head.layers[-1].bias, module, bias)
+    next_stepped, _ = stepping(state, make_inputs())
+    ne_step = UNIFORM_TIMEBASE_DT / (TAU_REF_S * np.exp(log_tau_ne)) * change
+    te_step = UNIFORM_TIMEBASE_DT / (TAU_REF_S * np.exp(log_tau_te)) * change
+    ne_now = np.asarray(state.profiles[-1, :N_RHO])
+    te_now = np.asarray(state.profiles[-1, N_RHO:])
+    np.testing.assert_allclose(np.asarray(next_stepped.profiles[-1, :N_RHO]), ne_now + ne_step, rtol=1e-12)
+    np.testing.assert_allclose(np.asarray(next_stepped.profiles[-1, N_RHO:]), te_now + te_step, rtol=1e-12)
 
 
 @pytest.mark.slow
