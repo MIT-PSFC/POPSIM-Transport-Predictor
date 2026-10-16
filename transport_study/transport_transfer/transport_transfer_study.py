@@ -290,6 +290,16 @@ class TransportStudy(Study):
             return pinned
 
         def model_type_prereqs(self) -> list[Study.Case]:
+            submodules = self.submodule_prereqs()
+            if submodules:
+                return submodules
+            if self.model_type in MULTIOBJECTIVE_MODEL_TYPES and self.multiobjective:
+                # The Wtot and P_oh anchors take the huber deltas the hyperparam power_balance and p_oh cases were tuned with.
+                # The model type guard matters when the hyperparam value is True, which pins the prereqs' own flag True
+                return [self.hyperparam_case_of(model_type) for model_type in ("power_balance", "p_oh")]
+            return []
+
+        def submodule_prereqs(self) -> list[Study.Case]:
             # sciml restores a pre-trained power balance and profile predictor.
             # The power balance itself restores pre-trained p_oh/p_rad.
             # Every prereq is built at the case's own model size, so a sized case sizes the whole model.
@@ -297,10 +307,6 @@ class TransportStudy(Study):
                 submodule_types = ("power_balance", "profile")
             elif self.model_type == "power_balance":
                 submodule_types = ("p_oh", "p_rad")
-            elif self.model_type in MULTIOBJECTIVE_MODEL_TYPES and self.multiobjective:
-                # The Wtot and P_oh anchors take the huber deltas the hyperparam power_balance and p_oh cases were tuned with.
-                # The model type guard matters when the hyperparam value is True, which pins the prereqs' own flag True
-                return [self.hyperparam_case_of(model_type) for model_type in ("power_balance", "p_oh")]
             else:
                 return []
             return [self.replace_pinned(model_type=submodule_type) for submodule_type in submodule_types]

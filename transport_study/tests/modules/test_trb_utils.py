@@ -11,8 +11,10 @@ from transport_validation_datasets.machine.generic import UNIFORM_TIMEBASE_DT
 
 from transport_study import EPISODE_DIM, TIME_COORD, TIME_DIM
 from transport_study.modules.trb_utils import (
+    DIVERGED_PROFILE_LIMIT,
     TimeAveragedLoss,
     mask_to_largest_contiguous_segment,
+    replace_diverged_profiles,
     scalar_study_results,
 )
 
@@ -78,6 +80,18 @@ def test_per_shot_vars_keep_their_dims():
     # force_drop_nans-style ds.where would broadcast this to (shot, time)
     assert ds["hazard"].dims == (EPISODE_DIM,)
     assert np.allclose(ds["hazard"].values, [0.0])
+
+
+def test_validation_replaces_profiles_beyond_the_limit():
+    """A finite point beyond DIVERGED_PROFILE_LIMIT diverges its timeslice like a NaN does, and takes its target value."""
+    ne_pred = jnp.array([[1.0, 2.0], [1.0, 10.0 * DIVERGED_PROFILE_LIMIT], [1.0, nan]])
+    te_pred = jnp.ones((3, 2))
+    ne_targ = jnp.full((3, 2), 0.5)
+    te_targ = jnp.full((3, 2), 0.5)
+    ne_valid, te_valid, diverged = replace_diverged_profiles(ne_pred, te_pred, ne_targ, te_targ)
+    np.testing.assert_array_equal(np.asarray(diverged), [False, True, True])
+    np.testing.assert_array_equal(np.asarray(ne_valid), [[1.0, 2.0], [1.0, 0.5], [1.0, 0.5]])
+    np.testing.assert_array_equal(np.asarray(te_valid), np.asarray(te_pred))
 
 
 @pytest.mark.parametrize("bad_value", [np.nan, np.inf])

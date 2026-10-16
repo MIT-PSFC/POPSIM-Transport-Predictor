@@ -34,6 +34,7 @@ from transport_study.modules.profile_predictor.module import (
 from transport_study.modules.profile_predictor.torax_module import ProfilePredictorTorax
 from transport_study.modules.trb_utils import (
     CHI_ERROR_VARS,
+    DIVERGED_PROFILE_LIMIT,
     PROFILE_SCALE_FLOOR,
     CaseTrainDataLoader,
     chi_gradient,
@@ -472,7 +473,8 @@ class ProfilePredictorTRB(TrainRunBuilder):
                 - Per-timeslice profile-integrated absolute/relative errors
                 - Per-timeslice chi summed over the channels (error_chi_value_ts, error_chi_grad_ts),
                   and error_chi_ts = value + gradient_weight * grad, the validation loss less the device weight
-                - error_diverged_ts: 1 where the prediction went non-finite, 0 where finite, NaN without a target
+                - error_diverged_ts: 1 where the prediction diverged (non-finite or beyond DIVERGED_PROFILE_LIMIT), 0 where not,
+                  NaN without a target
                 - Per-shot time-integrated errors
             Keeps shot and ds_source coordinates for downstream analysis.
             """
@@ -500,15 +502,16 @@ class ProfilePredictorTRB(TrainRunBuilder):
             ne_pred = _ensure_rho_dim(unstack_samples(eval_data.output_ds[f"{output_prefix}ne"]), ne_targ)
             te_pred = _ensure_rho_dim(unstack_samples(eval_data.output_ds[f"{output_prefix}te"]), te_targ)
 
-            # A prediction with any non-finite point in either channel diverged.
+            # A prediction with any point in either channel non-finite or beyond DIVERGED_PROFILE_LIMIT diverged,
+            # as in the validation losses (replace_diverged_profiles), the comparison False for NaN and inf too.
             # Its errors are NaN, never inf, and error_diverged_ts counts it instead,
             # outside the freshness mask like the validation divergence penalty
-            ne_pred_finite = xr.apply_ufunc(np.isfinite, ne_pred).all(RADIAL_DIM)
-            te_pred_finite = xr.apply_ufunc(np.isfinite, te_pred).all(RADIAL_DIM)
-            mask_pred_finite = ne_pred_finite & te_pred_finite
+            ne_pred_valid = (xr.apply_ufunc(np.abs, ne_pred) <= DIVERGED_PROFILE_LIMIT).all(RADIAL_DIM)
+            te_pred_valid = (xr.apply_ufunc(np.abs, te_pred) <= DIVERGED_PROFILE_LIMIT).all(RADIAL_DIM)
+            mask_pred_valid = ne_pred_valid & te_pred_valid
             mask_targ_present = ne_targ.notnull().all(RADIAL_DIM) & te_targ.notnull().all(RADIAL_DIM)
-            error_diverged_ts = (~mask_pred_finite).astype(float).where(mask_targ_present)
-            mask_scored = mask_pred_finite
+            error_diverged_ts = (~mask_pred_valid).astype(float).where(mask_targ_present)
+            mask_scored = mask_pred_valid
             if fresh_only:
                 # Stale timeslices score NaN, every error below and the shot integrals then skip them
                 mask_fresh = unstack_samples(eval_data.input_ds["fresh_profile"]) == 1

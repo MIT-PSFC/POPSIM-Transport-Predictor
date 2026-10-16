@@ -324,6 +324,29 @@ def test_cases_launch_gpu_only_then_cpu_only_then_cpu_capable(make_stub_study, m
     assert launches == [("case.b", "gpu"), ("case.d", "cpu"), ("case.a", "cpu"), ("case.c", "gpu")]
 
 
+def test_dependent_starts_on_tuned_config_but_restore_waits_for_merge(make_stub_study):
+    """A hyperparam prereq that only hands a case its tuned config is ready once that config is written.
+
+    A case restoring a checkpoint from the same hyperparam case waits for its merged result.
+    """
+    hyperparam = StubCase(name="case.hyperparam", hyperparam=True)
+    tuned_only = StubCase(name="case.tuned_only", prereqs=[hyperparam])
+    restoring = StubCase(name="case.restoring", prereqs=[hyperparam], restored=[hyperparam])
+    study = make_stub_study([hyperparam, tuned_only, restoring])
+    assert not study.check_prereq_satisfied(tuned_only)
+
+    tuned_config_path = study.tuned_config_path(hyperparam)
+    tuned_config_path.parent.mkdir(parents=True, exist_ok=True)
+    tuned_config_path.touch()
+    assert study.check_prereq_satisfied(tuned_only)
+    assert not study.check_prereq_satisfied(restoring)
+
+    result_path = study.result_path(hyperparam)
+    result_path.parent.mkdir(parents=True, exist_ok=True)
+    result_path.touch()
+    assert study.check_prereq_satisfied(restoring)
+
+
 def test_case_finding_no_room_holds_only_cases_asking_as_much_memory(make_stub_study, monkeypatch):
     """The CPU partition has room for 12G jobs but not 80G ones in the first pass, for both in the next.
 

@@ -268,14 +268,20 @@ class PowerBalanceStudy(Study):
             return pinned
 
         def model_type_prereqs(self) -> list[Study.Case]:
-            # The structured models restore pre-trained p_oh/p_rad submodules at the case's own model size,
-            # so a sized case sizes the whole model
-            if self.model_type in MODEL_TYPES_WITH_SUBMODULES:
-                return [self.replace_pinned(model_type=submodule_type) for submodule_type in SUBMODULE_MODEL_TYPES]
+            submodules = self.submodule_prereqs()
+            if submodules:
+                return submodules
             # A multiobjective case's anchors take the huber deltas the hyperparam p_oh / p_rad cases were tuned with.
             # The model type guard matters when the hyperparam value is True, which pins the submodules' own flag True
             if self.model_type in MULTIOBJECTIVE_MODEL_TYPES and self.multiobjective:
                 return [self.hyperparam_case_of(submodule_type) for submodule_type in SUBMODULE_MODEL_TYPES]
+            return []
+
+        def submodule_prereqs(self) -> list[Study.Case]:
+            # The structured models restore pre-trained p_oh/p_rad submodules at the case's own model size,
+            # so a sized case sizes the whole model
+            if self.model_type in MODEL_TYPES_WITH_SUBMODULES:
+                return [self.replace_pinned(model_type=submodule_type) for submodule_type in SUBMODULE_MODEL_TYPES]
             return []
 
     #############

@@ -648,6 +648,20 @@ class Study:
             """Extra prereq cases implied by the model type (e.g. submodule predictors)."""
             return []
 
+        def submodule_prereqs(self) -> list[Study.Case]:
+            """The model-type prereqs this case restores a checkpoint from, its submodule predictors."""
+            return []
+
+        def restored_prereqs(self) -> list[Study.Case]:
+            """The prereqs whose checkpoints this case restores: its submodules and its transfer pretrain twin.
+
+            Every other prereq (the hyperparam case, the anchor-delta hyperparam cases) only hands the case its tuned config.
+            """
+            restored = self.submodule_prereqs()
+            if self.domain_adaptation == "transfer":
+                restored.append(self.transfer_pretrain_case())
+            return restored
+
         def normalization_method(self) -> str | None:
             """The input normalization method this case trains with, None when the study has none."""
             return None
@@ -897,12 +911,20 @@ class Study:
         return f"collect_results.{self.name}"
 
     def check_prereq_satisfied(self, case: Case) -> bool:
-        """Check if the prerequisites for this case have been satisfied by looking for the existence of the result path"""
+        """Whether every prereq of the case is ready for it to train.
+
+        Every prereq is ready once its seeds are merged into its result.
+        A hyperparam prereq that only hands the case its tuned config (not one of Case.restored_prereqs)
+        is ready already once that config is written, so its dependents start while its own seeds still train.
+        """
         if case.prereqs is None:
             return True
+        restored_names = {str(prereq) for prereq in case.restored_prereqs()}
         for prereq in case.prereqs:
-            prereq_result_path = self.result_path(prereq)
-            if not prereq_result_path.exists():
+            if self.result_path(prereq).exists():
+                continue
+            tuned_config_only = str(prereq) not in restored_names and prereq.is_hyperparam_case()
+            if not (tuned_config_only and self.tuned_config_path(prereq).exists()):
                 return False
         return True
 

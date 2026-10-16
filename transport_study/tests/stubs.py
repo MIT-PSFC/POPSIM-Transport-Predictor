@@ -61,9 +61,14 @@ class StubCase:
     hyperparam: bool = False
     # A twin or submodule stand-in, whose merge keeps every seed's best checkpoint
     keeps_seed_checkpoints: bool = False
+    # The prereqs this case restores a checkpoint from, every other one only hands it its tuned config
+    restored: list[StubCase] = field(default_factory=list)
 
     def is_hyperparam_case(self) -> bool:
         return self.hyperparam
+
+    def restored_prereqs(self) -> list[StubCase]:
+        return list(self.restored)
 
     def get_hyperparam_prereq(self) -> StubCase:
         """A stub case has no hyperparam axes, so it is its own hyperparam case."""

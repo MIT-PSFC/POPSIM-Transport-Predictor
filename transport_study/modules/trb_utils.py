@@ -210,20 +210,27 @@ def chi_profile_loss(
     return value_chi + gradient_weight * grad_chi
 
 
+# A profile point beyond this magnitude diverged, in 1e20 m^-3 and keV, about 100x any measured value.
+# A rollout can blow up to finite but astronomical values, which overflowed to inf in the float32 seed merge
+DIVERGED_PROFILE_LIMIT = 1e3
+
+
 def replace_diverged_profiles(
     ne_pred: jnp.ndarray, te_pred: jnp.ndarray, ne_targ: jnp.ndarray, te_targ: jnp.ndarray
 ) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
-    """The predicted (..., rho) profiles with every non-finite value replaced by its target, and whether each timeslice diverged.
+    """The predicted (..., rho) profiles with every diverged value replaced by its target, and whether each timeslice diverged.
 
+    A value diverged when it is non-finite or beyond DIVERGED_PROFILE_LIMIT in magnitude.
     For the validation losses, which charge a diverged timeslice divergence_penalty_val instead of passing it through as NaN,
     so one diverged sample cannot turn val/loss.mean NaN.
     Training never replaces them: a non-finite loss lets popsim mask the sample,
     where a finite stand-in leaves the gradient NaN and popsim skips the whole step.
     """
-    ne_finite = jnp.isfinite(ne_pred)
-    te_finite = jnp.isfinite(te_pred)
-    diverged = ~(jnp.all(ne_finite, axis=-1) & jnp.all(te_finite, axis=-1))
-    return jnp.where(ne_finite, ne_pred, ne_targ), jnp.where(te_finite, te_pred, te_targ), diverged
+    # Both comparisons are False for NaN and inf, so this one check covers them too
+    ne_valid = jnp.abs(ne_pred) <= DIVERGED_PROFILE_LIMIT
+    te_valid = jnp.abs(te_pred) <= DIVERGED_PROFILE_LIMIT
+    diverged = ~(jnp.all(ne_valid, axis=-1) & jnp.all(te_valid, axis=-1))
+    return jnp.where(ne_valid, ne_pred, ne_targ), jnp.where(te_valid, te_pred, te_targ), diverged
 
 
 def chi_sigma_floors_of(datasets: list[xr.Dataset], label: str) -> dict[str, float]:

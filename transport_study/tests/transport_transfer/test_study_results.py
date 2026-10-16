@@ -130,9 +130,10 @@ def test_stale_timeslices_score_nan_only_in_the_transport_suite():
     assert (ds_profile["error_chi_ts"].where(stale, drop=True) > 1.0).all()
 
 
-@pytest.mark.parametrize("bad_value", [np.nan, np.inf])
+# 1e6 is finite but beyond DIVERGED_PROFILE_LIMIT, a blown-up rollout that overflowed to inf in the float32 merge
+@pytest.mark.parametrize("bad_value", [np.nan, np.inf, 1e6])
 def test_non_finite_predictions_are_flagged_and_never_score_inf(bad_value):
-    """One non-finite point diverges the whole timeslice: flag 1, every error NaN, the shot integrals finite."""
+    """One diverged point diverges the whole timeslice: flag 1, every error NaN, the shot integrals finite."""
     te_pred = np.broadcast_to(TE_TARG, (len(SHOTS), N_TIME, RHO.size)).copy()
     te_pred[0, 1, 3] = bad_value
     ds = _profile_results(_eval_data(te_pred=te_pred))
