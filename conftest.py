@@ -6,6 +6,9 @@ from loguru import logger
 
 os.environ.setdefault("JAX_DEBUG_NANS", "0")
 os.environ.setdefault("MPLBACKEND", "Agg")
+# The jax CUDA plugin version check hangs forever on a node without a GPU.
+if not any(Path("/dev").glob("nvidia[0-9]*")):
+    os.environ.setdefault("JAX_PLATFORMS", "cpu")
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 DEBUG_LOG_DIR = PROJECT_ROOT / "scratch" / "debug_logs"

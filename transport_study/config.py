@@ -1,27 +1,92 @@
 """
 Load and parse configuration files for the project.
-This is where we set global variables from env vars or config files
+This is where we set global variables from env vars or config files.
+
+Every config field has exactly one role, declared with its type,
+because the role decides whether changing the field can mix results from two setups:
+- Identity (Identity[T]): names the study, whose working dir is working_dir_base / study_name.
+- Locked (no marker): changes what a case produces without changing the case's name.
+  The config lock refuses a run that changes one.
+  Unmarked fields are locked on purpose, so a new setting can never silently mix results.
+- Case axis (Annotated[T, CaseAxis(<Case field>)]): the values one Case field takes across the case grid.
+  It selects which cases exist, never what one case produces, so it may change between runs.
+- Orchestration (Orchestration[T]): where and how jobs run.
+  It never changes what a job computes, so it is neither locked nor written to the lock.
+
+A study TOML mirrors the roles:
+identity and locked fields at the top level, the axes under [cases], the orchestration settings under [orchestration],
+and the device dataset paths plus the target device under [datasets].
 """
 
 import json
 import os
 import tomllib
+from dataclasses import dataclass
+from enum import StrEnum
 from pathlib import Path
 from types import MappingProxyType
+from typing import Annotated, Self, TypeVar
 
 import numpy as np
 import toml
 from loguru import logger
-from pydantic import BaseModel, ConfigDict, Field, field_serializer, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    field_serializer,
+    field_validator,
+    model_validator,
+)
 
-# 80/20 between train/val
+# 80/20 between train/val, by a deterministic hazard sort: the highest-hazard fifth of each source is its validation set
 TRAIN_VAL_SPLIT = (0.8, 0.2)
 
-# Uniform normalized-minor-radius grid the profile transfer workflow puts every
+# Uniform rho_tor_norm grid the profile and transport studies put every
 # dataset on and every profile predictor family predicts on
 # Changing this changes the structure of the modules, cannot restore from checkpoints trained on a different grid
 N_RHO_POINTS = 51
 RHO_GRID = np.linspace(0.0, 1.0, N_RHO_POINTS)
+
+# debug runs a whole study cheaply:
+# the target device keeps every shot, each source device keeps only its DEBUG_MAX_SOURCE_SHOTS most recent ones,
+# training and sweep trials stop by DEBUG_MAX_EPOCHS and validate at least every DEBUG_EPOCHS_PER_VAL epochs,
+# each sweep runs DEBUG_HYPERPARAM_SWEEPS trials and is read from wandb every DEBUG_SWEEP_POLL_INTERVAL_S,
+# and every case trains at most DEBUG_NUM_SEEDS seeds (CaseGridConfig)
+DEBUG_MAX_SOURCE_SHOTS = 100
+DEBUG_MAX_EPOCHS = 12
+DEBUG_EPOCHS_PER_VAL = 3
+DEBUG_HYPERPARAM_SWEEPS = 1
+DEBUG_SWEEP_POLL_INTERVAL_S = 1.0
+DEBUG_NUM_SEEDS = 2
+
+
+class FieldRole(StrEnum):
+    """What a config field controls, see the module docstring."""
+
+    IDENTITY = "identity"
+    LOCKED = "locked"
+    CASE_AXIS = "case_axis"
+    ORCHESTRATION = "orchestration"
+
+
+@dataclass(frozen=True)
+class CaseAxis:
+    """Marks a config field as a case-grid axis, the values the Case field case_field takes across the grid."""
+
+    case_field: str
+
+
+T = TypeVar("T")
+Identity = Annotated[T, FieldRole.IDENTITY]
+Orchestration = Annotated[T, FieldRole.ORCHESTRATION]
+
+# TOML table of each role kept out of the top level, where the identity and locked fields sit
+ROLE_TABLES = {FieldRole.CASE_AXIS: "cases", FieldRole.ORCHESTRATION: "orchestration"}
+
+
+def _toml_location(table: str | None) -> str:
+    return f"in [{table}]" if table else "at the top level"
 
 
 def env_dataset_paths() -> dict[str, Path]:
@@ -31,99 +96,152 @@ def env_dataset_paths() -> dict[str, Path]:
     return {k: Path(v) for k, v in json.loads(os.environ.get("PTPS_DATASET_PATHS", "{}")).items()}
 
 
-def _env_spillover_partitions() -> tuple[str, ...]:
-    """Parse PTPS_SPILLOVER_PARTITIONS, a comma-separated ordered list of
-    partitions, e.g. "mit_preemptable,mit_normal_gpu"
-    """
-    raw = os.environ.get("PTPS_SPILLOVER_PARTITIONS", "")
-    return tuple(p.strip() for p in raw.split(",") if p.strip())
+def _env_list(var_name: str, default: str = "") -> tuple[str, ...]:
+    """Parse a comma-separated environment variable, e.g. PTPS_SPILLOVER_PARTITIONS="mit_preemptable,mit_normal_gpu"."""
+    raw = os.environ.get(var_name, default)
+    return tuple(item.strip() for item in raw.split(",") if item.strip())
 
 
-def _env_gpu_types() -> tuple[str, ...]:
-    """Parse PTPS_GPU_TYPES, a comma-separated list of SLURM gres GPU type
-    names GPU jobs may land on, e.g. "a100,h100,h200"
-    """
-    raw = os.environ.get("PTPS_GPU_TYPES", "a100,h100,h200")
-    return tuple(t.strip().lower() for t in raw.split(",") if t.strip())
+# SLURM memory size suffixes in MB, a bare number is MB
+SLURM_MEM_UNITS_MB = {"K": 1 / 1024, "M": 1, "G": 1024, "T": 1024 * 1024}
 
 
-def _env_exclude_nodes() -> tuple[str, ...]:
-    """Parse PTPS_EXCLUDE_NODES, a comma-separated list of SLURM node names
-    GPU jobs must avoid, e.g. a node with a GPU that faults on startup
-    """
-    raw = os.environ.get("PTPS_EXCLUDE_NODES", "")
-    return tuple(n.strip() for n in raw.split(",") if n.strip())
+def source_devices(dataset_paths: dict, target_device: str | None) -> list[str]:
+    """The non-target devices with a store, sorted: the historic sources of every study."""
+    return sorted(set(dataset_paths) - {target_device})
+
+
+def slurm_mem_MB(mem: str) -> int:
+    """MB of a SLURM memory size like "48G", "64000M" or "386G", raising on anything else."""
+    unit = mem[-1].upper() if mem and mem[-1].isalpha() else "M"
+    number = mem[:-1] if mem and mem[-1].isalpha() else mem
+    if unit not in SLURM_MEM_UNITS_MB or not number.replace(".", "", 1).isdigit():
+        raise ValueError(f"Not a SLURM memory size: {mem!r}")
+    return int(float(number) * SLURM_MEM_UNITS_MB[unit])
 
 
 # Main config for environment variables
 class StudyConfig(BaseModel):
     # Shared between all studies
-    study_name: str
+    study_name: Identity[str]
     dataset_paths: dict[str, Path] = Field(default_factory=env_dataset_paths)
     target_device: str
 
-    # Debugging and dev stuff
-    debug: bool = True
-    # Unused by the studies, but every existing working dir's config_lock.toml
-    # carries it and the lock is reloaded through this frozen model
-    # TODO(ZanderKeith): Remove this for APS study
-    dry_run: bool = False
-    max_ds_size: int = 1000
-    hyperparam_sweeps: int = 200
-    max_epochs: int = 1000
-    epochs_per_val: int = 20
-    patience: int = 6  # epochs_per_val * patience = max epochs without improvement before stopping
+    # Cheap whole-study runs, see DEBUG_MAX_SOURCE_SHOTS
+    debug: bool = False
+    # Keep only the most recent shots of each device, every shot when None (get_ds logs a truncation)
+    max_ds_size: int | None = None
+    # Loeppky, Sacks and Welch (2009, Technometrics 51) suggest about 10 trials per swept dimension.
+    # The sweeps vary 9 to 15 hyperparameters, 8 to 12 of them continuous, the rest discrete with 2 to 8 levels.
+    # Random search with far fewer trials than a grid matches or beats it (Bergstra and Bengio 2012, JMLR 13),
+    # and these sweeps are Bayesian.
+    hyperparam_sweeps: int = 80
+    max_epochs: int = 120
+    epochs_per_val: int = 1
+    patience: int = 10  # epochs_per_val * patience = max epochs without improvement before stopping
+    # Horizon in epochs of the weight average every run validates, checkpoints and restores (popsim Trainer.eval_model).
+    # The running mean of every iterate until the horizon, then an EMA over it.
+    # One target-only epoch is 1 to 3 steps, so the same horizon is far fewer steps in the finetune stage, by design
+    ema_horizon_epochs: float = 5.0
+    # Patience counts a validation as an improvement only when it beats the best by more than this fraction of it
+    min_relative_improvement: float = 0.01
+    # Epochs and patience of the finetune stage, the transfer finetunes and exnihilo cases that train on the target shots alone.
+    # An epoch of a target-only set is one or a few optimizer steps, so these run longer than every other case.
+    # Their learning-rate decay stays that of a max_epochs run (Study._extend_finetune_budget),
+    # so the epochs past max_epochs train on its decayed tail
+    finetune_max_epochs: int = 240
+    finetune_patience: int = 20
     # Epoch cap for hyperparameter sweep trials and agent jobs
     # Trials are wall-clock limited to train_wall_budget_s and stop early via patience
-    # Capped below max_epochs so sweep trials stay cheap. The swept LR decay params
-    # (transition_steps, decay_rate) carry into production training unchanged, so
-    # tuned schedules are only validated over this shorter horizon
-    hyperparam_max_epochs: int = 240
+    # Capped below max_epochs so sweep trials stay cheap.
+    # The swept transition_frac is a fraction of each run's own step budget,
+    # so a tuned schedule stretches to the production horizon, validated only over this shorter one
+    hyperparam_max_epochs: int = 100
 
     # Environment-specific orchestration settings
-    partition: str | None = Field(default_factory=lambda: os.environ.get("PTPS_PARTITION"))
+    partition: Orchestration[str | None] = Field(default_factory=lambda: os.environ.get("PTPS_PARTITION"))
     # Partition for CPU-only analysis jobs (per-case metrics and case reports).
     # These need no GPU, so point this at a CPU partition. Falls back to `partition`
-    analysis_partition: str | None = Field(default_factory=lambda: os.environ.get("PTPS_ANALYSIS_PARTITION"))
+    analysis_partition: Orchestration[str | None] = Field(default_factory=lambda: os.environ.get("PTPS_ANALYSIS_PARTITION"))
     # SLURM walltime request for analysis jobs, sbatch --time format
-    analysis_time_limit: str = Field(default_factory=lambda: os.environ.get("PTPS_ANALYSIS_TIME_LIMIT", "07:59:59"))
+    analysis_time_limit: Orchestration[str] = Field(default_factory=lambda: os.environ.get("PTPS_ANALYSIS_TIME_LIMIT", "07:59:59"))
+    # sbatch --mem of every analysis job
+    analysis_mem: Orchestration[str] = Field(default_factory=lambda: os.environ.get("PTPS_ANALYSIS_MEM", "32G"))
+    # sbatch --mem of the collect_results job
+    collect_mem: Orchestration[str] = Field(default_factory=lambda: os.environ.get("PTPS_COLLECT_MEM", "64G"))
     # Cap on this study's concurrent (running + pending) analysis jobs, so a study
     # with hundreds of cases doesn't flood the queue with pending jobs at once
-    max_analysis_jobs: int = Field(default_factory=lambda: int(os.environ.get("PTPS_MAX_ANALYSIS_JOBS", "20")))
+    max_analysis_jobs: Orchestration[int] = Field(default_factory=lambda: int(os.environ.get("PTPS_MAX_ANALYSIS_JOBS", "20")))
     # SLURM walltime request for training and agent jobs, sbatch --time format
-    train_time_limit: str = Field(default_factory=lambda: os.environ.get("PTPS_TRAIN_TIME_LIMIT", "07:59:59"))
+    train_time_limit: Orchestration[str] = Field(default_factory=lambda: os.environ.get("PTPS_TRAIN_TIME_LIMIT", "07:59:59"))
     # In-job wall-clock training budget in seconds. Set below the SLURM limit so the
     # trainer can save the latest checkpoint and exit cleanly, then a resubmitted job
     # resumes from that checkpoint. 27000 s = 7.5 h
-    train_wall_budget_s: int = Field(default_factory=lambda: int(os.environ.get("PTPS_TRAIN_WALL_BUDGET_S", "27000")))
-    buffer_gpus: int | None = Field(default_factory=lambda: int(os.environ.get("PTPS_BUFFER_GPUS", "12")))
-    # SLURM gres GPU type names training and agent jobs may land on
-    # The default keeps float64 TORAX training off cards with slow fp64
-    # pipelines (l40s, a40, l4, rtx_pro_6000). Empty disables the exclusion
-    gpu_types: tuple[str, ...] = Field(default_factory=_env_gpu_types)
-    # SLURM node names GPU jobs must never land on, e.g. a node with a GPU
-    # that faults every job at startup. Unlike the gpu_types exclusion this
-    # applies to every gres request, typed fallbacks included. Note sbatch has
-    # no SBATCH_EXCLUDE environment variable, so an in-script #SBATCH
-    # --exclude line is the only way to pass this through. Empty disables it
-    exclude_nodes: tuple[str, ...] = Field(default_factory=_env_exclude_nodes)
-    # Overflow partitions for GPU jobs once `partition` has no idle GPUs beyond
-    # buffer_gpus, tried in order. Jobs submitted there can be preempted
-    # (requeued) at any time, so training relies on resume-from-checkpoint.
-    # Submissions per partition are capped at its per-user GPU allowance
-    # (QOS MaxTRESPU gres/gpu) so jobs don't pile up pending behind a QOS cap.
-    # Empty disables spillover
-    spillover_partitions: tuple[str, ...] = Field(default_factory=_env_spillover_partitions)
-    # Ceiling on this user's total running + pending jobs across all partitions.
-    # Default matches the mit_preemptable QOS MaxSubmitPU (448), the tightest of
-    # the limits that apply (association MaxSubmit is 500)
-    max_user_jobs: int = Field(default_factory=lambda: int(os.environ.get("PTPS_MAX_USER_JOBS", "448")))
-    # Spillover submissions stop once total jobs reach max_user_jobs - this headroom,
-    # leaving slack for analysis jobs and interactive work
-    spillover_job_headroom: int = Field(default_factory=lambda: int(os.environ.get("PTPS_SPILLOVER_JOB_HEADROOM", "10")))
-    wandb_entity: str | None = Field(default_factory=lambda: os.environ.get("PTPS_WANDB_ENTITY"))
+    train_wall_budget_s: Orchestration[int] = Field(default_factory=lambda: int(os.environ.get("PTPS_TRAIN_WALL_BUDGET_S", "27000")))
+    # Idle GPUs of the primary partition a GPU-only job leaves for other users and studies
+    buffer_gpus: Orchestration[int] = Field(default_factory=lambda: int(os.environ.get("PTPS_BUFFER_GPUS", "12")), ge=0)
+    # GPU-only jobs allowed to pend on the primary partition beyond its GPUs past buffer_gpus (slurm_utils.LaunchSlots),
+    # so SLURM starts the next one the moment a GPU frees, without waiting for the next orchestration pass
+    gpu_pending_jobs: Orchestration[int] = Field(default_factory=lambda: int(os.environ.get("PTPS_GPU_PENDING_JOBS", "0")), ge=0)
+    # SLURM gres GPU type names training and agent jobs may land on.
+    # The default keeps float64 TORAX training off cards with slow fp64 pipelines (l40s, a40, l4, rtx_pro_6000).
+    # Empty disables the exclusion.
+    gpu_types: Orchestration[tuple[str, ...]] = Field(default_factory=lambda: _env_list("PTPS_GPU_TYPES", "a100,h100,h200"))
+    # SLURM node names GPU jobs must never land on, e.g. a node whose GPU faults every job at startup.
+    # Unlike the gpu_types exclusion it applies to every gres request, typed fallbacks included.
+    # sbatch has no SBATCH_EXCLUDE environment variable, so it reaches the job as an #SBATCH --exclude line.
+    # Empty disables it.
+    exclude_nodes: Orchestration[tuple[str, ...]] = Field(default_factory=lambda: _env_list("PTPS_EXCLUDE_NODES"))
+    # Overflow partitions for GPU jobs once `partition` has no idle GPUs beyond buffer_gpus, tried in order.
+    # Jobs there can be preempted at any time, so training relies on resume-from-checkpoint.
+    # Submissions per partition are capped at its per-user GPU allowance (QOS MaxTRESPU gres/gpu).
+    # Empty disables spillover.
+    spillover_partitions: Orchestration[tuple[str, ...]] = Field(default_factory=lambda: _env_list("PTPS_SPILLOVER_PARTITIONS"))
+    # Model types whose training and sweep agent jobs run on GPU partitions only, and those that run on the CPU partitions only.
+    # Every other model type is CPU-capable: it takes a primary GPU only after the GPU-only cases
+    # and while more than cpu_capable_buffer_gpus are idle, else the first CPU partition with room.
+    # Without a cpu_partition every model type trains on GPU, so a slow type must be listed GPU-only once there is one.
+    # Prereq pseudo types count by their own name (p_oh, power_balance, profile).
+    # No env var, the valid names differ per study.
+    gpu_only_model_types: Orchestration[tuple[str, ...]] = ()
+    cpu_only_model_types: Orchestration[tuple[str, ...]] = ()
+    # Primary CPU partition of the CPU-capable and CPU-only model types, then the fallbacks in order
+    cpu_partition: Orchestration[str | None] = Field(default_factory=lambda: os.environ.get("PTPS_CPU_PARTITION"))
+    cpu_fallback_partitions: Orchestration[tuple[str, ...]] = Field(default_factory=lambda: _env_list("PTPS_CPU_FALLBACK_PARTITIONS"))
+    # CPUs per CPU training or agent job.
+    # XLA's CPU thread pool follows the job's cgroup, and the sequential rollouts barely speed up past 4.
+    cpu_train_cpus: Orchestration[int] = Field(default_factory=lambda: int(os.environ.get("PTPS_CPU_TRAIN_CPUS", "4")), ge=1)
+    # Idle primary GPUs a CPU-capable case leaves for GPU-only cases, for this running study or another running in parallel.
+    # A CPU-capable job never pends on the primary partition, the CPU partitions take it instead
+    cpu_capable_buffer_gpus: Orchestration[int] = Field(
+        default_factory=lambda: int(os.environ.get("PTPS_CPU_CAPABLE_BUFFER_GPUS", "0")), ge=0
+    )
+    # Jobs allowed to pend on each CPU partition beyond what fits on it now (slurm_utils.cpu_partition_room),
+    # so SLURM refills a freed slot without waiting for the next orchestration pass
+    cpu_pending_jobs: Orchestration[int] = Field(default_factory=lambda: int(os.environ.get("PTPS_CPU_PENDING_JOBS", "0")), ge=0)
+    # sbatch --mem of the training and agent jobs of every model type train_mem_by_model_type does not list, GPU or CPU.
+    # A CPU job also holds the device arrays in host RAM, so size it from the CPU peak.
+    train_mem: Orchestration[str] = Field(default_factory=lambda: os.environ.get("PTPS_TRAIN_MEM", "120G"))
+    # sbatch --mem of the training and agent jobs of each listed model type, on either device.
+    # Prereq pseudo types count by their own name (p_oh, power_balance, profile).
+    # No env var, the valid names differ per study.
+    train_mem_by_model_type: Orchestration[dict[str, str]] = Field(default_factory=dict)
+    # Ceiling on this user's running + pending jobs across all partitions.
+    # The default is the mit_preemptable QOS MaxSubmitPU (448), the tightest limit that applies.
+    max_user_jobs: Orchestration[int] = Field(default_factory=lambda: int(os.environ.get("PTPS_MAX_USER_JOBS", "448")))
+    # Spillover submissions stop at max_user_jobs minus this headroom, leaving slack for analysis and interactive jobs
+    spillover_job_headroom: Orchestration[int] = Field(default_factory=lambda: int(os.environ.get("PTPS_SPILLOVER_JOB_HEADROOM", "10")))
+    wandb_entity: Orchestration[str | None] = Field(default_factory=lambda: os.environ.get("PTPS_WANDB_ENTITY"))
+    # The orchestrator reads a sweep's wandb project at most this often, by the sweep progress check and by the agent watchdog each.
+    # A read costs about one request per run of the project, so reading every pass would hit the wandb rate limit
+    sweep_poll_interval_s: Orchestration[float] = Field(
+        default_factory=lambda: float(os.environ.get("PTPS_SWEEP_POLL_INTERVAL_S", "300")), gt=0
+    )
+    # Ceiling on one sweep's running + pending agent jobs,
+    # so the bayes search takes in finished trials before it suggests the next ones
+    max_running_agents: Orchestration[int] = Field(default_factory=lambda: int(os.environ.get("PTPS_MAX_RUNNING_AGENTS", "20")), ge=1)
     # Scratch directory for trajectory-optimization intermediate results
-    scratch_dir: Path | None = None
+    scratch_dir: Orchestration[Path | None] = None
 
     # make everything in the config completely immutable, including the nested dataset_paths dict
     # extra="forbid" so a mistyped field name raises instead of being silently ignored and replaced by the default
@@ -134,6 +252,64 @@ class StudyConfig(BaseModel):
         object.__setattr__(self, "dataset_paths", MappingProxyType(self.dataset_paths))
         return self
 
+    @field_validator("gpu_types")
+    @classmethod
+    def _lowercase_gpu_types(cls, gpu_types: tuple[str, ...]) -> tuple[str, ...]:
+        """The sinfo GPU types are compared lowercase, so gpu_types matches in whatever case it is written."""
+        return tuple(gpu_type.lower() for gpu_type in gpu_types)
+
+    @model_validator(mode="after")
+    def _check_finetune_max_epochs(self):
+        """The finetune stage trains at least max_epochs, so a TOML raising max_epochs has to set finetune_max_epochs too."""
+        if self.finetune_max_epochs < self.max_epochs:
+            raise ValueError(f"finetune_max_epochs {self.finetune_max_epochs} is below max_epochs {self.max_epochs}")
+        return self
+
+    @model_validator(mode="after")
+    def _check_cpu_partitions(self):
+        """CPU training needs a CPU partition, and no partition may serve both devices, since submission picks the device by partition.
+
+        A model type is GPU-only, CPU-only or neither (CPU-capable), never both.
+        """
+        if (self.cpu_only_model_types or self.cpu_fallback_partitions) and not self.cpu_partition:
+            raise ValueError("cpu_only_model_types and cpu_fallback_partitions need a cpu_partition")
+        both_devices_only = sorted(set(self.gpu_only_model_types) & set(self.cpu_only_model_types))
+        if both_devices_only:
+            raise ValueError(f"Model types {both_devices_only} are in both gpu_only_model_types and cpu_only_model_types")
+        # Unset partitions are None, a config rebuilt from its lock carries no orchestration fields at all
+        gpu_partitions = {p for p in (self.partition, *self.spillover_partitions) if p}
+        shared = sorted(p for p in (self.cpu_partition, *self.cpu_fallback_partitions) if p and p in gpu_partitions)
+        if shared:
+            raise ValueError(f"Partitions {shared} are both CPU and GPU partitions")
+        return self
+
+    @field_validator("train_mem", "analysis_mem", "collect_mem")
+    @classmethod
+    def _check_slurm_mem(cls, mem: str) -> str:
+        """A SLURM memory size, so a typo fails when the config loads instead of at sbatch."""
+        slurm_mem_MB(mem)
+        return mem
+
+    @field_validator("train_mem_by_model_type")
+    @classmethod
+    def _check_slurm_mems(cls, mems: dict[str, str]) -> dict[str, str]:
+        """Every listed memory a SLURM memory size, as _check_slurm_mem checks one."""
+        for mem in mems.values():
+            slurm_mem_MB(mem)
+        return mems
+
+    @model_validator(mode="after")
+    def _apply_debug_limits(self):
+        """Cap the epochs, the validation interval, the sweep size and the sweep poll interval of a debug run (get_ds caps the source shots)."""
+        if self.debug:
+            object.__setattr__(self, "max_epochs", min(self.max_epochs, DEBUG_MAX_EPOCHS))
+            object.__setattr__(self, "finetune_max_epochs", min(self.finetune_max_epochs, DEBUG_MAX_EPOCHS))
+            object.__setattr__(self, "hyperparam_max_epochs", min(self.hyperparam_max_epochs, DEBUG_MAX_EPOCHS))
+            object.__setattr__(self, "epochs_per_val", min(self.epochs_per_val, DEBUG_EPOCHS_PER_VAL))
+            object.__setattr__(self, "hyperparam_sweeps", min(self.hyperparam_sweeps, DEBUG_HYPERPARAM_SWEEPS))
+            object.__setattr__(self, "sweep_poll_interval_s", min(self.sweep_poll_interval_s, DEBUG_SWEEP_POLL_INTERVAL_S))
+        return self
+
     # dataset_paths is stored as a MappingProxyType for immutability, but the field is typed
     # dict[str, Path], so tell the serializer to emit a plain dict and avoid a Pydantic warning
     @field_serializer("dataset_paths")
@@ -141,44 +317,90 @@ class StudyConfig(BaseModel):
         return dict(v)
 
     @classmethod
-    def from_toml(cls, path: Path | str) -> "StudyConfig":
-        path = Path(path)
+    def field_role(cls, name: str) -> FieldRole:
+        """The role a field declares with its type, LOCKED when it declares none."""
+        for marker in cls.model_fields[name].metadata:
+            if isinstance(marker, CaseAxis):
+                return FieldRole.CASE_AXIS
+            if isinstance(marker, FieldRole):
+                return marker
+        return FieldRole.LOCKED
+
+    @classmethod
+    def fields_with_role(cls, *roles: FieldRole) -> tuple[str, ...]:
+        return tuple(name for name in cls.model_fields if cls.field_role(name) in roles)
+
+    @classmethod
+    def case_axes(cls) -> dict[str, str]:
+        """Case field name -> the config field holding its values, one entry per case-grid axis."""
+        axes = {}
+        for name, info in cls.model_fields.items():
+            for marker in info.metadata:
+                if isinstance(marker, CaseAxis):
+                    axes[marker.case_field] = name
+        return axes
+
+    def differing_fields(self, other: "StudyConfig", *roles: FieldRole) -> list[str]:
+        """Names of the fields with one of roles whose values differ between the two configs."""
+        return [name for name in self.fields_with_role(*roles) if getattr(self, name) != getattr(other, name)]
+
+    @classmethod
+    def toml_kwargs(cls, path: Path | str) -> dict:
+        """Constructor kwargs of a study TOML laid out by role (see the module docstring).
+
+        A field outside the table of its role raises, naming the right table.
+        PTPS_DATASET_PATHS provides default device paths, explicit [datasets] paths win.
+        """
         with open(path, "rb") as f:
             data = tomllib.load(f)
         datasets = data.pop("datasets", {})
         target = datasets.pop("target", None)
-        # Env vars provide defaults, explicit TOML paths win
-        return cls(
-            **data,
-            dataset_paths=env_dataset_paths() | {k: Path(v) for k, v in datasets.items()},
-            target_device=target,
-        )
+        tables = {table: data.pop(table, {}) for table in ROLE_TABLES.values()}
+        kwargs = {}
+        for table, entries in [(None, data), *tables.items()]:
+            for name, value in entries.items():
+                if name not in cls.model_fields:
+                    raise ValueError(f"Unknown config field {name} {_toml_location(table)} of {path}")
+                expected_table = ROLE_TABLES.get(cls.field_role(name))
+                if expected_table != table:
+                    raise ValueError(
+                        f"Config field {name} is {_toml_location(table)} of {path}, but it belongs {_toml_location(expected_table)}"
+                    )
+                kwargs[name] = value
+        dataset_paths = env_dataset_paths() | {k: Path(v) for k, v in datasets.items()}
+        return kwargs | {"dataset_paths": dataset_paths, "target_device": target}
+
+    @classmethod
+    def from_toml(cls, path: Path | str) -> Self:
+        kwargs = cls.toml_kwargs(path)
+        return cls(**kwargs)
 
     @property
     def ds_source_to_idx(self) -> dict[str, int]:
         """Stable integer index per device, sorted alphabetically for reproducibility."""
         return {k: i for i, k in enumerate(sorted(self.dataset_paths.keys()))}
 
-    def is_compatible(self, cfg: "StudyConfig") -> bool:
-        """Check if two configs are compatible for running the same study (e.g. dataset paths and target device must match)."""
-        return self.dataset_paths == cfg.dataset_paths and self.target_device == cfg.target_device
+    def toml_data(self, roles: tuple[FieldRole, ...] = tuple(FieldRole)) -> dict:
+        """The TOML tables save writes and from_toml reads back, laid out by role.
 
-    def save(self, path: Path):
-        raw = self.model_dump()
+        Only fields with one of roles are written, None fields are left out.
+        """
         datasets = {k: str(v) for k, v in self.dataset_paths.items()}
         if self.target_device is not None:
             datasets["target"] = self.target_device
-        data = {}
-        for k, v in raw.items():
-            if k in ("dataset_paths", "target_device"):
+        data: dict = {}
+        tables: dict = {table: {} for role, table in ROLE_TABLES.items() if role in roles}
+        for name, value in self.model_dump().items():
+            role = self.field_role(name)
+            if name in ("dataset_paths", "target_device") or value is None or role not in roles:
                 continue
-            if v is None:
-                continue
-            if isinstance(v, Path):
-                data[k] = str(v)
-            else:
-                data[k] = v
-        data["datasets"] = datasets
+            table = ROLE_TABLES.get(role)
+            entries = tables[table] if table else data
+            entries[name] = str(value) if isinstance(value, Path) else value
+        return data | tables | {"datasets": datasets}
+
+    def save(self, path: Path):
+        data = self.toml_data()
         with open(path, "w") as f:
             toml.dump(data, f)
 
@@ -214,6 +436,12 @@ class _ConfigProxy:
             raise RuntimeError("Config not loaded. Call load_config() first.")
         return type(_ConfigProxy._cfg)
 
+    def get_instance(self) -> StudyConfig:
+        """The loaded config object itself, for code that stores or compares it (e.g. the config lock)."""
+        if _ConfigProxy._cfg is None:
+            raise RuntimeError("Config not loaded. Call load_config() first.")
+        return _ConfigProxy._cfg
+
 
 config = _ConfigProxy()
 
@@ -222,10 +450,11 @@ def load_config(cfg: "StudyConfig | Path | str") -> "StudyConfig":
     """Load study config from a StudyConfig object or a path to a TOML file."""
     if _ConfigProxy.initialized:
         raise RuntimeError("Config already loaded. Multiple calls to load_config() are not allowed.")
-    _ConfigProxy.initialized = True
     if isinstance(cfg, (Path, str)):
         cfg = StudyConfig.from_toml(cfg)
+    # Only a loaded config counts, a failed TOML parse leaves the proxy loadable
     _ConfigProxy._cfg = cfg
+    _ConfigProxy.initialized = True
     return cfg
 
 

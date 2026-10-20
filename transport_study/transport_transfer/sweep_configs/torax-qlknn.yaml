@@ -4,8 +4,8 @@ metric:
   goal: "minimize"
 early_terminate:
   type: hyperband
-  min_iter: 2
-  eta: 3
+  min_iter: 10
+  eta: 2
 parameters:
   model_init_config:
     parameters:
@@ -13,41 +13,59 @@ parameters:
       # No t_final / n_solver_steps sweep: the transport predictor advances exactly one
       # solver step of the dataset timebase per call (sim_dt is fixed)
       nn_width:
-        values: [8, 16, 32, 64]
+        values: [24, 40, 64, 96, 144]
       nn_depth:
         values: [1, 2, 3, 4]
   optimizer_config:
     parameters:
+      # Two decades up to 1e-1, the first apsdpp power balance launch tuned lr0 into the top third of [1e-5, 1e-2]
       lr0:
         distribution: log_uniform_values
-        min: 1.0e-5
-        max: 1.0e-2
-      lrf:
+        min: 1.0e-4
+        max: 1.0e-1
+      # Final learning rate as a fraction of lr0, never above it
+      lrf_frac:
         distribution: log_uniform_values
-        min: 1.0e-7
-        max: 1.0e-4
+        min: 1.0e-3
+        max: 1.0
       weight_decay:
         distribution: log_uniform_values
         min: 1.0e-6
         max: 0.1
-      # Learning-rate decay time constant as a fraction of the run's total
-      # optimizer steps (steps_per_epoch * max_epochs), resolved to
-      # transition_steps at train time. Horizon-invariant: the tuned schedule
-      # transfers to runs with different epoch budgets or batch sizes.
+      # The AdamW moments as 1 - b (trb_utils.make_exponential_adamw), b1 in [0.7, 0.99] and b2 in [0.9, 0.9999]
+      one_minus_b1:
+        distribution: log_uniform_values
+        min: 0.01
+        max: 0.3
+      one_minus_b2:
+        distribution: log_uniform_values
+        min: 1.0e-4
+        max: 0.1
+      eps:
+        distribution: log_uniform_values
+        min: 1.0e-10
+        max: 1.0e-4
+      nesterov:
+        values: [false, true]
+      # Optimizer steps per 10x learning-rate decay as a fraction of the run's own steps (popsim resolve_transition_frac), horizon-invariant
       transition_frac:
         distribution: log_uniform_values
         min: 0.03
         max: 3.0
+      # Only ln(decay_rate) / transition_frac shapes the decay, so transition_frac alone sweeps it
       decay_rate:
-        distribution: uniform
-        min: 0.5
-        max: 0.999
+        value: 0.1
   loss_config:
     parameters:
-      # The delta acts on peak-normalized profiles, so it reads as a fractional
-      # error. Safe to sweep, the sweep metric val/loss.mean is the delta-free
+      # Deltas act on chi, the residual in GP-fit error bars (trb_utils.huber_profile_loss).
+      # Safe to sweep, the sweep metric val/loss.mean is the delta-free
       # validation loss (TransportPredictorTRB.get_val_loss_fn)
       huber_delta:
         distribution: log_uniform_values
-        min: 0.01
-        max: 1.0
+        min: 0.1
+        max: 10.0
+      # Trained models sat near 1 error bar on the values and 3-4 on the gradients, so the gradient term has its own delta
+      huber_delta_grad:
+        distribution: log_uniform_values
+        min: 0.3
+        max: 30.0

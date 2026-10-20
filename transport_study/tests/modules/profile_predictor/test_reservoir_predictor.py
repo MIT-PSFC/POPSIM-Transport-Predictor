@@ -1,28 +1,31 @@
 """Tests for the reservoir profile predictor.
 
-The reservoir weights are drawn once at init and must stay frozen: only the
-readout network trains. These pin that contract plus the reservoir's own
-spectral-radius scaling and determinism.
+The reservoir weights are drawn once at init and must stay frozen:
+only the readout network trains.
+These pin that contract plus the reservoir's own spectral-radius scaling and determinism,
+and the per-sample state cache model_init attaches to the loaders.
 """
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from popsim.ml import TrainConfig
+from popsim.ml.eval import batched_model_eval_and_loss
 from popsim.ml.launch import launch_train
 
-from transport_study import PACKAGE_ROOT
-from transport_study.config import RHO_GRID, StudyConfig, load_config
+from transport_study import RADIAL_DIM
+from transport_study.config import RHO_GRID, StudyConfig, load_config, reset_config
 from transport_study.modules.normalization import CoralFeatureNormalizer
 from transport_study.modules.profile_predictor.module import (
     N_NN_INPUTS,
+    RESERVOIR_FINGERPRINT_VAR,
+    RESERVOIR_STATE_VAR,
     Inputs,
     ProfilePredictorReservoir,
 )
 from transport_study.modules.profile_predictor.trb import ProfilePredictorTRB
-from transport_study.orchestration.organize_data import PROFILE_TARGET_VARS
-from transport_study.profile_transfer.profile_study import PROFILE_INPUT_VARS
+from transport_study.profile_transfer.profile_study import ProfileStudy
+from transport_study.tests.sample_data import SAMPLE_DIR, requires_sample_data
 
 RESERVOIR_SIZE = 32
 
@@ -33,8 +36,8 @@ def loaded_config():
         StudyConfig(
             study_name="test_reservoir_predictor",
             dataset_paths={
-                "cmod-low": PACKAGE_ROOT / "datasets" / "sample" / "cmod-low1.nc",
-                "cmod-high": PACKAGE_ROOT / "datasets" / "sample" / "cmod-high.nc",
+                "cmod-low1": SAMPLE_DIR / "cmod-low1.nc",
+                "cmod-high": SAMPLE_DIR / "cmod-high.nc",
             },
             target_device="cmod-high",
         )
@@ -57,15 +60,16 @@ def make_module():
 
 def _inputs() -> Inputs:
     return Inputs(
-        Ip=1.0,
-        B0=5.4,
-        betan=1.2,
-        ne20_line_avg=1.5,
-        R0=0.68,
-        a_minor=0.22,
-        kappa=1.6,
-        delta_top=0.4,
-        delta_bot=0.5,
+        ip_MA=1.0,
+        b0=5.56,
+        b_geo=5.4,
+        beta_tor_norm=1.2,
+        n_e_line_average_1e20=1.5,
+        geometric_axis_r=0.68,
+        minor_radius=0.22,
+        elongation=1.6,
+        triangularity_upper=0.4,
+        triangularity_lower=0.5,
         rho=jnp.asarray(RHO_GRID),
         ds_source_idx=jnp.asarray(0.0),
     )
@@ -95,7 +99,7 @@ def test_reservoir_state_deterministic_and_input_sensitive(make_module):
 def test_reservoir_trainable_getter_only_readout(make_module):
     """The reservoir tensors must never appear in the trainable selection."""
     module = make_module()
-    trainable = ProfilePredictorTRB.get_trainable_getter({"model_type": "reservoir"})(module)
+    trainable = ProfilePredictorTRB.get_trainable_getter({"model_type": "reservoir", "domain_adaptation": None})(module)
 
     trainable_ids = {id(leaf) for leaf in trainable}
     nn_ids = {id(leaf) for leaf in jax.tree.leaves(module.nn)}
@@ -104,44 +108,79 @@ def test_reservoir_trainable_getter_only_readout(make_module):
     assert not (trainable_ids & reservoir_ids)
 
 
-@pytest.mark.slow
-def test_reservoir_training_smoke():
-    """End-to-end launch_train on the sample dataset."""
-    train_config = TrainConfig(
-        project="test_reservoir_training_smoke",
-        train_run_builder="transport_study.modules.profile_predictor.trb.ProfilePredictorTRB",
+def _sample_reservoir_study(study_name: str, working_dir_base) -> ProfileStudy:
+    """A one-case reservoir study on the sample dataset, loading its own config in place of the module fixture's."""
+    reset_config()
+    cfg = ProfileStudy.Config(
+        study_name=study_name,
+        working_dir_base=working_dir_base,
+        dataset_paths={
+            "cmod-low1": SAMPLE_DIR / "cmod-low1.nc",
+            "cmod-high": SAMPLE_DIR / "cmod-high.nc",
+        },
+        target_device="cmod-high",
+        max_ds_size=10,
         max_epochs=2,
         epochs_per_val=1,
-        checkpoint_dir=None,
-        dataloader_config={
-            "input_vars": PROFILE_INPUT_VARS,
-            "target_vars": [*PROFILE_TARGET_VARS, "ds_source_idx"],
-            "training_data": {"sources_unsorted": ["cmod-low"], "exnihilo": False},
-            "batch_size": None,
-        },
-        model_init_config={
-            "model_type": "reservoir",
-            # model_init indexes this strictly, the study normally supplies it
-            "data_normalization": "physics-coral",
-            "reservoir_size": RESERVOIR_SIZE,
-            "spectral_radius": 0.9,
-            "input_scaling": 0.5,
-            "leak_rate": 1.0,
-            "n_steps": 10,
-            "prng_seed": 42,
-        },
-        loss_config={
-            "huber_delta": 0.5,
-            "gradient_weight": 0.1,
-            "huber_delta_grad": 5.0,
-        },
-        optimizer_config={
-            "lr0": 3e-3,
-            "transition_steps": 500,
-            "decay_rate": 0.5,
-            "lrf": 5e-4,
-            "weight_decay": 2e-4,
-        },
+        model_types=("reservoir",),
+        data_normalization_methods=("physics-coral",),
+        hyperparam_data_normalization="physics-coral",
+        training_datasets=("cmod-low1",),
+        domain_adaptation_methods=(None,),
+        num_target_shots_options=(0,),
+        target_test_set_size=4,
     )
+    return ProfileStudy(cfg)
 
-    launch_train(train_config)
+
+@pytest.fixture
+def cached_reservoir_run(tmp_path):
+    """The train config, loaders and module model_init returns for the sample reservoir case, the loaders holding the cache."""
+    study = _sample_reservoir_study("test_reservoir_state_cache", tmp_path)
+    (case,) = study.cases
+    train_config = study.make_train_config(case)
+    _, train_dl, val_dl, _ = ProfilePredictorTRB.get_dataloaders(train_config.dataloader_config)
+    module = ProfilePredictorTRB.model_init(train_dl, train_config.model_init_config)
+    return train_config, train_dl, val_dl, module
+
+
+@requires_sample_data
+def test_cached_states_match_uncached_losses(cached_reservoir_run):
+    """The cached states give the training and validation losses the reservoir itself gives."""
+    train_config, train_dl, val_dl, module = cached_reservoir_run
+    train_loss_fn = ProfilePredictorTRB.get_loss_fn(train_config.loss_config)
+    val_loss_fn = ProfilePredictorTRB.get_val_loss_fn(train_config.val_eval_suite_config["loss_config"])
+    for loader, loss_fn in ((train_dl, train_loss_fn), (val_dl, val_loss_fn)):
+        batch = next(iter(loader))
+        inputs, targets = batch.get_inputs_and_targets()
+        assert RESERVOIR_STATE_VAR in inputs
+        inputs_uncached = inputs.drop_vars([RESERVOIR_STATE_VAR, RESERVOIR_FINGERPRINT_VAR])
+        losses_cached = batched_model_eval_and_loss(module, loss_fn, inputs, targets)
+        losses_uncached = batched_model_eval_and_loss(module, loss_fn, inputs_uncached, targets)
+        np.testing.assert_allclose(losses_cached, losses_uncached, rtol=1e-10)
+
+
+@requires_sample_data
+def test_cached_states_refuse_other_reservoir(cached_reservoir_run):
+    """Another seed's reservoir evaluating the cache raises, as after Study.restore_trainer restores the best seed."""
+    train_config, train_dl, _, module = cached_reservoir_run
+    other_seed_module = ProfilePredictorReservoir(
+        reservoir_size=train_config.model_init_config["reservoir_size"],
+        rhogrid=np.asarray(train_dl.ds[RADIAL_DIM]),
+        key=jax.random.PRNGKey(train_config.model_init_config["prng_seed"] + 1),
+        normalizer=module.normalizer,
+    )
+    loss_fn = ProfilePredictorTRB.get_loss_fn(train_config.loss_config)
+    batch = next(iter(train_dl))
+    inputs, targets = batch.get_inputs_and_targets()
+    with pytest.raises(RuntimeError, match="made by another reservoir"):
+        batched_model_eval_and_loss(other_seed_module, loss_fn, inputs, targets)
+
+
+@pytest.mark.slow
+@requires_sample_data
+def test_reservoir_training_smoke(tmp_path):
+    """End-to-end launch_train of the production reservoir config on the sample dataset."""
+    study = _sample_reservoir_study("test_reservoir_training_smoke", tmp_path)
+    (case,) = study.cases
+    launch_train(study.make_train_config(case))

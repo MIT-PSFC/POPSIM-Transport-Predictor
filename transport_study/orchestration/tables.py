@@ -5,10 +5,10 @@ combination of the remaining case fields, one markdown table comparing the
 cases that differ only along that axis, plus a flat case_stats.csv with one
 row per case for ad hoc analysis.
 
-Each study declares a ComparisonTableSpec (axes, case fields, filename tokens,
-table columns) and builds its own one-row-per-case stats DataFrame in its
-tables module. Everything downstream of that frame (grouping, markdown, csv)
-is shared here.
+Each study declares a ComparisonTableSpec in its tables module.
+The studies whose collect_results is the per-case scalar summary (dims case_idx) build their stats frame here too,
+the profile study builds its own from its long-form per-shot records.
+Everything downstream of that frame (grouping, markdown, csv) is shared here.
 """
 
 from dataclasses import dataclass
@@ -31,29 +31,70 @@ class ComparisonTableSpec:
     field_tokens: per-field filename token template (e.g. "td_{}"), mirroring
         the case-string vocabulary so table filenames read like case names
     columns: (table header, dataframe column) pairs
+    stage_metrics: the metrics of the collected metrics dataset, merged in as <metric>_mean<suffix>_<stage> columns
+    excluded_model_types: submodule prereq case types, whose errors are not comparable to the main models
     """
 
     axis_names: tuple[str, ...]
     case_field_order: tuple[str, ...]
     field_tokens: dict[str, str]
     columns: tuple[tuple[str, str], ...]
+    stage_metrics: tuple[str, ...]
+    excluded_model_types: tuple[str, ...] = ()
+
+
+# The three seed values of a per-stage mean (orchestration.seed_results.seed_statistics)
+SEED_SUFFIXES = ("", "_best", "_seed_std")
 
 
 def merge_stage_metrics(df: pd.DataFrame, metrics_ds: xr.Dataset, metric_names: tuple[str, ...]) -> pd.DataFrame:
-    """Merge the per-stage means from a collected metrics dataset (dims
-    case_idx x stage, variables <metric>_mean) into a per-case frame as
-    <metric>_mean_<stage> columns, NaN for cases without valid metrics."""
+    """Merge the per-stage means from a collected metrics dataset (dims case_idx x stage)
+    into a per-case frame as <metric>_mean<suffix>_<stage> columns, one per SEED_SUFFIXES entry:
+    the seed mean, the best seed's and the seed std.
+    NaN for cases without valid metrics."""
+    column_sources = [
+        (f"{metric}_mean{suffix}_{stage}", f"{metric}_mean{suffix}", stage)
+        for metric in metric_names
+        for suffix in SEED_SUFFIXES
+        for stage in STAGE_AGG_NAMES
+    ]
     if metrics_ds.data_vars and "case_idx" in metrics_ds.dims:
-        stage_cols = {}
-        for metric in metric_names:
-            for stage in STAGE_AGG_NAMES:
-                stage_cols[f"{metric}_mean_{stage}"] = metrics_ds[f"{metric}_mean"].sel(stage=stage).values
+        stage_cols = {column: metrics_ds[var].sel(stage=stage).values for column, var, stage in column_sources}
         stage_df = pd.DataFrame({"case_idx": metrics_ds["case_idx"].values, **stage_cols})
         return df.merge(stage_df, on="case_idx", how="left")
-    for metric in metric_names:
-        for stage in STAGE_AGG_NAMES:
-            df[f"{metric}_mean_{stage}"] = np.nan
+    for column, _, _ in column_sources:
+        df[column] = np.nan
     return df
+
+
+# Integral error medians of the per-case scalar summary (Study.collect_results)
+SUMMARY_ERROR_VARS = ("err_rel_shot_med", "err_abs_shot_med")
+
+
+def summary_case_stats_frame(results_ds: xr.Dataset, metrics_ds: xr.Dataset, spec: ComparisonTableSpec) -> pd.DataFrame:
+    """One row per main-model case of a per-case scalar summary.
+
+    Columns: the case-grid coords, the integral error medians,
+    and the per-stage time-averaged metrics (NaN for cases without valid metrics).
+    """
+    df = results_ds[list(SUMMARY_ERROR_VARS)].to_dataframe().reset_index()
+    # Case coords shared by every case (e.g. freeze_submodules with a single configured option)
+    # are scalar in the collected file and may not survive to_dataframe as columns, broadcast them back
+    for field in spec.case_field_order:
+        if field not in df.columns:
+            df[field] = results_ds[field].item()
+    df = df[[*spec.case_field_order, "case_idx", *SUMMARY_ERROR_VARS]]
+    df = merge_stage_metrics(df, metrics_ds, spec.stage_metrics)
+    return df[~df["model_type"].isin(spec.excluded_model_types)]
+
+
+def write_summary_comparison_tables(results_ds: xr.Dataset, metrics_ds: xr.Dataset, spec: ComparisonTableSpec, figure_dir: Path):
+    """write_case_comparison_tables over the summary_case_stats_frame of a per-case scalar summary."""
+    if not results_ds.data_vars or "case_idx" not in results_ds.dims:
+        logger.warning("No collected results available, skipping comparison tables")
+        return
+    df = summary_case_stats_frame(results_ds, metrics_ds, spec)
+    write_case_comparison_tables(df, spec, figure_dir)
 
 
 def _fmt(value) -> str:
@@ -69,10 +110,8 @@ def _group_filename(spec: ComparisonTableSpec, axis: str, group_key: tuple) -> s
 
 
 def _axis_sort_key(axis: str, value):
-    if axis == "num_target_shots":
-        # The -1 sentinel means all target shots, list it after the real counts
-        return (1, 0) if value == -1 else (0, int(value))
-    return (0, str(value))
+    # Shot counts sort numerically, every other axis by its string
+    return int(value) if axis == "num_target_shots" else str(value)
 
 
 def _write_group_table(spec: ComparisonTableSpec, axis: str, group_key: tuple, group: pd.DataFrame, out_path: Path):

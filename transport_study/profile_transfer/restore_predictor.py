@@ -7,26 +7,28 @@ from transport_study.modules.profile_predictor.module import ProfilePredictor
 from transport_study.modules.profile_predictor.trb import (
     ProfilePredictorTRB,
 )
-from transport_study.profile_transfer.profile_study import (
-    HYPERPARAM_TARGET_SHOTS,
-    ProfileStudy,
-)
+from transport_study.modules.trb_utils import CHECKPOINT_FORMAT
+from transport_study.orchestration.study import BASE_MODEL_SIZE, HYPERPARAM_TARGET_SHOTS
+from transport_study.orchestration.target_shots import BASE_TARGET_SHOT_ORDER
+from transport_study.profile_transfer.profile_study import ProfileStudy
 
 
 def checkpoint_to_profile_case(checkpoint_dir: Path | str) -> ProfileStudy.Case:
     """Parse a case directory name back into a ProfileStudy.Case.
 
     Mirrors ProfileStudy.Case.__str__:
-    case.{model_type}.td_{td}.norm_{n}.freeze_{f}.geom_{g}                   source-trained, no adaptation
-    case.{model_type}.td_{td}.norm_{n}.freeze_{f}.geom_{g}.targ_{n}          exnihilo
-    case.{model_type}.td_{td}.norm_{n}.freeze_{f}.geom_{g}.targ_{n}.da_{da}  domain adaptation
+    case.{model_type}.td_{td}.norm_{n}[.freeze_True].geom_{g}[.size_{s}]                                 source-trained, no adaptation
+    case.{model_type}.td_{td}.norm_{n}[.freeze_True].geom_{g}[.size_{s}].targ_{n}[.order_{o}]            exnihilo
+    case.{model_type}.td_{td}.norm_{n}[.freeze_True].geom_{g}[.size_{s}].targ_{n}[.order_{o}].da_{da}    domain adaptation
 
-    No case-name token is suppressed (see Study.Case.STR_TOKEN_FIELDS), so
-    norm_/freeze_/geom_ are all mandatory and fixed in position.
+    The freeze_ token is suppressed for unfrozen shapes (see Study.Case.STR_TOKEN_FIELDS),
+    the size_ token for the base model size,
+    the order_ token for the base target shot order,
+    norm_ and geom_ are mandatory and fixed in position.
     """
     case_name = Path(checkpoint_dir).name
     pieces = case_name.split(".")
-    if len(pieces) < 6 or pieces[0] != "case" or not pieces[2].startswith("td_"):
+    if len(pieces) < 5 or pieces[0] != "case" or not pieces[2].startswith("td_"):
         raise ValueError(f"Unexpected case name format: {case_name}")
 
     idx = 3
@@ -35,21 +37,31 @@ def checkpoint_to_profile_case(checkpoint_dir: Path | str) -> ProfileStudy.Case:
     data_normalization = pieces[idx].removeprefix("norm_")
     idx += 1
 
-    if not pieces[idx].startswith("freeze_"):
-        raise ValueError(f"Unexpected case name format: {case_name}")
-    freeze_shapes = pieces[idx].removeprefix("freeze_") == "True"
-    idx += 1
+    freeze_shapes = pieces[idx].startswith("freeze_")
+    if freeze_shapes:
+        if pieces[idx] != "freeze_True":
+            raise ValueError(f"Unexpected case name format: {case_name}")
+        idx += 1
 
-    if not pieces[idx].startswith("geom_"):
+    if idx == len(pieces) or not pieces[idx].startswith("geom_"):
         raise ValueError(f"Unexpected case name format: {case_name}")
     geometry_builder = pieces[idx].removeprefix("geom_")
     idx += 1
 
+    model_size = BASE_MODEL_SIZE
+    if idx < len(pieces) and pieces[idx].startswith("size_"):
+        model_size = pieces[idx].removeprefix("size_")
+        idx += 1
+
     num_target_shots = HYPERPARAM_TARGET_SHOTS
+    target_shot_order = BASE_TARGET_SHOT_ORDER
     domain_adaptation = None
     if idx < len(pieces) and pieces[idx].startswith("targ_"):
         num_target_shots = int(pieces[idx].removeprefix("targ_"))
         idx += 1
+        if idx < len(pieces) and pieces[idx].startswith("order_"):
+            target_shot_order = pieces[idx].removeprefix("order_")
+            idx += 1
         if idx < len(pieces) and pieces[idx].startswith("da_"):
             domain_adaptation = pieces[idx].removeprefix("da_")
             idx += 1
@@ -65,6 +77,8 @@ def checkpoint_to_profile_case(checkpoint_dir: Path | str) -> ProfileStudy.Case:
         freeze_shapes=freeze_shapes,
         num_target_shots=num_target_shots,
         geometry_builder=geometry_builder,
+        target_shot_order=target_shot_order,
+        model_size=model_size,
     )
 
 
@@ -87,15 +101,14 @@ def restore_profile_predictor(
     if isinstance(profile_predictor_config, TrainConfig):
         profile_predictor_config = profile_predictor_config.model_dump()
 
-    # Don't need the full dataloader, only want rho grid
-    profile_predictor_config["dataloader_config"]["debug"] = True
-
     _, profile_predictor_train_dl, _, _ = ProfilePredictorTRB.get_dataloaders(profile_predictor_config["dataloader_config"])
     profile_predictor = ProfilePredictorTRB.model_init(
         profile_predictor_train_dl,
         profile_predictor_config["model_init_config"],
     )
-    profile_predictor_manager = create_default_checkpoint_manager(profile_predictor_config["checkpoint_dir"])
+    profile_predictor_manager = create_default_checkpoint_manager(
+        profile_predictor_config["checkpoint_dir"], checkpoint_format=CHECKPOINT_FORMAT
+    )
     profile_predictor = restore_model(profile_predictor_manager, profile_predictor)
     return profile_predictor
 

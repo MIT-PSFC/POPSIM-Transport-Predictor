@@ -1,11 +1,10 @@
 [project]
 name = "popsim-transport-predictor"
-version = "0.1.0"
-description = ""
+version = "0.3.0"
+description = "Benchmarking model architectures on tasks related to particle transport in tokamaks"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
-    "disruption-py",
     "popsim",
     "torax",
     "pre-commit>=4.3.0",
@@ -13,11 +12,9 @@ dependencies = [
     "netcdf4",
     "fire>=0.7.1",
     "pydantic-settings>=2.12.0",
-    "dynaconf>=3.2.12",
     "wandb>=0.25.0",
-    "srunx>=2.2.1",
-    "mkgp>=3.1.4",
-    "threadpoolctl>=3.6.0",
+    "toml>=0.10.2",
+    "transport-validation-datasets",
 ]
 
 [dependency-groups]
@@ -34,25 +31,22 @@ dev = [
     "yamllint>=1.37.1",
 ]
 
-gpu-orcd = [
-    "jax[cuda13]>=0.8.1,<0.9",
-]
+gpu = ["jax[cuda13]>=0.11.1,<0.12"]
 
 [tool.isort]
 profile = "black"
+
+[tool.uv]
+# transport-validation-datasets pins disruption-py 0.14.0, which pins numpy<2, and nothing the study imports needs it.
+override-dependencies = ["numpy>=2.4.4,<3"]
 
 [tool.setuptools]
 packages = ["transport_study"]
 
 [tool.uv.sources]
-disruption-py = { path = "./submodules/disruption-py", editable = true }
 popsim = { path = "./submodules/popsim-public", editable = true }
 torax = { path = "./submodules/torax", editable = true }
-
-[tool.uv]
-override-dependencies = [
-  "jax[cuda13]>=0.8.1,<0.9",
-]
+transport-validation-datasets = { path = "./submodules/transport-validation-datasets", editable = true }
 
 [tool.hatch.build.targets.sdist]
 include = ["transport_study"]

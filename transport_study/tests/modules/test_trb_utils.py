@@ -1,10 +1,22 @@
-"""Tests for the dataloader helpers shared by every study's TrainRunBuilder."""
+"""Tests for the helpers shared by every study's TrainRunBuilder."""
 
+from types import SimpleNamespace
+
+import jax.numpy as jnp
 import numpy as np
+import pytest
 import xarray as xr
+import xarray_jax
+from transport_validation_datasets.machine.generic import UNIFORM_TIMEBASE_DT
 
 from transport_study import EPISODE_DIM, TIME_COORD, TIME_DIM
-from transport_study.modules.trb_utils import mask_to_largest_contiguous_segment
+from transport_study.modules.trb_utils import (
+    DIVERGED_PROFILE_LIMIT,
+    TimeAveragedLoss,
+    mask_to_largest_contiguous_segment,
+    replace_diverged_profiles,
+    scalar_study_results,
+)
 
 nan = np.nan
 
@@ -12,8 +24,8 @@ nan = np.nan
 def _make_ds(times, wtot, ip):
     return xr.Dataset(
         data_vars={
-            "Wtot_MJ": ((EPISODE_DIM, TIME_DIM), np.asarray(wtot, dtype=np.float32)),
-            "Ip_MA": ((EPISODE_DIM, TIME_DIM), np.asarray(ip, dtype=np.float32)),
+            "energy_mhd_MJ": ((EPISODE_DIM, TIME_DIM), np.asarray(wtot, dtype=np.float32)),
+            "ip_MA": ((EPISODE_DIM, TIME_DIM), np.asarray(ip, dtype=np.float32)),
             "hazard": ((EPISODE_DIM,), np.arange(len(wtot), dtype=np.float32)),
         },
         coords={
@@ -38,9 +50,9 @@ def test_keeps_only_longest_contiguous_run():
         [1.0, 1.0, nan, 1.0, 1.0, 1.0, nan],
         [1.0, 1.0, 1.0, 1.0, 1.0, nan, nan],
     ]
-    ds = mask_to_largest_contiguous_segment(_make_ds(times, wtot, ip), ["Wtot_MJ", "Ip_MA"])
+    ds = mask_to_largest_contiguous_segment(_make_ds(times, wtot, ip), ["energy_mhd_MJ", "ip_MA"])
 
-    got = ds["Wtot_MJ"].values
+    got = ds["energy_mhd_MJ"].values
     assert np.allclose(got[0], [nan, nan, nan, 4.0, 5.0, 6.0, nan], equal_nan=True)
     assert np.allclose(got[1], [1.0, 2.0, 3.0, 4.0, 5.0, nan, nan], equal_nan=True)
 
@@ -56,15 +68,77 @@ def test_gap_in_any_training_var_splits_the_run():
     times = [[0.000, 0.001, 0.002, 0.003, 0.004]]
     wtot = [[1.0, 2.0, 3.0, 4.0, 5.0]]
     ip = [[1.0, nan, 1.0, 1.0, 1.0]]
-    ds = mask_to_largest_contiguous_segment(_make_ds(times, wtot, ip), ["Wtot_MJ", "Ip_MA"])
-    assert np.allclose(ds["Wtot_MJ"].values[0], [nan, nan, 3.0, 4.0, 5.0], equal_nan=True)
+    ds = mask_to_largest_contiguous_segment(_make_ds(times, wtot, ip), ["energy_mhd_MJ", "ip_MA"])
+    assert np.allclose(ds["energy_mhd_MJ"].values[0], [nan, nan, 3.0, 4.0, 5.0], equal_nan=True)
 
 
 def test_per_shot_vars_keep_their_dims():
     times = [[0.000, 0.001, 0.002]]
     wtot = [[1.0, nan, 3.0]]
     ip = [[1.0, nan, 1.0]]
-    ds = mask_to_largest_contiguous_segment(_make_ds(times, wtot, ip), ["Wtot_MJ", "Ip_MA"])
+    ds = mask_to_largest_contiguous_segment(_make_ds(times, wtot, ip), ["energy_mhd_MJ", "ip_MA"])
     # force_drop_nans-style ds.where would broadcast this to (shot, time)
     assert ds["hazard"].dims == (EPISODE_DIM,)
     assert np.allclose(ds["hazard"].values, [0.0])
+
+
+def test_validation_replaces_profiles_beyond_the_limit():
+    """A finite point beyond DIVERGED_PROFILE_LIMIT diverges its timeslice like a NaN does, and takes its target value."""
+    ne_pred = jnp.array([[1.0, 2.0], [1.0, 10.0 * DIVERGED_PROFILE_LIMIT], [1.0, nan]])
+    te_pred = jnp.ones((3, 2))
+    ne_targ = jnp.full((3, 2), 0.5)
+    te_targ = jnp.full((3, 2), 0.5)
+    ne_valid, te_valid, diverged = replace_diverged_profiles(ne_pred, te_pred, ne_targ, te_targ)
+    np.testing.assert_array_equal(np.asarray(diverged), [False, True, True])
+    np.testing.assert_array_equal(np.asarray(ne_valid), [[1.0, 2.0], [1.0, 0.5], [1.0, 0.5]])
+    np.testing.assert_array_equal(np.asarray(te_valid), np.asarray(te_pred))
+
+
+@pytest.mark.parametrize("bad_value", [np.nan, np.inf])
+def test_scalar_results_flag_non_finite_predictions(bad_value):
+    """A non-finite prediction is flagged diverged with NaN errors, never inf, and a missing target is neither."""
+    targ = np.array([[1.0, 1.0, 1.0, nan]])
+    pred = np.array([[1.5, bad_value, 1.0, nan]])
+    coords = {EPISODE_DIM: [7], TIME_DIM: np.arange(4), TIME_COORD: ((EPISODE_DIM, TIME_DIM), 1e-3 * np.arange(4)[None, :])}
+    dims = (EPISODE_DIM, TIME_DIM)
+    stack = {"sample": dims}
+    input_ds = xr.Dataset({"energy_mhd_MJ": (dims, targ)}, coords=coords).assign_coords(ds_source="mast").stack(stack)
+    output_ds = xr.Dataset({"output.energy_mhd_MJ_pred": (dims, pred)}, coords=coords).stack(stack)
+
+    ds = scalar_study_results(SimpleNamespace(input_ds=input_ds, output_ds=output_ds), "energy_mhd_MJ", "output.energy_mhd_MJ_pred")
+
+    np.testing.assert_array_equal(ds["error_diverged_ts"].values[0], [0.0, 1.0, 0.0, nan])
+    np.testing.assert_array_equal(np.isnan(ds["error_abs_ts"].values[0]), [False, True, False, True])
+    assert np.isfinite(ds["error_abs_shot"].values).all()
+
+
+def _fresh_abs_error(pred, targ):
+    return targ["fresh"].data * jnp.abs(pred["value"].data - targ["value"].data)
+
+
+def _episode(step_errors: np.ndarray, fresh: np.ndarray):
+    """pred, targ and time of an episode on the 1 kHz grid, its prediction off by step_errors, fresh the 0 / 1 freshness flag."""
+    time = UNIFORM_TIMEBASE_DT * jnp.arange(step_errors.size)
+    pred = {"value": xarray_jax.DataArray(jnp.asarray(step_errors), dims=(TIME_DIM,))}
+    targ = {
+        "value": xarray_jax.DataArray(jnp.zeros(step_errors.size), dims=(TIME_DIM,)),
+        "fresh": xarray_jax.DataArray(jnp.asarray(fresh, dtype=float), dims=(TIME_DIM,)),
+    }
+    return pred, targ, time
+
+
+def test_time_averaged_loss_is_the_mean_over_fresh_time():
+    """Short and long episodes off by one error score that error, whatever the stale steps hold, and no fresh time scores 0."""
+    loss_fn = TimeAveragedLoss(_fresh_abs_error, "fresh")
+    step_error = 0.3
+
+    for n_steps in (10, 400):
+        steps_all_fresh = np.full(n_steps, step_error)
+        assert float(loss_fn(*_episode(steps_all_fresh, np.ones(n_steps)))) == pytest.approx(step_error)
+
+    # Every fifth step fresh, the stale steps off by far more
+    fresh = np.zeros(400)
+    fresh[::5] = 1.0
+    steps_stale_worse = np.where(fresh == 1.0, step_error, 5.0)
+    assert float(loss_fn(*_episode(steps_stale_worse, fresh))) == pytest.approx(step_error)
+    assert float(loss_fn(*_episode(steps_stale_worse, np.zeros(400)))) == 0.0

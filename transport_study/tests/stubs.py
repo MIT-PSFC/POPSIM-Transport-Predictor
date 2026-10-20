@@ -11,8 +11,23 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from types import SimpleNamespace
+from typing import Annotated
 
-from transport_study.orchestration.study import CaseGridConfig, Study
+import xarray as xr
+
+from transport_study.config import CaseAxis, StudyConfig
+from transport_study.orchestration.case_metrics import case_metrics_path
+from transport_study.orchestration.seed_results import (
+    SEED_BEST_EPOCH_ATTR,
+    SEED_VAL_LOSS_ATTR,
+)
+from transport_study.orchestration.study import (
+    BASE_MODEL_SIZE,
+    CaseGridConfig,
+    Study,
+    write_netcdf_atomic,
+)
+from transport_study.orchestration.target_shots import BASE_TARGET_SHOT_ORDER
 
 
 class StubConfig(CaseGridConfig):
@@ -21,8 +36,8 @@ class StubConfig(CaseGridConfig):
     The case grid is injected, so the axes carry inert defaults.
     """
 
-    target_test_set_size: int = 0
-    training_datasets: tuple[str, ...] = ()
+    target_test_set_size: int | None = 1
+    training_datasets: Annotated[tuple[str, ...], CaseAxis("training_data")] = ()
 
 
 @dataclass
@@ -32,16 +47,32 @@ class StubCase:
     Deliberately not a Study.Case subclass: the base dataclass validates
     model_type against VALID_MODEL_TYPES and builds a prereq chain, neither of
     which these tests want. check_data_requirements reads training_data and
-    domain_adaptation, so both carry inert defaults.
+    domain_adaptation and case_coords reads the case-axis fields, so they carry inert defaults.
     """
 
     name: str
     prereqs: list[StubCase] | None = None
+    model_type: str = "stub"
     training_data: SimpleNamespace = field(default_factory=lambda: SimpleNamespace(sources=[], exnihilo=False))
     domain_adaptation: str | None = None
+    target_shot_order: str = BASE_TARGET_SHOT_ORDER
+    model_size: str = BASE_MODEL_SIZE
+    # A hyperparam case also owns sweep agent jobs
+    hyperparam: bool = False
+    # A twin or submodule stand-in, whose merge keeps every seed's best checkpoint
+    keeps_seed_checkpoints: bool = False
+    # The prereqs this case restores a checkpoint from, every other one only hands it its tuned config
+    restored: list[StubCase] = field(default_factory=list)
 
     def is_hyperparam_case(self) -> bool:
-        return False
+        return self.hyperparam
+
+    def restored_prereqs(self) -> list[StubCase]:
+        return list(self.restored)
+
+    def get_hyperparam_prereq(self) -> StubCase:
+        """A stub case has no hyperparam axes, so it is its own hyperparam case."""
+        return self
 
     def is_impossible(self) -> bool:
         return False
@@ -58,31 +89,39 @@ class StubStudy(Study):
 
     Config = StubConfig
     STUDY_TYPE = "stub"
-    CASE_AXIS_FIELDS = ()
-    # This module doubles as the per-case analysis reports module (see below),
-    # which is all orchestration.case_analysis resolves off the study class
-    ANALYSIS_REPORTS_MODULE = "transport_study.tests.stubs"
-    ANALYSIS_METRICS_MODULE = "transport_study.tests.stubs"
 
     def __init__(self, cfg: CaseGridConfig, cases: list[StubCase]):
         self.injected_cases = list(cases)
         super().__init__(cfg)
 
-    def make_cases(self) -> list[StubCase]:
+    def make_cases(self, cfg: StudyConfig) -> list[StubCase]:
         return self.injected_cases
 
 
-# Marker file standing in for a real study's per-case report artifacts
-ANALYSIS_MARKER_NAME = "analysis_done"
+def open_launch_slots(partition: str) -> type:
+    """A slurm_utils.LaunchSlots stand-in class, every job going to partition and never out of room."""
+
+    class OpenLaunchSlots:
+        def pick(self, devices, mem: str) -> str:
+            return partition
+
+        def available(self, partition_name: str, devices, mem: str) -> int:
+            return 1000
+
+        def take(self, partition_name: str, mem: str) -> None:
+            pass
+
+    return OpenLaunchSlots
 
 
-def analysis_case_done(study: Study, case, figure_dir) -> bool:
-    """Reports-module hook the parallel analysis driver polls for completion."""
-    return (figure_dir / str(case) / ANALYSIS_MARKER_NAME).exists()
+def with_seed_attrs(seed_ds: xr.Dataset, val_loss: float, best_epoch: int = 1) -> xr.Dataset:
+    """seed_ds as seed_results.seed_result writes it, with its best epoch and that epoch's validation loss."""
+    seed_ds = seed_ds.copy()
+    seed_ds.attrs[SEED_BEST_EPOCH_ATTR] = best_epoch
+    seed_ds.attrs[SEED_VAL_LOSS_ATTR] = val_loss
+    return seed_ds
 
 
 def mark_analysis_done(study: Study, case) -> None:
-    """Stand in for a finished analysis job having written its artifacts."""
-    marker = study.figure_dir / str(case) / ANALYSIS_MARKER_NAME
-    marker.parent.mkdir(parents=True, exist_ok=True)
-    marker.touch()
+    """Stand in for a finished analysis job, with the empty 'no valid timeslices' metrics cache."""
+    write_netcdf_atomic(xr.Dataset(), case_metrics_path(study, case))

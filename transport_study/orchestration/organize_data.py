@@ -7,13 +7,18 @@ import jax.numpy as jnp
 import numpy as np
 import xarray as xr
 from loguru import logger
-from popsim.cfspopcon_jax.geometry import calc_plasma_volume
 from popsim.ml.split_utils import split_dataset_by_fracs
-from scipy.constants import mu_0
+from transport_validation_datasets.machine.generic import UNIFORM_TIMEBASE_DT
 
-from transport_study import EPISODE_DIM, TIME_COORD, TIME_DIM
-from transport_study.config import RHO_GRID, TRAIN_VAL_SPLIT, config
-from transport_study.datasets import UNIFORM_TIMEBASE_DT_S, make_uniform_1khz_timebase
+from transport_study import EPISODE_DIM, RADIAL_DIM, TIME_COORD, TIME_DIM
+from transport_study.config import (
+    DEBUG_MAX_SOURCE_SHOTS,
+    RHO_GRID,
+    TRAIN_VAL_SPLIT,
+    config,
+    source_devices,
+)
+from transport_study.modules import plasma_parameters
 from transport_study.modules.normalization import (
     NORM_INPUT_VARS,
     PHYSICS_FEATURE_NAMES,
@@ -21,6 +26,7 @@ from transport_study.modules.normalization import (
     apply_z_score,
     fit_coral_stats,
     fit_z_score_stats,
+    flat_columns,
     identity_coral_stats,
     physics_feature_vec,
 )
@@ -29,6 +35,8 @@ from transport_study.modules.profile_predictor.module import (
     NN_INPUT_SOURCE_VARS,
     nn_input_matrix,
 )
+from transport_study.orchestration.target_shots import TargetSplit, target_shot_split
+from transport_study.signals import convert_to_working_units, store_signals_for
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -36,15 +44,20 @@ if TYPE_CHECKING:
 
 @dataclass(frozen=True)
 class TrainingData:
-    """Specifies which source devices to use for training.
+    """The source devices a case trains on.
 
-    sources: tuple of device keys
-    exnihilo: if True, load sources for normalization only - strip them from the
-              actual training set, leaving only target device shots.
+    sources: device keys, stored sorted for stable concatenation and indexing,
+             so equal device sets compare and hash equal
+    exnihilo: train from scratch on the target device only,
+              every source device is loaded and then stripped from the training set again
     """
 
-    sources_unsorted: list[str]
+    # A list rather than a tuple, train configs are YAML-dumped and safe_load rejects python tuples
+    sources: list[str]
     exnihilo: bool = False
+
+    def __post_init__(self):
+        object.__setattr__(self, "sources", sorted(self.sources))
 
     def __hash__(self):
         return hash((tuple(self.sources), self.exnihilo))
@@ -52,12 +65,7 @@ class TrainingData:
     def __str__(self) -> str:
         if self.exnihilo:
             return "exnihilo"
-        return "_".join(sorted(self.sources))
-
-    @property
-    def sources(self) -> list[str]:
-        """Sources in deterministic order for stable concatenation and indexing."""
-        return sorted(self.sources_unsorted)
+        return "_".join(self.sources)
 
     @property
     def source_idxs(self) -> list:
@@ -68,64 +76,49 @@ class TrainingData:
 def parse_training_data(s: str, dataset_paths: dict, target_device: str | None) -> TrainingData:
     """Convert a string like 'cmod_tcv' or 'exnihilo' to a TrainingData object."""
     if s == "exnihilo":
-        non_target = set(dataset_paths.keys()) - ({target_device} if target_device else set())
-        return TrainingData(sources_unsorted=sorted(non_target), exnihilo=True)
-    return TrainingData(sources_unsorted=s.split("_"))
+        return TrainingData(sources=source_devices(dataset_paths, target_device), exnihilo=True)
+    sources = s.split("_")
+    if target_device in sources:
+        raise ValueError(
+            f"training_data {s!r} names the target device {target_device!r}, whose held-out test shots would land in the training set"
+        )
+    return TrainingData(sources=sources)
 
 
 REQUIRED_SIGNALS_POWER_BALANCE = [
-    # Target
-    "Wtot_MJ",
+    # Targets, the powers those of the p_oh / p_rad submodule cases and anchors of the joint training loss
+    "energy_mhd_MJ",
+    "power_ohm_MW",
+    "power_radiated_MW",
+    "fresh_equilibrium",  # The Wtot and P_oh losses count only the timeslices a reconstruction landed on
     # Inputs
-    "Ip_MA",
-    "B0",
-    "R0",
-    "kappa",
-    "a_minor",  # For inverse aspect ratio
+    "ip_MA",
+    "b_geo",
+    "geometric_axis_r",
+    "elongation",
+    "minor_radius",  # For inverse aspect ratio
+    "n_e_line_average_1e20",
+    "power_additional_MW",
+    # Extra
+    "time",  # Data variable holding per-shot time values, promoted to the time coordinate downstream
+    "b0",  # Visualization-only beta_tor of normalize_domain, normalized with b0 at r0 as IMAS does
 ]
-INPUT_POWER_SIGNALS = ["P_ECRH_MW", "P_NBI_MW", "P_ICRF_MW", "P_LH_MW"]
 
 
-def _add_aux_power(ds: xr.Dataset) -> xr.Dataset:
-    """Zero-fill missing per-system aux power signals and sum them to P_aux_MW.
+# Profile channels and the gradient and error-bar companions every device store carries.
+# For each base signal <v> the companions are <v>_gradient, <v>_error and <v>_gradient_error,
+# the GP fit's (C-Mod, MAST, TCV) or IDA's (DIII-D) 1-sigma uncertainties.
+PROFILE_BASE_SIGNALS = ["t_e_keV", "n_e_1e20"]
+PROFILE_GRAD_SIGNALS = [f"{v}_gradient" for v in PROFILE_BASE_SIGNALS]
+PROFILE_ERROR_SIGNALS = [f"{v}_error" for v in PROFILE_BASE_SIGNALS] + [f"{v}_gradient_error" for v in PROFILE_BASE_SIGNALS]
 
-    Some devices lack entire heating systems (and the sample datasets lack all
-    of them), the submodule TRBs still expect the per-system names to exist.
-    """
-    for signal in INPUT_POWER_SIGNALS:
-        if signal not in ds:
-            ds[signal] = xr.zeros_like(ds["Ip_MA"])
-    ds["P_aux_MW"] = ds["P_NBI_MW"] + ds["P_ECRH_MW"] + ds["P_ICRF_MW"] + ds["P_LH_MW"]
-    return ds
-
-
-# Profile channels that carry GP-fit gradient and error-bar companions.
-# For each base signal <v> the companions are <v>_grad, <v>_error and
-# <v>_grad_error. An error of 0 is the sentinel for "no rigorous error
-# quantification", the loss treats it as a zero-width error bar
-PROFILE_BASE_SIGNALS = ["Te_keV_rho", "ne20_rho"]
-PROFILE_GRAD_SIGNALS = [f"{v}_grad" for v in PROFILE_BASE_SIGNALS]
-PROFILE_ERROR_SIGNALS = [f"{v}_error" for v in PROFILE_BASE_SIGNALS] + [f"{v}_grad_error" for v in PROFILE_BASE_SIGNALS]
+# Unit-integral profile shapes to_rho_grid adds, one per PROFILE_BASE_SIGNALS entry,
+# the shape-init families fit their shape basis on them
+PROFILE_SHAPE_VARS = ["t_e_shape", "n_e_shape"]
 
 # Everything the profile-predictor loss reads from the target side:
 # the profiles themselves plus their gradients and error-bars
 PROFILE_TARGET_VARS = [*PROFILE_BASE_SIGNALS, *PROFILE_GRAD_SIGNALS, *PROFILE_ERROR_SIGNALS]
-
-
-def add_missing_profile_companions(ds: xr.Dataset) -> xr.Dataset:
-    """Fill in gradient and error-bar companions for datasets that lack them.
-
-    Some device workflows (TCV) produce no GP-fit gradients or error bars.
-    Missing gradients fall back to finite differences of the values, missing
-    errors get the 0 sentinel (no rigorous error quantification).
-    """
-    for base in PROFILE_BASE_SIGNALS:
-        if f"{base}_grad" not in ds:
-            ds[f"{base}_grad"] = ds[base].differentiate("rho")
-        for err in (f"{base}_error", f"{base}_grad_error"):
-            if err not in ds:
-                ds[err] = xr.zeros_like(ds[base])
-    return ds
 
 
 REQUIRED_SIGNALS_PROFILE_TRANSFER = [
@@ -133,47 +126,65 @@ REQUIRED_SIGNALS_PROFILE_TRANSFER = [
     *PROFILE_BASE_SIGNALS,
     *PROFILE_GRAD_SIGNALS,
     *PROFILE_ERROR_SIGNALS,
-    "fresh_profiles",  # Needed so we only train on time points where the profile data is fresh, avoiding forward-filled.
+    "fresh_profile",  # Needed so we only train on time points where the profile data is fresh, avoiding forward-filled.
     # Inputs
-    "Ip_MA",
-    "B0",
-    "betan",
-    "ne20_line_avg",
-    "R0",
-    "a_minor",
-    "kappa",
-    "delta_top",
-    "delta_bot",
+    "ip_MA",
+    "b0",
+    "b_geo",
+    "beta_tor_norm",
+    "n_e_line_average_1e20",
+    "geometric_axis_r",
+    "minor_radius",
+    "elongation",
+    "triangularity_upper",
+    "triangularity_lower",
     # Extra
-    "time",  # Data variable holding per-shot time values, the var selection below would drop it and the dataloader consumes it as the time coordinate
-    "Wtot_MJ",  # Not strictly necessary but used for hazard extrapolation
+    "time",  # Data variable holding per-shot time values, promoted to the time coordinate downstream
+    "energy_mhd_MJ",  # The hazard metric needs it
 ]
 
-# Union of the profile and power balance needs, minus betan: the transport
-# modules derive every beta quantity from the evolving stored-energy state
-# instead of a measured betan (see modules/transport_predictor/module.py).
-# P_aux_MW is computed from the per-system signals by _add_aux_power.
+# Union of the profile and power balance needs, minus beta_tor_norm:
+# the transport modules derive every beta quantity from the evolving stored-energy state
+# instead of a measured beta_tor_norm (see modules/transport_predictor/module.py).
 REQUIRED_SIGNALS_TRANSPORT_TRANSFER = [
     # Targets and their companions
     *PROFILE_BASE_SIGNALS,
     *PROFILE_GRAD_SIGNALS,
     *PROFILE_ERROR_SIGNALS,
-    "fresh_profiles",  # Kept as data (not a filter) so downstream losses or metrics can mask stale forward-filled profiles
+    "fresh_profile",  # Kept as data (not a filter) so downstream losses or metrics can mask stale forward-filled profiles
+    "fresh_equilibrium",  # The stored-energy and ohmic power anchors count only the timeslices a reconstruction landed on
     # Inputs
-    "Ip_MA",
-    "B0",
-    "ne20_line_avg",
-    "R0",
-    "a_minor",
-    "kappa",
-    "delta_top",
-    "delta_bot",
+    "ip_MA",
+    "b0",
+    "b_geo",
+    "n_e_line_average_1e20",
+    "geometric_axis_r",
+    "minor_radius",
+    "elongation",
+    "triangularity_upper",
+    "triangularity_lower",
+    "power_additional_MW",
     # Extra
     "time",  # Data variable holding per-shot time values, promoted to the time coordinate downstream
-    "Wtot_MJ",  # Seeds the sciml stored-energy state and the normalizer fit, also used for hazard extrapolation and as an anchor target in the sciml training loss
-    "P_oh_MW",  # Anchor target for the sciml training loss
-    "P_rad_MW",  # Anchor target for the sciml training loss
+    "energy_mhd_MJ",  # Seeds the sciml stored-energy state and the normalizer fit, the hazard metric, an anchor target of the sciml training loss
+    "power_ohm_MW",  # Anchor target for the sciml training loss
+    "power_radiated_MW",  # Anchor target for the sciml training loss
 ]
+
+REQUIRED_SIGNALS = {
+    "profile_transfer": REQUIRED_SIGNALS_PROFILE_TRANSFER,
+    "power_balance_transfer": REQUIRED_SIGNALS_POWER_BALANCE,
+    "transport_transfer": REQUIRED_SIGNALS_TRANSPORT_TRANSFER,
+}
+
+# Per-shot variables add_hazard writes, on (shot,)
+HAZARD_VARS = ("hazard", "ip_MA_p95", "energy_mhd_MJ_p95")
+
+# A time step within this of UNIFORM_TIMEBASE_DT is the 1 kHz step, the slack absorbs float32 round-off
+TIMEBASE_STEP_TOLERANCE_S = 1e-5
+
+# The row dim of stack_0d_timeslices, one timeslice of one shot per row
+TIMESLICE_DIM = "timeslice"
 
 
 def concat_with_nan_padding(
@@ -183,8 +194,8 @@ def concat_with_nan_padding(
 ) -> xr.Dataset:
     """Concatenate datasets while padding shorter `pad_dim` with NaNs.
 
-    This is needed when datasets have different lengths along `pad_dim` and
-    do not all have an explicit coordinate index for that dimension.
+    pad_dim gets an ordinal index when it has none,
+    so the outer join of the concat pads the shorter datasets.
     """
     prepared_datasets = []
     for dataset in datasets:
@@ -194,14 +205,8 @@ def concat_with_nan_padding(
             ds = dataset
         prepared_datasets.append(ds)
 
-    # Align only along pad_dim to avoid creating duplicates along concat_dim
-    if len(prepared_datasets) > 1 and pad_dim in prepared_datasets[0].dims:
-        aligned_datasets = xr.align(*prepared_datasets, join="outer", fill_value=np.nan, exclude=concat_dim)
-    else:
-        aligned_datasets = prepared_datasets
-
     ds_padded = xr.concat(
-        aligned_datasets,
+        prepared_datasets,
         dim=concat_dim,
         join="outer",
         coords="different",
@@ -212,320 +217,220 @@ def concat_with_nan_padding(
     return ds_padded
 
 
-def reindex_to_uniform_timebase(ds: xr.Dataset) -> xr.Dataset:
-    """Place every shot back on the canonical 1 kHz grid, NaN at missing times.
+def check_uniform_timebase(ds: xr.Dataset) -> None:
+    """Raise unless every shot is one contiguous run of 1 kHz samples followed by NaN padding.
 
-    The device workflows build their timebases with make_uniform_1khz_timebase
-    (an absolute grid anchored at t=0), but the stored shots are compacted and
-    contain mid-shot gaps where time slices were dropped during acquisition or
-    dataset generation. Downstream, the simple-Euler stepper integrates with
-    real dt, and steps with dt >~ tau_e are numerically unstable. Mapping each
-    sample to its slot on the canonical grid turns those gaps into NaN slices,
-    which the dataloader's nan_handling can then drop as whole segments, so
-    every surviving training segment is contiguous.
-
-    Columns are absolute grid slots, so equal columns mean equal times across
-    shots. The time coordinate is NaN outside each shot's first..last sample
-    window (leading and trailing padding convention).
+    The stores hold one contiguous segment per shot,
+    which the simple-Euler steppers rely on (a step of dt >~ tau_e is unstable),
+    so a gap or an off-grid sample is a broken store, not something to repair here.
     """
     time2d = ds[TIME_COORD].transpose(EPISODE_DIM, TIME_DIM).values
-    n_shots = time2d.shape[0]
-    finite = np.isfinite(time2d)
-    if not finite.any():
-        return ds
-
-    slots = time2d / UNIFORM_TIMEBASE_DT_S
-    k = np.rint(np.where(finite, slots, 0)).astype(np.int64)
-    k_finite = k[finite]
-    if k_finite.min() < 0:
-        raise ValueError("Negative time values found while reindexing to the uniform timebase.")
-
-    residual = np.abs(np.where(finite, slots - k, 0.0))
-    max_residual = float(residual.max())
-    if max_residual > 0.25:
-        logger.warning(
-            f"Time values deviate from the nominal {UNIFORM_TIMEBASE_DT_S} s grid by up to {max_residual:.2f} steps, "
-            "the stored timebase may not actually be uniform at this rate."
-        )
-
-    n_new = int(k_finite.max()) + 1
-    shot_i, time_i = np.nonzero(finite)
-    grid_i = k[shot_i, time_i]
-    keys = shot_i * n_new + grid_i
-    if np.unique(keys).size != keys.size:
-        dup_shots = np.unique(shot_i[np.isin(keys, keys[np.diff(np.sort(keys), prepend=-1) == 0])])
+    shots = ds[EPISODE_DIM].values
+    mask_finite = np.isfinite(time2d)
+    # A finite time after a NaN one means the padding is not trailing
+    mask_resumes = ~mask_finite[:, :-1] & mask_finite[:, 1:]
+    shots_with_gaps = shots[mask_resumes.any(axis=1)]
+    if shots_with_gaps.size:
         raise ValueError(
-            f"Multiple samples map to the same uniform-grid slot for shots {ds[EPISODE_DIM].values[dup_shots]}, "
-            f"the data is sampled faster than the {UNIFORM_TIMEBASE_DT_S} s grid."
+            f"Shots {shots_with_gaps.tolist()} have NaN times inside the shot, the store is not one contiguous segment per shot"
         )
+    dt = np.diff(time2d, axis=1)
+    mask_both_finite = mask_finite[:, :-1] & mask_finite[:, 1:]
+    mask_off_grid = mask_both_finite & (np.abs(dt - UNIFORM_TIMEBASE_DT) > TIMEBASE_STEP_TOLERANCE_S)
+    shots_off_grid = shots[mask_off_grid.any(axis=1)]
+    if shots_off_grid.size:
+        raise ValueError(f"Shots {shots_off_grid.tolist()} have time steps other than the {UNIFORM_TIMEBASE_DT} s step")
 
-    k_first = np.full(n_shots, n_new, dtype=np.int64)
-    k_last = np.full(n_shots, -1, dtype=np.int64)
-    np.minimum.at(k_first, shot_i, grid_i)
-    np.maximum.at(k_last, shot_i, grid_i)
 
-    grid = make_uniform_1khz_timebase(float(np.nanmax(time2d)))
-    if grid.size < n_new:
-        raise ValueError(f"Canonical timebase has {grid.size} slots but the data spans {n_new}.")
-    col = np.arange(n_new)[None, :]
-    in_window = (col >= k_first[:, None]) & (col <= k_last[:, None])
-    new_time = np.where(in_window, grid[None, :n_new], np.nan).astype(time2d.dtype)
+def to_rho_grid(ds: xr.Dataset) -> xr.Dataset:
+    """Profiles interpolated onto the shared RHO_GRID, with the t_e / n_e shape variables.
 
-    data_vars = {}
-    for name, da in ds.data_vars.items():
-        if name == TIME_COORD:
-            continue
-        if TIME_DIM not in da.dims:
-            data_vars[name] = da
-            continue
-        da_t = da.transpose(EPISODE_DIM, TIME_DIM, ...)
-        arr = da_t.values
-        new_arr = np.full((n_shots, n_new, *arr.shape[2:]), np.nan, dtype=arr.dtype)
-        new_arr[shot_i, grid_i, ...] = arr[shot_i, time_i, ...]
-        data_vars[name] = xr.DataArray(new_arr, dims=da_t.dims)
+    The store's fit grid covers RHO_GRID on every device, so nothing extrapolates.
+    Attrs are stripped: they become static jit metadata in the xarray pytree registration,
+    and array-valued ones break the treedef equality check.
+    """
+    ds_rho = ds.interp({RADIAL_DIM: RHO_GRID})
+    for shape_var, profile_var in zip(PROFILE_SHAPE_VARS, PROFILE_BASE_SIGNALS, strict=True):
+        ds_rho[shape_var] = ds_rho[profile_var] / ds_rho[profile_var].integrate(RADIAL_DIM)
+    return ds_rho.drop_attrs()
 
-    coords = {name: coord for name, coord in ds.coords.items() if TIME_DIM not in coord.dims}
-    time_da = xr.DataArray(new_time, dims=(EPISODE_DIM, TIME_DIM))
-    if TIME_COORD in ds.coords:
-        coords[TIME_COORD] = time_da
-    else:
-        data_vars[TIME_COORD] = time_da
 
-    return xr.Dataset(data_vars=data_vars, coords=coords, attrs=ds.attrs)
+def keep_fresh_timeslices(ds: xr.Dataset) -> xr.Dataset:
+    """Each shot's fresh profile timeslices, moved to the front of the time axis in time order, and drop the shots without one.
+
+    The time axis is cut to the most fresh slices any shot holds and the rest is NaN,
+    so the forward-filled slices (about 98 percent of a DIII-D shot) take no memory.
+    time_idx counts the fresh slices of a shot, the time coordinate keeps each slice's time.
+    Only the time-dependent variables are reordered:
+    a whole-dataset operation would broadcast the per-shot variables (hazard) against time.
+    """
+    names_per_shot = [name for name in ds.data_vars if TIME_DIM not in ds[name].dims]
+    mask_fresh = (ds["fresh_profile"] == 1).transpose(EPISODE_DIM, TIME_DIM).values
+    n_fresh = mask_fresh.sum(axis=1)
+    n_kept = int(n_fresh.max(initial=0))
+    # A stable sort of the stale flags puts each shot's fresh slices first without reordering them
+    fresh_first = np.argsort(~mask_fresh, axis=1, kind="stable")[:, :n_kept]
+    indexer = xr.DataArray(fresh_first, dims=(EPISODE_DIM, TIME_DIM))
+    mask_kept = xr.DataArray(np.arange(n_kept)[np.newaxis, :] < n_fresh[:, np.newaxis], dims=(EPISODE_DIM, TIME_DIM))
+    ds_time_dep = ds.drop_vars([*names_per_shot, TIME_DIM], errors="ignore").isel({TIME_DIM: indexer}).where(mask_kept)
+    # where leaves coordinates alone, the time coordinate of the slots past a shot's fresh slices must be NaN too
+    if TIME_COORD in ds_time_dep.coords:
+        ds_time_dep = ds_time_dep.assign_coords({TIME_COORD: ds_time_dep[TIME_COORD].where(mask_kept)})
+    ds_time_dep = ds_time_dep.assign_coords({TIME_DIM: np.arange(n_kept)}).isel({EPISODE_DIM: n_fresh > 0})
+    return ds_time_dep.merge(ds[names_per_shot], join="left")
+
+
+def _profile_transfer(ds: xr.Dataset) -> xr.Dataset:
+    """Fresh profile timeslices only, on RHO_GRID."""
+    ds_fresh = keep_fresh_timeslices(ds)
+    return to_rho_grid(ds_fresh)
+
+
+def _power_balance(ds: xr.Dataset) -> xr.Dataset:
+    """Scalar time series as stored, attrs stripped (see to_rho_grid)."""
+    return ds.drop_attrs()
+
+
+def _transport_transfer(ds: xr.Dataset) -> xr.Dataset:
+    """Every timeslice on RHO_GRID, without the shape variables.
+
+    No fresh-profile filter: the time-dependent rollouts need contiguous segments,
+    so the forward-filled profile timeslices stay in as targets
+    and fresh_profile rides along as data for masking downstream.
+    Nothing in the transport study reads the shapes:
+    the sciml profile submodule is restored with the shape basis its profile prereq case fitted on the profile view.
+    """
+    return to_rho_grid(ds).drop_vars(PROFILE_SHAPE_VARS)
+
+
+STUDY_PREPS = {
+    "profile_transfer": _profile_transfer,
+    "power_balance_transfer": _power_balance,
+    "transport_transfer": _transport_transfer,
+}
 
 
 def get_ds(
     source_ds: str,
     study_type: str,
-) -> tuple[xr.Dataset, str]:
-    """Open the dataset, and do some light processing to get it ready for training.
+) -> xr.Dataset:
+    """Open a device store and prepare it for one study.
+
+    Reads only the store signals the study needs (the power balance study never loads the profiles),
+    converts to working units, keeps the max_ds_size most recent shots
+    (and in debug at most DEBUG_MAX_SOURCE_SHOTS of a source device, the target keeps every shot),
+    checks every shot is one contiguous 1 kHz segment,
+    adds the hazard metric on the full 0D series so every study holds out the same target shots,
+    drops the shots without one, then runs the study's prep.
 
     Args:
         source_ds (str): Identifier for the source dataset.
         study_type (str): Type of study for which to prepare the dataset.
 
     Returns:
-        tuple[xr.Dataset, str]: The processed dataset and the dimension along which to group the data
+        xr.Dataset: The prepared dataset on (shot, time_idx[, rho_tor_norm])
     """
     if source_ds not in config.dataset_paths:
         raise ValueError(f"Unknown source dataset: {source_ds!r}. Available: {set(config.dataset_paths)}")
+    if study_type not in STUDY_PREPS:
+        raise ValueError(f"Unknown study type: {study_type}")
     ds_path = Path(config.dataset_paths[source_ds])
+    required_signals = REQUIRED_SIGNALS[study_type]
+    store_signals = store_signals_for(required_signals)
 
-    ds = xr.open_dataset(ds_path)
+    with xr.open_dataset(ds_path) as ds_store:
+        ds_selected = ds_store[store_signals].load()
 
-    if study_type == "power_balance_transfer":
-        # Power balance only uses scalar time series. Drop profile variables
-        # before the eager astype below so their (shot, time, rho) arrays are
-        # never read from disk. Keeping them OOMs training jobs: concatenating
-        # devices with mismatched rho grids NaN-pads every profile variable to
-        # the union grid across all shots, blowing past the SLURM memory request
-        ds = ds.drop_dims([d for d in ("rho", "psi_n") if d in ds.dims])
-
+    # Stores are IMAS names in SI, the study works in the suffixed working units
+    ds_working = convert_to_working_units(ds_selected)
+    ds = ds_working[required_signals]
     ds = ds.astype(jax.numpy.float64 if jax.config.jax_enable_x64 else jax.numpy.float32)
 
     if EPISODE_DIM not in ds.dims:
         raise ValueError(f"Expected dataset to have {EPISODE_DIM} dimension, but it was not found. Found dimensions: {ds.dims}")
 
     ds = ds.sortby(EPISODE_DIM, ascending=False)  # Most recent shots first
-    ds = ds.isel({EPISODE_DIM: slice(0, config.max_ds_size)})
+    n_shots_stored = ds.sizes[EPISODE_DIM]
+    max_shots = config.max_ds_size
+    if config.debug and source_ds != config.target_device:
+        max_shots = DEBUG_MAX_SOURCE_SHOTS if max_shots is None else min(max_shots, DEBUG_MAX_SOURCE_SHOTS)
+    if max_shots is not None and n_shots_stored > max_shots:
+        logger.warning(f"Keeping the {max_shots} most recent of the {n_shots_stored} {source_ds} shots")
+        ds = ds.isel({EPISODE_DIM: slice(0, max_shots)})
 
-    def _profile_transfer(ds: xr.Dataset) -> xr.Dataset:
-        ds = add_missing_profile_companions(ds)
-        ds = ds[REQUIRED_SIGNALS_PROFILE_TRANSFER]
+    check_uniform_timebase(ds)
 
-        # Only keep fresh profiles for training
-        ds = ds.where(ds["fresh_profiles"] == 1, drop=True)
-        # TCV only has profile data out to rho=1
-        # Put all the datasets on the shared uniform rho grid for consistency
-        ds = ds.interp(rho=RHO_GRID, kwargs={"fill_value": "extrapolate"})
+    ds = add_hazard(ds)
+    mask_hazard_valid = ds["hazard"].notnull().values
+    if not mask_hazard_valid.all():
+        shots_without_hazard = ds[EPISODE_DIM].values[~mask_hazard_valid]
+        logger.warning(f"Dropping {shots_without_hazard.size} {source_ds} shots without a hazard metric: {shots_without_hazard.tolist()}")
+        ds = ds.isel({EPISODE_DIM: mask_hazard_valid})
 
-        # Linear extrapolation at the grid edges can push error bars slightly
-        # negative, error bars are widths so clamp them
-        for err_sig in PROFILE_ERROR_SIGNALS:
-            ds[err_sig] = ds[err_sig].clip(min=0.0)
+    ds = STUDY_PREPS[study_type](ds)
 
-        # Compute means and shapes
-        ds["Te_shape"] = ds["Te_keV_rho"] / ds["Te_keV_rho"].integrate("rho")
-        ds["ne_shape"] = ds["ne20_rho"] / ds["ne20_rho"].integrate("rho")
-        return ds
-
-    def _power_balance(ds: xr.Dataset) -> xr.Dataset:
-        # Ensure all required signals are present
-        for signal in REQUIRED_SIGNALS_POWER_BALANCE:
-            if signal not in ds:
-                raise ValueError(f"Required signal for training {signal} not found in dataset.")
-
-        # Additional signals and duplicates for slight renames between submodules
-        # This is for the individual submodule training to work, since when they're running on their own they expect these names.
-        ds = _add_aux_power(ds)
-
-        # Some device datasets carry multi-element numpy arrays in variable
-        # attrs (e.g. a 'validity' time range). Attrs become static jit
-        # metadata in the xarray pytree registration and arrays there break
-        # the treedef equality check, so strip them. (The profile branch loses
-        # attrs implicitly through interp, this branch must do it explicitly.)
-        for var in ds.variables:
-            ds[var].attrs = {}
-
-        # The stored timebases have mid-shot gaps, put every shot on a strict
-        # 1 kHz grid with NaN at the missing times so the train dataloader's
-        # drop_segment nan_handling only keeps contiguous segments
-        ds = reindex_to_uniform_timebase(ds)
-
-        return ds
-
-    def _transport_transfer(ds: xr.Dataset) -> xr.Dataset:
-        ds = add_missing_profile_companions(ds)
-        ds = _add_aux_power(ds)
-        ds = ds[[*REQUIRED_SIGNALS_TRANSPORT_TRANSFER, *INPUT_POWER_SIGNALS, "P_aux_MW"]]
-
-        # Unlike the profile branch there is NO fresh-profile filter here: the
-        # time-dependent rollouts need contiguous segments, so the stale
-        # (forward-filled) profile timeslices stay in as targets and
-        # fresh_profiles rides along as data for masking downstream
-        ds = ds.interp(rho=RHO_GRID, kwargs={"fill_value": "extrapolate"})
-
-        # Linear extrapolation at the grid edges can push error bars slightly
-        # negative, error bars are widths so clamp them
-        for err_sig in PROFILE_ERROR_SIGNALS:
-            ds[err_sig] = ds[err_sig].clip(min=0.0)
-
-        # Shape variables so the sciml profile submodule skeleton can run its
-        # PCA / k-means initial guess on this dataset (ProfilePredictorTRB.model_init)
-        ds["Te_shape"] = ds["Te_keV_rho"] / ds["Te_keV_rho"].integrate("rho")
-        ds["ne_shape"] = ds["ne20_rho"] / ds["ne20_rho"].integrate("rho")
-
-        # Same attr-stripping rationale as the power balance branch: array-valued
-        # attrs become static jit metadata and break the treedef equality check
-        for var in ds.variables:
-            ds[var].attrs = {}
-
-        # Strict 1 kHz grid with NaN at missing times so the train dataloader's
-        # drop_segment nan_handling only keeps contiguous segments
-        ds = reindex_to_uniform_timebase(ds)
-
-        return ds
-
-    if study_type == "profile_transfer":
-        ds = _profile_transfer(ds)
-    elif study_type == "power_balance_transfer":
-        ds = _power_balance(ds)
-    elif study_type == "transport_transfer":
-        ds = _transport_transfer(ds)
-    else:
-        raise ValueError(f"Unknown study type: {study_type}")
-
-    # If dataset was from a zarr store, must promote the 'time' data var to a coordinate
+    # From a zarr store the time variable is a data variable, the dataloaders consume it as the time coordinate
     if TIME_COORD not in ds.coords:
         ds = ds.set_coords(TIME_COORD)
-
-    # Dataset retains all signals, the dataloader will filter out the ones that are not needed.
-    return ds, EPISODE_DIM
-
-
-def add_hazard(
-    ds: xr.Dataset,
-    episode_coord: str,
-) -> xr.Dataset:
-    """
-    Add hazard metric to dataset
-    We are saying hazard is 95th percentile of (Wtot_MJ^2 + Ip_MA^2)**0.5 along a shot,
-    indicating shots are more dangerous with more stored energy and plasma current
-    Ignoring nans in the calculation
-
-    Also stores the specific Ip_MA and Wtot_MJ values at the time point where the
-    hazard metric reaches its 95th percentile for plotting in parameter space
-    """
-
-    max_Wtot = float(ds["Wtot_MJ"].max().values)
-    max_Ip = float(ds["Ip_MA"].max().values)
-    Wtot_scale = 1.0 / max_Wtot if max_Wtot != 0 else 1.0
-    Ip_scale = 1.0 / max_Ip if max_Ip != 0 else 1.0
-
-    # Calculate hazard at each time step (once for all shots)
-    hazard_timeseries = ds.eval(f"(({Wtot_scale} * Wtot_MJ)**2 + ({Ip_scale} * Ip_MA)**2)**0.5")
-
-    # Get the 95th percentile value per shot
-    ds["hazard"] = hazard_timeseries.quantile(0.95, dim=TIME_DIM, skipna=True)
-
-    n_shots = ds.sizes[episode_coord]
-
-    Ip_MA_p95 = np.full(n_shots, np.nan)
-    Wtot_MJ_p95 = np.full(n_shots, np.nan)
-
-    # Per shot, take Ip and Wtot at the timeslice whose hazard is closest to the p95 value
-    hazard_ts_data = hazard_timeseries.values  # shape: (n_shots, n_time)
-    p95_vals = ds["hazard"].values  # shape: (n_shots,)
-    Ip_MA_data = ds["Ip_MA"].values
-    Wtot_MJ_data = ds["Wtot_MJ"].values
-
-    for i in range(n_shots):
-        hazard_shot = hazard_ts_data[i]
-        p95_val = p95_vals[i]
-        valid_mask = ~np.isnan(hazard_shot)
-
-        if valid_mask.sum() > 0 and not np.isnan(p95_val):
-            # Find index where hazard is closest to p95
-            abs_diff = np.abs(hazard_shot - p95_val)
-            abs_diff[~valid_mask] = np.inf
-            idx_p95 = np.argmin(abs_diff)
-            Ip_MA_p95[i] = Ip_MA_data[i, idx_p95]
-            Wtot_MJ_p95[i] = Wtot_MJ_data[i, idx_p95]
-
-    ds["Ip_MA_p95"] = (episode_coord, Ip_MA_p95)
-    ds["Wtot_MJ_p95"] = (episode_coord, Wtot_MJ_p95)
 
     return ds
 
 
-def normalize_domain(
-    ds_source: xr.Dataset,
-    ds_target: xr.Dataset | None = None,
-    method: str = "raw",
-    feature_space: str = "power_balance",
-) -> tuple[xr.Dataset, xr.Dataset | None]:
-    """Apply the specified domain normalization method to the dataset.
+def add_hazard(ds: xr.Dataset) -> xr.Dataset:
+    """Add the per-shot hazard metric, the p95 along the shot of (energy_mhd_MJ^2 + ip_MA^2)^0.5,
+    each normalized by its dataset maximum, so shots with more stored energy and plasma current rank higher.
+    NaNs are ignored.
 
-    Thin wrapper around transport_study.modules.normalization: the per-method
-    math (physics features, per-device z-score, CORAL) is exactly the module
-    implementation the models consume, fitted here from ds_source and applied
-    to both datasets. Used for data visualization only. Datasets are modified
-    in place and returned.
+    Also stores ip_MA and energy_mhd_MJ at the timeslice whose hazard is closest to the p95
+    for plotting in parameter space.
+    """
+    max_energy_mhd = float(ds["energy_mhd_MJ"].max().values)
+    max_ip = float(ds["ip_MA"].max().values)
+    energy_mhd_scale = 1.0 / max_energy_mhd if max_energy_mhd != 0 else 1.0
+    ip_scale = 1.0 / max_ip if max_ip != 0 else 1.0
 
-    ds_source is used to inform the normalization parameters (e.g. mean and std for z-score, covariance for coral),
-    but the normalization is applied to both source and target datasets.
+    energy_mhd_normalized = energy_mhd_scale * ds["energy_mhd_MJ"]
+    ip_normalized = ip_scale * ds["ip_MA"]
+    hazard_timeseries = (energy_mhd_normalized**2 + ip_normalized**2) ** 0.5
+    hazard_p95 = hazard_timeseries.quantile(0.95, dim=TIME_DIM, skipna=True).drop_vars("quantile")
+    ds["hazard"] = hazard_p95
 
-    feature_space selects which model family's features the stat stage runs on,
+    # The timeslice closest to the p95, NaN hazards sit at +inf so a shot with any valid slice picks a valid one
+    distance_to_p95 = abs(hazard_timeseries - hazard_p95).fillna(np.inf)
+    idx_p95 = distance_to_p95.argmin(dim=TIME_DIM)
+    mask_shot_valid = hazard_p95.notnull()
+    ip_MA_p95 = ds["ip_MA"].isel({TIME_DIM: idx_p95}).reset_coords(drop=True)
+    energy_mhd_MJ_p95 = ds["energy_mhd_MJ"].isel({TIME_DIM: idx_p95}).reset_coords(drop=True)
+    ds["ip_MA_p95"] = ip_MA_p95.where(mask_shot_valid)
+    ds["energy_mhd_MJ_p95"] = energy_mhd_MJ_p95.where(mask_shot_valid)
+
+    return ds
+
+
+def normalize_domain(ds: xr.Dataset, method: str = "raw", feature_space: str = "power_balance") -> xr.Dataset:
+    """Apply a domain normalization method to a dataset holding every device, for data visualization only.
+
+    Thin wrapper around transport_study.modules.normalization:
+    the per-method math (physics features, per-device z-score, CORAL) is exactly the module implementation the models consume,
+    fitted on ds and applied to it.
+    The dataset is modified in place and returned.
+
+    feature_space selects which model family's features the physics* methods run on,
     so each study visualizes what its own modules consume:
-        - "power_balance": the 7 physics features of normalization.physics_feature_vec
-          (q_star, epsilon, aB0, f_G, surface_power_density, ...), fitted over the
-          7 physical inputs
+        - "power_balance": the 7 physics features of normalization.physics_feature_vec, fitted over the 7 physical inputs
         - "profile": the 10 dimensionless nn_inputs of the profile predictor
-          (beta, q_star, epsilon, f_G, aB0, betan, kappa, delta_top, delta_bot,
-          log_nu_star)
-        - "transport": those 10 slots with the beta-derived ones computed from
-          the measured Wtot, plus the normalized aux power (paux_norm)
-    Only the physics* methods honor it, the raw-variable methods ("zscore",
-    "coral") are power-balance inputs by definition.
+        - "transport": those 10 slots with the beta-derived ones from the measured energy_mhd_MJ, plus paux_norm
+    The raw-variable methods ("zscore", "coral") are power-balance inputs by definition.
 
     Methods:
-        - "raw": No normalization, Ip, Wtot, etc. are in their original units
-        - "physics": The module's dimensionless features. In the power-balance space that is
-          (q_star, epsilon, aB0, f_G, surface_power_density) plus beta as a visualization-only extra,
-          in the profile space the nn_inputs themselves (which carry their own beta)
-        - "zscore": Within each device, normalize each variable to zero mean and unit variance. Variable gets a `_z` suffix after normalization. Wtot_MJ is a visualization-only extra column (harmless, z-scoring is per-variable)
-        - "coral": Use the CORAL method to align covariances of various devices over exactly the model's 7 input vars. Variable gets a `_coral` suffix after normalization.
-        - "physics-coral": CORAL alignment over the physics features of the selected feature space. Variable gets a `_pcoral` suffix (a `_coral` suffix would collide with the raw coral vars).
-        - "physics-zscore": Per-device z-score over the physics features of the selected feature space. Variable gets a `_pz` suffix.
-
-    Args:
-        ds_source: The source dataset (e.g. historic data)
-        ds_target: The target dataset (e.g. DIII-D high-hazard shots)
-        method: The normalization method to apply
-        feature_space: Which model family's feature vector the physics* methods use
-
-    Returns:
-        The normalized source and target datasets.
+        - "raw": no normalization, variables stay in their working units
+        - "physics": the module's dimensionless features.
+          The power-balance space adds beta as a visualization-only extra, the other spaces carry their own beta slot.
+        - "zscore": per-device zero mean and unit variance of each variable, `_z` suffix.
+          energy_mhd_MJ is a visualization-only extra column.
+        - "coral": CORAL alignment of every device's covariance to the target device's over the 7 input vars, `_coral` suffix
+        - "physics-coral": the same CORAL alignment over the physics features of the feature space, `_pcoral` suffix
+        - "physics-zscore": per-device z-score over the physics features of the feature space, `_pz` suffix
     """
     physics_names: tuple[str, ...]
     physics_source_vars: tuple[str, ...]
@@ -550,165 +455,162 @@ def normalize_domain(
         physics_names, physics_source_vars, physics_matrix_fn = PHYSICS_FEATURE_NAMES, NORM_INPUT_VARS, None
     else:
         raise ValueError(f"Unknown feature space: {feature_space}")
-    datasets = [ds_source] if ds_target is None else [ds_source, ds_target]
+    # Broadcast template carrying the full per-sample dims
+    reference = ds[NORM_INPUT_VARS[0]]
 
-    def _reference(ds: xr.Dataset) -> xr.DataArray:
-        # Broadcast template carrying the full per-sample dims
-        return ds[NORM_INPUT_VARS[0]]
+    def _feature_matrix_for(variables: tuple[str, ...]) -> np.ndarray:
+        missing = [var for var in variables if var not in ds]
+        if missing:
+            raise ValueError(f"Feature matrix needs {missing}, the dataset lacks them")
+        return flat_columns(ds, variables)
 
-    def _feature_matrix_for(ds: xr.Dataset, variables: tuple[str, ...]) -> np.ndarray:
-        reference = _reference(ds)
-        columns = []
-        for var in variables:
-            if var in ds:
-                col = np.asarray(ds[var].broadcast_like(reference).values, dtype=float).ravel()
-            else:
-                # Missing signals become zeros (profile-transfer sets lack P_aux_MW unless zero-filled upstream)
-                col = np.zeros(reference.size)
-            columns.append(col)
-        return np.column_stack(columns)
-
-    def _physics_matrix(ds: xr.Dataset) -> np.ndarray:
+    def _physics_matrix() -> np.ndarray:
         if physics_matrix_fn is not None:
             return physics_matrix_fn(ds)
-        raw = jnp.asarray(_feature_matrix_for(ds, NORM_INPUT_VARS))
+        raw = jnp.asarray(_feature_matrix_for(NORM_INPUT_VARS))
         return np.asarray(jax.vmap(physics_feature_vec)(raw))
 
-    # Physics slots that are identity mappings of a raw input var of the same name
-    identity_slots = set(physics_source_vars)
-
-    def _write_features(ds: xr.Dataset, matrix: np.ndarray, names: tuple[str, ...], suffix: str) -> None:
-        reference = _reference(ds)
+    def _write_features(matrix: np.ndarray, names: tuple[str, ...], suffix: str) -> None:
         for j, name in enumerate(names):
             ds[f"{name}{suffix}"] = (reference.dims, np.asarray(matrix[:, j], dtype=float).reshape(reference.shape))
 
-    def _add_physics_vars(ds: xr.Dataset) -> None:
-        phys = _physics_matrix(ds)
-        reference = _reference(ds)
-        for j, name in enumerate(physics_names):
-            # Identity slots (Ip_MA / kappa, plus betan / delta_* in the profile
-            # feature space) already exist as raw vars
-            if name in identity_slots:
-                continue
-            ds[name] = (reference.dims, np.asarray(phys[:, j], dtype=float).reshape(reference.shape))
-        if feature_space != "power_balance":
-            # The profile and transport feature vectors carry their own beta slot
-            return
-        # beta needs the stored energy, which is the predicted state rather than
-        # a model input, so it is a visualization-only extra
-        epsilon = ds["a_minor"] / ds["R0"]
-        avg_pressure = (2.0 / 3.0) * (ds["Wtot_MJ"] * 1e6) / calc_plasma_volume(ds["R0"], epsilon, ds["kappa"])
-        ds["beta"] = 100 * avg_pressure / ((ds["B0"] ** 2) / (2 * mu_0))
-
     if method == "raw":
-        return ds_source, ds_target
+        return ds
     if method == "physics":
-        for ds in datasets:
-            _add_physics_vars(ds)
-        return ds_source, ds_target
+        physics_matrix = _physics_matrix()
+        # Physics slots that are identity mappings of a raw input var already exist as raw vars
+        identity_slots = set(physics_source_vars)
+        for j, name in enumerate(physics_names):
+            if name not in identity_slots:
+                ds[name] = (reference.dims, np.asarray(physics_matrix[:, j], dtype=float).reshape(reference.shape))
+        if feature_space == "power_balance":
+            # beta needs the stored energy, the predicted state rather than a model input, so it is a visualization-only extra.
+            # The same fraction the modules call beta, through the store's betan formula with volume_approx.
+            volume_m3 = plasma_parameters.volume_approx(ds["geometric_axis_r"], ds["minor_radius"], ds["elongation"])
+            beta_tor_norm = plasma_parameters.beta_tor_norm_from_energy_mhd_MJ(
+                ds["energy_mhd_MJ"], volume_m3, ds["minor_radius"], ds["b0"], ds["ip_MA"]
+            )
+            ds["beta"] = plasma_parameters.beta_tor_from_beta_tor_norm(beta_tor_norm, ds["ip_MA"], ds["minor_radius"], ds["b0"])
+        return ds
 
-    # Stat-bearing methods key per-device statistics on an integer index built
-    # locally from the ds_source coordinate (the modules use the global
-    # config.ds_source_to_idx, but any consistent indexing gives the same stats)
-    registry: dict[str, int] = {}
-    for ds in datasets:
-        for device in np.atleast_1d(ds.coords["ds_source"].values):
-            registry.setdefault(str(device), len(registry))
-
-    def _source_idx_for(ds: xr.Dataset) -> np.ndarray:
-        idx_da = xr.apply_ufunc(np.vectorize(lambda d: registry[str(d)]), ds.coords["ds_source"])
-        return np.asarray(idx_da.broadcast_like(_reference(ds)).values).ravel().astype(int)
+    # Stat-bearing methods key per-device statistics on an integer index built locally from the ds_source coordinate.
+    # The modules use the global config.ds_source_to_idx, any consistent indexing gives the same stats.
+    registry = {str(device): idx for idx, device in enumerate(dict.fromkeys(np.atleast_1d(ds.coords["ds_source"].values)))}
+    source_idx_da = xr.apply_ufunc(np.vectorize(lambda d: registry[str(d)]), ds.coords["ds_source"])
+    source_idx = np.asarray(source_idx_da.broadcast_like(reference).values).ravel().astype(int)
 
     if method == "zscore":
-        zscore_vars = (*NORM_INPUT_VARS, "Wtot_MJ")
-        means, stds = fit_z_score_stats(_feature_matrix_for(ds_source, zscore_vars), _source_idx_for(ds_source), len(registry))
-        for ds in datasets:
-            matrix = apply_z_score(jnp.asarray(_feature_matrix_for(ds, zscore_vars)), _source_idx_for(ds), means, stds)
-            _write_features(ds, np.asarray(matrix), zscore_vars, "_z")
-        return ds_source, ds_target
-
+        zscore_vars = (*NORM_INPUT_VARS, "energy_mhd_MJ")
+        zscore_inputs = _feature_matrix_for(zscore_vars)
+        means, stds = fit_z_score_stats(zscore_inputs, source_idx, len(registry))
+        zscore_matrix = apply_z_score(jnp.asarray(zscore_inputs), source_idx, means, stds)
+        _write_features(np.asarray(zscore_matrix), zscore_vars, "_z")
+        return ds
     if method == "physics-zscore":
-        means, stds = fit_z_score_stats(_physics_matrix(ds_source), _source_idx_for(ds_source), len(registry))
-        for ds in datasets:
-            matrix = apply_z_score(jnp.asarray(_physics_matrix(ds)), _source_idx_for(ds), means, stds)
-            _write_features(ds, np.asarray(matrix), physics_names, "_pz")
-        return ds_source, ds_target
+        physics_matrix = _physics_matrix()
+        means, stds = fit_z_score_stats(physics_matrix, source_idx, len(registry))
+        zscore_matrix = apply_z_score(jnp.asarray(physics_matrix), source_idx, means, stds)
+        _write_features(np.asarray(zscore_matrix), physics_names, "_pz")
+        return ds
+    if method not in ("coral", "physics-coral"):
+        raise ValueError(f"Unknown normalization method: {method}")
 
-    def _shot_idx_for(ds: xr.Dataset) -> np.ndarray:
-        return np.asarray(ds.coords["shot"].broadcast_like(_reference(ds)).values).ravel()
-
-    def _coral_normalization(variables: tuple[str, ...], suffix: str, matrix_fn) -> None:
-        # Devices below MIN_CORAL_SHOTS (or absent from ds_source) keep the
-        # identity transform, so their features pass through raw. Rows with any
-        # NaN feature come out all-NaN (the joint transform needs complete rows).
-        stats = fit_coral_stats(matrix_fn(ds_source), _source_idx_for(ds_source), len(registry), _shot_idx_for(ds_source))
-        means, transforms = identity_coral_stats(len(registry), len(variables)) if stats is None else stats
-        batched_apply = jax.vmap(apply_coral, in_axes=(0, 0, None, None))
-        for ds in datasets:
-            matrix = batched_apply(jnp.asarray(matrix_fn(ds)), jnp.asarray(_source_idx_for(ds)), means, transforms)
-            _write_features(ds, np.asarray(matrix), variables, suffix)
-
+    # Every device aligns to the target device's covariance, all keep the identity transform without the target.
+    # Source devices below MIN_CORAL_SHOTS keep the identity transform, so their features pass through raw.
+    # Rows with any NaN feature come out all-NaN (the joint transform needs complete rows).
+    coral_names: tuple[str, ...]
     if method == "coral":
-        _coral_normalization(NORM_INPUT_VARS, "_coral", lambda ds: _feature_matrix_for(ds, NORM_INPUT_VARS))
-        return ds_source, ds_target
-    if method == "physics-coral":
-        _coral_normalization(physics_names, "_pcoral", _physics_matrix)
-        return ds_source, ds_target
+        coral_names, coral_suffix, coral_inputs = NORM_INPUT_VARS, "_coral", _feature_matrix_for(NORM_INPUT_VARS)
+    else:
+        coral_names, coral_suffix, coral_inputs = physics_names, "_pcoral", _physics_matrix()
+    stats = None
+    if config.target_device in registry:
+        shot_idx = np.asarray(ds.coords["shot"].broadcast_like(reference).values).ravel()
+        stats = fit_coral_stats(coral_inputs, source_idx, len(registry), shot_idx, registry[config.target_device])
+    means, transforms = identity_coral_stats(len(registry), len(coral_names)) if stats is None else stats
+    batched_apply = jax.vmap(apply_coral, in_axes=(0, 0, None, None))
+    coral_matrix = batched_apply(jnp.asarray(coral_inputs), jnp.asarray(source_idx), means, transforms)
+    _write_features(np.asarray(coral_matrix), coral_names, coral_suffix)
+    return ds
 
-    raise ValueError(f"Unknown normalization method: {method}")
+
+def _source_split_parts(training_data: TrainingData, study_type: str) -> tuple[list[xr.Dataset], list[xr.Dataset]]:
+    """Each source device split into training and validation shots by a deterministic hazard sort.
+
+    The TRAIN_VAL_SPLIT highest-hazard shots of every source are its validation set.
+    Returns (train_parts, val_parts), one dataset per source in training_data.sources order.
+    """
+    train_parts, val_parts = [], []
+    for source in training_data.sources:
+        ds = get_ds(source, study_type)
+        # popsim requires a seed, the hazard sort makes the split deterministic and leaves it unused
+        train_src, val_src = split_dataset_by_fracs(
+            ds,
+            fracs=TRAIN_VAL_SPLIT,
+            dim=EPISODE_DIM,
+            seed=0,
+            sortby="hazard",
+        )
+        src_idx = config.ds_source_to_idx[source]
+        train_src["ds_source_idx"] = (
+            EPISODE_DIM,
+            np.full(train_src.sizes[EPISODE_DIM], src_idx),
+        )
+        val_src["ds_source_idx"] = (
+            EPISODE_DIM,
+            np.full(val_src.sizes[EPISODE_DIM], src_idx),
+        )
+        train_parts.append(train_src.assign_coords(ds_source=source))
+        val_parts.append(val_src.assign_coords(ds_source=source))
+    if not train_parts:
+        raise ValueError("training_data.sources is empty - cannot build train/val datasets")
+    return train_parts, val_parts
+
+
+def merge_parts(parts: list[xr.Dataset]) -> xr.Dataset:
+    """Training parts in one dataset along the shot dim, the shorter shots NaN-padded to the longest.
+
+    Only for parts that are small on the time axis (the validation sets, the 0D and the compacted profile views):
+    the time-dependent training parts go through trb_utils.segmented_train_dataloader instead.
+    """
+    return parts[0] if len(parts) == 1 else concat_with_nan_padding(parts, concat_dim=EPISODE_DIM)
+
+
+def stack_0d_timeslices(parts: list[xr.Dataset]) -> xr.Dataset:
+    """The 0D variables of every real timeslice of the parts, one row each along TIMESLICE_DIM.
+
+    The normalizer fit set of the time-dependent cases (see trb_utils.normalizer_fit_dataset).
+    The normalizers read 0D signals alone,
+    and merged on one time axis every shot would be NaN-padded to the longest shot of any part.
+    A padding row holds no value, so dropping it leaves every fitted statistic unchanged.
+    Each row keeps its shot as a coordinate, and the per-shot variables are broadcast to every row.
+    """
+    part_rows = []
+    for part in parts:
+        part_0d = part.drop_dims(RADIAL_DIM, errors="ignore")
+        part_stacked = part_0d.stack({TIMESLICE_DIM: (EPISODE_DIM, TIME_DIM)}).reset_index(TIMESLICE_DIM)
+        mask_real_timeslice = np.isfinite(part_stacked[TIME_COORD].values)
+        part_rows.append(part_stacked.isel({TIMESLICE_DIM: mask_real_timeslice}))
+    return xr.concat(part_rows, dim=TIMESLICE_DIM, data_vars="all", coords="different", compat="equals", join="outer")
 
 
 def get_train_val_datasets(
     training_data: TrainingData,
     study_type: str = "profile_transfer",
-):
-    """
-    Split dataset into training and validation sets based on the specified training data case.
+) -> tuple[list[xr.Dataset], xr.Dataset]:
+    """The historic training parts and the merged historic validation set (see _source_split_parts).
 
-    The reason why we only have train and val sets here is because our true test set is the
+    There is no test set here because the true test set is the
     high-hazard target device shots, handled separately.
     That means all historic source data can be used for training and validation.
+    The training data stays one part per source device,
+    so no source is NaN-padded to the time axis of another (see merge_parts).
     """
-    ds_sources: dict[str, tuple] = {}
-    episode_coord = None
-
-    for source in training_data.sources:
-        ds, episode_coord = get_ds(source, study_type)
-        ds = add_hazard(ds, episode_coord)
-        train_src, val_src = split_dataset_by_fracs(
-            ds,
-            fracs=TRAIN_VAL_SPLIT,
-            dim=episode_coord,
-            seed=42,
-            sortby="hazard",
-        )
-        src_idx = config.ds_source_to_idx[source]
-        train_src["ds_source_idx"] = (
-            episode_coord,
-            np.full(train_src.sizes[episode_coord], src_idx),
-        )
-        val_src["ds_source_idx"] = (
-            episode_coord,
-            np.full(val_src.sizes[episode_coord], src_idx),
-        )
-        train_src = train_src.assign_coords(ds_source=source)
-        val_src = val_src.assign_coords(ds_source=source)
-        ds_sources[source] = (train_src, val_src)
-
-    if not ds_sources:
-        raise ValueError("training_data.sources is empty - cannot build train/val datasets")
-
-    if len(ds_sources) == 1:
-        source = next(iter(ds_sources))
-        train_ds, val_ds = ds_sources[source]
-    else:
-        train_ds = concat_with_nan_padding([pair[0] for pair in ds_sources.values()], concat_dim=episode_coord)
-        val_ds = concat_with_nan_padding([pair[1] for pair in ds_sources.values()], concat_dim=episode_coord)
-
-    logger.debug("Historic Training dataset size: {}", train_ds.sizes[episode_coord])
-    logger.debug("Historic Validation dataset size: {}", val_ds.sizes[episode_coord])
-
-    return train_ds, val_ds
+    train_parts, val_parts = _source_split_parts(training_data, study_type)
+    val_ds = merge_parts(val_parts)
+    logger.debug("Historic training shots: {}", sum(part.sizes[EPISODE_DIM] for part in train_parts))
+    logger.debug("Historic validation shots: {}", val_ds.sizes[EPISODE_DIM])
+    return train_parts, val_ds
 
 
 def get_loaded_shot_count(source_ds: str, study_type: str = "profile_transfer") -> int:
@@ -720,131 +622,103 @@ def get_loaded_shot_count(source_ds: str, study_type: str = "profile_transfer") 
     from disk, so it is not free, but it is only needed once per device when
     building a train config.
     """
-    ds, episode_coord = get_ds(source_ds, study_type)
-    return int(ds.sizes[episode_coord])
+    ds = get_ds(source_ds, study_type)
+    return int(ds.sizes[EPISODE_DIM])
 
 
-def _split_target_shots(
-    num_target_shots: int,
-    target_test_set_size: int,
-    study_type: str,
-):
+def _split_target_shots(target_split: TargetSplit, study_type: str):
     """Load the target device and split it into training shots and the held-out test set.
 
-    The test set is the target_test_set_size highest-hazard shots
-    The training shots are the first num_target_shots of the remaining pool
-    (or every shot for -1, the cheating upper-bound reference).
-    Returns (train_ds_target, test_ds, episode_coord).
+    The split is decided on the power balance view of the target device (see orchestration/target_shots.py),
+    then the study's own view is indexed by those shot numbers,
+    so every study trains and tests on the same target shots.
+    Returns (target_train_parts, test_ds).
+    target_train_parts is empty without target training shots,
+    since a zero-shot part would still carry the target's full time axis.
     """
     target = config.target_device
     if target is None:
         raise ValueError("config.target_device must be set before transfer learning")
 
-    ds_target, episode_coord = get_ds(target, study_type=study_type)
-    ds_target = add_hazard(ds_target, episode_coord)
+    ds_target = get_ds(target, study_type=study_type)
+    ds_power_balance = ds_target if study_type == "power_balance_transfer" else get_ds(target, study_type="power_balance_transfer")
+    train_shots, test_shots = target_shot_split(ds_power_balance, target_split)
+    split_shots = {*train_shots.tolist(), *test_shots.tolist()}
+    missing = sorted(split_shots - set(ds_target[EPISODE_DIM].values.tolist()))
+    if missing:
+        raise ValueError(f"The {study_type} prep dropped target shots {missing} that the target split uses")
+
     ds_target["ds_source_idx"] = (
-        episode_coord,
-        np.full(ds_target.sizes[episode_coord], config.ds_source_to_idx[target]),
+        EPISODE_DIM,
+        np.full(ds_target.sizes[EPISODE_DIM], config.ds_source_to_idx[target]),
     )
     ds_target = ds_target.assign_coords(ds_source=target)
-    sorted_shots = np.argsort(ds_target["hazard"].values)
+    train_ds_target = ds_target.sel({EPISODE_DIM: train_shots})
+    test_ds = ds_target.sel({EPISODE_DIM: test_shots})
+    assert not (set(train_shots.tolist()) & set(test_shots.tolist())), "Target train and test shot pools overlap - data leakage"
+    target_train_parts = [train_ds_target] if train_shots.size else []
 
-    test_shot_pool = sorted_shots[-target_test_set_size:] if target_test_set_size else sorted_shots[:0]
-    test_ds = ds_target.isel({episode_coord: test_shot_pool})
-
-    if num_target_shots == -1:
-        # All available target shots in training and testing (upper-bound reference, CHEATING!)
-        train_ds_target = ds_target.isel({episode_coord: sorted_shots})
-    else:
-        # Exclude the held-out test shots before selecting training shots so the two pools
-        # never overlap (otherwise a large num_target_shots would leak high-hazard test
-        # shots into training)
-        train_candidate_pool = sorted_shots[:-target_test_set_size] if target_test_set_size else sorted_shots
-        if num_target_shots > len(train_candidate_pool):
-            raise ValueError(
-                f"num_target_shots={num_target_shots} requested but only {len(train_candidate_pool)} target "
-                f"shots remain after holding out target_test_set_size={target_test_set_size} of "
-                f"{len(sorted_shots)} loaded shots. Is the dataset smaller than expected "
-                f"(debug mode / max_ds_size truncation)?"
-            )
-        train_shot_pool = train_candidate_pool[:num_target_shots]
-        assert not (set(train_shot_pool.tolist()) & set(test_shot_pool.tolist())), "Target train and test shot pools overlap - data leakage"
-        train_ds_target = ds_target.isel({episode_coord: train_shot_pool})
-
-    return train_ds_target, test_ds, episode_coord
+    return target_train_parts, test_ds
 
 
 def get_train_test_datasets(
     training_data: "TrainingData",
     domain_adaptation: str | None,
-    num_target_shots: int,
-    target_test_set_size: int,
+    target_split: TargetSplit,
     study_type: str = "profile_transfer",
-):
-    """
-    Split dataset into training and test sets for the target learning case.
-    If domain adaptation is 'weighted' or 'addition', makes a combined training set of historic
-    data and target device shots (the two methods share this dataset, 'weighted' additionally
-    gets per-device loss weights injected in make_train_config). If domain adaptation is
-    'transfer' or training_data.exnihilo is True, removes all historic data from the training
-    set, leaving only the target device shots.
-    The number of target shots included in training is specified by `num_target_shots`.
+) -> tuple[list[xr.Dataset], xr.Dataset]:
+    """The training parts and the test set of a target learning case.
+
+    If domain adaptation is 'weighted' or 'addition', the training parts are the historic data
+    (each source's training then validation shots) followed by the target device's training shots
+    (the two methods share them, 'weighted' additionally gets per-device loss weights injected in make_train_config).
+    If domain adaptation is 'transfer' or training_data.exnihilo is True, the target training shots are the only part,
+    and no source device is loaded.
+    target_split picks the target shots included in training and the held-out test set (see orchestration/target_shots.py).
 
     The test set is always the same set of target device shots.
-    The training set is the historic data from training_data.sources plus num_target_shots target shots.
-
     There is no validation set here since hyperparameters are not tuned on transfer learning data.
     We treat the test set as a validation set for checkpoint selection, which is slightly optimistic
     but consistent across all models so comparisons are fair.
     """
-    train_ds_target, test_ds, episode_coord = _split_target_shots(num_target_shots, target_test_set_size, study_type)
-
-    # Load historic source data for training (for exnihilo it is stripped again below)
-    # exnihilo.sources contains all non-target devices, so we can pass training_data directly
-    train_ds_hist, val_ds_hist = get_train_val_datasets(training_data, study_type=study_type)
-    train_ds = concat_with_nan_padding(
-        [train_ds_hist, val_ds_hist, train_ds_target],
-        concat_dim=episode_coord,
-    )
-
-    # For 'transfer' and exnihilo: strip historic data, train only on target device shots
+    target_train_parts, test_ds = _split_target_shots(target_split, study_type)
     if domain_adaptation == "transfer" or training_data.exnihilo:
-        train_ds = train_ds.where(
-            train_ds["ds_source_idx"] == config.ds_source_to_idx[config.target_device],
-            drop=True,
-        )
+        train_parts = target_train_parts
+    else:
+        source_train_parts, source_val_parts = _source_split_parts(training_data, study_type)
+        train_parts = [*source_train_parts, *source_val_parts, *target_train_parts]
 
-    logger.debug("HP Training dataset size: {}", train_ds.sizes[episode_coord])
-    logger.debug("HP Test dataset size: {}", test_ds.sizes[episode_coord])
-
-    return train_ds, test_ds
+    logger.debug("Training shots: {}", sum(part.sizes[EPISODE_DIM] for part in train_parts))
+    logger.debug("Test shots: {}", test_ds.sizes[EPISODE_DIM])
+    return train_parts, test_ds
 
 
 def get_transfer_pretrain_datasets(
     training_data: "TrainingData",
-    num_target_shots: int,
-    target_test_set_size: int,
+    target_split: TargetSplit,
     study_type: str = "profile_transfer",
 ):
     """Datasets for a transfer_pretrain case (the pretrain half of a stat-normalized transfer).
 
-    The case trains on ALL historic data (train and val splits together, the
-    source val split is not needed because checkpoint selection uses the
-    target test set, like every other domain-adaptation case). The combined
-    dataset (historic + the transfer case's num_target_shots target shots)
-    exists only to fit the normalization statistics, which the transfer case
-    then inherits through the checkpoint restore.
+    The case trains on ALL historic data
+    (train and val splits together, the source val split is not needed because
+    checkpoint selection uses the target test set, like every other domain-adaptation case)
+    The timeslices of the historic and the transfer case's target training shots
+    exist only to fit the normalization statistics,
+    which the transfer case then inherits through the checkpoint restore.
 
-    Returns (train_ds_hist, train_ds_combined, test_ds).
+    Returns (train_parts_hist, normalizer_fit_ds, test_ds),
+    the historic training parts (each source's training then validation shots),
+    and their 0D timeslices with the target's (see stack_0d_timeslices)
     """
-    train_ds_target, test_ds, episode_coord = _split_target_shots(num_target_shots, target_test_set_size, study_type)
+    target_train_parts, test_ds = _split_target_shots(target_split, study_type)
 
-    train_ds_hist, val_ds_hist = get_train_val_datasets(training_data, study_type=study_type)
-    train_ds_hist = concat_with_nan_padding([train_ds_hist, val_ds_hist], concat_dim=episode_coord)
-    train_ds_combined = concat_with_nan_padding([train_ds_hist, train_ds_target], concat_dim=episode_coord)
+    source_train_parts, source_val_parts = _source_split_parts(training_data, study_type)
+    train_parts_hist = [*source_train_parts, *source_val_parts]
+    normalizer_fit_ds = stack_0d_timeslices([*train_parts_hist, *target_train_parts])
 
-    logger.debug("Transfer pretrain historic dataset size: {}", train_ds_hist.sizes[episode_coord])
-    logger.debug("Transfer pretrain normalizer-fit dataset size: {}", train_ds_combined.sizes[episode_coord])
-    logger.debug("Transfer pretrain test dataset size: {}", test_ds.sizes[episode_coord])
+    logger.debug("Transfer pretrain historic shots: {}", sum(part.sizes[EPISODE_DIM] for part in train_parts_hist))
+    logger.debug("Transfer pretrain normalizer-fit timeslices: {}", normalizer_fit_ds.sizes[TIMESLICE_DIM])
+    logger.debug("Transfer pretrain test shots: {}", test_ds.sizes[EPISODE_DIM])
 
-    return train_ds_hist, train_ds_combined, test_ds
+    return train_parts_hist, normalizer_fit_ds, test_ds

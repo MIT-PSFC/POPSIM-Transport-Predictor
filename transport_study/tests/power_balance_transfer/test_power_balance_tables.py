@@ -5,10 +5,13 @@ import pandas as pd
 import xarray as xr
 
 from transport_study.orchestration.stages import STAGE_AGG_NAMES
-from transport_study.power_balance_transfer.tables import (
-    case_stats_frame,
-    write_comparison_tables,
+from transport_study.orchestration.tables import (
+    SEED_SUFFIXES,
+    summary_case_stats_frame,
+    write_summary_comparison_tables,
 )
+from transport_study.power_balance_transfer.study_metrics import METRIC_NAMES
+from transport_study.power_balance_transfer.tables import SPEC
 
 
 def _results_ds() -> xr.Dataset:
@@ -23,6 +26,9 @@ def _results_ds() -> xr.Dataset:
         "domain_adaptation": ("case_idx", np.array(["none"] * 3)),
         "num_target_shots": ("case_idx", np.array([0, 0, 0])),
         "freeze_submodules": "none",
+        "multiobjective": False,
+        "target_shot_order": "ascending",
+        "model_size": "sweep",
     }
     return xr.Dataset(
         data_vars={
@@ -34,26 +40,31 @@ def _results_ds() -> xr.Dataset:
 
 
 def _metrics_ds() -> xr.Dataset:
+    """Per-stage means offset by 10 per metric, the best seed's by 100 more and the seed stds by 1000."""
     n_stages = len(STAGE_AGG_NAMES)
     data_vars = {}
-    for i, metric in enumerate(("abs", "rel")):
+    for i, metric in enumerate(METRIC_NAMES):
         values = np.arange(3 * n_stages, dtype=float).reshape(3, n_stages) + 10 * i
-        data_vars[f"{metric}_mean"] = (("case_idx", "stage"), values)
+        for suffix, offset in zip(SEED_SUFFIXES, (0.0, 100.0, 1000.0), strict=True):
+            data_vars[f"{metric}_mean{suffix}"] = (("case_idx", "stage"), values + offset)
     return xr.Dataset(data_vars=data_vars, coords={"case_idx": [0, 1, 2], "stage": list(STAGE_AGG_NAMES)})
 
 
 def test_case_stats_frame_excludes_submodules_and_merges_metrics():
-    df = case_stats_frame(_results_ds(), _metrics_ds())
+    df = summary_case_stats_frame(_results_ds(), _metrics_ds(), SPEC)
     assert set(df["model_type"]) == {"sciml-taue-nn", "sciml-taue-scalinglaw"}
     # The scalar freeze_submodules coord is broadcast back to a column
     assert (df["freeze_submodules"] == "none").all()
     df = df.set_index("case_idx")
     assert df.loc[0, "abs_mean_all"] == 0.0
     assert df.loc[1, "rel_mean_all"] == float(len(STAGE_AGG_NAMES)) + 10
+    # The best seed's and the seed std columns come from their own variables
+    assert df.loc[1, "rel_mean_best_all"] == float(len(STAGE_AGG_NAMES)) + 110
+    assert df.loc[1, "rel_mean_seed_std_all"] == float(len(STAGE_AGG_NAMES)) + 1010
 
 
 def test_write_comparison_tables(tmp_path):
-    write_comparison_tables(_results_ds(), _metrics_ds(), tmp_path)
+    write_summary_comparison_tables(_results_ds(), _metrics_ds(), SPEC, tmp_path)
 
     csv_path = tmp_path / "tables" / "case_stats.csv"
     assert csv_path.exists()
@@ -61,19 +72,23 @@ def test_write_comparison_tables(tmp_path):
     assert len(df) == 2
     assert "p_oh" not in set(df["model_type"])
 
-    table_path = tmp_path / "tables" / "model_type" / "td_cmod.norm_physics.da_none.freeze_none.targ_0.md"
+    table_path = (
+        tmp_path / "tables" / "model_type" / "td_cmod.norm_physics.da_none.freeze_none.mo_False.targ_0.order_ascending.size_sweep.md"
+    )
     content = table_path.read_text()
     assert "| sciml-taue-nn |" in content
     assert "| sciml-taue-scalinglaw |" in content
 
 
 def test_missing_metrics_render_as_dash(tmp_path):
-    write_comparison_tables(_results_ds(), xr.Dataset(), tmp_path)
-    table_path = tmp_path / "tables" / "model_type" / "td_cmod.norm_physics.da_none.freeze_none.targ_0.md"
+    write_summary_comparison_tables(_results_ds(), xr.Dataset(), SPEC, tmp_path)
+    table_path = (
+        tmp_path / "tables" / "model_type" / "td_cmod.norm_physics.da_none.freeze_none.mo_False.targ_0.order_ascending.size_sweep.md"
+    )
     content = table_path.read_text()
     assert "| sciml-taue-nn | - |" in content
 
 
 def test_empty_results_skip(tmp_path):
-    write_comparison_tables(xr.Dataset(), xr.Dataset(), tmp_path)
+    write_summary_comparison_tables(xr.Dataset(), xr.Dataset(), SPEC, tmp_path)
     assert not (tmp_path / "tables").exists()

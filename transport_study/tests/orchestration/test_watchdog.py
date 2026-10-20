@@ -2,29 +2,37 @@
 
 Both exist so a case can never be stranded by a job that will not finish:
 
-- The stall watchdog (Study._kill_stuck_jobs) kills a RUNNING training job that
+- The stall watchdog (Study.kill_stuck_jobs) kills a RUNNING training job that
   deadlocks (e.g. an OpenBLAS or XLA compile-pool hang) and so sits in the
-  queue forever without checkpointing.
+  queue forever without checkpointing or writing its train log.
 - The pending watchdog (Study._kill_long_pending_jobs) cancels a job stuck
   PENDING on a spillover partition, handing the case back to the launch path
-  so pick_partition can re-decide placement. The primary partition is exempt.
-
-The pending-watchdog bodies are blocked out as docstring stubs.
+  so the next pass's LaunchSlots can re-decide placement. The primary partition is exempt.
 """
 
 import os
 import time
-from pathlib import Path
+from types import SimpleNamespace
 
+import jax.numpy as jnp
 import pytest
+from popsim.ml.checkpointing import (
+    TrainState,
+    checkpoint_step_path,
+    create_default_checkpoint_manager,
+    save_train_state,
+)
 
+from transport_study.modules.trb_utils import CHECKPOINT_FORMAT
+from transport_study.orchestration import slurm_utils
 from transport_study.orchestration import study as study_module
 from transport_study.orchestration.study import (
     WATCHDOG_MIN_AGE_S,
+    WATCHDOG_PENDING_S,
     WATCHDOG_STALL_S,
     Study,
 )
-from transport_study.tests.stubs import StubCase
+from transport_study.tests.stubs import StubCase, open_launch_slots
 
 
 @pytest.fixture
@@ -46,27 +54,38 @@ def killed(monkeypatch) -> list[str]:
 
 
 def set_job_elapsed(monkeypatch, study, case, elapsed_s: float | None):
-    """Report the case's train job as running for elapsed_s (None: not running)."""
-    elapsed = {} if elapsed_s is None else {study.train_job_name(case): elapsed_s}
+    """Report the case's one seed job as running for elapsed_s (None: not running)."""
+    elapsed = {} if elapsed_s is None else {study.train_job_name(case, 0): elapsed_s}
     monkeypatch.setattr(study_module, "get_running_job_elapsed_s", lambda partition=None: elapsed)
 
 
 def write_checkpoint(study: Study, case, epoch: int, age_s: float):
-    """Create a latest-checkpoint epoch dir, backdated by age_s seconds."""
-    epoch_dir = Path(f"{study.trained_model_dir(case)}_latest") / str(epoch)
-    epoch_dir.mkdir(parents=True, exist_ok=True)
+    """Create a checkpoint of the case's one seed at epoch, backdated by age_s seconds."""
+    seed_model_dir = study.seed_model_dir(case, 0)
+    seed_model_dir.mkdir(parents=True, exist_ok=True)
+    checkpoint_path = checkpoint_step_path(seed_model_dir, epoch, CHECKPOINT_FORMAT)
+    checkpoint_path.touch()
     mtime = time.time() - age_s
-    os.utime(epoch_dir, (mtime, mtime))
+    os.utime(checkpoint_path, (mtime, mtime))
+
+
+def write_train_log(study: Study, case, age_s: float):
+    """Create the train log of the case's one seed, last written age_s seconds ago."""
+    train_log_path = study.train_log_path(case, 0)
+    train_log_path.parent.mkdir(parents=True, exist_ok=True)
+    train_log_path.touch()
+    mtime = time.time() - age_s
+    os.utime(train_log_path, (mtime, mtime))
 
 
 # ----------------------------------------------------------------------
-# Stall watchdog (Study._kill_stuck_jobs)
+# Stall watchdog (Study.kill_stuck_jobs)
 # ----------------------------------------------------------------------
 def test_young_job_not_killed(study, case, killed, monkeypatch):
     """A job that has not yet run WATCHDOG_MIN_AGE_S is left alone even with no checkpoint."""
     set_job_elapsed(monkeypatch, study, case, WATCHDOG_MIN_AGE_S - 1)
 
-    study._kill_stuck_jobs([case])
+    study.kill_stuck_jobs([case])
 
     assert killed == []
 
@@ -76,7 +95,7 @@ def test_old_job_with_recent_checkpoint_not_killed(study, case, killed, monkeypa
     write_checkpoint(study, case, epoch=40, age_s=WATCHDOG_STALL_S - 1)
     set_job_elapsed(monkeypatch, study, case, WATCHDOG_MIN_AGE_S + 1)
 
-    study._kill_stuck_jobs([case])
+    study.kill_stuck_jobs([case])
 
     assert killed == []
 
@@ -86,18 +105,33 @@ def test_old_job_with_stale_checkpoint_killed(study, case, killed, monkeypatch):
     write_checkpoint(study, case, epoch=40, age_s=WATCHDOG_STALL_S + 1)
     set_job_elapsed(monkeypatch, study, case, WATCHDOG_MIN_AGE_S + 1)
 
-    study._kill_stuck_jobs([case])
+    study.kill_stuck_jobs([case])
 
-    assert killed == [study.train_job_name(case)]
+    assert killed == [study.train_job_name(case, 0)]
 
 
 def test_old_job_with_no_checkpoint_killed(study, case, killed, monkeypatch):
     """An old job that never wrote a first checkpoint is also deadlocked."""
     set_job_elapsed(monkeypatch, study, case, WATCHDOG_MIN_AGE_S + 1)
 
-    study._kill_stuck_jobs([case])
+    study.kill_stuck_jobs([case])
 
-    assert killed == [study.train_job_name(case)]
+    assert killed == [study.train_job_name(case, 0)]
+
+
+@pytest.mark.parametrize(("log_age_s", "is_killed"), [(WATCHDOG_STALL_S - 1, False), (WATCHDOG_STALL_S + 1, True)])
+def test_train_log_progress_spares_a_job_between_checkpoints(study, case, killed, monkeypatch, log_age_s, is_killed):
+    """A job writes its train log every epoch but checkpoints once per validation interval,
+    which can outlast the stall window on a slow model.
+    Only a job whose log is stale too is deadlocked.
+    """
+    write_checkpoint(study, case, epoch=40, age_s=WATCHDOG_STALL_S + 1)
+    write_train_log(study, case, age_s=log_age_s)
+    set_job_elapsed(monkeypatch, study, case, WATCHDOG_MIN_AGE_S + 1)
+
+    study.kill_stuck_jobs([case])
+
+    assert killed == ([study.train_job_name(case, 0)] if is_killed else [])
 
 
 def test_job_absent_from_elapsed_map_not_killed(study, case, killed, monkeypatch):
@@ -108,97 +142,176 @@ def test_job_absent_from_elapsed_map_not_killed(study, case, killed, monkeypatch
     """
     set_job_elapsed(monkeypatch, study, case, None)
 
-    study._kill_stuck_jobs([case])
+    study.kill_stuck_jobs([case])
 
     assert killed == []
 
 
-# ----------------------------------------------------------------------
-# Pending watchdog (Study._kill_long_pending_jobs)
-# ----------------------------------------------------------------------
-def test_pending_job_past_threshold_is_cancelled():
-    """A train job pending WATCHDOG_PENDING_S or longer on a spillover partition gets cancelled.
+def test_latest_checkpoint_epoch_reads_real_checkpoint_layout(study, case):
+    """Checkpoints saved by popsim itself must be visible to latest_checkpoint_epoch.
 
-    Mock get_pending_job_pending_s to return the case's train job name at
-    WATCHDOG_PENDING_S seconds and assert cancel_job is called once with
-    state="PENDING" and the spillover partition string for that job name.
+    The stall watchdog and the launch_train resume counter both read it,
+    so a layout mismatch kills every healthy job and never resets the counter.
+    With max_to_keep 1 and the best loss at epoch 1, the newest checkpoint left is the unvalidated latest one.
     """
+    manager = create_default_checkpoint_manager(study.seed_model_dir(case, 0), max_to_keep=1, checkpoint_format=CHECKPOINT_FORMAT)
+    for epoch, loss in {1: 0.2, 2: 0.9, 3: None}.items():
+        state = TrainState(step=epoch, epoch=epoch, model={"w": jnp.zeros(2)}, opt_state={"dummy": jnp.zeros(1)})
+        save_train_state(state, manager, loss=loss)
 
-
-def test_primary_partition_pending_jobs_are_exempt():
-    """The watchdog only queries and cancels on spillover partitions.
-
-    Both get_pending_job_pending_s and cancel_job must receive the
-    comma-joined config.spillover_partitions (with config.partition filtered
-    out if it appears there), never config.partition, so a job pending on the
-    primary partition keeps its queue position no matter how long it pends.
-    """
-
-
-def test_no_spillover_partitions_disables_watchdog():
-    """With config.spillover_partitions empty the watchdog is a no-op.
-
-    Neither squeue (get_pending_job_pending_s) nor scancel (cancel_job) is
-    called, every job can only be pending on the primary partition.
-    """
-
-
-def test_pending_job_under_threshold_is_left_alone():
-    """A train job pending less than WATCHDOG_PENDING_S is not cancelled.
-
-    Mock the pending map just under the threshold and assert cancel_job is
-    never called.
-    """
-
-
-def test_pending_cancel_refunds_train_attempt():
-    """Cancelling a pending train job decrements train_attempts for the case.
-
-    Seed study.train_attempts[str(case)] = 2, trigger the watchdog, and assert
-    the counter drops to 1. Repeated pending-cancel cycles must never reach
-    MAX_TRAIN_ATTEMPTS, since the job never ran.
-    """
-
-
-def test_pending_refund_does_not_go_negative():
-    """A cancel with no recorded launch attempt leaves the counter at 0.
-
-    Covers the orchestrator-restart path where train_attempts is empty but a
-    pending job from the previous orchestrator process is still in the queue.
-    """
-
-
-def test_agent_pending_cancel_skips_refund():
-    """Cancelling a pending agent job leaves train_attempts untouched.
-
-    Hyperparam case with a pending agent job past the threshold: cancel_job is
-    called for the agent job name but the train attempt counter is unchanged,
-    launch_sweep handles agent top-up on its own.
-    """
-
-
-def test_squeue_failure_skips_pending_watchdog():
-    """When get_pending_job_pending_s returns None nothing is cancelled.
-
-    Scheduler-unreachable must not look like "no pending jobs" and must not
-    trigger any scancel calls.
-    """
+    assert study.latest_checkpoint_epoch(case, 0) == 3
 
 
 # ----------------------------------------------------------------------
-# The slurm_utils helpers both watchdogs drive
+# Pending watchdog (Study._kill_long_pending_jobs, driven through run_unfinished_cases)
 # ----------------------------------------------------------------------
-def test_get_pending_job_pending_s_parses_output():
-    """squeue -O 'PendingTime:20,Name:512' lines parse into {name: seconds}.
+SPILLOVER_PARTITIONS = ("spill_a", "spill_b")
 
-    Mock subprocess.run stdout with padded columns, a blank line, and two
-    entries sharing a name where the larger pending time must win.
+
+@pytest.fixture
+def spillover_study(make_stub_study) -> Study:
+    """The primary partition also listed among the spillover ones, which the watchdog must filter out."""
+    return make_stub_study(
+        [StubCase(name="case.a", hyperparam=True)],
+        study_name="pending_watchdog_test",
+        partition="primary",
+        spillover_partitions=("primary", *SPILLOVER_PARTITIONS),
+    )
+
+
+def run_one_pass(monkeypatch, study: Study, pending: dict[str, int] | None) -> SimpleNamespace:
+    """One run_unfinished_cases pass with the given squeue pending map, the case finishing in it.
+
+    Returns the partitions the pending squeue was asked about and every cancel_job call.
     """
+    calls = SimpleNamespace(pending_queries=[], cancels=[])
+
+    def pending_job_pending_s(partition=None):
+        calls.pending_queries.append(partition)
+        return pending
+
+    def cancel_job(job_name, partition=None, state="RUNNING"):
+        calls.cancels.append((job_name, partition, state))
+
+    def finish_case(case, seed, skip_tuning, enable_parallelism, partition=None):
+        result_path = study.result_path(case)
+        result_path.parent.mkdir(parents=True, exist_ok=True)
+        result_path.touch()
+        return True
+
+    monkeypatch.setattr(study_module, "get_pending_job_pending_s", pending_job_pending_s)
+    monkeypatch.setattr(study_module, "cancel_job", cancel_job)
+    monkeypatch.setattr(study_module, "get_running_job_names", lambda: set())
+    monkeypatch.setattr(study_module, "get_running_job_elapsed_s", lambda partition=None: {})
+    monkeypatch.setattr(study_module, "recent_submitted_jobs", lambda name_prefix, name_suffix: {})
+    monkeypatch.setattr(study_module, "LaunchSlots", open_launch_slots("primary"))
+    monkeypatch.setattr(study_module.time, "sleep", lambda s: None)
+    monkeypatch.setattr(study, "run_case", finish_case)
+    study.run_unfinished_cases(skip_tuning=True, enable_parallelism=True)
+    return calls
 
 
-def test_cancel_job_state_parameter_reaches_scancel():
-    """cancel_job(job, state="PENDING") passes --state=PENDING to scancel.
+@pytest.mark.parametrize(("pending_s", "cancelled"), [(WATCHDOG_PENDING_S, True), (WATCHDOG_PENDING_S - 1, False)])
+def test_spillover_train_job_cancelled_past_threshold(spillover_study, monkeypatch, pending_s, cancelled):
+    """Only the spillover partitions are queried and cancelled on, so a primary-partition job keeps its queue position."""
+    train_job_name = spillover_study.train_job_name(spillover_study.cases[0], 0)
 
-    Default call keeps --state=RUNNING so the stall watchdog behavior is
-    unchanged, and one scancel runs per configured partition.
+    calls = run_one_pass(monkeypatch, spillover_study, {train_job_name: pending_s})
+
+    spillover = ",".join(SPILLOVER_PARTITIONS)
+    assert calls.pending_queries == [spillover]
+    assert calls.cancels == ([(train_job_name, spillover, "PENDING")] if cancelled else [])
+
+
+def test_no_spillover_partitions_disables_watchdog(make_stub_study, monkeypatch):
+    study = make_stub_study([StubCase(name="case.a")], partition="primary", spillover_partitions=())
+    train_job_name = study.train_job_name(study.cases[0], 0)
+
+    calls = run_one_pass(monkeypatch, study, {train_job_name: 10 * WATCHDOG_PENDING_S})
+
+    assert calls.pending_queries == []
+    assert calls.cancels == []
+
+
+@pytest.mark.parametrize(("attempts_before", "attempts_after"), [(2, 1), (None, 0)])
+def test_pending_cancel_refunds_train_attempt(spillover_study, monkeypatch, attempts_before, attempts_after):
+    """A job cancelled while pending never ran, so its launch attempt is refunded, never below 0.
+
+    None is an orchestrator restart, an empty counter facing a job the previous process submitted.
     """
+    train_job_name = spillover_study.train_job_name(spillover_study.cases[0], 0)
+    if attempts_before is not None:
+        spillover_study.train_attempts[train_job_name] = attempts_before
+
+    run_one_pass(monkeypatch, spillover_study, {train_job_name: WATCHDOG_PENDING_S})
+
+    assert spillover_study.train_attempts[train_job_name] == attempts_after
+
+
+def test_agent_pending_cancel_skips_refund(spillover_study, monkeypatch):
+    """launch_sweep tops agents back up on its own, so cancelling a pending agent refunds nothing."""
+    case = spillover_study.cases[0]
+    train_job_name = spillover_study.train_job_name(case, 0)
+    spillover_study.train_attempts[train_job_name] = 2
+    agent_job_name = spillover_study.agent_job_name(case)
+
+    calls = run_one_pass(monkeypatch, spillover_study, {agent_job_name: WATCHDOG_PENDING_S})
+
+    assert calls.cancels == [(agent_job_name, ",".join(SPILLOVER_PARTITIONS), "PENDING")]
+    assert spillover_study.train_attempts[train_job_name] == 2
+
+
+def test_squeue_failure_skips_pending_watchdog(spillover_study, monkeypatch):
+    """An unreachable scheduler must not read as "no pending jobs" and trigger cancels."""
+    calls = run_one_pass(monkeypatch, spillover_study, None)
+
+    assert calls.cancels == []
+
+
+@pytest.fixture
+def slurm_commands(monkeypatch) -> SimpleNamespace:
+    """Record every SLURM command and answer it with the configured stdout."""
+    record = SimpleNamespace(commands=[], stdout="")
+
+    def run(cmd, **kwargs):
+        record.commands.append(cmd)
+        return SimpleNamespace(returncode=0, stdout=record.stdout, stderr="")
+
+    monkeypatch.setattr(slurm_utils.subprocess, "run", run)
+    return record
+
+
+def test_get_pending_job_pending_s_parses_output(slurm_commands):
+    """PendingTime:20,Name:512 columns parse into {name: seconds}, a repeated name keeping its longest wait."""
+    slurm_commands.stdout = "1234                case.a     \n\n50                  agent.b    \n900                 agent.b    \n"
+
+    pending = slurm_utils.get_pending_job_pending_s(partition="spill_a")
+
+    assert pending == {"case.a": 1234, "agent.b": 900}
+
+
+def test_cancel_job_runs_one_scancel_per_partition_in_the_given_state(slurm_commands):
+    """scancel -p takes one partition, a comma list would match nothing while still exiting 0."""
+    slurm_utils.cancel_job("job.a", partition="spill_a,spill_b", state="PENDING")
+    slurm_utils.cancel_job("job.a", partition="spill_a")
+
+    partitions = [cmd[cmd.index("-p") + 1] for cmd in slurm_commands.commands]
+    states = [next(arg for arg in cmd if arg.startswith("--state=")) for cmd in slurm_commands.commands]
+    assert partitions == ["spill_a", "spill_b", "spill_a"]
+    assert states == ["--state=PENDING", "--state=PENDING", "--state=RUNNING"]
+
+
+def test_cpu_capable_job_pending_for_a_gpu_is_cancelled(make_stub_study, monkeypatch):
+    """A case that can also train on CPU stops waiting for a primary GPU past the threshold, so it can be re-placed on CPU.
+
+    A GPU-only case pending there keeps its queue position.
+    """
+    cpu_capable = StubCase(name="case.cpu", model_type="cpu_type")
+    gpu_only = StubCase(name="case.gpu", model_type="gpu_type")
+    study = make_stub_study([cpu_capable, gpu_only], partition="primary", cpu_partition="cpu_primary", gpu_only_model_types=("gpu_type",))
+    pending = {study.train_job_name(case, 0): WATCHDOG_PENDING_S for case in (cpu_capable, gpu_only)}
+
+    calls = run_one_pass(monkeypatch, study, pending)
+
+    assert calls.pending_queries == ["primary"]
+    assert calls.cancels == [(study.train_job_name(cpu_capable, 0), "primary", "PENDING")]

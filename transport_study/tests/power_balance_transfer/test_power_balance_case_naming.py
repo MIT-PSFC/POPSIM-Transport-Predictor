@@ -8,11 +8,8 @@ from pathlib import Path
 
 import pytest
 
-from transport_study import PACKAGE_ROOT
 from transport_study.config import load_config
 from transport_study.power_balance_transfer.power_balance_study import PowerBalanceStudy
-
-SAMPLE_DIR = Path(PACKAGE_ROOT) / "datasets" / "sample"
 
 
 @pytest.fixture
@@ -20,7 +17,7 @@ def loaded_config():
     return load_config(
         PowerBalanceStudy.Config(
             study_name="test-case-naming",
-            dataset_paths={"cmod-low1": SAMPLE_DIR / "cmod-low1.nc", "cmod-high": SAMPLE_DIR / "cmod-high.nc"},
+            dataset_paths={"cmod-low1": Path("path/to/cmod_low1.nc"), "cmod-high": Path("path/to/cmod_high.nc")},
             target_device="cmod-high",
             target_test_set_size=5,
             training_datasets=("cmod-low1",),
@@ -46,8 +43,9 @@ def test_source_trained_case_name(loaded_config):
 
 
 def test_exnihilo_case_name(loaded_config):
-    case = _case(model_type="mlp", training_data="exnihilo", data_normalization="raw", num_target_shots=5)
-    assert str(case) == "case.mlp.td_exnihilo.norm_raw.freeze_True.targ_5"
+    # Unfrozen is the default, so it leaves no freeze token
+    case = _case(model_type="mlp", training_data="exnihilo", data_normalization="raw", freeze_submodules=False, num_target_shots=5)
+    assert str(case) == "case.mlp.td_exnihilo.norm_raw.targ_5"
 
 
 def test_domain_adaptation_case_name(loaded_config):
@@ -55,6 +53,54 @@ def test_domain_adaptation_case_name(loaded_config):
     assert str(case) == "case.sciml-taue-nn.td_cmod-low1.norm_coral.freeze_True.targ_3.da_transfer"
 
 
+def test_target_shot_order_case_name(loaded_config):
+    # The base (ascending) order leaves no token, every other order follows targ_
+    case = _case(domain_adaptation="transfer", num_target_shots=3, target_shot_order="spanning")
+    assert str(case) == "case.sciml-taue-nn.td_cmod-low1.norm_coral.freeze_True.targ_3.order_spanning.da_transfer"
+
+
 def test_cases_are_hashable_and_set_stable(loaded_config):
     assert _case() in {_case()}
     assert hash(_case()) == hash(_case())
+
+
+def test_multiobjective_case_name_and_shared_sweep(loaded_config):
+    """A multiobjective transformer carries mo_True and tunes on the plain transformer's sweep."""
+    case = _case(
+        model_type="transformer",
+        data_normalization="physics",
+        freeze_submodules=False,
+        domain_adaptation="weighted",
+        num_target_shots=3,
+        multiobjective=True,
+    )
+    assert str(case) == "case.transformer.td_cmod-low1.norm_physics.mo_True.targ_3.da_weighted"
+    assert str(case.prereqs[0]) == "case.transformer.td_cmod-low1.norm_physics"
+
+
+def test_sciml_rejects_multiobjective(loaded_config):
+    # The sciml types anchor their submodules regardless, the axis does not apply to them
+    with pytest.raises(ValueError, match=r"sciml-taue-nn ignores .*multiobjective"):
+        _case(multiobjective=True)
+
+
+def test_model_size_case_name_shared_sweep_and_prereq_sizes(loaded_config):
+    """A max-size case carries size_max and tunes on the plain case's sweep.
+    Its p_oh / p_rad prereqs and its pretrain twin take its size, so the whole model is sized.
+    """
+    case = _case(freeze_submodules=False, domain_adaptation="transfer", num_target_shots=3, model_size="max")
+    assert str(case) == "case.sciml-taue-nn.td_cmod-low1.norm_coral.size_max.targ_3.da_transfer"
+    plain_case = case.replace(model_size="sweep")
+    assert case.get_hyperparam_prereq() == plain_case.get_hyperparam_prereq()
+    submodule_prereqs = [prereq for prereq in case.prereqs if prereq.model_type in ("p_oh", "p_rad")]
+    assert [str(prereq) for prereq in submodule_prereqs] == [
+        "case.p_oh.td_cmod-low1.norm_coral.size_max.targ_3.da_transfer",
+        "case.p_rad.td_cmod-low1.norm_coral.size_max.targ_3.da_transfer",
+    ]
+    assert case.transfer_pretrain_case().model_size == "max"
+
+
+def test_scalinglaw_sizes_through_its_submodules(loaded_config):
+    # The scaling law's own coefficients are not a swept net, its p_oh / p_rad nets are
+    case = _case(model_type="sciml-taue-scalinglaw", freeze_submodules=False, model_size="half")
+    assert [prereq.model_size for prereq in case.prereqs if prereq.model_type in ("p_oh", "p_rad")] == ["half", "half"]

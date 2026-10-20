@@ -1,0 +1,351 @@
+"""Tests for the power balance TRB and modules: the training loss (submodule anchor terms), the module outputs,
+and the grouped optimizer (reduced submodule learning rate, no weight decay on the scaling law).
+"""
+
+from pathlib import Path
+
+import equinox as eqx
+import jax
+import jax.numpy as jnp
+import numpy as np
+import pytest
+import xarray as xr
+from popsim.ml.partition import make_partition_by_members
+
+from transport_study.config import StudyConfig, config, load_config
+from transport_study.modules.normalization import InputNormalizer, make_normalizer
+from transport_study.modules.power_balance.module import (
+    SCALING_LAW_FIELDS,
+    PowerBalance,
+    PowerBalanceMLP,
+    PowerBalanceScalingLaw,
+    PowerBalanceSciML,
+    PowerBalanceTransformer,
+    TauePredictorOutputs,
+)
+from transport_study.modules.power_balance.p_oh.module import OhmicPower
+from transport_study.modules.power_balance.p_rad.module import RadiatedPower
+from transport_study.modules.power_balance.trb import PowerBalanceTRB
+from transport_study.modules.trb_utils import (
+    ADAMW_DEFAULTS,
+    make_grouped_exponential_adamw,
+)
+
+##################
+# Loss functions #
+##################
+
+# Unit typical values, so the training residuals keep their plain values
+UNIT_RESIDUAL_SCALES = {device: {"energy_mhd_MJ": 1.0, "power_ohm_MW": 1.0, "power_radiated_MW": 1.0} for device in ("cmod", "mast")}
+BASE_LOSS_CONFIG = {
+    "huber_delta": 0.5,
+    "anchor_weight_power_ohm": 0.1,
+    "anchor_weight_power_radiated": 0.1,
+    "anchor_huber_deltas": {"power_ohm_MW": 0.5, "power_radiated_MW": 0.5},
+    "residual_scales": UNIT_RESIDUAL_SCALES,
+    "device_weights": {},
+}
+
+
+@pytest.fixture
+def loaded_config():
+    """cmod and mast, which the residual scales and device weights are keyed by (ds_source_to_idx sorts them: cmod 0, mast 1)."""
+    return load_config(
+        StudyConfig(
+            study_name="pb_trb_loss_test",
+            dataset_paths={"cmod": Path("unused_a.nc"), "mast": Path("unused_b.nc")},
+            target_device="mast",
+        )
+    )
+
+
+def _huber(residual: float, delta: float) -> float:
+    return 0.5 * residual**2 if abs(residual) <= delta else delta * (abs(residual) - 0.5 * delta)
+
+
+def _make_output(n: int, p_oh: float | None = None, p_rad: float | None = None, energy: float = 1.0) -> PowerBalance.Output:
+    kwargs = {}
+    if p_oh is not None:
+        kwargs["power_ohm_MW_pred"] = jnp.full(n, p_oh)
+    if p_rad is not None:
+        kwargs["power_radiated_MW_pred"] = jnp.full(n, p_rad)
+    return PowerBalance.Output(
+        energy_mhd_MJ_pred=jnp.full(n, energy),
+        P_cond_MW=jnp.ones(n),
+        taue_predictor_output=TauePredictorOutputs(taue_pred=jnp.ones(n), debug_info={}),
+        **kwargs,
+    )
+
+
+def _make_targets(n: int, with_powers: bool = True, ds_source_idx=None) -> dict:
+    if ds_source_idx is None:
+        ds_source_idx = np.zeros(n, dtype=np.float32)
+    targ = {
+        "energy_mhd_MJ": xr.DataArray(np.ones(n, dtype=np.float32)),
+        "fresh_equilibrium": xr.DataArray(np.ones(n, dtype=np.float32)),
+        "ds_source_idx": xr.DataArray(np.asarray(ds_source_idx, dtype=np.float32)),
+    }
+    if with_powers:
+        targ["power_ohm_MW"] = xr.DataArray(np.full(n, 2.0, dtype=np.float32))
+        targ["power_radiated_MW"] = xr.DataArray(np.full(n, 1.0, dtype=np.float32))
+    return targ
+
+
+def test_anchor_terms_enter_train_loss_for_sciml(loaded_config):
+    inst = PowerBalanceTRB.get_loss_fn(BASE_LOSS_CONFIG).instantaneous_loss
+    targ = _make_targets(4)
+
+    loss_match = inst(_make_output(4, p_oh=2.0, p_rad=1.0), targ)
+    loss_drift = inst(_make_output(4, p_oh=5.0, p_rad=1.0), targ)
+
+    # Wtot term is zero (pred == targ), so the difference is exactly the
+    # P_oh anchor: anchor_weight * huber(5 - 2) at the anchor's own delta
+    assert float(loss_match) == 0.0
+    assert np.isclose(float(loss_drift), 0.1 * _huber(3.0, 0.5), atol=1e-6)
+
+
+def test_training_loss_weighs_relative_misses_alike_across_devices(loaded_config):
+    """A 10 percent Wtot miss costs the same training loss on a 0.03 MJ and a 0.6 MJ device,
+    while the validation loss stays the absolute miss [MJ]."""
+    typical_energies = {"cmod": 0.03, "mast": 0.6}
+    residual_scales = {
+        device: {"energy_mhd_MJ": energy, "power_ohm_MW": 1.0, "power_radiated_MW": 1.0} for device, energy in typical_energies.items()
+    }
+    loss_config = {**BASE_LOSS_CONFIG, "residual_scales": residual_scales}
+    train_inst = PowerBalanceTRB.get_loss_fn(loss_config).instantaneous_loss
+    val_inst = PowerBalanceTRB.get_val_loss_fn(loss_config).instantaneous_loss
+
+    train_losses, val_losses = {}, {}
+    for device, energy in typical_energies.items():
+        targ = _make_targets(4, with_powers=False, ds_source_idx=[float(config.ds_source_to_idx[device])] * 4)
+        targ["energy_mhd_MJ"] = xr.DataArray(np.full(4, energy, dtype=np.float32))
+        pred = _make_output(4, energy=1.1 * energy)
+        train_losses[device] = float(train_inst(pred, targ))
+        val_losses[device] = float(val_inst(pred, targ))
+
+    assert np.isclose(train_losses["cmod"], train_losses["mast"], rtol=1e-5)
+    assert np.isclose(val_losses["mast"], 20.0 * val_losses["cmod"], rtol=1e-5)
+
+
+def test_anchor_terms_absent_from_val_loss():
+    inst = PowerBalanceTRB.get_val_loss_fn(BASE_LOSS_CONFIG).instantaneous_loss
+    targ = _make_targets(4)
+
+    loss_match = inst(_make_output(4, p_oh=2.0, p_rad=1.0), targ)
+    loss_drift = inst(_make_output(4, p_oh=5.0, p_rad=4.0), targ)
+
+    assert np.isclose(float(loss_match), float(loss_drift))
+
+
+def test_anchor_terms_noop_without_power_targets(loaded_config):
+    # mlp / transformer target_vars carry no powers, and their Output keeps
+    # the NaN defaults, which must never reach the loss
+    inst = PowerBalanceTRB.get_loss_fn(BASE_LOSS_CONFIG).instantaneous_loss
+    targ = _make_targets(4, with_powers=False)
+
+    loss = inst(_make_output(4), targ)
+
+    assert np.isfinite(float(loss))
+    assert float(loss) == 0.0
+
+
+def test_anchor_weight_zero_disables_term(loaded_config):
+    loss_config = {**BASE_LOSS_CONFIG, "anchor_weight_power_ohm": 0.0, "anchor_weight_power_radiated": 0.0}
+    inst = PowerBalanceTRB.get_loss_fn(loss_config).instantaneous_loss
+    targ = _make_targets(4)
+
+    loss_drift = inst(_make_output(4, p_oh=5.0, p_rad=4.0), targ)
+
+    assert float(loss_drift) == 0.0
+
+
+def test_anchor_terms_respect_device_weights(loaded_config):
+    loss_config = {**BASE_LOSS_CONFIG, "device_weights": {"cmod": 1.0, "mast": 5.0}}
+    inst = PowerBalanceTRB.get_loss_fn(loss_config).instantaneous_loss
+    targ = _make_targets(4, ds_source_idx=[0.0, 0.0, 1.0, 1.0])
+
+    # P_oh anchor error is 1.0 everywhere, so the term is
+    # anchor_weight * mean(sample_weights) * huber(1.0) = 0.1 * mean([1, 1, 5, 5]) * huber(1.0)
+    loss = inst(_make_output(4, p_oh=3.0, p_rad=1.0), targ)
+
+    assert np.isclose(float(loss), 0.1 * 3.0 * _huber(1.0, 0.5), atol=1e-6)
+
+
+##################
+# Module outputs #
+##################
+
+
+def _scalar_inputs() -> InputNormalizer.Inputs:
+    return PowerBalance.Inputs(
+        ip_MA=jnp.asarray(1.0),
+        b_geo=jnp.asarray(5.0),
+        geometric_axis_r=jnp.asarray(1.7),
+        minor_radius=jnp.asarray(0.5),
+        elongation=jnp.asarray(1.7),
+        n_e_line_average_1e20=jnp.asarray(1.5),
+        power_additional_MW=jnp.asarray(2.0),
+        ds_source_idx=jnp.asarray(0),
+    )
+
+
+def _make_submodules() -> tuple[OhmicPower, RadiatedPower]:
+    p_oh = OhmicPower.init(nn_width=4, nn_depth=1, prng_seed=1, normalizer=make_normalizer("raw", None, 1, target_idx=0))
+    p_rad = RadiatedPower.init(nn_width=4, nn_depth=1, prng_seed=2, normalizer=make_normalizer("raw", None, 1, target_idx=0))
+    return p_oh, p_rad
+
+
+def test_structured_outputs_carry_submodule_predictions():
+    p_oh, p_rad = _make_submodules()
+    inputs = _scalar_inputs()
+    state = PowerBalance.State(energy_mhd_MJ=jnp.asarray(0.1))
+
+    expected_p_oh = p_oh(inputs).power_ohm_MW_pred
+    expected_p_rad = p_rad(inputs).power_radiated_MW_pred
+
+    sciml = PowerBalanceSciML.init(
+        nn_width=4,
+        nn_depth=1,
+        p_oh_predictor=p_oh,
+        p_rad_predictor=p_rad,
+        normalizer=make_normalizer("raw", None, 1, target_idx=0),
+        prng_seed=42,
+    )
+    scalinglaw = PowerBalanceScalingLaw.init(p_oh_predictor=p_oh, p_rad_predictor=p_rad)
+    for module in (sciml, scalinglaw):
+        _, output = module(state, inputs)
+        assert np.isclose(float(output.power_ohm_MW_pred), float(expected_p_oh))
+        assert np.isclose(float(output.power_radiated_MW_pred), float(expected_p_rad))
+
+    # The models fed their own Wtot take a normalizer built with_energy
+    energy_normalizer = make_normalizer("zscore", None, 1, target_idx=0, with_energy=True)
+    mlp = PowerBalanceMLP.init(nn_width=4, nn_depth=1, normalizer=energy_normalizer)
+    _, output = mlp(state, inputs)
+    assert np.isnan(float(output.power_ohm_MW_pred))
+    assert np.isnan(float(output.power_radiated_MW_pred))
+
+    transformer_state = PowerBalanceTransformer.State(energy_mhd_MJ=jnp.asarray(0.1), history=jnp.full((4,), 0.1))
+    for predicts_powers in (False, True):
+        transformer = PowerBalanceTransformer.init(
+            d_model=8, num_heads=2, history_len=4, nn_width=4, nn_depth=1, normalizer=energy_normalizer, predicts_powers=predicts_powers
+        )
+        _, output = transformer(transformer_state, inputs)
+        # Only the multiobjective head predicts the powers the training loss anchors
+        assert np.isfinite(float(output.power_ohm_MW_pred)) == predicts_powers
+        assert np.isfinite(float(output.power_radiated_MW_pred)) == predicts_powers
+
+
+def test_mlp_feeds_back_its_predicted_wtot():
+    """The mlp's dW/dt depends on its own state, without that feedback a rollout is an open-loop integrator."""
+    mlp = PowerBalanceMLP.init(nn_width=4, nn_depth=1, normalizer=make_normalizer("raw", None, 1, target_idx=0))
+    inputs = _scalar_inputs()
+
+    state_dot_low, _ = mlp(PowerBalance.State(energy_mhd_MJ=jnp.asarray(0.05)), inputs)
+    state_dot_high, _ = mlp(PowerBalance.State(energy_mhd_MJ=jnp.asarray(0.5)), inputs)
+
+    assert float(state_dot_low.energy_mhd_MJ) != float(state_dot_high.energy_mhd_MJ)
+
+
+#####################
+# Grouped optimizer #
+#####################
+
+
+class FakeSubmodule(eqx.Module):
+    nn: eqx.nn.MLP
+
+
+class FakeModule(eqx.Module):
+    taue_predictor: FakeSubmodule
+    p_oh_predictor: FakeSubmodule
+    p_rad_predictor: FakeSubmodule
+
+
+OPTIMIZER_CONFIG = {
+    "lr0": 1e-3,
+    "lrf_frac": 0.01,
+    "transition_steps": 100,
+    "decay_rate": 0.9,
+    "weight_decay": 0.0,
+    **ADAMW_DEFAULTS,
+    "submodule_lr_factors": {"p_oh_predictor": 0.1, "p_rad_predictor": 0.1},
+}
+
+
+def _make_fake_module() -> FakeModule:
+    k1, k2, k3 = jax.random.split(jax.random.PRNGKey(0), 3)
+    return FakeModule(
+        taue_predictor=FakeSubmodule(eqx.nn.MLP(2, 1, 8, 2, key=k1)),
+        p_oh_predictor=FakeSubmodule(eqx.nn.MLP(2, 1, 8, 2, key=k2)),
+        p_rad_predictor=FakeSubmodule(eqx.nn.MLP(2, 1, 8, 2, key=k3)),
+    )
+
+
+def _first_step_updates(optimizer, trainable):
+    opt_state = optimizer.init(trainable)
+    grads = jax.tree.map(jnp.ones_like, trainable)
+    updates, _ = optimizer.update(grads, opt_state, trainable)
+    return updates
+
+
+def test_grouped_adamw_scales_submodule_updates():
+    # Adam normalizes the first-step update to the learning rate, so the
+    # update ratio between groups is exactly the configured factor
+    trainable, _ = make_partition_by_members(lambda m: m)(_make_fake_module())
+    updates = _first_step_updates(make_grouped_exponential_adamw(OPTIMIZER_CONFIG), trainable)
+
+    u_taue = jnp.abs(updates.taue_predictor.nn.layers[0].weight).mean()
+    for submodule in ("p_oh_predictor", "p_rad_predictor"):
+        u_sub = jnp.abs(getattr(updates, submodule).nn.layers[0].weight).mean()
+        assert np.isclose(float(u_sub / u_taue), 0.1, atol=1e-3)
+
+
+def test_grouped_adamw_falls_back_to_plain_adamw():
+    trainable, _ = make_partition_by_members(lambda m: m)(_make_fake_module())
+
+    # The grouped state is a partition keyed by label, the plain adamw state is not
+    grouped_state = make_grouped_exponential_adamw(OPTIMIZER_CONFIG).init(trainable)
+    assert hasattr(grouped_state, "inner_states")
+
+    for optimizer_config in (
+        {k: v for k, v in OPTIMIZER_CONFIG.items() if k != "submodule_lr_factors"},
+        {**OPTIMIZER_CONFIG, "submodule_lr_factors": {}},
+        {**OPTIMIZER_CONFIG, "submodule_lr_factors": {"p_oh_predictor": 1.0, "p_rad_predictor": 1.0}},
+    ):
+        plain_state = make_grouped_exponential_adamw(optimizer_config).init(trainable)
+        assert not hasattr(plain_state, "inner_states")
+
+
+def test_grouped_adamw_labels_transfer_partition():
+    # Transfer mode trains only last-layer leaves, the rest of the pytree is
+    # None. Path labeling must still find the submodule leaves.
+    model = _make_fake_module()
+    partition_fn = make_partition_by_members(
+        lambda m: [
+            m.taue_predictor.nn.layers[-1].weight,
+            m.p_oh_predictor.nn.layers[-1].weight,
+        ]
+    )
+    trainable, _ = partition_fn(model)
+    updates = _first_step_updates(make_grouped_exponential_adamw(OPTIMIZER_CONFIG), trainable)
+
+    u_taue = jnp.abs(updates.taue_predictor.nn.layers[-1].weight).mean()
+    u_p_oh = jnp.abs(updates.p_oh_predictor.nn.layers[-1].weight).mean()
+    assert np.isclose(float(u_p_oh / u_taue), 0.1, atol=1e-3)
+
+
+def test_scaling_law_coefficients_skip_weight_decay():
+    """With zero gradients the AdamW step is pure weight decay, which the submodule NNs take and the scaling law does not."""
+    p_oh, p_rad = _make_submodules()
+    model = PowerBalanceScalingLaw.init(p_oh_predictor=p_oh, p_rad_predictor=p_rad)
+    trainable, _ = make_partition_by_members(lambda m: m)(model)
+    optimizer = PowerBalanceTRB.get_optimizer({**OPTIMIZER_CONFIG, "weight_decay": 0.1})
+    opt_state = optimizer.init(trainable)
+    zero_grads = jax.tree.map(jnp.zeros_like, trainable)
+
+    updates, _ = optimizer.update(zero_grads, opt_state, trainable)
+
+    for name in SCALING_LAW_FIELDS:
+        scaling_updates = getattr(updates.taue_predictor, name)
+        assert all(float(update) == 0.0 for update in scaling_updates.values())
+    assert float(jnp.abs(updates.p_oh_predictor.nn.layers[0].weight).max()) > 0.0

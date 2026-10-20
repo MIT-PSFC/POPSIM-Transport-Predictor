@@ -9,14 +9,11 @@ from pathlib import Path
 
 import pytest
 
-from transport_study import PACKAGE_ROOT
 from transport_study.config import load_config
 from transport_study.profile_transfer.profile_study import ProfileStudy
 from transport_study.profile_transfer.restore_predictor import (
     checkpoint_to_profile_case,
 )
-
-SAMPLE_DIR = Path(PACKAGE_ROOT) / "datasets" / "sample"
 
 
 @pytest.fixture
@@ -24,7 +21,7 @@ def loaded_config():
     return load_config(
         ProfileStudy.Config(
             study_name="test-case-naming",
-            dataset_paths={"cmod-low1": SAMPLE_DIR / "cmod-low1.nc", "cmod-high": SAMPLE_DIR / "cmod-high.nc"},
+            dataset_paths={"cmod-low1": Path("path/to/cmod_low1.nc"), "cmod-high": Path("path/to/cmod_high.nc")},
             target_device="cmod-high",
             target_test_set_size=5,
             training_datasets=("cmod-low1",),
@@ -54,18 +51,24 @@ def test_exnihilo_case_name(loaded_config):
 
 
 def test_domain_adaptation_case_name(loaded_config):
-    case = _case(model_type="torax-cgm", domain_adaptation="addition", num_target_shots=10)
-    assert str(case) == "case.torax-cgm.td_cmod-low1.norm_physics.freeze_True.geom_circular.targ_10.da_addition"
+    case = _case(model_type="torax-gyrobohm", domain_adaptation="addition", num_target_shots=10)
+    assert str(case) == "case.torax-gyrobohm.td_cmod-low1.norm_physics.freeze_True.geom_circular.targ_10.da_addition"
 
 
 def test_weighted_case_name(loaded_config):
-    """Pin the case-name string for the 'weighted' domain adaptation method.
+    case = _case(data_normalization="physics-coral", domain_adaptation="weighted", num_target_shots=3)
+    assert str(case) == "case.shape-init-pca.td_cmod-low1.norm_physics-coral.freeze_True.geom_circular.targ_3.da_weighted"
 
-    Should test that a case with domain_adaptation='weighted' names as
-    case.{model_type}.td_{td}.norm_{n}.freeze_{f}.geom_{g}.targ_{n}.da_weighted, and that
-    checkpoint_to_profile_case round-trips it (see
-    test_checkpoint_parser_round_trip).
-    """
+
+def test_model_size_case_name(loaded_config):
+    # The base size leaves no token, every other size follows the geom_ token
+    case = _case(domain_adaptation="weighted", num_target_shots=3, model_size="min")
+    assert str(case) == "case.shape-init-pca.td_cmod-low1.norm_physics.freeze_True.geom_circular.size_min.targ_3.da_weighted"
+
+
+def test_target_shot_order_case_name(loaded_config):
+    case = _case(model_type="mlp", training_data="exnihilo", num_target_shots=7, target_shot_order="descending")
+    assert str(case) == "case.mlp.td_exnihilo.norm_physics.freeze_True.geom_circular.targ_7.order_descending"
 
 
 @pytest.mark.parametrize(
@@ -73,7 +76,22 @@ def test_weighted_case_name(loaded_config):
     [
         {},
         {"model_type": "mlp", "training_data": "exnihilo", "num_target_shots": 7},
-        {"model_type": "torax-cgm", "domain_adaptation": "transfer", "num_target_shots": 3},
+        {"model_type": "torax-gyrobohm", "domain_adaptation": "transfer", "num_target_shots": 3},
+        {"data_normalization": "physics-coral", "domain_adaptation": "weighted", "num_target_shots": 3},
+        {"model_type": "torax-qlknn", "geometry_builder": "miller", "domain_adaptation": "addition", "num_target_shots": 1},
+        # Unfrozen shapes leave no freeze token
+        {"freeze_shapes": False},
+        {"freeze_shapes": False, "domain_adaptation": "transfer", "num_target_shots": 3},
+        {"domain_adaptation": "weighted", "num_target_shots": 3, "target_shot_order": "spanning"},
+        {"model_type": "mlp", "training_data": "exnihilo", "num_target_shots": 7, "target_shot_order": "descending"},
+        {"model_size": "max"},
+        {
+            "model_type": "reservoir",
+            "domain_adaptation": "weighted",
+            "num_target_shots": 3,
+            "target_shot_order": "spanning",
+            "model_size": "half",
+        },
     ],
 )
 def test_checkpoint_parser_round_trip(loaded_config, overrides):

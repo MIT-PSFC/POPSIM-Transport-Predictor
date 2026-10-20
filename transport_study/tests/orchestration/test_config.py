@@ -3,7 +3,13 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
-from transport_study.config import StudyConfig, config, load_config
+from transport_study.config import (
+    DEBUG_EPOCHS_PER_VAL,
+    DEBUG_MAX_EPOCHS,
+    StudyConfig,
+    config,
+    load_config,
+)
 
 # Global config reset around each test is handled by the shared conftest fixture
 
@@ -16,6 +22,8 @@ def test_config_load():
     cfg = StudyConfig(
         study_name="test_study",
         debug=True,
+        # Above the debug cap, which the default validation interval already sits under
+        epochs_per_val=20,
         dataset_paths={
             "cmod-low": "path/to/cmod_low.nc",
             "cmod-high": "path/to/cmod_high.nc",
@@ -27,6 +35,10 @@ def test_config_load():
     # After loading, should be able to access config values
     assert config.study_name == "test_study"
     assert config.debug is True
+    # debug caps the epochs, the validation interval and the sweep size
+    assert config.max_epochs == DEBUG_MAX_EPOCHS
+    assert config.epochs_per_val == DEBUG_EPOCHS_PER_VAL
+    assert config.hyperparam_sweeps == 1
 
 
 def test_config_immutable():

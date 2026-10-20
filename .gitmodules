@@ -1,10 +1,9 @@
-[submodule "submodules/disruption-py"]
-	path = submodules/disruption-py
-	url = git@github.com:MIT-PSFC/disruption-py.git
-	branch = zk/popsim
 [submodule "submodules/torax"]
 	path = submodules/torax
-	url = git@github.com:ZanderKeith/torax.git
+	url = git@github.com:google-deepmind/torax.git
 [submodule "submodules/popsim-public"]
 	path = submodules/popsim-public
 	url = git@github.com:MIT-PSFC/POPSIM-Public.git
+[submodule "submodules/transport-validation-datasets"]
+	path = submodules/transport-validation-datasets
+	url = git@github.com:MIT-PSFC/transport-validation-datasets.git

@@ -8,6 +8,7 @@ wiring lives in tests/transport_transfer/.
 
 import copy
 import dataclasses
+from pathlib import Path
 
 import equinox as eqx
 import jax
@@ -15,8 +16,11 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 import xarray as xr
+from popsim.field_labels import partition_discrete_cont, partition_save_no_save
+from popsim.ml.partition import make_partition_by_members
+from transport_validation_datasets.machine.generic import UNIFORM_TIMEBASE_DT
 
-from transport_study import PACKAGE_ROOT
+from transport_study import RADIAL_DIM
 from transport_study.config import RHO_GRID
 from transport_study.modules.normalization import (
     CoralFeatureNormalizer,
@@ -25,6 +29,7 @@ from transport_study.modules.normalization import (
     feature_fit_arrays,
 )
 from transport_study.modules.power_balance.module import (
+    FREEZABLE_SUBMODULES,
     PowerBalance,
     PowerBalanceSciML,
 )
@@ -37,34 +42,41 @@ from transport_study.modules.profile_predictor.module import (
 from transport_study.modules.profile_predictor.torax_module import (
     TAU_REF_S,
     ProfilePredictorTorax,
+    clamp_core_profiles,
 )
 from transport_study.modules.profile_predictor.train_configs import (
     TORAX_CONFIG_BASE,
     TORAX_TRANSPORT_BLOCKS,
 )
 from transport_study.modules.transport_predictor.module import (
+    ABSORPTION_DEPTH_BIAS,
+    MIN_PROFILE,
     MIN_W_MJ,
     N_TRANSPORT_NN_INPUTS,
     NE_SEED_FLOOR_20,
+    PROFILE_LEAK_SLOPE,
     SOURCE_SHAPE_COEFFICIENT_NAMES,
     TE_SEED_FLOOR_KEV,
     TRANSPORT_NN_INPUT_NAMES,
     Inputs,
+    TransportPredictor,
     TransportPredictorEnv,
     TransportPredictorSciML,
     TransportPredictorTorax,
     TransportPredictorToraxBase,
-    TransportPredictorToraxSimState,
+    TransportPredictorToraxCarry,
     TransportPredictorTransformer,
+    energy_mhd_from_profiles,
     make_transport_nn_input_normalizer,
     transport_nn_input_matrix,
-    wtot_from_profiles,
 )
 from transport_study.modules.transport_predictor.train_configs import (
     make_transport_torax_config,
 )
-
-SAMPLE_DIR = PACKAGE_ROOT / "datasets" / "sample"
+from transport_study.modules.transport_predictor.trb import TransportPredictorTRB
+from transport_study.signals import convert_to_working_units
+from transport_study.tests.sample_data import SAMPLE_DIR, requires_sample_data
+from transport_study.transport_transfer.transport_transfer_study import TransportStudy
 
 RHO = np.asarray(RHO_GRID)
 N_RHO = len(RHO)
@@ -80,15 +92,16 @@ TE0 = 2.0 * (1.0 - RHO**2) + 0.05
 TE0[-3:] = 0.0
 
 INPUT_SCALARS = {
-    "Ip_MA": 1.0,
-    "B0": 5.4,
-    "ne20_line_avg": 1.5,
-    "R0": 0.68,
-    "a_minor": 0.22,
-    "kappa": 1.6,
-    "delta_top": 0.35,
-    "delta_bot": 0.45,
-    "P_aux_MW": 2.0,
+    "ip_MA": 1.0,
+    "b0": 5.56,
+    "b_geo": 5.4,
+    "n_e_line_average_1e20": 1.5,
+    "geometric_axis_r": 0.68,
+    "minor_radius": 0.22,
+    "elongation": 1.6,
+    "triangularity_upper": 0.35,
+    "triangularity_lower": 0.45,
+    "power_additional_MW": 2.0,
     "ds_source_idx": 0.0,
 }
 
@@ -96,9 +109,9 @@ INPUT_SCALARS = {
 def make_observations(**overrides) -> xr.Dataset:
     """t0 slice of the state_init_vars the dataloader hands create_state."""
     data = {
-        "ne20_rho": ("rho", NE0.copy()),
-        "Te_keV_rho": ("rho", TE0.copy()),
-        "Wtot_MJ": 0.15,
+        "n_e_1e20": (RADIAL_DIM, NE0.copy()),
+        "t_e_keV": (RADIAL_DIM, TE0.copy()),
+        "energy_mhd_MJ": 0.15,
         **INPUT_SCALARS,
         **overrides,
     }
@@ -123,8 +136,8 @@ def normalizer_leaves(module) -> list:
     return jax.tree_util.tree_leaves(eqx.filter(module.normalizer, eqx.is_array))
 
 
-@pytest.fixture(scope="module")
-def transformer_module() -> TransportPredictorTransformer:
+def fresh_transformer(multiobjective: bool = False) -> TransportPredictorTransformer:
+    """A small transformer as init builds it, its head's last layer zero."""
     return TransportPredictorTransformer.init(
         d_model=D_MODEL,
         num_heads=2,
@@ -132,23 +145,40 @@ def transformer_module() -> TransportPredictorTransformer:
         nn_width=8,
         nn_depth=1,
         rhogrid=RHO,
-        normalizer=make_transport_nn_input_normalizer("physics", None, 2),
+        normalizer=make_transport_nn_input_normalizer("physics", None, 2, target_idx=0),
+        multiobjective=multiobjective,
         prng_seed=0,
     )
 
 
+def with_random_head(module: TransportPredictorTransformer, seed: int = 0) -> TransportPredictorTransformer:
+    """The transformer with a random last head layer in place of its zero init, so its next profile responds to its inputs and history."""
+    key = jax.random.PRNGKey(seed)
+    key_weight, key_bias = jax.random.split(key)
+    last_layer = module.head.layers[-1]
+    weight = 0.1 * jax.random.normal(key_weight, last_layer.weight.shape)
+    bias = 0.1 * jax.random.normal(key_bias, last_layer.bias.shape)
+    return eqx.tree_at(lambda m: (m.head.layers[-1].weight, m.head.layers[-1].bias), module, (weight, bias))
+
+
+@pytest.fixture(scope="module")
+def transformer_module() -> TransportPredictorTransformer:
+    """A transformer as training leaves it, with a non-zero head."""
+    module = fresh_transformer()
+    return with_random_head(module)
+
+
 @pytest.fixture(scope="module")
 def sciml_module() -> TransportPredictorSciML:
-    p_oh = OhmicPower.init(in_size=7, out_size=1, nn_width=4, nn_depth=1, prng_seed=0, normalizer=RawNormalizer())
-    p_rad = RadiatedPower.init(in_size=7, out_size=1, nn_width=4, nn_depth=1, prng_seed=1, normalizer=RawNormalizer())
+    p_oh = OhmicPower.init(nn_width=4, nn_depth=1, prng_seed=0, normalizer=RawNormalizer())
+    p_rad = RadiatedPower.init(nn_width=4, nn_depth=1, prng_seed=1, normalizer=RawNormalizer())
     power_balance = PowerBalanceSciML.init(
-        in_size=7,
-        out_size=1,
         nn_width=4,
         nn_depth=1,
         p_oh_predictor=p_oh,
         p_rad_predictor=p_rad,
         normalizer=RawNormalizer(),
+        prng_seed=42,
     )
     profile_predictor = ProfilePredictorUnstructuredNN(
         nn_width=4,
@@ -168,51 +198,53 @@ def torax_rebuild_module() -> TransportPredictorTorax:
         nn_width=8,
         nn_depth=2,
         prng_seed=0,
-        normalizer=make_transport_nn_input_normalizer("physics", None, 2),
+        normalizer=make_transport_nn_input_normalizer("physics", None, 2, target_idx=0),
         sim_dt=0.001,
         transport_model="constant",
         geometry_builder="circular",
+        delta_exponent=2.0,
     )
 
 
 @pytest.fixture(scope="module")
-def torax_carry_module() -> TransportPredictorToraxSimState:
-    return TransportPredictorToraxSimState.init(
+def torax_carry_module() -> TransportPredictorToraxCarry:
+    return TransportPredictorToraxCarry.init(
         rhogrid=RHO,
-        torax_config=make_transport_torax_config("constant"),
+        torax_config=make_transport_torax_config("constant", "carry"),
         nn_width=8,
         nn_depth=2,
         prng_seed=0,
-        normalizer=make_transport_nn_input_normalizer("physics", None, 2),
+        normalizer=make_transport_nn_input_normalizer("physics", None, 2, target_idx=0),
         sim_dt=0.001,
         transport_model="constant",
         geometry_builder="circular",
+        delta_exponent=2.0,
     )
 
 
 def test_env_create_state_per_model_type(transformer_module, sciml_module, torax_rebuild_module, torax_carry_module):
     """TransportPredictorEnv.create_state seeds the right state per module:
     transformer gets a (history_len, 2 n_rho) buffer tiled from the measured
-    t0 profiles, sciml gets PowerBalance.State with the measured Wtot_MJ,
+    t0 profiles, sciml gets PowerBalance.State with the measured energy_mhd_MJ,
     torax rebuild gets ne/te from the measured profiles, and torax carry gets
-    a full ToraxSimState built from the measured profiles with the edge points
-    pinned to the NN boundary conditions."""
+    cell-grid ne/te/ti with the edge faces pinned to the NN boundary conditions,
+    T_i equal to T_e, and psi from the current-profile formula."""
     obs = make_observations()
 
     # Transformer: whole buffer tiled from the raw measured t0 profiles
-    state_tf = TransportPredictorEnv(module=transformer_module).create_state(obs, obs)
+    state_tf = TransportPredictorEnv(module=transformer_module, domain_adaptation=None).create_state(obs, obs)
     assert isinstance(state_tf, TransportPredictorTransformer.State)
     assert state_tf.profiles.shape == (HISTORY_LEN, 2 * N_RHO)
     row = np.concatenate([NE0, TE0])
     np.testing.assert_array_equal(np.asarray(state_tf.profiles), np.tile(row, (HISTORY_LEN, 1)))
 
     # Sciml: PowerBalance.State seeded with the measured stored energy
-    state_sciml = TransportPredictorEnv(module=sciml_module).create_state(obs, obs)
+    state_sciml = TransportPredictorEnv(module=sciml_module, domain_adaptation=None).create_state(obs, obs)
     assert isinstance(state_sciml, PowerBalance.State)
-    assert float(state_sciml.Wtot_MJ) == pytest.approx(0.15)
+    assert float(state_sciml.energy_mhd_MJ) == pytest.approx(0.15)
 
     # Torax rebuild: measured profiles with the seed floors applied
-    state_rb = TransportPredictorEnv(module=torax_rebuild_module).create_state(obs, obs)
+    state_rb = TransportPredictorEnv(module=torax_rebuild_module, domain_adaptation=None).create_state(obs, obs)
     assert isinstance(state_rb, TransportPredictorTorax.State)
     np.testing.assert_allclose(np.asarray(state_rb.ne), np.maximum(NE0, NE_SEED_FLOOR_20))
     np.testing.assert_allclose(np.asarray(state_rb.te), np.maximum(TE0, TE_SEED_FLOOR_KEV))
@@ -221,45 +253,37 @@ def test_env_create_state_per_model_type(transformer_module, sciml_module, torax
     np.testing.assert_allclose(np.asarray(state_rb.te[-3:]), TE_SEED_FLOOR_KEV)
     np.testing.assert_allclose(np.asarray(state_rb.ne[-1]), NE_SEED_FLOOR_20)
 
-    # Torax carry: full ToraxSimState at t_initial, edge points pinned to the
-    # NN Dirichlet boundary conditions computed from the floored seeds
-    state_carry = TransportPredictorEnv(module=torax_carry_module).create_state(obs, obs)
-    assert isinstance(state_carry, TransportPredictorToraxSimState.State)
-    sim_state, post_processed = state_carry.unwrap()
-    assert sim_state is not None
-    assert post_processed is not None
-    assert float(sim_state.t) == pytest.approx(0.0)
+    # Torax carry: cell values plus both faces, the edge faces pinned to the NN Dirichlet
+    # boundary conditions computed from the floored seeds
+    state_carry = TransportPredictorEnv(module=torax_carry_module, domain_adaptation=None).create_state(obs, obs)
+    assert isinstance(state_carry, TransportPredictorToraxCarry.State)
+    n_cells = len(torax_carry_module.rho_norm_grid)
+    for name in ("ne", "te", "ti"):
+        assert getattr(state_carry, name).shape == (n_cells + 2,)
+    assert state_carry.psi.shape == (n_cells,)
 
     inputs0 = TransportPredictorEnv.create_inputs(obs)
     ne_seed = jnp.maximum(jnp.asarray(NE0), NE_SEED_FLOOR_20)
     te_seed = jnp.maximum(jnp.asarray(TE0), TE_SEED_FLOOR_KEV)
-    wtot0 = wtot_from_profiles(ne_seed, te_seed, jnp.asarray(RHO), inputs0.volume_approx)
+    wtot0 = energy_mhd_from_profiles(ne_seed, te_seed, jnp.asarray(RHO), inputs0.volume_approx)
     coeffs = torax_carry_module.nn_coefficients(inputs0, wtot0)
-    core_profiles = sim_state.core_profiles
-    np.testing.assert_allclose(
-        np.asarray(core_profiles.T_e.right_face_constraint),
-        np.squeeze(np.asarray(coeffs["T_e_right_bc"])),
-        rtol=1e-6,
-    )
-    np.testing.assert_allclose(
-        np.asarray(core_profiles.n_e.right_face_constraint),
-        1e20 * np.squeeze(np.asarray(coeffs["n_e_right_bc"])),
-        rtol=1e-6,
-    )
-    assert np.all(np.isfinite(np.asarray(core_profiles.T_e.value)))
-    assert np.all(np.asarray(core_profiles.T_e.value) > 0.0)
-    assert np.all(np.asarray(core_profiles.n_e.value) > 0.0)
+    np.testing.assert_allclose(float(state_carry.te[-1]), scalar(coeffs["T_e_right_bc"]), rtol=1e-6)
+    np.testing.assert_allclose(float(state_carry.ne[-1]), scalar(coeffs["n_e_right_bc"]), rtol=1e-6)
+    np.testing.assert_array_equal(np.asarray(state_carry.ti), np.asarray(state_carry.te))
+    assert np.all(np.isfinite(np.asarray(state_carry.psi)))
+    assert np.all(np.asarray(state_carry.te) > 0.0)
+    assert np.all(np.asarray(state_carry.ne) > 0.0)
 
 
 def test_env_get_trainable_selections(transformer_module, sciml_module, torax_rebuild_module):
-    """get_trainable never includes normalizer statistics; for transfer it
-    returns only last-layer leaves (transformer head, the three torax MLPs,
-    sciml taue/profile last layers); for sciml with freeze_submodules both
-    submodules drop out of the selection entirely; for the transformer at
-    da=none the selection is exactly feature_embed, profile_embed, pos_embed,
-    attention and head."""
+    """get_trainable never includes normalizer statistics.
+
+    For transfer it returns only last-layer leaves (transformer head, the three torax MLPs, sciml taue/profile last layers).
+    For sciml with freeze_submodules only the p_oh / p_rad predictors drop out, the tau_E network and the profile predictor still train.
+    For the transformer at da=none the selection is exactly feature_embed, profile_embed, pos_embed, attention and head.
+    """
     # Transformer, da=none: exactly the five architecture components
-    sel_tf = TransportPredictorEnv(module=transformer_module, domain_adaptation="none").get_trainable()
+    sel_tf = TransportPredictorEnv(module=transformer_module, domain_adaptation=None).get_trainable()
     assert sorted(sel_tf.keys()) == ["attention", "feature_embed", "head", "pos_embed", "profile_embed"]
     assert leaf_in_selection(sel_tf, transformer_module.pos_embed)
     for leaf in normalizer_leaves(transformer_module):
@@ -286,20 +310,22 @@ def test_env_get_trainable_selections(transformer_module, sciml_module, torax_re
         assert not leaf_in_selection(sel_tx_transfer, leaf)
 
     # Torax, da=none: exactly the three MLPs, normalizer excluded
-    sel_tx = TransportPredictorEnv(module=torax_rebuild_module, domain_adaptation="none").get_trainable()
+    sel_tx = TransportPredictorEnv(module=torax_rebuild_module, domain_adaptation=None).get_trainable()
     assert sorted(sel_tx.keys()) == ["nn_edge", "nn_sources", "nn_transport"]
     for leaf in normalizer_leaves(torax_rebuild_module):
         assert not leaf_in_selection(sel_tx, leaf)
 
-    # Sciml, da=none: both submodule subtrees present, dropped when frozen
-    sel_sciml = TransportPredictorEnv(module=sciml_module, domain_adaptation="none").get_trainable()
+    # Sciml, da=none: both submodule subtrees present, frozen ones keep the tau_E network but drop p_oh / p_rad
+    sel_sciml = TransportPredictorEnv(module=sciml_module, domain_adaptation=None).get_trainable()
     assert sorted(sel_sciml.keys()) == ["power_balance", "profile_predictor"]
+    assert sorted(sel_sciml["power_balance"].keys()) == ["p_oh_predictor", "p_rad_predictor", "taue_predictor"]
     sel_sciml_frozen = TransportPredictorEnv(
         module=sciml_module,
-        domain_adaptation="none",
-        freeze_submodules=["power_balance", "profile_predictor"],
+        domain_adaptation=None,
+        freeze_submodules=list(FREEZABLE_SUBMODULES),
     ).get_trainable()
-    assert sel_sciml_frozen == {}
+    assert sorted(sel_sciml_frozen.keys()) == ["power_balance", "profile_predictor"]
+    assert sorted(sel_sciml_frozen["power_balance"].keys()) == ["taue_predictor"]
 
     # Sciml, transfer: taue / p_oh / p_rad / profile last layers only
     sel_sciml_transfer = TransportPredictorEnv(module=sciml_module, domain_adaptation="transfer").get_trainable()
@@ -321,13 +347,21 @@ def test_env_get_trainable_selections(transformer_module, sciml_module, torax_re
         assert not leaf_in_selection(sel_sciml_transfer, leaf)
         assert not leaf_in_selection(sel_sciml, leaf)
 
-    # Sciml, transfer with both submodules frozen: nothing left to train
+    # Sciml, transfer with frozen p_oh / p_rad: the taue and profile last layers only
     sel_sciml_transfer_frozen = TransportPredictorEnv(
         module=sciml_module,
         domain_adaptation="transfer",
-        freeze_submodules=["power_balance", "profile_predictor"],
+        freeze_submodules=list(FREEZABLE_SUBMODULES),
     ).get_trainable()
-    assert sel_sciml_transfer_frozen == []
+    expected_sciml_frozen = [
+        pb.taue_predictor.nn.layers[-1].weight,
+        pb.taue_predictor.nn.layers[-1].bias,
+        sciml_module.profile_predictor.nn.layers[-1].weight,
+        sciml_module.profile_predictor.nn.layers[-1].bias,
+    ]
+    assert len(sel_sciml_transfer_frozen) == len(expected_sciml_frozen)
+    for want in expected_sciml_frozen:
+        assert leaf_in_selection(sel_sciml_transfer_frozen, want)
 
 
 def test_transformer_position_embedding_orders_history(transformer_module):
@@ -343,7 +377,7 @@ def test_transformer_position_embedding_orders_history(transformer_module):
 
     inputs = make_inputs()
     obs = make_observations()
-    seeded = TransportPredictorEnv(module=transformer_module).create_state(obs, obs)
+    seeded = TransportPredictorEnv(module=transformer_module, domain_adaptation=None).create_state(obs, obs)
     # Nonconstant history, then swap two rows that are NOT the newest one so
     # the current profile (and the features derived from it) stay identical
     profiles = seeded.profiles.at[0].mul(1.2).at[1].mul(0.8)
@@ -355,8 +389,11 @@ def test_transformer_position_embedding_orders_history(transformer_module):
     next_state_perm, output_perm = transformer_module(state_perm, inputs)
     # The reported output (profile at time t) is order-independent by design
     np.testing.assert_array_equal(np.asarray(output.ne), np.asarray(output_perm.ne))
-    # But the predicted next profile must see the history order
-    assert not np.allclose(np.asarray(next_state.profiles[-1]), np.asarray(next_state_perm.profiles[-1]))
+    # But the predicted step must see the history order.
+    # A step is a small change of the profile, so the steps are compared, not the next profiles
+    step = np.asarray(next_state.profiles[-1] - profiles[-1])
+    step_perm = np.asarray(next_state_perm.profiles[-1] - permuted[-1])
+    assert np.max(np.abs(step - step_perm)) > 1e-6 * np.max(np.abs(step))
 
     # Zeroing pos_embed restores permutation invariance, so the position
     # embedding is exactly what breaks it
@@ -379,14 +416,14 @@ def test_transformer_history_holds_profiles_only(transformer_module):
     assert field_names == ["profiles"]
 
     obs = make_observations()
-    state = TransportPredictorEnv(module=transformer_module).create_state(obs, obs)
+    state = TransportPredictorEnv(module=transformer_module, domain_adaptation=None).create_state(obs, obs)
     assert state.profiles.shape == (HISTORY_LEN, 2 * N_RHO)
 
     # The buffer update is a pure shift plus the newest prediction: the rows
     # carried over are byte-identical to the old rows regardless of the
     # current input features, so no feature values ever enter the buffer
-    next_a, _ = transformer_module(state, make_inputs(P_aux_MW=0.0))
-    next_b, _ = transformer_module(state, make_inputs(P_aux_MW=6.0))
+    next_a, _ = transformer_module(state, make_inputs(power_additional_MW=0.0))
+    next_b, _ = transformer_module(state, make_inputs(power_additional_MW=6.0))
     np.testing.assert_array_equal(np.asarray(next_a.profiles[:-1]), np.asarray(state.profiles[1:]))
     np.testing.assert_array_equal(np.asarray(next_b.profiles[:-1]), np.asarray(state.profiles[1:]))
     # Only the newest row responds to the changed features (via the query)
@@ -398,15 +435,136 @@ def test_transformer_history_holds_profiles_only(transformer_module):
     np.testing.assert_array_equal(np.asarray(output.te), np.asarray(next_a.profiles[-1, N_RHO:]))
 
 
+def test_transformer_multiobjective_heads_leave_the_profiles_alone(transformer_module):
+    """The two multiobjective head rows come after the profile changes and the two time scales.
+
+    A multiobjective twin sharing every plain weight, its extra head rows zeroed,
+    steps to the same next profile, reports the profile-implied stored energy and zero ohmic power.
+    The plain transformer reports neither.
+    """
+    multiobjective_module = fresh_transformer(multiobjective=True)
+    plain_arrays, _ = eqx.partition(transformer_module, eqx.is_array)
+    multiobjective_arrays, multiobjective_static = eqx.partition(multiobjective_module, eqx.is_array)
+    plain_leaves = jax.tree_util.tree_leaves(plain_arrays)
+    multiobjective_leaves, multiobjective_treedef = jax.tree_util.tree_flatten(multiobjective_arrays)
+    twin_leaves = []
+    for plain_leaf, multiobjective_leaf in zip(plain_leaves, multiobjective_leaves, strict=True):
+        n_extra_rows = multiobjective_leaf.shape[0] - plain_leaf.shape[0]
+        extra_rows = jnp.zeros((n_extra_rows, *plain_leaf.shape[1:]), dtype=plain_leaf.dtype)
+        twin_leaves.append(jnp.concatenate([plain_leaf, extra_rows]))
+    twin_arrays = jax.tree_util.tree_unflatten(multiobjective_treedef, twin_leaves)
+    twin = eqx.combine(twin_arrays, multiobjective_static)
+
+    obs = make_observations()
+    inputs = make_inputs()
+    state = TransportPredictorEnv(module=transformer_module, domain_adaptation=None).create_state(obs, obs)
+    next_plain, output_plain = transformer_module(state, inputs)
+    next_twin, output_twin = twin(state, inputs)
+
+    np.testing.assert_array_equal(np.asarray(next_twin.profiles), np.asarray(next_plain.profiles))
+    energy_mhd_MJ_profiles = energy_mhd_from_profiles(state.profiles[-1, :N_RHO], state.profiles[-1, N_RHO:], RHO, inputs.volume_approx)
+    assert float(output_twin.energy_mhd_MJ_pred) == pytest.approx(float(energy_mhd_MJ_profiles))
+    assert float(output_twin.power_ohm_MW_pred) == 0.0
+    assert np.isnan(float(output_plain.energy_mhd_MJ_pred))
+    assert np.isnan(float(output_plain.power_ohm_MW_pred))
+
+    # Freshly initialized, the zero head reports the profile-implied stored energy and zero ohmic power
+    _, output_multiobjective = multiobjective_module(state, inputs)
+    assert float(output_multiobjective.energy_mhd_MJ_pred) == pytest.approx(float(energy_mhd_MJ_profiles))
+    assert float(output_multiobjective.power_ohm_MW_pred) == 0.0
+
+
+def test_positive_profiles_leak_below_the_floor():
+    """Identity at and above MIN_PROFILE, slope PROFILE_LEAK_SLOPE below it.
+
+    A point under the floor keeps its gradient, where the hard clip it replaced gave it none.
+    """
+    profile = jnp.array([-1.0, 0.0, 0.5 * MIN_PROFILE, MIN_PROFILE, 0.3, 4.0])
+    ne_floored, te_floored, _ = TransportPredictor.positive_profiles(profile, profile)
+    np.testing.assert_array_equal(np.asarray(ne_floored[3:]), np.asarray(profile[3:]))
+    np.testing.assert_array_equal(np.asarray(te_floored), np.asarray(ne_floored))
+    assert np.all(np.asarray(ne_floored[1:3]) > 0.0)
+
+    def floored_sum(values):
+        floored, _, _ = TransportPredictor.positive_profiles(values, values)
+        return jnp.sum(floored)
+
+    gradient = jax.grad(floored_sum)(profile)
+    np.testing.assert_allclose(np.asarray(gradient), [PROFILE_LEAK_SLOPE] * 3 + [1.0] * 3)
+
+
+def test_transformer_starts_at_persistence_and_steps_by_its_time_scales():
+    """A fresh transformer's zero head leaves the profile unchanged, at both time scales TAU_REF_S.
+
+    A head outputting a change c at every point and log multipliers m_ne, m_te of TAU_REF_S
+    moves each point by UNIFORM_TIMEBASE_DT / (TAU_REF_S exp(m)) x c in its channel.
+    """
+    module = fresh_transformer()
+    # Every seeded point above MIN_PROFILE, where the leaky floor is the identity
+    obs = make_observations(n_e_1e20=(RADIAL_DIM, NE0 + 0.1), t_e_keV=(RADIAL_DIM, TE0 + 0.1))
+    state = TransportPredictorEnv(module=module, domain_adaptation=None).create_state(obs, obs)
+    next_state, output = module(state, make_inputs())
+    np.testing.assert_array_equal(np.asarray(next_state.profiles[-1]), np.asarray(state.profiles[-1]))
+    assert float(output.debug_info["tau_ne_s"]) == pytest.approx(TAU_REF_S)
+    assert float(output.debug_info["tau_te_s"]) == pytest.approx(TAU_REF_S)
+
+    change, log_tau_ne, log_tau_te = 2.0, 0.5, -0.5
+    change_points = jnp.full(2 * N_RHO, change)
+    log_taus = jnp.array([log_tau_ne, log_tau_te])
+    bias = jnp.concatenate([change_points, log_taus])
+    stepping = eqx.tree_at(lambda m: m.head.layers[-1].bias, module, bias)
+    next_stepped, _ = stepping(state, make_inputs())
+    ne_step = UNIFORM_TIMEBASE_DT / (TAU_REF_S * np.exp(log_tau_ne)) * change
+    te_step = UNIFORM_TIMEBASE_DT / (TAU_REF_S * np.exp(log_tau_te)) * change
+    ne_now = np.asarray(state.profiles[-1, :N_RHO])
+    te_now = np.asarray(state.profiles[-1, N_RHO:])
+    np.testing.assert_allclose(np.asarray(next_stepped.profiles[-1, :N_RHO]), ne_now + ne_step, rtol=1e-12)
+    np.testing.assert_allclose(np.asarray(next_stepped.profiles[-1, N_RHO:]), te_now + te_step, rtol=1e-12)
+
+
+@pytest.mark.slow
+def test_torax_inferred_outputs_track_the_state_and_reach_the_transport_network(torax_rebuild_module):
+    """TORAX's stored energy and ohmic power at the current time come from the seeded state's post-processing.
+
+    They are finite and positive, the thermal energy sits near the profile-implied one,
+    and after one step the ohmic power depends on the transport network through the evolved profiles,
+    so a multiobjective anchor trains it.
+    """
+    obs = make_observations()
+    inputs = TransportPredictorEnv.create_inputs(obs)
+    state = TransportPredictorEnv(module=torax_rebuild_module, domain_adaptation=None).create_state(obs, obs)
+    _seeded, initial_post, *_rest, energy_mhd_MJ_profiles = torax_rebuild_module.seed_initial_state(inputs, state.ne, state.te)
+    _next_state, output = torax_rebuild_module(state, inputs)
+
+    energy_mhd_MJ_pred = float(output.energy_mhd_MJ_pred)
+    power_ohm_MW_pred = float(output.power_ohm_MW_pred)
+    assert energy_mhd_MJ_pred == pytest.approx(float(initial_post.W_thermal_total) / 1e6)
+    assert power_ohm_MW_pred == pytest.approx(float(initial_post.P_ohmic_e) / 1e6)
+    assert energy_mhd_MJ_pred > 0.0
+    assert power_ohm_MW_pred > 0.0
+    assert 0.5 < energy_mhd_MJ_pred / float(energy_mhd_MJ_profiles) < 2.0
+    assert np.isnan(float(output.power_radiated_MW_pred))
+
+    def ohmic_power_after_one_step(module):
+        stepped_state, _ = module(state, inputs)
+        _, stepped_output = module(stepped_state, inputs)
+        return stepped_output.power_ohm_MW_pred
+
+    grads = eqx.filter_jit(eqx.filter_grad(ohmic_power_after_one_step))(torax_rebuild_module)
+    transport_leaves = jax.tree_util.tree_leaves(eqx.filter(grads.nn_transport, eqx.is_inexact_array))
+    assert all(bool(jnp.all(jnp.isfinite(leaf))) for leaf in transport_leaves)
+    assert any(bool(jnp.any(leaf != 0.0)) for leaf in transport_leaves)
+
+
 def test_torax_p_aux_feed_through(torax_rebuild_module):
-    """The measured P_aux_MW input is wired directly to the TORAX
-    generic_heat.P_total runtime update (MW to W) for the rebuild variant,
-    the carry variant, and the env's initial TORAX state construction (all
-    three route through TransportPredictorToraxBase.build_provider_and_geo);
-    the sources network predicts only the deposition shape
-    (gaussian_location, gaussian_width, electron_heat_fraction), the
-    gas-puff fueling, and the absorption_fraction, so no NN output can
-    override the measured injected heating magnitude."""
+    """The measured power_additional_MW input is wired directly to the TORAX generic_heat.P_total runtime update (MW to W).
+
+    That holds for the rebuild variant, the carry variant and the env's initial TORAX state construction,
+    all three route through TransportPredictorToraxBase.build_provider_and_geo.
+    The sources network predicts only the deposition shape (gaussian_location, gaussian_width, electron_heat_fraction),
+    the gas-puff fueling and the absorption_fraction,
+    so no NN output can override the measured injected heating magnitude.
+    """
     module = torax_rebuild_module
 
     # The sources network has no heating-magnitude output slot
@@ -423,10 +581,10 @@ def test_torax_p_aux_feed_through(torax_rebuild_module):
     # Rebuild, carry, and the env's initial-state construction all share the
     # base implementation, so the provider-level checks below cover them all
     assert TransportPredictorTorax.build_provider_and_geo is TransportPredictorToraxBase.build_provider_and_geo
-    assert TransportPredictorToraxSimState.build_provider_and_geo is TransportPredictorToraxBase.build_provider_and_geo
+    assert TransportPredictorToraxCarry.build_provider_and_geo is TransportPredictorToraxBase.build_provider_and_geo
 
     for p_aux in (0.0, 2.0, 6.0):
-        inputs = make_inputs(P_aux_MW=p_aux)
+        inputs = make_inputs(power_additional_MW=p_aux)
         coeffs = module.nn_coefficients(inputs, 0.15)
         provider, _geo = module.build_provider_and_geo(inputs, coeffs)
         heat = provider(t=0.0).sources["generic_heat"]
@@ -445,13 +603,16 @@ def test_torax_p_aux_feed_through(torax_rebuild_module):
         assert 0.2 <= scalar(coeffs["electron_heat_fraction"]) <= 0.95
         assert scalar(coeffs["S_total"]) >= 0.0
 
-    # Transport coefficient bounds saturate for any raw network output
+    # Transport coefficient bounds saturate for any raw network output,
+    # dimensionless against the device diffusivity scale chi_ref that a zero output gives
+    minor_radius = make_inputs().minor_radius
+    chi_ref = scalar(module.transport_coefficients(jnp.zeros(4), minor_radius)["chi_i"])
     for raw in (50.0, -50.0):
-        bounded = module.transport_coefficients(jnp.full((4,), raw))
-        assert 0.1 <= scalar(bounded["chi_i"]) <= 5.0
-        assert 0.1 <= scalar(bounded["chi_e"]) <= 10.0
-        assert 0.1 <= scalar(bounded["D_e"]) <= 2.0
-        assert -5.0 <= scalar(bounded["V_e"]) <= 5.0
+        bounded = module.transport_coefficients(jnp.full((4,), raw), minor_radius)
+        for name in ("chi_i", "chi_e", "D_e"):
+            assert 0.1 <= scalar(bounded[name]) / chi_ref <= 10.0, name
+        peaking_rate = scalar(bounded["V_e"]) * minor_radius / scalar(bounded["D_e"])
+        assert -6.0 - 1e-5 <= peaking_rate <= 2.0 + 1e-5
 
     # Perturbing the sources network changes its predictions but can never
     # touch the measured heating magnitude
@@ -467,28 +628,118 @@ def test_torax_p_aux_feed_through(torax_rebuild_module):
     )
     heat = module.build_provider_and_geo(inputs, coeffs)[0](t=0.0).sources["generic_heat"]
     heat_perturbed = perturbed.build_provider_and_geo(inputs, coeffs_perturbed)[0](t=0.0).sources["generic_heat"]
-    np.testing.assert_allclose(np.asarray(heat.P_total), inputs.P_aux_MW * 1e6)
-    np.testing.assert_allclose(np.asarray(heat_perturbed.P_total), inputs.P_aux_MW * 1e6)
+    np.testing.assert_allclose(np.asarray(heat.P_total), inputs.power_additional_MW * 1e6)
+    np.testing.assert_allclose(np.asarray(heat_perturbed.P_total), inputs.power_additional_MW * 1e6)
 
 
 @pytest.mark.slow
 def test_torax_p_aux_change_reaches_one_step_output(torax_rebuild_module):
-    """Changing P_aux_MW changes the one-step evolved profiles with the
+    """Changing power_additional_MW changes the one-step evolved profiles with the
     module weights held fixed, so the measured heating magnitude feeds
     through the whole TORAX solve, not just the runtime params."""
     obs = make_observations()
-    state = TransportPredictorEnv(module=torax_rebuild_module).create_state(obs, obs)
-    next_low, _ = torax_rebuild_module(state, make_inputs(P_aux_MW=0.0))
-    next_high, _ = torax_rebuild_module(state, make_inputs(P_aux_MW=8.0))
+    state = TransportPredictorEnv(module=torax_rebuild_module, domain_adaptation=None).create_state(obs, obs)
+    next_low, _ = torax_rebuild_module(state, make_inputs(power_additional_MW=0.0))
+    next_high, _ = torax_rebuild_module(state, make_inputs(power_additional_MW=8.0))
     assert np.all(np.isfinite(np.asarray(next_low.te)))
     assert np.all(np.isfinite(np.asarray(next_high.te)))
     assert not np.allclose(np.asarray(next_low.te), np.asarray(next_high.te))
 
 
+@pytest.mark.slow
+@pytest.mark.parametrize("transport_model", ["constant", "gyrobohm"])
+def test_torax_rebuild_step_gradients_finite(transport_model):
+    """One rebuild step (initial state built from the carried profiles, checkpointed solver step)
+    gives finite, nonzero gradients for every trainable network."""
+    module = TransportPredictorTorax.init(
+        rhogrid=RHO,
+        torax_config=make_transport_torax_config(transport_model),
+        nn_width=8,
+        nn_depth=2,
+        prng_seed=0,
+        normalizer=make_transport_nn_input_normalizer("physics", None, 2, target_idx=0),
+        sim_dt=0.001,
+        transport_model=transport_model,
+        geometry_builder="miller",
+        delta_exponent=2.0,
+    )
+    obs = make_observations()
+    state = TransportPredictorEnv(module=module, domain_adaptation=None).create_state(obs, obs)
+    inputs = make_inputs()
+
+    def loss(mod):
+        next_state, _output = mod(state, inputs)
+        return jnp.sum(next_state.te) + jnp.sum(next_state.ne)
+
+    value, grads = eqx.filter_jit(eqx.filter_value_and_grad(loss))(module)
+    assert np.isfinite(float(value))
+    for name in ("nn_transport", "nn_sources", "nn_edge"):
+        leaves = jax.tree_util.tree_leaves(eqx.filter(getattr(grads, name), eqx.is_inexact_array))
+        assert all(bool(jnp.all(jnp.isfinite(leaf))) for leaf in leaves), name
+        assert any(bool(jnp.any(leaf != 0.0)) for leaf in leaves), name
+
+
+@pytest.mark.slow
+def test_torax_one_ms_step_matches_fine_substeps():
+    """Twenty carried 1 ms gyrobohm steps match two hundred converged 0.1 ms substeps.
+
+    Pins the transport solver of make_transport_torax_config.
+    The reference runs 4 corrector iterations without Pereverzev whatever the config says:
+    the missing -T dn/dt of a corrector-free step does not shrink with dt, so a self-convergence check would miss it.
+    The transport network outputs zero, the TORAX default BGB coefficients with no pinch.
+    A random init can land on an outward pinch, which no corrector count fixes at 1 ms (ne off by 0.03).
+    Without the corrector Te is off by 0.06 here,
+    and the old linear step with the default Pereverzev is off by 0.20.
+    """
+    converged_solver = {"use_pereverzev": False, "use_predictor_corrector": True, "n_corrector_steps": 4}
+
+    def carried_cell_profiles(sim_dt: float, n_steps: int, solver_overrides: dict) -> tuple[np.ndarray, np.ndarray]:
+        torax_config = make_transport_torax_config("gyrobohm")
+        torax_config["numerics"].update({"t_final": sim_dt, "fixed_dt": sim_dt, "min_dt": sim_dt / 10})
+        torax_config["solver"].update(solver_overrides)
+        module = TransportPredictorTorax.init(
+            rhogrid=jnp.asarray(RHO),
+            torax_config=torax_config,
+            nn_width=8,
+            nn_depth=2,
+            prng_seed=0,
+            normalizer=make_transport_nn_input_normalizer("physics", None, 2, target_idx=0),
+            sim_dt=sim_dt,
+            transport_model="gyrobohm",
+            geometry_builder="circular",
+            delta_exponent=2.0,
+        )
+        module = eqx.tree_at(
+            lambda m: (m.nn_transport.layers[-1].weight, m.nn_transport.layers[-1].bias),
+            module,
+            replace_fn=jnp.zeros_like,
+        )
+        state, post, provider, geo, _ = module.seed_initial_state(make_inputs(), jnp.asarray(NE0), jnp.asarray(TE0))
+
+        @jax.jit
+        def advance(state, post):
+            # Rewind t before each step, as the carried-state module does
+            state = dataclasses.replace(state, t=jnp.zeros_like(state.t))
+            state, post = module.step_fn(state, post, runtime_params_overrides=provider, geo_overrides=geo)
+            return clamp_core_profiles(state), post
+
+        for _ in range(n_steps):
+            state, post = advance(state, post)
+        return np.asarray(state.core_profiles.T_e.value), np.asarray(state.core_profiles.n_e.value)
+
+    te_coarse, ne_coarse = carried_cell_profiles(1e-3, 20, {})
+    te_fine, ne_fine = carried_cell_profiles(1e-4, 200, converged_solver)
+    te_error = np.sqrt(np.mean((te_coarse - te_fine) ** 2)) / np.abs(te_fine).max()
+    ne_error = np.sqrt(np.mean((ne_coarse - ne_fine) ** 2)) / np.abs(ne_fine).max()
+    assert te_error < 0.02
+    assert ne_error < 0.02
+
+
 def test_torax_absorption_fraction_nn(torax_rebuild_module):
     """The transport sources network's last output sets absorption_fraction
-    via the saturating Beer-Lambert form 1 - exp(-ne20_line_avg * softplus(nn
-    output)): always in (0, 1), linear in line density when optically thin,
+    via the saturating Beer-Lambert form 1 - exp(-softplus(nn output) * n_e_line_average_1e20 * a),
+    a dimensionless optical depth per unit line-integrated density:
+    always in (0, 1), linear in line density when optically thin,
     smoothly saturating toward 1 with no gradient-dead cap. The value reaches
     the generic_heat.absorption_fraction runtime update in
     build_provider_and_geo, and the profile predictor's TORAX modules keep
@@ -498,18 +749,18 @@ def test_torax_absorption_fraction_nn(torax_rebuild_module):
 
     # Manual reconstruction of the Beer-Lambert form from the raw network output
     for ne in (0.05, 0.5, 1.5, 5.0):
-        inputs = make_inputs(ne20_line_avg=ne)
+        inputs = make_inputs(n_e_line_average_1e20=ne)
         coeffs = module.nn_coefficients(inputs, wtot)
         nn_inputs = module.normalizer(inputs.transport_nn_inputs(wtot), inputs.ds_source_idx)
-        opacity = jax.nn.softplus(module.nn_sources(nn_inputs)[4:5])
-        expected = 1.0 - jnp.exp(-ne * opacity)
+        opacity = jax.nn.softplus(module.nn_sources(nn_inputs)[4:5] + ABSORPTION_DEPTH_BIAS)
+        expected = 1.0 - jnp.exp(-opacity * ne * inputs.minor_radius)
         np.testing.assert_allclose(np.asarray(coeffs["absorption_fraction"]), np.asarray(expected), rtol=1e-6)
         assert 0.0 < scalar(coeffs["absorption_fraction"]) < 1.0
 
     # Fix the opacity and probe the functional form in line density
     inputs = make_inputs()
     nn_inputs = module.normalizer(inputs.transport_nn_inputs(wtot), inputs.ds_source_idx)
-    opacity = float(jax.nn.softplus(module.nn_sources(nn_inputs)[4]))
+    opacity = float(jax.nn.softplus(module.nn_sources(nn_inputs)[4] + ABSORPTION_DEPTH_BIAS))
     assert opacity > 0.0
 
     def beer_lambert(ne_line):
@@ -542,53 +793,73 @@ def test_torax_absorption_fraction_nn(torax_rebuild_module):
         normalizer=CoralFeatureNormalizer.identity(1, N_NN_INPUTS),
         transport_model="constant",
         geometry_builder="circular",
+        delta_exponent=2.0,
     )
-    profile_inputs = inputs.to_profile_predictor_inputs(rho=jnp.asarray(RHO), betan=1.5)
+    profile_inputs = inputs.to_profile_predictor_inputs(rho=jnp.asarray(RHO), beta_tor_norm=1.5)
     profile_coeffs = profile_module.nn_coefficients(profile_inputs)
     profile_heat = profile_module.build_provider_and_geo(profile_inputs, profile_coeffs)[0](t=0.0).sources["generic_heat"]
     np.testing.assert_allclose(np.asarray(profile_heat.absorption_fraction), 0.9)
 
 
 @pytest.mark.slow
-def test_torax_absorbed_power_matches_absorption_fraction(torax_carry_module):
+def test_torax_absorbed_power_matches_absorption_fraction(torax_rebuild_module):
     """The absorbed power inside TORAX equals P_total * absorption_fraction:
     after one solver step the post-processed generic_heat total is the
     measured P_aux scaled by the NN-predicted absorption fraction."""
     obs = make_observations()
     inputs = TransportPredictorEnv.create_inputs(obs)
-    state = TransportPredictorEnv(module=torax_carry_module).create_state(obs, obs)
+    state, post, provider, geo, energy_mhd_MJ = torax_rebuild_module.seed_initial_state(inputs, jnp.asarray(NE0), jnp.asarray(TE0))
+    coeffs = torax_rebuild_module.nn_coefficients(inputs, energy_mhd_MJ)
 
-    # Recompute the coefficients exactly as __call__ does, from the stored
-    # energy implied by the carried TORAX core profiles
-    core_profiles = state.unwrap()[0].core_profiles
-    rho_cells = jnp.asarray(torax_carry_module.rho_norm_grid)
-    wtot = wtot_from_profiles(
-        core_profiles.n_e.value / 1e20,
-        core_profiles.T_e.value,
-        rho_cells,
-        inputs.volume_approx,
-    )
-    coeffs = torax_carry_module.nn_coefficients(inputs, wtot)
-
-    next_state, _output = torax_carry_module(state, inputs)
-    absorbed = float(np.squeeze(np.asarray(next_state.unwrap()[1].P_aux_generic_total)))
-    expected = float(inputs.P_aux_MW) * 1e6 * float(np.squeeze(np.asarray(coeffs["absorption_fraction"])))
+    _next_state, next_post = torax_rebuild_module.step_fn(state, post, runtime_params_overrides=provider, geo_overrides=geo)
+    absorbed = float(np.squeeze(np.asarray(next_post.P_aux_generic_total)))
+    expected = float(inputs.power_additional_MW) * 1e6 * scalar(coeffs["absorption_fraction"])
     assert absorbed == pytest.approx(expected, rel=1e-3)
 
 
+@pytest.mark.slow
+def test_torax_carry_state_runs_under_popsim_and_evolves_ions_and_current(torax_carry_module):
+    """The carried state survives popsim's state partitions and a jitted rollout step,
+    and keeps the ion temperature and psi that the rebuild variant resets every step.
+
+    A carried TORAX SimState crashed every popsim partition (CellVariable rejects the None-filled halves).
+    """
+    obs = make_observations()
+    inputs = make_inputs()
+    state0 = TransportPredictorEnv(module=torax_carry_module, domain_adaptation=None).create_state(obs, obs)
+    partition_discrete_cont(state0)
+    partition_save_no_save(state0)
+
+    step = eqx.filter_jit(lambda module, state: _rollout_step(module, state, inputs))
+    state1 = step(torax_carry_module, state0)
+    state2 = step(torax_carry_module, state1)
+    for name in ("ne", "te", "ti", "psi"):
+        assert np.all(np.isfinite(np.asarray(getattr(state2, name)))), name
+    # T_i starts equal to T_e and then evolves on its own, psi evolves with the current
+    assert not np.allclose(np.asarray(state2.ti), np.asarray(state2.te))
+    assert not np.allclose(np.asarray(state2.psi), np.asarray(state0.psi))
+
+
+def _rollout_step(module: TransportPredictorToraxCarry, state, inputs: Inputs):
+    """One popsim simple-Euler step of a discrete-state module, whose next state is the module output."""
+    discrete_next, _continuous = partition_discrete_cont(module(state, inputs)[0])
+    return discrete_next
+
+
+@requires_sample_data
 def test_normalizer_fit_features():
     """make_transport_nn_input_normalizer builds an (N, 11) feature matrix
     whose columns match Inputs.transport_nn_inputs evaluated with the
-    measured Wtot_MJ, drops rows with NaN device index, and returns identity
-    stats for devices with too few samples."""
+    measured energy_mhd_MJ, drops rows with NaN device index,
+    and aligns the populated device to the few-shot target under physics-coral."""
     assert N_TRANSPORT_NN_INPUTS == 11
     assert len(TRANSPORT_NN_INPUT_NAMES) == N_TRANSPORT_NN_INPUTS
     assert TRANSPORT_NN_INPUT_NAMES[-1] == "paux_norm"
 
-    ds = xr.open_dataset(SAMPLE_DIR / "cmod-low1.nc").isel(shot=slice(0, 40), time_idx=slice(0, 600, 3))
-    ds["P_aux_MW"] = sum(ds[var].fillna(0.0) for var in ("P_NBI_MW", "P_ICRF_MW", "P_ECRH_MW", "P_LH_MW"))
+    ds_sample = xr.open_dataset(SAMPLE_DIR / "cmod-low1.nc").isel(shot=slice(0, 40), time_idx=slice(0, 600, 3))
+    ds = convert_to_working_units(ds_sample)
     source_idx_per_shot = np.zeros(ds.sizes["shot"])
-    source_idx_per_shot[30:35] = 1.0  # a device with too few shots for CORAL
+    source_idx_per_shot[30:35] = 1.0  # the target, too few shots for a CORAL source but enough as the reference
     source_idx_per_shot[35:] = np.nan  # unattributed shots (NaN-padded concat)
     ds["ds_source_idx"] = ("shot", source_idx_per_shot)
     n_devices = 3  # device 2 is registered but absent from the fit data
@@ -599,26 +870,37 @@ def test_normalizer_fit_features():
 
     # Columns match Inputs.transport_nn_inputs evaluated with the MEASURED
     # stored energy, checked on one complete flattened row
-    reference = ds["Ip_MA"]
+    reference = ds["ip_MA"]
 
     def flat(var: str) -> np.ndarray:
         return np.asarray(ds[var].broadcast_like(reference).values, dtype=float).ravel()
 
-    source_vars = ("Ip_MA", "B0", "ne20_line_avg", "R0", "a_minor", "kappa", "delta_top", "delta_bot", "P_aux_MW")
-    columns = {var: flat(var) for var in (*source_vars, "Wtot_MJ")}
+    source_vars = (
+        "ip_MA",
+        "b0",
+        "b_geo",
+        "n_e_line_average_1e20",
+        "geometric_axis_r",
+        "minor_radius",
+        "elongation",
+        "triangularity_upper",
+        "triangularity_lower",
+        "power_additional_MW",
+    )
+    columns = {var: flat(var) for var in (*source_vars, "energy_mhd_MJ")}
     stacked = np.column_stack(list(columns.values()))
     row = int(np.argmax(~np.isnan(stacked).any(axis=1)))
     assert not np.isnan(stacked[row]).any()
     scalar_inputs = Inputs(**{var: columns[var][row] for var in source_vars}, ds_source_idx=0.0)
     np.testing.assert_allclose(
-        np.asarray(scalar_inputs.transport_nn_inputs(columns["Wtot_MJ"][row])),
+        np.asarray(scalar_inputs.transport_nn_inputs(columns["energy_mhd_MJ"][row])),
         matrix[row],
         rtol=1e-6,
     )
     # The aux power slot is the dimensionless TAU_REF_S * P_aux / Wtot scale,
     # log1p compressed so a near-zero stored energy cannot send it out of
     # distribution (P_aux = 0 still maps to exactly 0)
-    expected_paux_norm = np.log1p(TAU_REF_S * columns["P_aux_MW"] / np.maximum(columns["Wtot_MJ"], MIN_W_MJ))
+    expected_paux_norm = np.log1p(TAU_REF_S * columns["power_additional_MW"] / np.maximum(columns["energy_mhd_MJ"], MIN_W_MJ))
     np.testing.assert_allclose(matrix[:, -1], expected_paux_norm, rtol=1e-6, equal_nan=True)
 
     # Rows with a NaN device index are dropped before fitting
@@ -628,21 +910,21 @@ def test_normalizer_fit_features():
     assert not np.isnan(source_idx).any()
     assert set(np.unique(source_idx)) == {0, 1}
 
-    # physics-coral: the well-populated device gets fitted stats, the
-    # low-shot device and the absent device keep identity rows
-    normalizer = make_transport_nn_input_normalizer("physics-coral", ds, n_devices)
+    # physics-coral aligns to the target, device 1 (its few shots are enough for the reference).
+    # The well-populated device gets fitted stats, the target and the absent device keep identity rows
+    normalizer = make_transport_nn_input_normalizer("physics-coral", ds, n_devices, target_idx=1)
     assert isinstance(normalizer, CoralFeatureNormalizer)
     eye = np.eye(N_TRANSPORT_NN_INPUTS)
     assert not np.allclose(np.asarray(normalizer.transforms[0]), eye)
     complete = ~np.isnan(features).any(axis=1)
     device0 = complete & (source_idx == 0)
     np.testing.assert_allclose(np.asarray(normalizer.means[0]), features[device0].mean(axis=0), rtol=1e-6)
-    for low_count_device in (1, 2):
-        np.testing.assert_array_equal(np.asarray(normalizer.transforms[low_count_device]), eye)
-        np.testing.assert_array_equal(np.asarray(normalizer.means[low_count_device]), 0.0)
+    for identity_device in (1, 2):
+        np.testing.assert_array_equal(np.asarray(normalizer.transforms[identity_device]), eye)
+        np.testing.assert_array_equal(np.asarray(normalizer.means[identity_device]), 0.0)
 
     # physics-zscore: fitted for present devices, identity for the absent one
-    zscore = make_transport_nn_input_normalizer("physics-zscore", ds, n_devices)
+    zscore = make_transport_nn_input_normalizer("physics-zscore", ds, n_devices, target_idx=1)
     assert isinstance(zscore, ZScoreFeatureNormalizer)
     assert not np.allclose(np.asarray(zscore.means[0]), 0.0)
     np.testing.assert_array_equal(np.asarray(zscore.means[2]), 0.0)
@@ -651,12 +933,44 @@ def test_normalizer_fit_features():
     # physics keeps identity buffers, and fit_ds None yields identity stats
     # with the checkpoint's pytree structure
     for identity_normalizer in (
-        make_transport_nn_input_normalizer("physics", ds, n_devices),
-        make_transport_nn_input_normalizer("physics-coral", None, n_devices),
+        make_transport_nn_input_normalizer("physics", ds, n_devices, target_idx=1),
+        make_transport_nn_input_normalizer("physics-coral", None, n_devices, target_idx=1),
     ):
         assert isinstance(identity_normalizer, CoralFeatureNormalizer)
         np.testing.assert_array_equal(
             np.asarray(identity_normalizer.transforms),
             np.tile(eye, (n_devices, 1, 1)),
         )
-    assert isinstance(make_transport_nn_input_normalizer("physics-zscore", None, n_devices), ZScoreFeatureNormalizer)
+    assert isinstance(make_transport_nn_input_normalizer("physics-zscore", None, n_devices, target_idx=1), ZScoreFeatureNormalizer)
+
+
+def test_sciml_power_balance_subtree_runs_at_the_submodule_lr(sciml_module, tmp_path):
+    """The study's submodule_lr_factors keys must name the sciml pytree paths, or the subtree silently trains at the full rate.
+
+    Adam normalizes the first-step update to the learning rate, so the update ratio between the groups is the factor.
+    """
+    study = TransportStudy(
+        TransportStudy.Config(
+            study_name="test-sciml-lr-groups",
+            working_dir_base=tmp_path,
+            dataset_paths={"cmod": Path("path/to/cmod.zarr"), "mast": Path("path/to/mast.zarr")},
+            target_device="mast",
+            target_test_set_size=1,
+            training_datasets=("cmod",),
+        )
+    )
+    optimizer_config = study.base_optimizer_config()
+    optimizer = TransportPredictorTRB.get_optimizer(optimizer_config)
+    trainable, _ = make_partition_by_members(lambda module: module)(sciml_module)
+
+    grads = jax.tree.map(jnp.ones_like, trainable)
+    updates, _ = optimizer.update(grads, optimizer.init(trainable), trainable)
+
+    update_sizes = {"power_balance": [], "profile_predictor": []}
+    for path, leaf in jax.tree_util.tree_leaves_with_path(updates):
+        path_str = jax.tree_util.keystr(path)
+        for group, sizes in update_sizes.items():
+            if f".{group}" in path_str:
+                sizes.append(float(jnp.abs(leaf).mean()))
+    update_ratio = np.mean(update_sizes["power_balance"]) / np.mean(update_sizes["profile_predictor"])
+    assert update_ratio == pytest.approx(optimizer_config["submodule_lr_factors"]["power_balance"], rel=1e-2)

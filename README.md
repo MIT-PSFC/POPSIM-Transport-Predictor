@@ -38,7 +38,7 @@ To answer this question, for each model we do training with an increasing number
 ### 4: How should we be normalizing our input features?
 
 The raw input features (plasma current, toroidal field, major and minor radii, etc.) from different devices are wildly different, which can be problematic for data-driven models. There are many ways to process the input features to maintain the same dimensionality but have better domain overlap, and we will compare the results for the following:
-- Raw: No normalization. Ip, Wtot, R0, a_minor, etc. are in their original units
+- Raw: No normalization. Ip, Wtot, R_geo, a_minor, etc. are in their original units
 - Physics: Convert to dimensionless parameters like q95, betan, epsilon, etc.
 - Z-Score: Within each device, normalize each variable to zero mean and unit variance.
 - CORAL: Correlation alignment algorithm (https://arxiv.org/abs/1612.01939) to align the covariances of source and target domains
@@ -54,7 +54,7 @@ Many methods exist to take a data-driven model trained in one domain and adapt i
 
 Time-dependent stored energy prediction. Given the present timestep's stored energy and controllable input signals, predict the change in stored energy to the next timestep.
 
-The input signals are Ip_MA, B0, ne20, P_aux_MW, and shaping (R0, a_minor, kappa).
+The input signals are Ip_MA, B_geo, ne20, P_aux_MW, and shaping (R_geo, a_minor, kappa).
 These signals were chosen since they are present in the H89/H98 scaling laws which we are comparing against.
 
 Four model architectures investigated:
@@ -71,7 +71,7 @@ We also compare the different data normalization methods, where normalization is
 
 ## Study 2: Time-independent profile prediction
 
-For this study, the inputs are Ip_MA, B0, ne20, beta, and shaping (R0, a_minor, kappa, delta_top, delta_bot).
+For this study, the inputs are Ip_MA, B_geo, ne20, beta, and shaping (R_geo, a_minor, kappa, delta_top, delta_bot).
 This is similar to the plasma control system setup you might see on a present-day experimental device like DIII-D.
 Feedforward targets are given for each of the above quantities, so you have a reasonably good idea of what they will be in the future.
 The goal of the model is then to predict what the 1D profiles of temperature and density will be for a given set of inputs.
@@ -92,14 +92,12 @@ TODO(ZanderKeith)
 
 # Repo Organization:
 
-For robots, see `CLAUDE.md`.
-
-For humans, read on. (or check out `.ua/`)
+For robots, see `CLAUDE.md`. For humans, read on.
 
 ## `transport_study/datasets`
 
-Creation of the datasets for C-Mod, MAST, DIII-D, and TCV.
-There's a general `DataWorkflow` class which organizes the steps in making these datasets, however running it for a particular machine requires data access.
+Creation of the study datasets for C-Mod, MAST, DIII-D, and TCV.
+Every device is built by [transport-validation-datasets](https://github.com/MIT-PSFC/transport-validation-datasets), and `StoreWorkflow` here only selects the signals the studies read from its store, so running it needs the device's transport-validation-datasets store.
 
 MAST is publicly hosted so anyone can create the dataset for that device.
 In the near future `TODO(ZanderKeith)` I will be releasing the full C-Mod and MAST datasets used in the studies presented at ICDDPS 2026.
@@ -130,12 +128,12 @@ This was briefly attempted on DIII-D in March 2026, though results were inconclu
 
 I am not completely satisfied with how things are set up right now. The workflows are a consequence of my development environment and as such might be tricky to adapt. I've attempted to make the structure general where possible, but as it stands this is a project I made to facilitate my own work on a tight schedule. This whole thing could be iterated upon to smooth out the sharp edges, I simply do not have the bandwidth to do so. I'm still going ahead and releasing this on the off chance someone finds it useful. If you do, please cite the [POPSIM Repo](https://github.com/MIT-PSFC/POPSIM-Public) and its related [arXiv publication](https://arxiv.org/abs/2509.10244).
 
-I run the dataset creation on a local workstation, where it has access to C-Mod/DIII-D/TCV data (private) and MAST data (public). However, this workstation is too small to do the computationally intensive GP fitting routines for C-Mod and MAST. To get around this, it packages the raw TS data, ships it off to a remote cluster with srunx, and pulls back the results for assembly.
+Every dataset is built by [transport-validation-datasets](https://github.com/MIT-PSFC/transport-validation-datasets), which is where the computationally intensive GP fitting of the C-Mod, MAST and TCV Thomson scattering data lives. The C-Mod and MAST studies read its published stores, TCV and DIII-D its internal ones (no release permission). DIII-D is pulled on OMEGA, which has the DIII-D data servers and the IDA profile database, and TCV from the DEFUSE exports and LIUQE databases on the PSFC NFS.
 
 I run the training orchestration on an interactive node on a compute cluster (either Engaging or OMEGA). This is convenient for testing because whenever something breaks I can just run the study serially to step through the logic with a debugger.
 
-For installation, a simple `uv sync` should work. However, there might be some finagling you have to do to get the GPU dependencies to function. (For the ORCD cluster in particular, the required dependency can be installed with `uv sync --group gpu-orcd`.) I think this is a symptom of POPSIM having an older JAX dependency. I will get around to fixing that at some point in the future.
+For installation, run `git submodule update --init` (popsim, torax and transport-validation-datasets install from their submodules), then a simple `uv sync` should work, and `uv sync --group gpu` adds the CUDA 13 JAX plugin for GPU nodes. With that plugin installed, anything that imports JAX hangs on a node without a GPU unless `JAX_PLATFORMS=cpu` is set (the test suite's conftest sets it automatically).
 
 # Generative AI Disclosure
 
-GitHub Copilot and Claude Code were used for code completion, snippet generation, and code review. However, the results of this were carefully vetted. A human has read and understands every line in this repo (except for plots, which were fully vibe coded).
+Github Copilot and Claude Code were used for code completion, snippet generation, and refactoring. However, the results of this were carefully vetted. Plots were entirely vibe-coded, but critical functionality (primarily related to data integrity and the training pipeline) has been hand-reviewed by a human.

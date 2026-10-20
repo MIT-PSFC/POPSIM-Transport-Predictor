@@ -5,5 +5,5 @@ from transport_study.modules.power_balance.scalar_power_trb import ScalarPowerTR
 class OhmicPowerTRB(ScalarPowerTRB):
     """TrainRunBuilder for the ohmic power predictor used in transfer learning"""
 
-    SIGNAL = "P_oh_MW"
+    SIGNAL = "power_ohm_MW"
     MODULE_CLS = OhmicPower

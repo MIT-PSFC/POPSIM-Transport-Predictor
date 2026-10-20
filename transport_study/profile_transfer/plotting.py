@@ -1,19 +1,13 @@
-"""Case-comparison figures for profile transfer study results.
+"""Case-comparison figures of profile transfer study results (see orchestration.comparison_figures).
 
-All figures share one layout: a grid with one row per performance metric
-(value / gradient / combined, see study_metrics) and one column per shot stage
-(rampup, flattop, flattop ohmic, flattop aux, rampdown, all), with the number
-of target-device shots included in training on a semilog x axis. Each family
-draws one line per member of the comparison (model type, training dataset,
-data normalization, domain adaptation method, geometry builder, or
-freeze_shapes difference) and one figure per combination of the remaining
-case dimensions.
-
-The num_target_shots = -1 sentinel (all target shots in training, the cheating
-reference) has no x position: it is drawn as a dashed horizontal line in the
-series color.
+A grid with one row per chi metric (value / gradient / combined, see study_metrics)
+and one column per shot stage (all, rampup, flattop, flattop ohmic, flattop aux, rampdown),
+each line the seed mean with the seed std as its error bar.
+Consumes the stage-resolved collected metrics (collected_metrics.nc, dims case_idx x stage).
+freeze_shapes_comparison plots the frozen - unfrozen difference on the same grid.
 """
 
+from itertools import product
 from pathlib import Path
 
 import matplotlib.pyplot as plt
@@ -21,13 +15,32 @@ import numpy as np
 import xarray as xr
 from loguru import logger
 
-from transport_study.plot_style import BACKGROUND_COLOR, TEXT_COLOR, style_axis
-from transport_study.profile_transfer.study_metrics import METRIC_NAMES, STAGE_AGG_NAMES
-
-TITLE_FONTSIZE = 14
-LABEL_FONTSIZE = 11
-TICK_FONTSIZE = 9
-LEGEND_FONTSIZE = 10
+from transport_study.modules.profile_predictor.module import MODEL_TYPES_WITH_SHAPES
+from transport_study.modules.profile_predictor.torax_module import TORAX_MODEL_TYPES
+from transport_study.orchestration.comparison_figures import (
+    DA_COLORS,
+    DA_LABELS,
+    DIVERGED_THRESHOLD,
+    MODEL_SIZE_COLORS,
+    MODEL_SIZE_LABELS,
+    NORM_COLORS,
+    NORM_LABELS,
+    ORDER_COLORS,
+    ORDER_LABELS,
+    ORDER_MARKERS,
+    STAGE_LABELS,
+    TD_COLORS,
+    TD_LABELS,
+    ComparisonFamily,
+    ComparisonLayout,
+    coord_values,
+    finalize_grid,
+    grid_figure,
+    mask_select,
+    stage_series_stats,
+)
+from transport_study.orchestration.stages import STAGE_AGG_NAMES
+from transport_study.plot_style import LABEL_FONTSIZE, TEXT_COLOR
 
 MODEL_COLORS = {
     "shape-init-pca": "#0095ff",
@@ -35,7 +48,6 @@ MODEL_COLORS = {
     "mlp": "#ff4d4d",
     "reservoir": "#ffb347",
     "torax-constant": "#8dff36",
-    "torax-cgm": "#2fbf71",
     "torax-gyrobohm": "#b4ff9e",
     "torax-qlknn": "#0e8a5f",
 }
@@ -46,29 +58,8 @@ MODEL_LABELS = {
     "mlp": "MLP",
     "reservoir": "Reservoir",
     "torax-constant": "TORAX constant",
-    "torax-cgm": "TORAX CGM",
     "torax-gyrobohm": "TORAX GyroBohm",
     "torax-qlknn": "TORAX QLKNN",
-}
-
-DA_COLORS = {
-    "none": "#c0c0c0",
-    "weighted": "#ad2cfe",
-    "addition": "#ff2ea6",
-    "transfer": "#00ff5e",
-    "transfer_pretrain": "#00a33c",
-}
-
-NORM_COLORS = {
-    "physics": "#8dff36",
-    "physics-coral": "#ffb52e",
-    "physics-zscore": "#0095ff",
-}
-
-NORM_LABELS = {
-    "physics": "Physics",
-    "physics-coral": "Physics CORAL",
-    "physics-zscore": "Physics z-score",
 }
 
 GEOM_COLORS = {
@@ -81,153 +72,65 @@ GEOM_LABELS = {
     "miller": "Miller",
 }
 
-DA_LABELS = {
-    "none": "No adaptation",
-    "weighted": "Weighted",
-    "addition": "Addition",
-    "transfer": "Transfer",
-    "transfer_pretrain": "Transfer pretrain",
-}
-
+# Rows of the comparison grids, the chi metrics (the diverged fraction is a table column only)
 METRIC_LABELS = {
     "value": "Value loss",
     "grad": "Gradient loss",
     "combined": "Combined loss",
 }
 
-STAGE_LABELS = {
-    "all": "All",
-    "rampup": "Rampup",
-    "flattop": "Flattop",
-    "flattop_ohmic": "Flattop (ohmic)",
-    "flattop_aux": "Flattop (aux)",
-    "rampdown": "Rampdown",
-}
+LAYOUT = ComparisonLayout(
+    row_labels=METRIC_LABELS,
+    col_labels={stage: STAGE_LABELS[stage] for stage in STAGE_AGG_NAMES},
+    cell_size=(3.4, 2.9),
+    series_stats=stage_series_stats,
+    grid_fields=(
+        "model_type",
+        "training_data",
+        "data_normalization",
+        "domain_adaptation",
+        "freeze_shapes",
+        "geometry_builder",
+        "target_shot_order",
+        "model_size",
+    ),
+    field_tokens={
+        "model_type": "{}",
+        "training_data": "td_{}",
+        "data_normalization": "norm_{}",
+        "domain_adaptation": "da_{}",
+        "freeze_shapes": "freeze_{}",
+        "geometry_builder": "geom_{}",
+        "target_shot_order": "order_{}",
+        "model_size": "size_{}",
+    },
+    value_labels={
+        "model_type": MODEL_LABELS,
+        "training_data": TD_LABELS,
+        "data_normalization": NORM_LABELS,
+        "domain_adaptation": DA_LABELS,
+        "geometry_builder": GEOM_LABELS,
+        "target_shot_order": ORDER_LABELS,
+        "model_size": MODEL_SIZE_LABELS,
+    },
+)
 
-# Metric value above which a case is treated as diverged and masked out
-DIVERGED_THRESHOLD = 1e3
-
-# Model families with shape bases that can be frozen or trained
-MODELS_WITH_SHAPES = ("shape-init-pca", "shape-init-kmeans", "torax-constant", "torax-cgm", "torax-gyrobohm", "torax-qlknn")
-
-
-def _training_data_colors(training_datasets: list[str]) -> dict[str, tuple]:
-    cmap = plt.colormaps["tab10"].resampled(max(len(training_datasets), 1))
-    return {td: cmap(i) for i, td in enumerate(sorted(training_datasets))}
-
-
-def _mask_select(ds: xr.Dataset, mask) -> xr.Dataset:
-    return ds.isel(case_idx=np.asarray(mask))
-
-
-def _grid_figure() -> tuple[plt.Figure, np.ndarray]:
-    n_rows, n_cols = len(METRIC_NAMES), len(STAGE_AGG_NAMES)
-    fig, axes = plt.subplots(
-        n_rows,
-        n_cols,
-        figsize=(3.4 * n_cols, 2.9 * n_rows),
-        sharex=True,
-        squeeze=False,
-    )
-    fig.patch.set_facecolor(BACKGROUND_COLOR)
-    for row, metric in enumerate(METRIC_NAMES):
-        for col, stage in enumerate(STAGE_AGG_NAMES):
-            ax = axes[row, col]
-            style_axis(ax, TICK_FONTSIZE)
-            if row == 0:
-                ax.set_title(STAGE_LABELS[stage], color=TEXT_COLOR, fontsize=LABEL_FONTSIZE)
-            if col == 0:
-                ax.set_ylabel(METRIC_LABELS[metric], color=TEXT_COLOR, fontsize=LABEL_FONTSIZE)
-            if row == len(METRIC_NAMES) - 1:
-                ax.set_xlabel("Target shots in training", color=TEXT_COLOR, fontsize=LABEL_FONTSIZE)
-    return fig, axes
-
-
-def _plot_series(ax, sub: xr.Dataset, stage: str, metric: str, color, label: str, linestyle: str = "-") -> bool:
-    """One comparison member on one axis: errorbar line over num_target_shots >= 0,
-    plus a dashed horizontal reference for the -1 (all target shots) sentinel.
-    Returns whether anything was drawn."""
-    stage_sub = sub.sel(stage=stage)
-    shots = np.atleast_1d(stage_sub["num_target_shots"].values)
-    means = np.atleast_1d(stage_sub[f"{metric}_mean"].values).astype(float).copy()
-    stds = np.atleast_1d(stage_sub[f"{metric}_std"].values).astype(float).copy()
-
-    diverged = means > DIVERGED_THRESHOLD
-    means[diverged] = np.nan
-    stds[diverged] = np.nan
-
-    drew = False
-    line_mask = shots >= 0
-    if line_mask.any() and np.isfinite(means[line_mask]).any():
-        order = np.argsort(shots[line_mask])
-        ax.errorbar(
-            shots[line_mask][order],
-            means[line_mask][order],
-            yerr=stds[line_mask][order],
-            label=label,
-            color=color,
-            linestyle=linestyle,
-            marker="o",
-            markersize=4,
-            linewidth=1.6,
-            capsize=3,
-            capthick=1.0,
-        )
-        drew = True
-
-    for ref_mean in means[shots == -1]:
-        if np.isfinite(ref_mean):
-            ax.axhline(ref_mean, color=color, linestyle="--", linewidth=1.2, alpha=0.8)
-            drew = True
-
-    return drew
-
-
-def _finalize_grid(fig, axes, sub: xr.Dataset, title: str, save_path: Path):
-    shots = np.atleast_1d(sub["num_target_shots"].values)
-    tick_shots = sorted({int(s) for s in shots if s >= 0})
-    for ax in axes.flat:
-        ax.set_xscale("symlog", linthresh=1)
-        if tick_shots:
-            ax.set_xticks(tick_shots)
-            ax.set_xticklabels([str(s) for s in tick_shots])
-        ax.tick_params(colors=TEXT_COLOR, labelsize=TICK_FONTSIZE)
-
-    handles, labels = [], []
-    for ax in axes.flat:
-        h, ell = ax.get_legend_handles_labels()
-        for handle, lab in zip(h, ell, strict=True):
-            if lab not in labels:
-                handles.append(handle)
-                labels.append(lab)
-    if handles:
-        fig.legend(
-            handles,
-            labels,
-            loc="lower center",
-            ncols=min(len(labels), 4),
-            fontsize=LEGEND_FONTSIZE,
-            labelcolor=TEXT_COLOR,
-            facecolor=BACKGROUND_COLOR,
-            edgecolor=TEXT_COLOR,
-        )
-    fig.suptitle(title, color=TEXT_COLOR, fontsize=TITLE_FONTSIZE)
-    fig.text(
-        0.99,
-        0.01,
-        "dashed: trained on all target shots",
-        color=TEXT_COLOR,
-        fontsize=TICK_FONTSIZE,
-        ha="right",
-    )
-    fig.tight_layout(rect=(0, 0.06, 1, 0.96))
-    save_path.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(save_path, dpi=200, facecolor=fig.get_facecolor())
-    plt.close(fig)
-
-
-def _coord_values(ds: xr.Dataset, name: str) -> list:
-    return sorted(set(np.atleast_1d(ds[name].values).tolist()))
+COMPARISON_FAMILIES = (
+    ComparisonFamily("training_dataset_comparison", "training_data", "Training dataset comparison", TD_COLORS, include_exnihilo=True),
+    ComparisonFamily("model_comparison", "model_type", "Model comparison", MODEL_COLORS),
+    # The no-adaptation baseline only exists at num_target_shots = 0 for non-exnihilo training data,
+    # so it typically shows up as a single point rather than a trend
+    ComparisonFamily("domain_adaptation_comparison", "domain_adaptation", "Domain adaptation comparison", DA_COLORS),
+    ComparisonFamily("data_normalization_comparison", "data_normalization", "Data normalization comparison", NORM_COLORS),
+    # Only the torax model types carry the geometry_builder axis, the others are pinned to circular
+    ComparisonFamily(
+        "geometry_builder_comparison", "geometry_builder", "Geometry builder comparison", GEOM_COLORS, TORAX_MODEL_TYPES, min_series=2
+    ),
+    # Without target shots every case takes the base order, so the other orders start at 1 target shot
+    ComparisonFamily("target_shot_order_comparison", "target_shot_order", "Target shot order comparison", ORDER_COLORS, min_series=2),
+    # Only renders in a study that varies the model size, borrowing the tuned-size cases from its primary
+    ComparisonFamily("model_size_comparison", "model_size", "Model size comparison", MODEL_SIZE_COLORS, min_series=2),
+)
 
 
 def _freeze_diff(frozen_by_shot: dict, unfrozen_by_shot: dict, shot) -> float:
@@ -239,261 +142,90 @@ def _freeze_diff(frozen_by_shot: dict, unfrozen_by_shot: dict, shot) -> float:
     return f - u
 
 
-def _check_metrics_ds(metrics_ds: xr.Dataset, family: str) -> bool:
-    if not metrics_ds.data_vars or "case_idx" not in metrics_ds.dims:
-        logger.warning(f"No stage-resolved metrics available, skipping {family} figures")
-        return False
-    return True
-
-
-def model_comparison(metrics_ds: xr.Dataset, figure_dir: Path):
-    """One line per model type, one figure per (training_data, data_normalization, domain_adaptation, freeze_shapes, geometry_builder)."""
-    if not _check_metrics_ds(metrics_ds, "model comparison"):
-        return
-    out_dir = Path(figure_dir) / "comparison" / "model_comparison"
-    for td in _coord_values(metrics_ds, "training_data"):
-        for dn in _coord_values(metrics_ds, "data_normalization"):
-            for da in _coord_values(metrics_ds, "domain_adaptation"):
-                for freeze in _coord_values(metrics_ds, "freeze_shapes"):
-                    for geom in _coord_values(metrics_ds, "geometry_builder"):
-                        sub = _mask_select(
-                            metrics_ds,
-                            (metrics_ds["training_data"] == td)
-                            & (metrics_ds["data_normalization"] == dn)
-                            & (metrics_ds["domain_adaptation"] == da)
-                            & (metrics_ds["freeze_shapes"] == freeze)
-                            & (metrics_ds["geometry_builder"] == geom),
-                        )
-                        if sub.sizes.get("case_idx", 0) == 0:
-                            continue
-                        fig, axes = _grid_figure()
-                        drew = False
-                        for model_type in _coord_values(sub, "model_type"):
-                            model_sub = _mask_select(sub, sub["model_type"] == model_type)
-                            color = MODEL_COLORS.get(model_type, "white")
-                            label = MODEL_LABELS.get(model_type, model_type)
-                            for row, metric in enumerate(METRIC_NAMES):
-                                for col, stage in enumerate(STAGE_AGG_NAMES):
-                                    drew |= _plot_series(axes[row, col], model_sub, stage, metric, color, label)
-                        if not drew:
-                            plt.close(fig)
-                            continue
-                        title = (
-                            f"Model comparison - train: {td} / norm: {NORM_LABELS.get(dn, dn)}"
-                            f" / DA: {da} / freeze shapes: {freeze} / geom: {GEOM_LABELS.get(geom, geom)}"
-                        )
-                        _finalize_grid(fig, axes, sub, title, out_dir / f"td_{td}.norm_{dn}.da_{da}.freeze_{freeze}.geom_{geom}.png")
-    logger.info(f"Saved model comparison figures to {out_dir}")
-
-
-def training_dataset_comparison(metrics_ds: xr.Dataset, figure_dir: Path):
-    """One line per training dataset, one figure per (model_type, data_normalization, domain_adaptation, freeze_shapes)."""
-    if not _check_metrics_ds(metrics_ds, "training dataset comparison"):
-        return
-    out_dir = Path(figure_dir) / "comparison" / "training_dataset_comparison"
-    td_colors = _training_data_colors(_coord_values(metrics_ds, "training_data"))
-    for model_type in _coord_values(metrics_ds, "model_type"):
-        for dn in _coord_values(metrics_ds, "data_normalization"):
-            for da in _coord_values(metrics_ds, "domain_adaptation"):
-                for freeze in _coord_values(metrics_ds, "freeze_shapes"):
-                    for geom in _coord_values(metrics_ds, "geometry_builder"):
-                        sub = _mask_select(
-                            metrics_ds,
-                            (metrics_ds["model_type"] == model_type)
-                            & (metrics_ds["data_normalization"] == dn)
-                            & (metrics_ds["domain_adaptation"] == da)
-                            & (metrics_ds["freeze_shapes"] == freeze)
-                            & (metrics_ds["geometry_builder"] == geom),
-                        )
-                        if sub.sizes.get("case_idx", 0) == 0:
-                            continue
-                        fig, axes = _grid_figure()
-                        drew = False
-                        for td in _coord_values(sub, "training_data"):
-                            td_sub = _mask_select(sub, sub["training_data"] == td)
-                            for row, metric in enumerate(METRIC_NAMES):
-                                for col, stage in enumerate(STAGE_AGG_NAMES):
-                                    drew |= _plot_series(axes[row, col], td_sub, stage, metric, td_colors[td], str(td))
-                        if not drew:
-                            plt.close(fig)
-                            continue
-                        model_label = MODEL_LABELS.get(model_type, model_type)
-                        title = (
-                            f"Training dataset comparison - {model_label} / norm: {NORM_LABELS.get(dn, dn)}"
-                            f" / DA: {da} / freeze shapes: {freeze} / geom: {GEOM_LABELS.get(geom, geom)}"
-                        )
-                        _finalize_grid(fig, axes, sub, title, out_dir / f"{model_type}.norm_{dn}.da_{da}.freeze_{freeze}.geom_{geom}.png")
-    logger.info(f"Saved training dataset comparison figures to {out_dir}")
-
-
-def domain_adaptation_comparison(metrics_ds: xr.Dataset, figure_dir: Path):
-    """One line per domain adaptation method, one figure per (model_type, training_data, data_normalization, freeze_shapes).
-
-    The no-adaptation baseline only exists at num_target_shots = 0 for
-    non-exnihilo training data, so it typically shows up as a single point
-    rather than a trend.
-    """
-    if not _check_metrics_ds(metrics_ds, "domain adaptation comparison"):
-        return
-    out_dir = Path(figure_dir) / "comparison" / "domain_adaptation_comparison"
-    for model_type in _coord_values(metrics_ds, "model_type"):
-        for td in _coord_values(metrics_ds, "training_data"):
-            for dn in _coord_values(metrics_ds, "data_normalization"):
-                for freeze in _coord_values(metrics_ds, "freeze_shapes"):
-                    for geom in _coord_values(metrics_ds, "geometry_builder"):
-                        sub = _mask_select(
-                            metrics_ds,
-                            (metrics_ds["model_type"] == model_type)
-                            & (metrics_ds["training_data"] == td)
-                            & (metrics_ds["data_normalization"] == dn)
-                            & (metrics_ds["freeze_shapes"] == freeze)
-                            & (metrics_ds["geometry_builder"] == geom),
-                        )
-                        if sub.sizes.get("case_idx", 0) == 0:
-                            continue
-                        fig, axes = _grid_figure()
-                        drew = False
-                        for da in _coord_values(sub, "domain_adaptation"):
-                            da_sub = _mask_select(sub, sub["domain_adaptation"] == da)
-                            color = DA_COLORS.get(da, "white")
-                            label = DA_LABELS.get(da, da)
-                            for row, metric in enumerate(METRIC_NAMES):
-                                for col, stage in enumerate(STAGE_AGG_NAMES):
-                                    drew |= _plot_series(axes[row, col], da_sub, stage, metric, color, label)
-                        if not drew:
-                            plt.close(fig)
-                            continue
-                        model_label = MODEL_LABELS.get(model_type, model_type)
-                        title = (
-                            f"Domain adaptation comparison - {model_label} / train: {td}"
-                            f" / norm: {NORM_LABELS.get(dn, dn)} / freeze shapes: {freeze} / geom: {GEOM_LABELS.get(geom, geom)}"
-                        )
-                        _finalize_grid(fig, axes, sub, title, out_dir / f"{model_type}.td_{td}.norm_{dn}.freeze_{freeze}.geom_{geom}.png")
-    logger.info(f"Saved domain adaptation comparison figures to {out_dir}")
-
-
-def data_normalization_comparison(metrics_ds: xr.Dataset, figure_dir: Path):
-    """One line per data normalization method, one figure per (model_type, training_data, domain_adaptation, freeze_shapes)."""
-    if not _check_metrics_ds(metrics_ds, "data normalization comparison"):
-        return
-    out_dir = Path(figure_dir) / "comparison" / "data_normalization_comparison"
-    for model_type in _coord_values(metrics_ds, "model_type"):
-        for td in _coord_values(metrics_ds, "training_data"):
-            for da in _coord_values(metrics_ds, "domain_adaptation"):
-                for freeze in _coord_values(metrics_ds, "freeze_shapes"):
-                    for geom in _coord_values(metrics_ds, "geometry_builder"):
-                        sub = _mask_select(
-                            metrics_ds,
-                            (metrics_ds["model_type"] == model_type)
-                            & (metrics_ds["training_data"] == td)
-                            & (metrics_ds["domain_adaptation"] == da)
-                            & (metrics_ds["freeze_shapes"] == freeze)
-                            & (metrics_ds["geometry_builder"] == geom),
-                        )
-                        if sub.sizes.get("case_idx", 0) == 0:
-                            continue
-                        fig, axes = _grid_figure()
-                        drew = False
-                        for dn in _coord_values(sub, "data_normalization"):
-                            dn_sub = _mask_select(sub, sub["data_normalization"] == dn)
-                            color = NORM_COLORS.get(dn, "white")
-                            label = NORM_LABELS.get(dn, dn)
-                            for row, metric in enumerate(METRIC_NAMES):
-                                for col, stage in enumerate(STAGE_AGG_NAMES):
-                                    drew |= _plot_series(axes[row, col], dn_sub, stage, metric, color, label)
-                        if not drew:
-                            plt.close(fig)
-                            continue
-                        model_label = MODEL_LABELS.get(model_type, model_type)
-                        title = (
-                            f"Data normalization comparison - {model_label} / train: {td}"
-                            f" / DA: {da} / freeze shapes: {freeze} / geom: {GEOM_LABELS.get(geom, geom)}"
-                        )
-                        _finalize_grid(fig, axes, sub, title, out_dir / f"{model_type}.td_{td}.da_{da}.freeze_{freeze}.geom_{geom}.png")
-    logger.info(f"Saved data normalization comparison figures to {out_dir}")
-
-
 def freeze_shapes_comparison(metrics_ds: xr.Dataset, figure_dir: Path):
-    """Effect of freezing shapes: (frozen - unfrozen) metric difference vs
-    num_target_shots, one line per (training_data, domain_adaptation), one
-    figure per model type that has shapes. Positive difference means the
-    unfrozen model is better."""
-    if not _check_metrics_ds(metrics_ds, "freeze shapes comparison"):
+    """Effect of freezing shapes: (frozen - unfrozen) metric difference vs num_target_shots.
+
+    One line per combination of the other case-grid fields, one figure per model type that has shapes.
+    Positive difference means the unfrozen model is better.
+    """
+    if not metrics_ds.data_vars or "case_idx" not in metrics_ds.dims:
+        logger.warning("No stage-resolved metrics available, skipping freeze shapes comparison figures")
         return
     out_dir = Path(figure_dir) / "comparison" / "freeze_shapes_comparison"
-    td_colors = _training_data_colors(_coord_values(metrics_ds, "training_data"))
+    training_datasets = coord_values(metrics_ds, "training_data")
+    cmap = plt.colormaps["tab10"].resampled(max(len(training_datasets), 1))
+    td_colors = {td: cmap(i) for i, td in enumerate(training_datasets)}
     da_linestyles = {"none": ":", "weighted": "-", "addition": (0, (3, 1, 1, 1)), "transfer": "--", "transfer_pretrain": "-."}
 
-    for model_type in _coord_values(metrics_ds, "model_type"):
-        if model_type not in MODELS_WITH_SHAPES:
+    for model_type in coord_values(metrics_ds, "model_type"):
+        if model_type not in MODEL_TYPES_WITH_SHAPES:
             continue
-        model_sub = _mask_select(metrics_ds, metrics_ds["model_type"] == model_type)
-        norms = _coord_values(model_sub, "data_normalization")
-        geoms = _coord_values(model_sub, "geometry_builder")
-        fig, axes = _grid_figure()
+        model_sub = mask_select(metrics_ds, metrics_ds["model_type"] == model_type)
+        norms = coord_values(model_sub, "data_normalization")
+        geoms = coord_values(model_sub, "geometry_builder")
+        orders = coord_values(model_sub, "target_shot_order")
+        line_fields = product(
+            coord_values(model_sub, "training_data"),
+            norms,
+            coord_values(model_sub, "domain_adaptation"),
+            geoms,
+            orders,
+        )
+        fig, axes = grid_figure(LAYOUT)
         drew = False
-        for td in _coord_values(model_sub, "training_data"):
-            for dn in norms:
-                for da in _coord_values(model_sub, "domain_adaptation"):
-                    for geom in geoms:
-                        combo_mask = (
-                            (model_sub["training_data"] == td)
-                            & (model_sub["data_normalization"] == dn)
-                            & (model_sub["domain_adaptation"] == da)
-                            & (model_sub["geometry_builder"] == geom)
+        for td, dn, da, geom, order in line_fields:
+            combo_mask = (
+                (model_sub["training_data"] == td)
+                & (model_sub["data_normalization"] == dn)
+                & (model_sub["domain_adaptation"] == da)
+                & (model_sub["geometry_builder"] == geom)
+                & (model_sub["target_shot_order"] == order)
+            )
+            frozen = mask_select(model_sub, combo_mask & model_sub["freeze_shapes"])
+            unfrozen = mask_select(model_sub, combo_mask & ~model_sub["freeze_shapes"])
+            if frozen.sizes.get("case_idx", 0) == 0 or unfrozen.sizes.get("case_idx", 0) == 0:
+                continue
+
+            frozen_shots = np.atleast_1d(frozen["num_target_shots"].values)
+            unfrozen_shots = np.atleast_1d(unfrozen["num_target_shots"].values)
+            shared = sorted(set(frozen_shots.tolist()) & set(unfrozen_shots.tolist()))
+
+            color = td_colors[td]
+            linestyle = da_linestyles.get(da, "-")
+            label = f"{td} / {DA_LABELS.get(da, da)}"
+            if len(norms) > 1:
+                label = f"{label} / {NORM_LABELS.get(dn, dn)}"
+            if len(geoms) > 1:
+                label = f"{label} / {GEOM_LABELS.get(geom, geom)}"
+            if len(orders) > 1:
+                label = f"{label} / {ORDER_LABELS.get(order, order)}"
+
+            for row, metric in enumerate(METRIC_LABELS):
+                for col, stage in enumerate(STAGE_AGG_NAMES):
+                    frozen_means = np.atleast_1d(frozen.sel(stage=stage)[f"{metric}_mean"].values).astype(float)
+                    unfrozen_means = np.atleast_1d(unfrozen.sel(stage=stage)[f"{metric}_mean"].values).astype(float)
+                    frozen_by_shot = dict(zip(frozen_shots.tolist(), frozen_means.tolist(), strict=True))
+                    unfrozen_by_shot = dict(zip(unfrozen_shots.tolist(), unfrozen_means.tolist(), strict=True))
+                    diffs = np.array([_freeze_diff(frozen_by_shot, unfrozen_by_shot, s) for s in shared])
+                    if np.isfinite(diffs).any():
+                        axes[row, col].plot(
+                            shared,
+                            diffs,
+                            color=color,
+                            linestyle=linestyle,
+                            linewidth=1.6,
+                            marker=ORDER_MARKERS.get(order, "o"),
+                            markersize=4,
+                            label=label,
                         )
-                        frozen = _mask_select(model_sub, combo_mask & model_sub["freeze_shapes"])
-                        unfrozen = _mask_select(model_sub, combo_mask & ~model_sub["freeze_shapes"])
-                        if frozen.sizes.get("case_idx", 0) == 0 or unfrozen.sizes.get("case_idx", 0) == 0:
-                            continue
-
-                        frozen_shots = np.atleast_1d(frozen["num_target_shots"].values)
-                        unfrozen_shots = np.atleast_1d(unfrozen["num_target_shots"].values)
-                        shared = sorted(set(frozen_shots.tolist()) & set(unfrozen_shots.tolist()))
-                        shared_line = [s for s in shared if s >= 0]
-
-                        color = td_colors[td]
-                        linestyle = da_linestyles.get(da, "-")
-                        label = f"{td} / {DA_LABELS.get(da, da)}"
-                        if len(norms) > 1:
-                            label = f"{label} / {NORM_LABELS.get(dn, dn)}"
-                        if len(geoms) > 1:
-                            label = f"{label} / {GEOM_LABELS.get(geom, geom)}"
-
-                        for row, metric in enumerate(METRIC_NAMES):
-                            for col, stage in enumerate(STAGE_AGG_NAMES):
-                                ax = axes[row, col]
-                                frozen_means = np.atleast_1d(frozen.sel(stage=stage)[f"{metric}_mean"].values).astype(float)
-                                unfrozen_means = np.atleast_1d(unfrozen.sel(stage=stage)[f"{metric}_mean"].values).astype(float)
-                                frozen_by_shot = dict(zip(frozen_shots.tolist(), frozen_means.tolist(), strict=True))
-                                unfrozen_by_shot = dict(zip(unfrozen_shots.tolist(), unfrozen_means.tolist(), strict=True))
-
-                                if shared_line:
-                                    diffs = np.array([_freeze_diff(frozen_by_shot, unfrozen_by_shot, s) for s in shared_line])
-                                    if np.isfinite(diffs).any():
-                                        ax.plot(
-                                            shared_line,
-                                            diffs,
-                                            color=color,
-                                            linestyle=linestyle,
-                                            linewidth=1.6,
-                                            marker="o",
-                                            markersize=4,
-                                            label=label,
-                                        )
-                                        drew = True
-                                if -1 in shared:
-                                    ref = _freeze_diff(frozen_by_shot, unfrozen_by_shot, -1)
-                                    if np.isfinite(ref):
-                                        ax.axhline(ref, color=color, linestyle="--", linewidth=1.2, alpha=0.6)
-                                        drew = True
+                        drew = True
 
         if not drew:
             plt.close(fig)
             continue
         for ax in axes.flat:
             ax.axhline(0, color=TEXT_COLOR, linewidth=0.8, linestyle=":")
-        for row, metric in enumerate(METRIC_NAMES):
+        for row, metric in enumerate(METRIC_LABELS):
             axes[row, 0].set_ylabel(
                 f"Delta {METRIC_LABELS[metric].lower()}\n(frozen - unfrozen)",
                 color=TEXT_COLOR,
@@ -501,56 +233,5 @@ def freeze_shapes_comparison(metrics_ds: xr.Dataset, figure_dir: Path):
             )
         model_label = MODEL_LABELS.get(model_type, model_type)
         title = f"Shape freezing effect - {model_label} (positive: unfrozen better)"
-        _finalize_grid(fig, axes, model_sub, title, out_dir / f"{model_type}.png")
+        finalize_grid(fig, axes, model_sub, title, out_dir / f"{model_type}.png")
     logger.info(f"Saved freeze shapes comparison figures to {out_dir}")
-
-
-def geometry_builder_comparison(metrics_ds: xr.Dataset, figure_dir: Path):
-    """One line per geometry builder, one figure per (model_type, training_data, data_normalization, domain_adaptation, freeze_shapes).
-
-    Only torax model types carry the geometry_builder axis (all other model
-    families are pinned to circular at case generation), so non-torax model
-    types are skipped, as are combinations where only one geometry exists.
-    """
-    if not _check_metrics_ds(metrics_ds, "geometry builder comparison"):
-        return
-    out_dir = Path(figure_dir) / "comparison" / "geometry_builder_comparison"
-    for model_type in _coord_values(metrics_ds, "model_type"):
-        if not str(model_type).startswith("torax-"):
-            continue
-        for td in _coord_values(metrics_ds, "training_data"):
-            for dn in _coord_values(metrics_ds, "data_normalization"):
-                for da in _coord_values(metrics_ds, "domain_adaptation"):
-                    for freeze in _coord_values(metrics_ds, "freeze_shapes"):
-                        sub = _mask_select(
-                            metrics_ds,
-                            (metrics_ds["model_type"] == model_type)
-                            & (metrics_ds["training_data"] == td)
-                            & (metrics_ds["data_normalization"] == dn)
-                            & (metrics_ds["domain_adaptation"] == da)
-                            & (metrics_ds["freeze_shapes"] == freeze),
-                        )
-                        if sub.sizes.get("case_idx", 0) == 0:
-                            continue
-                        geoms = _coord_values(sub, "geometry_builder")
-                        if len(geoms) < 2:
-                            continue
-                        fig, axes = _grid_figure()
-                        drew = False
-                        for geom in geoms:
-                            geom_sub = _mask_select(sub, sub["geometry_builder"] == geom)
-                            color = GEOM_COLORS.get(geom, "white")
-                            label = GEOM_LABELS.get(geom, geom)
-                            for row, metric in enumerate(METRIC_NAMES):
-                                for col, stage in enumerate(STAGE_AGG_NAMES):
-                                    drew |= _plot_series(axes[row, col], geom_sub, stage, metric, color, label)
-                        if not drew:
-                            plt.close(fig)
-                            continue
-                        model_label = MODEL_LABELS.get(model_type, model_type)
-                        title = (
-                            f"Geometry builder comparison - {model_label} / train: {td}"
-                            f" / norm: {NORM_LABELS.get(dn, dn)} / DA: {da} / freeze shapes: {freeze}"
-                        )
-                        _finalize_grid(fig, axes, sub, title, out_dir / f"{model_type}.td_{td}.norm_{dn}.da_{da}.freeze_{freeze}.png")
-    logger.info(f"Saved geometry builder comparison figures to {out_dir}")

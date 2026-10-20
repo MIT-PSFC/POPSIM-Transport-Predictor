@@ -1,81 +1,131 @@
 """Literal case-name regression tests for the transport transfer study.
 
-str(case) names checkpoint dirs, result files, tuned-config paths, wandb
-projects, and SLURM job names, so its format must never drift. Mirror
-tests/power_balance_transfer/test_power_balance_case_naming.py: a loaded
-TransportStudy.Config on the sample datasets (cmod-low1 as source, cmod-high
-as target) and a _case helper with defaults model_type="sciml",
-training_data="cmod-low1", domain_adaptation=None, freeze_submodules=True,
-num_target_shots=0, geometry_builder="circular", torax_state="rebuild".
-
-Test implementations are deliberately blocked out as stubs, see the
-repository convention.
+str(case) names checkpoint dirs, result files, tuned-config paths, wandb projects, and SLURM job names,
+so its format must never drift.
 """
 
+from pathlib import Path
 
-def test_source_trained_case_name():
-    """str of the default sciml case is exactly
-    "case.sciml.td_cmod-low1.freeze_True": no norm_ token (normalization is
-    not a case axis in this study), and the suppressed geometry_builder /
-    torax_state defaults produce no geom_ / tstate_ tokens."""
+import pytest
 
-
-def test_exnihilo_case_name():
-    """str of a transformer exnihilo case with num_target_shots=5 is exactly
-    "case.transformer.td_exnihilo.freeze_True.targ_5"."""
+from transport_study.config import load_config
+from transport_study.transport_transfer.transport_transfer_study import TransportStudy
 
 
-def test_domain_adaptation_case_name():
-    """str of the default case with domain_adaptation="transfer" and
-    num_target_shots=3 is exactly
-    "case.sciml.td_cmod-low1.freeze_True.targ_3.da_transfer"."""
+@pytest.fixture
+def loaded_config():
+    return load_config(
+        TransportStudy.Config(
+            study_name="test-transport-case-naming",
+            dataset_paths={"cmod-low1": Path("path/to/cmod_low1.nc"), "cmod-high": Path("path/to/cmod_high.nc")},
+            target_device="cmod-high",
+            target_test_set_size=5,
+            training_datasets=("cmod-low1",),
+        )
+    )
 
 
-def test_torax_miller_case_name():
-    """str of a torax-cgm case with geometry_builder="miller" is exactly
-    "case.torax-cgm.td_cmod-low1.freeze_True.geom_miller": the non-default
-    geometry gets its token, the default torax_state stays suppressed."""
+def _case(**overrides):
+    kwargs = {
+        "model_type": "sciml",
+        "training_data": "cmod-low1",
+        "domain_adaptation": None,
+        "freeze_submodules": True,
+        "num_target_shots": 0,
+    }
+    kwargs.update(overrides)
+    return TransportStudy.Case(**kwargs)
 
 
-def test_torax_carry_case_name():
-    """str of a torax-cgm case with torax_state="carry" is exactly
-    "case.torax-cgm.td_cmod-low1.freeze_True.tstate_carry": the non-default
-    state carry gets its token, the default geometry stays suppressed."""
+def test_source_trained_case_name(loaded_config):
+    # Normalization is study-wide, and the circular / rebuild defaults are suppressed
+    assert str(_case()) == "case.sciml.td_cmod-low1.freeze_True"
 
 
-def test_torax_miller_carry_token_order():
-    """A torax case with both geometry_builder="miller" and torax_state="carry"
-    emits the tokens in STR_TOKEN_FIELDS order:
-    "case.torax-cgm.td_cmod-low1.freeze_True.geom_miller.tstate_carry"."""
+def test_exnihilo_case_name(loaded_config):
+    # Only sciml has submodules to freeze, every other type sits at the unfrozen hyperparam value with no token
+    case = _case(model_type="transformer", training_data="exnihilo", freeze_submodules=False, num_target_shots=5)
+    assert str(case) == "case.transformer.td_exnihilo.targ_5"
 
 
-def test_submodule_prereq_case_names():
-    """The sciml case's prereqs contain a "case.power_balance.td_..." and a
-    "case.profile.td_..." case, and the power_balance prereq's own prereqs
-    contain "case.p_oh.td_..." and "case.p_rad.td_..." cases (chained
-    prereq depth of two)."""
+def test_domain_adaptation_case_name(loaded_config):
+    case = _case(domain_adaptation="transfer", num_target_shots=3)
+    assert str(case) == "case.sciml.td_cmod-low1.freeze_True.targ_3.da_transfer"
 
 
-def test_non_torax_rejects_torax_axes():
-    """Constructing a transformer case with geometry_builder="miller" or
-    torax_state="carry" raises ValueError: those axes only apply to torax-*
-    model types."""
+@pytest.mark.parametrize(
+    ("geometry_builder", "torax_state", "suffix"),
+    [
+        ("miller", "rebuild", ".geom_miller"),
+        ("circular", "carry", ".tstate_carry"),
+        ("miller", "carry", ".geom_miller.tstate_carry"),
+    ],
+)
+def test_torax_axis_tokens(loaded_config, geometry_builder, torax_state, suffix):
+    """A non-default torax axis gets its token in STR_TOKEN_FIELDS order, a default one stays suppressed."""
+    case = _case(model_type="torax-gyrobohm", freeze_submodules=False, geometry_builder=geometry_builder, torax_state=torax_state)
+    assert str(case) == f"case.torax-gyrobohm.td_cmod-low1{suffix}"
 
 
-def test_cases_are_hashable_and_set_stable():
-    """The default case is in a set containing an identically constructed
-    case, and both hash equal (the __hash__ = Study.Case.__hash__ alias
-    survived the dataclass decorator)."""
+def test_submodule_prereq_case_names(loaded_config):
+    """sciml needs a power_balance and a profile case, and the power_balance case needs p_oh and p_rad.
+
+    Submodule cases sit at the unfrozen hyperparam default, so their names carry no freeze token.
+    """
+    prereq_names = {str(prereq) for prereq in _case().prereqs}
+    assert {"case.power_balance.td_cmod-low1", "case.profile.td_cmod-low1"} <= prereq_names
+
+    power_balance_case = next(prereq for prereq in _case().prereqs if prereq.model_type == "power_balance")
+    power_balance_prereq_names = {str(prereq) for prereq in power_balance_case.prereqs}
+    assert {"case.p_oh.td_cmod-low1", "case.p_rad.td_cmod-low1"} <= power_balance_prereq_names
 
 
-def test_compatible_configs():
-    """is_compatible is True for a config differing only in case-grid axes
-    (model_types), and False when any COMPAT_HYPERPARAM_FIELDS entry differs
-    (data_normalization, power_balance_model_type, profile_model_type,
-    power_balance_data_normalization, hyperparam_* fields)."""
+def test_target_shot_order_reaches_every_prereq(loaded_config):
+    """A sciml case's power_balance and profile prereqs, and their p_oh and p_rad, train on the same target shots."""
+    case = _case(domain_adaptation="weighted", num_target_shots=3, target_shot_order="spanning")
+    assert str(case) == "case.sciml.td_cmod-low1.freeze_True.targ_3.order_spanning.da_weighted"
+
+    prereq_names = {str(prereq) for prereq in case.prereqs}
+    assert "case.power_balance.td_cmod-low1.targ_3.order_spanning.da_weighted" in prereq_names
+    assert "case.profile.td_cmod-low1.targ_3.order_spanning.da_weighted" in prereq_names
+    power_balance_case = next(prereq for prereq in case.prereqs if prereq.model_type == "power_balance")
+    power_balance_prereq_names = {str(prereq) for prereq in power_balance_case.prereqs}
+    assert "case.p_oh.td_cmod-low1.targ_3.order_spanning.da_weighted" in power_balance_prereq_names
 
 
-def test_base_config_rejects_subclass_fields():
-    """The base StudyConfig raises a validation error when given
-    TransportStudy.Config-only fields such as torax_state_options (extra
-    fields are forbidden)."""
+@pytest.mark.parametrize("torax_axis", ["geometry_builder", "torax_state"])
+def test_non_torax_rejects_torax_axes(loaded_config, torax_axis):
+    """An axis a model type ignores must hold its pinned value, a case spelled otherwise names no grid case."""
+    off_pin = {"geometry_builder": "miller", "torax_state": "carry"}[torax_axis]
+    with pytest.raises(ValueError, match=f"transformer ignores .*{torax_axis}"):
+        _case(model_type="transformer", freeze_submodules=False, **{torax_axis: off_pin})
+
+
+def test_cases_are_hashable_and_set_stable(loaded_config):
+    assert _case() in {_case()}
+    assert hash(_case()) == hash(_case())
+
+
+@pytest.mark.parametrize("model_type", ["transformer", "torax-gyrobohm"])
+def test_multiobjective_case_name_and_shared_sweep(loaded_config, model_type):
+    """A multiobjective case carries mo_True and tunes on the plain case's sweep."""
+    case = _case(model_type=model_type, freeze_submodules=False, domain_adaptation="weighted", num_target_shots=3, multiobjective=True)
+    assert str(case) == f"case.{model_type}.td_cmod-low1.mo_True.targ_3.da_weighted"
+    assert str(case.prereqs[0]) == f"case.{model_type}.td_cmod-low1"
+
+
+def test_sciml_rejects_multiobjective(loaded_config):
+    # sciml always anchors its submodules, the axis does not apply to it
+    with pytest.raises(ValueError, match=r"sciml ignores .*multiobjective"):
+        _case(multiobjective=True)
+
+
+def test_model_size_case_name_and_sized_sciml_prereqs(loaded_config):
+    case = _case(model_type="transformer", freeze_submodules=False, domain_adaptation="weighted", num_target_shots=3, model_size="half")
+    assert str(case) == "case.transformer.td_cmod-low1.size_half.targ_3.da_weighted"
+    # sciml composes its prereqs' nets, so they and the power balance's p_oh / p_rad take its size
+    sciml_case = _case(freeze_submodules=False, model_size="max")
+    prereq_sizes = {prereq.model_type: prereq.model_size for prereq in sciml_case.prereqs if not prereq.is_hyperparam_case()}
+    assert prereq_sizes == {"power_balance": "max", "profile": "max"}
+    power_balance_prereq = next(prereq for prereq in sciml_case.prereqs if prereq.model_type == "power_balance")
+    assert [prereq.model_size for prereq in power_balance_prereq.prereqs if prereq.model_type in ("p_oh", "p_rad")] == ["max", "max"]

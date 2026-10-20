@@ -2,9 +2,8 @@
 
 Labels each timeslice of a shot as rampup / flattop / rampdown from the
 plasma current trace, with an auxiliary-heating flag that subdivides the
-flattop into ohmic and aux-heated timeslices. Both the profile transfer and
-power balance transfer studies aggregate their per-timeslice metrics over
-these stages.
+flattop into ohmic and aux-heated timeslices.
+Every study aggregates its per-timeslice metrics over these stages.
 """
 
 import numpy as np

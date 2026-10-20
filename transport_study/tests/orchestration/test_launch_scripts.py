@@ -5,6 +5,7 @@ embedded path must be a str at interpolation time. These capture the generated
 scripts without touching SLURM and check they compile.
 """
 
+import runpy
 from pathlib import Path
 
 import pytest
@@ -13,6 +14,7 @@ from popsim.ml import TrainConfig
 
 from transport_study.config import StudyConfig, load_config
 from transport_study.orchestration import slurm_utils
+from transport_study.tests.stubs import StubCase
 
 
 @pytest.fixture
@@ -69,7 +71,7 @@ def assert_script_valid(script_path: Path):
 
 
 def test_launch_agent_parallel_script_compiles(tmp_path, loaded_config, train_config, submitted_scripts):
-    slurm_utils.launch_agent_parallel(train_config, "sweep123", {"count": 1}, "agent_test_job", tmp_path)
+    slurm_utils.launch_agent_parallel(train_config, "sweep123", {"count": 1}, "agent_test_job", tmp_path, "48G")
 
     assert len(submitted_scripts) == 1
     scripts = list(tmp_path.glob("agent_test_job_*/run_agent.py"))
@@ -81,9 +83,65 @@ def test_launch_agent_parallel_script_compiles(tmp_path, loaded_config, train_co
 
 
 def test_launch_train_parallel_script_compiles(tmp_path, loaded_config, train_config, submitted_scripts):
-    slurm_utils.launch_train_parallel(train_config, "train_test_job", tmp_path / "result.nc", tmp_path)
+    slurm_utils.launch_train_parallel(train_config, "train_test_job", tmp_path / "result.nc", tmp_path / "train_test_job.log", "48G")
 
     assert len(submitted_scripts) == 1
     scripts = list(tmp_path.glob("train_test_job_script_*.py"))
     assert len(scripts) == 1
     assert_script_valid(scripts[0])
+
+
+def test_cpu_partition_job_requests_cpus_and_no_gpu(tmp_path, train_config, submitted_scripts):
+    """A training job on a CPU partition asks for no GPU and pins jax to the CPU, with the configured CPUs and its own memory."""
+    load_config(
+        StudyConfig(
+            study_name="launch_script_test",
+            dataset_paths={},
+            target_device="cmod",
+            partition="fake_gpu_partition",
+            cpu_partition="fake_cpu_partition",
+            cpu_train_cpus=8,
+        )
+    )
+    slurm_utils.launch_train_parallel(
+        train_config, "train_cpu_job", tmp_path / "result.nc", tmp_path / "train_cpu_job.log", "48G", partition="fake_cpu_partition"
+    )
+
+    (script,) = submitted_scripts
+    assert "--gres" not in script
+    assert "export JAX_PLATFORMS=cpu" in script
+    assert "#SBATCH --cpus-per-task=8" in script
+    assert "#SBATCH --mem=48G" in script
+
+
+def test_collect_results_job_script_compiles_and_asks_for_its_cpus(make_stub_study, submitted_scripts):
+    """The collection job reads on one process per CPU, so it asks for that many."""
+    study = make_stub_study([StubCase(name="case.a")], partition="fake_partition")
+
+    slurm_utils.launch_collect_results_job(study, cpus=16)
+
+    (script,) = submitted_scripts
+    assert "#SBATCH --cpus-per-task=16" in script
+    assert "export JAX_PLATFORMS=cpu" in script
+    collect_scripts = list((study.working_dir / "logs" / "logs_collect").glob(f"{study.collect_job_name()}_*.py"))
+    assert len(collect_scripts) == 1
+    assert_script_valid(collect_scripts[0])
+
+
+def test_collect_results_job_script_inert_when_rerun_as_mp_main(make_stub_study, submitted_scripts):
+    """Each spawned reader process re-runs the job's script as __mp_main__.
+
+    Without the main guard every reader built the study and spawned readers of its own,
+    and multiprocessing aborted the job.
+    """
+    study = make_stub_study([StubCase(name="case.a")], partition="fake_partition")
+    slurm_utils.launch_collect_results_job(study, cpus=16)
+    log_dir = study.working_dir / "logs" / "logs_collect"
+    (collect_script,) = log_dir.glob(f"{study.collect_job_name()}_*.py")
+    (study_config,) = log_dir.glob(f"{study.collect_job_name()}_study_config_*.toml")
+
+    runpy.run_path(str(collect_script), run_name="__mp_main__")
+
+    # Only the main process deletes the config it reloads
+    assert study_config.exists()
+    assert not study.collected_results_path().exists()

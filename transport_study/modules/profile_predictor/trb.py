@@ -1,6 +1,7 @@
 import copy
+import time
 from collections.abc import Callable
-from typing import Any
+from typing import Any, ClassVar
 
 import equinox as eqx
 import jax
@@ -8,15 +9,20 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import xarray as xr
+from jaxtyping import Array
 from loguru import logger
 from popsim.ml import DataLoader, TrainRunBuilder
-from popsim.ml.checkpointing import create_default_checkpoint_manager, restore_model
-from popsim.ml.dataloading import make_dataloaders
+from popsim.ml.dataloading import XarrayPreppedDataset, make_dataloaders
 from popsim.ml.eval import EvalData, EvaluationSuite
+from popsim.xarray_utils import run_function_with_dim_removed
 
-from transport_study import EPISODE_DIM, TIME_COORD, TIME_DIM
+from transport_study import EPISODE_DIM, RADIAL_DIM, TIME_COORD
 from transport_study.config import config
 from transport_study.modules.profile_predictor.module import (
+    MODEL_TYPES_WITH_SHAPES,
+    RESERVOIR_DIM,
+    RESERVOIR_FINGERPRINT_VAR,
+    RESERVOIR_STATE_VAR,
     ProfilePredictorReservoir,
     ProfilePredictorShapeInit,
     ProfilePredictorUnstructuredNN,
@@ -27,42 +33,130 @@ from transport_study.modules.profile_predictor.module import (
 )
 from transport_study.modules.profile_predictor.torax_module import ProfilePredictorTorax
 from transport_study.modules.trb_utils import (
+    CHI_ERROR_VARS,
+    DIVERGED_PROFILE_LIMIT,
+    PROFILE_SCALE_FLOOR,
+    CaseTrainDataLoader,
+    chi_gradient,
+    chi_profile_loss,
+    chi_value,
+    ds_source_per_shot,
+    huber_profile_loss,
     integrate_error_over_time,
     make_exponential_adamw,
     make_loss_eval_suite,
+    module_build_config,
+    normalizer_fit_dataset,
+    per_sample_device_values,
+    per_sample_sigma_floor,
+    replace_diverged_profiles,
     resolve_case_datasets,
+    restore_from_checkpoint,
+    target_device_idx,
+    transfer_checkpoint_to_restore,
+    unstack_samples,
 )
+from transport_study.orchestration.organize_data import merge_parts
+
+# Profile relaxation solver step [s].
+# The Pereverzev linear step makes the same progress per step at any dt,
+# so the step count alone sets how far the relaxation gets:
+# the output is n_solver_steps damped steps from the parabolic initial profiles, never a steady state.
+# 25 ms is the step the production relaxation was benchmarked at (8 steps, 0.2 s).
+RELAXATION_DT_S = 0.025
 
 
-def resolve_relaxation_overrides(model_init_config: dict) -> dict:
-    """Numerics overrides for the sweepable torax relaxation window.
+def relaxation_numerics(n_solver_steps: int) -> dict:
+    """TORAX numerics window of an n_solver_steps relaxation at the fixed RELAXATION_DT_S step."""
+    return {"t_final": n_solver_steps * RELAXATION_DT_S, "fixed_dt": RELAXATION_DT_S}
 
-    n_solver_steps fixes the solver step count and derives fixed_dt = t_final / n_solver_steps,
-    which decouples the swept relaxation horizon from per-sample solver cost
-    (compute scales with step count, not physical time).
-    Returns the dict of numerics keys to override, empty when nothing is set.
+
+def _per_shot_sigma_floor(
+    sigma_floors: dict[str, dict[str, float]], ds_source: np.ndarray, error_var: str, shots: np.ndarray
+) -> xr.DataArray:
+    """The chi_sigma_floors entry of error_var for each shot's device, on EPISODE_DIM."""
+    floors = np.array([sigma_floors[device][error_var] for device in ds_source])
+    return xr.DataArray(floors, dims=EPISODE_DIM, coords={EPISODE_DIM: shots})
+
+
+def _profile_chi(chi_fn: Callable, profiles: tuple[xr.DataArray, ...], floor: xr.DataArray, rho: np.ndarray) -> xr.DataArray:
+    """chi_fn (trb_utils.chi_value or chi_gradient) of every timeslice of the profiles, the floor given per shot.
+
+    Evaluated on the CPU, the whole test set at once would otherwise land on the training GPU.
     """
-    t_final = model_init_config.get("t_final")
-    fixed_dt = model_init_config.get("fixed_dt")
-    n_solver_steps = model_init_config.get("n_solver_steps")
-    overrides: dict[str, float] = {}
-    if t_final is not None:
-        overrides["t_final"] = float(t_final)
-    if n_solver_steps is not None:
-        if fixed_dt is not None:
-            raise ValueError("n_solver_steps and fixed_dt are mutually exclusive, sweep one or the other")
-        if t_final is None:
-            raise ValueError("n_solver_steps requires t_final to derive fixed_dt")
-        overrides["fixed_dt"] = float(t_final) / int(n_solver_steps)
-    elif fixed_dt is not None:
-        overrides["fixed_dt"] = float(fixed_dt)
-    return overrides
+
+    def chi_of_arrays(*arrays: np.ndarray) -> np.ndarray:
+        *profile_arrays, floor_array = arrays
+        with jax.default_device(jax.devices("cpu")[0]):
+            chi = chi_fn(*profile_arrays, floor_array[..., None], rho)
+        return np.asarray(chi)
+
+    core_dims = [[RADIAL_DIM]] * len(profiles)
+    return xr.apply_ufunc(chi_of_arrays, *profiles, floor, input_core_dims=[*core_dims, []])
+
+
+def _dataset_reservoir_states(module: ProfilePredictorReservoir, dataset: XarrayPreppedDataset, batch_size: int) -> np.ndarray:
+    """The reservoir state of every sample of dataset in sample order, (sample, reservoir_size).
+
+    Fixed-size batches in order, the last one padded, so one compiled shape covers every batch.
+    """
+    sample_dim = dataset.training_metadata.sample_dim
+
+    @eqx.filter_jit
+    def batch_states(module: ProfilePredictorReservoir, inputs: xr.Dataset) -> Array:
+        return run_function_with_dim_removed(ProfilePredictorReservoir.reservoir_state_of, (module, inputs), sample_dim, in_axes=(None, 0))
+
+    sequential_dl = DataLoader(dataset, batch_size=batch_size, shuffle=False, pad_last=True)
+    states = np.empty((len(dataset), module.res_bias.shape[0]), dtype=module.res_bias.dtype)
+    n_filled = 0
+    for batch in sequential_dl:
+        inputs, _ = batch.get_inputs_and_targets()
+        batch_states_device = batch_states(module, inputs)
+        batch_states_host = np.asarray(batch_states_device)
+        n_real = len(batch) - batch.n_padded
+        states[n_filled : n_filled + n_real] = batch_states_host[:n_real]
+        n_filled += n_real
+    return states
+
+
+def _attach_reservoir_states(module: ProfilePredictorReservoir, train_dl: CaseTrainDataLoader) -> None:
+    """Cache every training and validation sample's reservoir state on its loader, so no epoch reruns the frozen reservoir.
+
+    Each loader's dataset gains the input variables RESERVOIR_STATE_VAR (sample, RESERVOIR_DIM) and RESERVOIR_FINGERPRINT_VAR (sample),
+    which every batch carries (the filled final batch and the NaN retry index the same dataset),
+    and ProfilePredictorReservoir reads them in place of the reservoir.
+    The validation loader is also the test loader (get_dataloaders).
+    """
+    if train_dl.eval_dl is None:
+        raise ValueError("The reservoir state cache needs the loader the case validates on (CaseTrainDataLoader.eval_dl)")
+    fingerprint = float(module.frozen_fingerprint())
+    time_start = time.perf_counter()
+    for loader in (train_dl, train_dl.eval_dl):
+        if RESERVOIR_STATE_VAR in loader.ds:
+            raise ValueError("The loader already holds cached reservoir states, model_init ran twice on it")
+        sample_dim = loader.metadata.sample_dim
+        states = _dataset_reservoir_states(module, loader.dataset, train_dl.batch_size)
+        fingerprints = np.full(len(loader.dataset), fingerprint)
+        # A new Dataset object, the positional tuples skip alignment against the sample MultiIndex
+        # and the normalizer_fit_ds that may alias the old one stays untouched
+        loader.dataset.ds = loader.ds.assign(
+            {RESERVOIR_STATE_VAR: ((sample_dim, RESERVOIR_DIM), states), RESERVOIR_FINGERPRINT_VAR: (sample_dim, fingerprints)}
+        )
+        # A new list, the training and validation metadata share the old one
+        loader.metadata.input_vars = [*loader.metadata.input_vars, RESERVOIR_STATE_VAR, RESERVOIR_FINGERPRINT_VAR]
+    n_train = len(train_dl.dataset)
+    n_eval = len(train_dl.eval_dl.dataset)
+    time_elapsed_s = time.perf_counter() - time_start
+    logger.info(f"Cached the reservoir states of {n_train} training and {n_eval} validation samples in {time_elapsed_s:.1f} s")
 
 
 class ProfilePredictorTRB(TrainRunBuilder):
     """Training run builder for the profile predictor module,
     based on `popsim.modules.profile_predictor.training_run_builder.ProfilePredictorTrainRunBuilder`
     """
+
+    # The organize_data prep its dataloaders load every device with
+    STUDY_TYPE: ClassVar[str] = "profile_transfer"
 
     @staticmethod
     def get_dataloaders(
@@ -73,62 +167,50 @@ class ProfilePredictorTRB(TrainRunBuilder):
         Dataset selection and preparation is the shared
         trb_utils.resolve_case_datasets, this only builds the
         time-independent dataloaders on top.
+        The training parts are merged first, cheap since the profile view keeps only the fresh timeslices of each shot.
         """
-        ds_train, ds_val, input_vars, normalizer_fit_ds = resolve_case_datasets(dataloader_config, "profile_transfer")
+        train_parts, ds_val, input_vars, normalizer_fit_ds = resolve_case_datasets(dataloader_config, ProfilePredictorTRB.STUDY_TYPE)
 
         train_dl, val_dl = make_dataloaders(
-            datasets=(ds_train, ds_val),
+            datasets=(merge_parts(train_parts), ds_val),
             time_coord=TIME_COORD,
             episode_coord=EPISODE_DIM,
             input_vars=input_vars,
             target_vars=dataloader_config["target_vars"],
-            extra_vars=dataloader_config.get("extra_vars", None),
-            batch_size=dataloader_config.get("batch_size", None),
+            extra_vars=dataloader_config.get("extra_vars"),
+            batch_size=dataloader_config["batch_size"],
             shuffle=[True, False],
             convert_xr_to_jnp=False,  # Needed to keep the coords for calculating loss
             # Keep every batch the same shape to avoid an extra XLA compilation
             # for the final partial batch, which is expensive for TORAX models.
-            # Train drops the ragged tail (reshuffled every epoch, so no data is
-            # permanently lost), val pads it and consumers trim the duplicates.
-            drop_last=[True, False],
+            # Training fills its ragged final batch with samples drawn from the rest of the epoch,
+            # validation pads it and its consumers trim the duplicates.
             pad_last=[False, True],
+            fill_last=[True, False],
         )
-        # Transfer pretrain fits the normalizer on more data than it trains on
-        # (historic + target shots). model_init reads this attribute off the
-        # train dataloader, every other case fits on train_dl.ds itself
-        # TODO(ZanderKeith): Must be *extremely clear* about why you're doing this
-        if normalizer_fit_ds is not None:
-            train_dl.normalizer_fit_ds = normalizer_fit_ds
+        train_dl = CaseTrainDataLoader(train_dl, dataloader_config["shuffle_seed"], normalizer_fit_ds, eval_dl=val_dl)
         # The validation set doubles as the test set (see resolve_case_datasets)
         return ds_val, train_dl, val_dl, val_dl
 
     @staticmethod
     def model_init(train_dl: DataLoader, model_init_config: dict) -> Any:
-        """
-        Instantiate and return your model given a training DataLoader
-        and a model config dict.
-        """
-        # Stat stage (CORAL or z-score) on the dimensionless nn_inputs.
-        # Fitted from the training data only. When a transfer checkpoint will overwrite
-        # the module anyway, skip the fit (a fit on a handful of target shots is
-        # ill-conditioned and the restored stats, fitted on historic + target
-        # shots by the transfer_pretrain prereq case, are the correct ones).
-        # transfer_pretrain dataloaders carry that combined fit dataset as an
-        # attribute (see get_dataloaders).
-        # skip_data_init is the same escape hatch for a caller building this
-        # module as a submodule skeleton on a dataset that cannot support the
-        # data-driven init at all - the transport study's sciml model type builds
-        # one on its own dataloader, which carries neither a measured betan nor
-        # the profile shape variables (see transport_predictor/trb.py)
-        n_devices = len(config.ds_source_to_idx)
-        skip_data_init = model_init_config.get("skip_data_init", False)
-        if model_init_config.get("transfer_checkpoint") or skip_data_init:
-            fit_ds = None
-        else:
-            fit_ds = getattr(train_dl, "normalizer_fit_ds", train_dl.ds)
-        normalizer = make_nn_input_normalizer(model_init_config["data_normalization"], fit_ds, n_devices)
+        """The profile predictor of a case, restored from the transfer checkpoint when one is set.
 
-        if model_init_config["model_type"] in ["shape-init-pca", "shape-init-kmeans"]:
+        The data-driven init (normalizer statistics, PCA / k-means shape guess) is skipped when a restore will overwrite it
+        (see trb_utils.module_build_config): for a transfer case,
+        and for a skip_data_init skeleton, which the transport sciml submodule also needs since its dataset cannot support the init.
+        A reservoir caches every training and validation sample's state on the loaders (_attach_reservoir_states).
+        """
+        build_config = module_build_config(model_init_config)
+        # Stat stage (CORAL or z-score) on the dimensionless nn_inputs
+        normalizer = make_nn_input_normalizer(
+            model_init_config["data_normalization"],
+            normalizer_fit_dataset(train_dl, build_config),
+            len(config.ds_source_to_idx),
+            target_device_idx(),
+        )
+
+        if model_init_config["model_type"] in MODEL_TYPES_WITH_SHAPES:
             te_shape_var = model_init_config["te_shape_var"]
             ne_shape_var = model_init_config["ne_shape_var"]
             n_shapes = model_init_config["n_shapes"]
@@ -140,29 +222,27 @@ class ProfilePredictorTRB(TrainRunBuilder):
 
             module = ProfilePredictorShapeInit.init(
                 n_shapes=model_init_config["n_shapes"],
-                rhogrid=np.asarray(train_dl.ds["rho"]),
+                rhogrid=np.asarray(train_dl.ds[RADIAL_DIM]),
                 nn_width=model_init_config["nn_width"],
                 nn_depth=model_init_config["nn_depth"],
                 in_size=model_init_config["in_size"],
                 shape_type=shape_type,
-                softmax_temp=model_init_config["softmax_temp"],
                 prng_seed=model_init_config["prng_seed"],
                 normalizer=normalizer,
             )
 
-            # PCA/K-means initial guess for the shapes.
-            # Skipped when restoring from a transfer checkpoint, which overwrites the
-            # shapes anyway and whose fine-tune dataset may have fewer samples than shapes.
-            # Also skipped for a restore-bound submodule skeleton (skip_data_init),
-            # whose dataloader need not carry the shape variables at all.
-            if not model_init_config.get("transfer_checkpoint", False) and not skip_data_init:
+            # PCA / k-means initial guess for the shapes, unless a restore overwrites them
+            # (a transfer fine-tune dataset can also hold fewer samples than shapes)
+            if not build_config.get("skip_data_init", False):
                 ds = train_dl.ds
                 sample_dim = train_dl.dataset.training_metadata.sample_dim
 
                 if shape_type == ShapeType.PCA_LIKE:
                     te_shapes, ne_shapes = pca_initial_guess(n_shapes, ds[te_shape_var], ds[ne_shape_var], sample_dim)
                 elif shape_type == ShapeType.CONVEX_COMBINATION:
-                    te_shapes, ne_shapes = kmeans_initial_guess(n_shapes, ds[te_shape_var], ds[ne_shape_var], sample_dim)
+                    te_shapes, ne_shapes = kmeans_initial_guess(
+                        n_shapes, ds[te_shape_var], ds[ne_shape_var], sample_dim, seed=model_init_config["prng_seed"]
+                    )
                 else:
                     raise ValueError(f"Invalid shape type: {shape_type}")
 
@@ -176,34 +256,29 @@ class ProfilePredictorTRB(TrainRunBuilder):
             module = ProfilePredictorUnstructuredNN(
                 nn_width=model_init_config["nn_width"],
                 nn_depth=model_init_config["nn_depth"],
-                rhogrid=np.asarray(train_dl.ds["rho"]),
+                rhogrid=np.asarray(train_dl.ds[RADIAL_DIM]),
                 key=jax.random.PRNGKey(model_init_config["prng_seed"]),
                 normalizer=normalizer,
             )
         elif model_init_config["model_type"] == "reservoir":
             module = ProfilePredictorReservoir(
                 reservoir_size=model_init_config["reservoir_size"],
-                spectral_radius=model_init_config.get("spectral_radius", 0.9),
-                input_scaling=model_init_config.get("input_scaling", 0.5),
-                leak_rate=model_init_config.get("leak_rate", 1.0),
-                n_steps=model_init_config.get("n_steps", 20),
-                rhogrid=np.asarray(train_dl.ds["rho"]),
+                spectral_radius=model_init_config["spectral_radius"],
+                input_scaling=model_init_config["input_scaling"],
+                leak_rate=model_init_config["leak_rate"],
+                n_steps=model_init_config["n_steps"],
+                rhogrid=np.asarray(train_dl.ds[RADIAL_DIM]),
                 key=jax.random.PRNGKey(model_init_config["prng_seed"]),
                 normalizer=normalizer,
             )
         elif model_init_config["model_type"].startswith("torax-"):
-            # model_type is "torax-<transport_model>", e.g. "torax-cgm"
-            torax_config = model_init_config["torax_config"]
-            numerics_overrides = resolve_relaxation_overrides(model_init_config)
-            if numerics_overrides:
-                if not isinstance(torax_config, dict):
-                    raise ValueError("t_final / fixed_dt / n_solver_steps overrides require torax_config as a dict")
-                torax_config = copy.deepcopy(torax_config)
-                torax_config["numerics"].update(numerics_overrides)
+            # model_type is "torax-<transport_model>", e.g. "torax-gyrobohm"
+            torax_config = copy.deepcopy(model_init_config["torax_config"])
+            torax_config["numerics"].update(relaxation_numerics(model_init_config["n_solver_steps"]))
             module = ProfilePredictorTorax(
                 nn_width=model_init_config["nn_width"],
                 nn_depth=model_init_config["nn_depth"],
-                rhogrid=np.asarray(train_dl.ds["rho"]),
+                rhogrid=np.asarray(train_dl.ds[RADIAL_DIM]),
                 torax_config=torax_config,
                 key=jax.random.PRNGKey(model_init_config["prng_seed"]),
                 normalizer=normalizer,
@@ -214,260 +289,115 @@ class ProfilePredictorTRB(TrainRunBuilder):
         else:
             raise ValueError(f"Invalid model type {model_init_config['model_type']}")
 
-        if model_init_config.get("transfer_checkpoint", False):
-            transfer_manager = create_default_checkpoint_manager(model_init_config["transfer_checkpoint"])
-            module = restore_model(transfer_manager, module)
-            logger.debug(f"Restoring module from transfer learning pretrained checkpoint\n{model_init_config['transfer_checkpoint']}")
-
+        transfer_checkpoint = transfer_checkpoint_to_restore(model_init_config)
+        if transfer_checkpoint:
+            module = restore_from_checkpoint(module, transfer_checkpoint)
+        # After the restore, so the cache holds the states of the reservoir that trains.
+        # A caller-passed skip_data_init skeleton is restored by its caller, whose leaves would leave the cache stale
+        if model_init_config["model_type"] == "reservoir" and not model_init_config.get("skip_data_init", False):
+            _attach_reservoir_states(module, train_dl)
         return module
 
-    # Floor on the per-sample target peak used for profile normalization.
-    # In channel units (1e20 m^-3 for ne, keV for Te) any real fresh profile
-    # peaks far above this, so the floor only guards degenerate targets from
-    # blowing up the 1/scale division
-    PROFILE_SCALE_FLOOR = 1e-2
-
-    # Softening fraction for the relative-error denominator in study_results
-    # The floor added to abs(targ) is this fraction of the profile's own peak
-    # (per timeslice, floored by PROFILE_SCALE_FLOOR), so it reads as the same
-    # relative amount for ne (1e20 m^-3) and Te (keV) on every device instead
-    # of a fixed absolute offset in mismatched units
+    # Softening fraction for the relative-error denominator in study_results.
+    # The floor added to abs(targ) is this fraction of the profile's own peak (per timeslice, floored by PROFILE_SCALE_FLOOR),
+    # so it reads as the same relative amount for ne and Te on every device
     REL_ERROR_FLOOR_FRAC = 0.1
 
-    # Gradient loss only applies for rho below this. Beyond it the GP fits
-    # are extrapolating into the pedestal / scrape-off layer where the
-    # measured gradients are unreliable, so they should not steer training
-    GRAD_LOSS_RHO_MAX = 0.9
-
     @staticmethod
-    def _make_profile_loss_fn(loss_config: dict, use_huber: bool) -> Callable[[Any, Any], jnp.ndarray]:
-        """Shared builder for the training and validation losses.
+    def get_loss_fn(loss_config: dict) -> Callable[[Any, Any], jnp.ndarray]:
+        """Training loss: the huber of chi, the residual of the values and of the gradients in GP-fit error bars (trb_utils.huber_profile_loss).
 
-        Both losses operate on peak-normalized profiles: each target profile is
-        scaled so its largest value is 1, and the prediction is divided by the
-        same per-sample scale. This keeps the two channels comparable (ne is
-        ~0.5-4 in 1e20 m^-3, Te up to ~8 keV on C-Mod but ~1 on TCV) so neither
-        channel nor device dominates, and an error of 0.1 always means 10% of
-        the profile peak.
-
-        Measurement error bars (<v>_error / <v>_grad_error target vars, from
-        the GP profile fits) soften the VALIDATION residual only: the part of
-        the residual inside the error bar is down-weighted by
-        within_error_weight, the part beyond it is penalized at full weight, so
-        the validation metric still pulls toward the GP fit mean everywhere but
-        landing inside the error bars costs significantly less than missing
-        them. The training loss uses the raw residual, its robustness to fit
-        noise comes from the huber deltas alone. An error of 0 is the sentinel
-        for "no rigorous error quantification" and gives a zero-width bar,
-        which reduces to the plain residual loss. When the error / gradient
-        target vars are absent entirely the validation loss falls back to
-        zero-width error bars, and both losses fall back to finite-difference
-        gradient targets.
-
-        use_huber=True builds the training loss with the swept huber_delta /
-        huber_delta_grad (deltas read as fractional errors on the normalized
-        profiles). use_huber=False builds the validation loss as plain absolute
-        error with no deltas at all: huber loss shrinks monotonically as
-        delta -> 0, so a delta-dependent sweep metric would reward small deltas
-        instead of good predictions.
+        Summed over ne and Te, device-weighted.
+        The error bars are floored per device at train_chi_sigma_floors, taken from the case's own training data,
+        and huber_delta / huber_delta_grad are in units of the error bar.
+        The gradient targets are the GP-fit gradients, masked to rho below GRAD_RHO_MAX.
+        The swept deltas make this loss unfit for the sweep metric, validation uses get_val_loss_fn.
         """
-        if "device_weights" not in loss_config:
-            device_weights = dict.fromkeys(config.dataset_paths, 1.0)
-        else:
-            device_weights = loss_config["device_weights"]
-
-        # Weight of the profile-gradient term relative to the value term.
-        # Gradient agreement matters for downstream stability predictions, which
-        # depend on dTe/drho and dne/drho rather than the values themselves.
-        gradient_weight = loss_config.get("gradient_weight", 0.0)
-
-        if use_huber:
-            # Normalized gradients are still larger than normalized values
-            # (a peak-normalized pedestal can have d/drho of order 10), so the
-            # huber transition needs its own delta
-            huber_delta = loss_config["huber_delta"]
-            huber_delta_grad = loss_config.get("huber_delta_grad", 1.0)
-
-            def value_err(excess):
-                return optax.huber_loss(excess, delta=huber_delta)
-
-            def grad_err(excess):
-                return optax.huber_loss(excess, delta=huber_delta_grad)
-
-            def _residual(pred, targ, sigma):
-                # Training residual: plain distance to the GP fit mean,
-                # the error bars do not soften it
-                return jnp.abs(pred - targ)
-        else:
-
-            def value_err(excess):
-                return excess
-
-            grad_err = value_err
-
-            # Down-weighting of the residual inside the measurement error bar, read strictly
-            # a silent default here would change checkpoint selection without changing the case
-            # TODO(ZanderKeith): This was a poor design choice on my part. Should be doing chi metrics.
-            # I'm reporting on chi metrics in the presentation, must update this to match
-            within_error_weight = loss_config["within_error_weight"]
-
-            def _residual(pred, targ, sigma):
-                # Piecewise-linear shrink of the residual: full weight on the
-                # part beyond the error bar, within_error_weight on the part
-                # inside it. Continuous and monotone in |residual|, so the pull
-                # toward the GP fit mean never vanishes, it just weakens inside
-                # the bar. sigma is clamped at 0 so a degenerate negative error
-                # bar cannot inflate the residual
-                abs_residual = jnp.abs(pred - targ)
-                sigma = jnp.maximum(sigma, 0.0)
-                outside = jnp.maximum(abs_residual - sigma, 0.0)
-                inside = jnp.minimum(abs_residual, sigma)
-                return outside + within_error_weight * inside
-
-        def _sigma_from_targ(targ, var, scale):
-            # Error-bar target var, normalized like the profiles. An absent
-            # var behaves like the 0 sentinel (zero-width error bar)
-            if var in targ:
-                return targ[var].data / scale
-            return 0.0
+        device_weights = loss_config.get("device_weights", {})
+        sigma_floors = loss_config["train_chi_sigma_floors"]
 
         def loss_fn(pred, targ):
-            ne_targ = targ["ne20_rho"].data
-            te_targ = targ["Te_keV_rho"].data
-
-            # Peak-normalize per sample: scale comes from the target only and is
-            # applied to prediction and target alike, so a perfect prediction
-            # still gives zero loss
-            floor = ProfilePredictorTRB.PROFILE_SCALE_FLOOR
-            ne_scale = jnp.maximum(jnp.max(jnp.abs(ne_targ), axis=-1, keepdims=True), floor)
-            te_scale = jnp.maximum(jnp.max(jnp.abs(te_targ), axis=-1, keepdims=True), floor)
-
-            ne_sigma = _sigma_from_targ(targ, "ne20_rho_error", ne_scale)
-            te_sigma = _sigma_from_targ(targ, "Te_keV_rho_error", te_scale)
-
-            ne_err = value_err(_residual(pred.ne.data / ne_scale, ne_targ / ne_scale, ne_sigma))
-            te_err = value_err(_residual(pred.te.data / te_scale, te_targ / te_scale, te_sigma))
-
-            # Build per-sample device weight
+            rho = pred.ne[RADIAL_DIM].data
             ds_source_idx = targ["ds_source_idx"].data
-            sample_weights = jnp.ones(ds_source_idx.shape, dtype=ne_err.dtype)
-            for device, weight in device_weights.items():
-                sample_weights = jnp.where(
-                    ds_source_idx == config.ds_source_to_idx[device],
-                    weight,
-                    sample_weights,
+            sample_weights = per_sample_device_values(ds_source_idx, device_weights, 1.0)
+            loss = 0.0
+            for channel, pred_channel in (("n_e_1e20", pred.ne.data), ("t_e_keV", pred.te.data)):
+                value_error_var, grad_error_var = CHI_ERROR_VARS[channel]
+                loss = loss + huber_profile_loss(
+                    pred_channel,
+                    targ[channel].data,
+                    targ[value_error_var].data,
+                    targ[f"{channel}_gradient"].data,
+                    targ[grad_error_var].data,
+                    per_sample_sigma_floor(ds_source_idx, sigma_floors, value_error_var),
+                    per_sample_sigma_floor(ds_source_idx, sigma_floors, grad_error_var),
+                    rho,
+                    loss_config["huber_delta"],
+                    loss_config["huber_delta_grad"],
+                    loss_config["gradient_weight"],
                 )
-
-            # Broadcast sample weights across profile/time axes
-            while sample_weights.ndim < ne_err.ndim:
-                sample_weights = sample_weights[..., None]
-
-            rho = pred.ne.rho.data
-            ne_rho_loss = jnp.trapezoid(sample_weights * ne_err, x=rho)
-            te_rho_loss = jnp.trapezoid(sample_weights * te_err, x=rho)
-
-            loss = ne_rho_loss + te_rho_loss
-
-            if gradient_weight > 0.0:
-                # Finite-difference gradients of the normalized predictions at
-                # the rho midpoints (robust to non-uniform grids, no
-                # jnp.gradient spacing support needed)
-                d_rho = jnp.diff(rho)
-                rho_mid = 0.5 * (rho[:-1] + rho[1:])
-
-                ne_grad_pred = jnp.diff(pred.ne.data / ne_scale, axis=-1) / d_rho
-                te_grad_pred = jnp.diff(pred.te.data / te_scale, axis=-1) / d_rho
-
-                def _to_mid(arr):
-                    # Grid-point signal averaged to the rho midpoints, matching
-                    # the finite-difference prediction gradients
-                    return 0.5 * (arr[..., :-1] + arr[..., 1:])
-
-                # Gradient targets come from the GP-fit gradient signals when present
-                # (measured slope, smoother than differencing the values),
-                # otherwise fall back to finite differences of the value targets
-                if "ne20_rho_grad" in targ:
-                    ne_grad_targ = _to_mid(targ["ne20_rho_grad"].data) / ne_scale
-                else:
-                    ne_grad_targ = jnp.diff(ne_targ / ne_scale, axis=-1) / d_rho
-                if "Te_keV_rho_grad" in targ:
-                    te_grad_targ = _to_mid(targ["Te_keV_rho_grad"].data) / te_scale
-                else:
-                    te_grad_targ = jnp.diff(te_targ / te_scale, axis=-1) / d_rho
-
-                ne_grad_sigma = _sigma_from_targ(targ, "ne20_rho_grad_error", ne_scale)
-                te_grad_sigma = _sigma_from_targ(targ, "Te_keV_rho_grad_error", te_scale)
-                if not isinstance(ne_grad_sigma, float):
-                    ne_grad_sigma = _to_mid(ne_grad_sigma)
-                if not isinstance(te_grad_sigma, float):
-                    te_grad_sigma = _to_mid(te_grad_sigma)
-
-                ne_grad_err = sample_weights * grad_err(_residual(ne_grad_pred, ne_grad_targ, ne_grad_sigma))
-                te_grad_err = sample_weights * grad_err(_residual(te_grad_pred, te_grad_targ, te_grad_sigma))
-
-                # Gradient loss only counts for rho below GRAD_LOSS_RHO_MAX,
-                # the measured gradients beyond it are unreliable
-                grad_rho_mask = rho_mid < ProfilePredictorTRB.GRAD_LOSS_RHO_MAX
-
-                ne_grad_loss = jnp.trapezoid(grad_rho_mask * ne_grad_err, x=rho_mid)
-                te_grad_loss = jnp.trapezoid(grad_rho_mask * te_grad_err, x=rho_mid)
-
-                loss = loss + gradient_weight * (ne_grad_loss + te_grad_loss)
-
-            return loss
+            return sample_weights * loss
 
         return loss_fn
 
     @staticmethod
-    def get_loss_fn(loss_config: dict) -> Callable[[Any, Any], jnp.ndarray]:
-        """Training loss: huber on the raw peak-normalized residual.
-
-        No error-bar softening, so robustness to GP-fit noise comes from the huber deltas alone.
-        huber_delta and huber_delta_grad are swept hyperparameters,
-        so this loss must only be used for training.
-        Validation uses get_val_loss_fn, which is delta-free,
-        so the sweep metric stays comparable across delta values.
-        """
-        return ProfilePredictorTRB._make_profile_loss_fn(loss_config, use_huber=True)
-
-    @staticmethod
     def get_val_loss_fn(loss_config: dict) -> Callable[[Any, Any], jnp.ndarray]:
-        """Validation loss: error-bar-softened absolute error on peak-normalized profiles.
+        """Validation loss: chi, the residual in units of the GP-fit error bar (trb_utils.chi_profile_loss).
 
-        Shares device_weights and gradient_weight with the training loss so
-        validation weights samples consistently, but reads no huber deltas:
-        the sweep metric val/loss.mean must not depend on the swept deltas or
-        the sweep would drive them to their minimum to shrink the reported
-        number instead of improving predictions. Unlike the training loss it
-        down-weights the residual inside the GP-fit error bars
-        (within_error_weight), so checkpoint selection does not chase fit
-        noise the measurement cannot distinguish.
+        Summed over ne and Te, value chi plus gradient_weight times gradient chi, device-weighted.
+        The error bars are floored per device at chi_sigma_floors from the loss config.
+        Chi reads no huber delta, so the sweep metric val/loss.mean cannot be gamed by shrinking one.
+        A diverged (non-finite) prediction scores the chi of its finite points plus divergence_penalty_val,
+        so one diverged sample cannot turn val/loss.mean NaN (trb_utils.replace_diverged_profiles).
         """
-        return ProfilePredictorTRB._make_profile_loss_fn(loss_config, use_huber=False)
+        device_weights = loss_config.get("device_weights", {})
+        gradient_weight = loss_config["gradient_weight"]
+        sigma_floors = loss_config["chi_sigma_floors"]
+        divergence_penalty_val = loss_config["divergence_penalty_val"]
+
+        def loss_fn(pred, targ):
+            rho = pred.ne[RADIAL_DIM].data
+            ds_source_idx = targ["ds_source_idx"].data
+            sample_weights = per_sample_device_values(ds_source_idx, device_weights, 1.0)
+            ne_pred, te_pred, diverged = replace_diverged_profiles(pred.ne.data, pred.te.data, targ["n_e_1e20"].data, targ["t_e_keV"].data)
+            loss = divergence_penalty_val * diverged
+            for channel, pred_channel in (("n_e_1e20", ne_pred), ("t_e_keV", te_pred)):
+                targ_channel = targ[channel].data
+                value_error_var, grad_error_var = CHI_ERROR_VARS[channel]
+                value_floor = per_sample_sigma_floor(ds_source_idx, sigma_floors, value_error_var)
+                grad_floor = per_sample_sigma_floor(ds_source_idx, sigma_floors, grad_error_var)
+                loss = loss + chi_profile_loss(
+                    pred_channel,
+                    targ_channel,
+                    targ[value_error_var].data,
+                    targ[f"{channel}_gradient"].data,
+                    targ[grad_error_var].data,
+                    value_floor,
+                    grad_floor,
+                    rho,
+                    gradient_weight,
+                )
+            return sample_weights * loss
+
+        return loss_fn
 
     @staticmethod
     def get_optimizer(optimizer_config: dict) -> optax.GradientTransformation:
-        # Standard AdamW plus a global-norm cap
-        # the differentiated TORAX solve can spike gradients and NaN a run without it
-        return optax.chain(
-            optax.clip_by_global_norm(optimizer_config.get("grad_clip_max_norm", 1.0)),
-            make_exponential_adamw(optimizer_config),
-        )
+        # popsim's Trainer chains clip_by_global_norm(0.5) before it
+        return make_exponential_adamw(optimizer_config)
 
     @staticmethod
     def get_trainable_getter(model_init_config: dict) -> Callable[[Any], Any] | None:
         """Optionally return a function that takes in the trainable parameters of your model and returns the trainable parameters."""
 
         def get_trainable_shape_init(module: ProfilePredictorShapeInit):
-            # The normalizer statistics are never trainable,
-            # the shapes only trainable when freeze_shapes is off
-            # Everything else trains.
-            if model_init_config["freeze_shapes"]:
-                frozen = (module.te_shapes, module.ne_shapes, module.normalizer)
-            else:
-                frozen = (module.normalizer,)
-            ids_of_frozen_leaves = [id(x) for x in jax.tree.leaves(frozen)]
-            return [x for x in jax.tree.leaves(module) if id(x) not in ids_of_frozen_leaves]
+            # The network, plus the shape points when freeze_shapes is off.
+            # Never a shape's rho grid (InterpedLinearBasis.grid) or the normalizer statistics
+            trainable = [module.nn]
+            if not model_init_config["freeze_shapes"]:
+                trainable += [shape.coeffs for shape in (*module.te_shapes, *module.ne_shapes)]
+            ids_of_trainable_leaves = {id(x) for x in jax.tree.leaves(trainable)}
+            return [x for x in jax.tree.leaves(module) if id(x) in ids_of_trainable_leaves]
 
         def get_trainable_nn(module: ProfilePredictorUnstructuredNN):
             ids_of_nn_leaves = [id(x) for x in jax.tree.leaves(module.nn)]
@@ -493,7 +423,7 @@ class ProfilePredictorTRB(TrainRunBuilder):
             ids_of_last_layer_leaves = [id(x) for x in jax.tree.leaves(last_layers)]
             return [x for x in jax.tree.leaves(module) if id(x) in ids_of_last_layer_leaves]
 
-        if model_init_config["model_type"] in ["shape-init-pca", "shape-init-kmeans"]:
+        if model_init_config["model_type"] in MODEL_TYPES_WITH_SHAPES:
             getter = get_trainable_shape_init
         elif model_init_config["model_type"] in ["mlp", "reservoir"]:
             # For the reservoir, only the readout (module.nn) is trainable, the
@@ -504,7 +434,7 @@ class ProfilePredictorTRB(TrainRunBuilder):
         else:
             raise ValueError(f"Invalid model type {model_init_config['model_type']}")
 
-        if model_init_config.get("domain_adaptation") == "transfer":
+        if model_init_config["domain_adaptation"] == "transfer":
             return get_trainable_transfer
         return getter
 
@@ -515,45 +445,39 @@ class ProfilePredictorTRB(TrainRunBuilder):
             return None
 
         # Shares device_weights / gradient_weight with the training loss_config,
-        # but builds the delta-free validation loss: huber_delta is a swept
-        # hyperparameter and must not leak into the sweep metric
+        # but scores chi, which no swept delta can shrink
         return make_loss_eval_suite(ProfilePredictorTRB.get_val_loss_fn(suite_config["loss_config"]))
 
     @staticmethod
-    def get_test_eval_suite(suite_config) -> EvaluationSuite:
+    def get_test_eval_suite(suite_config) -> EvaluationSuite | None:
         """Evaluation suite for testing after training."""
+        return ProfilePredictorTRB.make_test_eval_suite(suite_config, fresh_only=False)
+
+    @staticmethod
+    def make_test_eval_suite(suite_config, fresh_only: bool) -> EvaluationSuite | None:
+        """The test suite, with fresh_only scoring only the timeslices whose target is a fresh profile.
+
+        The transport study keeps forward-filled timeslices for contiguous rollouts,
+        its targets there are stale measurements, so it scores with fresh_only.
+        The chi reads gradient_weight and chi_sigma_floors from the suite's loss_config.
+        None for sweep trials, which run no test evals.
+        """
+        if not suite_config:
+            return None
+        gradient_weight = suite_config["loss_config"]["gradient_weight"]
+        sigma_floors = suite_config["loss_config"]["chi_sigma_floors"]
 
         def study_results(eval_data: EvalData) -> xr.Dataset:
             """Calculate final study results for profile prediction.
-                - Target vs predicted ne20_rho and Te_keV_rho profiles
+                - Target vs predicted n_e_1e20 and t_e_keV profiles
                 - Per-timeslice profile-integrated absolute/relative errors
+                - Per-timeslice chi summed over the channels (error_chi_value_ts, error_chi_grad_ts),
+                  and error_chi_ts = value + gradient_weight * grad, the validation loss less the device weight
+                - error_diverged_ts: 1 where the prediction diverged (non-finite or beyond DIVERGED_PROFILE_LIMIT), 0 where not,
+                  NaN without a target
                 - Per-shot time-integrated errors
             Keeps shot and ds_source coordinates for downstream analysis.
             """
-
-            def _unstack_and_rename_time(da: xr.DataArray) -> xr.DataArray:
-                da = da.unstack("sample")
-                # Keep episode/time axes even when they have length 1.
-                # Single-shot eval splits are valid and should retain the shot dimension.
-                protected_dims = {EPISODE_DIM, TIME_DIM, TIME_DIM + "_input"}
-                squeeze_dims = [d for d, n in da.sizes.items() if n == 1 and d not in protected_dims]
-                if squeeze_dims:
-                    da = da.squeeze(dim=squeeze_dims, drop=True)
-                # Time-dependent dataloaders suffix every input-side dim
-                # (the transport study reuses this suite)
-                # rename them back (time_idx_input -> time_idx, rho_input -> rho)
-                # so targets and predictions share one grid
-                # No-op for time-independent evals.
-                renames = {d: d.removesuffix("_input") for d in da.dims if isinstance(d, str) and d.endswith("_input")}
-                if renames:
-                    da = da.rename(renames)
-                return da
-
-            def _get_first_present(ds: xr.Dataset, candidates: list[str]) -> xr.DataArray:
-                for name in candidates:
-                    if name in ds.data_vars:
-                        return ds[name]
-                raise KeyError(f"None of the candidate output vars were found: {candidates}")
 
             def _ensure_rho_dim(pred: xr.DataArray, targ: xr.DataArray) -> xr.DataArray:
                 # Time-dependent stepper outputs are bare arrays whose profile
@@ -561,55 +485,80 @@ class ProfilePredictorTRB(TrainRunBuilder):
                 # (the transport study reuses this suite)
                 # Identify it as the one dim the target does not have and rename it,
                 # so the error math never silently outer-broadcasts pred rho against targ rho
-                if "rho" in pred.dims:
+                if RADIAL_DIM in pred.dims:
                     return pred
                 extra = [d for d in pred.dims if d not in targ.dims]
-                if len(extra) != 1 or pred.sizes[extra[0]] != targ.sizes["rho"]:
+                if len(extra) != 1 or pred.sizes[extra[0]] != targ.sizes[RADIAL_DIM]:
                     raise ValueError(f"Cannot identify the profile axis of the prediction, dims {pred.dims} vs target {targ.dims}")
-                return pred.rename({extra[0]: "rho"}).assign_coords(rho=targ["rho"].values)
+                return pred.rename({extra[0]: RADIAL_DIM}).assign_coords({RADIAL_DIM: targ[RADIAL_DIM].values})
 
-            # Targets from input dataset
-            ne_targ = _unstack_and_rename_time(eval_data.input_ds["ne20_rho"])
-            te_targ = _unstack_and_rename_time(eval_data.input_ds["Te_keV_rho"])
-            time_2d = _unstack_and_rename_time(eval_data.input_ds[TIME_COORD])
+            ne_targ = unstack_samples(eval_data.input_ds["n_e_1e20"])
+            te_targ = unstack_samples(eval_data.input_ds["t_e_keV"])
+            time_2d = unstack_samples(eval_data.input_ds[TIME_COORD])
+            ds_source = ds_source_per_shot(eval_data.input_ds["ds_source"], ne_targ.sizes[EPISODE_DIM])
 
-            # Predictions from output dataset.
+            # The time-dependent modules (the transport study) nest their outputs under output.
+            output_prefix = "" if "ne" in eval_data.output_ds else "output."
+            ne_pred = _ensure_rho_dim(unstack_samples(eval_data.output_ds[f"{output_prefix}ne"]), ne_targ)
+            te_pred = _ensure_rho_dim(unstack_samples(eval_data.output_ds[f"{output_prefix}te"]), te_targ)
 
-            ne_pred_raw = _get_first_present(
-                eval_data.output_ds,
-                ["ne", "output.ne", "output.profile_predictor_output.ne"],
-            )
-            te_pred_raw = _get_first_present(
-                eval_data.output_ds,
-                ["te", "output.te", "output.profile_predictor_output.te"],
-            )
-            ne_pred = _ensure_rho_dim(_unstack_and_rename_time(ne_pred_raw), ne_targ)
-            te_pred = _ensure_rho_dim(_unstack_and_rename_time(te_pred_raw), te_targ)
+            # A prediction with any point in either channel non-finite or beyond DIVERGED_PROFILE_LIMIT diverged,
+            # as in the validation losses (replace_diverged_profiles), the comparison False for NaN and inf too.
+            # Its errors are NaN, never inf, and error_diverged_ts counts it instead,
+            # outside the freshness mask like the validation divergence penalty
+            ne_pred_valid = (xr.apply_ufunc(np.abs, ne_pred) <= DIVERGED_PROFILE_LIMIT).all(RADIAL_DIM)
+            te_pred_valid = (xr.apply_ufunc(np.abs, te_pred) <= DIVERGED_PROFILE_LIMIT).all(RADIAL_DIM)
+            mask_pred_valid = ne_pred_valid & te_pred_valid
+            mask_targ_present = ne_targ.notnull().all(RADIAL_DIM) & te_targ.notnull().all(RADIAL_DIM)
+            error_diverged_ts = (~mask_pred_valid).astype(float).where(mask_targ_present)
+            mask_scored = mask_pred_valid
+            if fresh_only:
+                # Stale timeslices score NaN, every error below and the shot integrals then skip them
+                mask_fresh = unstack_samples(eval_data.input_ds["fresh_profile"]) == 1
+                mask_scored = mask_scored & mask_fresh
 
             # Per-point profile errors
-            ne_error_abs_profile = xr.apply_ufunc(np.abs, ne_pred - ne_targ)
-            te_error_abs_profile = xr.apply_ufunc(np.abs, te_pred - te_targ)
+            ne_error_abs_profile = xr.apply_ufunc(np.abs, ne_pred - ne_targ).where(mask_scored)
+            te_error_abs_profile = xr.apply_ufunc(np.abs, te_pred - te_targ).where(mask_scored)
 
             # Softening floor scales with each profile's own peak (per timeslice)
             # instead of a fixed absolute value, so it means the same relative
             # amount for ne and Te on every device (see REL_ERROR_FLOOR_FRAC)
             floor_frac = ProfilePredictorTRB.REL_ERROR_FLOOR_FRAC
-            scale_floor = ProfilePredictorTRB.PROFILE_SCALE_FLOOR
-            ne_peak = np.maximum(xr.apply_ufunc(np.abs, ne_targ).max(dim="rho"), scale_floor)
-            te_peak = np.maximum(xr.apply_ufunc(np.abs, te_targ).max(dim="rho"), scale_floor)
+            scale_floor = PROFILE_SCALE_FLOOR
+            ne_peak = np.maximum(xr.apply_ufunc(np.abs, ne_targ).max(dim=RADIAL_DIM), scale_floor)
+            te_peak = np.maximum(xr.apply_ufunc(np.abs, te_targ).max(dim=RADIAL_DIM), scale_floor)
 
             ne_error_rel_profile = ne_error_abs_profile / (xr.apply_ufunc(np.abs, ne_targ) + floor_frac * ne_peak)
             te_error_rel_profile = te_error_abs_profile / (xr.apply_ufunc(np.abs, te_targ) + floor_frac * te_peak)
 
             # Integrate profile error over rho for each timeslice
-            ne_error_abs_ts = ne_error_abs_profile.integrate("rho")
-            te_error_abs_ts = te_error_abs_profile.integrate("rho")
-            ne_error_rel_ts = ne_error_rel_profile.integrate("rho")
-            te_error_rel_ts = te_error_rel_profile.integrate("rho")
+            ne_error_abs_ts = ne_error_abs_profile.integrate(RADIAL_DIM)
+            te_error_abs_ts = te_error_abs_profile.integrate(RADIAL_DIM)
+            ne_error_rel_ts = ne_error_rel_profile.integrate(RADIAL_DIM)
+            te_error_rel_ts = te_error_rel_profile.integrate(RADIAL_DIM)
 
             # Combined timeslice errors (equal weighting between ne and Te channels)
             error_abs_ts = 0.5 * (ne_error_abs_ts + te_error_abs_ts)
             error_rel_ts = 0.5 * (ne_error_rel_ts + te_error_rel_ts)
+
+            # Chi of the validation loss (chi_profile_loss), summed over the channels
+            rho = ne_targ[RADIAL_DIM].values
+            shots = ne_targ[EPISODE_DIM].values
+            chi_value_ts = xr.zeros_like(error_abs_ts)
+            chi_grad_ts = xr.zeros_like(error_abs_ts)
+            for channel, pred_channel, targ_channel in (("n_e_1e20", ne_pred, ne_targ), ("t_e_keV", te_pred, te_targ)):
+                value_error_var, grad_error_var = CHI_ERROR_VARS[channel]
+                sigma = unstack_samples(eval_data.input_ds[value_error_var])
+                grad_targ = unstack_samples(eval_data.input_ds[f"{channel}_gradient"])
+                grad_sigma = unstack_samples(eval_data.input_ds[grad_error_var])
+                value_floor = _per_shot_sigma_floor(sigma_floors, ds_source, value_error_var, shots)
+                grad_floor = _per_shot_sigma_floor(sigma_floors, ds_source, grad_error_var, shots)
+                chi_value_ts = chi_value_ts + _profile_chi(chi_value, (pred_channel, targ_channel, sigma), value_floor, rho)
+                chi_grad_ts = chi_grad_ts + _profile_chi(chi_gradient, (pred_channel, targ_channel, grad_targ, grad_sigma), grad_floor, rho)
+            error_chi_value_ts = chi_value_ts.where(mask_scored)
+            error_chi_grad_ts = chi_grad_ts.where(mask_scored)
+            error_chi_ts = error_chi_value_ts + gradient_weight * error_chi_grad_ts
 
             # Integrate over time for each shot, handling NaN-padded entries safely
             ne_error_abs_shot = integrate_error_over_time(ne_error_abs_ts, time_2d)
@@ -620,39 +569,22 @@ class ProfilePredictorTRB(TrainRunBuilder):
             error_abs_shot = 0.5 * (ne_error_abs_shot + te_error_abs_shot)
             error_rel_shot = 0.5 * (ne_error_rel_shot + te_error_rel_shot)
 
-            # Keep ds_source coord aligned to shot
-            ds_source = eval_data.input_ds["ds_source"]
-            if "sample" in ds_source.dims:
-                ds_source_unstacked = ds_source.unstack("sample")
-                if EPISODE_DIM in ds_source_unstacked.dims and ds_source_unstacked.ndim > 1:
-                    other_dims = [d for d in ds_source_unstacked.dims if d != EPISODE_DIM]
-                    ds_source_stacked = ds_source_unstacked.stack(_other=other_dims).transpose(EPISODE_DIM, "_other")
-                    ds_source_vals = ds_source_stacked.values
-                    ds_source_valid = ds_source_stacked.notnull().values
-                    ds_source_array = np.array(
-                        [
-                            row[np.flatnonzero(valid_mask)[0]] if np.any(valid_mask) else np.nan
-                            for row, valid_mask in zip(ds_source_vals, ds_source_valid, strict=True)
-                        ],
-                        dtype=object,
-                    )
-                else:
-                    ds_source_array = ds_source_unstacked.values
-            else:
-                ds_source_array = np.array([ds_source.values.item() for _ in range(ne_targ.sizes[EPISODE_DIM])])
-
             ds = xr.Dataset(
                 data_vars={
-                    "ne20_rho_targ": ne_targ,
-                    "ne20_rho_pred": ne_pred,
-                    "Te_keV_rho_targ": te_targ,
-                    "Te_keV_rho_pred": te_pred,
+                    "n_e_1e20_targ": ne_targ,
+                    "n_e_1e20_pred": ne_pred,
+                    "t_e_keV_targ": te_targ,
+                    "t_e_keV_pred": te_pred,
                     "ne_error_abs_ts": ne_error_abs_ts,
                     "te_error_abs_ts": te_error_abs_ts,
                     "ne_error_rel_ts": ne_error_rel_ts,
                     "te_error_rel_ts": te_error_rel_ts,
                     "error_abs_ts": error_abs_ts,
                     "error_rel_ts": error_rel_ts,
+                    "error_chi_value_ts": error_chi_value_ts,
+                    "error_chi_grad_ts": error_chi_grad_ts,
+                    "error_chi_ts": error_chi_ts,
+                    "error_diverged_ts": error_diverged_ts,
                     "ne_error_abs_shot": ne_error_abs_shot,
                     "te_error_abs_shot": te_error_abs_shot,
                     "ne_error_rel_shot": ne_error_rel_shot,
@@ -661,17 +593,6 @@ class ProfilePredictorTRB(TrainRunBuilder):
                     "error_rel_shot": error_rel_shot,
                 }
             )
+            return ds.assign_coords(ds_source=(EPISODE_DIM, ds_source)).drop_vars(["quantile", "input_batch"], errors="ignore")
 
-            ds = ds.assign_coords(ds_source=(EPISODE_DIM, ds_source_array))
-            ds = ds.drop_vars("quantile", errors="ignore")
-            ds = ds.drop_vars("input_batch", errors="ignore")
-            return ds
-
-        if suite_config:
-            eval_suite = {
-                "study_results": study_results,
-            }
-            return eval_suite
-        else:
-            # Hyperparameter tuning, do not run test evals
-            return None
+        return {"study_results": study_results}

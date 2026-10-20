@@ -4,14 +4,16 @@ import jax
 import jax.numpy as jnp
 from popsim.module_base import TimeIndepModule
 
-from transport_study.modules.normalization import InputNormalizer
+from transport_study.modules.normalization import N_FEATURES, InputNormalizer
+from transport_study.modules.power_balance.scalar_power import leaky_softplus
 
 
 class RadiatedPower(TimeIndepModule):
     """Model that predicts radiated power from plasma parameters.
 
-    P_rad = ne20 * softplus(network),
-    i.e. the network predicts a positive per-density radiation factor
+    P_rad = ne20 * leaky_softplus(network),
+    i.e. the network predicts a per-density radiation factor,
+    positive except for the leak that keeps a very negative network learning
 
     Consumes PHYSICAL inputs and normalizes them internally with its own normalizer,
     so its NN weights and normalization statistics always travel together through checkpoints
@@ -26,7 +28,7 @@ class RadiatedPower(TimeIndepModule):
 
     @chex.dataclass
     class Output:
-        P_rad_MW_pred: float
+        power_radiated_MW_pred: float
         debug_info: dict
 
     def __call__(self, inputs: InputNormalizer.Inputs) -> Output:
@@ -36,10 +38,12 @@ class RadiatedPower(TimeIndepModule):
 
         features = self.normalizer(inputs)
         nn_out = self.nn(features.to_vec())
-        p_rad = (jnp.abs(inputs.ne20_line_avg) * jax.nn.softplus(nn_out)).squeeze()
+        density_magnitude = jnp.abs(inputs.n_e_line_average_1e20)
+        radiation_factor = leaky_softplus(nn_out)
+        p_rad = (density_magnitude * radiation_factor).squeeze()
 
         output = RadiatedPower.Output(
-            P_rad_MW_pred=p_rad,
+            power_radiated_MW_pred=p_rad,
             debug_info={
                 "nn_out": nn_out.squeeze(),
             },
@@ -50,16 +54,14 @@ class RadiatedPower(TimeIndepModule):
     @classmethod
     def init(
         cls,
-        in_size: int,
-        out_size: int,
         nn_width: int,
         nn_depth: int,
         prng_seed: int,
         normalizer: InputNormalizer,
     ) -> "RadiatedPower":
         nn = eqx.nn.MLP(
-            in_size=in_size,
-            out_size=out_size,
+            in_size=N_FEATURES,
+            out_size=1,
             width_size=nn_width,
             depth=nn_depth,
             key=jax.random.PRNGKey(prng_seed),

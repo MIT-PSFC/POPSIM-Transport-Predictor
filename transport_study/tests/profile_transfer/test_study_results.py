@@ -5,14 +5,13 @@ import pytest
 import xarray as xr
 
 from transport_study import PACKAGE_ROOT
-from transport_study.profile_transfer.profile_study import ProfileStudy, run_study
-from transport_study.profile_transfer.study_metrics import (
-    STAGE_AGG_NAMES,
-    collected_metrics_path,
-)
+from transport_study.orchestration.stages import STAGE_AGG_NAMES
+from transport_study.profile_transfer.profile_study import ProfileStudy
+from transport_study.tests.sample_data import SAMPLE_DIR, requires_sample_data
 
 
 @pytest.mark.slow()
+@requires_sample_data
 class TestCmodToCmod:
     """Test to ensure all the important results are generated for a cmod to cmod profile transfer study"""
 
@@ -25,13 +24,12 @@ class TestCmodToCmod:
             study_name="test_results_cmod_to_cmod_plots",
             working_dir_base=Path(working_dir_base),
             dataset_paths={
-                "cmod-low1": PACKAGE_ROOT / "datasets" / "sample" / "cmod-low1.nc",
-                "cmod-low2": PACKAGE_ROOT / "datasets" / "sample" / "cmod-low2.nc",
-                "cmod-high": PACKAGE_ROOT / "datasets" / "sample" / "cmod-high.nc",
+                "cmod-low1": SAMPLE_DIR / "cmod-low1.nc",
+                "cmod-low2": SAMPLE_DIR / "cmod-low2.nc",
+                "cmod-high": SAMPLE_DIR / "cmod-high.nc",
             },
             target_device="cmod-high",
             debug=True,
-            dry_run=False,
             # Must comfortably exceed target_test_set_size so a train candidate
             # pool remains after the test split (sample datasets have 100 shots)
             max_ds_size=100,
@@ -45,7 +43,6 @@ class TestCmodToCmod:
                 "mlp",
                 "reservoir",
                 "torax-constant",
-                "torax-cgm",
                 "torax-gyrobohm",
                 "torax-qlknn",
             ],
@@ -55,12 +52,12 @@ class TestCmodToCmod:
                 "cmod-low1_cmod-low2",
             ],
             domain_adaptation_methods=[None, "weighted", "transfer"],
-            num_target_shots_options=[0, 1, 10, -1],
+            num_target_shots_options=[0, 1, 10],
             target_test_set_size=60,
         )
 
         # Run study, reusing the same working directory to test that results are not overwritten and figures are regenerated
-        run_study(
+        ProfileStudy.run_study(
             config=study_config,
             enable_parallelism=True,
             skip_tuning=True,
@@ -78,7 +75,7 @@ class TestCmodToCmod:
         assert any((figure_dir / "data_visualization" / "domain_overlap").glob("*.png")), "Data visualization figures were not generated"
 
         # Stage-resolved metrics collected and cached for every finished case
-        metrics_path = collected_metrics_path(study)
+        metrics_path = study.collected_metrics_path()
         assert metrics_path.exists(), "collected_metrics.nc was not generated"
         metrics_ds = xr.load_dataset(metrics_path)
         assert list(metrics_ds["stage"].values) == list(STAGE_AGG_NAMES)

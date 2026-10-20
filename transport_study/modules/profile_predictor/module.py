@@ -4,29 +4,28 @@ import chex
 import equinox as eqx
 import jax
 import jax.numpy as jnp
-import matplotlib.pyplot as plt
 import numpy as np
 import xarray as xr
-from jaxtyping import Array
+from jaxtyping import Array, ArrayLike
 from loguru import logger
 from popsim import TimeIndepModule
 from popsim.basis import Basis1DProtocol, BSplineBasis, InterpedLinearBasis
-from popsim.cfspopcon_jax.current_drive import calc_f_shaping, calc_q_star
-from popsim.cfspopcon_jax.geometry import calc_plasma_volume
 from popsim.math_utils import safe_log
 from popsim.ml.rtd_mlp import Activation, RtdMLP
-from scipy.constants import epsilon_0, eV, mu_0
 
+from transport_study import RADIAL_DIM
+from transport_study.modules import plasma_parameters
 from transport_study.modules.normalization import (
     FeatureNormalizer,
     feature_fit_arrays,
+    flat_columns,
     make_feature_normalizer,
 )
 
 
 class ProfileShape(TimeIndepModule):
     """
-    A module defining a profile shape on the normalized minor radius (rho) grid [0, 1].
+    A module defining a profile shape on the rho_tor_norm grid [0, 1].
 
     The profile shape can be specified either directly with points on the rho grid or with a set of coefficients for a B-spline basis.
     """
@@ -67,34 +66,11 @@ class ProfileShape(TimeIndepModule):
         self,
         n_normalize: int = 100,
     ) -> float:
-        """Calculate the integral of the profile shape."""
-        rho_norm = jnp.linspace(0, 1.2, n_normalize)
+        """Integral of the profile shape over the rho grid domain [0, 1], where the data shapes have unit integral."""
+        rho_norm = jnp.linspace(0, 1, n_normalize)
         vals_rho_norm = self.basis(self.coeffs, rho_norm)
         integral = jnp.trapezoid(vals_rho_norm, rho_norm)
         return integral
-
-    def visualize(self, rho: Array = None, ax=None):
-        """Visualize the profile shape and the components"""
-        if rho is None:
-            rho = jnp.linspace(0, 1.2, 100)
-        # Calculate the profile shape and its components
-        profile_shape = self(rho)
-
-        # Create a new figure and axis if none are provided
-        if ax is None:
-            _fig, ax = plt.subplots()
-
-        # Plot the overall profile shape
-        ax.plot(rho, profile_shape, label="Profile Shape", color="black", linewidth=2)
-
-        # Add labels and legend
-        ax.set_xlabel("rho")
-        ax.set_ylabel("Profile value")
-        ax.legend()
-
-        # Display the plot if a new figure was created
-        if ax is None:
-            plt.show()
 
     @classmethod
     def make_bspline(cls, coeffs: Array, normalize: bool = True) -> "ProfileShape":
@@ -113,7 +89,7 @@ class ProfileShape(TimeIndepModule):
         return cls(basis=basis, coeffs=coeffs, normalize=normalize)
 
     @classmethod
-    def make_points(cls, points: Array, grid: Array, normalize: bool = True) -> "ProfileShape":
+    def make_points(cls, points: Array, grid: Array | np.ndarray, normalize: bool = True) -> "ProfileShape":
         """Create a ProfileShape with points on the grid. To evaluate the profile shape on an arbitrary grid, we use interpolation.
 
         Args:
@@ -143,129 +119,133 @@ NN_INPUT_NAMES = (
     "epsilon",
     "f_G",
     "aB0",
-    "betan",
-    "kappa",
-    "delta_top",
-    "delta_bot",
+    "beta_tor_norm",
+    "elongation",
+    "triangularity_upper",
+    "triangularity_lower",
     "log_nu_star",
 )
 
 # Dataset variables Inputs.nn_inputs is derived from
 NN_INPUT_SOURCE_VARS = (
-    "Ip_MA",
-    "B0",
-    "betan",
-    "ne20_line_avg",
-    "R0",
-    "a_minor",
-    "kappa",
-    "delta_top",
-    "delta_bot",
+    "ip_MA",
+    "b0",
+    "b_geo",
+    "beta_tor_norm",
+    "n_e_line_average_1e20",
+    "geometric_axis_r",
+    "minor_radius",
+    "elongation",
+    "triangularity_upper",
+    "triangularity_lower",
 )
 
 
+class DerivedPlasmaParameters:
+    """Dimensionless parameters shared by the profile and transport Inputs, which both carry the fields read here."""
+
+    @property
+    def epsilon(self):
+        return plasma_parameters.inverse_aspect_ratio(self.minor_radius, self.geometric_axis_r)
+
+    @property
+    def q_star(self):
+        return plasma_parameters.q_star(
+            self.ip_MA,
+            self.b_geo,
+            self.geometric_axis_r,
+            self.minor_radius,
+            self.elongation,
+            self.triangularity_upper,
+            self.triangularity_lower,
+        )
+
+    @property
+    def fGW(self):
+        return plasma_parameters.greenwald_fraction(self.n_e_line_average_1e20, self.ip_MA, self.minor_radius)
+
+    @property
+    def aB0(self):
+        return plasma_parameters.a_b0(self.minor_radius, self.b_geo)
+
+    @property
+    def volume_approx(self):
+        return plasma_parameters.volume_approx(self.geometric_axis_r, self.minor_radius, self.elongation)
+
+    def beta_tor_of(self, beta_tor_norm: ArrayLike) -> ArrayLike:
+        """Toroidal beta as a fraction, from the IMAS percent beta_tor_norm with b0 at r0."""
+        return plasma_parameters.beta_tor_from_beta_tor_norm(beta_tor_norm, self.ip_MA, self.minor_radius, self.b0)
+
+    def te_approx_of(self, beta_tor: ArrayLike) -> ArrayLike:
+        """Single-fluid temperature estimate <p> / n_e [keV] of a toroidal beta."""
+        return plasma_parameters.te_approx_keV(beta_tor, self.b0, self.n_e_line_average_1e20)
+
+    def nu_star_of(self, te_keV: ArrayLike) -> ArrayLike:
+        return plasma_parameters.nu_star(te_keV, self.n_e_line_average_1e20, self.q_star, self.geometric_axis_r, self.epsilon)
+
+
 @chex.dataclass
-class Inputs:
-    Ip: float  # Plasma current [MA]
-    B0: float  # On-axis toroidal field [T]
-    betan: float  # Normalized beta [-]
-    ne20_line_avg: float  # line-averaged electron density [10^20 m^-3]
-    R0: float  # Geometric major radius [m]
-    a_minor: float  # Minor radius [m]
-    kappa: float  # Elongation [-]
-    delta_top: float  # Upper triangularity [-]
-    delta_bot: float  # Bottom triangularity [-]
+class Inputs(DerivedPlasmaParameters):
+    ip_MA: float  # Plasma current [MA]
+    b0: float  # Vacuum toroidal field at r0, the one IMAS normalizes beta_tor_norm with [T]
+    b_geo: float  # Vacuum toroidal field at the geometric axis [T]
+    beta_tor_norm: float  # Normalized beta [-]
+    n_e_line_average_1e20: float  # line-averaged electron density [10^20 m^-3]
+    geometric_axis_r: float  # Geometric major radius [m]
+    minor_radius: float  # Minor radius [m]
+    elongation: float  # Elongation [-]
+    triangularity_upper: float  # Upper triangularity [-]
+    triangularity_lower: float  # Bottom triangularity [-]
     ds_source_idx: float  # Device index selecting per-device normalization statistics
 
     # Other
-    rho: Array  # Normalized minor radius coordinate to evaluate the profiles at
+    rho: Array  # rho_tor_norm values to evaluate the profiles at
 
     @classmethod
     def from_dataset(cls, ds: xr.Dataset, rho: Array) -> "Inputs":
         return cls(
-            Ip=ds["Ip_MA"].data,
-            B0=ds["B0"].data,
-            betan=ds["betan"].data,
-            ne20_line_avg=ds["ne20_line_avg"].data,
-            R0=ds["R0"].data,
-            a_minor=ds["a_minor"].data,
-            kappa=ds["kappa"].data,
-            delta_top=ds["delta_top"].data,
-            delta_bot=ds["delta_bot"].data,
+            ip_MA=ds["ip_MA"].data,
+            b0=ds["b0"].data,
+            b_geo=ds["b_geo"].data,
+            beta_tor_norm=ds["beta_tor_norm"].data,
+            n_e_line_average_1e20=ds["n_e_line_average_1e20"].data,
+            geometric_axis_r=ds["geometric_axis_r"].data,
+            minor_radius=ds["minor_radius"].data,
+            elongation=ds["elongation"].data,
+            triangularity_upper=ds["triangularity_upper"].data,
+            triangularity_lower=ds["triangularity_lower"].data,
             ds_source_idx=ds["ds_source_idx"].data,
             rho=rho,
         )
 
     @property
-    def epsilon(self):
-        return self.a_minor / self.R0
-
-    @property
-    def q_star(self):
-        delta = (self.delta_top + self.delta_bot) / 2
-        f_shaping = calc_f_shaping(
-            self.epsilon,
-            self.kappa,
-            delta,
-        )
-        q_star = calc_q_star(self.B0, self.R0, self.epsilon, self.Ip, f_shaping)
-        return q_star
-
-    @property
-    def fGW(self):
-        greenwald_limit = self.Ip / (jnp.pi * self.a_minor**2)
-        return self.ne20_line_avg / greenwald_limit
-
-    @property
-    def aB0(self):
-        return self.a_minor * self.B0
-
-    @property
-    def volume_approx(self):
-        return calc_plasma_volume(
-            major_radius=self.R0,
-            inverse_aspect_ratio=self.epsilon,
-            areal_elongation=self.kappa,
-        )
-
-    @property
     def beta(self):
-        # betan follows the percent Troyon convention (beta[%] * a*B0/Ip)
-        # divide by 100 to return beta as a true fraction
-        return self.betan * self.Ip / (self.a_minor * self.B0) / 100.0
+        """Toroidal beta as a fraction of the measured beta_tor_norm."""
+        return self.beta_tor_of(self.beta_tor_norm)
 
     @property
     def te_approx(self):
-        pressure_Pa = self.beta * self.B0**2 / (2 * mu_0)
-        pressure_eV = pressure_Pa / eV
-        pressure_keV20 = pressure_eV / 1e3 / 1e20
-        temp_keV = pressure_keV20 / self.ne20_line_avg
-        return temp_keV
+        """Single-fluid temperature estimate <p> / n_e [keV]."""
+        return self.te_approx_of(self.beta)
 
     @property
     def w_approx(self):
-        # Beta-derived stored energy estimate [MJ], W = (3/2) p V
-        pressure_Pa = self.beta * self.B0**2 / (2 * mu_0)
-        return 1.5 * pressure_Pa * self.volume_approx / 1e6
+        """Stored energy [MJ] of beta_tor_norm through the store's own inverse, with volume_approx as the volume.
+
+        The store's betan used the reconstruction volume,
+        so this carries the volume_approx / reconstruction volume ratio.
+        """
+        return plasma_parameters.energy_mhd_MJ_from_beta_tor_norm(
+            self.beta_tor_norm,
+            self.volume_approx,
+            self.minor_radius,
+            self.b0,
+            self.ip_MA,
+        )
 
     @property
     def nu_star(self):
-        # characteristic collisionality, from https://arxiv.org/pdf/2406.18442 eqn 2
-        # SI formula with temperature in joules, rearranged so the physical
-        # constants and unit conversions fold into python-float coefficients
-        # before touching the arrays
-        # float32 array intermediates would otherwise overflow (ne_m3 / te_J^2 ~ 1e49)
-        # or underflow (eV^4 ~ 6.6e-76) and produce inf * 0 = nan
-        te_eV = self.te_approx * 1e3
-        # coulomb logarithm of debye_length over b90, which expands to
-        # log of 4 pi eps0^1.5 te_J^1.5 / (e^3 ne_m3^0.5) with te_J = te_eV * e
-        lambda_coeff = 4 * jnp.pi * epsilon_0**1.5 / (eV**1.5 * 1e10)
-        ln_lambda = safe_log(lambda_coeff * te_eV**1.5 / jnp.sqrt(self.ne20_line_avg))
-        # e^4 / (2 pi eps0^2) * ne_m3 / te_J^2
-        collision_coeff = eV**2 / (2 * jnp.pi * epsilon_0**2) * 1e20
-        collision_term = collision_coeff * self.ne20_line_avg / te_eV**2
-        geometry_term = self.q_star * self.R0 / (self.epsilon**1.5)
-        return collision_term * geometry_term * ln_lambda
+        return self.nu_star_of(self.te_approx)
 
     @property
     def nn_inputs(self):
@@ -277,45 +257,45 @@ class Inputs:
                 self.epsilon,
                 self.fGW,
                 self.aB0,
-                self.betan,
-                self.kappa,
-                self.delta_top,
-                self.delta_bot,
+                self.beta_tor_norm,
+                self.elongation,
+                self.triangularity_upper,
+                self.triangularity_lower,
                 safe_log(self.nu_star),
             ]
         )
         return inp_array
 
 
+# Inputs fields nn_input_matrix reads from a dataset
+_NN_INPUT_MATRIX_VARS = (
+    "ip_MA",
+    "b0",
+    "b_geo",
+    "beta_tor_norm",
+    "n_e_line_average_1e20",
+    "geometric_axis_r",
+    "minor_radius",
+    "elongation",
+    "triangularity_upper",
+    "triangularity_lower",
+)
+
+
 def nn_input_matrix(ds: xr.Dataset) -> np.ndarray:
-    """(N, N_NN_INPUTS) matrix of the dimensionless nn_inputs over a flattened dataset.
+    """(N, N_NN_INPUTS) matrix of the dimensionless nn_inputs over a flattened dataset (see flat_columns).
 
-    Every column is broadcast against Ip_MA first, so per-shot variables line up
-    with the per-timeslice ones. Shared by the normalizer fit and the data
-    visualization so both see exactly the feature space the modules consume.
+    Shared by the normalizer fit and the data visualization,
+    so both see exactly the feature space the modules consume.
     """
-    reference = ds["Ip_MA"]
-
-    def col(var: str) -> np.ndarray:
-        return np.asarray(ds[var].broadcast_like(reference).values, dtype=float).ravel()
-
-    inputs = Inputs(
-        Ip=col("Ip_MA"),
-        B0=col("B0"),
-        betan=col("betan"),
-        ne20_line_avg=col("ne20_line_avg"),
-        R0=col("R0"),
-        a_minor=col("a_minor"),
-        kappa=col("kappa"),
-        delta_top=col("delta_top"),
-        delta_bot=col("delta_bot"),
-        ds_source_idx=np.zeros(reference.size),  # Unused by nn_inputs
-        rho=jnp.zeros(1),  # Unused by nn_inputs
-    )
+    columns = flat_columns(ds, _NN_INPUT_MATRIX_VARS)
+    input_columns = dict(zip(_NN_INPUT_MATRIX_VARS, columns.T, strict=True))
+    # ds_source_idx and rho are unused by nn_inputs
+    inputs = Inputs(**input_columns, ds_source_idx=np.zeros(len(columns)), rho=jnp.zeros(1))
     return np.asarray(inputs.nn_inputs).T
 
 
-def make_nn_input_normalizer(method: str, fit_ds: xr.Dataset | None, n_devices: int) -> FeatureNormalizer:
+def make_nn_input_normalizer(method: str, fit_ds: xr.Dataset | None, n_devices: int, target_idx: int) -> FeatureNormalizer:
     """Build the per-device stat stage over the 10 dimensionless nn_inputs.
 
     Thin wrapper around normalization.make_feature_normalizer
@@ -324,7 +304,7 @@ def make_nn_input_normalizer(method: str, fit_ds: xr.Dataset | None, n_devices: 
     for callers about to overwrite the buffers from a checkpoint.
     """
     fit_data = None if fit_ds is None else feature_fit_arrays(fit_ds, nn_input_matrix(fit_ds))
-    return make_feature_normalizer(method, fit_data, n_devices, N_NN_INPUTS)
+    return make_feature_normalizer(method, fit_data, n_devices, N_NN_INPUTS, target_idx)
 
 
 @chex.dataclass
@@ -334,9 +314,49 @@ class Outputs:
     debug_info: dict | None = None
 
 
+def static_rhogrid(rhogrid: ArrayLike) -> tuple:
+    """The rho grid as a tuple of floats, since arrays in static fields break pytree metadata equality."""
+    return tuple(np.asarray(rhogrid).tolist())
+
+
+def profile_outputs(rhogrid: tuple, ne: Array, te: Array, debug_info: dict | None = None) -> Outputs:
+    """Outputs holding the ne and te profiles labeled with the rho grid."""
+    rho_coords = {RADIAL_DIM: list(rhogrid)}
+    ne_da = xr.DataArray(data=ne, dims=(RADIAL_DIM,), coords=rho_coords)
+    te_da = xr.DataArray(data=te, dims=(RADIAL_DIM,), coords=rho_coords)
+    return Outputs(ne=ne_da, te=te_da, debug_info=debug_info)
+
+
+def scaled_profile_points(output_vector: Array, n_rho: int) -> tuple[Array, Array]:
+    """ne and te from an output vector of ne points, te points, then the te and ne scale corrections.
+
+    The one decode of every data-driven time-independent profile model (mlp, reservoir, shape-init).
+    """
+    ne_points = output_vector[:n_rho]
+    te_points = output_vector[n_rho : 2 * n_rho]
+    te_correction = jnp.abs(output_vector[-2])
+    ne_correction = jnp.abs(output_vector[-1])
+    ne = ne_points * ne_correction
+    te = te_points * te_correction
+    return ne, te
+
+
 class ShapeType(IntEnum):
     PCA_LIKE = 0
     CONVEX_COMBINATION = 1
+
+
+# Model types built as ProfilePredictorShapeInit, the only ones with shape bases to freeze
+MODEL_TYPES_WITH_SHAPES = ("shape-init-pca", "shape-init-kmeans")
+
+# The per-sample reservoir states ProfilePredictorTRB.model_init caches on the training and validation loaders,
+# and the fingerprint of the frozen leaves that made them (ProfilePredictorReservoir.frozen_fingerprint)
+RESERVOIR_DIM = "reservoir"
+RESERVOIR_STATE_VAR = "reservoir_state"
+RESERVOIR_FINGERPRINT_VAR = "reservoir_fingerprint"
+# Reduction-order noise moves the fingerprint by ~1e-14 of itself.
+# Another seed, spectral radius, input scaling or normalizer fit moves it by 1e-5 or more
+RESERVOIR_FINGERPRINT_RTOL = 1e-9
 
 
 def kmeans_initial_guess(
@@ -344,15 +364,16 @@ def kmeans_initial_guess(
     te_data: xr.DataArray,
     ne_data: xr.DataArray,
     sample_dim: str,
-    seed: int = 0,
+    seed: int,
 ):
+    """k-means centers of the unit-integral training shapes, seeded so every training seed of a case clusters on its own."""
     from sklearn.cluster import KMeans
 
     te_data = te_data.transpose(sample_dim, ...)
     ne_data = ne_data.transpose(sample_dim, ...)
 
     # Small datasets may have fewer samples than shapes
-    # (e.g. exnihilo with 1 target shot and it happens to only have 2 or 3 valid profile fits) 
+    # (e.g. exnihilo with 1 target shot and it happens to only have 2 or 3 valid profile fits)
     n_clusters = min(n_shapes, te_data.sizes[sample_dim])
     if n_clusters < n_shapes:
         logger.warning(
@@ -362,11 +383,15 @@ def kmeans_initial_guess(
     te_kmeans = KMeans(n_clusters=n_clusters, random_state=seed).fit(te_data.values)
     ne_kmeans = KMeans(n_clusters=n_clusters, random_state=seed).fit(ne_data.values)
 
+    # The centers are means of unit-integral shapes, so unit-integral already.
+    # normalize is a static field, so it must match the skeleton (ProfilePredictorShapeInit.init) a restore fills
     te_shapes = [
-        ProfileShape.make_points(points=te_kmeans.cluster_centers_[i % n_clusters], grid=te_data.rho.values) for i in range(n_shapes)
+        ProfileShape.make_points(points=te_kmeans.cluster_centers_[i % n_clusters], grid=te_data[RADIAL_DIM].values, normalize=False)
+        for i in range(n_shapes)
     ]
     ne_shapes = [
-        ProfileShape.make_points(points=ne_kmeans.cluster_centers_[i % n_clusters], grid=ne_data.rho.values) for i in range(n_shapes)
+        ProfileShape.make_points(points=ne_kmeans.cluster_centers_[i % n_clusters], grid=ne_data[RADIAL_DIM].values, normalize=False)
+        for i in range(n_shapes)
     ]
     return te_shapes, ne_shapes
 
@@ -375,31 +400,33 @@ def pca_initial_guess(n_shapes: int, te_data: xr.DataArray, ne_data: xr.DataArra
     from xeofs.single import EOF
 
     # Small datasets may have fewer samples than shapes
-    # (e.g. exnihilo with 1 target shot and it happens to only have 2 or 3 valid profile fits) 
+    # (e.g. exnihilo with 1 target shot and it happens to only have 2 or 3 valid profile fits)
     n_modes = min(n_shapes, te_data.sizes[sample_dim])
     if n_modes < n_shapes:
         logger.warning(
             f"Only {te_data.sizes[sample_dim]} samples available for {n_shapes} PCA shapes, fitting {n_modes} modes and repeating them"
         )
 
-    te_eof = EOF(n_modes=n_modes)
+    # Uncentered, so the leading mode follows the average profile.
+    # A centered basis spans only the variations about the mean and cannot represent the profiles themselves.
+    te_eof = EOF(n_modes=n_modes, center=False)
     te_eof.fit(te_data, dim=sample_dim)
     te_components = te_eof.components()
     te_shapes = [
         ProfileShape.make_points(
             points=te_components.sel(mode=te_components.mode.values[i % n_modes]).values,
-            grid=te_data.rho.values,
+            grid=te_data[RADIAL_DIM].values,
             normalize=False,
         )
         for i in range(n_shapes)
     ]
-    ne_eof = EOF(n_modes=n_modes)
+    ne_eof = EOF(n_modes=n_modes, center=False)
     ne_eof.fit(ne_data, dim=sample_dim)
     ne_components = ne_eof.components()
     ne_shapes = [
         ProfileShape.make_points(
             points=ne_components.sel(mode=ne_components.mode.values[i % n_modes]).values,
-            grid=ne_data.rho.values,
+            grid=ne_data[RADIAL_DIM].values,
             normalize=False,
         )
         for i in range(n_shapes)
@@ -416,13 +443,17 @@ class ProfilePredictor(TimeIndepModule):
     # Frozen like every normalizer, the trainable getters never include it
     normalizer: FeatureNormalizer
 
+    def assemble_profile_outputs(self, output_vector: Array, debug_info: dict | None = None) -> Outputs:
+        """Outputs from an output vector laid out as scaled_profile_points reads it."""
+        ne, te = scaled_profile_points(output_vector, len(self.rhogrid))
+        return profile_outputs(self.rhogrid, ne, te, debug_info)
+
 
 class ProfilePredictorShapeInit(ProfilePredictor):
     te_shapes: list[ProfileShape]
     ne_shapes: list[ProfileShape]
 
     shape_type: ShapeType = eqx.field(static=True)
-    softmax_temp: float = eqx.field(static=True, default=1.0)
 
     def __init__(
         self,
@@ -431,7 +462,6 @@ class ProfilePredictorShapeInit(ProfilePredictor):
         nn_width: int,
         nn_depth: int,
         in_size: int,
-        softmax_temp: float,
         shape_type: ShapeType,
         rhogrid: tuple,
         key: jax.random.PRNGKey,
@@ -444,14 +474,13 @@ class ProfilePredictorShapeInit(ProfilePredictor):
         key, subkey = jax.random.split(key)
         self.nn = RtdMLP(
             in_size=in_size,
-            out_size=len(te_shapes) + len(ne_shapes) + 1,
+            out_size=len(te_shapes) + len(ne_shapes) + 2,
             width_size=nn_width,
             depth=nn_depth,
             activation=Activation.RELU,
             final_activation=Activation.IDENTITY,
             key=subkey,
         )
-        self.softmax_temp = softmax_temp
         self.shape_type = shape_type
         self.rhogrid = rhogrid
 
@@ -461,15 +490,16 @@ class ProfilePredictorShapeInit(ProfilePredictor):
 
         nn_inputs = self.normalizer(inputs.nn_inputs, inputs.ds_source_idx)
 
-        # Predict the coefficients for the shapes and the correction factor.
-        coeffs = self.nn(nn_inputs)
-        te_coeffs = coeffs[: len(self.te_shapes)]
-        ne_coeffs = coeffs[len(self.te_shapes) : -1]
-        te_correction = jnp.abs(coeffs[-1])
+        # Predict the ne then te shape coefficients, then the te and ne correction factors
+        coeffs_and_corrections = self.nn(nn_inputs)
+        n_ne_shapes = len(self.ne_shapes)
+        ne_coeffs = coeffs_and_corrections[:n_ne_shapes]
+        te_coeffs = coeffs_and_corrections[n_ne_shapes:-2]
+        corrections = coeffs_and_corrections[-2:]
 
         if self.shape_type == ShapeType.CONVEX_COMBINATION:
-            te_coeffs = jax.nn.softmax(te_coeffs / self.softmax_temp)
-            ne_coeffs = jax.nn.softmax(ne_coeffs / self.softmax_temp)
+            te_coeffs = jax.nn.softmax(te_coeffs)
+            ne_coeffs = jax.nn.softmax(ne_coeffs)
         elif self.shape_type == ShapeType.PCA_LIKE:
             # NN outputs are already ready to be used as coefficients.
             pass
@@ -486,28 +516,19 @@ class ProfilePredictorShapeInit(ProfilePredictor):
             axis=0,
         )
 
-        # Compute the ne profile.
-        ne = jnp.sum(ne_shapes, axis=0) * inputs.ne20_line_avg
-
-        # Compute the te profile using the learned correction.
-        te = jnp.sum(te_shapes, axis=0) * inputs.te_approx * te_correction
+        ne_points = jnp.sum(ne_shapes, axis=0) * inputs.n_e_line_average_1e20
+        te_points = jnp.sum(te_shapes, axis=0) * inputs.te_approx
 
         if debug:
             debug_info = {
                 "te_coeffs": te_coeffs,
                 "ne_coeffs": ne_coeffs,
-                "te_correction": te_correction,
             }
         else:
             debug_info = None
 
-        out = Outputs(
-            ne=xr.DataArray(data=ne, dims=("rho",), coords={"rho": list(self.rhogrid)}),
-            te=xr.DataArray(data=te, dims=("rho",), coords={"rho": list(self.rhogrid)}),
-            debug_info=debug_info,
-        )
-
-        return out
+        output_vector = jnp.concatenate([ne_points, te_points, corrections])
+        return self.assemble_profile_outputs(output_vector, debug_info)
 
     @classmethod
     def init(
@@ -518,12 +539,11 @@ class ProfilePredictorShapeInit(ProfilePredictor):
         nn_depth: int,
         in_size: int,
         shape_type: ShapeType,
-        softmax_temp: float,
         prng_seed: int,
         normalizer: FeatureNormalizer,
     ) -> "ProfilePredictor":
         rhogrid_jax = jnp.array(rhogrid)
-        rhogrid_tuple = tuple(rhogrid.tolist())
+        rhogrid_tuple = static_rhogrid(rhogrid)
         te_shapes = [
             ProfileShape.make_points(points=jnp.zeros_like(rhogrid_jax), grid=rhogrid_jax, normalize=False) for _ in range(n_shapes)
         ]
@@ -536,7 +556,6 @@ class ProfilePredictorShapeInit(ProfilePredictor):
             nn_width=nn_width,
             nn_depth=nn_depth,
             in_size=in_size,
-            softmax_temp=softmax_temp,
             shape_type=shape_type,
             rhogrid=rhogrid_tuple,
             key=jax.random.PRNGKey(prng_seed),
@@ -553,6 +572,9 @@ class ProfilePredictorReservoir(ProfilePredictor):
     and only the linear readout (self.nn, an RtdMLP with depth=0) is trained.
     The reservoir weights (w_in, w_res, res_bias) are drawn once at init
     and kept frozen by the trainable getter, which only exposes self.nn leaves.
+    So a sample's state never changes during training:
+    model_init caches every sample's state on the loaders (RESERVOIR_STATE_VAR),
+    and a batch carrying it skips the reservoir, which dominated the cost of every step.
     """
 
     w_in: Array  # Fixed random input weights (reservoir_size, 10)
@@ -572,16 +594,16 @@ class ProfilePredictorReservoir(ProfilePredictor):
         leak_rate: float = 1.0,
         n_steps: int = 20,
     ):
-        rhogrid_tuple = tuple(rhogrid.tolist()) if hasattr(rhogrid, "tolist") else tuple(rhogrid)
+        rhogrid_tuple = static_rhogrid(rhogrid)
         self.normalizer = normalizer
 
         key_in, key_res, key_bias, key_out = jax.random.split(key, 4)
         self.w_in = input_scaling * jax.random.uniform(key_in, (reservoir_size, N_NN_INPUTS), minval=-1.0, maxval=1.0)
         w_res = jax.random.normal(key_res, (reservoir_size, reservoir_size))
-        # Rescale recurrent weights to the requested spectral radius so the state
-        # update is contracting (echo state property)
-        # Done with numpy at init time since general eigvals is host-side anyway.
-        # TODO(ZanderKeith): double check this
+        # Rescale the recurrent weights to the requested spectral radius (max |eigenvalue|).
+        # A radius below 1 is the standard echo state heuristic for fading memory of the initial state,
+        # though only a largest singular value below 1 guarantees a contracting update.
+        # numpy at init time, general eigvals is host-side anyway.
         eig_max = float(np.max(np.abs(np.linalg.eigvals(np.asarray(w_res)))))
         self.w_res = w_res * (spectral_radius / eig_max)
         self.res_bias = input_scaling * jax.random.uniform(key_bias, (reservoir_size,), minval=-1.0, maxval=1.0)
@@ -610,31 +632,52 @@ class ProfilePredictorReservoir(ProfilePredictor):
         h0 = jnp.zeros(self.res_bias.shape, dtype=drive.dtype)
         return jax.lax.fori_loop(0, self.n_steps, step, h0)
 
-    def __call__(self, inputs: Inputs | xr.Dataset, debug: bool = False) -> Outputs:
+    def reservoir_state_of(self, inputs: Inputs | xr.Dataset) -> Array:
+        """The washed-out reservoir state of one sample's inputs, normalized like the readout sees them."""
         if isinstance(inputs, xr.Dataset):
             inputs = Inputs.from_dataset(inputs, jnp.array(self.rhogrid))
-
         nn_inputs = self.normalizer(inputs.nn_inputs, inputs.ds_source_idx)
-        n_pred_points = len(self.rhogrid)
+        return self.reservoir_state(nn_inputs)
 
-        # Predict profile values directly on the rhogrid
-        state = self.reservoir_state(nn_inputs)
-        outputs = self.nn(state)
-        ne_points = outputs[:n_pred_points]
-        te_points = outputs[n_pred_points : 2 * n_pred_points]
-        ne_correction = jnp.abs(outputs[-1])
-        te_correction = jnp.abs(outputs[-2])
+    def frozen_fingerprint(self) -> Array:
+        """A positive scalar of the frozen leaves the reservoir state depends on.
 
-        ne = ne_points * inputs.ne20_line_avg * ne_correction
-        te = te_points * inputs.te_approx * te_correction
+        The sum of squares of w_in, res_bias, the diagonal of w_res and the normalizer buffers.
+        Every redraw or rescale of the reservoir changes the diagonal,
+        and leaving out the rest of w_res keeps the check cheap inside every train step.
+        """
+        w_res_diagonal = jnp.diagonal(self.w_res)
+        normalizer_leaves = [leaf for leaf in jax.tree.leaves(self.normalizer) if eqx.is_inexact_array(leaf)]
+        frozen_leaves = [self.w_in, self.res_bias, w_res_diagonal, *normalizer_leaves]
+        return sum(jnp.sum(leaf**2) for leaf in frozen_leaves)
 
-        out = Outputs(
-            ne=xr.DataArray(data=ne, dims=("rho",), coords={"rho": list(self.rhogrid)}),
-            te=xr.DataArray(data=te, dims=("rho",), coords={"rho": list(self.rhogrid)}),
-            debug_info=None,
+    def cached_readout(self, inputs: xr.Dataset) -> Array:
+        """The readout of the state model_init cached for this sample, raising when this module's frozen leaves did not make it.
+
+        A checkpoint restored after model_init (another seed's, as Study.restore_trainer does) leaves the cache stale.
+        The check rides on the small readout output:
+        on the (reservoir_size,) state it copied every batch's states and cost a quarter of a CPU train step.
+        """
+        cached_state = inputs[RESERVOIR_STATE_VAR].data
+        nn_outputs = self.nn(cached_state)
+        cached_fingerprint = inputs[RESERVOIR_FINGERPRINT_VAR].data
+        own_fingerprint = self.frozen_fingerprint()
+        fingerprint_tolerance = RESERVOIR_FINGERPRINT_RTOL * own_fingerprint
+        mask_fingerprint_mismatch = jnp.abs(cached_fingerprint - own_fingerprint) > fingerprint_tolerance
+        return eqx.error_if(
+            nn_outputs,
+            mask_fingerprint_mismatch,
+            "The cached reservoir states were made by another reservoir, a checkpoint restored after model_init leaves them stale",
         )
 
-        return out
+    def __call__(self, inputs: Inputs | xr.Dataset, debug: bool = False) -> Outputs:
+        # Profile values directly on the rhogrid
+        if isinstance(inputs, xr.Dataset) and RESERVOIR_STATE_VAR in inputs:
+            nn_outputs = self.cached_readout(inputs)
+        else:
+            state = self.reservoir_state_of(inputs)
+            nn_outputs = self.nn(state)
+        return self.assemble_profile_outputs(nn_outputs)
 
 
 class ProfilePredictorUnstructuredNN(ProfilePredictor):
@@ -646,7 +689,7 @@ class ProfilePredictorUnstructuredNN(ProfilePredictor):
         key: jax.random.PRNGKey,
         normalizer: FeatureNormalizer,
     ):
-        rhogrid_tuple = tuple(rhogrid.tolist()) if hasattr(rhogrid, "tolist") else tuple(rhogrid)
+        rhogrid_tuple = static_rhogrid(rhogrid)
         self.normalizer = normalizer
 
         key, subkey = jax.random.split(key)
@@ -666,22 +709,6 @@ class ProfilePredictorUnstructuredNN(ProfilePredictor):
             inputs = Inputs.from_dataset(inputs, jnp.array(self.rhogrid))
 
         nn_inputs = self.normalizer(inputs.nn_inputs, inputs.ds_source_idx)
-        n_pred_points = len(self.rhogrid)
-
-        # Predict the profile values directly on the rhogrid.
-        outputs = self.nn(nn_inputs)
-        ne_points = outputs[:n_pred_points]
-        te_points = outputs[n_pred_points : 2 * n_pred_points]
-        ne_correction = jnp.abs(outputs[-1])
-        te_correction = jnp.abs(outputs[-2])
-
-        ne = ne_points * inputs.ne20_line_avg * ne_correction
-        te = te_points * inputs.te_approx * te_correction
-
-        out = Outputs(
-            ne=xr.DataArray(data=ne, dims=("rho",), coords={"rho": list(self.rhogrid)}),
-            te=xr.DataArray(data=te, dims=("rho",), coords={"rho": list(self.rhogrid)}),
-            debug_info=None,
-        )
-
-        return out
+        # Profile values directly on the rhogrid
+        nn_outputs = self.nn(nn_inputs)
+        return self.assemble_profile_outputs(nn_outputs)

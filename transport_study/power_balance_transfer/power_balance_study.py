@@ -1,90 +1,162 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from itertools import product
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Annotated, ClassVar
 
 if TYPE_CHECKING:
     from popsim.ml import TrainConfig
 
 import fire
 import netCDF4  # noqa: F401
-import xarray as xr
-from loguru import logger
-from pydantic import Field, field_validator
+from pydantic import Field
 
 from transport_study import PACKAGE_ROOT
-from transport_study.config import config
-from transport_study.orchestration.case_analysis import run_case_analysis_parallel
+from transport_study.config import CaseAxis, config
+from transport_study.modules.normalization import INPUT_NORMALIZATIONS, NORM_INPUT_VARS
+from transport_study.modules.power_balance.module import (
+    MODEL_TYPES_WITH_SUBMODULES,
+    MULTIOBJECTIVE_MODEL_TYPES,
+    SUBMODULE_MODEL_TYPES,
+)
+from transport_study.orchestration.case_analysis import run_summary_analysis
 from transport_study.orchestration.study import (
-    HYPERPARAM_TARGET_SHOTS,
+    BASE_MODEL_SIZE,
+    NN_INIT_DEFAULTS,
     CaseGridConfig,
     ModelTrainSpec,
     Study,
+    model_type_field_choices,
 )
-from transport_study.power_balance_transfer.case_reports import generate_case_reports
+from transport_study.orchestration.target_shots import BASE_TARGET_SHOT_ORDER
 from transport_study.power_balance_transfer.data_visualization import DataVisualization
-from transport_study.power_balance_transfer.plotting import (
-    data_normalization_comparison,
-    domain_adaptation_comparison,
-    model_comparison,
-    training_dataset_comparison,
-)
-from transport_study.power_balance_transfer.study_metrics import collect_metrics
-from transport_study.power_balance_transfer.tables import write_comparison_tables
+from transport_study.power_balance_transfer.plotting import COMPARISON_FAMILIES, LAYOUT
+from transport_study.power_balance_transfer.tables import SPEC as TABLE_SPEC
 
 # The 7 physical inputs every power-balance model consumes. Normalization is
 # done inside the modules (transport_study.modules.normalization), so the
 # dataloader always pulls exactly these (the TRB adds ds_source_idx itself)
-POWER_BALANCE_INPUT_VARS = [
-    "Ip_MA",
-    "B0",
-    "R0",
-    "a_minor",
-    "kappa",
-    "ne20_line_avg",
-    "P_aux_MW",
-]
+POWER_BALANCE_INPUT_VARS = list(NORM_INPUT_VARS)
 
-# Model types with p_oh/p_rad submodules (the SciML-style structured models)
-MODEL_TYPES_WITH_SUBMODULES = ("sciml-taue-scalinglaw", "sciml-taue-nn")
 # Purely data-driven model types, no submodules so nothing to freeze
 MODEL_TYPES_WITHOUT_SUBMODULES = ("mlp", "transformer")
-# Submodule pseudo-model-types, they appear as prereq cases of the structured models
-SUBMODULE_MODEL_TYPES = ("p_oh", "p_rad")
+# Every model type a case of this study can have, the prereq submodules included
+STUDY_MODEL_TYPES = (*MODEL_TYPES_WITH_SUBMODULES, *MODEL_TYPES_WITHOUT_SUBMODULES, *SUBMODULE_MODEL_TYPES)
+# The measured powers, targets of the anchor terms in the training loss
+POWER_TARGET_VARS = ["power_ohm_MW", "power_radiated_MW"]
 
-VALID_DATA_NORMALIZATIONS = ("raw", "physics", "zscore", "coral", "physics-coral", "physics-zscore")
 
 # Per-submodule train settings shared with the transport study, which trains
-# the same p_oh/p_rad prereq cases for its power balance submodule
+# the same p_oh/p_rad prereq cases for its power balance submodule.
+# fresh_var keeps the training and validation samples to the timeslices where it is 1 (see trb_utils.get_time_dep_dataloaders):
+# P_oh comes from the reconstruction, which the stores hold between reconstructions, P_rad from bolometry
 SCALAR_SUBMODULE_SETTINGS = {
     "p_oh": {
         "train_run_builder": "transport_study.modules.power_balance.p_oh.trb.OhmicPowerTRB",
-        "target_vars": ["P_oh_MW", "ds_source_idx"],
+        "target_vars": ["power_ohm_MW", "ds_source_idx"],
+        "fresh_var": "fresh_equilibrium",
     },
     "p_rad": {
         "train_run_builder": "transport_study.modules.power_balance.p_rad.trb.RadiatedPowerTRB",
-        "target_vars": ["P_rad_MW", "ds_source_idx"],
+        "target_vars": ["power_radiated_MW", "ds_source_idx"],
+        "fresh_var": None,
     },
 }
+
+# Training batches, shared with the transport study's power balance pseudo-types.
+# Each sits at or below its family's critical batch size (McCandlish et al. 2018),
+# past which a larger batch reaches a given loss in about the same steps and wastes the extra samples.
+# Gradient noise scale at the best-validation epoch, plain / Adam: mlp 341 / 534, sciml-taue-nn 284 / 304, transformer 2,017 / 4,121.
+# The mlp's fitted critical batch grows from about 330 to 930 as the loss falls,
+# and every batch from 4096 to the full set needed about the same steps to reach the same loss.
+# 512 gives 93 batches per epoch on the hyperparam case.
+# For reference, the largest batches on an A100-80GB at the sweep maxima:
+# the transformer 8192 (72.6 GB of the 77 GB XLA pool, 12288 runs out of memory),
+# mlp / sciml-taue-nn / sciml-taue-scalinglaw 65536 at 4-13 GB, the largest tried, their time per sample flat past 32768.
+POWER_BALANCE_BATCH_SIZE = 512
+# p_oh / p_rad train on CPU only, on about 2.1 and 2.3M timeslices, so 2048 is about 1,100 steps per epoch.
+# p_rad's noise scale at its best epoch is 2,070 / 2,619 (plain / Adam), p_oh's is unusable, its gradient vanishing at convergence.
+# For reference, on GPU their time per sample stops falling near 393216 (1.3 GB),
+# and a CPU epoch took 24 s at 4096, nearly flat to 16384
+SCALAR_SUBMODULE_BATCH_SIZE = 2048
+
+POWER_BALANCE_TRB = "transport_study.modules.power_balance.trb.PowerBalanceTRB"
+# The stored energy and its freshness flag the Wtot loss reads, with the device label
+WTOT_TARGET_VARS = ["energy_mhd_MJ", "fresh_equilibrium", "ds_source_idx"]
+# The structured models add the measured powers, so the training loss anchors their submodule predictions to them
+STRUCTURED_TARGET_VARS = ["energy_mhd_MJ", "fresh_equilibrium", *POWER_TARGET_VARS, "ds_source_idx"]
+
+# Fallback loss hyperparameters of every power balance case run without a tuned config,
+# also those of the transport study's power balance pseudo-types (p_oh, p_rad, power_balance)
+POWER_BALANCE_LOSS_DEFAULTS = {
+    # The training residuals are divided by the device's typical value (trb_utils.residual_scales),
+    # so the delta is a fraction of it, swept over 1 to 100 percent
+    "huber_delta": 0.1,
+    # Anchor terms keeping the predicted P_oh / P_rad (the sciml submodules, a multiobjective transformer's heads)
+    # close to the measured signals while the whole module trains on Wtot.
+    # Training loss only, and a no-op for model types whose target_vars carry no power_ohm_MW / power_radiated_MW.
+    # A relative P_oh or P_rad miss weighs a tenth of the same relative Wtot miss, an untuned prior
+    "anchor_weight_power_ohm": 0.1,
+    "anchor_weight_power_radiated": 0.1,
+}
+
+
+def scalar_submodule_train_spec(
+    submodule_type: str, dataloader_config_base: dict, data_normalization: str, domain_adaptation: str | None
+) -> ModelTrainSpec:
+    """The spec of a p_oh or p_rad prereq case, the power balance study's and the transport study's pseudo-type's alike."""
+    settings = SCALAR_SUBMODULE_SETTINGS[submodule_type]
+    return ModelTrainSpec(
+        train_run_builder=settings["train_run_builder"],
+        dataloader_config={
+            "target_vars": settings["target_vars"],
+            "fresh_var": settings["fresh_var"],
+            "input_vars": POWER_BALANCE_INPUT_VARS,
+            # The submodules load the power balance view
+            "data_train_run_builder": POWER_BALANCE_TRB,
+            **dataloader_config_base,
+            "batch_size": SCALAR_SUBMODULE_BATCH_SIZE,
+        },
+        model_init_config={**NN_INIT_DEFAULTS, "data_normalization": data_normalization, "domain_adaptation": domain_adaptation},
+    )
+
+
+def structured_power_balance_train_spec(
+    model_type: str,
+    dataloader_config_base: dict,
+    data_normalization: str,
+    domain_adaptation: str | None,
+    freeze_submodules: bool,
+    submodule_configs: dict[str, TrainConfig],
+) -> ModelTrainSpec:
+    """The spec of a sciml-taue-nn or sciml-taue-scalinglaw case over its restored p_oh / p_rad configs, for both studies."""
+    return ModelTrainSpec(
+        train_run_builder=POWER_BALANCE_TRB,
+        dataloader_config={
+            "input_vars": POWER_BALANCE_INPUT_VARS,
+            "target_vars": STRUCTURED_TARGET_VARS,
+            "state_vars": ["energy_mhd_MJ"],
+            **dataloader_config_base,
+        },
+        model_init_config={
+            "model_type": model_type,
+            "data_normalization": data_normalization,
+            "domain_adaptation": domain_adaptation,
+            "freeze_submodules": freeze_submodules,
+            **NN_INIT_DEFAULTS,
+            "submodules": submodule_configs,
+        },
+    )
 
 
 class PowerBalanceStudy(Study):
     SWEEP_CONFIG_DIR = Path(PACKAGE_ROOT) / "power_balance_transfer" / "sweep_configs"
     STUDY_TYPE = "power_balance_transfer"
+    RESIDUAL_SCALE_LOSS = True
+    ANCHOR_DELTA_MODEL_TYPES: ClassVar[dict[str, str]] = {"power_ohm_MW": "p_oh", "power_radiated_MW": "p_rad"}
     DATA_VISUALIZATION = DataVisualization
     ANALYSIS_METRICS_MODULE = "transport_study.power_balance_transfer.study_metrics"
     ANALYSIS_REPORTS_MODULE = "transport_study.power_balance_transfer.case_reports"
-    CASE_AXIS_FIELDS = (
-        "model_types",
-        "training_datasets",
-        "data_normalization_methods",
-        "domain_adaptation_methods",
-        "freeze_submodules_options",
-        "num_target_shots_options",
-    )
-    TUNED_DATALOADER_KEYS = ("segment_length_train", "segment_overlap_train", "batch_size")
     TUNED_LOSS_KEYS = ("huber_delta",)
 
     ##################
@@ -92,84 +164,70 @@ class PowerBalanceStudy(Study):
     ##################
     class Config(CaseGridConfig):
         # The different cases being compared in this study
-        model_types: tuple[str, ...] = Field(default_factory=lambda: ("sciml-taue-scalinglaw", "sciml-taue-nn", "mlp", "transformer"))
-        data_normalization_methods: tuple[str, ...] = Field(default_factory=lambda: VALID_DATA_NORMALIZATIONS)
-        freeze_submodules_options: tuple[bool, ...] = Field(default_factory=lambda: (True,))
-        num_target_shots_options: tuple[int, ...] = Field(default_factory=lambda: (0, 1, 3, 10, 32, -1))
+        model_types: Annotated[tuple[str, ...], CaseAxis("model_type")] = Field(
+            default_factory=lambda: ("sciml-taue-scalinglaw", "sciml-taue-nn", "mlp", "transformer")
+        )
+        data_normalization_methods: Annotated[tuple[str, ...], CaseAxis("data_normalization")] = Field(
+            default_factory=lambda: INPUT_NORMALIZATIONS
+        )
+        freeze_submodules_options: Annotated[tuple[bool, ...], CaseAxis("freeze_submodules")] = Field(default_factory=lambda: (False,))
+        multiobjective_options: Annotated[tuple[bool, ...], CaseAxis("multiobjective")] = Field(default_factory=lambda: (False,))
+        num_target_shots_options: Annotated[tuple[int, ...], CaseAxis("num_target_shots")] = Field(
+            default_factory=lambda: (0, 1, 3, 10, 32)
+        )
         # Hyperparameter tuning case configuration
         # (hyperparam_domain_adaptation and hyperparam_num_target_shots live on CaseGridConfig)
         hyperparam_data_normalization: str = "physics"
-        hyperparam_freeze_submodules: bool = True
+        hyperparam_freeze_submodules: bool = False
+        hyperparam_multiobjective: bool = False
 
-        COMPAT_HYPERPARAM_FIELDS = (
-            "hyperparam_data_normalization",
-            "hyperparam_domain_adaptation",
-            "hyperparam_freeze_submodules",
-            "hyperparam_num_target_shots",
-        )
-
-        @field_validator("model_types")
-        @classmethod
-        def _validate_model_types(cls, v: tuple[str, ...]) -> tuple[str, ...]:
-            valid = {*MODEL_TYPES_WITH_SUBMODULES, *MODEL_TYPES_WITHOUT_SUBMODULES, *SUBMODULE_MODEL_TYPES}
-            for mt in v:
-                if mt not in valid:
-                    raise ValueError(f"Invalid model type: {mt}. Must be one of {sorted(valid)}.")
-            return v
-
-        @field_validator("data_normalization_methods", "hyperparam_data_normalization")
-        @classmethod
-        def _validate_data_normalization(cls, v):
-            methods = (v,) if isinstance(v, str) else v
-            for dn in methods:
-                if dn not in VALID_DATA_NORMALIZATIONS:
-                    raise ValueError(f"Invalid data normalization method: {dn}. Must be one of {sorted(VALID_DATA_NORMALIZATIONS)}.")
-            return v
+        FIELD_CHOICES: ClassVar[dict[str, tuple]] = {
+            **model_type_field_choices(STUDY_MODEL_TYPES),
+            "data_normalization_methods": INPUT_NORMALIZATIONS,
+            "hyperparam_data_normalization": INPUT_NORMALIZATIONS,
+        }
 
     @dataclass
     class Case(Study.Case):
-        """
-        model_type: The type of power_balance model to use.
-        - sciml-taue-scalinglaw: H89, H98, and P_LH scaling laws to predict tau_e
-        - sciml-taue-nn: neural network predicts tau_e, and we do the power balance calculation
-        - mlp: a simple MLP directly predicts stored energy evolution
-        - transformer: recurrent causal attention over past inputs directly predicts stored energy evolution
-        - p_oh / p_rad: submodule predictors, appear only as prereq cases of sciml-taue-scalinglaw and sciml-taue-nn
+        """The power balance case, see Study.Case for the shared axes.
 
-        training_data: The dataset(s) used for training
-        - cmod: C-Mod only
-        - tcv: TCV only
-        - cmod_tcv: C-Mod + TCV
-        - exnihilo: No historic training data
+        model_type:
+        - sciml-taue-scalinglaw: H89, H98 and P_LH scaling laws predict tau_e
+        - sciml-taue-nn: a neural network predicts tau_e, the power balance does the rest
+        - mlp: an MLP predicts the stored-energy evolution from the inputs and its own predicted stored energy
+        - transformer: the current inputs attend over a buffer of past predicted stored energies
+        - p_oh / p_rad: the submodule predictors, prereq cases of the sciml types alone
 
-        data_normalization: The method for normalizing the model's NN inputs, implemented
-        as a POPSIM module configured from the training data only (transport_study/modules/normalization.py).
-        - raw: No normalization, Ip, Wtot, etc. are in their original units
-        - physics: Convert to typical dimensionless parameters like q_star, f_G, etc.
-        - zscore: Within each device, normalize each variable to zero mean and unit variance.
-        - coral: Use the CORAL method to align covariances of source and target domains (https://arxiv.org/abs/1612.01939)
-        - physics-coral: The physics parameters followed by CORAL alignment fitted on them.
-        - physics-zscore: The physics parameters followed by a per-device z-score fitted on them.
+        data_normalization: the input normalization of the model's NN,
+        a POPSIM module fitted on the training data only (transport_study/modules/normalization.py)
+        - raw: Ip, Wtot and the rest in their working units
+        - physics: dimensionless parameters like q_star and f_G
+        - zscore: per-device zero mean and unit variance
+        - coral: per-device covariance alignment to the target device (https://arxiv.org/abs/1612.01939)
+        - physics-coral / physics-zscore: the physics parameters followed by the per-device stage fitted on them
 
-        domain_adaptation: The method for domain adaptation between source and target devices.
-        - none: No domain adaptation, train and test on the same device(s). This is used for hyperparameter tuning and as a baseline for comparison, answering the question "what is the best possible performance we could expect if we had a bunch of data?"
-        - weighted: Add a small amount of highly-weighted target data during training
-        - addition: Add target shots to the training set as normal samples, no weighting
-        - transfer: Train on source data, freeze all but the last layers of the model, and fine-tune on a small amount of target data
-        - transfer_pretrain: The pretrain half of a transfer case, never a case-grid axis value (see Study.Case.transfer_pretrain_case). Trains on historic data only with checkpoint selection on the target test set. Stat normalizations fit the normalizer on historic + the transfer case's target shots so the fine-tune case inherits target-aware statistics through the checkpoint restore, stateless ones (raw / physics) share one twin at 0 target shots
+        freeze_submodules: whether the sciml types keep their p_oh / p_rad submodules fixed in joint training,
+        the alternative letting them drift from the measured powers toward a better Wtot
 
-        freeze_submodules: Whether to freeze the p_oh/p_rad submodules of the model during training.
-        The P_oh and P_rad signals are hard to quantify, we might want to let them drift from the original targets to better match Wtot_MJ
-
-        num_target_shots: The number of shots included in the training data from the target dataset, or -1 to include all shots (including all shots in training is cheating, but again answers the question of what is the best possible performance).
+        multiobjective: whether the transformer's head also predicts P_oh and P_rad,
+        anchored to the measured powers like the sciml submodules (MULTIOBJECTIVE_MODEL_TYPES alone).
+        Shares the plain case's sweep, named mo_True
         """
 
         data_normalization: str
         freeze_submodules: bool
+        multiobjective: bool
 
-        VALID_MODEL_TYPES = (*MODEL_TYPES_WITH_SUBMODULES, *MODEL_TYPES_WITHOUT_SUBMODULES, *SUBMODULE_MODEL_TYPES)
-        STR_TOKEN_FIELDS = (("norm_", "data_normalization"), ("freeze_", "freeze_submodules"))
-        HYPERPARAM_FIELDS = ("data_normalization", "domain_adaptation", "freeze_submodules", "num_target_shots")
+        VALID_MODEL_TYPES = STUDY_MODEL_TYPES
+        # The p_oh / p_rad predictors the sciml types restore
+        RESTORED_MODEL_TYPES = SUBMODULE_MODEL_TYPES
+        # Unfrozen submodules and single-objective training are the defaults, so only the others show in the name
+        STR_TOKEN_FIELDS = (
+            ("norm_", "data_normalization"),
+            ("freeze_", "freeze_submodules", False),
+            ("mo_", "multiobjective", False),
+        )
+        HYPERPARAM_FIELDS = ("data_normalization", "domain_adaptation", "freeze_submodules", "multiobjective", "num_target_shots")
 
         # The dataclass decorator would null an inherited __hash__
         __hash__ = Study.Case.__hash__
@@ -182,103 +240,74 @@ class PowerBalanceStudy(Study):
             domain_adaptation: str | None,
             freeze_submodules: bool,
             num_target_shots: int,
+            target_shot_order: str = BASE_TARGET_SHOT_ORDER,
+            multiobjective: bool = False,
+            model_size: str = BASE_MODEL_SIZE,
         ):
             self.data_normalization = data_normalization
             self.freeze_submodules = freeze_submodules
-            self._init_common(model_type, training_data, domain_adaptation, num_target_shots)
+            self.multiobjective = multiobjective
+            self.init_common(model_type, training_data, domain_adaptation, num_target_shots, target_shot_order, model_size)
 
-        def _normalization_method(self) -> str | None:
+        def normalization_method(self) -> str | None:
             return self.data_normalization
 
-        def _validate(self):
-            super()._validate()
-            if self.data_normalization not in VALID_DATA_NORMALIZATIONS:
+        def validate(self):
+            super().validate()
+            if self.data_normalization not in INPUT_NORMALIZATIONS:
                 raise ValueError(f"Unknown data normalization method: {self.data_normalization}")
-            if self.model_type in SUBMODULE_MODEL_TYPES and self.freeze_submodules != config.hyperparam_freeze_submodules:
-                raise ValueError(
-                    f"freeze_submodules should be a dummy value ({config.hyperparam_freeze_submodules}) for submodule {self.model_type}"
-                )
 
-        def _model_type_prereqs(self) -> list[Study.Case]:
-            # The structured models restore pre-trained p_oh/p_rad submodules
-            if self.model_type not in MODEL_TYPES_WITH_SUBMODULES:
-                return []
-            return [
-                self.replace(model_type=submodule_type, freeze_submodules=config.hyperparam_freeze_submodules)
-                for submodule_type in SUBMODULE_MODEL_TYPES
-            ]
+        @classmethod
+        def pin_inapplicable_axes(cls, fields: dict) -> dict:
+            pinned = super().pin_inapplicable_axes(fields)
+            # Only the structured models have submodules to freeze
+            if fields["model_type"] not in MODEL_TYPES_WITH_SUBMODULES:
+                pinned |= {"freeze_submodules": config.hyperparam_freeze_submodules}
+            if fields["model_type"] not in MULTIOBJECTIVE_MODEL_TYPES:
+                pinned |= {"multiobjective": config.hyperparam_multiobjective}
+            return pinned
 
-    def make_cases(self):
-        cases = []
-        # Make every case we're interested in for this study
-        for (
-            model_type,
-            training_dataset,
-            data_normalization,
-            domain_adaptation,
-            freeze_submodules,
-            num_target_shots,
-        ) in product(
-            config.model_types,
-            config.training_datasets,
-            config.data_normalization_methods,
-            config.domain_adaptation_methods,
-            config.freeze_submodules_options,
-            config.num_target_shots_options,
-        ):
-            if domain_adaptation is None:
-                if training_dataset.exnihilo:
-                    if num_target_shots == 0:
-                        continue  # Can't train from nothing with 0 target shots
-                elif num_target_shots != HYPERPARAM_TARGET_SHOTS:
-                    continue  # Invalid case, skip
-            if model_type in MODEL_TYPES_WITHOUT_SUBMODULES and freeze_submodules != config.hyperparam_freeze_submodules:
-                continue  # No submodules to freeze, just do one of the two
+        def model_type_prereqs(self) -> list[Study.Case]:
+            submodules = self.submodule_prereqs()
+            if submodules:
+                return submodules
+            # A multiobjective case's anchors take the huber deltas the hyperparam p_oh / p_rad cases were tuned with.
+            # The model type guard matters when the hyperparam value is True, which pins the submodules' own flag True
+            if self.model_type in MULTIOBJECTIVE_MODEL_TYPES and self.multiobjective:
+                return [self.hyperparam_case_of(submodule_type) for submodule_type in SUBMODULE_MODEL_TYPES]
+            return []
 
-            case = self.Case(
-                model_type=model_type,
-                training_data=training_dataset,
-                data_normalization=data_normalization,
-                domain_adaptation=domain_adaptation,
-                freeze_submodules=freeze_submodules,
-                num_target_shots=num_target_shots,
-            )
-
-            cases.append(case)
-
-        return self.finalize_cases(cases)
+        def submodule_prereqs(self) -> list[Study.Case]:
+            # The structured models restore pre-trained p_oh/p_rad submodules at the case's own model size,
+            # so a sized case sizes the whole model
+            if self.model_type in MODEL_TYPES_WITH_SUBMODULES:
+                return [self.replace_pinned(model_type=submodule_type) for submodule_type in SUBMODULE_MODEL_TYPES]
+            return []
 
     #############
     # EXECUTION #
     #############
 
-    def _base_dataloader_config(self, case: Case) -> dict:
+    def base_dataloader_config(self, case: Case) -> dict:
         return {
-            "training_data": case.training_data,
-            "domain_adaptation": case.domain_adaptation,
-            "num_target_shots": case.num_target_shots,
-            "target_test_set_size": config.target_test_set_size,
-            "prng_seed": 42,
-            "debug": config.debug,
-            # Hyperparameters
+            **self.target_split_config(case),
+            # Fixed loader settings, no sweep changes them (test_sweep_configs)
             "segment_length_train": 100,
             "segment_overlap_train": 50,
-            # 4096 measured 42 GB on the worst case
-            # (transformer at sweep max, d_model 64, history_len 50, these 100-step segments)
-            # Memory scales linearly with batch and segment_length_train so revisit this cap if segment_length_train grows.
-            "batch_size": 4096,
-            # Part of validation, should be left alone during hyperparameter tuning
+            # Memory scales linearly with batch and segment_length_train, see POWER_BALANCE_BATCH_SIZE
+            "batch_size": POWER_BALANCE_BATCH_SIZE,
+            # Validation scores whole episodes
             "segment_length_val": None,
             "segment_overlap_val": 0,
         }
 
-    def _base_optimizer_config(self) -> dict:
+    def base_optimizer_config(self) -> dict:
         return {
-            **super()._base_optimizer_config(),
+            **super().base_optimizer_config(),
             # The p_oh/p_rad submodules train at a reduced rate relative to
             # the taue network so joint training does not pull them far from
             # their pretrained behavior. In transfer finetunes this stacks
-            # with the step-budgeted transfer LR on purpose: the submodules
+            # with the target-only lr0 scale on purpose: the submodules
             # already ran their own pretrain + finetune prereq chain, so the
             # joint finetune lets their last layers drift only at 0.1x the
             # transfer LR.
@@ -286,102 +315,57 @@ class PowerBalanceStudy(Study):
             "submodule_lr_factors": {"p_oh_predictor": 0.1, "p_rad_predictor": 0.1},
         }
 
-    def _base_loss_config(self) -> dict:
-        return {
-            "huber_delta": 0.5,
-            # Anchor terms keeping the p_oh/p_rad submodule predictions close
-            # to the measured signals while the whole module trains on Wtot.
-            # Training loss only, and a no-op for model types without
-            # submodules (their target_vars carry no P_oh_MW / P_rad_MW)
-            "anchor_weight_p_oh": 0.1,
-            "anchor_weight_p_rad": 0.1,
-        }
+    def base_loss_config(self, case: Case) -> dict:
+        return dict(POWER_BALANCE_LOSS_DEFAULTS)
 
-    def _make_submodule_config(self, case: Case, submodule_type: str) -> TrainConfig:
-        """Full TrainConfig for a p_oh/p_rad submodule, recursing through make_train_config
-        so submodule cases get their own tuned merge and transfer wiring."""
-        return self.make_train_config(case.replace(model_type=submodule_type, freeze_submodules=config.hyperparam_freeze_submodules))
-
-    def _model_train_spec(self, case: Case, dataloader_config_base: dict) -> ModelTrainSpec:
-        trb = "transport_study.modules.power_balance.trb.PowerBalanceTRB"
+    def model_train_spec(self, case: Case, dataloader_config_base: dict) -> ModelTrainSpec:
         if case.model_type in SUBMODULE_MODEL_TYPES:
-            submodule_settings = SCALAR_SUBMODULE_SETTINGS[case.model_type]
-            return ModelTrainSpec(
-                train_run_builder=submodule_settings["train_run_builder"],
-                dataloader_config={
-                    "target_vars": submodule_settings["target_vars"],
-                    "input_vars": POWER_BALANCE_INPUT_VARS,
-                    "data_train_run_builder": trb,  # Needed for submodules
-                    **dataloader_config_base,
-                },
-                model_init_config={
-                    "nn_depth": 2,
-                    "nn_width": 16,
-                    "prng_seed": 42,
-                    "in_size": 7,
-                    "out_size": 1,
-                    "data_normalization": case.data_normalization,
-                    "domain_adaptation": case.domain_adaptation,
-                },
+            return scalar_submodule_train_spec(case.model_type, dataloader_config_base, case.data_normalization, case.domain_adaptation)
+        if case.model_type in MODEL_TYPES_WITH_SUBMODULES:
+            submodule_configs = {
+                "p_oh_predictor": self.make_submodule_config(case, "p_oh"),
+                "p_rad_predictor": self.make_submodule_config(case, "p_rad"),
+            }
+            return structured_power_balance_train_spec(
+                case.model_type,
+                dataloader_config_base,
+                case.data_normalization,
+                case.domain_adaptation,
+                case.freeze_submodules,
+                submodule_configs,
             )
-        elif case.model_type in MODEL_TYPES_WITH_SUBMODULES:
+        if case.model_type == "mlp":
             return ModelTrainSpec(
-                train_run_builder=trb,
+                train_run_builder=POWER_BALANCE_TRB,
                 dataloader_config={
                     "input_vars": POWER_BALANCE_INPUT_VARS,
-                    # The measured powers are targets so the training loss can
-                    # anchor the submodule predictions to them (anchor_weight_*
-                    # in the loss config)
-                    "target_vars": ["Wtot_MJ", "P_oh_MW", "P_rad_MW", "ds_source_idx"],
-                    "state_vars": ["Wtot_MJ"],
+                    "target_vars": WTOT_TARGET_VARS,
+                    "state_vars": ["energy_mhd_MJ"],
+                    # Unused by the model, but the dataloader drops the NaN slices of every loaded variable,
+                    # so the measured powers keep the training segments identical to the structured models'
+                    "extra_vars": POWER_TARGET_VARS,
                     **dataloader_config_base,
                 },
                 model_init_config={
                     "model_type": case.model_type,
                     "data_normalization": case.data_normalization,
                     "domain_adaptation": case.domain_adaptation,
-                    "freeze_submodules": case.freeze_submodules,
-                    "nn_depth": 2,
-                    "nn_width": 16,
-                    "in_size": 7,  # Ip, B0, R0, a_minor, kappa, ne20_line_avg, P_aux_MW
-                    "out_size": 1,
-                    "prng_seed": 42,
-                    "submodules": {
-                        "p_oh_predictor": self._make_submodule_config(case, "p_oh"),
-                        "p_rad_predictor": self._make_submodule_config(case, "p_rad"),
-                    },
-                    "restore_submodules": True,  # Always restoring pre-trained submodules in this study
+                    **NN_INIT_DEFAULTS,
                 },
             )
-        elif case.model_type == "mlp":
+        if case.model_type == "transformer":
+            # The multiobjective head predicts the measured powers, so they are targets its training loss anchors.
+            # For the plain transformer they only keep the training segments identical to the structured models', see mlp
+            if case.multiobjective:
+                power_vars = {"target_vars": STRUCTURED_TARGET_VARS}
+            else:
+                power_vars = {"target_vars": WTOT_TARGET_VARS, "extra_vars": POWER_TARGET_VARS}
             return ModelTrainSpec(
-                train_run_builder=trb,
+                train_run_builder=POWER_BALANCE_TRB,
                 dataloader_config={
                     "input_vars": POWER_BALANCE_INPUT_VARS,
-                    "target_vars": ["Wtot_MJ", "ds_source_idx"],
-                    "state_vars": ["Wtot_MJ"],
-                    "extra_vars": ["P_oh_MW", "P_rad_MW"],
-                    **dataloader_config_base,
-                },
-                model_init_config={
-                    "model_type": case.model_type,
-                    "data_normalization": case.data_normalization,
-                    "domain_adaptation": case.domain_adaptation,
-                    "nn_depth": 2,
-                    "nn_width": 16,
-                    "in_size": 7,  # Ip, B0, R0, a_minor, kappa, ne20_line_avg, P_aux_MW
-                    "out_size": 1,
-                    "prng_seed": 42,
-                },
-            )
-        elif case.model_type == "transformer":
-            return ModelTrainSpec(
-                train_run_builder=trb,
-                dataloader_config={
-                    "input_vars": POWER_BALANCE_INPUT_VARS,
-                    "target_vars": ["Wtot_MJ", "ds_source_idx"],
-                    "state_vars": ["Wtot_MJ"],
-                    "extra_vars": ["P_oh_MW", "P_rad_MW"],
+                    "state_vars": ["energy_mhd_MJ"],
+                    **power_vars,
                     **dataloader_config_base,
                 },
                 model_init_config={
@@ -391,85 +375,24 @@ class PowerBalanceStudy(Study):
                     "d_model": 16,  # Token embedding width
                     "num_heads": 2,
                     "history_len": 20,  # Attention window over past timesteps
-                    "nn_depth": 2,  # MLP head after attention
-                    "nn_width": 16,
-                    "prng_seed": 42,
+                    **NN_INIT_DEFAULTS,
+                    "multiobjective": case.multiobjective,
                 },
             )
-        else:
-            raise ValueError(f"Unknown model type: {case.model_type}")
-
-    def _tuned_model_init_updates(self, case: Case, tuned_config: TrainConfig) -> dict:
-        # sciml-taue-scalinglaw has no NN of its own (its submodules carry their own tuned configs)
-        updates = {}
-        if case.model_type in [*SUBMODULE_MODEL_TYPES, "mlp", "sciml-taue-nn", "transformer"]:
-            updates["nn_depth"] = tuned_config.model_init_config["nn_depth"]
-            updates["nn_width"] = tuned_config.model_init_config["nn_width"]
-        if case.model_type == "transformer":
-            updates["d_model"] = tuned_config.model_init_config["d_model"]
-            updates["num_heads"] = tuned_config.model_init_config["num_heads"]
-            updates["history_len"] = tuned_config.model_init_config["history_len"]
-        return updates
-
-    ##############
-    # COLLECTION #
-    ##############
-
-    # Coords describing which case a record belongs to
-    _CASE_COORD_NAMES = (
-        "case_idx",
-        "model_type",
-        "training_data",
-        "data_normalization",
-        "domain_adaptation",
-        "freeze_submodules",
-        "num_target_shots",
-    )
+        raise ValueError(f"Unknown model type: {case.model_type}")
 
     ############
     # ANALYSIS #
     ############
 
-    def _run_analysis(self, enable_parallelism: bool) -> None:
-        # Per-case analysis (stage metrics + best/worst shot PDFs) is CPU-bound
-        # matplotlib and numpy work, so we can fan it out over SLURM to speed things up
-        if enable_parallelism:
-            run_case_analysis_parallel(self)
-
-        # Stage-resolved (rampup / flattop ohmic / flattop aux / rampdown)
-        # time-averaged errors for every finished case, cached to
-        # collected_metrics.nc alongside collected_results.nc
-        metrics_ds = collect_metrics(self)
-
-        results_ds = xr.load_dataset(self.collected_results_path())
-
-        logger.opt(colors=True).info("<bold><magenta>TRAINING DATA COMPARISON</magenta></bold>")
-        training_dataset_comparison(results_ds, self.figure_dir)
-
-        logger.opt(colors=True).info("<bold><magenta>MODEL COMPARISON</magenta></bold>")
-        model_comparison(results_ds, self.figure_dir)
-
-        logger.opt(colors=True).info("<bold><magenta>DATA NORMALIZATION COMPARISON</magenta></bold>")
-        data_normalization_comparison(results_ds, self.figure_dir)
-
-        logger.opt(colors=True).info("<bold><magenta>DOMAIN ADAPTATION COMPARISON</magenta></bold>")
-        domain_adaptation_comparison(results_ds, self.figure_dir)
-
-        # Per-case deep dives: best/worst holdout shot PDFs by time-averaged error
-        logger.opt(colors=True).info("<bold><magenta>CASE REPORTS</magenta></bold>")
-        generate_case_reports(self, self.figure_dir)
-
-        # One markdown table per case axis and combination of the other axes
-        logger.opt(colors=True).info("<bold><magenta>COMPARISON TABLES</magenta></bold>")
-        write_comparison_tables(results_ds, metrics_ds, self.figure_dir)
-
-
-run_study = PowerBalanceStudy.run_study
+    def run_analysis(self, enable_parallelism: bool) -> None:
+        run_summary_analysis(self, enable_parallelism, LAYOUT, COMPARISON_FAMILIES, TABLE_SPEC)
 
 
 if __name__ == "__main__":
     fire.Fire(
         {
-            "run_study": run_study,
+            "run_study": PowerBalanceStudy.run_study,
+            "reset_study": PowerBalanceStudy.reset_study,
         }
     )

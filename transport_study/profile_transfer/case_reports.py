@@ -1,4 +1,4 @@
-"""Per-case deep-dive reports for profile transfer study results.
+"""Per-case reports of profile transfer study results (its ANALYSIS_REPORTS_MODULE, see orchestration.case_reports).
 
 For every finished case:
 - A PDF of the 10 best and 10 worst test timeslices by the combined metric,
@@ -14,44 +14,56 @@ measured target shape.
 """
 
 import io
+from functools import partial
 from pathlib import Path
 
 import matplotlib.pyplot as plt
 import numpy as np
 import xarray as xr
 from loguru import logger
-from matplotlib.backends.backend_pdf import PdfPages
 from PIL import Image
 
-from transport_study import EPISODE_DIM, TIME_DIM
-from transport_study.config import config
-from transport_study.modules.profile_predictor.trb import ProfilePredictorTRB
-from transport_study.plot_style import BACKGROUND_COLOR, TEXT_COLOR, style_axis
-from transport_study.profile_transfer.plot_torax_evolution import plot_relaxation
+from transport_study import EPISODE_DIM, RADIAL_DIM, TIME_DIM
+from transport_study.modules.trb_utils import GRAD_RHO_MAX
+from transport_study.orchestration.case_reports import (
+    TITLE_FONTSIZE,
+    atomic_output,
+    best_worst_pdf,
+)
+from transport_study.plot_style import (
+    BACKGROUND_COLOR,
+    LABEL_FONTSIZE,
+    LEGEND_STYLE,
+    TEXT_COLOR,
+    TICK_FONTSIZE,
+    style_axis,
+)
+from transport_study.profile_transfer.plot_torax_evolution import (
+    load_timeslice,
+    plot_relaxation,
+)
 from transport_study.profile_transfer.study_metrics import (
     CaseTimesliceMetrics,
-    case_metrics_path,
     compute_case_timeslice_metrics,
     load_eval_dataset,
+    result_device_shots,
 )
 
-N_BEST_WORST = 10
 GIF_FRAME_DURATION_MS = 200
-
-LABEL_FONTSIZE = 11
-TICK_FONTSIZE = 9
-TITLE_FONTSIZE = 12
+# At most this many frames per GIF, evenly spaced over the shot's records, which bounds the rendering time and memory
+GIF_MAX_FRAMES = 60
+REPORT_FILENAME = "best_worst_timeslices.pdf"
 
 VALUE_LABELS = {
-    "Te_keV_rho": r"$T_e$ [keV]",
-    "ne20_rho": r"$n_e$ [$10^{20}$ m$^{-3}$]",
+    "t_e_keV": r"$T_e$ [keV]",
+    "n_e_1e20": r"$n_e$ [$10^{20}$ m$^{-3}$]",
 }
 GRAD_LABELS = {
-    "Te_keV_rho": r"$dT_e/d\rho$ [keV]",
-    "ne20_rho": r"$dn_e/d\rho$ [$10^{20}$ m$^{-3}$]",
+    "t_e_keV": r"$dT_e/d\rho$ [keV]",
+    "n_e_1e20": r"$dn_e/d\rho$ [$10^{20}$ m$^{-3}$]",
 }
 # Panel order: Te value, ne value, Te gradient, ne gradient
-PANEL_VARS = ("Te_keV_rho", "ne20_rho")
+PANEL_VARS = ("t_e_keV", "n_e_1e20")
 
 
 def _axis_lims(*arrays: np.ndarray) -> tuple[float, float]:
@@ -62,10 +74,8 @@ def _axis_lims(*arrays: np.ndarray) -> tuple[float, float]:
 
 
 def _shade_ignored_grad_region(ax, rho_mid: np.ndarray):
-    """Transparent red span over the rho region excluded from the gradient
-    loss (rho >= GRAD_LOSS_RHO_MAX), where the measured gradients are
-    unreliable and not fit against."""
-    ax.axvspan(ProfilePredictorTRB.GRAD_LOSS_RHO_MAX, rho_mid[-1], color="red", alpha=0.12, linewidth=0, zorder=0)
+    """Transparent red span over the rho region the gradient chi metric excludes (rho >= GRAD_RHO_MAX)."""
+    ax.axvspan(GRAD_RHO_MAX, rho_mid[-1], color="red", alpha=0.12, linewidth=0, zorder=0)
 
 
 def _record_title(ts_metrics: CaseTimesliceMetrics, record_idx: int) -> str:
@@ -74,9 +84,9 @@ def _record_title(ts_metrics: CaseTimesliceMetrics, record_idx: int) -> str:
         stage = "flattop (aux)" if ts_metrics.aux_heated[record_idx] else "flattop (ohmic)"
     return (
         f"shot {ts_metrics.shot[record_idx]} @ t={ts_metrics.time[record_idx]:.3f}s - {stage}\n"
-        f"value={ts_metrics.metric_value[record_idx]:.3f}  "
-        f"grad={ts_metrics.metric_grad[record_idx]:.3f}  "
-        f"combined={ts_metrics.metric_combined[record_idx]:.3f}"
+        f"value={ts_metrics.best('value')[record_idx]:.3f}  "
+        f"grad={ts_metrics.best('grad')[record_idx]:.3f}  "
+        f"combined={ts_metrics.best('combined')[record_idx]:.3f}"
     )
 
 
@@ -96,9 +106,10 @@ def _timeslice_panel(
     shot = ts_metrics.shot[record_idx]
     device = ts_metrics.ds_source[record_idx]
     shot_res = result_ds.sel({EPISODE_DIM: shot}).isel({TIME_DIM: int(ts_metrics.result_time_idx[record_idx])})
-    shot_eval = load_eval_dataset(device).sel({EPISODE_DIM: shot}).isel({TIME_DIM: int(ts_metrics.eval_time_idx[record_idx])})
+    device_shots = result_device_shots(result_ds, device)
+    shot_eval = load_eval_dataset(device, device_shots).sel({EPISODE_DIM: shot}).isel({TIME_DIM: int(ts_metrics.eval_time_idx[record_idx])})
 
-    rho = result_ds["rho"].values
+    rho = result_ds[RADIAL_DIM].values
     rho_mid = 0.5 * (rho[:-1] + rho[1:])
     d_rho = np.diff(rho)
 
@@ -109,14 +120,14 @@ def _timeslice_panel(
         targ = shot_res[f"{var}_targ"].values
         pred = shot_res[f"{var}_pred"].values
         err = shot_eval[f"{var}_error"].values
-        grad_targ = shot_eval[f"{var}_grad"].values
-        grad_err = shot_eval[f"{var}_grad_error"].values
+        grad_targ = shot_eval[f"{var}_gradient"].values
+        grad_err = shot_eval[f"{var}_gradient_error"].values
         grad_targ_mid = 0.5 * (grad_targ[:-1] + grad_targ[1:])
         grad_err_mid = 0.5 * (grad_err[:-1] + grad_err[1:])
         grad_pred = np.diff(pred) / d_rho
 
         ax_val = axes[0, col]
-        style_axis(ax_val, TICK_FONTSIZE)
+        style_axis(ax_val)
         ax_val.fill_between(rho, targ - err, targ + err, color="white", alpha=0.25, linewidth=0)
         ax_val.plot(rho, targ, color="white", linewidth=2, linestyle="--", label="Measured")
         ax_val.plot(rho, pred, color="#0095ff", linewidth=2, label="Predicted")
@@ -125,17 +136,17 @@ def _timeslice_panel(
             ax_val.set_ylim(*ylims[f"{var}_value"])
 
         ax_grad = axes[1, col]
-        style_axis(ax_grad, TICK_FONTSIZE)
+        style_axis(ax_grad)
         _shade_ignored_grad_region(ax_grad, rho_mid)
         ax_grad.fill_between(rho_mid, grad_targ_mid - grad_err_mid, grad_targ_mid + grad_err_mid, color="white", alpha=0.25, linewidth=0)
         ax_grad.plot(rho_mid, grad_targ_mid, color="white", linewidth=2, linestyle="--", label="Measured")
         ax_grad.plot(rho_mid, grad_pred, color="#0095ff", linewidth=2, label="Predicted")
         ax_grad.set_ylabel(GRAD_LABELS[var], color=TEXT_COLOR, fontsize=LABEL_FONTSIZE)
-        ax_grad.set_xlabel(r"$\rho$", color=TEXT_COLOR, fontsize=LABEL_FONTSIZE)
-        if ylims and f"{var}_grad" in ylims:
-            ax_grad.set_ylim(*ylims[f"{var}_grad"])
+        ax_grad.set_xlabel(r"$\rho_{tor,N}$", color=TEXT_COLOR, fontsize=LABEL_FONTSIZE)
+        if ylims and f"{var}_gradient" in ylims:
+            ax_grad.set_ylim(*ylims[f"{var}_gradient"])
         else:
-            grad_rho_mask = rho_mid < ProfilePredictorTRB.GRAD_LOSS_RHO_MAX
+            grad_rho_mask = rho_mid < GRAD_RHO_MAX
             ax_grad.set_ylim(
                 *_axis_lims(
                     (grad_targ_mid - grad_err_mid)[grad_rho_mask],
@@ -144,13 +155,7 @@ def _timeslice_panel(
                 )
             )
 
-    axes[0, 0].legend(
-        fontsize=TICK_FONTSIZE,
-        labelcolor=TEXT_COLOR,
-        facecolor=BACKGROUND_COLOR,
-        edgecolor=TEXT_COLOR,
-        loc="upper right",
-    )
+    axes[0, 0].legend(fontsize=TICK_FONTSIZE, loc="upper right", **LEGEND_STYLE)
     fig.suptitle(f"{title_prefix}{_record_title(ts_metrics, record_idx)}", color=TEXT_COLOR, fontsize=TITLE_FONTSIZE)
     fig.tight_layout(rect=(0, 0, 1, 0.93))
     return fig
@@ -159,28 +164,28 @@ def _timeslice_panel(
 def _shot_ylims(result_ds: xr.Dataset, ts_metrics: CaseTimesliceMetrics, record_idxs: np.ndarray) -> dict:
     """Fixed axis limits over one shot's frames so the GIF does not jump around.
 
-    Gradient y-lims are computed only over rho < GRAD_LOSS_RHO_MAX, the region
-    actually counted in the gradient loss, so a noisy/unreliable edge gradient
-    outside that region does not blow out the axis scale.
+    Gradient y-lims are computed only over rho < GRAD_RHO_MAX, the region the gradient metric counts,
+    so a noisy edge gradient outside it does not blow out the axis scale.
     """
     ylims = {}
-    rho = result_ds["rho"].values
+    rho = result_ds[RADIAL_DIM].values
     d_rho = np.diff(rho)
     rho_mid = 0.5 * (rho[:-1] + rho[1:])
-    grad_rho_mask = rho_mid < ProfilePredictorTRB.GRAD_LOSS_RHO_MAX
+    grad_rho_mask = rho_mid < GRAD_RHO_MAX
     shot = ts_metrics.shot[record_idxs[0]]
     device = ts_metrics.ds_source[record_idxs[0]]
     shot_res = result_ds.sel({EPISODE_DIM: shot})
-    shot_eval = load_eval_dataset(device).sel({EPISODE_DIM: shot})
+    device_shots = result_device_shots(result_ds, device)
+    shot_eval = load_eval_dataset(device, device_shots).sel({EPISODE_DIM: shot})
     res_idxs = ts_metrics.result_time_idx[record_idxs]
     eval_idxs = ts_metrics.eval_time_idx[record_idxs]
 
     for var in PANEL_VARS:
-        targ = shot_res[f"{var}_targ"].transpose(TIME_DIM, "rho").values[res_idxs]
-        pred = shot_res[f"{var}_pred"].transpose(TIME_DIM, "rho").values[res_idxs]
-        err = shot_eval[f"{var}_error"].transpose(TIME_DIM, "rho").values[eval_idxs]
-        grad_targ = shot_eval[f"{var}_grad"].transpose(TIME_DIM, "rho").values[eval_idxs]
-        grad_err = shot_eval[f"{var}_grad_error"].transpose(TIME_DIM, "rho").values[eval_idxs]
+        targ = shot_res[f"{var}_targ"].transpose(TIME_DIM, RADIAL_DIM).values[res_idxs]
+        pred = shot_res[f"{var}_pred"].transpose(TIME_DIM, RADIAL_DIM).values[res_idxs]
+        err = shot_eval[f"{var}_error"].transpose(TIME_DIM, RADIAL_DIM).values[eval_idxs]
+        grad_targ = shot_eval[f"{var}_gradient"].transpose(TIME_DIM, RADIAL_DIM).values[eval_idxs]
+        grad_err = shot_eval[f"{var}_gradient_error"].transpose(TIME_DIM, RADIAL_DIM).values[eval_idxs]
         # Measured gradients live on the full rho grid, average to the rho
         # midpoints where the panel plots them so the mask lines up
         grad_targ_mid = 0.5 * (grad_targ[:, :-1] + grad_targ[:, 1:])
@@ -188,7 +193,7 @@ def _shot_ylims(result_ds: xr.Dataset, ts_metrics: CaseTimesliceMetrics, record_
         grad_pred = np.diff(pred, axis=-1) / d_rho
 
         ylims[f"{var}_value"] = _axis_lims(targ - err, targ + err, pred)
-        ylims[f"{var}_grad"] = _axis_lims(
+        ylims[f"{var}_gradient"] = _axis_lims(
             (grad_targ_mid - grad_err_mid)[:, grad_rho_mask],
             (grad_targ_mid + grad_err_mid)[:, grad_rho_mask],
             grad_pred[:, grad_rho_mask],
@@ -204,36 +209,13 @@ def _fig_to_image(fig: plt.Figure) -> Image.Image:
     return Image.open(buf).convert("RGB")
 
 
-def best_worst_pdf(result_ds: xr.Dataset, ts_metrics: CaseTimesliceMetrics, pdf_path: Path):
-    """One PDF per case: the N_BEST_WORST best pages then the N_BEST_WORST
-    worst pages, ranked by the per-timeslice combined metric."""
-    finite = np.flatnonzero(np.isfinite(ts_metrics.metric_combined))
-    if len(finite) == 0:
-        logger.warning(f"No finite combined metrics, skipping {pdf_path}")
-        return
-    order = finite[np.argsort(ts_metrics.metric_combined[finite])]
-    best = order[:N_BEST_WORST]
-    worst = order[::-1][:N_BEST_WORST]
-
-    pdf_path.parent.mkdir(parents=True, exist_ok=True)
-    with PdfPages(pdf_path) as pdf:
-        for rank, record_idx in enumerate(best, start=1):
-            fig = _timeslice_panel(result_ds, ts_metrics, record_idx, title_prefix=f"BEST #{rank} - ")
-            pdf.savefig(fig, facecolor=fig.get_facecolor())
-            plt.close(fig)
-        for rank, record_idx in enumerate(worst, start=1):
-            fig = _timeslice_panel(result_ds, ts_metrics, record_idx, title_prefix=f"WORST #{rank} - ")
-            pdf.savefig(fig, facecolor=fig.get_facecolor())
-            plt.close(fig)
-    logger.info(f"Saved best/worst timeslice PDF to {pdf_path}")
-
-
 def _select_gif_shots(ts_metrics: CaseTimesliceMetrics) -> list:
-    """Best, median, and worst test shots by shot-mean combined metric."""
+    """Best, median, and worst test shots by the best seed's shot-mean combined metric."""
     shots = np.unique(ts_metrics.shot)
+    combined = ts_metrics.best("combined")
 
     def _shot_mean(shot) -> float:
-        values = ts_metrics.metric_combined[ts_metrics.shot == shot]
+        values = combined[ts_metrics.shot == shot]
         values = values[np.isfinite(values)]
         return float(np.mean(values)) if len(values) else np.nan
 
@@ -255,81 +237,51 @@ def evolution_gifs(result_ds: xr.Dataset, ts_metrics: CaseTimesliceMetrics, case
         record_idxs = record_idxs[np.argsort(ts_metrics.time[record_idxs])]
         if len(record_idxs) == 0:
             continue
-        ylims = _shot_ylims(result_ds, ts_metrics, record_idxs)
+        n_frames = min(len(record_idxs), GIF_MAX_FRAMES)
+        frame_positions = np.linspace(0, len(record_idxs) - 1, n_frames).round().astype(int)
+        frame_record_idxs = record_idxs[frame_positions]
+        ylims = _shot_ylims(result_ds, ts_metrics, frame_record_idxs)
         frames = [
-            _fig_to_image(
-                _timeslice_panel(result_ds, ts_metrics, record_idx, title_prefix=f"frame {i + 1}/{len(record_idxs)} - ", ylims=ylims)
-            )
-            for i, record_idx in enumerate(record_idxs)
+            _fig_to_image(_timeslice_panel(result_ds, ts_metrics, record_idx, title_prefix=f"frame {i + 1}/{n_frames} - ", ylims=ylims))
+            for i, record_idx in enumerate(frame_record_idxs)
         ]
         gif_path = case_dir / f"shot_{shot}_evolution.gif"
-        gif_path.parent.mkdir(parents=True, exist_ok=True)
-        frames[0].save(
-            gif_path,
-            save_all=True,
-            append_images=frames[1:],
-            duration=GIF_FRAME_DURATION_MS,
-            loop=0,
-        )
+        # The temporary name hides the extension, so PIL is told the format
+        with atomic_output(gif_path) as tmp_path:
+            frames[0].save(
+                tmp_path,
+                format="GIF",
+                save_all=True,
+                append_images=frames[1:],
+                duration=GIF_FRAME_DURATION_MS,
+                loop=0,
+            )
         logger.info(f"Saved profile evolution GIF to {gif_path}")
 
 
-def generate_case_reports(study, figure_dir: Path):
-    """Best/worst timeslice PDFs and profile evolution GIFs for every finished
-    case. Existing case report directories are left alone (GIF rendering is
-    slow); clean_figures wipes the figure dir to force regeneration."""
-    for case in study.cases:
-        generate_case_report(study, case, figure_dir)
-
-
-def case_report_dir(figure_dir: Path, case) -> Path:
-    return Path(figure_dir) / "case_reports" / str(case)
-
-
 def case_report_done(case_dir: Path) -> bool:
-    return (case_dir / "best_worst_timeslices.pdf").exists() and any(case_dir.glob("shot_*_evolution.gif"))
+    """The PDF is written last, so it alone marks a finished report."""
+    return (case_dir / REPORT_FILENAME).exists()
 
 
-def generate_case_report(study, case, figure_dir: Path):
-    """Best/worst timeslice PDF and profile evolution GIFs for one case.
-    No-op when the case has no result file or the report already exists."""
-    result_path = study.result_path(case)
-    if not result_path.exists():
-        return
-    case_dir = case_report_dir(figure_dir, case)
-    if case_report_done(case_dir):
-        logger.info(f"Case report already exists for {case}, skipping")
-        return
+def render_case_report(result_ds: xr.Dataset, ts_metrics: CaseTimesliceMetrics, case_dir: Path):
+    """The profile evolution GIFs, then the best and worst test timeslices by the combined metric.
 
-    result_ds = xr.load_dataset(result_path)
-    loss_config = study.make_train_config(case).loss_config
-    ts_metrics = compute_case_timeslice_metrics(result_ds, loss_config)
-    if len(ts_metrics) == 0:
-        logger.warning(f"No valid test timeslices for case {case}, skipping case report")
-        return
-
-    best_worst_pdf(result_ds, ts_metrics, case_dir / "best_worst_timeslices.pdf")
+    Both score the best seed, whose predictions the result file holds.
+    The PDF comes last, since case_report_done reads it alone.
+    """
     evolution_gifs(result_ds, ts_metrics, case_dir)
-
-
-def analysis_case_done(study, case, figure_dir: Path) -> bool:
-    """Whether a case needs no more analysis work: its metrics cache exists and
-    either it is the empty 'nothing valid' marker or the case report is on disk."""
-    cache_path = case_metrics_path(study, case)
-    if not cache_path.exists():
-        return False
-    case_metrics = xr.load_dataset(cache_path)
-    if not case_metrics.data_vars:
-        return True
-    return case_report_done(case_report_dir(figure_dir, case))
+    timeslice_page = partial(_timeslice_panel, result_ds, ts_metrics)
+    record_idxs = np.arange(len(ts_metrics))
+    best_worst_pdf(record_idxs, ts_metrics.best("combined"), timeslice_page, case_dir / REPORT_FILENAME)
 
 
 def torax_relaxation_report(study, metrics_ds: xr.Dataset, figure_dir: Path):
     """Relaxation figure for the best torax case at its best timeslice.
 
     Picks the torax-* case with the lowest combined-metric mean over all test
-    timeslices, restores its trained module, reruns the TORAX solve step by
-    step on the timeslice where the fit is best, and plots the profile
+    timeslices (seed mean), restores its trained module, reruns the TORAX solve step by
+    step on the timeslice where the best seed fits best, and plots the profile
     relaxation into the measured target shape.
     """
     if not metrics_ds.data_vars or "case_idx" not in metrics_ds.dims:
@@ -353,13 +305,13 @@ def torax_relaxation_report(study, metrics_ds: xr.Dataset, figure_dir: Path):
     logger.info(f"Best torax case by combined metric: {case}")
 
     result_ds = xr.load_dataset(study.result_path(case))
-    train_config = study.make_train_config(case)
-    ts_metrics = compute_case_timeslice_metrics(result_ds, train_config.loss_config)
-    finite_records = np.flatnonzero(np.isfinite(ts_metrics.metric_combined))
+    ts_metrics = compute_case_timeslice_metrics(result_ds)
+    combined = ts_metrics.best("combined")
+    finite_records = np.flatnonzero(np.isfinite(combined))
     if len(finite_records) == 0:
         logger.warning(f"No valid test timeslices for torax case {case}, skipping relaxation report")
         return
-    best_record = int(finite_records[np.argmin(ts_metrics.metric_combined[finite_records])])
+    best_record = int(finite_records[np.argmin(combined[finite_records])])
 
     shot = ts_metrics.shot[best_record]
     device = ts_metrics.ds_source[best_record]
@@ -375,13 +327,8 @@ def torax_relaxation_report(study, metrics_ds: xr.Dataset, figure_dir: Path):
         logger.info(f"TORAX relaxation figure already exists at {plot_path}, skipping")
         return
 
-    # The raw device dataset carries the scalar input vars the module needs.
-    # load_eval_dataset keeps the same time_idx indexing (rows are never dropped)
-    timeslice = xr.open_dataset(config.dataset_paths[device]).sel({EPISODE_DIM: shot}).isel({TIME_DIM: eval_time_idx})
-    # Raw device files lack the device index organize_data assigns, the
-    # module's normalizer needs it to pick the right per-device statistics
-    timeslice["ds_source_idx"] = float(config.ds_source_to_idx[device])
-
+    # Only now, since it loads every device (chi_sigma_floors) and the figure may already exist
+    train_config = study.make_train_config(case)
     # Function-level import: restore_predictor imports profile_study, which
     # imports this module at run_study time, so a top-level import would cycle
     from transport_study.profile_transfer.restore_predictor import (
@@ -389,10 +336,12 @@ def torax_relaxation_report(study, metrics_ds: xr.Dataset, figure_dir: Path):
     )
 
     try:
+        # The result files keep the store's time_idx indexing (rows are never dropped)
+        timeslice = load_timeslice(device, shot, eval_time_idx)
         module = restore_profile_predictor(train_config)
         steps, coeffs = module.evolve(timeslice)
     except Exception:
-        logger.exception(f"Failed to restore or evolve torax module for case {case}, skipping relaxation report")
+        logger.exception(f"Failed to load, restore or evolve torax module for case {case}, skipping relaxation report")
         return
     logger.info(f"TORAX relaxation recorded {len(steps)} states (initial + {len(steps) - 1} steps)")
 

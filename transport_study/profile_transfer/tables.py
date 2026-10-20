@@ -1,18 +1,18 @@
 """Per-axis comparison tables for profile transfer study results.
 
-For every case axis (model type, training dataset, domain adaptation, freeze
-shapes, number of target shots) and every combination of the remaining axes,
+For every case axis (CASE_FIELD_ORDER) and every combination of the remaining axes,
 one markdown table comparing the cases that differ only along that axis.
 Columns combine the stage-resolved TIME-AVERAGED loss metrics from
 collected_metrics.nc (per-timeslice means of the value / gradient / combined
 validation loss components, free of the shot-duration confound in the
 time-integrated per-shot errors) with the time-integrated per-shot error
 medians from the long-form collected_results.nc.
+The headline metric also gets its best seed's value and its std over the seeds (orchestration.seed_results).
 
 A flat case_stats.csv with one row per case and every column is written next
-to the tables for ad hoc analysis. The table and csv writing itself is the
-shared orchestration.tables machinery; this module only declares the spec and
-builds the per-case stats frame.
+to the tables for ad hoc analysis.
+The table and csv writing itself is the shared orchestration.tables machinery,
+this module only declares the spec and builds the per-case stats frame.
 """
 
 from pathlib import Path
@@ -26,10 +26,7 @@ from transport_study.orchestration.tables import (
     merge_stage_metrics,
     write_case_comparison_tables,
 )
-
-# Stage-resolved metric variables in collected_metrics.nc
-# (see profile_transfer.study_metrics.METRIC_NAMES)
-_STAGE_METRICS = ("value", "grad", "combined")
+from transport_study.profile_transfer.study_metrics import METRIC_NAMES
 
 # Per-shot time-integrated errors kept from the long-form collected results,
 # reduced to a per-case median
@@ -43,6 +40,8 @@ CASE_FIELD_ORDER = (
     "freeze_shapes",
     "geometry_builder",
     "num_target_shots",
+    "target_shot_order",
+    "model_size",
 )
 
 SPEC = ComparisonTableSpec(
@@ -57,9 +56,13 @@ SPEC = ComparisonTableSpec(
         "freeze_shapes": "freeze_{}",
         "geometry_builder": "geom_{}",
         "num_target_shots": "targ_{}",
+        "target_shot_order": "order_{}",
+        "model_size": "size_{}",
     },
     columns=(
         ("combined (time avg)", "combined_mean_all"),
+        ("best", "combined_mean_best_all"),
+        ("seed std", "combined_mean_seed_std_all"),
         ("rampup", "combined_mean_rampup"),
         ("flattop", "combined_mean_flattop"),
         ("flattop ohmic", "combined_mean_flattop_ohmic"),
@@ -67,9 +70,11 @@ SPEC = ComparisonTableSpec(
         ("rampdown", "combined_mean_rampdown"),
         ("value (time avg)", "value_mean_all"),
         ("grad (time avg)", "grad_mean_all"),
+        ("diverged", "diverged_mean_all"),
         ("rel err (integral, med)", "err_rel_shot_med"),
         ("abs err (integral, med)", "err_abs_shot_med"),
     ),
+    stage_metrics=METRIC_NAMES,
 )
 
 
@@ -85,7 +90,7 @@ def case_stats_frame(results_ds: xr.Dataset, metrics_ds: xr.Dataset) -> pd.DataF
     case_fields = grouped[list(CASE_FIELD_ORDER)].first()
     df = pd.concat([case_fields, medians], axis=1).reset_index()
     df = df[[*CASE_FIELD_ORDER, "case_idx", *medians.columns]]
-    return merge_stage_metrics(df, metrics_ds, _STAGE_METRICS)
+    return merge_stage_metrics(df, metrics_ds, SPEC.stage_metrics)
 
 
 def write_comparison_tables(results_ds: xr.Dataset, metrics_ds: xr.Dataset, figure_dir: Path):

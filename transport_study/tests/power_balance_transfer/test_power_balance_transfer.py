@@ -10,13 +10,16 @@ import xarray as xr
 from transport_study import PACKAGE_ROOT
 from transport_study.config import config
 from transport_study.modules.normalization import STAT_NORMALIZATIONS
+from transport_study.modules.power_balance.trb import PowerBalanceTRB
 from transport_study.orchestration.organize_data import get_train_test_datasets
-from transport_study.power_balance_transfer.power_balance_study import (
-    HYPERPARAM_TARGET_SHOTS,
-    PowerBalanceStudy,
+from transport_study.orchestration.study import HYPERPARAM_TARGET_SHOTS
+from transport_study.orchestration.target_shots import (
+    BASE_TARGET_SHOT_ORDER,
+    configured_target_split,
 )
-
-SAMPLE_DIR = PACKAGE_ROOT / "datasets" / "sample"
+from transport_study.power_balance_transfer.power_balance_study import PowerBalanceStudy
+from transport_study.tests.sample_data import SAMPLE_DIR, requires_sample_data
+from transport_study.tests.tuned_configs import write_hyperparam_tuned_configs
 
 
 def _working_dir_base() -> Path:
@@ -27,7 +30,7 @@ def _working_dir_base() -> Path:
 
 
 def _make_config(study_name: str, **overrides) -> PowerBalanceStudy.Config:
-    """Small Config against the bundled sample datasets, quick enough for smoke training."""
+    """Small Config against the sample datasets, quick enough for smoke training."""
     defaults = dict(
         study_name=study_name,
         working_dir_base=_working_dir_base(),
@@ -42,6 +45,8 @@ def _make_config(study_name: str, **overrides) -> PowerBalanceStudy.Config:
         max_epochs=2,
         epochs_per_val=1,
         patience=2,
+        # One seed, so every case trains once as before seeds
+        num_seeds=1,
         model_types=("sciml-taue-nn", "mlp"),
         training_datasets=("cmod-low1", "cmod-low1_cmod-low2"),
         data_normalization_methods=("coral",),
@@ -57,16 +62,32 @@ def _make_config(study_name: str, **overrides) -> PowerBalanceStudy.Config:
 def _clean_case(study: PowerBalanceStudy, case: PowerBalanceStudy.Case):
     """Clear a case's checkpoints and results from previous runs before retraining.
 
-    Without this, orbax keeps the old "best" checkpoint (max_to_keep=1,
+    Without this, the checkpoint manager keeps the old "best" checkpoint (max_to_keep=1,
     best_mode=min), so restore_best_checkpoint=True would load stale weights
-    from a broken training run. The _latest resume dir must go too, otherwise
-    launch_train resumes at max_epochs and trains for zero epochs, never
-    writing a fresh best checkpoint.
+    from a broken training run.
+    The same dir holds the latest checkpoint, so launch_train would also resume at max_epochs
+    and train for zero epochs, never writing a fresh best checkpoint.
     """
     shutil.rmtree(study.trained_model_dir(case), ignore_errors=True)
-    shutil.rmtree(Path(f"{study.trained_model_dir(case)}_latest"), ignore_errors=True)
     if study.result_path(case).exists():
         os.remove(study.result_path(case))
+    for seed in range(config.num_seeds):
+        study.seed_result_path(case, seed).unlink(missing_ok=True)
+
+
+def _train_case(study: PowerBalanceStudy, case: PowerBalanceStudy.Case):
+    """Train the case as the serial orchestrator would.
+
+    Its unfinished prereqs go first, then every seed through run_case,
+    which writes a hyperparam case's tuned config before training (the anchor terms read the submodules' ones),
+    then the seed merge into the result file and best checkpoint.
+    """
+    for prereq in case.prereqs or []:
+        if not study.result_path(prereq).exists():
+            _train_case(study, prereq)
+    for seed in range(config.num_seeds):
+        study.run_case(case, seed, skip_tuning=True, enable_parallelism=False)
+    study.merge_seed_results(case)
 
 
 def _hyperparam_case(study: PowerBalanceStudy, model_type: str) -> PowerBalanceStudy.Case:
@@ -75,17 +96,20 @@ def _hyperparam_case(study: PowerBalanceStudy, model_type: str) -> PowerBalanceS
     return case.get_hyperparam_prereq()
 
 
-def test_power_balance_transfer_cases():
+def test_power_balance_transfer_cases(tmp_path):
     """Make sure the case graph is set up correctly (pure logic, no training)."""
     study = PowerBalanceStudy(
         _make_config(
             "xfer_test",
+            working_dir_base=tmp_path,
             model_types=("sciml-taue-nn", "mlp", "transformer"),
             data_normalization_methods=("raw", "coral"),
             freeze_submodules_options=(True, False),
-            num_target_shots_options=(0, -1),
+            num_target_shots_options=(0, 1),
+            target_shot_orders=("ascending", "spanning"),
         )
     )
+    assert any(case.target_shot_order == "spanning" for case in study.cases)
 
     # Ensure that each case with a prereq, has that prereq in the list of cases
     for case in study.cases:
@@ -96,7 +120,7 @@ def test_power_balance_transfer_cases():
     # Ensure that there are no duplicate cases
     assert len(study.cases) == len(set(study.cases)), "There are duplicate cases in the study"
 
-    # Ensure there is only one hyperparameter tuning case per model type
+    # Ensure there is only one hyperparameter tuning case per model type, shared by every target shot order
     hp_tuning_cases_by_model = {}
     for case in study.cases:
         if case.is_hyperparam_case():
@@ -123,6 +147,7 @@ def test_power_balance_transfer_cases():
                 domain_adaptation=case.domain_adaptation,
                 freeze_submodules=config.hyperparam_freeze_submodules,
                 num_target_shots=case.num_target_shots,
+                target_shot_order=case.target_shot_order,
             )
             for submodule_type in ("p_oh", "p_rad")
         ]
@@ -135,17 +160,21 @@ def test_power_balance_transfer_cases():
                 continue
             expected_prereqs = _submodule_prereqs(case)
         elif case.domain_adaptation == "transfer":
+            # Stat normalizations fit their per-device statistics on the
+            # combined historic + target data of THIS case, so their twin
+            # keeps its target shots. Stateless normalizations have
+            # nothing to fit, so all their transfer cases share one twin
+            if case.data_normalization in STAT_NORMALIZATIONS:
+                twin_shots = {"num_target_shots": case.num_target_shots, "target_shot_order": case.target_shot_order}
+            else:
+                twin_shots = {"num_target_shots": HYPERPARAM_TARGET_SHOTS, "target_shot_order": BASE_TARGET_SHOT_ORDER}
             twin = PowerBalanceStudy.Case(
                 model_type=case.model_type,
                 training_data=case.training_data,
                 data_normalization=case.data_normalization,
                 domain_adaptation="transfer_pretrain",
                 freeze_submodules=case.freeze_submodules,
-                # Stat normalizations fit their per-device statistics on the
-                # combined historic + target data of THIS case, so their twin
-                # keeps its num_target_shots. Stateless normalizations have
-                # nothing to fit, so all their transfer cases share one twin
-                num_target_shots=case.num_target_shots if case.data_normalization in STAT_NORMALIZATIONS else HYPERPARAM_TARGET_SHOTS,
+                **twin_shots,
             )
             expected_prereqs = [_hyperparam_case(study, case.model_type), twin]
             if case.model_type in ("sciml-taue-nn", "sciml-taue-scalinglaw"):
@@ -166,6 +195,7 @@ def test_power_balance_transfer_cases():
 
 
 @pytest.mark.slow
+@requires_sample_data
 def test_weighted_device_weight():
     """Train a single p_oh case with weighted domain adaptation to exercise device weighting."""
     study = PowerBalanceStudy(
@@ -183,21 +213,22 @@ def test_weighted_device_weight():
         training_data="cmod-low1_cmod-low2",
         data_normalization="coral",
         domain_adaptation="weighted",
-        freeze_submodules=True,
+        freeze_submodules=config.hyperparam_freeze_submodules,
         num_target_shots=3,
     )
 
-    weights = study.make_weighted_device_weights(case_p_oh)
+    weights = study.make_weighted_device_weights(case_p_oh, PowerBalanceTRB.STUDY_TYPE)
     assert set(weights) == {"cmod-low1", "cmod-low2", "cmod-high"}
     assert all(w > 0 for w in weights.values())
     # Target gets the largest per-sample weight (few shots, half the budget)
     assert weights["cmod-high"] > weights["cmod-low1"]
 
-    study.launch_train(case_p_oh)
+    _train_case(study, case_p_oh)
     assert study.result_path(case_p_oh).exists()
 
 
-def test_addition_no_device_weights():
+@requires_sample_data
+def test_addition_no_device_weights(tmp_path):
     """An 'addition' case adds target shots as normal samples without loss weighting.
 
     make_train_config for a domain_adaptation='addition' case must NOT put a
@@ -210,6 +241,7 @@ def test_addition_no_device_weights():
     study = PowerBalanceStudy(
         _make_config(
             "test_addition_no_device_weights",
+            working_dir_base=tmp_path,
             model_types=("mlp",),
             training_datasets=("cmod-low1_cmod-low2",),
             domain_adaptation_methods=("weighted", "addition"),
@@ -223,13 +255,14 @@ def test_addition_no_device_weights():
             training_data="cmod-low1_cmod-low2",
             data_normalization="coral",
             domain_adaptation=domain_adaptation,
-            freeze_submodules=True,
+            freeze_submodules=config.hyperparam_freeze_submodules,
             num_target_shots=3,
         )
 
     case_weighted = _case("weighted")
     case_addition = _case("addition")
 
+    write_hyperparam_tuned_configs(study)
     train_config_weighted = study.make_train_config(case_weighted)
     train_config_addition = study.make_train_config(case_addition)
 
@@ -247,18 +280,20 @@ def test_addition_no_device_weights():
         return get_train_test_datasets(
             case.training_data,
             domain_adaptation=case.domain_adaptation,
-            num_target_shots=case.num_target_shots,
-            target_test_set_size=config.target_test_set_size,
+            target_split=configured_target_split(case.num_target_shots, case.target_shot_order),
             study_type=PowerBalanceStudy.STUDY_TYPE,
         )
 
-    train_ds_weighted, test_ds_weighted = _datasets(case_weighted)
-    train_ds_addition, test_ds_addition = _datasets(case_addition)
-    xr.testing.assert_identical(train_ds_weighted, train_ds_addition)
+    train_parts_weighted, test_ds_weighted = _datasets(case_weighted)
+    train_parts_addition, test_ds_addition = _datasets(case_addition)
+    assert len(train_parts_weighted) == len(train_parts_addition)
+    for part_weighted, part_addition in zip(train_parts_weighted, train_parts_addition, strict=True):
+        xr.testing.assert_identical(part_weighted, part_addition)
     xr.testing.assert_identical(test_ds_weighted, test_ds_addition)
 
 
 @pytest.mark.slow
+@requires_sample_data
 def test_transformer_training():
     """Smoke-train the transformer case and check the normalizer stats stay frozen."""
     study = PowerBalanceStudy(
@@ -276,19 +311,19 @@ def test_transformer_training():
         training_data="cmod-low1",
         data_normalization="coral",
         domain_adaptation=None,
-        freeze_submodules=True,
+        freeze_submodules=config.hyperparam_freeze_submodules,
         num_target_shots=0,
     )
 
     _clean_case(study, case)
 
-    study.launch_train(case)
+    _train_case(study, case)
     assert study.result_path(case).exists()
 
     trainer_init, _ = study.restore_trainer(case, restore_best_checkpoint=False)
     trainer_final, _ = study.restore_trainer(case, restore_best_checkpoint=True)
-    module_init = trainer_init.train_state.model.module
-    module_final = trainer_final.train_state.model.module
+    module_init = trainer_init.eval_model.module
+    module_final = trainer_final.eval_model.module
 
     # Normalizer statistics are frozen buffers, training must not touch them
     chex.assert_trees_all_equal(module_init.normalizer, module_final.normalizer)
@@ -298,6 +333,7 @@ def test_transformer_training():
 
 
 @pytest.mark.slow
+@requires_sample_data
 def test_submodule_freezing():
     study = PowerBalanceStudy(
         _make_config(
@@ -320,14 +356,14 @@ def test_submodule_freezing():
             num_target_shots=HYPERPARAM_TARGET_SHOTS,
         )
 
-    case_p_oh = _case("p_oh", True)
-    case_p_rad = _case("p_rad", True)
+    case_p_oh = _case("p_oh", config.hyperparam_freeze_submodules)
+    case_p_rad = _case("p_rad", config.hyperparam_freeze_submodules)
     case_frozen = _case("sciml-taue-nn", True)
     case_unfrozen = _case("sciml-taue-nn", False)
 
     for case in [case_p_oh, case_p_rad, case_frozen, case_unfrozen]:
         if not study.result_path(case).exists():
-            study.launch_train(case)
+            _train_case(study, case)
 
     # Load the trained models for each case,
     # Ensure the weights for p_oh and p_rad are the same for the frozen case,
@@ -337,10 +373,10 @@ def test_submodule_freezing():
     trainer_frozen, _ = study.restore_trainer(case_frozen)
     trainer_unfrozen, _ = study.restore_trainer(case_unfrozen)
 
-    model_p_oh = trainer_p_oh.train_state.model.nn
-    model_p_rad = trainer_p_rad.train_state.model.nn
-    model_frozen = trainer_frozen.train_state.model.module
-    model_unfrozen = trainer_unfrozen.train_state.model.module
+    model_p_oh = trainer_p_oh.eval_model.nn
+    model_p_rad = trainer_p_rad.eval_model.nn
+    model_frozen = trainer_frozen.eval_model.module
+    model_unfrozen = trainer_unfrozen.eval_model.module
 
     chex.assert_trees_all_equal(model_p_oh, model_frozen.p_oh_predictor.nn)
     chex.assert_trees_all_equal(model_p_rad, model_frozen.p_rad_predictor.nn)
@@ -351,12 +387,13 @@ def test_submodule_freezing():
 
     # The frozen submodules' normalizer stats survive unchanged too
     chex.assert_trees_all_equal(
-        trainer_p_oh.train_state.model.normalizer,
+        trainer_p_oh.eval_model.normalizer,
         model_frozen.p_oh_predictor.normalizer,
     )
 
 
 @pytest.mark.slow
+@requires_sample_data
 def test_transfer_weights():
     """Transfer with a stat-based normalization runs as two cases: a
     transfer_pretrain twin trains on the historic data with the normalizer
@@ -378,7 +415,7 @@ def test_transfer_weights():
         training_data="cmod-low1_cmod-low2",
         data_normalization="coral",
         domain_adaptation="transfer",
-        freeze_submodules=True,
+        freeze_submodules=config.hyperparam_freeze_submodules,
         num_target_shots=3,
     )
     # The pretrain twin keeps this case's num_target_shots, the old shared
@@ -390,31 +427,33 @@ def test_transfer_weights():
 
     _clean_case(study, case_pretrain)
     _clean_case(study, case_transfer)
-    study.launch_train(case_pretrain)
+    _train_case(study, case_pretrain)
     assert study.result_path(case_pretrain).exists()
-    study.launch_train(case_transfer)
+    _train_case(study, case_transfer)
     assert study.result_path(case_transfer).exists()
 
-    pretrain_final = study.restore_trainer(case_pretrain)[0].train_state.model.module
+    pretrain_final = study.restore_trainer(case_pretrain)[0].eval_model.module
     # restore_best_checkpoint=False on the transfer case IS the pretrain best:
     # model_init restores the transfer_checkpoint before fine-tuning starts
-    transfer_init = study.restore_trainer(case_transfer, restore_best_checkpoint=False)[0].train_state.model.module
-    transfer_final = study.restore_trainer(case_transfer)[0].train_state.model.module
+    transfer_init = study.restore_trainer(case_transfer, restore_best_checkpoint=False)[0].eval_model.module
+    transfer_final = study.restore_trainer(case_transfer)[0].eval_model.module
 
-    # Important! The TARGET device's per-device stats are fitted by the pretrain twin
-    # (identity before this change, the shared pretrain never saw the target device)
+    # CORAL aligns every source device to the target, which keeps the identity transform as the reference,
+    # so the pretrain twin's fit on historic + the case's target shots shows on the sources
     target_idx = config.ds_source_to_idx[config.target_device]
-    n = np.asarray(pretrain_final.normalizer.transforms[target_idx]).shape[0]
-    assert not np.allclose(np.asarray(pretrain_final.normalizer.transforms[target_idx]), np.eye(n)), (
-        "Target device CORAL transform is identity, the combined fit did not happen"
-    )
+    transforms = pretrain_final.normalizer.transforms
+    n = np.asarray(transforms[target_idx]).shape[0]
+    assert np.allclose(np.asarray(transforms[target_idx]), np.eye(n)), "The target device is the CORAL reference"
+    for source in case_transfer.training_data.sources:
+        source_idx = config.ds_source_to_idx[source]
+        assert not np.allclose(np.asarray(transforms[source_idx]), np.eye(n)), f"{source} was not aligned to the target"
     # The transfer case inherits the pretrain normalizer through the
     # checkpoint restore and never refits or trains it
     chex.assert_trees_all_equal(pretrain_final.normalizer, transfer_init.normalizer)
     chex.assert_trees_all_equal(pretrain_final.normalizer, transfer_final.normalizer)
 
     # The pretrain trained the full network from the random init
-    pretrain_random_init = study.restore_trainer(case_pretrain, restore_best_checkpoint=False)[0].train_state.model.module
+    pretrain_random_init = study.restore_trainer(case_pretrain, restore_best_checkpoint=False)[0].eval_model.module
     for i in range(len(pretrain_final.nn.layers)):
         with pytest.raises(AssertionError):
             chex.assert_trees_all_equal(pretrain_random_init.nn.layers[i], pretrain_final.nn.layers[i])
@@ -428,6 +467,7 @@ def test_transfer_weights():
 
 
 @pytest.mark.slow
+@requires_sample_data
 @pytest.mark.parametrize("freeze_submodules", [True, False], ids=["frozen", "unfrozen"])
 def test_transfer_weights_submodules(freeze_submodules):
     study = PowerBalanceStudy(
@@ -451,8 +491,8 @@ def test_transfer_weights_submodules(freeze_submodules):
             num_target_shots=HYPERPARAM_TARGET_SHOTS if domain_adaptation is None else 3,
         )
 
-    case_p_oh_transfer = _case("p_oh", "transfer", True)
-    case_p_rad_transfer = _case("p_rad", "transfer", True)
+    case_p_oh_transfer = _case("p_oh", "transfer", config.hyperparam_freeze_submodules)
+    case_p_rad_transfer = _case("p_rad", "transfer", config.hyperparam_freeze_submodules)
     case_sciml_transfer = _case("sciml-taue-nn", "transfer", freeze_submodules)
     case_p_oh_pretrain = case_p_oh_transfer.replace(domain_adaptation="transfer_pretrain")
     case_p_rad_pretrain = case_p_rad_transfer.replace(domain_adaptation="transfer_pretrain")
@@ -474,15 +514,15 @@ def test_transfer_weights_submodules(freeze_submodules):
     for case in ordered_cases:
         _clean_case(study, case)
     for case in ordered_cases:
-        study.launch_train(case)
+        _train_case(study, case)
         assert study.result_path(case).exists()
 
     # Get initial and final modules for each case
-    sciml_transfer_init = study.restore_trainer(case_sciml_transfer, restore_best_checkpoint=False)[0].train_state.model.module
-    p_oh_transfer_final = study.restore_trainer(case_p_oh_transfer)[0].train_state.model
-    p_rad_transfer_final = study.restore_trainer(case_p_rad_transfer)[0].train_state.model
-    sciml_transfer_final = study.restore_trainer(case_sciml_transfer)[0].train_state.model.module
-    sciml_pretrain_final = study.restore_trainer(case_sciml_pretrain)[0].train_state.model.module
+    sciml_transfer_init = study.restore_trainer(case_sciml_transfer, restore_best_checkpoint=False)[0].eval_model.module
+    p_oh_transfer_final = study.restore_trainer(case_p_oh_transfer)[0].eval_model
+    p_rad_transfer_final = study.restore_trainer(case_p_rad_transfer)[0].eval_model
+    sciml_transfer_final = study.restore_trainer(case_sciml_transfer)[0].eval_model.module
+    sciml_pretrain_final = study.restore_trainer(case_sciml_pretrain)[0].eval_model.module
 
     # 1. The transfer case fine-tunes only the taue network's last layer on
     # top of the pretrain best
@@ -524,6 +564,7 @@ def test_transfer_weights_submodules(freeze_submodules):
 
 
 @pytest.mark.slow
+@requires_sample_data
 def test_collect_results():
     study = PowerBalanceStudy(
         _make_config(
@@ -542,11 +583,7 @@ def test_collect_results():
     shutil.rmtree(study.result_dir, ignore_errors=True)
     study.working_dir.mkdir(parents=True, exist_ok=True)
 
-    unfinished_cases = [case for case in study.cases if not study.result_path(case).exists() and study.check_data_requirements(case)]
-    while len(unfinished_cases) > 0:
-        for case in unfinished_cases:
-            study.run_case(case, skip_tuning=True, enable_parallelism=False)
-        unfinished_cases = [case for case in unfinished_cases if not study.result_path(case).exists()]
+    study.run_unfinished_cases(skip_tuning=True, enable_parallelism=False)
 
     ds_merged = study.collect_results()
 

@@ -1,0 +1,176 @@
+"""Per-case report driver and page pieces shared by every study.
+
+Each study's ANALYSIS_REPORTS_MODULE exports two names:
+    case_report_done(case_dir): whether the case's report files are on disk
+    render_case_report(result_ds, ts_metrics, case_dir): write them
+Everything else lives here:
+the skip and no-result checks, the timeslice scoring through orchestration.case_metrics,
+the best / worst PDF assembly and the stage shading of the trajectory pages.
+"""
+
+from collections.abc import Callable, Generator, Sequence
+from contextlib import contextmanager
+from importlib import import_module
+from pathlib import Path
+
+import matplotlib.pyplot as plt
+import numpy as np
+import xarray as xr
+from loguru import logger
+from matplotlib.backends.backend_pdf import PdfPages
+from matplotlib.patches import Patch
+
+from transport_study.orchestration.case_metrics import (
+    StagedTimesliceMetrics,
+    cached_case_metrics_path,
+    case_timeslice_metrics,
+)
+from transport_study.orchestration.study import Study
+from transport_study.plot_style import BACKGROUND_COLOR, TEXT_COLOR
+
+N_BEST_WORST = 10
+TITLE_FONTSIZE = 12
+
+STAGE_SHADE_COLORS = {
+    "rampup": "#4d94ff",
+    "flattop": "#8dff36",
+    "rampdown": "#ff4d4d",
+}
+AUX_SHADE_COLOR = "#ffb347"
+
+
+def stage_spans(times: np.ndarray, mask: np.ndarray) -> list[tuple[float, float]]:
+    """(start, end) time spans of the contiguous True runs of mask."""
+    spans: list[tuple[float, float]] = []
+    idxs = np.flatnonzero(mask)
+    if len(idxs) == 0:
+        return spans
+    breaks = np.flatnonzero(np.diff(idxs) > 1)
+    starts = np.concatenate(([idxs[0]], idxs[breaks + 1]))
+    ends = np.concatenate((idxs[breaks], [idxs[-1]]))
+    for s, e in zip(starts, ends, strict=True):
+        spans.append((float(times[s]), float(times[e])))
+    return spans
+
+
+def shade_stages(stage_axes: Sequence, aux_ax, ts_metrics: StagedTimesliceMetrics, records: np.ndarray) -> list[Patch]:
+    """Shade the shot stages of time-sorted records on stage_axes and the aux-heated spans along the bottom of aux_ax.
+
+    Returns the legend handles of the shaded stages and of the aux-heated marker.
+    """
+    record_time = ts_metrics.time[records]
+    stage_handles = []
+    for stage, color in STAGE_SHADE_COLORS.items():
+        spans = stage_spans(record_time, ts_metrics.stage[records] == stage)
+        for start, end in spans:
+            for ax in stage_axes:
+                ax.axvspan(start, end, color=color, alpha=0.10, linewidth=0, zorder=0)
+        if spans:
+            stage_handles.append(Patch(facecolor=color, alpha=0.35, label=stage))
+    aux_spans = stage_spans(record_time, ts_metrics.aux_heated[records])
+    for start, end in aux_spans:
+        aux_ax.axvspan(start, end, ymin=0.0, ymax=0.05, color=AUX_SHADE_COLOR, alpha=0.6, linewidth=0, zorder=0)
+    if aux_spans:
+        stage_handles.append(Patch(facecolor=AUX_SHADE_COLOR, alpha=0.6, label="aux heated"))
+    return stage_handles
+
+
+@contextmanager
+def atomic_output(path: Path) -> Generator[Path, None, None]:
+    """A temporary path next to path, renamed onto it once the block finishes.
+
+    A report file marks its case as done by existing, so a job killed mid-write must leave none behind.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_name(path.name + ".tmp")
+    yield tmp_path
+    tmp_path.replace(path)
+
+
+def _message_page(message: str) -> plt.Figure:
+    fig = plt.figure(figsize=(8.5, 2.5))
+    fig.patch.set_facecolor(BACKGROUND_COLOR)
+    fig.text(0.5, 0.5, message, ha="center", va="center", color=TEXT_COLOR, fontsize=TITLE_FONTSIZE)
+    return fig
+
+
+def best_worst_pdf(items: np.ndarray, scores: np.ndarray, page_fn: Callable[..., plt.Figure], pdf_path: Path):
+    """The N_BEST_WORST lowest-score pages then the N_BEST_WORST highest-score pages in one PDF.
+
+    page_fn(item, title_prefix=...) renders one item's page, items with a non-finite score are left out.
+    Without any finite score the PDF is one page saying so,
+    so the case still counts as reported instead of being relaunched and rescored on every run.
+    """
+    finite = np.flatnonzero(np.isfinite(scores))
+    order = finite[np.argsort(scores[finite])]
+    best = order[:N_BEST_WORST]
+    worst = order[::-1][:N_BEST_WORST]
+
+    with atomic_output(pdf_path) as tmp_path, PdfPages(tmp_path) as pdf:
+        if len(finite) == 0:
+            logger.warning(f"No finite score among {len(scores)} items for {pdf_path}, writing a one-page report")
+            fig = _message_page(f"No finite score among the {len(scores)} items, nothing to rank")
+            pdf.savefig(fig, facecolor=fig.get_facecolor())
+            plt.close(fig)
+        for label, ranked in (("BEST", best), ("WORST", worst)):
+            for rank, item_idx in enumerate(ranked, start=1):
+                fig = page_fn(items[item_idx], title_prefix=f"{label} #{rank} - ")
+                pdf.savefig(fig, facecolor=fig.get_facecolor())
+                plt.close(fig)
+    logger.info(f"Saved best/worst PDF to {pdf_path}")
+
+
+def case_report_dir(figure_dir: Path, case) -> Path:
+    return Path(figure_dir) / "case_reports" / str(case)
+
+
+def generate_case_report(study: Study, case, figure_dir: Path, ts_metrics: StagedTimesliceMetrics | None = None):
+    """The study's report for one case.
+
+    A no-op without a result file, when the report is already on disk,
+    or for a borrowed case, whose home study renders its own report.
+    ts_metrics are the case's per-timeslice scores when the caller has them (compute_and_save_case_metrics),
+    otherwise they are scored here.
+    """
+    result_path = study.result_path(case)
+    if not result_path.exists() or study.is_borrowed(case):
+        return
+    reports_module = import_module(study.ANALYSIS_REPORTS_MODULE)
+    case_dir = case_report_dir(figure_dir, case)
+    if reports_module.case_report_done(case_dir):
+        logger.info(f"Case report already exists for {case}, skipping")
+        return
+
+    result_ds = xr.load_dataset(result_path)
+    if ts_metrics is None:
+        ts_metrics = case_timeslice_metrics(study, case, result_ds)
+    if len(ts_metrics) == 0:
+        logger.warning(f"No valid test timeslices for case {case}, skipping case report")
+        return
+    reports_module.render_case_report(result_ds, ts_metrics, case_dir)
+
+
+def generate_case_reports(study: Study, figure_dir: Path):
+    """Reports of every finished case.
+
+    Existing reports are left alone, clean_figures wipes the figure dir to force regeneration.
+    """
+    for case in study.cases:
+        generate_case_report(study, case, figure_dir)
+
+
+def analysis_case_done(study: Study, case, figure_dir: Path) -> bool:
+    """Whether a case needs no more analysis work.
+
+    Its metrics cache exists, and either it is the empty 'nothing valid' marker,
+    the case is borrowed (no report here), or the case report is on disk.
+    """
+    cache_path = cached_case_metrics_path(study, case)
+    if cache_path is None:
+        return False
+    case_metrics = xr.load_dataset(cache_path)
+    if not case_metrics.data_vars or study.is_borrowed(case):
+        return True
+    reports_module = import_module(study.ANALYSIS_REPORTS_MODULE)
+    case_dir = case_report_dir(figure_dir, case)
+    return reports_module.case_report_done(case_dir)

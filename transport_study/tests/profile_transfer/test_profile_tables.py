@@ -5,6 +5,8 @@ import pandas as pd
 import xarray as xr
 
 from transport_study.orchestration.stages import STAGE_AGG_NAMES
+from transport_study.orchestration.tables import SEED_SUFFIXES
+from transport_study.profile_transfer.study_metrics import METRIC_NAMES
 from transport_study.profile_transfer.tables import (
     CASE_FIELD_ORDER,
     case_stats_frame,
@@ -20,6 +22,8 @@ FIXED_CASE_FIELDS = {
     "freeze_shapes": True,
     "geometry_builder": "circular",
     "num_target_shots": 0,
+    "target_shot_order": "ascending",
+    "model_size": "sweep",
 }
 MODEL_TYPES = ["shape-init-pca", "mlp"]
 SHOTS = [101, 102, 103]
@@ -42,11 +46,13 @@ def _results_ds() -> xr.Dataset:
 
 
 def _metrics_ds() -> xr.Dataset:
+    """Per-stage means offset by 10 per metric, the best seed's by 100 more and the seed stds by 1000."""
     n_stages = len(STAGE_AGG_NAMES)
     data_vars = {}
-    for i, metric in enumerate(("value", "grad", "combined")):
+    for i, metric in enumerate(METRIC_NAMES):
         values = np.arange(len(MODEL_TYPES) * n_stages, dtype=float).reshape(len(MODEL_TYPES), n_stages) + 10 * i
-        data_vars[f"{metric}_mean"] = (("case_idx", "stage"), values)
+        for suffix, offset in zip(SEED_SUFFIXES, (0.0, 100.0, 1000.0), strict=True):
+            data_vars[f"{metric}_mean{suffix}"] = (("case_idx", "stage"), values + offset)
     return xr.Dataset(data_vars=data_vars, coords={"case_idx": np.arange(len(MODEL_TYPES)), "stage": list(STAGE_AGG_NAMES)})
 
 
@@ -81,7 +87,9 @@ def test_write_comparison_tables(tmp_path):
     assert len(pd.read_csv(csv_path)) == len(MODEL_TYPES)
 
     # The two cases differ only along model_type, so exactly that axis gets a table
-    table_path = tmp_path / "tables" / "model_type" / "td_cmod.norm_physics.da_none.freeze_True.geom_circular.targ_0.md"
+    table_path = (
+        tmp_path / "tables" / "model_type" / "td_cmod.norm_physics.da_none.freeze_True.geom_circular.targ_0.order_ascending.size_sweep.md"
+    )
     content = table_path.read_text()
     for model_type in MODEL_TYPES:
         assert f"| {model_type} |" in content

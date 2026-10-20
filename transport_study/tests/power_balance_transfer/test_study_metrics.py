@@ -9,19 +9,28 @@ import numpy as np
 import pytest
 import xarray as xr
 
-from transport_study.orchestration.organize_data import INPUT_POWER_SIGNALS
-from transport_study.power_balance_transfer import study_metrics
-from transport_study.power_balance_transfer.case_reports import best_worst_pdf
-from transport_study.power_balance_transfer.study_metrics import (
-    STAGE_AGG_NAMES,
-    aggregate_case_metrics,
-    compute_case_timeslice_metrics,
-    shot_time_averaged_errors,
+from transport_study.orchestration.case_metrics import aggregate_case_metrics
+from transport_study.orchestration.seed_results import aggregate_seed_results
+from transport_study.orchestration.stages import STAGE_AGG_NAMES
+from transport_study.orchestration.tables import (
+    SEED_SUFFIXES,
+    write_summary_comparison_tables,
 )
-from transport_study.power_balance_transfer.tables import write_comparison_tables
+from transport_study.power_balance_transfer import study_metrics
+from transport_study.power_balance_transfer.case_reports import shot_pdf
+from transport_study.power_balance_transfer.study_metrics import (
+    METRIC_NAMES,
+    compute_case_timeslice_metrics,
+    shot_time_averaged,
+)
+from transport_study.power_balance_transfer.tables import SPEC
+from transport_study.tests.stubs import with_seed_attrs
 
 N_TS = 100
 SHOTS = [101, 102]
+# The best seed's errors are the constants below, the other seed's are twice them
+BEST_SEED = 1
+OTHER_SEED = 0
 
 
 @pytest.fixture()
@@ -33,35 +42,37 @@ def device_ds() -> xr.Dataset:
     time = np.arange(N_TS) * 1e-3
 
     data_vars = {
-        "Ip_MA": (("shot", "time_idx"), np.stack([ip, ip])),
-        "P_NBI_MW": (("shot", "time_idx"), np.stack([p_nbi, p_nbi])),
+        "ip_MA": (("shot", "time_idx"), np.stack([ip, ip])),
+        "power_additional_MW": (("shot", "time_idx"), np.stack([p_nbi, p_nbi])),
     }
-    for sig in INPUT_POWER_SIGNALS:
-        if sig not in data_vars:
-            data_vars[sig] = (("shot", "time_idx"), np.zeros((2, N_TS)))
     return xr.Dataset(
         data_vars=data_vars,
         coords={"shot": SHOTS, "time": (("shot", "time_idx"), np.stack([time, time]))},
     )
 
 
-@pytest.fixture()
-def result_ds() -> xr.Dataset:
-    """Synthetic case result file: constant abs error 0.1 on shot 101,
-    0.3 on shot 102, with the last 20 timeslices of shot 102 NaN-padded."""
+def _step_result(error_scale: float, n_diverged_101: int = 0) -> xr.Dataset:
+    """One seed's study_results: constant abs error 0.1 on shot 101 and 0.3 on shot 102 times error_scale,
+    the last 20 timeslices of shot 102 NaN-padded, and the last n_diverged_101 of shot 101 diverged."""
     time = np.arange(N_TS) * 1e-3
     targ = np.full((N_TS, 2), 1.0)
-    err = np.stack([np.full(N_TS, 0.1), np.full(N_TS, 0.3)], axis=1)
+    err = np.stack([np.full(N_TS, 0.1), np.full(N_TS, 0.3)], axis=1) * error_scale
     err[80:, 1] = np.nan
     targ[80:, 1] = np.nan
     pred = targ + err
+    diverged = np.where(np.isfinite(targ), 0.0, np.nan)
+    if n_diverged_101:
+        pred[N_TS - n_diverged_101 :, 0] = np.nan
+        err[N_TS - n_diverged_101 :, 0] = np.nan
+        diverged[N_TS - n_diverged_101 :, 0] = 1.0
 
     return xr.Dataset(
         data_vars={
-            "Wtot_MJ_targ": (("time_idx", "shot"), targ),
-            "Wtot_MJ_pred": (("time_idx", "shot"), pred),
+            "energy_mhd_MJ_targ": (("time_idx", "shot"), targ),
+            "energy_mhd_MJ_pred": (("time_idx", "shot"), pred),
             "error_abs_ts": (("time_idx", "shot"), err),
             "error_rel_ts": (("time_idx", "shot"), err / 1.1),
+            "error_diverged_ts": (("time_idx", "shot"), diverged),
         },
         coords={
             "shot": SHOTS,
@@ -69,6 +80,19 @@ def result_ds() -> xr.Dataset:
             "ds_source": ("shot", ["testdev", "testdev"]),
         },
     )
+
+
+def _two_seed_result(best_seed_ds: xr.Dataset) -> xr.Dataset:
+    """A case result of best_seed_ds and another seed at twice the constant errors with a higher validation loss."""
+    best_seed_ds = with_seed_attrs(best_seed_ds, val_loss=0.1)
+    other_seed_ds = with_seed_attrs(_step_result(2.0), val_loss=0.2)
+    return aggregate_seed_results({BEST_SEED: best_seed_ds, OTHER_SEED: other_seed_ds})
+
+
+@pytest.fixture()
+def result_ds() -> xr.Dataset:
+    """Synthetic case result file of two seeds, the best one (lower validation loss) with the constant errors."""
+    return _two_seed_result(_step_result(1.0))
 
 
 @pytest.fixture()
@@ -88,13 +112,32 @@ def test_compute_case_timeslice_metrics(ts_metrics):
     assert ts_metrics.aux_heated[shot_101][40:60].all()
     assert not ts_metrics.aux_heated[shot_101][:40].any()
 
-    # Errors ride along unchanged
-    assert np.allclose(ts_metrics.err_abs[shot_101], 0.1)
-    assert np.allclose(ts_metrics.err_abs[~shot_101], 0.3)
+    # Errors ride along unchanged, one column per seed
+    assert np.allclose(ts_metrics.best("abs")[shot_101], 0.1)
+    assert np.allclose(ts_metrics.best("abs")[~shot_101], 0.3)
+    assert np.allclose(ts_metrics.metric("abs")[shot_101], [0.2, 0.1])
+
+
+def test_first_real_timeslice_after_leading_padding_is_kept(monkeypatch, device_ds, result_ds):
+    """A shot whose result starts with NaN times keeps its first real timeslice.
+
+    Same rule as real_timeslice_mask: a timeslice after a NaN time is real, only clock-stalled repeats are padding.
+    """
+    monkeypatch.setattr(study_metrics, "load_stage_dataset", lambda device: device_ds)
+    n_leading_nan = 10
+    time = result_ds["time"].values.copy()
+    time[:n_leading_nan, 1] = np.nan
+    result_ds = result_ds.assign_coords(time=(("time_idx", "shot"), time))
+
+    ts_metrics = compute_case_timeslice_metrics(result_ds)
+
+    times_102 = ts_metrics.time[ts_metrics.shot == 102]
+    assert times_102.min() == pytest.approx(time[n_leading_nan, 1])
+    assert len(times_102) == 80 - n_leading_nan
 
 
 def test_aggregate_case_metrics(ts_metrics):
-    case_ds = aggregate_case_metrics(ts_metrics)
+    case_ds = aggregate_case_metrics(ts_metrics, METRIC_NAMES)
 
     assert list(case_ds["stage"].values) == list(STAGE_AGG_NAMES)
     counts = case_ds["abs_count"].values
@@ -104,23 +147,46 @@ def test_aggregate_case_metrics(ts_metrics):
     assert by_stage["rampup"] + by_stage["flattop"] + by_stage["rampdown"] == by_stage["all"]
 
     # Pooled mean over both shots sits between the per-shot constants
-    all_mean = float(case_ds["abs_mean"].sel(stage="all"))
-    assert 0.1 < all_mean < 0.3
+    best_mean = float(case_ds["abs_mean_best"].sel(stage="all"))
+    assert 0.1 < best_mean < 0.3
+
+    # Each seed scores the case on its own, the other seed's errors are twice the best one's
+    other_mean = 2.0 * best_mean
+    assert np.isclose(case_ds["abs_mean"].sel(stage="all"), 0.5 * (best_mean + other_mean))
+    assert np.isclose(case_ds["abs_mean_seed_std"].sel(stage="all"), (other_mean - best_mean) / np.sqrt(2.0))
+    assert np.isclose(case_ds["diverged_mean"].sel(stage="all"), 0.0)
 
 
-def test_shot_time_averaged_errors(ts_metrics):
-    shots, avg_abs, avg_rel, n_ts = shot_time_averaged_errors(ts_metrics)
+def test_diverged_timeslices_stay_records_and_count_as_the_fraction(monkeypatch, device_ds):
+    """A rollout that diverges keeps its timeslices as records:
+    NaN in the errors, which the error means skip, and 1 in the diverged flag, whose stage mean is the fraction."""
+    monkeypatch.setattr(study_metrics, "load_stage_dataset", lambda device: device_ds)
+    n_diverged = 15
+    result_ds = _two_seed_result(_step_result(1.0, n_diverged))
+
+    ts_metrics = compute_case_timeslice_metrics(result_ds)
+    case_ds = aggregate_case_metrics(ts_metrics, METRIC_NAMES)
+
+    assert len(ts_metrics) == N_TS + 80
+    assert np.isclose(case_ds["diverged_mean_best"].sel(stage="all"), n_diverged / (N_TS + 80))
+    assert np.isclose(case_ds["diverged_mean"].sel(stage="all"), 0.5 * n_diverged / (N_TS + 80))
+    assert case_ds["abs_count_best"].sel(stage="all") == N_TS + 80 - n_diverged
+
+
+def test_shot_time_averaged(ts_metrics):
+    shots, avg_abs, n_ts = shot_time_averaged(ts_metrics, "abs")
+    _, avg_rel, _ = shot_time_averaged(ts_metrics, "rel")
 
     assert list(shots) == SHOTS
-    # Time-averaged errors are duration-free: the constants come back exactly
+    # Time-averaged errors are duration-free: the best seed's constants come back exactly
     assert np.allclose(avg_abs, [0.1, 0.3])
     assert np.allclose(avg_rel, np.array([0.1, 0.3]) / 1.1)
     assert list(n_ts) == [N_TS, 80]
 
 
-def test_best_worst_pdf(tmp_path, result_ds, ts_metrics):
+def test_shot_pdf(tmp_path, result_ds, ts_metrics):
     pdf_path = tmp_path / "case_reports" / "best_worst_shots.pdf"
-    best_worst_pdf(result_ds, ts_metrics, pdf_path)
+    shot_pdf(result_ds, ts_metrics, pdf_path)
     assert pdf_path.exists()
     assert pdf_path.stat().st_size > 0
 
@@ -131,7 +197,7 @@ def collected_datasets() -> tuple[xr.Dataset, xr.Dataset]:
     case_idx, with a p_oh submodule case and one case missing from metrics."""
     model_types = ["sciml-taue-nn", "transformer", "p_oh"]
     normalizations = ["raw", "coral"]
-    shots_options = [0, 3, -1]
+    shots_options = [0, 3, 10]
 
     rows = [(mt, "cmod_tcv", dn, "addition", True, n) for mt, dn, n in product(model_types, normalizations, shots_options)]
     n = len(rows)
@@ -144,6 +210,8 @@ def collected_datasets() -> tuple[xr.Dataset, xr.Dataset]:
         strict=True,
     ):
         results = results.assign_coords({coord_name: ("case_idx", [row[idx] for row in rows])})
+    # A single configured value is a scalar coord in real collected files
+    results = results.assign_coords(target_shot_order="ascending", multiobjective=False, model_size="sweep")
     for err in ("err_abs", "err_rel"):
         for domain in ("shot", "ts"):
             for stat in ("mean", "std", "med", "p25", "p75", "min", "max"):
@@ -152,19 +220,18 @@ def collected_datasets() -> tuple[xr.Dataset, xr.Dataset]:
     # Metrics cover every case except the last (simulates a diverged case)
     n_metrics = n - 1
     metrics = xr.Dataset(coords={"case_idx": np.arange(n_metrics), "stage": list(STAGE_AGG_NAMES)})
-    for metric in ("abs", "rel"):
-        for stat in ("mean", "std", "med"):
-            metrics[f"{metric}_{stat}"] = (
+    for metric in METRIC_NAMES:
+        for suffix in SEED_SUFFIXES:
+            metrics[f"{metric}_mean{suffix}"] = (
                 ("case_idx", "stage"),
                 rng.uniform(0.01, 1.0, (n_metrics, len(STAGE_AGG_NAMES))),
             )
-        metrics[f"{metric}_count"] = (("case_idx", "stage"), np.full((n_metrics, len(STAGE_AGG_NAMES)), 10))
     return results, metrics
 
 
 def test_write_comparison_tables(tmp_path, collected_datasets):
     results, metrics = collected_datasets
-    write_comparison_tables(results, metrics, tmp_path)
+    write_summary_comparison_tables(results, metrics, SPEC, tmp_path)
 
     tables_dir = tmp_path / "tables"
     assert (tables_dir / "case_stats.csv").exists()
@@ -186,6 +253,8 @@ def test_write_comparison_tables(tmp_path, collected_datasets):
     assert "transformer" in model_table
     assert "rel err (time avg)" in model_table
     assert "flattop ohmic" in model_table
+    assert "| seed std |" in model_table
+    assert "| diverged |" in model_table
 
     # Axes with a single value (training_data, domain_adaptation) produce no tables
     assert not (tables_dir / "training_data").exists()
@@ -193,5 +262,5 @@ def test_write_comparison_tables(tmp_path, collected_datasets):
 
 
 def test_write_comparison_tables_empty(tmp_path):
-    write_comparison_tables(xr.Dataset(), xr.Dataset(), tmp_path)
+    write_summary_comparison_tables(xr.Dataset(), xr.Dataset(), SPEC, tmp_path)
     assert not (tmp_path / "tables").exists()

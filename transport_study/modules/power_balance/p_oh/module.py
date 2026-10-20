@@ -4,14 +4,16 @@ import jax
 import jax.numpy as jnp
 from popsim.module_base import TimeIndepModule
 
-from transport_study.modules.normalization import InputNormalizer
+from transport_study.modules.normalization import N_FEATURES, InputNormalizer
+from transport_study.modules.power_balance.scalar_power import leaky_softplus
 
 
 class OhmicPower(TimeIndepModule):
     """Model that predicts ohmic heating power from plasma parameters.
 
-    P_oh = |Ip| * softplus(network),
-    i.e. the network predicts a positive loop voltage.
+    P_oh = |Ip| * leaky_softplus(network),
+    i.e. the network predicts a loop voltage,
+    positive except for the leak that keeps a very negative network learning.
 
     Consumes PHYSICAL inputs and normalizes them internally with its own normalizer,
     so its NN weights and normalization statistics always travel together through checkpoints
@@ -26,7 +28,7 @@ class OhmicPower(TimeIndepModule):
 
     @chex.dataclass
     class Output:
-        P_oh_MW_pred: float
+        power_ohm_MW_pred: float
         debug_info: dict
 
     def __call__(self, inputs: InputNormalizer.Inputs) -> Output:
@@ -36,10 +38,12 @@ class OhmicPower(TimeIndepModule):
 
         features = self.normalizer(inputs)
         nn_out = self.nn(features.to_vec())
-        p_oh = (jnp.abs(inputs.Ip_MA) * jax.nn.softplus(nn_out)).squeeze()
+        ip_magnitude = jnp.abs(inputs.ip_MA)
+        loop_voltage = leaky_softplus(nn_out)
+        p_oh = (ip_magnitude * loop_voltage).squeeze()
 
         output = OhmicPower.Output(
-            P_oh_MW_pred=p_oh,
+            power_ohm_MW_pred=p_oh,
             debug_info={
                 "nn_out": nn_out.squeeze(),
             },
@@ -50,16 +54,14 @@ class OhmicPower(TimeIndepModule):
     @classmethod
     def init(
         cls,
-        in_size: int,
-        out_size: int,
         nn_width: int,
         nn_depth: int,
         prng_seed: int,
         normalizer: InputNormalizer,
     ) -> "OhmicPower":
         nn = eqx.nn.MLP(
-            in_size=in_size,
-            out_size=out_size,
+            in_size=N_FEATURES,
+            out_size=1,
             width_size=nn_width,
             depth=nn_depth,
             key=jax.random.PRNGKey(prng_seed),

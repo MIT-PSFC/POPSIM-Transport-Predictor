@@ -1,259 +1,222 @@
 from collections.abc import Callable
-from typing import Any
+from typing import Any, ClassVar
 
 import equinox as eqx
 import jax.numpy as jnp
-import numpy as np
 import optax
 import xarray as xr
-from loguru import logger
-from popsim.ml import DataLoader, IntegralLoss, TrainConfig, TrainRunBuilder
-from popsim.ml.checkpointing import create_default_checkpoint_manager, restore_model
-from popsim.ml.eval import EvalData, EvaluationSuite
+from popsim.ml import DataLoader, IntegralLoss, TrainRunBuilder
+from popsim.ml.eval import EvaluationSuite
 
-from transport_study import EPISODE_DIM, TIME_COORD, TIME_DIM
 from transport_study.config import config
 from transport_study.modules.normalization import make_normalizer
 from transport_study.modules.power_balance.module import (
+    FREEZABLE_SUBMODULES,
+    MODEL_TYPES_WITH_ENERGY_INPUT,
+    MODEL_TYPES_WITH_SUBMODULES,
+    SCALING_LAW_FIELDS,
     PowerBalanceEnv,
+    PowerBalanceMLP,
     PowerBalanceScalingLaw,
     PowerBalanceSciML,
     PowerBalanceTransformer,
-    PowerBalanceUnstructuredNN,
 )
 from transport_study.modules.power_balance.p_oh.trb import OhmicPowerTRB
 from transport_study.modules.power_balance.p_rad.trb import RadiatedPowerTRB
-from transport_study.modules.trb_utils import (  # noqa: F401 re-exported, historical import location
+from transport_study.modules.trb_utils import (
+    TimeAveragedLoss,
+    freshness_weight,
     get_time_dep_dataloaders,
-    integrate_error_over_time,
-    make_exponential_adamw,
     make_grouped_exponential_adamw,
     make_loss_eval_suite,
-    mask_to_largest_contiguous_segment,
+    module_build_config,
+    normalizer_fit_dataset,
+    per_sample_device_values,
+    per_sample_residual_scale,
+    restore_from_checkpoint,
+    scalar_study_results,
+    submodule_config_dict,
+    target_device_idx,
+    transfer_checkpoint_to_restore,
 )
 
-STUDY_TYPE = "power_balance_transfer"
 
-# Anchor terms in the training loss for SciML models, keyed by measured target signal
-# Meant to keep the submodule's predictions from straying too far from what they're supposed
-# to be doing during training. This is not cheating because we'd have these anchor signals
-# to use in training in addition to the overall target Wtot after these shots.
-# Output attribute holding the model's own prediction, loss_config key for the weight
-ANCHOR_SIGNALS = {
-    "P_oh_MW": ("P_oh_MW_pred", "anchor_weight_p_oh"),
-    "P_rad_MW": ("P_rad_MW_pred", "anchor_weight_p_rad"),
-}
+def _prereq_submodules(train_dl: DataLoader, model_init_config: dict) -> tuple:
+    """The p_oh and p_rad predictors, built by their own TRBs as skeletons and restored from their prereq case checkpoints.
+
+    A skip_data_init model_init_config gets the unrestored skeletons, its caller restores them (see trb_utils.module_build_config).
+    """
+    submodules = []
+    for name, submodule_trb in (("p_oh_predictor", OhmicPowerTRB), ("p_rad_predictor", RadiatedPowerTRB)):
+        submodule_config = submodule_config_dict(model_init_config["submodules"][name])
+        submodule = submodule_trb.model_init(train_dl, {**submodule_config["model_init_config"], "skip_data_init": True})
+        if not model_init_config.get("skip_data_init", False):
+            submodule = restore_from_checkpoint(submodule, submodule_config["checkpoint_dir"])
+        submodules.append(submodule)
+    return tuple(submodules)
 
 
 class PowerBalanceTRB(TrainRunBuilder):
     """TrainRunBuilder for the power balance modules used in transfer learning"""
+
+    # The organize_data prep its dataloaders load every device with
+    STUDY_TYPE: ClassVar[str] = "power_balance_transfer"
+
+    # Anchor terms in the training loss of the models that predict P_oh / P_rad, keyed by measured target signal:
+    # (Output attribute holding the prediction, loss_config key of its weight).
+    # They keep the submodule predictions close to the measured signals.
+    # Not cheating, a real application has these signals for training alongside the target Wtot
+    ANCHOR_SIGNALS: ClassVar[dict[str, tuple[str, str]]] = {
+        "power_ohm_MW": ("power_ohm_MW_pred", "anchor_weight_power_ohm"),
+        "power_radiated_MW": ("power_radiated_MW_pred", "anchor_weight_power_radiated"),
+    }
 
     @staticmethod
     def get_dataloaders(
         dataloader_config: dict,
     ) -> tuple[xr.Dataset, DataLoader, DataLoader, DataLoader]:
         """Dataset and dataloaders for training, see trb_utils.get_time_dep_dataloaders."""
-        return get_time_dep_dataloaders(dataloader_config, STUDY_TYPE)
+        return get_time_dep_dataloaders(dataloader_config, PowerBalanceTRB.STUDY_TYPE)
 
     @staticmethod
-    def model_init(train_dl: DataLoader, model_init_config: dict) -> Any:
+    def _build_module(train_dl: DataLoader, build_config: dict) -> Any:
+        """The power balance module of build_config["model_type"], normalizer fitted on the training data (see module_build_config)."""
+        model_type = build_config["model_type"]
+        if model_type == "sciml-taue-scalinglaw":
+            # The scaling law consumes physical units and holds no normalizer,
+            # data_normalization reaches only its p_oh / p_rad prereq cases
+            p_oh_predictor, p_rad_predictor = _prereq_submodules(train_dl, build_config)
+            return PowerBalanceScalingLaw.init(p_oh_predictor=p_oh_predictor, p_rad_predictor=p_rad_predictor)
+        normalizer = make_normalizer(
+            build_config["data_normalization"],
+            normalizer_fit_dataset(train_dl, build_config),
+            len(config.ds_source_to_idx),
+            target_device_idx(),
+            with_energy=model_type in MODEL_TYPES_WITH_ENERGY_INPUT,
+        )
+        if model_type == "sciml-taue-nn":
+            p_oh_predictor, p_rad_predictor = _prereq_submodules(train_dl, build_config)
+            return PowerBalanceSciML.init(
+                p_oh_predictor=p_oh_predictor,
+                p_rad_predictor=p_rad_predictor,
+                normalizer=normalizer,
+                nn_width=build_config["nn_width"],
+                nn_depth=build_config["nn_depth"],
+                prng_seed=build_config["prng_seed"],
+            )
+        if model_type == "mlp":
+            return PowerBalanceMLP.init(
+                nn_width=build_config["nn_width"],
+                nn_depth=build_config["nn_depth"],
+                normalizer=normalizer,
+                prng_seed=build_config["prng_seed"],
+            )
+        if model_type == "transformer":
+            return PowerBalanceTransformer.init(
+                d_model=build_config["d_model"],
+                num_heads=build_config["num_heads"],
+                history_len=build_config["history_len"],
+                nn_width=build_config["nn_width"],
+                nn_depth=build_config["nn_depth"],
+                normalizer=normalizer,
+                predicts_powers=build_config["multiobjective"],
+                prng_seed=build_config["prng_seed"],
+            )
+        raise ValueError(f"Invalid model type: {model_type}")
+
+    @staticmethod
+    def model_init(train_dl: DataLoader, model_init_config: dict) -> PowerBalanceEnv:
+        """The PowerBalanceEnv of a case, its submodules restored from their prereq cases.
+
+        A transfer case builds a skeleton (see trb_utils.module_build_config),
+        restores the whole env from its transfer_pretrain checkpoint,
+        then puts back the submodules of its own p_oh / p_rad prereq cases,
+        which ran their own pretrain and finetune on the target device.
+        Under skip_data_init it is an unrestored skeleton.
         """
-        Instantiate and return your model given a training DataLoader
-        and a model config dict.
-        """
-
-        def _build_module(train_dl: DataLoader, model_init_config: dict) -> Any:
-            model_type = model_init_config["model_type"]
-            # Fit normalization stats from the training data only.
-            # When a transfer checkpoint will overwrite the module anyway, skip the fit
-            # (a CORAL fit on a handful of target shots is ill-conditioned and the restored stats,
-            # fitted on historic + target shots by the transfer_pretrain prereq case, are the correct ones)
-            # transfer_pretrain dataloaders carry that combined fit dataset as an attribute (see get_dataloaders)
-            n_devices = len(config.ds_source_to_idx)
-            if model_init_config.get("transfer_checkpoint"):
-                fit_ds = None
-            else:
-                fit_ds = getattr(train_dl, "normalizer_fit_ds", train_dl.ds)
-            normalizer = make_normalizer(model_init_config["data_normalization"], fit_ds, n_devices)
-            if model_type in ("sciml-taue-scalinglaw", "sciml-taue-nn"):
-                p_oh_config = model_init_config["submodules"]["p_oh_predictor"]
-                if isinstance(p_oh_config, TrainConfig):
-                    p_oh_config = p_oh_config.model_dump()
-                p_oh_predictor = OhmicPowerTRB.model_init(train_dl, p_oh_config["model_init_config"])
-                p_rad_config = model_init_config["submodules"]["p_rad_predictor"]
-                if isinstance(p_rad_config, TrainConfig):
-                    p_rad_config = p_rad_config.model_dump()
-                p_rad_predictor = RadiatedPowerTRB.model_init(train_dl, p_rad_config["model_init_config"])
-                if model_init_config["restore_submodules"]:
-                    p_oh_manager = create_default_checkpoint_manager(p_oh_config["checkpoint_dir"])
-                    p_oh_predictor = restore_model(p_oh_manager, p_oh_predictor)
-                    p_rad_manager = create_default_checkpoint_manager(p_rad_config["checkpoint_dir"])
-                    p_rad_predictor = restore_model(p_rad_manager, p_rad_predictor)
-                if model_type == "sciml-taue-scalinglaw":
-                    module = PowerBalanceScalingLaw.init(
-                        p_oh_predictor=p_oh_predictor,
-                        p_rad_predictor=p_rad_predictor,
-                        min_taue=model_init_config.get("min_taue", None),
-                        max_taue=model_init_config.get("max_taue", None),
-                    )
-                else:  # model_type == "sciml-taue-nn"
-                    module = PowerBalanceSciML.init(
-                        p_oh_predictor=p_oh_predictor,
-                        p_rad_predictor=p_rad_predictor,
-                        normalizer=normalizer,
-                        in_size=model_init_config["in_size"],
-                        out_size=model_init_config["out_size"],
-                        nn_width=model_init_config["nn_width"],
-                        nn_depth=model_init_config["nn_depth"],
-                        min_taue=model_init_config.get("min_taue", None),
-                        max_taue=model_init_config.get("max_taue", None),
-                        prng_seed=model_init_config.get("prng_seed", 42),
-                    )
-            elif model_type == "mlp":
-                module = PowerBalanceUnstructuredNN.init(
-                    in_size=model_init_config["in_size"],
-                    out_size=model_init_config["out_size"],
-                    nn_width=model_init_config["nn_width"],
-                    nn_depth=model_init_config["nn_depth"],
-                    normalizer=normalizer,
-                    prng_seed=model_init_config.get("prng_seed", 42),
-                )
-            elif model_type == "transformer":
-                module = PowerBalanceTransformer.init(
-                    d_model=model_init_config["d_model"],
-                    num_heads=model_init_config["num_heads"],
-                    history_len=model_init_config["history_len"],
-                    nn_width=model_init_config["nn_width"],
-                    nn_depth=model_init_config["nn_depth"],
-                    normalizer=normalizer,
-                    prng_seed=model_init_config.get("prng_seed", 42),
-                )
-            else:
-                raise ValueError(f"Invalid model type: {model_type}")
-
-            return module
-
-        module = _build_module(train_dl, model_init_config)
-
-        if model_init_config.get("freeze_submodules", False):
-            freeze_submodules = ["p_oh_predictor", "p_rad_predictor"]
-        else:
-            freeze_submodules = []
-
+        freeze_submodules = list(FREEZABLE_SUBMODULES) if model_init_config.get("freeze_submodules", False) else []
+        build_config = module_build_config(model_init_config)
         env = PowerBalanceEnv(
-            module=module,
+            module=PowerBalanceTRB._build_module(train_dl, build_config),
             domain_adaptation=model_init_config["domain_adaptation"],
             freeze_submodules=freeze_submodules,
         )
-
-        if model_init_config.get("transfer_checkpoint", False):
-            transfer_manager = create_default_checkpoint_manager(model_init_config["transfer_checkpoint"])
-            env = restore_model(transfer_manager, env)
-            # Restoring the whole env overwrote the freshly restored submodule weights, restore them again from their own checkpoints
-            # TODO(ZanderKeith): Verify we're testing this logic
-            if model_init_config["model_type"] in ["sciml-taue-scalinglaw", "sciml-taue-nn"]:
-                p_oh_config = model_init_config["submodules"]["p_oh_predictor"]
-                if isinstance(p_oh_config, TrainConfig):
-                    p_oh_config = p_oh_config.model_dump()
-                p_rad_config = model_init_config["submodules"]["p_rad_predictor"]
-                if isinstance(p_rad_config, TrainConfig):
-                    p_rad_config = p_rad_config.model_dump()
-
-                p_oh_manager = create_default_checkpoint_manager(p_oh_config["checkpoint_dir"])
-                p_oh_restored = restore_model(p_oh_manager, env.module.p_oh_predictor)
-                p_rad_manager = create_default_checkpoint_manager(p_rad_config["checkpoint_dir"])
-                p_rad_restored = restore_model(p_rad_manager, env.module.p_rad_predictor)
+        transfer_checkpoint = transfer_checkpoint_to_restore(model_init_config)
+        if transfer_checkpoint:
+            env = restore_from_checkpoint(env, transfer_checkpoint)
+            if model_init_config["model_type"] in MODEL_TYPES_WITH_SUBMODULES:
                 env = eqx.tree_at(
                     lambda e: (e.module.p_oh_predictor, e.module.p_rad_predictor),
                     env,
-                    (p_oh_restored, p_rad_restored),
+                    _prereq_submodules(train_dl, model_init_config),
                 )
-
-            logger.debug(f"Restoring module from transfer learning pretrained checkpoint\n{model_init_config['transfer_checkpoint']}")
-
-        # This restoration of the main module is separate from the transfer learning restoration
-        # This would get the post-trained model, AFTER transfer learning has already been done
-        if model_init_config.get("restore_main_module", False):
-            manager = create_default_checkpoint_manager(model_init_config["checkpoint_dir"])
-            env = restore_model(manager, env)
-            logger.debug(f"Restoring module from post-training checkpoint\n{model_init_config['checkpoint_dir']}")
-        else:
-            logger.debug("Not restoring main module from post-training checkpoint.")
-
         return env
 
     @staticmethod
-    def _make_wtot_loss_fn(loss_config: dict, use_huber: bool, include_anchors: bool = False) -> IntegralLoss:
-        """Device-weighted loss on Wtot_MJ_pred, wrapped for time integration.
+    def _make_wtot_loss_fn(loss_config: dict, training: bool) -> IntegralLoss:
+        """Device-weighted loss on energy_mhd_MJ_pred, wrapped for time integration.
 
-        use_huber selects the training loss (huber, with the swept huber_delta)
-        or the delta-free validation loss (plain absolute error),
-        so the sweep metric val/loss.mean cannot be gamed by shrinking delta.
+        Training: huber on the Wtot residual divided by the device's typical stored energy
+        (loss_config residual_scales, from the case's own training data, see trb_utils.residual_scales),
+        so every device weighs alike whatever its scale and the swept huber_delta reads as a fraction of the typical value.
+        Validation: the plain absolute residual [MJ], which reads no delta,
+        so the sweep metric val/loss.mean cannot be gamed by shrinking it.
 
-        include_anchors adds the ANCHOR_SIGNALS terms pulling the submodule
-        predictions toward the measured signals, weighted by the anchor_weight_* loss_config keys.
-        Training loss only: validation stays pure Wtot so the sweep metric is comparable across model types.
-        The terms drop out at trace time for model types whose target_vars do not
-        carry the measured signals (mlp, transformer).
+        Wtot counts only the timeslices a reconstruction landed on (trb_utils.freshness_weight),
+        the stores hold it forward between reconstructions.
+        Training integrates over the equal-length segments,
+        validation averages over each episode's fresh time (TimeAveragedLoss), so a long shot weighs no more than a short one.
 
-        Anchor errors are plain absolute error, not huber.
-        huber_delta is swept on the MJ-scale Wtot residuals and is meaningless for the MW-scale powers,
-        and the anchors are not worth a second delta hyperparameter
+        The training loss adds the ANCHOR_SIGNALS terms pulling the predicted powers toward the measured signals,
+        weighted by the anchor_weight_* loss_config keys, P_oh at the fresh timeslices only and P_rad at every one.
+        Each is a huber on the residual over the device's typical value,
+        with the delta tuned on the study's hyperparam case of the submodule predicting it (loss_config anchor_huber_deltas).
+        Validation stays pure Wtot so the sweep metric is comparable across model types.
+        The terms drop out at trace time for cases whose target_vars do not
+        carry the measured signals (mlp, the plain transformer).
         """
-        if "device_weights" not in loss_config:
-            device_weights = dict.fromkeys(config.dataset_paths, 1.0)
-        else:
-            device_weights = loss_config["device_weights"]
-
-        anchor_weights = {}
-        if include_anchors:
-            for signal, (_, weight_key) in ANCHOR_SIGNALS.items():
-                anchor_weights[signal] = loss_config.get(weight_key, 0.0)
+        device_weights = loss_config.get("device_weights", {})
+        residual_scales = loss_config["residual_scales"] if training else {}
+        anchor_signals = PowerBalanceTRB.ANCHOR_SIGNALS if training else {}
+        anchor_weights = {signal: loss_config[weight_key] for signal, (_, weight_key) in anchor_signals.items()}
 
         def loss_fn(pred, targ):
-            if use_huber:
-                errors = optax.huber_loss(
-                    pred.Wtot_MJ_pred,
-                    targ["Wtot_MJ"].data,
-                    delta=loss_config["huber_delta"],
-                )
-            else:
-                errors = jnp.abs(pred.Wtot_MJ_pred - targ["Wtot_MJ"].data)
-
-            # Build per-sample weights from device labels
             ds_source_idx = targ["ds_source_idx"].data
-            sample_weights = jnp.ones(ds_source_idx.shape, dtype=errors.dtype)
-            for device, weight in device_weights.items():
-                sample_weights = jnp.where(
-                    ds_source_idx == config.ds_source_to_idx[device],
-                    weight,
-                    sample_weights,
-                )
-
-            # Broadcast sample weights to match the error shape if needed
-            while sample_weights.ndim < errors.ndim:
-                sample_weights = sample_weights[..., None]
-
-            loss = jnp.mean(sample_weights * errors)
+            sample_weights = per_sample_device_values(ds_source_idx, device_weights, 1.0)
+            residual = pred.energy_mhd_MJ_pred - targ["energy_mhd_MJ"].data
+            if training:
+                energy_scale = per_sample_residual_scale(ds_source_idx, residual_scales, "energy_mhd_MJ")
+                errors = optax.huber_loss(residual / energy_scale, delta=loss_config["huber_delta"])
+            else:
+                errors = jnp.abs(residual)
+            wtot_weights = sample_weights * freshness_weight("energy_mhd_MJ", targ)
+            loss = jnp.mean(wtot_weights * errors)
 
             for signal, anchor_weight in anchor_weights.items():
                 if anchor_weight <= 0.0 or signal not in targ:
                     continue
-                pred_attr = ANCHOR_SIGNALS[signal][0]
-                anchor_errors = jnp.abs(getattr(pred, pred_attr) - targ[signal].data)
-                loss = loss + anchor_weight * jnp.mean(sample_weights * anchor_errors)
-
+                anchor_residual = getattr(pred, anchor_signals[signal][0]) - targ[signal].data
+                anchor_scale = per_sample_residual_scale(ds_source_idx, residual_scales, signal)
+                anchor_errors = optax.huber_loss(anchor_residual / anchor_scale, delta=loss_config["anchor_huber_deltas"][signal])
+                anchor_sample_weights = sample_weights * freshness_weight(signal, targ)
+                loss = loss + anchor_weight * jnp.mean(anchor_sample_weights * anchor_errors)
             return loss
 
-        return IntegralLoss(loss_fn)
+        # Validation scores whole episodes, where an integral would weigh each shot by its length,
+        # so it divides by the fresh time and every shot counts once.
+        # Training stays an integral, its segments are equal length so dividing by their duration would only rescale the loss.
+        # Dividing by their fresh time would weigh each fresh timeslice by 1 / (fresh time of its segment)
+        if training:
+            return IntegralLoss(loss_fn)
+        return TimeAveragedLoss(loss_fn, "fresh_equilibrium")
 
     @staticmethod
     def get_loss_fn(loss_config: dict) -> Callable[[Any, Any], jnp.ndarray]:
-        return PowerBalanceTRB._make_wtot_loss_fn(loss_config, use_huber=True, include_anchors=True)
+        return PowerBalanceTRB._make_wtot_loss_fn(loss_config, training=True)
 
     @staticmethod
     def get_val_loss_fn(loss_config: dict) -> Callable[[Any, Any], jnp.ndarray]:
-        return PowerBalanceTRB._make_wtot_loss_fn(loss_config, use_huber=False)
+        return PowerBalanceTRB._make_wtot_loss_fn(loss_config, training=False)
 
     @staticmethod
     def get_val_eval_suite(suite_config) -> EvaluationSuite | None:
@@ -263,67 +226,12 @@ class PowerBalanceTRB(TrainRunBuilder):
         return make_loss_eval_suite(PowerBalanceTRB.get_val_loss_fn(suite_config["loss_config"]))
 
     @staticmethod
-    def get_optimizer(config: dict) -> optax.GradientTransformation:
-        return make_grouped_exponential_adamw(config)
+    def get_optimizer(optimizer_config: dict) -> optax.GradientTransformation:
+        return make_grouped_exponential_adamw(optimizer_config, no_decay_names=SCALING_LAW_FIELDS)
 
     @staticmethod
-    def get_test_eval_suite(config) -> EvaluationSuite:
-        """Evaluation suite for testing after training."""
-
-        def study_results(eval_data: EvalData) -> xr.Dataset:
-            """Calculate final study results
-                - Target vs predicted Wtot_MJ
-                - Absolute and relative error on a per-timeslice basis
-                - Integrated error over time for each shot
-            This should maintain the coordinates of the original dataset, in particular `ds_source` and `shot`
-            """
-
-            # Unstack sample MultiIndex -> (shot, time_idx) and sqeeze out batch dimension so we can integrate per shot
-            targ = eval_data.input_ds.Wtot_MJ.unstack("sample").squeeze()
-            pred = eval_data.output_ds["output.Wtot_MJ_pred"].unstack("sample").squeeze()
-            time_2d = eval_data.input_ds[TIME_COORD].unstack("sample").squeeze()
-
-            # time-dependent modules modify the time dimension name, change it back to avoid confusion
-            targ = targ.rename({TIME_DIM + "_input": TIME_DIM})
-            pred = pred.rename({TIME_DIM + "_input": TIME_DIM})
-            time_2d = time_2d.rename({TIME_DIM + "_input": TIME_DIM})
-
-            # Get relative error on a per-timeslice basis
-            error_abs_ts = xr.apply_ufunc(np.abs, pred - targ)
-            error_rel_ts = error_abs_ts / (xr.apply_ufunc(np.abs, targ) + 0.1)
-
-            # Integrate absolute error over time for each shot, ignoring NaN-padded entries
-            error_abs_shot = integrate_error_over_time(error_abs_ts, time_2d)
-            error_rel_shot = integrate_error_over_time(error_rel_ts, time_2d)
-
-            ds_source = eval_data.input_ds["ds_source"]
-            if "sample" in ds_source.dims:
-                # Case when there are multiple source datasets present
-                ds_source_array = eval_data.input_ds["ds_source"].unstack("sample").squeeze().values
-            else:
-                # Case when there is a single source dataset present
-                ds_source_array = np.array([ds_source.values.item() for _ in range(targ.sizes["shot"])])
-
-            ds = xr.Dataset(
-                data_vars={
-                    "Wtot_MJ_targ": targ,
-                    "Wtot_MJ_pred": pred,
-                    "error_abs_ts": error_abs_ts,
-                    "error_rel_ts": error_rel_ts,
-                    "error_abs_shot": error_abs_shot,
-                    "error_rel_shot": error_rel_shot,
-                }
-            )
-            ds = ds.assign_coords(ds_source=(EPISODE_DIM, ds_source_array))
-            ds = ds.drop_vars("quantile", errors="ignore")
-            ds = ds.drop_vars("input_batch", errors="ignore")
-            return ds
-
-        if config:
-            eval_suite = {
-                "study_results": study_results,
-            }
-            return eval_suite
-        else:
-            # Hyperparameter tuning, do not run test evals
+    def get_test_eval_suite(suite_config) -> EvaluationSuite | None:
+        """The stored-energy study results (trb_utils.scalar_study_results), None for sweep trials."""
+        if not suite_config:
             return None
+        return {"study_results": lambda eval_data: scalar_study_results(eval_data, "energy_mhd_MJ", "output.energy_mhd_MJ_pred")}
